@@ -158,9 +158,66 @@
     const fmtShort = d => d.toLocaleDateString('de-DE', { day: '2-digit', month: 'short' });
     const fmtFull  = d => d.toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' });
 
+    // ─── SKEW-NORMAL MATH ────────────────────────────────────────────────────
+    // Empirical shape from Smith 2001 (KM, spontaneous onset, n=1514):
+    // Bowley skewness = (Q3+Q1−2·Q2)/(Q3−Q1) = (+4+(−6))/10 = −0.2  →  α ≈ −2
+    const SKEW_ALPHA = -2;
+
+    // Owen's T via 8-point Gauss-Legendre quadrature on [0, |a|]
+    function owensT(h, a) {
+      if (a === 0) return 0;
+      const sgn = a < 0 ? -1 : 1;
+      const A   = Math.abs(a);
+      const GL_N = [0.9602898564975363, 0.7966664774136267,
+                    0.5255324099163290, 0.1834346424956498];
+      const GL_W = [0.1012285362903763, 0.2223810344533745,
+                    0.3137066458778873, 0.3626837833783620];
+      let s = 0;
+      for (let i = 0; i < 4; i++) {
+        for (const nd of [GL_N[i], -GL_N[i]]) {
+          const t = A / 2 * nd + A / 2;
+          s += GL_W[i] * Math.exp(-0.5 * h * h * (1 + t * t)) / (1 + t * t);
+        }
+      }
+      return sgn * A / (4 * Math.PI) * s;
+    }
+
+    const skewPDF = (x, xi, omega, alpha) => {
+      const z = (x - xi) / omega;
+      return 2 / omega * normPDF(z) * normCDF(alpha * z);
+    };
+    const skewCDF = (x, xi, omega, alpha) => {
+      const z = (x - xi) / omega;
+      return normCDF(z) - 2 * owensT(z, alpha);
+    };
+
+    // Given desired sigma (std-dev) and alpha, return {xi, omega} so that
+    // Var = sigma² and Median = 0.
+    function skewParams(sigma, alpha) {
+      const delta = alpha / Math.sqrt(1 + alpha * alpha);
+      const omega = sigma / Math.sqrt(1 - 2 * delta * delta / Math.PI);
+      // bisect for xi: skewCDF(0; xi, omega, alpha) = 0.5
+      let lo = -6 * sigma, hi = 6 * sigma;
+      for (let i = 0; i < 56; i++) {
+        const mid = (lo + hi) / 2;
+        if (skewCDF(0, mid, omega, alpha) > 0.5) lo = mid; else hi = mid;
+      }
+      return { xi: (lo + hi) / 2, omega };
+    }
+
+    function skewQuantile(p, xi, omega, alpha) {
+      let lo = xi - 10 * omega, hi = xi + 10 * omega;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        if (skewCDF(mid, xi, omega, alpha) < p) lo = mid; else hi = mid;
+      }
+      return (lo + hi) / 2;
+    }
+
     // ─── MODEL ───────────────────────────────────────────────────────────────
     function computeModel({ method, lmp, cycleLength, usEdd, usWeek, transferDate, embryoAge,
-                            parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod }) {
+                            parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod,
+                            distType }) {
       let baseEdd, sigmaBase, naegeleEdd = null;
 
       if (method === 'lmp') {
@@ -199,34 +256,58 @@
       if (parity === 0) sigma += 0.5;
       if (priorPTB)     sigma += 2.0;
 
+      // Distribution helpers — swap between normal and skew-normal
+      let distPDF, distCDF, distQuantile, meanDays, modeDays;
+      if (distType === 'skew') {
+        const { xi, omega } = skewParams(sigma, SKEW_ALPHA);
+        distPDF      = x => skewPDF(x, xi, omega, SKEW_ALPHA);
+        distCDF      = x => skewCDF(x, xi, omega, SKEW_ALPHA);
+        distQuantile = p => skewQuantile(p, xi, omega, SKEW_ALPHA);
+        const delta  = SKEW_ALPHA / Math.sqrt(1 + SKEW_ALPHA * SKEW_ALPHA);
+        meanDays     = Math.round(xi + omega * delta * Math.sqrt(2 / Math.PI));
+        // mode via scan
+        let maxP = -1;
+        modeDays = 0;
+        for (let d = -42; d <= 28; d += 0.1) {
+          const v = distPDF(d); if (v > maxP) { maxP = v; modeDays = d; }
+        }
+        modeDays = Math.round(modeDays);
+      } else {
+        distPDF      = x => normPDF(x, 0, sigma);
+        distCDF      = x => normCDF(x, 0, sigma);
+        distQuantile = p => normQuantile(p, 0, sigma);
+        meanDays = 0;
+        modeDays = 0;
+      }
+
       // Risk outputs
-      const pPreterm  = priorPTB ? 0.30 : normCDF(-21, 0, sigma);
-      const pPostterm = 1 - normCDF(14, 0, sigma);
-      const pByEdd7   = normCDF(7, 0, sigma);
+      const pPreterm  = priorPTB ? 0.30 : distCDF(-21);
+      const pPostterm = 1 - distCDF(14);
+      const pByEdd7   = distCDF(7);
 
       // Percentiles
       const PCT = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95];
       const percentiles = PCT.map(p => {
-        const days = normQuantile(p, 0, sigma);
+        const days = distQuantile(p);
         return { p, days, date: addDays(eddModel, days), label: `P${Math.round(p * 100)}` };
       });
 
-      const p10d      = normQuantile(0.10, 0, sigma);
-      const p90d      = normQuantile(0.90, 0, sigma);
+      const p10d       = distQuantile(0.10);
+      const p90d       = distQuantile(0.90);
       const windowDays = Math.round(p90d - p10d);
 
       // Naegele delta relative to eddModel (naegele - model; negative = naegele is earlier)
       const naegeleD       = naegeleEdd ? daysDiff(eddModel, naegeleEdd) : null;
       const modelVsNaegele = naegeleEdd ? -naegeleD : null; // positive = model later than Naegele
 
-      // Chart data: d = -49..+28
+      // Chart data: d = -42..+28
       const chartData = [];
       for (let i = 0; i < 71; i++) {
         const d = i - 42;
         chartData.push({
           d,
-          pdf:  normPDF(d, 0, sigma),
-          cdf:  normCDF(d, 0, sigma),
+          pdf:  distPDF(d),
+          cdf:  distCDF(d),
           date: fmtShort(addDays(eddModel, d)),
           wk:   (40 + d / 7).toFixed(1),
         });
@@ -235,6 +316,7 @@
       return {
         eddModel, sigma, sigmaBase, naegeleEdd, naegeleD, modelVsNaegale: modelVsNaegele,
         pPreterm, pPostterm, pByEdd7, percentiles, windowDays, p10d, p90d, chartData,
+        meanDays, modeDays,
       };
     }
 
@@ -507,13 +589,14 @@
       const [conceptionMethod, setConceptionMethod] = useState('natural');
       const [tooltip,          setTooltip]          = useState(null);
       const [chartMode,        setChartMode]        = useState('pdf');
+      const [distType,         setDistType]         = useState('skew');
       const svgRef = useRef(null);
 
       const model = useMemo(() => computeModel({
         method, lmp, cycleLength, usEdd, usWeek, transferDate, embryoAge,
-        parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod,
+        parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod, distType,
       }), [method, lmp, cycleLength, usEdd, usWeek, transferDate, embryoAge,
-           parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod]);
+           parity, priorPTB, height, bmi, ethnicity, fetalSex, conceptionMethod, distType]);
 
       function handleMouseMove(e) {
         if (!svgRef.current || !model) return;
@@ -663,8 +746,12 @@
                 {/* Stats Cards */}
                 <div className="gt-stats">
                   <div className="gt-card">
-                    <div className="gt-label">Modell-ET</div>
+                    <div className="gt-label">Modell-ET (Median)</div>
                     <div className="gt-val">{fmtFull(model.eddModel)}</div>
+                    <div className="gt-sub">
+                      Ø {fmtShort(addDays(model.eddModel, model.meanDays))}
+                      {' · '}Mode {fmtShort(addDays(model.eddModel, model.modeDays))}
+                    </div>
                     <div className="gt-sub">σ = {model.sigma.toFixed(1)} Tage</div>
                   </div>
 
@@ -697,15 +784,28 @@
 
                 {/* Chart */}
                 <div className="gt-chart-wrap">
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                    <span style={{ fontSize: '.73rem', color: '#64748b', flexShrink: 0 }}>Ansicht:</span>
-                    <div className="gt-tg" style={{ maxWidth: 220 }}>
-                      {[['pdf','Dichte'],['cdf','Kumulativ'],['both','Beide']].map(([v, l]) => (
-                        <button key={v} onClick={() => setChartMode(v)}
-                                className={chartMode === v ? 'active' : ''}>
-                          {l}
-                        </button>
-                      ))}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: '.73rem', color: '#64748b', minWidth: 72 }}>Verteilung:</span>
+                      <div className="gt-tg">
+                        {[['normal','Normalverteilung'],['skew','Skew-Normal (empirisch)']].map(([v, l]) => (
+                          <button key={v} onClick={() => setDistType(v)}
+                                  className={distType === v ? 'active' : ''}>
+                            {l}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: '.73rem', color: '#64748b', minWidth: 72 }}>Ansicht:</span>
+                      <div className="gt-tg" style={{ maxWidth: 240 }}>
+                        {[['pdf','Dichte'],['cdf','Kumulativ'],['both','Beide']].map(([v, l]) => (
+                          <button key={v} onClick={() => setChartMode(v)}
+                                  className={chartMode === v ? 'active' : ''}>
+                            {l}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
                   <Chart model={model} tooltip={tooltip} chartMode={chartMode}
@@ -777,11 +877,12 @@
                 <div className="gt-caveat">
                   <strong>Modellgrenzen</strong>
                   <ol>
-                    <li>Normal-Approximation: Die echte Verteilung ist leicht linksschief (längerer Frühgeburts-Tail) – dieser wird hier unterschätzt.</li>
-                    <li>Prior PTB: Das 30 %-Rezidivrisiko ist ein Populationsmittelwert (Meta-Analyse). Individuelle Risiken variieren nach Gestationsalter, Mechanismus (PPROM vs. PTL) und Anzahl vorangegangener PTBs.</li>
-                    <li>Ethnizitäts-Effekte spiegeln strukturelle Faktoren wider (Stress, Versorgung), keine biologische Konstante.</li>
-                    <li>Klinische Interventionen (Einleitung ≥ 41+0 SSW) schneiden den rechten Tail ab. Die Kurve zeigt das unintervenierte Modell.</li>
-                    <li>LMP-Methode setzt korrektes Erinnern des Datums und einen regelmäßigen Zyklus voraus.</li>
+                    <li><strong>Verteilungsform (Normalverteilung):</strong> Vereinfachung. Die echte Verteilung ist linksschief – längerer Frühgeburts-Tail, kürzerer Post-term-Tail.</li>
+                    <li><strong>Verteilungsform (Skew-Normal, empirisch):</strong> Der Shape-Parameter α = −2 wurde aus den Kaplan-Meier-Quantilen von Smith 2001 (n = 1 514, nur spontaner Geburtsbeginn, zensierte Einleitungen) gefittet. Die Schiefe gilt als konstant über alle Subgruppen; nur Median und Varianz werden individuell angepasst. Frühgeburts-Komponente (Mischmodell) und tagesweise Rohdaten stünden für ein vollständigeres Fit zur Verfügung, sind aber nicht in publizierten Tabellen zugänglich.</li>
+                    <li><strong>Klinische Interventionen:</strong> Einleitungen ab 41+0 SSW schneiden den rechten Tail in der Realität ab. Beide Kurven zeigen das unintervenierte biologische Modell.</li>
+                    <li><strong>Prior PTB:</strong> Das 30 %-Rezidivrisiko ist ein Populationsmittelwert (Meta-Analyse). Individuelle Risiken variieren nach Gestationsalter, Mechanismus (PPROM vs. PTL) und Anzahl vorangegangener PTBs.</li>
+                    <li><strong>Ethnizitäts-Effekte</strong> spiegeln strukturelle Faktoren wider (Stress, Versorgung), keine biologische Konstante.</li>
+                    <li><strong>LMP-Methode</strong> setzt korrektes Erinnern des Datums und einen regelmäßigen Zyklus voraus.</li>
                   </ol>
                 </div>
                 <div className="gt-sources">
