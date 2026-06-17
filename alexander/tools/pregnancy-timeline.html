@@ -95,6 +95,9 @@
         probLabel: 'Wahrscheinlichkeit',
         survivalLabel: 'Überleben bei Frühgeburt',
         miscarriageLabel: 'Fehlgeburt',
+        ageLabel: 'Alter Mutter',
+        ageUnit: 'J.',
+        ageNote: 'Fehlgeburtskurve altersadjustiert nach Magnus 2019 (BMJ): das mütterliche Alter skaliert das Gesamtrisiko (J-förmig), der SSW-Verlauf bleibt gleich. Auf das Überleben bei Frühgeburt hat das Alter konditioniert auf die SSW kaum direkten Einfluss.',
         todayMarker: 'HEUTE',
         riskMiscarriage: pct => `${pct}\u00a0% Fehlgeburt`,
         riskSurvival: pct => `${pct}\u00a0% Überleben`,
@@ -140,6 +143,9 @@
         probLabel: 'Probability',
         survivalLabel: 'Preterm Survival',
         miscarriageLabel: 'Miscarriage',
+        ageLabel: 'Maternal age',
+        ageUnit: 'yr',
+        ageNote: 'Miscarriage curve age-adjusted per Magnus 2019 (BMJ): maternal age scales the overall risk (J-shaped); the gestational-week trend is unchanged. Maternal age has little direct effect on preterm survival once gestational age is fixed.',
         todayMarker: 'TODAY',
         riskMiscarriage: pct => `${pct}\u00a0% Miscarriage`,
         riskSurvival: pct => `${pct}\u00a0% Survival`,
@@ -249,6 +255,25 @@
       {week:8,value:2.5},{week:10,value:1.5},{week:12,value:1},{week:14,value:0.5},
       {week:16,value:0.3},{week:20,value:0.2},{week:28,value:0.1},{week:40,value:0.05},
     ];
+    // Risiko bei ~Erkennung der Schwangerschaft (SSW 6) – Anker für die Altersskalierung.
+    const MISCARRIAGE_ANCHOR = MISCARRIAGE_DATA.find(d => d.week === 6).value;
+    // Mütterliches Alter → Gesamt-Fehlgeburtsrisiko einer erkannten Schwangerschaft
+    // (Magnus 2019 BMJ, J-förmig; Werte ≈ alterspezifische Risiken der Studie).
+    const MAGNUS_AGE_RISK = [
+      {age:18,value:13.5},{age:22,value:11.1},{age:27,value:9.8},{age:32,value:11.5},
+      {age:37,value:16.7},{age:42,value:32.6},{age:47,value:53.6},
+    ];
+    const magnusRisk = (age) => {
+      const d = MAGNUS_AGE_RISK;
+      if (age <= d[0].age) return d[0].value;
+      if (age >= d[d.length-1].age) return d[d.length-1].value;
+      for (let i = 0; i < d.length-1; i++)
+        if (age >= d[i].age && age <= d[i+1].age) {
+          const f = (age - d[i].age) / (d[i+1].age - d[i].age);
+          return d[i].value + f * (d[i+1].value - d[i].value);
+        }
+      return d[d.length-1].value;
+    };
     const MILESTONES = [
       {week:6.5,label:t.milestoneLabels[0]},{week:11,label:t.milestoneLabels[1]},
       {week:22,label:t.milestoneLabels[2]},{week:37,label:t.milestoneLabels[3]},{week:40,label:t.milestoneLabels[4]},
@@ -308,6 +333,7 @@
       const [todayStr, setTodayStr] = useState(new Date().toISOString().slice(0,10));
       const [activeCats, setActiveCats] = useState(new Set(Object.keys(CATEGORIES)));
       const [hover, setHover] = useState(null);
+      const [motherAge, setMotherAge] = useState(32);
 
       const lmp   = useMemo(() => new Date(lmpStr   + 'T12:00:00'), [lmpStr]);
       const today = useMemo(() => new Date(todayStr  + 'T12:00:00'), [todayStr]);
@@ -322,6 +348,17 @@
         () => SYMPTOMS.filter(s => activeCats.has(s.category)).sort((a,b)=>a.start-b.start),
         [activeCats]
       );
+
+      // Fehlgeburtskurve: Form bleibt, Gesamtniveau nach Magnus alterskaliert (Anker SSW 6).
+      // Skalierung auf der Hazard-/Überlebens-Skala 1-(1-p)^k: bleibt mathematisch immer
+      // <100 % (kein Abschneiden bei hohem Alter / früher SSW), bei normalem Alter ≈ linear.
+      const miscarriageData = useMemo(() => {
+        const k = Math.log(1 - magnusRisk(motherAge) / 100) / Math.log(1 - MISCARRIAGE_ANCHOR / 100);
+        return MISCARRIAGE_DATA.map(d => ({
+          week: d.week,
+          value: +((1 - Math.pow(1 - d.value / 100, k)) * 100).toFixed(2),
+        }));
+      }, [motherAge]);
 
       const W = 944, ML = 203, MR = 24, MT = 56, MB = 48;
       const ROW_H = 21;
@@ -377,6 +414,13 @@
                     <span>{t.todayLabel}</span>
                     <DateInput value={todayStr} onChange={e=>setTodayStr(e.target.value)} />
                   </label>
+                  <label style={{display:'flex',alignItems:'center',gap:8,fontSize:13,color:'#64748b'}}>
+                    <span>{t.ageLabel}</span>
+                    <input type="range" min={18} max={50} step={1} value={motherAge}
+                      onChange={e=>setMotherAge(+e.target.value)}
+                      style={{width:104,accentColor:'#e11d48',cursor:'pointer'}}/>
+                    <strong style={{color:'#475569',whiteSpace:'nowrap'}}>{motherAge} {t.ageUnit}</strong>
+                  </label>
                   <span style={{fontSize:13,color:'#94a3b8'}}>
                     {t.eddLabel}: <strong style={{color:'#475569'}}>{fmtDE(et)}</strong>
                     &ensp;·&ensp;
@@ -385,6 +429,9 @@
                 </div>
                 <p style={{fontSize:11,color:'#94a3b8',margin:'6px 0 0',lineHeight:1.5}}>
                   {t.noteText}
+                </p>
+                <p style={{fontSize:11,color:'#94a3b8',margin:'4px 0 0',lineHeight:1.5}}>
+                  {t.ageNote}
                 </p>
               </div>
               <p style={{fontSize:11,color:'#94a3b8',maxWidth:340,margin:0,alignSelf:'center'}}>
@@ -502,9 +549,9 @@
                 <text x={xOf(32)+8} y={riskY+riskH-(89.8/100)*riskH+4}
                   fill="#10b981" fontSize={11} fontWeight={600}>{t.survivalLabel}</text>
 
-                <path d={linePath(MISCARRIAGE_DATA,riskY,riskH)}
+                <path d={linePath(miscarriageData,riskY,riskH)}
                   fill="none" stroke="#e11d48" strokeWidth={2.5} strokeLinejoin="round"/>
-                {MISCARRIAGE_DATA.map(d=>{
+                {miscarriageData.map(d=>{
                   const cx=xOf(d.week), cy=riskY+riskH-(d.value/100)*riskH;
                   return <circle key={d.week} cx={cx} cy={cy} r={3.5}
                     fill="#e11d48" stroke="white" strokeWidth={1.5}
@@ -512,14 +559,14 @@
                       label:t.miscarriageLabel,week:d.week,value:d.value,color:'#e11d48'})}
                     onMouseLeave={()=>setHover(null)} style={{cursor:'pointer'}}/>;
                 })}
-                <text x={xOf(6)-4} y={riskY+riskH-(28/100)*riskH-8}
+                <text x={xOf(6)-4} y={riskY+riskH-(Math.max(miscarriageData[2].value,18)/100)*riskH-8}
                   textAnchor="end" fill="#e11d48" fontSize={11} fontWeight={600}>{t.miscarriageLabel}</text>
 
                 {todaySsw >= 0 && todaySsw <= 42 && (() => {
                   const tx = xOf(todaySsw);
                   const useMiscarriage = todaySsw < 22;
                   const riskVal = useMiscarriage
-                    ? interpolate(MISCARRIAGE_DATA, todaySsw)
+                    ? interpolate(miscarriageData, todaySsw)
                     : interpolate(SURVIVAL_DATA, todaySsw);
                   const riskCy = riskVal !== null ? riskY + riskH - (riskVal / 100) * riskH : null;
                   const riskColor = useMiscarriage ? '#e11d48' : '#10b981';
