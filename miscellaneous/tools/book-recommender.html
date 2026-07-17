@@ -321,6 +321,46 @@
       };
     }
 
+    // Top-pick map, one risk row: at fixed risk every book's score is LINEAR in the blend
+    // dial, s_j(bl) = mp[j] + bl·(rp[j] − mp[j]), so the rank-#1 book across the whole blend
+    // axis is the upper envelope of those lines. Building it costs one sort plus a linear
+    // hull pass, which beats re-scanning the pool at every blend sample (O(cols·n)) and is
+    // exact, so the map needs no coarse candidate pre-pass.
+    // `order` holds the pool's book indices and is sorted IN PLACE by slope (equal slopes:
+    // higher intercept, then higher tie[] first, so identical lines resolve to the more
+    // popular book, as in the recommendation ranking). Pass the same array back for the next
+    // row: it stays nearly sorted, which makes the re-sort cheap. Winners land in `out`.
+    function envelopeRow(order, mp, rp, cols, tie, out) {
+      const nl = order.length;
+      order.sort((a, b) => (rp[a] - mp[a]) - (rp[b] - mp[b]) || mp[b] - mp[a] || tie[b] - tie[a]);
+      const st = new Int32Array(nl);     // hull lines, slope increasing
+      const xs = new Float64Array(nl);   // xs[k] = blend at which st[k] overtakes st[k-1]
+      let top = -1;
+      for (let k = 0; k < nl; k++) {
+        const j = order[k], a = mp[j], b = rp[j] - mp[j];
+        let x = -Infinity, drop = false;
+        while (top >= 0) {
+          const j0 = st[top], a0 = mp[j0], b0 = rp[j0] - mp[j0];
+          if (b === b0) {                                    // parallel: only the higher line lives
+            if (a <= a0) { drop = true; break; }
+            top--; continue;
+          }
+          x = (a0 - a) / (b - b0);                           // b > b0 by the sort order
+          if (top > 0 && x <= xs[top]) { top--; continue; }  // st[top] never leads → pop
+          break;
+        }
+        if (drop) continue;
+        if (top < 0) x = -Infinity;
+        top++; st[top] = j; xs[top] = x;
+      }
+      for (let c = 0, k = 0; c < cols; c++) {                // blends ascend → walk the hull once
+        const bl = cols > 1 ? c / (cols - 1) : 0;
+        while (k < top && xs[k + 1] <= bl) k++;
+        out[c] = st[k];
+      }
+      return out;
+    }
+
     // Nadaraya-Watson smoothed grid over the embedding square [-1,1]²: divide kernel-weighted
     // sum by kernel mass (avoids edge artefacts); cells without mass stay neutral.
     // `coords` (optional) is a per-book [x,y] array, the active embedding's positions; when
@@ -604,7 +644,7 @@
       cholesky: cholesky, cholSolve: cholSolve, quadForm: quadForm,
       prepare: prepare, foldIn: foldIn, predictAll: predictAll, easeScores: easeScores,
       exposureU: exposureU, pKnowAll: pKnowAll, recompute: recompute,
-      smoothGrid: smoothGrid, loo: loo, clusterRated: clusterRated,
+      smoothGrid: smoothGrid, envelopeRow: envelopeRow, loo: loo, clusterRated: clusterRated,
       detectDelim: detectDelim, parseCSV: parseCSV, csvField: csvField, exportCSV: exportCSV,
       normKey: normKey, buildMatchIndex: buildMatchIndex, importRatings: importRatings,
       resolveByName: resolveByName, remapEntries: remapEntries,
@@ -1677,9 +1717,9 @@
       // the map switches with the active method. Unknown future keys fall back to meta.name and
       // a generic line, so the tool never shows a wrong description.
       const METHOD_INFO = {
-        ssumap_macro: { label: 'Taste map',
-          blurb: "The default. A UMAP projection gently guided by broad genre, so books that share both an audience and a genre pull together. Of the layouts here it forms the cleanest, most readable islands and separates genres best." },
-        umap: { label: 'UMAP (raw)',
+        ssumap_macro: { label: 'SSUMAP',
+          blurb: "The default. Semi-supervised UMAP: the projection is gently guided by broad genre, so books that share both an audience and a genre pull together. Of the layouts here it forms the cleanest, most readable islands and separates genres best." },
+        umap: { label: 'UMAP',
           blurb: "The same UMAP, but with no genre hint at all: position comes purely from co-reading. Tellingly, the islands barely line up with genre: raw reading data sorts people only weakly by genre. This is the honest unsupervised view." },
         tsne: { label: 't-SNE',
           blurb: "Emphasizes tight local neighborhoods, so it forms crisp clusters, but the gaps between clusters carry no meaning. Read who sits next to whom, not how far apart two islands are." },
@@ -1788,8 +1828,7 @@
     // cell by the book that ranks #1 there: an approximate Voronoi/decision-region map.
     function TopPickTab({ model, comp, filtered, blend, risk, setBlend, setRisk, nerd }) {
       const [tip, setTip] = useState(null);
-      const [res, setRes] = useState(192);   // fine render resolution (contour smoothness)
-      const CAND = 80;   // coarse grid used only to collect the set of possible winners
+      const [res, setRes] = useState(128);   // render resolution (contour smoothness)
       const W = 760, H = 560, L = 30, R = 150, T = 24, B = 40;
       const plotW = W - L - R, plotH = H - T - B;
       const cy0 = T + plotH / 2;             // risk = 0 sits at mid-height (the fan's axis)
@@ -1798,49 +1837,43 @@
 
       // The field replicates RecsTab's scoring rule EXACTLY so a clicked cell's winner
       // equals the Recommendations #1. mp (match percentile) is constant over the whole
-      // plane; rp (rating percentile) depends only on risk → one sort per risk row.
-      // Two-stage for a smooth-but-cheap render: a coarse pass collects the (small) set of
-      // books that ever win, then the fine field argmaxes over only that candidate set, so
-      // we can raster at high resolution (smooth contours) without an O(res²·n) blow-up.
+      // plane; rp (rating percentile) depends only on risk → one sort per risk row. Within
+      // a row the score is linear in blend, so RecMath.envelopeRow hands us the winner of
+      // every column at once (upper envelope of the score lines) instead of an argmax scan
+      // per cell. Keys and percentiles are precomputed into typed arrays because the sorts
+      // run once per row: no sqrt or closure work inside a comparator.
       // We then trace the borders between differing winners as vector contours (marching
       // squares) instead of painting cells: white lines on the dark surface, no fills.
       const G = useMemo(() => {
-        const n = filtered.length;
-        if (n === 0) return null;
-        const books = model.prep.books;
-        const matchKey = comp.nRated > 0 ? (j => comp.ease[j]) : (j => books[j].n);
-        const pctMap = (pool, keyFn) => {
-          const order = pool.slice().sort((a, b) => keyFn(a) - keyFn(b) || books[a].n - books[b].n);
-          const p = new Float64Array(model.prep.n);   // books outside the pool stay 0
-          order.forEach((j, i) => { p[j] = order.length > 1 ? i / (order.length - 1) : 0.5; });
-          return p;
+        if (filtered.length === 0) return null;
+        const books = model.prep.books, N = model.prep.n;
+        const tie = new Float64Array(N);              // popularity, the ranking's tie-break
+        for (const j of filtered) tie[j] = books[j].n;
+        const key = new Float64Array(N);
+        const pct = (order, p) => {                   // key[] → percentile in [0,1] over `order`
+          order.sort((a, b) => key[a] - key[b] || tie[a] - tie[b]);
+          for (let i = 0; i < order.length; i++) p[order[i]] = order.length > 1 ? i / (order.length - 1) : 0.5;
         };
         // Same signal-pool rule as RecsTab, or the map's winners would diverge from
         // the Recommendations #1 the tooltip promises.
         const matchPool = comp.nRated > 0 ? filtered.filter(j => comp.ease[j] > 0) : filtered;
-        const mp = pctMap(matchPool, matchKey);
-        const riskAt = (i, N) => N > 1 ? 1 - 2 * i / (N - 1) : 0;   // row 0 (top) = +1 moonshots
-        const blendAt = (i, N) => N > 1 ? i / (N - 1) : 0;          // col 0 (left) = match/popular
-        const winnerIn = (bl, rp, pool) => {                        // argmax over a candidate pool
-          let best = -1, bestScore = -Infinity, bestN = -1;
-          for (let k = 0; k < pool.length; k++) {
-            const j = pool[k], s = (1 - bl) * mp[j] + bl * rp[j], nj = books[j].n;
-            if (s > bestScore || (s === bestScore && nj > bestN)) { bestScore = s; best = j; bestN = nj; }
-          }
-          return best;
-        };
-        // Stage 1: candidate winners over the full pool on a coarse grid.
-        const cand = new Set();
-        for (let r = 0; r < CAND; r++) {
-          const rp = pctMap(filtered, j => M.clip(comp.m[j] + riskAt(r, CAND) * zc * Math.sqrt(comp.va[j]), 1, 5));
-          for (let c = 0; c < CAND; c++) cand.add(winnerIn(blendAt(c, CAND), rp, filtered));
-        }
-        const pool = [...cand];
-        // Stage 2: fine field over candidates only.
+        const mp = new Float64Array(N);               // books outside the match pool stay 0
+        for (const j of matchPool) key[j] = comp.nRated > 0 ? comp.ease[j] : books[j].n;
+        pct(matchPool, mp);
+        const riskAt = (i, N2) => N2 > 1 ? 1 - 2 * i / (N2 - 1) : 0;   // row 0 (top) = +1 moonshots
+        const sd = new Float64Array(N);
+        for (const j of filtered) sd[j] = Math.sqrt(comp.va[j]);
         const fr = res, field = new Int32Array(fr * fr);
+        const rp = new Float64Array(N);
+        const rankOrder = filtered.slice();           // both orders are reused across rows: risk
+        const hullOrder = filtered.slice();           // shifts them only slightly, so re-sorting
+        const row = new Int32Array(fr);               // nearly sorted data stays cheap
         for (let r = 0; r < fr; r++) {
-          const rp = pctMap(filtered, j => M.clip(comp.m[j] + riskAt(r, fr) * zc * Math.sqrt(comp.va[j]), 1, 5));
-          for (let c = 0; c < fr; c++) field[r * fr + c] = winnerIn(blendAt(c, fr), rp, pool);
+          const rk = riskAt(r, fr);
+          for (const j of filtered) key[j] = M.clip(comp.m[j] + rk * zc * sd[j], 1, 5);
+          pct(rankOrder, rp);
+          M.envelopeRow(hullOrder, mp, rp, fr, tie, row);
+          field.set(row, r * fr);
         }
         // Winners by area, plus a label anchor per winner: the pole of
         // inaccessibility (region cell farthest from any border), the area
@@ -1940,7 +1973,7 @@
             </p>}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0 8px' }}>
             <span style={{ color: C.label, fontSize: 13 }}>Resolution:</span>
-            <Seg options={[{ id: '128', label: 'Coarse' }, { id: '192', label: 'Medium' }, { id: '288', label: 'Fine' }]}
+            <Seg options={[{ id: '128', label: 'Coarse' }, { id: '288', label: 'Fine' }]}
               value={String(res)} onChange={v => setRes(+v)} />
           </div>
           {!G &&
