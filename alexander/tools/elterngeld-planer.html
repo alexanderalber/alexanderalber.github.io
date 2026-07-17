@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="de" data-theme="dark" data-section="alexander">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Elterngeld-Planer: Alexander Alber</title>
+  <meta name="description" content="Interaktiver Rechner zur Optimierung von Elterngeldstrategien.">
+  <link rel="canonical" href="https://alber.me/alexander/tools/elterngeld-planer.html">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/alexander/">About</a></li>
+        <li><a href="/alexander/publications.html">Publications</a></li>
+        <li><a href="/alexander/writing.html">Writing</a></li>
+        <li><a href="/alexander/projects.html">Projects &amp; Art</a></li>
+        <li><a href="/alexander/miscellaneous.html" aria-current="page">Miscellaneous</a></li>
+        <li><a href="/alexander/cv.html">CV</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main style="background:linear-gradient(180deg,#f8f7f4 0%,#f0efe9 100%);min-height:100vh;">
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/alexander/visualizations-for-parents.html">← Visualizations for Parents</a>
+    </p>
+    <div id="root"></div>
+  </main>
+
+  <script type="text/babel">
+    const { useState, useMemo, useCallback } = React;
+
+    const MONTHS_LABEL = [
+      "LM 1", "LM 2", "LM 3", "LM 4", "LM 5", "LM 6",
+      "LM 7", "LM 8", "LM 9", "LM 10", "LM 11", "LM 12",
+      "LM 13", "LM 14", "LM 15", "LM 16", "LM 17", "LM 18",
+      "LM 19", "LM 20", "LM 21", "LM 22", "LM 23", "LM 24"
+    ];
+
+    const STATUS = {
+      NONE: "none", BASIS: "basis", PLUS: "plus", BONUS: "bonus", MUTTERSCHUTZ: "mutterschutz",
+    };
+    const STATUS_LABELS = {
+      [STATUS.NONE]: "—", [STATUS.BASIS]: "Basis", [STATUS.PLUS]: "Plus",
+      [STATUS.BONUS]: "Bonus", [STATUS.MUTTERSCHUTZ]: "MuSch",
+    };
+    const STATUS_COLORS = {
+      [STATUS.NONE]: { bg: "transparent", text: "#888", border: "#ddd" },
+      [STATUS.BASIS]: { bg: "#2563eb", text: "#fff", border: "#1d4ed8" },
+      [STATUS.PLUS]: { bg: "#7c3aed", text: "#fff", border: "#6d28d9" },
+      [STATUS.BONUS]: { bg: "#059669", text: "#fff", border: "#047857" },
+      [STATUS.MUTTERSCHUTZ]: { bg: "#dc2626", text: "#fff", border: "#b91c1c" },
+    };
+
+    const PRESETS = {
+      klassisch: {
+        name: "Modell A – Klassisch (12+2)",
+        desc: "Mutter 12 Basis, Vater 2 Basis. Einfach, wenig gemeinsame Zeit.",
+        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","basis","basis","basis","basis","basis","none","none","none","none","none","none","none","none","none","none","none","none"],
+        father: ["basis","none","none","none","none","none","none","none","none","none","none","none","basis","none","none","none","none","none","none","none","none","none","none","none"],
+      },
+      mix: {
+        name: "Modell B – Mix (mehr gemeinsam)",
+        desc: "Mutter 8 Basis + 8 Plus, Vater 1 Basis + 6 Plus. ~6 Monate gemeinsam.",
+        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","basis","plus","plus","plus","plus","plus","plus","plus","plus","none","none","none","none","none","none","none","none"],
+        father: ["basis","none","plus","plus","plus","plus","plus","plus","none","none","none","none","none","none","none","none","none","none","none","none","none","none","none","none"],
+      },
+      maximum: {
+        name: "Modell C – Maximum (Partnerschaftsbonus)",
+        desc: "10 Basis + 4 Plus (Mutter), 1 Basis + 3 Plus + 4 Bonus (Vater). Bis 22 Monate.",
+        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","basis","basis","basis","plus","plus","plus","plus","bonus","bonus","bonus","bonus","none","none","none","none","none","none"],
+        father: ["basis","plus","plus","plus","none","none","none","none","none","none","none","none","none","none","bonus","bonus","bonus","bonus","none","none","none","none","none","none"],
+      },
+    };
+
+    function calcElterngeld(monthlyNet) {
+      if (monthlyNet <= 0) return { basis: 300, plus: 150 };
+      const rate = monthlyNet < 1240 ? 0.67 : 0.65;
+      const basis = Math.min(1800, Math.max(300, Math.round(monthlyNet * rate)));
+      const plus = Math.min(900, Math.round(basis / 2));
+      return { basis, plus };
+    }
+
+    function validate(mother, father) {
+      const warnings = [], errors = [];
+      let motherBasis = 0, motherPlus = 0, fatherBasis = 0, fatherPlus = 0;
+      let motherBonus = 0, fatherBonus = 0, simultaneousBasisMonths = 0;
+
+      for (let i = 0; i < 24; i++) {
+        const m = mother[i], f = father[i];
+        if (m === STATUS.MUTTERSCHUTZ || m === STATUS.BASIS) motherBasis++;
+        if (m === STATUS.PLUS) motherPlus++;
+        if (m === STATUS.BONUS) motherBonus++;
+        if (f === STATUS.BASIS) fatherBasis++;
+        if (f === STATUS.PLUS) fatherPlus++;
+        if (f === STATUS.BONUS) fatherBonus++;
+        const mIsBasis = m === STATUS.BASIS || m === STATUS.MUTTERSCHUTZ;
+        if (mIsBasis && f === STATUS.BASIS) simultaneousBasisMonths++;
+        if (i >= 14) {
+          if (m === STATUS.BASIS || m === STATUS.MUTTERSCHUTZ)
+            errors.push(`Mutter: Basiselterngeld in ${MONTHS_LABEL[i]} nicht möglich (nur bis LM 14)`);
+          if (f === STATUS.BASIS)
+            errors.push(`Vater: Basiselterngeld in ${MONTHS_LABEL[i]} nicht möglich (nur bis LM 14)`);
+        }
+      }
+
+      const totalBudget = motherBasis + fatherBasis + (motherPlus + fatherPlus) * 0.5;
+      if (totalBudget > 14) errors.push(`Budget überschritten: ${totalBudget.toFixed(1)} von 14 Basismonaten verbraucht (Plus zählt halb)`);
+      if (motherBasis + motherPlus > 0 && motherBasis + motherPlus < 2) warnings.push("Mutter: Mindestens 2 Monate Bezug erforderlich");
+      if (fatherBasis + fatherPlus > 0 && fatherBasis + fatherPlus < 2) warnings.push("Vater: Mindestens 2 Monate Bezug erforderlich");
+      if (motherBasis > 12) errors.push("Mutter: Max 12 Basismonate");
+      if (fatherBasis > 12) errors.push("Vater: Max 12 Basismonate");
+      if (simultaneousBasisMonths > 1) errors.push(`Gleichzeitiges Basiselterngeld: ${simultaneousBasisMonths} Monate (max. 1 erlaubt seit April 2024)`);
+      if (motherBonus > 0 || fatherBonus > 0) {
+        if (motherBonus < 2 || motherBonus > 4) warnings.push(`Mutter: Partnerschaftsbonus muss 2–4 Monate sein (aktuell: ${motherBonus})`);
+        if (fatherBonus < 2 || fatherBonus > 4) warnings.push(`Vater: Partnerschaftsbonus muss 2–4 Monate sein (aktuell: ${fatherBonus})`);
+        for (let i = 0; i < 24; i++) {
+          if ((mother[i] === STATUS.BONUS) !== (father[i] === STATUS.BONUS)) {
+            warnings.push(`${MONTHS_LABEL[i]}: Partnerschaftsbonus muss gleichzeitig bezogen werden`);
+            break;
+          }
+        }
+      }
+      return { warnings, errors, totalBudget, motherBasis, fatherBasis, motherPlus, fatherPlus, motherBonus, fatherBonus };
+    }
+
+    const cycleStatus = (current, isMother, monthIndex) => {
+      if (isMother && monthIndex < 2) return current === STATUS.MUTTERSCHUTZ ? STATUS.NONE : STATUS.MUTTERSCHUTZ;
+      const order = [STATUS.NONE, STATUS.BASIS, STATUS.PLUS, STATUS.BONUS];
+      return order[(order.indexOf(current) + 1) % order.length];
+    };
+
+    function ElterngeldPlaner() {
+      const [motherNet, setMotherNet] = useState(3100);
+      const [fatherNet, setFatherNet] = useState(3800);
+      const [mother, setMother] = useState(() => PRESETS.maximum.mother.slice());
+      const [father, setFather] = useState(() => PRESETS.maximum.father.slice());
+      const [showHelp, setShowHelp] = useState(false);
+
+      const motherEG = useMemo(() => calcElterngeld(motherNet), [motherNet]);
+      const fatherEG = useMemo(() => calcElterngeld(fatherNet), [fatherNet]);
+
+      const handleCellClick = useCallback((who, index) => {
+        if (who === "mother") {
+          setMother(prev => { const next = [...prev]; next[index] = cycleStatus(prev[index], true, index); return next; });
+        } else {
+          setFather(prev => { const next = [...prev]; next[index] = cycleStatus(prev[index], false, index); return next; });
+        }
+      }, []);
+
+      const loadPreset = useCallback((key) => {
+        setMother(PRESETS[key].mother.slice());
+        setFather(PRESETS[key].father.slice());
+      }, []);
+
+      const resetAll = useCallback(() => {
+        setMother(Array(24).fill(STATUS.NONE));
+        setFather(Array(24).fill(STATUS.NONE));
+      }, []);
+
+      const validation = useMemo(() => validate(mother, father), [mother, father]);
+
+      const financials = useMemo(() => {
+        let motherTotal = 0, fatherTotal = 0, simultaneousMonths = 0, lastActiveMonth = 0;
+        const monthlyDetail = [];
+        for (let i = 0; i < 24; i++) {
+          let mAmount = 0, fAmount = 0;
+          const m = mother[i], f = father[i];
+          if (m === STATUS.MUTTERSCHUTZ) mAmount = motherNet;
+          else if (m === STATUS.BASIS) mAmount = motherEG.basis;
+          else if (m === STATUS.PLUS || m === STATUS.BONUS) mAmount = motherEG.plus;
+          if (f === STATUS.BASIS) fAmount = fatherEG.basis;
+          else if (f === STATUS.PLUS || f === STATUS.BONUS) fAmount = fatherEG.plus;
+          motherTotal += mAmount; fatherTotal += fAmount;
+          if (m !== STATUS.NONE && f !== STATUS.NONE) simultaneousMonths++;
+          if (m !== STATUS.NONE || f !== STATUS.NONE) lastActiveMonth = i + 1;
+          monthlyDetail.push({ month: i + 1, mAmount, fAmount, total: mAmount + fAmount });
+        }
+        return { motherTotal, fatherTotal, total: motherTotal + fatherTotal, simultaneousMonths, lastActiveMonth, monthlyDetail };
+      }, [mother, father, motherNet, fatherNet, motherEG, fatherEG]);
+
+      return (
+        <div style={{
+          fontFamily: "'IBM Plex Sans', 'SF Pro Display', -apple-system, sans-serif",
+          maxWidth: 960, margin: "0 auto", padding: "24px 16px",
+          color: "#1a1a2e",
+        }}>
+          <div style={{ marginBottom: 32 }}>
+            <h1 style={{ fontSize: 28, fontWeight: 700, margin: 0, letterSpacing: "-0.5px", color: "#1a1a2e" }}>
+              Elterngeld-Planer
+            </h1>
+            <p style={{ margin: "6px 0 0", fontSize: 14, color: "#666", lineHeight: 1.5 }}>
+              Klick auf eine Zelle zum Durchschalten: — → Basis → Plus → Bonus → —
+            </p>
+            <button onClick={() => setShowHelp(!showHelp)} style={{
+              marginTop: 8, background: "none", border: "1px solid #ccc", borderRadius: 6,
+              padding: "4px 12px", fontSize: 12, color: "#666", cursor: "pointer",
+            }}>
+              {showHelp ? "Hilfe ausblenden" : "Regeln & Hilfe"}
+            </button>
+            {showHelp && (
+              <div style={{
+                marginTop: 12, padding: 16, background: "#fff", borderRadius: 8,
+                border: "1px solid #e0dfd8", fontSize: 13, lineHeight: 1.7, color: "#444",
+              }}>
+                <strong>Basiselterngeld:</strong> 65% vom Netto, max 1.800€/Monat. Nur in LM 1–14. Gleichzeitig max 1 Monat (seit 04/2024).<br/>
+                <strong>ElterngeldPlus:</strong> Halber Basissatz, max 900€. Auch nach LM 14 möglich. 1 Basismonat = 2 Plus-Monate im Budget.<br/>
+                <strong>Partnerschaftsbonus:</strong> 2–4 Extramonate Plus je Elternteil bei gleichzeitiger Teilzeit (24–32h). Zusätzlich zum Budget.<br/>
+                <strong>Budget:</strong> 14 Basismonate gesamt. Plus-Monate kosten 0,5 Basismonate. Bonus ist extra.<br/>
+                <strong>MuSch:</strong> Lebensmonat 1–2 zählen als Mutterschutz (volles Netto, wird auf Elterngeld angerechnet).
+              </div>
+            )}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
+            {[["Mutter", motherNet, setMotherNet, motherEG], ["Vater", fatherNet, setFatherNet, fatherEG]].map(([label, net, setNet, eg]) => (
+              <div key={label} style={{ background: "#fff", borderRadius: 10, padding: 16, border: "1px solid #e0dfd8" }}>
+                <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>
+                  {label} – Elterngeld-Netto
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input type="range" min={1000} max={5000} step={50} value={net}
+                    onChange={e => setNet(Number(e.target.value))} style={{ flex: 1 }}/>
+                  <span style={{ fontSize: 18, fontWeight: 600, fontVariantNumeric: "tabular-nums", minWidth: 70, textAlign: "right" }}>
+                    {net.toLocaleString("de-DE")} €
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
+                  → Basis: {eg.basis.toLocaleString("de-DE")} € · Plus: {eg.plus.toLocaleString("de-DE")} €
+                  {eg.basis === 1800 && <span style={{ color: "#059669", fontWeight: 600 }}> (Cap)</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
+            {Object.entries(PRESETS).map(([key, p]) => (
+              <button key={key} onClick={() => loadPreset(key)} style={{
+                background: "#fff", border: "1px solid #d0cfc8", borderRadius: 8,
+                padding: "8px 14px", fontSize: 12, cursor: "pointer", textAlign: "left",
+                lineHeight: 1.4, flex: "1 1 180px",
+              }}>
+                <div style={{ fontWeight: 600, marginBottom: 2 }}>{p.name}</div>
+                <div style={{ color: "#888", fontSize: 11 }}>{p.desc}</div>
+              </button>
+            ))}
+            <button onClick={resetAll} style={{
+              background: "#fff", border: "1px solid #d0cfc8", borderRadius: 8,
+              padding: "8px 14px", fontSize: 12, cursor: "pointer", minWidth: 80,
+            }}>Reset</button>
+          </div>
+
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", overflow: "hidden", marginBottom: 24 }}>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
+                <thead>
+                  <tr>
+                    <th style={{
+                      padding: "10px 12px", textAlign: "left", fontSize: 11, textTransform: "uppercase",
+                      letterSpacing: 1, color: "#888", borderBottom: "2px solid #e0dfd8", background: "#fafaf7",
+                      position: "sticky", left: 0, zIndex: 1, minWidth: 70,
+                    }}>Monat</th>
+                    {MONTHS_LABEL.map((label, i) => (
+                      <th key={i} style={{
+                        padding: "10px 4px", textAlign: "center", fontSize: 10, fontWeight: 600,
+                        color: i < 14 ? "#1a1a2e" : "#aaa", borderBottom: "2px solid #e0dfd8",
+                        background: "#fafaf7", minWidth: 38, borderLeft: i === 14 ? "2px dashed #ccc" : "none",
+                      }}>
+                        {label}
+                        {i < 2 && <div style={{ fontSize: 8, color: "#dc2626", fontWeight: 400 }}>MuSch</div>}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[["mother", mother, motherEG, motherNet], ["father", father, fatherEG, null]].map(([who, plan, eg, net]) => (
+                    <tr key={who}>
+                      <td style={{
+                        padding: "6px 12px", fontSize: 12, fontWeight: 600,
+                        background: "#fafaf7", position: "sticky", left: 0, zIndex: 1, borderBottom: "1px solid #eee",
+                      }}>{who === "mother" ? "Mutter" : "Vater"}</td>
+                      {plan.map((status, i) => {
+                        const colors = STATUS_COLORS[status];
+                        return (
+                          <td key={i} onClick={() => handleCellClick(who, i)} style={{
+                            padding: 2, textAlign: "center", cursor: "pointer",
+                            borderLeft: i === 14 ? "2px dashed #ccc" : "none", borderBottom: "1px solid #eee",
+                          }}>
+                            <div style={{
+                              background: colors.bg, color: colors.text,
+                              border: `1.5px solid ${status === STATUS.NONE ? "#ddd" : colors.border}`,
+                              borderRadius: 5, padding: "6px 2px", fontSize: 10, fontWeight: 600,
+                              userSelect: "none", lineHeight: 1.2,
+                            }}>
+                              {STATUS_LABELS[status]}
+                              {status !== STATUS.NONE && (
+                                <div style={{ fontSize: 9, fontWeight: 400, opacity: 0.85, marginTop: 1 }}>
+                                  {status === STATUS.MUTTERSCHUTZ ? `${net.toLocaleString("de-DE")}€`
+                                    : status === STATUS.BASIS ? `${eg.basis.toLocaleString("de-DE")}€`
+                                    : `${eg.plus.toLocaleString("de-DE")}€`}
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                  <tr>
+                    <td style={{
+                      padding: "6px 12px", fontSize: 11, fontWeight: 600, color: "#888",
+                      background: "#fafaf7", position: "sticky", left: 0, zIndex: 1,
+                    }}>Σ/Monat</td>
+                    {financials.monthlyDetail.map((d, i) => (
+                      <td key={i} style={{
+                        padding: "6px 2px", textAlign: "center", fontSize: 9,
+                        color: d.total > 0 ? "#1a1a2e" : "#ccc", fontWeight: d.total > 0 ? 600 : 400,
+                        borderLeft: i === 14 ? "2px dashed #ccc" : "none",
+                      }}>
+                        {d.total > 0 ? `${(d.total / 1000).toFixed(1)}k` : "—"}
+                      </td>
+                    ))}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {(validation.errors.length > 0 || validation.warnings.length > 0) && (
+            <div style={{ marginBottom: 24 }}>
+              {validation.errors.map((e, i) => (
+                <div key={`e${i}`} style={{
+                  background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 8,
+                  padding: "10px 14px", marginBottom: 6, fontSize: 13, color: "#991b1b",
+                  display: "flex", alignItems: "center", gap: 8,
+                }}>⛔ {e}</div>
+              ))}
+              {validation.warnings.map((w, i) => (
+                <div key={`w${i}`} style={{
+                  background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8,
+                  padding: "10px 14px", marginBottom: 6, fontSize: 13, color: "#92400e",
+                  display: "flex", alignItems: "center", gap: 8,
+                }}>⚠️ {w}</div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginBottom: 24 }}>
+            {[
+              { label: "Gesamtauszahlung", value: `${financials.total.toLocaleString("de-DE")} €`, sub: `Mutter: ${financials.motherTotal.toLocaleString("de-DE")} € · Vater: ${financials.fatherTotal.toLocaleString("de-DE")} €`, accent: "#1a1a2e" },
+              { label: "Bezugsdauer", value: `${financials.lastActiveMonth} Monate`, sub: `Letzter aktiver Monat: LM ${financials.lastActiveMonth}`, accent: "#2563eb" },
+              { label: "Gemeinsame Monate", value: `${financials.simultaneousMonths}`, sub: "Monate, in denen beide zu Hause sind", accent: "#059669" },
+              { label: "Budget verbraucht", value: `${validation.totalBudget.toFixed(1)} / 14`, sub: `${(14 - validation.totalBudget).toFixed(1)} Basismonate übrig`, accent: validation.totalBudget > 14 ? "#dc2626" : "#7c3aed" },
+            ].map((card, i) => (
+              <div key={i} style={{
+                background: "#fff", borderRadius: 10, padding: 16, border: "1px solid #e0dfd8",
+                borderTop: `3px solid ${card.accent}`,
+              }}>
+                <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>{card.label}</div>
+                <div style={{ fontSize: 24, fontWeight: 700, color: card.accent, fontVariantNumeric: "tabular-nums" }}>{card.value}</div>
+                <div style={{ fontSize: 11, color: "#999", marginTop: 4, lineHeight: 1.4 }}>{card.sub}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20, marginBottom: 24 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 16 }}>
+              Monatliche Auszahlung
+            </div>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 120 }}>
+              {financials.monthlyDetail.map((d, i) => {
+                const maxTotal = Math.max(...financials.monthlyDetail.map(x => x.total), 1);
+                const mH = d.total > 0 ? (d.mAmount / maxTotal) * 100 : 0;
+                const fH = d.total > 0 ? (d.fAmount / maxTotal) * 100 : 0;
+                return (
+                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%" }}>
+                    <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", width: "100%", height: "100%" }}>
+                      <div style={{
+                        background: mother[i] === STATUS.MUTTERSCHUTZ ? "#dc2626" : mother[i] === STATUS.BASIS ? "#2563eb" : mother[i] === STATUS.BONUS ? "#059669" : "#7c3aed",
+                        height: `${mH}%`, borderRadius: "3px 3px 0 0", opacity: d.mAmount > 0 ? 1 : 0,
+                      }} />
+                      <div style={{
+                        background: father[i] === STATUS.BASIS ? "#93c5fd" : father[i] === STATUS.BONUS ? "#6ee7b7" : "#c4b5fd",
+                        height: `${fH}%`, borderRadius: "0 0 3px 3px", opacity: d.fAmount > 0 ? 1 : 0,
+                      }} />
+                    </div>
+                    <div style={{ fontSize: 8, color: "#aaa", marginTop: 3 }}>{i + 1}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 11, color: "#666", flexWrap: "wrap" }}>
+              {[["#dc2626","MuSch"],["#2563eb","Basis (M)"],["#93c5fd","Basis (V)"],["#7c3aed","Plus (M)"],["#c4b5fd","Plus (V)"],["#059669","Bonus (M)"],["#6ee7b7","Bonus (V)"]].map(([bg,lbl])=>(
+                <span key={lbl}><span style={{ display:"inline-block",width:10,height:10,background:bg,borderRadius:2,marginRight:4,verticalAlign:"middle" }}/>{lbl}</span>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 12 }}>
+              Budget-Aufschlüsselung
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13 }}>
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Mutter</div>
+                <div style={{ color: "#555", lineHeight: 1.8 }}>
+                  Basis/MuSch: {validation.motherBasis} Monate = {validation.motherBasis} BM<br/>
+                  ElterngeldPlus: {validation.motherPlus} Monate = {(validation.motherPlus * 0.5).toFixed(1)} BM<br/>
+                  Partnerschaftsbonus: {validation.motherBonus} Monate (extra)
+                </div>
+              </div>
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Vater</div>
+                <div style={{ color: "#555", lineHeight: 1.8 }}>
+                  Basis: {validation.fatherBasis} Monate = {validation.fatherBasis} BM<br/>
+                  ElterngeldPlus: {validation.fatherPlus} Monate = {(validation.fatherPlus * 0.5).toFixed(1)} BM<br/>
+                  Partnerschaftsbonus: {validation.fatherBonus} Monate (extra)
+                </div>
+              </div>
+            </div>
+            <div style={{
+              marginTop: 12, padding: "10px 14px", background: "#f8f7f4", borderRadius: 8,
+              fontSize: 13, fontWeight: 600, color: validation.totalBudget > 14 ? "#dc2626" : "#1a1a2e",
+            }}>
+              Budget: {validation.totalBudget.toFixed(1)} / 14 Basismonate verbraucht
+              <div style={{ marginTop: 6, height: 8, background: "#e5e5e0", borderRadius: 4, overflow: "hidden" }}>
+                <div style={{
+                  width: `${Math.min(100, (validation.totalBudget / 14) * 100)}%`, height: "100%",
+                  background: validation.totalBudget > 14 ? "linear-gradient(90deg, #dc2626, #ef4444)"
+                    : validation.totalBudget > 12 ? "linear-gradient(90deg, #f59e0b, #fbbf24)"
+                    : "linear-gradient(90deg, #2563eb, #3b82f6)",
+                  borderRadius: 4,
+                }} />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 24, fontSize: 11, color: "#aaa", lineHeight: 1.6, textAlign: "center" }}>
+            Vereinfachte Berechnung. Keine Gewähr für Richtigkeit. Für verbindliche Auskunft → ZBFS Bayern (0800 6645471).
+            <br/>Mutterschutzgeld wird hier als volles Netto angezeigt (Krankenkasse + AG-Zuschuss).
+            <br/>Partnerschaftsbonus-Monate zählen nicht ins 14-Monats-Budget.
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<ElterngeldPlaner />);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Alexander Alber · <a href="/">alber.me</a></small>
+  </footer>
+</body>
+</html>
