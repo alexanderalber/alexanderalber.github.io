@@ -419,15 +419,18 @@
       return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     }
 
+    // rows: [title, author, rating, book_id?]. The trailing book_id column lets our
+    // own export round-trip exactly even when a (title, author) pair is ambiguous in
+    // the catalog; foreign CSVs simply won't have it and fall back to name matching.
     function exportCSV(rows) {
-      const lines = ['title,author,rating'];
-      for (const r of rows) lines.push([csvField(r[0]), csvField(r[1]), r[2]].join(','));
+      const lines = ['title,author,rating,book_id'];
+      for (const r of rows) lines.push([csvField(r[0]), csvField(r[1]), r[2], r[3] != null ? r[3] : ''].join(','));
       return lines.join('\r\n');
     }
 
     // Diacritics-free, punctuation-free matching key.
     function normKey(s) {
-      return String(s).toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
+      return String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
         .replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
     }
 
@@ -456,12 +459,13 @@
     function importRatings(prep, index, text) {
       const rows = parseCSV(text);
       if (!rows.length) return { matched: [], notFound: [], skipped: 0, error: 'File is empty.' };
-      let start = 0, ct = 0, ca = 1, cr = 2;
+      let start = 0, ct = 0, ca = 1, cr = 2, cid = -1;
       const head = rows[0].map(function (h) { return normKey(h); });
       const it = head.findIndex(function (h) { return /^(title|book title|book|name)$/.test(h); });
       const ia = head.findIndex(function (h) { return /author/.test(h); });
       const ir = head.findIndex(function (h) { return /(my )?(rating|stars|score)$/.test(h) && !/average|avg/.test(h); });
-      if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; }
+      const iid = head.findIndex(function (h) { return /^(book id|id)$/.test(h); });
+      if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; cid = iid; }
       else if (rows[0].length < 3) return { matched: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
       const matched = [], notFound = [];
       let skipped = 0;
@@ -472,6 +476,10 @@
         const author = ca >= 0 ? (row[ca] || '').trim() : '';
         const r = parseFloat(String(row[cr] || '').replace(',', '.'));
         if (!(r >= 0.5 && r <= 5)) { skipped++; continue; }
+        if (cid >= 0) {                            // exact re-import from our own export
+          const bid = parseInt(String(row[cid]), 10);
+          if (Number.isInteger(bid) && bid >= 0 && bid < prep.n) { matched.push([bid, clip(r, 1, 5)]); continue; }
+        }
         const kt = normKey(cleanTitle(title)), ka = normKey(cleanAuthor(author));
         let idx = index.byTA.get(kt + '|' + ka);
         if (idx == null && ka) idx = index.byTA.get(kt + '|' + ka.split(' ').pop());
@@ -712,21 +720,28 @@
     /* ── Rate tab ──────────────────────────────────────────────────────── */
     function QuestionCard({ model, comp, idx, nerd, onRate, onUnknown, onSkip }) {
       const b = model.prep.books[idx];
+      // Fixed geometry so cards don't jostle as long/short titles rotate through:
+      // title reserves 2 lines, meta lines are single-line ellipsis, controls pinned bottom.
+      const clamp2 = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+        overflow: 'hidden', minHeight: '2.7em' };
+      const oneLine = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
       return (
-        <div className="rec-card">
-          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35 }}>{M.cleanTitle(b.t)}</div>
-          <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px' }}>
+        <div className="rec-card" style={{ display: 'flex', flexDirection: 'column', minHeight: 178 }}>
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{M.cleanTitle(b.t)}</div>
+          <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px', ...oneLine }}>
             {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}{b.s ? ' · series' : ''}
           </div>
-          <div style={{ marginBottom: 8 }}>
+          <div style={{ marginBottom: 8, ...oneLine }}>
             <TagChips tags={b.g} />
             <span style={{ fontSize: 11.5, color: C.foot }}> · {fmtN(b.n)} raters</span>
-            {nerd && <span style={{ fontSize: 11.5, color: C.foot }}> · P(you know it) {pct(comp.pknow[idx])} · leverage {comp.lev[idx].toFixed(3)}</span>}
+            {nerd && <span style={{ fontSize: 11.5, color: C.foot }}> · P(known) {pct(comp.pknow[idx])} · lev {comp.lev[idx].toFixed(3)}</span>}
           </div>
-          <RateSlider onCommit={v => onRate(idx, v)} />
-          <div style={{ display: 'flex', gap: 14, marginTop: 8 }}>
-            <a href="#" style={{ fontSize: 12.5, color: C.label }} onClick={e => { e.preventDefault(); onUnknown(idx); }}>Don't know it</a>
-            <a href="#" style={{ fontSize: 12.5, color: C.foot }} onClick={e => { e.preventDefault(); onSkip(idx); }}>Skip</a>
+          <div style={{ marginTop: 'auto' }}>
+            <RateSlider onCommit={v => onRate(idx, v)} />
+            <div style={{ display: 'flex', gap: 14, marginTop: 8 }}>
+              <a href="#" style={{ fontSize: 12.5, color: C.label }} onClick={e => { e.preventDefault(); onUnknown(idx); }}>Don't know it</a>
+              <a href="#" style={{ fontSize: 12.5, color: C.foot }} onClick={e => { e.preventDefault(); onSkip(idx); }}>Skip</a>
+            </div>
           </div>
         </div>
       );
@@ -780,7 +795,7 @@
             Questions are chosen to be books you probably know <em>and</em> that tell the model the most
             (expected variance reduction). "Don't know it" also teaches it what to ask next.
           </p>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12, maxWidth: 1040 }}>
             {questions.map(j => (
               <QuestionCard key={j} model={model} comp={comp} idx={j} nerd={nerd}
                 onRate={onRate} onUnknown={onUnknown} onSkip={onSkip} />
@@ -847,16 +862,17 @@
     function FunnelMini({ vols, ret }) {
       const maxN = Math.max(...vols.map(v => v[0]), 1);
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 5, flexWrap: 'wrap' }}>
-          <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, width: 120 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 6, flexWrap: 'wrap' }}>
+          <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, width: 130 }}>
             {vols.slice(0, 8).map((v, i) => (
-              <span key={i} title={`Vol. ${i + 1}: ${fmtN(v[0])} raters, ${v[1].toFixed(2)}★ avg`}
+              <span key={i} title={`Vol. ${i + 1}: ${fmtN(v[0])} people rated it, ${v[1].toFixed(2)}★ average`}
                 style={{ display: 'block', height: 5, width: `${Math.max(3, v[0] / maxN * 100)}%`,
                   background: avgColor(v[1]), borderRadius: 2 }} />
             ))}
           </span>
-          <span style={{ fontSize: 11.5, color: C.foot }}>
-            series · {vols.length} vols{ret != null ? ` · ${Math.round(ret * 100)}% read on past vol. 1` : ''}
+          <span style={{ fontSize: 11.5, color: C.foot, lineHeight: 1.5 }}>
+            Series drop-off — each bar is a volume; length = how many rated it, color = its avg ★.
+            {' '}{vols.length} volumes{ret != null ? `, ${Math.round(ret * 100)}% went on to vol. 2` : ''}.
           </span>
         </div>
       );
@@ -1016,17 +1032,31 @@
       const grid = useMemo(() => {
         if (comp.nRated === 0) return null;
         const cur = M.smoothGrid(model.prep, comp.plike, GW, GH, BW);
-        const cells = [];
+        // Delta of P(like) vs. the cold baseline per cell...
+        const raw = [];
+        let sum = 0;
         for (let r = 0; r < GH; r++) {
           for (let c = 0; c < GW; c++) {
             const i = r * GW + c;
             if (cur.den[i] < 0.15) continue;      // no kernel mass -> stay neutral
             const delta = cur.num[i] / cur.den[i] - model.gridBase.num[i] / model.gridBase.den[i];
-            if (Math.abs(delta) < 0.012) continue;
-            cells.push({ c, r, t: Math.max(-1, Math.min(1, delta / 0.25)) });
+            raw.push({ c, r, delta });
+            sum += delta;
           }
         }
-        return cells;
+        if (!raw.length) return [];
+        // ...centered on the mean lift (a uniform global offset carries no spatial
+        // information — the interesting signal is which regions are hotter/cooler
+        // than your overall taste)...
+        const mean = sum / raw.length;
+        const mags = raw.map(x => Math.abs(x.delta - mean)).sort((a, b) => a - b);
+        // ...and normalized by a robust (90th-pct) scale so the strongest regions
+        // saturate to full color instead of washing out to mid-gray.
+        const scale = Math.max(0.015, mags[Math.floor(mags.length * 0.9)]);
+        return raw.map(x => {
+          const t = Math.max(-1, Math.min(1, (x.delta - mean) / scale));
+          return { c: x.c, r: x.r, t, op: 0.18 + 0.5 * Math.min(1, Math.abs(t)) };
+        }).filter(cell => Math.abs(cell.t) > 0.05);
       }, [comp]);
 
       const sx = mx => P + (mx + 1) / 2 * (W - 2 * P);
@@ -1057,20 +1087,20 @@
               <span style={{ fontSize: 11.5, color: C.foot, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                 <span style={{ width: 70, height: 8, borderRadius: 4, display: 'inline-block',
                   background: `linear-gradient(90deg, ${cmap(-1)}, ${cmap(0)}, ${cmap(1)})` }} />
-                less likely → more likely (vs. your baseline)
+                cooler ← relative to your average → hotter
               </span>
             )}
           </div>
           {comp.nRated === 0 &&
             <p style={{ fontSize: 12.5, color: C.foot, margin: '4px 0 8px' }}>
-              The terrain appears once you've rated a few books — it shows where in taste-space your P(like) rises above the baseline.
+              The terrain appears once you've rated a few books — it shows which regions of taste-space you'd like more (or less) than your overall average.
             </p>}
           <div className="rec-svgwrap">
             <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
               <rect x={0} y={0} width={W} height={H} fill="#0b1220" rx={8} />
               {showTerrain && grid && grid.map((cell, i) => (
                 <rect key={i} x={P + cell.c * cw} y={P + cell.r * ch} width={cw + 0.5} height={ch + 0.5}
-                  fill={cmap(cell.t)} opacity={0.42} shapeRendering="crispEdges" />
+                  fill={cmap(cell.t)} opacity={cell.op} shapeRendering="crispEdges" />
               ))}
               {model.prep.books.map((b, j) => ratings.has(j) ? null : (
                 <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={2}
@@ -1149,14 +1179,20 @@
         return M.clusterRated(model.prep, idxs, maxK).map(members => {
           const counts = {};
           for (const i of members) for (const g of model.prep.books[i].g || []) counts[g] = (counts[g] || 0) + 1;
-          const label = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 2).map(x => x[0]).join(' · ');
+          // Require a tag to appear in ≥2 books of a larger cluster, then rank by
+          // count × inverse tag frequency so distinctive subgenres win the label.
+          const minSup = members.length >= 3 ? 2 : 1;
+          let scored = Object.entries(counts).filter(([, c]) => c >= minSup)
+            .map(([g, c]) => [g, c * (model.tagIdf[g] || 1)]);
+          if (!scored.length) scored = Object.entries(counts).map(([g, c]) => [g, c]);
+          const label = scored.sort((a, b) => b[1] - a[1]).slice(0, 2).map(x => x[0]).join(' · ');
           return { label: label || 'mixed', members: members.slice().sort((a, b) => ratings.get(b) - ratings.get(a)) };
         });
       }, [ratedArr]);
 
       const doExport = () => {
         const rows = ratedArr.map(([j, r]) => [
-          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1)
+          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1), j
         ]);
         const blob = new Blob([M.exportCSV(rows)], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a');
@@ -1337,10 +1373,14 @@
               if (b.y) { yMin = Math.min(yMin, b.y); yMax = Math.max(yMax, b.y); }
             }
             const tagList = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).filter(x => x[1] >= 10);
+            // Inverse tag frequency, so cluster labels prefer distinctive subgenres
+            // (military-sf, space-opera) over blanket tags (fantasy, scifi, ya, childrens).
+            const tagIdf = {};
+            for (const [tag, cnt] of Object.entries(tagCounts)) tagIdf[tag] = Math.log(prep.n / cnt);
             const searchKeys = prep.books.map(b => M.normKey(b.t + ' ' + b.a));
             const gridBase = M.smoothGrid(prep, base.plike, 60, 40, 0.08);
             setModel({
-              prep, base, baseCiMean: ciSum / prep.n, tagList, yMin, yMax,
+              prep, base, baseCiMean: ciSum / prep.n, tagList, tagIdf, yMin, yMax,
               searchKeys, gridBase, matchIndex: M.buildMatchIndex(prep)
             });
             setYearState([yMin, yMax]);
