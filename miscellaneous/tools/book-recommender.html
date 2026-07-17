@@ -321,14 +321,17 @@
       };
     }
 
-    // Nadaraya-Watson smoothed grid over the UMAP square [-1,1]²: divide kernel-weighted
+    // Nadaraya-Watson smoothed grid over the embedding square [-1,1]²: divide kernel-weighted
     // sum by kernel mass (avoids edge artefacts); cells without mass stay neutral.
-    function smoothGrid(prep, w, gw, gh, bw) {
+    // `coords` (optional) is a per-book [x,y] array — the active embedding's positions; when
+    // omitted we fall back to the default map coords (mx/my). The terrain must be recomputed
+    // per embedding because a book's position — and thus which cell its lift lands in — changes.
+    function smoothGrid(prep, w, gw, gh, bw, coords) {
       const { n, books } = prep;
       const num = new Float64Array(gw * gh), den = new Float64Array(gw * gh);
       const inv2h2 = 1 / (2 * bw * bw), rad = 3 * bw;
       for (let i = 0; i < n; i++) {
-        const bx = books[i].mx, by = books[i].my, wi = w[i];
+        const bx = coords ? coords[i][0] : books[i].mx, by = coords ? coords[i][1] : books[i].my, wi = w[i];
         const c0 = Math.max(0, Math.floor((bx - rad + 1) * gw / 2 - 0.5));
         const c1 = Math.min(gw - 1, Math.ceil((bx + rad + 1) * gw / 2 - 0.5));
         const r0 = Math.max(0, Math.floor((by - rad + 1) * gh / 2 - 0.5));
@@ -1529,14 +1532,17 @@
       const svgRef = useRef(null);
       const W = 760, H = 540, P = 10;
       const GW = 60, GH = 40, BW = 0.08;
+      // Which embedding (ss-UMAP / t-SNE / SOM / …) drives point positions and terrain.
+      const [method, setMethod] = useState(model.defaultMethod);
+      const coords = model.emCoords[method] || model.emCoords[model.defaultMethod];
 
       // Terrain as a crisp hexbin (no blur): the same kernel-smoothed Δ P(like)
       // field as before, sampled at pointy-top hex centers by bilinearly
       // interpolating the 60×40 num/den grids.
       const hexes = useMemo(() => {
         if (comp.nRated === 0) return null;
-        const cur = M.smoothGrid(model.prep, comp.plike, GW, GH, BW);
-        const base = model.gridBase;
+        const cur = M.smoothGrid(model.prep, comp.plike, GW, GH, BW, coords);
+        const base = model.gridBaseByMethod[method];
         const samp = (F, gx, gy) => {
           const x = Math.min(Math.max(gx, 0), GW - 1), y = Math.min(Math.max(gy, 0), GH - 1);
           const c0 = Math.floor(x), r0 = Math.floor(y);
@@ -1586,7 +1592,7 @@
           out.push({ d: d + 'Z', t, op: 0.18 + 0.5 * Math.min(1, Math.abs(t)) });
         }
         return out;
-      }, [comp]);
+      }, [comp, method]);
 
       const sx = mx => P + (mx + 1) / 2 * (W - 2 * P);
       const sy = my => P + (my + 1) / 2 * (H - 2 * P);
@@ -1658,16 +1664,28 @@
         let best = null, bd = 324;   // 18px hit radius in screen space
         for (let j = 0; j < model.prep.n; j++) {
           if (!passes[j] && !ratings.has(j)) continue;
-          const dx = (view.z * sx(model.prep.books[j].mx) + view.ox) - fx;
-          const dy = (view.z * sy(model.prep.books[j].my) + view.oy) - fy;
+          const dx = (view.z * sx(coords[j][0]) + view.ox) - fx;
+          const dy = (view.z * sy(coords[j][1]) + view.oy) - fy;
           const d = dx * dx + dy * dy;
           if (d < bd) { bd = d; best = j; }
         }
         setTip(best != null ? { j: best, px: fx / W * 100, py: fy / H * 100 } : null);
       };
 
+      // English labels for the known embedding keys (the JSON `name` fields are German);
+      // fall back to meta.name so any future method still gets a button label.
+      const METHOD_LABELS = { ssumap_macro: 'Taste map', umap: 'UMAP (raw)', tsne: 't-SNE', som: 'SOM', pacmap: 'PaCMAP' };
+      const switchMethod = k => { setMethod(k); setView({ z: 1, ox: 0, oy: 0 }); setTip(null); };
+
       return (
         <div>
+          {model.emMethods.length > 1 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0' }}>
+              <span style={{ color: C.label, fontSize: 13 }}>Projection:</span>
+              <Seg options={model.emMethods.map(m => ({ id: m.key, label: METHOD_LABELS[m.key] || m.name }))}
+                value={method} onChange={switchMethod} />
+            </div>
+          )}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0' }}>
             <span style={{ color: C.label, fontSize: 13 }}>Taste terrain:</span>
             <Seg options={[{ id: 'on', label: 'On' }, { id: 'off', label: 'Off' }]}
@@ -1706,11 +1724,11 @@
                 {/* r and strokeWidth counter the group scale so point sizes stay
                     constant on screen while zooming (only positions spread apart). */}
                 {model.prep.books.map((b, j) => ratings.has(j) ? null : (
-                  <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={(passes[j] ? 2.4 : 2.1) / view.z}
+                  <circle key={j} cx={sx(coords[j][0])} cy={sy(coords[j][1])} r={(passes[j] ? 2.4 : 2.1) / view.z}
                     fill={passes[j] ? '#a9b7ca' : C.foot} opacity={passes[j] ? 0.85 : 0.32} />
                 ))}
                 {[...ratings.entries()].map(([j, r]) => (
-                  <circle key={'r' + j} cx={sx(model.prep.books[j].mx)} cy={sy(model.prep.books[j].my)}
+                  <circle key={'r' + j} cx={sx(coords[j][0])} cy={sy(coords[j][1])}
                     r={5.5 / view.z} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5 / view.z} />
                 ))}
               </g>
@@ -2280,7 +2298,21 @@
             const tagIdf = {};
             for (const [tag, cnt] of Object.entries(tagCounts)) tagIdf[tag] = Math.log(prep.n / cnt);
             const searchIdx = M.buildSearchIndex(prep.books);   // t + a + s + vt titles
-            const gridBase = M.smoothGrid(prep, base.plike, 60, 40, 0.08);
+            // Multi-embedding (v7): the JSON carries several 2D layouts per book under
+            // `em`, listed in meta.em_methods. Extract each method's coord array and its
+            // own cold-baseline terrain grid up front (base.plike is method-independent, so
+            // this is just one smoothGrid per method). mx/my alias the default method, so
+            // pre-v7 data (no em) degrades to a single default map.
+            const emMethods = (prep.meta.em_methods && prep.meta.em_methods.length)
+              ? prep.meta.em_methods
+              : [{ key: 'default', name: 'Taste map', kind: 'discover', default: true }];
+            const defaultMethod = (emMethods.find(m => m.default) || emMethods[0]).key;
+            const emCoords = {}, gridBaseByMethod = {};
+            for (const m of emMethods) {
+              const co = prep.books.map(b => (b.em && b.em[m.key]) ? b.em[m.key] : [b.mx, b.my]);
+              emCoords[m.key] = co;
+              gridBaseByMethod[m.key] = M.smoothGrid(prep, base.plike, 60, 40, 0.08, co);
+            }
             const matchIndex = M.buildMatchIndex(prep);
             // Hydrate persisted state against this catalog (remaps on version mismatch).
             // Batched with setModel, so the persist effect only ever sees hydrated state.
@@ -2290,7 +2322,7 @@
             if (hyd.lost.length) setLost(hyd.lost);
             setModel({
               prep, base, baseCiMean: ciSum / prep.n, tagList, tagIdf, yMin, yMax,
-              searchIdx, gridBase, matchIndex
+              searchIdx, emMethods, defaultMethod, emCoords, gridBaseByMethod, matchIndex
             });
             setYearState([yMin, yMax]);
           })
