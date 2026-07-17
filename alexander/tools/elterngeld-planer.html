@@ -5,7 +5,7 @@
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'de');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Elterngeld-Planer: Alexander Alber</title>
-  <meta name="description" content="Interaktiver Rechner zur Optimierung von Elterngeldstrategien.">
+  <meta name="description" content="Elterngeld, Einkommensteuer (Progressionsvorbehalt) und Timing gemeinsam optimieren – mit Pareto-Front.">
   <link rel="canonical" href="https://alber.me/alexander/tools/elterngeld-planer.html">
   <link rel="alternate" hreflang="de" href="https://alber.me/alexander/tools/elterngeld-planer.html">
   <link rel="alternate" hreflang="en" href="https://alber.me/alexander/tools/elterngeld-planer.html?lang=en">
@@ -22,7 +22,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Elterngeld-Planer",
-    "description": "Interaktiver Rechner zur Optimierung von Elterngeldstrategien.",
+    "description": "Elterngeld, Einkommensteuer und Timing gemeinsam optimieren – mit Pareto-Front.",
     "url": "https://alber.me/alexander/tools/elterngeld-planer.html",
     "applicationCategory": "FinanceApplication",
     "inLanguage": "de",
@@ -76,210 +76,435 @@
   </main>
 
   <script type="text/babel">
-    const { useState, useMemo, useCallback } = React;
+    const { useState, useMemo, useCallback, useEffect, useRef } = React;
 
     const lang = localStorage.getItem('lang') || 'de';
     const STRINGS = {
       de: {
         monthPrefix: 'LM',
         h1: 'Elterngeld-Planer',
-        instructions: 'Klick auf eine Zelle zum Durchschalten:\u00a0— → Basis → Plus → Bonus → —',
-        helpShow: 'Regeln\u00a0& Hilfe',
+        instructions: 'Klick auf eine Zelle zum Durchschalten: — → Basis → Plus → Bonus → Frei → —. LM 1–2 der Mutter sind gesetzlicher Mutterschutz (fix).',
+        helpShow: 'Regeln & Hilfe',
         helpHide: 'Hilfe ausblenden',
         helpContent: [
-          ['Basiselterngeld:', '65\u00a0% vom Netto, max\u00a01.800\u00a0€/Monat. Nur in LM\u00a01–14. Gleichzeitig max\u00a01\u00a0Monat (seit 04/2024).'],
-          ['ElterngeldPlus:', 'Halber Basissatz, max\u00a0900\u00a0€. Auch nach LM\u00a014 möglich. 1\u00a0Basismonat\u00a0=\u00a02\u00a0Plus-Monate im Budget.'],
-          ['Partnerschaftsbonus:', '2–4\u00a0Extramonate Plus je Elternteil bei gleichzeitiger Teilzeit (24–32\u00a0h). Zusätzlich zum Budget.'],
-          ['Budget:', '14\u00a0Basismonate gesamt. Plus-Monate kosten 0,5\u00a0Basismonate. Bonus ist extra.'],
-          ['MuSch:', 'Lebensmonat\u00a01–2 zählen als Mutterschutz (volles Netto, wird auf Elterngeld angerechnet).'],
+          ['Basiselterngeld:', '65 % vom Elterngeld-Netto, max 1.800 €/Monat. Nur in LM 1–14. Beide gleichzeitig: max 1 Monat (seit 04/2024).'],
+          ['ElterngeldPlus:', 'Max. halber Basissatz (900 €). Auch nach LM 14. 1 Basismonat = 2 Plus-Monate im Budget. Teilzeit bis 32 h erlaubt – der Zuverdienst kürzt das Elterngeld (Differenzmethode).'],
+          ['Partnerschaftsbonus:', '2–4 zusätzliche Plus-Monate je Elternteil, wenn beide gleichzeitig 24–32 h (≈ 60–80 %) arbeiten. Monate müssen aufeinanderfolgen. Extra zum Budget.'],
+          ['Frei:', 'Unbezahlte Elternzeit – zu Hause ohne Elterngeld und ohne Gehalt. Anspruch besteht bis zu 36 Monate; hier abgebildet im Fenster LM 1–24.'],
+          ['Budget:', '14 Basismonate gesamt, max 12 pro Elternteil. Mutterschutz zählt als Basis der Mutter. Plus zählt halb, Bonus ist extra.'],
+          ['Nach LM 14:', 'Elterngeld nur, wenn ab LM 15 mindestens ein Elternteil ohne Lücke bezieht (§ 4 BEEG).'],
         ],
-        presets: {
-          klassisch: { name: 'Preset MinMax', desc: 'Mutter 12 Basis, Vater 2 Basis. Einfach, wenig gemeinsame Zeit.' },
-          mix:       { name: 'Preset <3', desc: 'Mutter 5 Basis + 3 Plus + 3 Bonus, Vater 4 Basis + 3 Plus + 3 Bonus. Budget genau ausgeschoepft.' },
-          maximum:   { name: 'Preset Max', desc: '10 Basis + 4 Plus (Mutter), 1 Basis + 2 Plus + 4 Bonus (Vater). Bis 22 Monate.' },
-        },
         mother: 'Mutter', father: 'Vater',
-        egNet: 'Elterngeld-Netto',
         monthHeader: 'Monat',
-        sigmaMonth: '\u03a3/Monat',
-        muschNote: 'MuSch',
+        sigmaMonth: 'Σ/Monat',
         resetBtn: 'Reset',
-        statTotal: 'Gesamtauszahlung',
-        statTotalSub: (m, f) => `Mutter: ${m}\u00a0€\u00a0· Vater: ${f}\u00a0€`,
-        statDuration: 'Bezugsdauer',
-        statDurationVal: n => `${n}\u00a0Monate`,
-        statDurationSub: n => `Letzter aktiver Monat: LM\u00a0${n}`,
-        statShared: 'Gemeinsame Monate',
-        statSharedSub: 'Monate, in denen beide zu Hause sind',
-        statBudget: 'Budget verbraucht',
-        statBudgetSub: n => `${n}\u00a0Basismonate übrig`,
-        chartTitle: 'Monatliche Auszahlung',
+        inc: {
+          gross: 'Brutto/Jahr',
+          cls: 'Steuerklasse',
+          tz: 'Teilzeit in Plus/Bonus',
+          tzSub: '% vom Brutto während Plus-/Bonus-Monaten (max 80 % ≈ 32 h). Der Zuverdienst kürzt das Elterngeld nach der Differenzmethode. In Basis-Monaten wird nicht gearbeitet.',
+          egNetto: (v) => `EG-Netto ≈ ${v} €/Monat`,
+          netLine: (v) => `echtes Netto ≈ ${v} €/Monat`,
+          egLine: (b, p, tz) => tz > 0 ? `→ Basis: ${b} € · Plus bei ${tz} % TZ: ${p} €` : `→ Basis: ${b} € · Plus: ${p} €`,
+          clsHint: 'Steuerklasse wirkt nur auf Elterngeld-Netto und Mutterschaftsgeld – die Jahressteuer wird hier gemeinsam veranlagt (Splitting), dort gleicht sich die Klasse wieder aus. Der klassische Hebel: Wechsel der Mutter zu Klasse III, muss ≥ 7 Monate vor Mutterschutzbeginn gelten.',
+        },
+        birthMonthLabel: 'Geburtsmonat',
+        children: 'Kinder',
+        childrenSub: 'für Freibetrag & Kindergeld',
+        monthNames: ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'],
+        pareto: {
+          title: 'Pareto-Front: Freizeit vs. Kosten',
+          sub: 'Jede Kurve beantwortet: „Was kostet es mindestens, wenn der Vater ≥ X Personenmonate zuhause ist?“ Der vertikale Abstand zwischen den Kurven ist der Preis der Vätermonate. Klick auf einen Punkt lädt den Plan unten ins Raster. Achsen relativ zur Baseline „beide arbeiten voll, nur Pflicht-Mutterschutz“.',
+          xLabel: 'Gewonnene freie Personenmonate',
+          yLabel: 'Kosten (€)',
+          yourPlan: 'Dein Plan',
+          stageLabel: (n) => n === 0 ? 'ohne Bedingung' : `Vater ≥ ${n} Mon. zuhause`,
+          desc: (c) => `Mutter: MuSch + ${c.mB} Basis + ${c.mP} Plus${c.mFrei ? ` + ${c.mFrei} frei` : ''} · Vater: ${c.fB} Basis${c.fPar && c.fB ? ' (1 ab Geburt)' : ''} + ${c.fP} Plus${c.fFrei ? ` + ${c.fFrei} frei` : ''}${c.bonus ? ` · ${c.bonus} Bonus gemeinsam` : ''}`,
+          hover: (free, cost) => `${free} freie Personenmonate kosten mindestens ${cost} € — Klick lädt den Plan`,
+          clickHint: 'Punkt anklicken für Details · Raute = aktueller Plan im Raster',
+        },
+        stats: {
+          cost: 'Kosten vs. Durcharbeiten',
+          costSub: 'Konto-Differenz zur Baseline „beide Vollzeit, nur Pflicht-Mutterschutz“, über alle betroffenen Kalenderjahre',
+          free: 'Gewonnene Freizeit',
+          freeUnit: 'Personenmonate',
+          freeSub: 'Teilzeitmonate zählen anteilig (70 % Arbeit = 0,3 gewonnen). Mutterschutz zählt nicht – der ist eh Pflicht.',
+          eg: 'Elterngeld gesamt',
+          egSub: (m, f) => `Mutter: ${m} € · Vater: ${f} €`,
+          budget: 'Budget verbraucht',
+          budgetSub: n => `${n} Basismonate übrig`,
+        },
+        chartTitle: 'Monatliche Lohnersatz-Auszahlung',
+        legendItems: [['#dc2626','MuSch'],['#2563eb','Basis (M)'],['#93c5fd','Basis (V)'],['#7c3aed','Plus (M)'],['#c4b5fd','Plus (V)'],['#059669','Bonus (M)'],['#6ee7b7','Bonus (V)']],
         budgetTitle: 'Budget-Aufschlüsselung',
         budgetBasisMusch: 'Basis/MuSch:',
         budgetPlus: 'ElterngeldPlus:',
         budgetBonus: 'Partnerschaftsbonus:',
+        budgetFrei: 'Frei (unbezahlt):',
         budgetMonths: 'Monate',
         budgetBm: 'BM',
         budgetExtra: '(extra)',
-        budgetTotal: (used) => `Budget: ${used}\u00a0/ 14\u00a0Basismonate verbraucht`,
-        disclaimer: [
-          'Vereinfachte Berechnung. Keine Gewähr für Richtigkeit. Für verbindliche Auskunft → ZBFS Bayern (0800\u00a06645471).',
-          'Mutterschutzgeld wird hier als volles Netto angezeigt (Krankenkasse\u00a0+ AG-Zuschuss).',
-          'Partnerschaftsbonus-Monate zählen nicht ins 14-Monats-Budget.',
-        ],
-        errBasisAfter14M: (lm) => `Mutter: Basiselterngeld in ${lm} nicht möglich (nur bis LM\u00a014)`,
-        errBasisAfter14F: (lm) => `Vater: Basiselterngeld in ${lm} nicht möglich (nur bis LM\u00a014)`,
-        errBudget: (used) => `Budget überschritten: ${used} von 14\u00a0Basismonaten verbraucht (Plus zählt halb)`,
-        warnMinM: 'Mutter: Mindestens\u00a02\u00a0Monate Bezug erforderlich',
-        warnMinF: 'Vater: Mindestens\u00a02\u00a0Monate Bezug erforderlich',
-        errMaxBasisM: 'Mutter: Max\u00a012\u00a0Basismonate',
-        errMaxBasisF: 'Vater: Max\u00a012\u00a0Basismonate',
-        errSimultaneous: (n) => `Gleichzeitiges Basiselterngeld: ${n}\u00a0Monate (max.\u00a01 erlaubt seit April\u00a02024)`,
-        warnBonusM: (n) => `Mutter: Partnerschaftsbonus muss 2–4\u00a0Monate sein (aktuell: ${n})`,
-        warnBonusF: (n) => `Vater: Partnerschaftsbonus muss 2–4\u00a0Monate sein (aktuell: ${n})`,
+        budgetTotal: (used) => `Budget: ${used} / 14 Basismonate verbraucht`,
+        bmChart: {
+          title: 'Timing: Kosten desselben Plans je Geburtsmonat',
+          sub: 'Identischer Plan, anders auf Kalenderjahre verteilt → anderer Progressionseffekt. Blau = gewählter Monat, grün = günstigster.',
+        },
+        tax: {
+          title: 'Steuer & Progressionsvorbehalt',
+          intro: 'Elterngeld und Mutterschaftsgeld sind steuerfrei, erhöhen aber über den Progressionsvorbehalt den Steuersatz auf das übrige Einkommen. Berechnung pro Kalenderjahr, verheiratet mit Ehegattensplitting (Tarif 2026). Mutterschutz vor der Geburt (6 Wochen) ist anteilig berücksichtigt.',
+          ersatzBrutto: 'Lohnersatz steuerfrei',
+          ersatzBruttoSub: 'Elterngeld + Mutterschaftsgeld',
+          mehrsteuer: 'Progressionssteuer',
+          mehrsteuerSub: 'Mehrsteuer auf übriges Einkommen',
+          ersatzNetto: 'Lohnersatz netto',
+          ersatzNettoSub: 'was davon real übrig bleibt',
+          kindergeld: 'Kindergeld gesamt',
+          kindergeldSub: (m) => `${m} €/Monat/Kind im Zeitraum`,
+          yearTitle: 'Aufschlüsselung pro Kalenderjahr',
+          colYear: 'Jahr', colWork: 'Arbeitslohn', colErsatz: 'Lohnersatz', colZvE: 'zvE',
+          colTax: 'ESt', colMehr: 'dav. Progr.', colKg: 'Kindergeld', colKonto: 'Netto Konto',
+          yearLabel: (n) => n === 0 ? 'Geburtsjahr' : n < 0 ? 'Vorjahr' : `Jahr +${n}`,
+        },
+        statusLabels: { none:'—', basis:'Basis', plus:'Plus', bonus:'Bonus', frei:'Frei', mutterschutz:'MuSch' },
+        errBasisAfter14M: (lm) => `Mutter: Basiselterngeld in ${lm} nicht möglich (nur bis LM 14)`,
+        errBasisAfter14F: (lm) => `Vater: Basiselterngeld in ${lm} nicht möglich (nur bis LM 14)`,
+        errBudget: (used) => `Budget überschritten: ${used} von 14 Basismonaten verbraucht (Plus zählt halb)`,
+        warnMinF: 'Vater: Mindestens 2 Monate Bezug erforderlich',
+        errMaxBasisM: 'Mutter: Max 12 Basismonate',
+        errMaxBasisF: 'Vater: Max 12 Basismonate',
+        errSimultaneous: (n) => `Gleichzeitiges Basiselterngeld: ${n} Monate (max. 1 erlaubt seit April 2024)`,
+        errLueckenlos: (lm) => `${lm}: Nach LM 14 muss Elterngeld ab LM 15 lückenlos von mindestens einem Elternteil bezogen werden`,
+        warnBonusM: (n) => `Mutter: Partnerschaftsbonus muss 2–4 Monate sein (aktuell: ${n})`,
+        warnBonusF: (n) => `Vater: Partnerschaftsbonus muss 2–4 Monate sein (aktuell: ${n})`,
         warnBonusSync: (lm) => `${lm}: Partnerschaftsbonus muss gleichzeitig bezogen werden`,
-        statusLabels: { none:'—', basis:'Basis', plus:'Plus', bonus:'Bonus', mutterschutz:'MuSch' },
-        legendItems: [['#dc2626','MuSch'],['#2563eb','Basis (M)'],['#93c5fd','Basis (V)'],['#7c3aed','Plus (M)'],['#c4b5fd','Plus (V)'],['#059669','Bonus (M)'],['#6ee7b7','Bonus (V)']],
+        warnBonusConsec: 'Partnerschaftsbonus-Monate müssen aufeinanderfolgen',
+        warnBonusTZ: (who, tz) => `${who}: Partnerschaftsbonus erfordert 24–32 h Teilzeit (≈ 60–80 %), eingestellt: ${tz} %`,
+        warn175k: 'Gemeinsames zvE über 175.000 €: Anspruch auf Elterngeld entfällt voraussichtlich komplett (§ 1 Abs. 8 BEEG)',
+        disclaimer: [
+          'Vereinfachte Schätzung: Tarif 2026 für alle Jahre, gesetzlich versichert, Vorsorge über Pauschalen, keine Kirchensteuer. Keine Gewähr – verbindliche Auskunft: Elterngeldstelle (z. B. ZBFS Bayern, 0800 6645471) bzw. Steuerberater.',
+          'Elterngeld-Netto pauschal nach BEEG geschätzt (Steuerklasse, Pauschal-Sozialabgaben). Teilzeit-Zuverdienst kürzt das Elterngeld per Differenzmethode (Vor-Netto-Deckel 2.770 €).',
+          'Mutterschutz: 6 Wochen vor Geburt (anteilig) und LM 1–2 mit vollem Netto angesetzt, progressionswirksam. Geschwisterbonus und Mehrlinge nicht modelliert; Kindergeld älterer Geschwister erst ab Geburt gezählt.',
+          'Der Optimierer prüft kanonische Anordnungen (zusammenhängende Blöcke ab Geburt, Vater anschließend). Exotischere Verteilungen können im Einzelfall minimal besser sein – das Raster erlaubt manuelles Feintuning.',
+        ],
       },
       en: {
         monthPrefix: 'M',
         h1: 'Parental Leave Planner',
-        instructions: 'Click a cell to cycle:\u00a0— → Basis → Plus → Bonus → —',
-        helpShow: 'Rules\u00a0& Help',
+        instructions: 'Click a cell to cycle: — → Basis → Plus → Bonus → Off → —. Months 1–2 for the mother are statutory maternity leave (fixed).',
+        helpShow: 'Rules & Help',
         helpHide: 'Hide help',
         helpContent: [
-          ['Basis Benefit:', '65\u00a0% of net income, max\u00a0€1,800/month. Only in months\u00a01–14. Simultaneous max\u00a01\u00a0month (since 04/2024).'],
-          ['ElterngeldPlus:', 'Half the base rate, max\u00a0€900. Also available after month\u00a014. 1\u00a0base month\u00a0=\u00a02\u00a0Plus months in budget.'],
-          ['Partnership Bonus:', '2–4\u00a0extra Plus months per parent with simultaneous part-time work (24–32\u00a0h). Additional to the budget.'],
-          ['Budget:', '14\u00a0base months total. Plus months cost 0.5\u00a0base months. Bonus is extra.'],
-          ['Mat. Leave:', 'Life months\u00a01–2 count as maternity leave (full net income, offset against benefit).'],
+          ['Basis benefit:', '65 % of the parental-benefit net, max €1,800/month. Only in months 1–14. Both parents simultaneously: max 1 month (since 04/2024).'],
+          ['ElterngeldPlus:', 'At most half the basis rate (€900). Also after month 14. 1 basis month = 2 Plus months in the budget. Part-time work up to 32 h allowed – earnings reduce the benefit (differential method).'],
+          ['Partnership bonus:', '2–4 extra Plus months per parent if both work 24–32 h (≈ 60–80 %) simultaneously. Months must be consecutive. On top of the budget.'],
+          ['Off:', 'Unpaid parental leave – at home without benefit and without salary. Up to 36 months by law; shown here within the 24-month window.'],
+          ['Budget:', '14 basis months total, max 12 per parent. Maternity leave counts as the mother’s basis months. Plus counts half, bonus is extra.'],
+          ['After month 14:', 'Benefit only if at least one parent receives it without any gap from month 15 onward (§ 4 BEEG).'],
         ],
-        presets: {
-          klassisch: { name: 'Preset MinMax', desc: 'Mother 12 Basis, Father 2 Basis. Simple, little shared time.' },
-          mix:       { name: 'Preset <3', desc: 'Mother 5 Basis + 3 Plus + 3 Bonus, Father 4 Basis + 3 Plus + 3 Bonus. Budget fully used.' },
-          maximum:   { name: 'Preset Max', desc: '10 Basis + 4 Plus (Mother), 1 Basis + 2 Plus + 4 Bonus (Father). Up to 22 months.' },
-        },
         mother: 'Mother', father: 'Father',
-        egNet: 'Parental Leave Net',
         monthHeader: 'Month',
-        sigmaMonth: '\u03a3/Month',
-        muschNote: 'MuSch',
+        sigmaMonth: 'Σ/month',
         resetBtn: 'Reset',
-        statTotal: 'Total Payout',
-        statTotalSub: (m, f) => `Mother: ${m}\u00a0€\u00a0· Father: ${f}\u00a0€`,
-        statDuration: 'Benefit Period',
-        statDurationVal: n => `${n}\u00a0months`,
-        statDurationSub: n => `Last active month: M\u00a0${n}`,
-        statShared: 'Shared Months',
-        statSharedSub: 'Months both parents are home',
-        statBudget: 'Budget Used',
-        statBudgetSub: n => `${n}\u00a0base months remaining`,
-        chartTitle: 'Monthly Payout',
-        budgetTitle: 'Budget Breakdown',
-        budgetBasisMusch: 'Basis/Mat.:',
+        inc: {
+          gross: 'Gross salary/year',
+          cls: 'Tax class',
+          tz: 'Part-time in Plus/Bonus',
+          tzSub: '% of gross salary during Plus/bonus months (max 80 % ≈ 32 h). Earnings reduce the benefit via the differential method. No work assumed in basis months.',
+          egNetto: (v) => `benefit net ≈ €${v}/month`,
+          netLine: (v) => `actual net ≈ €${v}/month`,
+          egLine: (b, p, tz) => tz > 0 ? `→ Basis: €${b} · Plus at ${tz} % part-time: €${p}` : `→ Basis: €${b} · Plus: €${p}`,
+          clsHint: 'The tax class only affects the parental-benefit net and maternity pay – annual tax is assessed jointly here (income splitting), where the class washes out. The classic lever: the mother switching to class III, effective ≥ 7 months before maternity leave starts.',
+        },
+        birthMonthLabel: 'Month of birth',
+        children: 'Children',
+        childrenSub: 'for allowance & child benefit',
+        monthNames: ['January','February','March','April','May','June','July','August','September','October','November','December'],
+        pareto: {
+          title: 'Pareto front: free time vs. cost',
+          sub: 'Each curve answers: “what does it cost at least if the father is at home for ≥ X person-months?” The vertical gap between the curves is the price of the father months. Clicking a point loads the plan into the grid below. Axes relative to the baseline “both work full-time, only mandatory maternity leave”.',
+          xLabel: 'Free person-months gained',
+          yLabel: 'Cost (€)',
+          yourPlan: 'Your plan',
+          stageLabel: (n) => n === 0 ? 'unconstrained' : `father ≥ ${n} mo. at home`,
+          desc: (c) => `Mother: mat. leave + ${c.mB} basis + ${c.mP} Plus${c.mFrei ? ` + ${c.mFrei} off` : ''} · Father: ${c.fB} basis${c.fPar && c.fB ? ' (1 at birth)' : ''} + ${c.fP} Plus${c.fFrei ? ` + ${c.fFrei} off` : ''}${c.bonus ? ` · ${c.bonus} bonus together` : ''}`,
+          hover: (free, cost) => `${free} free person-months cost at least €${cost} — click to load the plan`,
+          clickHint: 'Click a point for details · diamond = current plan in the grid',
+        },
+        stats: {
+          cost: 'Cost vs. working through',
+          costSub: 'Account difference to the baseline “both full-time, only mandatory maternity leave”, over all affected calendar years',
+          free: 'Free time gained',
+          freeUnit: 'person-months',
+          freeSub: 'Part-time months count proportionally (70 % work = 0.3 gained). Maternity leave does not count – it is mandatory anyway.',
+          eg: 'Total parental benefit',
+          egSub: (m, f) => `Mother: €${m} · Father: €${f}`,
+          budget: 'Budget used',
+          budgetSub: n => `${n} basis months remaining`,
+        },
+        chartTitle: 'Monthly benefit payout',
+        legendItems: [['#dc2626','Mat. leave'],['#2563eb','Basis (M)'],['#93c5fd','Basis (F)'],['#7c3aed','Plus (M)'],['#c4b5fd','Plus (F)'],['#059669','Bonus (M)'],['#6ee7b7','Bonus (F)']],
+        budgetTitle: 'Budget breakdown',
+        budgetBasisMusch: 'Basis/mat.:',
         budgetPlus: 'ElterngeldPlus:',
-        budgetBonus: 'Partnership Bonus:',
+        budgetBonus: 'Partnership bonus:',
+        budgetFrei: 'Off (unpaid):',
         budgetMonths: 'months',
         budgetBm: 'BM',
         budgetExtra: '(extra)',
-        budgetTotal: (used) => `Budget: ${used}\u00a0/ 14\u00a0base months used`,
+        budgetTotal: (used) => `Budget: ${used} / 14 basis months used`,
+        bmChart: {
+          title: 'Timing: cost of this exact plan by birth month',
+          sub: 'Same plan, distributed differently across calendar years → different progression effect. Blue = selected month, green = cheapest.',
+        },
+        tax: {
+          title: 'Tax & progression clause',
+          intro: 'Parental and maternity benefits are tax-free but raise the tax rate on other income via the progression clause (Progressionsvorbehalt). Calculated per calendar year, married filing jointly (2026 tariff). Pre-birth maternity leave (6 weeks) is included proportionally.',
+          ersatzBrutto: 'Tax-free benefits',
+          ersatzBruttoSub: 'Parental + maternity benefit',
+          mehrsteuer: 'Progression tax',
+          mehrsteuerSub: 'Extra tax on other income',
+          ersatzNetto: 'Benefits net',
+          ersatzNettoSub: 'what actually remains of them',
+          kindergeld: 'Child benefit total',
+          kindergeldSub: (m) => `€${m}/month/child during period`,
+          yearTitle: 'Breakdown per calendar year',
+          colYear: 'Year', colWork: 'Salary', colErsatz: 'Benefits', colZvE: 'Taxable',
+          colTax: 'Income tax', colMehr: 'of which progr.', colKg: 'Child ben.', colKonto: 'Net to acct.',
+          yearLabel: (n) => n === 0 ? 'Birth year' : n < 0 ? 'Prior year' : `Year +${n}`,
+        },
+        statusLabels: { none:'—', basis:'Basis', plus:'Plus', bonus:'Bonus', frei:'Off', mutterschutz:'Mat.' },
+        errBasisAfter14M: (lm) => `Mother: basis benefit in ${lm} not possible (only up to month 14)`,
+        errBasisAfter14F: (lm) => `Father: basis benefit in ${lm} not possible (only up to month 14)`,
+        errBudget: (used) => `Budget exceeded: ${used} of 14 basis months used (Plus counts half)`,
+        warnMinF: 'Father: at least 2 months of benefits required',
+        errMaxBasisM: 'Mother: max 12 basis months',
+        errMaxBasisF: 'Father: max 12 basis months',
+        errSimultaneous: (n) => `Simultaneous basis benefit: ${n} months (max 1 allowed since April 2024)`,
+        errLueckenlos: (lm) => `${lm}: after month 14, the benefit must be drawn without gaps by at least one parent from month 15 onward`,
+        warnBonusM: (n) => `Mother: partnership bonus must be 2–4 months (current: ${n})`,
+        warnBonusF: (n) => `Father: partnership bonus must be 2–4 months (current: ${n})`,
+        warnBonusSync: (lm) => `${lm}: partnership bonus must be drawn simultaneously`,
+        warnBonusConsec: 'Partnership bonus months must be consecutive',
+        warnBonusTZ: (who, tz) => `${who}: partnership bonus requires 24–32 h part-time (≈ 60–80 %), currently set: ${tz} %`,
+        warn175k: 'Joint taxable income above €175,000: the benefit entitlement is likely lost entirely (§ 1 (8) BEEG)',
         disclaimer: [
-          'Simplified calculation. No warranty for accuracy. For binding information → ZBFS Bavaria (0800\u00a06645471).',
-          'Maternity leave pay shown as full net income (health insurance\u00a0+ employer supplement).',
-          'Partnership Bonus months do not count toward the 14-month budget.',
+          'Simplified estimate: 2026 tariff for all years, statutory insurance, deductions via standard allowances, no church tax. No warranty – for binding information contact the benefits office or a tax advisor.',
+          'Parental-benefit net estimated via the BEEG lump-sum method (tax class, flat social contributions). Part-time earnings reduce the benefit via the differential method (pre-birth net capped at €2,770).',
+          'Maternity leave: 6 weeks before birth (proportional) and months 1–2 at full net pay, progression-relevant. Sibling bonus and multiples not modelled; child benefit for older siblings only counted from birth.',
+          'The optimizer checks canonical arrangements (contiguous blocks from birth, father afterwards). More exotic distributions can occasionally be marginally better – the grid allows manual fine-tuning.',
         ],
-        errBasisAfter14M: (lm) => `Mother: Basis benefit in ${lm} not possible (only up to M\u00a014)`,
-        errBasisAfter14F: (lm) => `Father: Basis benefit in ${lm} not possible (only up to M\u00a014)`,
-        errBudget: (used) => `Budget exceeded: ${used} of 14\u00a0base months used (Plus counts half)`,
-        warnMinM: 'Mother: At least\u00a02\u00a0months of benefits required',
-        warnMinF: 'Father: At least\u00a02\u00a0months of benefits required',
-        errMaxBasisM: 'Mother: Max\u00a012\u00a0base months',
-        errMaxBasisF: 'Father: Max\u00a012\u00a0base months',
-        errSimultaneous: (n) => `Simultaneous Basis benefit: ${n}\u00a0months (max.\u00a01 allowed since April\u00a02024)`,
-        warnBonusM: (n) => `Mother: Partnership bonus must be 2–4\u00a0months (current: ${n})`,
-        warnBonusF: (n) => `Father: Partnership bonus must be 2–4\u00a0months (current: ${n})`,
-        warnBonusSync: (lm) => `${lm}: Partnership bonus must be drawn simultaneously`,
-        statusLabels: { none:'—', basis:'Basis', plus:'Plus', bonus:'Bonus', mutterschutz:'MuSch' },
-        legendItems: [['#dc2626','MuSch'],['#2563eb','Basis (M)'],['#93c5fd','Basis (V)'],['#7c3aed','Plus (M)'],['#c4b5fd','Plus (V)'],['#059669','Bonus (M)'],['#6ee7b7','Bonus (V)']],
-      }
+      },
     };
     const t = STRINGS[lang] || STRINGS.de;
 
-    const MONTHS_LABEL = Array.from({length:24}, (_,i) => `${t.monthPrefix}\u00a0${i+1}`);
+    const MONTHS_LABEL = Array.from({length:24}, (_,i) => `${t.monthPrefix} ${i+1}`);
 
-    const STATUS = {
-      NONE: "none", BASIS: "basis", PLUS: "plus", BONUS: "bonus", MUTTERSCHUTZ: "mutterschutz",
-    };
-    const STATUS_LABELS = t.statusLabels;
     const STATUS_COLORS = {
-      [STATUS.NONE]: { bg: "transparent", text: "#888", border: "#ddd" },
-      [STATUS.BASIS]: { bg: "#2563eb", text: "#fff", border: "#1d4ed8" },
-      [STATUS.PLUS]: { bg: "#7c3aed", text: "#fff", border: "#6d28d9" },
-      [STATUS.BONUS]: { bg: "#059669", text: "#fff", border: "#047857" },
-      [STATUS.MUTTERSCHUTZ]: { bg: "#dc2626", text: "#fff", border: "#b91c1c" },
+      none:         { bg: "transparent", text: "#888", border: "#ddd" },
+      basis:        { bg: "#2563eb", text: "#fff", border: "#1d4ed8" },
+      plus:         { bg: "#7c3aed", text: "#fff", border: "#6d28d9" },
+      bonus:        { bg: "#059669", text: "#fff", border: "#047857" },
+      frei:         { bg: "#d97706", text: "#fff", border: "#b45309" },
+      mutterschutz: { bg: "#dc2626", text: "#fff", border: "#b91c1c" },
     };
 
-    const PRESET_LABELS = { klassisch: 'Preset MinMax', mix: 'Preset ❤', maximum: 'Preset Max' };
+    const N = "none", MU = "mutterschutz";
+    const BASELINE_MOTHER = [MU,MU].concat(Array(22).fill(N));
+    const BASELINE_FATHER = Array(24).fill(N);
 
-    const PRESETS = {
-      klassisch: {
-        label: 'Preset MinMax',
-        name: t.presets.klassisch.name,
-        desc: t.presets.klassisch.desc,
-        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","basis","basis","basis","basis","basis","none","none","none","none","none","none","none","none","none","none","none","none"],
-        father: ["basis","none","none","none","none","none","none","none","none","none","none","none","basis","none","none","none","none","none","none","none","none","none","none","none"],
-      },
-      mix: {
-        label: 'Preset <3',
-        name: t.presets.mix.name,
-        desc: t.presets.mix.desc,
-        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","plus","plus","plus","bonus","bonus","bonus","none","none","none","none","none","none","none","none","none","none","none"],
-        father: ["basis","plus","plus","plus","none","none","none","basis","basis","basis","bonus","bonus","bonus","none","none","none","none","none","none","none","none","none","none","none"],
-      },
-      maximum: {
-        label: 'Preset Max',
-        name: t.presets.maximum.name,
-        desc: t.presets.maximum.desc,
-        mother: ["mutterschutz","mutterschutz","basis","basis","basis","basis","basis","basis","basis","basis","plus","plus","plus","plus","none","none","none","none","bonus","bonus","bonus","bonus","none","none"],
-        father: ["basis","plus","plus","none","none","none","none","none","none","none","none","none","none","none","none","none","none","none","bonus","bonus","bonus","bonus","none","none"],
-      },
+    // ===== Steuermodell (Werte 2026) =====
+    const TAX = {
+      kfbPerChild: 9756,        // Kinderfreibetrag + BEA, beide Eltern gesamt
+      kindergeldMonth: 259,
+      werbungskosten: 1230,     // Arbeitnehmer-Pauschbetrag je Person
+      sonderausgabenPausch: 36, // je Person
+      rvRate: 0.093, rvBBG: 101400,   // Rentenvers. AN-Anteil + Beitragsbemessungsgrenze
+      avRate: 0.013,                   // Arbeitslosenvers. AN-Anteil (nicht absetzbar)
+      kvEmpRate: 0.0875,        // KV AN: 7,3 % + halber Ø-Zusatzbeitrag (2,9 %/2)
+      kvDeductRate: 0.0845,     // absetzbar: 7,0 % (ohne Krankengeld) + halber Zusatzbeitrag
+      pvRate: 0.018,            // Pflegevers. AN-Anteil
+      kvBBG: 69750,             // BBG Kranken-/Pflegevers.
+      zvECap: 175000,           // Elterngeld-Einkommensgrenze (Paare, seit 04/2025)
+      egNettoCap: 2770,         // Vor-Geburt-Netto-Deckel bei Teilzeit-Differenzmethode
     };
 
-    function calcElterngeld(monthlyNet) {
-      if (monthlyNet <= 0) return { basis: 300, plus: 150 };
-      const rate = monthlyNet < 1240 ? 0.67 : 0.65;
-      const basis = Math.min(1800, Math.max(300, Math.round(monthlyNet * rate)));
-      const plus = Math.min(900, Math.round(basis / 2));
-      return { basis, plus };
+    // Einkommensteuer-Grundtarif §32a EStG 2026
+    function estTarif(x) {
+      x = Math.floor(x);
+      if (x <= 12348) return 0;
+      if (x <= 17799) { const y = (x - 12348) / 10000; return (914.51 * y + 1400) * y; }
+      if (x <= 69878) { const z = (x - 17799) / 10000; return (173.10 * z + 2397) * z + 1034.87; }
+      if (x <= 277825) return 0.42 * x - 11135.63;
+      return 0.45 * x - 19470.38;
+    }
+    function estSplitting(zvE) { return zvE <= 0 ? 0 : 2 * estTarif(zvE / 2); }
+    // Splittingtarif inkl. Progressionsvorbehalt: Lohnersatz hebt nur den Steuersatz
+    function estWithProgression(zvE, progIncome) {
+      if (zvE <= 0) return 0;
+      if (progIncome <= 0) return Math.round(estSplitting(zvE));
+      const base = zvE + progIncome;
+      const rate = estSplitting(base) / base;
+      return Math.round(rate * zvE);
+    }
+    function deductibleVorsorge(gross) {
+      return TAX.rvRate * Math.min(gross, TAX.rvBBG)
+        + (TAX.kvDeductRate + TAX.pvRate) * Math.min(gross, TAX.kvBBG);
+    }
+    function employeeSV(gross) {
+      return (TAX.rvRate + TAX.avRate) * Math.min(gross, TAX.rvBBG)
+        + (TAX.kvEmpRate + TAX.pvRate) * Math.min(gross, TAX.kvBBG);
+    }
+    // zu versteuerndes Einkommen aus zwei Jahres-Bruttolöhnen (Splitting)
+    function taxableIncome(grossA, grossB) {
+      const wk = g => g > 0 ? Math.min(TAX.werbungskosten, g) : 0;
+      return (grossA + grossB)
+        - wk(grossA) - wk(grossB)
+        - deductibleVorsorge(grossA) - deductibleVorsorge(grossB)
+        - 2 * TAX.sonderausgabenPausch;
+    }
+    // Jahres-Lohnsteuer-Schätzung nach Steuerklasse (für EG-Netto & Monatsnetto)
+    function lstYear(gross, cls) {
+      if (gross <= 0) return 0;
+      const zvE = Math.max(0, gross - TAX.werbungskosten - TAX.sonderausgabenPausch - deductibleVorsorge(gross));
+      if (cls === 'III') return 2 * estTarif(zvE / 2);
+      if (cls === 'V') {
+        const lst = 2 * (estTarif(zvE * 1.25) - estTarif(zvE * 0.75));
+        return Math.min(Math.max(lst, zvE * 0.14), zvE * 0.42);
+      }
+      return estTarif(zvE); // Klasse IV (bzw. I)
+    }
+    // Elterngeld-Netto pro Monat: BEEG-Pauschalabzüge (RV 10 % + AV 2 %, KV/PV 9 %)
+    function egNettoMonthly(gross, cls) {
+      if (gross <= 0) return 0;
+      const sv = 0.12 * Math.min(gross, TAX.rvBBG) + 0.09 * Math.min(gross, TAX.kvBBG);
+      return Math.max(0, (gross - TAX.werbungskosten - lstYear(gross, cls) - sv) / 12);
+    }
+    // echtes Monatsnetto (für Mutterschutzgeld & Anzeige)
+    function netMonthly(gross, cls) {
+      if (gross <= 0) return 0;
+      return Math.max(0, (gross - employeeSV(gross) - lstYear(gross, cls)) / 12);
+    }
+    // Ersatzrate §2 BEEG inkl. Geringverdienerkomponente
+    function egRate(netto) {
+      if (netto < 1000) return Math.min(1, 0.67 + ((1000 - netto) / 2) * 0.001);
+      if (netto <= 1200) return 0.67;
+      return Math.max(0.65, 0.67 - ((netto - 1200) / 2) * 0.001);
+    }
+    // Elterngeld-Beträge inkl. Teilzeit-Kürzung (Differenzmethode)
+    function calcEG(gross, cls, tzPct) {
+      const nettoVor = egNettoMonthly(gross, cls);
+      const rate = egRate(nettoVor);
+      const basisFull = Math.min(1800, Math.max(300, Math.round(rate * nettoVor)));
+      const plusCap = Math.min(900, Math.round(basisFull / 2));
+      const nettoNach = tzPct > 0 ? egNettoMonthly(gross * tzPct / 100, cls) : 0;
+      const diff = Math.max(0, Math.min(nettoVor, TAX.egNettoCap) - nettoNach);
+      const basisTZ = Math.min(1800, Math.max(300, Math.round(rate * diff)));
+      const plusTZ = Math.max(150, Math.min(plusCap, basisTZ));
+      return { nettoVor, rate, basisFull, plusCap, plusTZ };
+    }
+    function parentParams(gross, cls, tz) {
+      return { gross, grossM: gross / 12, tz, eg: calcEG(gross, cls, tz), net: netMonthly(gross, cls) };
+    }
+    function makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren) {
+      return { M: parentParams(mGross, mCls, mTZ), F: parentParams(fGross, fCls, fTZ), bm0: birthMonth - 1, numChildren };
     }
 
-    function validate(mother, father) {
+    // ===== Kern-Engine: bewertet einen Plan über alle Kalenderjahre =====
+    // Rückgabe: Konto (Netto-Zufluss gesamt), Freizeitgewinn in Personenmonaten, Jahreszeilen
+    function evaluate(mother, father, prm) {
+      const bm0 = prm.bm0;
+      const yStart = bm0 <= 1 ? -1 : 0;     // MuSch vor Geburt kann ins Vorjahr fallen
+      const lastYear = Math.floor((bm0 + 23) / 12);
+      const years = [];
+      let freeM = 0, freeF = 0, egM = 0, egF = 0;
+      for (let y = yStart; y <= lastYear; y++) {
+        let workM = 0, workF = 0, egCash = 0, muschCash = 0, prog = 0;
+        for (let m = 0; m < 12; m++) {
+          const lm = y * 12 + m - bm0 + 1;  // Lebensmonat (1-basiert); <1 = vor Geburt
+          // Mutter
+          if (lm >= 1 && lm <= 24) {
+            const s = mother[lm - 1];
+            if (s === MU) { muschCash += prm.M.net; prog += prm.M.net; }
+            else if (s === "basis") { egCash += prm.M.eg.basisFull; prog += prm.M.eg.basisFull; egM += prm.M.eg.basisFull; freeM += 1; }
+            else if (s === "plus" || s === "bonus") {
+              egCash += prm.M.eg.plusTZ; prog += prm.M.eg.plusTZ; egM += prm.M.eg.plusTZ;
+              workM += prm.M.grossM * prm.M.tz / 100; freeM += 1 - prm.M.tz / 100;
+            }
+            else if (s === "frei") { freeM += 1; }
+            else { workM += prm.M.grossM; }
+          } else if (lm === 0 || lm === -1) {
+            const frac = lm === 0 ? 1 : 0.4; // ~6 Wochen Mutterschutz vor Geburt
+            muschCash += prm.M.net * frac; prog += prm.M.net * frac;
+            workM += prm.M.grossM * (1 - frac);
+          } else { workM += prm.M.grossM; }
+          // Vater
+          if (lm >= 1 && lm <= 24) {
+            const s = father[lm - 1];
+            if (s === "basis") { egCash += prm.F.eg.basisFull; prog += prm.F.eg.basisFull; egF += prm.F.eg.basisFull; freeF += 1; }
+            else if (s === "plus" || s === "bonus") {
+              egCash += prm.F.eg.plusTZ; prog += prm.F.eg.plusTZ; egF += prm.F.eg.plusTZ;
+              workF += prm.F.grossM * prm.F.tz / 100; freeF += 1 - prm.F.tz / 100;
+            }
+            else if (s === "frei") { freeF += 1; }
+            else { workF += prm.F.grossM; }
+          } else { workF += prm.F.grossM; }
+        }
+        const childMonths = y < 0 ? 0 : (y === 0 ? 12 - bm0 : 12);
+        const kfbYear = TAX.kfbPerChild * prm.numChildren * childMonths / 12;
+        const kindergeldYear = TAX.kindergeldMonth * prm.numChildren * childMonths;
+        const zvEbase = Math.max(0, taxableIncome(workM, workF));
+        const taxNoKFB = estWithProgression(zvEbase, prog);
+        const zvEkfb = Math.max(0, zvEbase - kfbYear);
+        const taxWithKFB = estWithProgression(zvEkfb, prog);
+        // Günstigerprüfung: Steuerersparnis durch Freibetrag vs. Kindergeld
+        const useKFB = (taxNoKFB - taxWithKFB) > kindergeldYear;
+        const zvEused = useKFB ? zvEkfb : zvEbase;
+        const assessedESt = useKFB ? (taxWithKFB + kindergeldYear) : taxNoKFB;
+        const mehrsteuer = estWithProgression(zvEused, prog) - estWithProgression(zvEused, 0);
+        const sv = employeeSV(workM) + employeeSV(workF);
+        const konto = (workM + workF) - sv - assessedESt + egCash + muschCash + kindergeldYear;
+        years.push({ y, work: workM + workF, ersatz: egCash + muschCash, prog,
+          zvE: zvEused, est: assessedESt, mehrsteuer, kindergeld: kindergeldYear, konto });
+      }
+      const sum = (k) => years.reduce((s, r) => s + r[k], 0);
+      const ersatzBrutto = sum('ersatz'), mehrsteuer = sum('mehrsteuer');
+      return { years, konto: sum('konto'), ersatzBrutto, mehrsteuer, ersatzNetto: ersatzBrutto - mehrsteuer,
+        kindergeld: sum('kindergeld'), freeM, freeF, freeTime: freeM + freeF, egM, egF };
+    }
+
+    // ===== Validierung (manuelles Raster) =====
+    const isEG = s => s === "basis" || s === "plus" || s === "bonus" || s === MU;
+    function validate(mother, father, mTZ, fTZ) {
       const warnings = [], errors = [];
       let motherBasis = 0, motherPlus = 0, fatherBasis = 0, fatherPlus = 0;
-      let motherBonus = 0, fatherBonus = 0, simultaneousBasisMonths = 0;
-
+      let motherBonus = 0, fatherBonus = 0, motherFrei = 0, fatherFrei = 0;
+      let simultaneousBasisMonths = 0, lastEG = 0;
       for (let i = 0; i < 24; i++) {
         const m = mother[i], f = father[i];
-        if (m === STATUS.MUTTERSCHUTZ || m === STATUS.BASIS) motherBasis++;
-        if (m === STATUS.PLUS) motherPlus++;
-        if (m === STATUS.BONUS) motherBonus++;
-        if (f === STATUS.BASIS) fatherBasis++;
-        if (f === STATUS.PLUS) fatherPlus++;
-        if (f === STATUS.BONUS) fatherBonus++;
-        const mIsBasis = m === STATUS.BASIS || m === STATUS.MUTTERSCHUTZ;
-        if (mIsBasis && f === STATUS.BASIS) simultaneousBasisMonths++;
+        if (m === MU || m === "basis") motherBasis++;
+        if (m === "plus") motherPlus++;
+        if (m === "bonus") motherBonus++;
+        if (m === "frei") motherFrei++;
+        if (f === "basis") fatherBasis++;
+        if (f === "plus") fatherPlus++;
+        if (f === "bonus") fatherBonus++;
+        if (f === "frei") fatherFrei++;
+        if ((m === "basis" || m === MU) && f === "basis") simultaneousBasisMonths++;
+        if (isEG(m) || isEG(f)) lastEG = i + 1;
         if (i >= 14) {
-          if (m === STATUS.BASIS || m === STATUS.MUTTERSCHUTZ)
-            errors.push(t.errBasisAfter14M(MONTHS_LABEL[i]));
-          if (f === STATUS.BASIS)
-            errors.push(t.errBasisAfter14F(MONTHS_LABEL[i]));
+          if (m === "basis" || m === MU) errors.push(t.errBasisAfter14M(MONTHS_LABEL[i]));
+          if (f === "basis") errors.push(t.errBasisAfter14F(MONTHS_LABEL[i]));
         }
       }
-
+      if (lastEG > 14) {
+        for (let i = 14; i < lastEG; i++) {
+          if (!isEG(mother[i]) && !isEG(father[i])) { errors.push(t.errLueckenlos(MONTHS_LABEL[i])); break; }
+        }
+      }
       const totalBudget = motherBasis + fatherBasis + (motherPlus + fatherPlus) * 0.5;
       if (totalBudget > 14) errors.push(t.errBudget(totalBudget.toFixed(1)));
-      if (motherBasis + motherPlus > 0 && motherBasis + motherPlus < 2) warnings.push(t.warnMinM);
-      if (fatherBasis + fatherPlus > 0 && fatherBasis + fatherPlus < 2) warnings.push(t.warnMinF);
+      const fatherMonths = fatherBasis + fatherPlus + fatherBonus;
+      if (fatherMonths > 0 && fatherMonths < 2) warnings.push(t.warnMinF);
       if (motherBasis > 12) errors.push(t.errMaxBasisM);
       if (fatherBasis > 12) errors.push(t.errMaxBasisF);
       if (simultaneousBasisMonths > 1) errors.push(t.errSimultaneous(simultaneousBasisMonths));
@@ -287,77 +512,326 @@
         if (motherBonus < 2 || motherBonus > 4) warnings.push(t.warnBonusM(motherBonus));
         if (fatherBonus < 2 || fatherBonus > 4) warnings.push(t.warnBonusF(fatherBonus));
         for (let i = 0; i < 24; i++) {
-          if ((mother[i] === STATUS.BONUS) !== (father[i] === STATUS.BONUS)) {
+          if ((mother[i] === "bonus") !== (father[i] === "bonus")) {
             warnings.push(t.warnBonusSync(MONTHS_LABEL[i]));
             break;
           }
         }
+        const bonusIdx = [];
+        for (let i = 0; i < 24; i++) if (mother[i] === "bonus" || father[i] === "bonus") bonusIdx.push(i);
+        if (bonusIdx.length && bonusIdx[bonusIdx.length - 1] - bonusIdx[0] + 1 !== bonusIdx.length)
+          warnings.push(t.warnBonusConsec);
+        if (motherBonus > 0 && (mTZ < 60 || mTZ > 80)) warnings.push(t.warnBonusTZ(t.mother, mTZ));
+        if (fatherBonus > 0 && (fTZ < 60 || fTZ > 80)) warnings.push(t.warnBonusTZ(t.father, fTZ));
       }
-      return { warnings, errors, totalBudget, motherBasis, fatherBasis, motherPlus, fatherPlus, motherBonus, fatherBonus };
+      return { warnings, errors, totalBudget, motherBasis, fatherBasis, motherPlus, fatherPlus,
+        motherBonus, fatherBonus, motherFrei, fatherFrei };
     }
 
     const cycleStatus = (current, isMother, monthIndex) => {
-      if (isMother && monthIndex < 2) return current === STATUS.MUTTERSCHUTZ ? STATUS.NONE : STATUS.MUTTERSCHUTZ;
-      const order = [STATUS.NONE, STATUS.BASIS, STATUS.PLUS, STATUS.BONUS];
+      if (isMother && monthIndex < 2) return MU; // Mutterschutz ist Pflicht
+      const order = [N, "basis", "plus", "bonus", "frei"];
       return order[(order.indexOf(current) + 1) % order.length];
     };
 
+    // ===== Optimierer: kanonische Pläne aufzählen, Pareto-Front extrahieren =====
+    // Anordnung: Mutter ab Geburt (MuSch, Basis, Plus), Vater optional 1 Basis ab Geburt,
+    // Rest nahtlos nach der Mutter, Bonus gemeinsam am Ende, Frei-Monate angehängt.
+    function buildPlan(mB, mP, fB, fP, bonus, fPar, mFrei, fFrei) {
+      const mother = Array(24).fill(N), father = Array(24).fill(N);
+      mother[0] = mother[1] = MU;
+      let mi = 2;
+      for (let k = 0; k < mB; k++) mother[mi++] = "basis";
+      for (let k = 0; k < mP; k++) { if (mi >= 24) return null; mother[mi++] = "plus"; }
+      let fi = mi, fRem = fB;
+      if (fPar && fB > 0) { father[0] = "basis"; fRem--; }
+      for (let k = 0; k < fRem; k++) { if (fi >= 14) return null; father[fi++] = "basis"; } // Basis nur bis LM 14
+      for (let k = 0; k < fP; k++) { if (fi >= 24) return null; father[fi++] = "plus"; }
+      let bEnd = Math.max(mi, fi);
+      if (bonus > 0) {
+        if (bEnd + bonus > 24) return null;
+        for (let k = 0; k < bonus; k++) { mother[bEnd + k] = "bonus"; father[bEnd + k] = "bonus"; }
+        bEnd += bonus;
+      }
+      let mEnd = bonus > 0 ? bEnd : mi;
+      let fEnd = (fB + fP === 0 && bonus === 0) ? 0 : (bonus > 0 ? bEnd : fi); // inaktiver Vater: frei ab Geburt
+      for (let k = 0; k < mFrei; k++) { if (mEnd >= 24) return null; mother[mEnd++] = "frei"; }
+      for (let k = 0; k < fFrei; k++) { if (fEnd >= 24) return null; father[fEnd++] = "frei"; }
+      return { mother, father };
+    }
+
+    function lastActive(arr) { let l = 0; for (let i = 0; i < 24; i++) if (arr[i] !== N) l = i + 1; return l; }
+
+    function paretoFront(cands) {
+      const sorted = cands.slice().sort((a, b) => b.free - a.free || b.konto - a.konto);
+      const front = [];
+      let best = -Infinity;
+      for (const c of sorted) {
+        if (c.konto > best + 0.5) { front.push(c); best = c.konto; }
+      }
+      return front.reverse(); // aufsteigend nach Freizeit
+    }
+
+    // Frei-Monate an Front-Punkte anhängen, in beiden Reihenfolgen
+    // (Mutter zuerst auffüllen bzw. Vater zuerst); seen dedupliziert über Stufen hinweg
+    function extendFrei(front, prm, seen) {
+      const out = [];
+      for (const p of front) {
+        const mCap = 24 - lastActive(p.plan.mother), fCap = 24 - lastActive(p.plan.father);
+        for (const motherFirst of [true, false]) {
+          for (let n = 1; n <= mCap + fCap; n++) {
+            let mF, fF;
+            if (motherFirst) { mF = Math.min(n, mCap); fF = n - mF; }
+            else { fF = Math.min(n, fCap); mF = n - fF; }
+            const key = `${p.cfg.mB},${p.cfg.mP},${p.cfg.fB},${p.cfg.fP},${p.cfg.bonus},${p.cfg.fPar},${mF},${fF}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const plan = buildPlan(p.cfg.mB, p.cfg.mP, p.cfg.fB, p.cfg.fP, p.cfg.bonus, p.cfg.fPar, mF, fF);
+            if (!plan) continue;
+            const r = evaluate(plan.mother, plan.father, prm);
+            out.push({ free: r.freeTime, freeF: r.freeF, konto: r.konto, plan, cfg: { ...p.cfg, mFrei: mF, fFrei: fF } });
+          }
+        }
+      }
+      return out;
+    }
+
+    function computePareto(prm) {
+      const baseKonto = evaluate(BASELINE_MOTHER, BASELINE_FATHER, prm).konto;
+      const tzOkBonus = prm.M.tz >= 60 && prm.M.tz <= 80 && prm.F.tz >= 60 && prm.F.tz <= 80;
+      const bonusOpts = tzOkBonus ? [0, 2, 3, 4] : [0];
+      const cands = [];
+      for (let mB = 0; mB <= 10; mB++) {
+        for (let fB = 0; fB <= 12 - mB; fB++) {        // Budget: (2+mB)+fB ≤ 14
+          const maxPlus = (12 - mB - fB) * 2;          // Restbudget in Plus-Monaten
+          for (let mP = 0; mP <= Math.min(maxPlus, 22 - mB); mP++) {
+            for (let fP = 0; fP <= maxPlus - mP; fP++) {
+              for (const bonus of bonusOpts) {
+                const parOpts = fB > 0 ? [true, false] : [false];
+                for (const fPar of parOpts) {
+                  if (fB + fP + bonus === 1) continue; // Mindestbezugszeit Vater: 2 Monate
+                  const plan = buildPlan(mB, mP, fB, fP, bonus, fPar, 0, 0);
+                  if (!plan) continue;
+                  const r = evaluate(plan.mother, plan.father, prm);
+                  cands.push({ free: r.freeTime, freeF: r.freeF, konto: r.konto,
+                    cfg: { mB, mP, fB, fP, bonus, fPar, mFrei: 0, fFrei: 0 } });
+                }
+              }
+            }
+          }
+        }
+      }
+      // Gestaffelte Fronten: je Mindestanzahl Vater-Personenmonate zuhause.
+      // Die Frei-Erweiterungen ALLER Stufen landen in einem gemeinsamen Topf, aus dem
+      // jede Stufe ihre Front zieht – sonst kann eine bedingte Kurve unter der
+      // unbedingten liegen (Pools sind geschachtelt, also müssen es die Fronten auch sein).
+      const stages = [0, 2, 4, 6, 12];
+      const matPlan = p => { if (!p.plan) p.plan = buildPlan(p.cfg.mB, p.cfg.mP, p.cfg.fB, p.cfg.fP, p.cfg.bonus, p.cfg.fPar, p.cfg.mFrei, p.cfg.fFrei); return p; };
+      const seen = new Set();
+      let extensions = [];
+      for (const minF of stages) {
+        const pool = minF === 0 ? cands : cands.filter(c => c.freeF >= minF - 1e-9);
+        const base = paretoFront(pool);
+        base.forEach(matPlan);
+        extensions = extensions.concat(extendFrei(base, prm, seen));
+      }
+      const all = cands.concat(extensions);
+      const fronts = stages.map(minF => {
+        const pool = minF === 0 ? all : all.filter(c => c.freeF >= minF - 1e-9);
+        const f = paretoFront(pool);
+        f.forEach(matPlan);
+        return { minF, points: f };
+      });
+      return { fronts, baseKonto };
+    }
+
+    function niceTicks(max, n) {
+      const raw = max / Math.max(1, n);
+      const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+      const step = ([1, 2, 2.5, 5, 10].find(s => s * pow >= raw) || 10) * pow;
+      const out = [];
+      for (let v = 0; v <= max + 1e-9; v += step) out.push(v);
+      return out;
+    }
+    const fmt = (n) => Math.round(n).toLocaleString("de-DE");
+
+    function useDebounced(value, ms) {
+      const [v, setV] = useState(value);
+      useEffect(() => { const id = setTimeout(() => setV(value), ms); return () => clearTimeout(id); }, [value, ms]);
+      return v;
+    }
+
+    // ===== Pareto-Chart (SVG) =====
+    const STAGE_COLORS = ['#9ca3af', '#2563eb', '#7c3aed', '#db2777', '#ea580c'];
+    function ParetoChart({ fronts, baseKonto, current, onPick, stale }) {
+      const [hover, setHover] = useState(null); // { f: Kurvenindex, i: Punktindex }
+      const W = 720, H = 360, L = 64, R = 16, T = 16, B = 46;
+      // Anzeige auf ~0,5-Monats-Raster ausdünnen (Rechnung bleibt exakt), sonst kleben die Punkte aufeinander
+      const thin = (pts) => {
+        const out = [];
+        let lastX = -Infinity;
+        pts.forEach((p, i) => {
+          if (p.x - lastX >= 0.45 || i === pts.length - 1) { out.push(p); lastX = p.x; }
+        });
+        return out;
+      };
+      const X_MAX = 32; // Achsendeckel: der teure Schwanz rechts macht sonst die y-Achse unlesbar
+      const layers = fronts.map((fr, fi) => ({
+        minF: fr.minF, color: STAGE_COLORS[fi % STAGE_COLORS.length],
+        pts: thin(fr.points.filter(c => c.free <= X_MAX).map(c => ({ x: c.free, y: Math.max(0, baseKonto - c.konto), c }))),
+      }));
+      const allPts = layers.flatMap(l => l.pts);
+      const clipped = current.freeTime > X_MAX;
+      const cur = { x: Math.min(current.freeTime, X_MAX), y: baseKonto - current.konto };
+      const maxX = X_MAX * 1.04;
+      const maxY = Math.max(2000, ...allPts.map(p => p.y), clipped ? 0 : cur.y) * 1.08;
+      const sx = x => L + x / maxX * (W - L - R);
+      const sy = y => H - B - y / maxY * (H - T - B);
+      const xt = niceTicks(maxX, 8), yt = niceTicks(maxY, 6);
+      const fmtY = v => v >= 1000 ? `${Math.round(v / 1000)}k` : `${Math.round(v)}`;
+      const hovered = hover ? layers[hover.f].pts[hover.i] : null;
+      return (
+        <div>
+          <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block", opacity: stale ? 0.45 : 1, transition: "opacity 0.2s" }}>
+            {yt.map((v, i) => (
+              <g key={`y${i}`}>
+                <line x1={L} x2={W - R} y1={sy(v)} y2={sy(v)} stroke="#eceae3" strokeWidth="1"/>
+                <text x={L - 8} y={sy(v) + 4} textAnchor="end" fontSize="11" fill="#999">{fmtY(v)}</text>
+              </g>
+            ))}
+            {xt.map((v, i) => (
+              <g key={`x${i}`}>
+                <line x1={sx(v)} x2={sx(v)} y1={T} y2={H - B} stroke="#f3f2ec" strokeWidth="1"/>
+                <text x={sx(v)} y={H - B + 16} textAnchor="middle" fontSize="11" fill="#999">{Math.round(v)}</text>
+              </g>
+            ))}
+            <line x1={L} x2={W - R} y1={H - B} y2={H - B} stroke="#ccc" strokeWidth="1.5"/>
+            <line x1={L} x2={L} y1={T} y2={H - B} stroke="#ccc" strokeWidth="1.5"/>
+            <text x={(L + W - R) / 2} y={H - 8} textAnchor="middle" fontSize="12" fill="#666">{t.pareto.xLabel}</text>
+            <text x={14} y={(T + H - B) / 2} textAnchor="middle" fontSize="12" fill="#666" transform={`rotate(-90 14 ${(T + H - B) / 2})`}>{t.pareto.yLabel}</text>
+            {layers.map((l, fi) => (
+              <g key={fi}>
+                <polyline points={l.pts.map(p => `${sx(p.x)},${sy(p.y)}`).join(" ")} fill="none" stroke={l.color} strokeWidth="2" opacity="0.5"/>
+                {l.pts.map((p, i) => (
+                  <g key={i} style={{ cursor: "pointer" }}
+                    onClick={() => onPick(p.c)} onMouseEnter={() => setHover({ f: fi, i })} onMouseLeave={() => setHover(null)}>
+                    <title>{`${t.pareto.stageLabel(l.minF)} · ${p.x.toFixed(1)} ∕ ${fmt(p.y)} € — ${t.pareto.desc(p.c.cfg)}`}</title>
+                    <circle cx={sx(p.x)} cy={sy(p.y)} r="9" fill="transparent"/>
+                    <circle cx={sx(p.x)} cy={sy(p.y)} r={hover && hover.f === fi && hover.i === i ? 6.5 : 3.5} fill={l.color}
+                      stroke="#fff" strokeWidth="1" style={{ pointerEvents: "none" }}/>
+                  </g>
+                ))}
+              </g>
+            ))}
+            {(() => {
+              const cx = sx(cur.x), cy = sy(Math.min(cur.y, maxY));
+              const left = cur.x > X_MAX * 0.8;
+              return (
+                <g>
+                  <path d={`M ${cx} ${cy - 8} L ${cx + 8} ${cy} L ${cx} ${cy + 8} L ${cx - 8} ${cy} Z`}
+                    fill="#dc2626" stroke="#fff" strokeWidth="1.5"/>
+                  <text x={left ? cx - 12 : cx + 12} y={cy - 8} textAnchor={left ? "end" : "start"}
+                    fontSize="11" fontWeight="600" fill="#dc2626">{t.pareto.yourPlan}{clipped ? " ↗" : ""}</text>
+                </g>
+              );
+            })()}
+          </svg>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 10, fontSize: 11, color: "#666" }}>
+            {layers.map((l, i) => (
+              <span key={i}><span style={{ display: "inline-block", width: 10, height: 10, background: l.color, borderRadius: 5, marginRight: 4, verticalAlign: "middle" }}/>{t.pareto.stageLabel(l.minF)}</span>
+            ))}
+          </div>
+          <div style={{ fontSize: 12, color: "#555", marginTop: 8, minHeight: 34, lineHeight: 1.5 }}>
+            {hovered
+              ? <span><strong>{t.pareto.hover(hovered.x.toFixed(1), fmt(hovered.y))}</strong><br/>{t.pareto.desc(hovered.c.cfg)}</span>
+              : <span style={{ color: "#999" }}>{t.pareto.clickHint}</span>}
+          </div>
+        </div>
+      );
+    }
+
     function ElterngeldPlaner() {
-      const [motherNet, setMotherNet] = useState(2500);
-      const [fatherNet, setFatherNet] = useState(2500);
-      const [mother, setMother] = useState(() => PRESETS.maximum.mother.slice());
-      const [father, setFather] = useState(() => PRESETS.maximum.father.slice());
+      const [mGross, setMGross] = useState(45000);
+      const [fGross, setFGross] = useState(55000);
+      const [mCls, setMCls] = useState('IV');
+      const [fCls, setFCls] = useState('IV');
+      const [mTZ, setMTZ] = useState(50);
+      const [fTZ, setFTZ] = useState(50);
+      const [birthMonth, setBirthMonth] = useState(4);
+      const [numChildren, setNumChildren] = useState(1);
+      const [mother, setMother] = useState(() => BASELINE_MOTHER.slice());
+      const [father, setFather] = useState(() => BASELINE_FATHER.slice());
       const [showHelp, setShowHelp] = useState(false);
 
-      const motherEG = useMemo(() => calcElterngeld(motherNet), [motherNet]);
-      const fatherEG = useMemo(() => calcElterngeld(fatherNet), [fatherNet]);
+      const prm = useMemo(() => makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren),
+        [mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren]);
+
+      const result = useMemo(() => evaluate(mother, father, prm), [mother, father, prm]);
+      const baseline = useMemo(() => evaluate(BASELINE_MOTHER, BASELINE_FATHER, prm), [prm]);
+      const cost = baseline.konto - result.konto;
+
+      // Optimierer entkoppelt von den Slidern (debounced), sonst ruckelt es
+      const debPrm = useDebounced(prm, 350);
+      const pareto = useMemo(() => computePareto(debPrm), [debPrm]);
+      const currentOnChart = useMemo(() => evaluate(mother, father, debPrm), [mother, father, debPrm]);
+
+      // Startplan: günstigster Plan mit ≥ 12 gewonnenen Monaten auf der „Vater ≥ 6“-Kurve
+      const didInit = useRef(false);
+      useEffect(() => {
+        if (didInit.current || !pareto.fronts.length) return;
+        didInit.current = true;
+        const f6 = pareto.fronts.find(f => f.minF === 6) || pareto.fronts[0];
+        const p = f6.points.find(c => c.free >= 12 - 1e-9) || f6.points[f6.points.length - 1];
+        if (p) { setMother(p.plan.mother.slice()); setFather(p.plan.father.slice()); }
+      }, [pareto]);
+
+      const validation = useMemo(() => {
+        const v = validate(mother, father, mTZ, fTZ);
+        if (taxableIncome(mGross, fGross) > TAX.zvECap) v.warnings.unshift(t.warn175k);
+        return v;
+      }, [mother, father, mTZ, fTZ, mGross, fGross]);
+
+      const financials = useMemo(() => {
+        const amt = (s, P) => s === MU ? P.net : s === "basis" ? P.eg.basisFull
+          : (s === "plus" || s === "bonus") ? P.eg.plusTZ : 0;
+        const monthlyDetail = [];
+        for (let i = 0; i < 24; i++) {
+          const mAmount = amt(mother[i], prm.M), fAmount = amt(father[i], prm.F);
+          monthlyDetail.push({ mAmount, fAmount, total: mAmount + fAmount });
+        }
+        return { monthlyDetail };
+      }, [mother, father, prm]);
+
+      // Timing: gleicher Plan, alle 12 Geburtsmonate
+      const birthMonthCosts = useMemo(() => {
+        return Array.from({ length: 12 }, (_, bm0) => {
+          const p = { ...prm, bm0 };
+          return evaluate(BASELINE_MOTHER, BASELINE_FATHER, p).konto - evaluate(mother, father, p).konto;
+        });
+      }, [mother, father, prm]);
 
       const handleCellClick = useCallback((who, index) => {
-        if (who === "mother") {
-          setMother(prev => { const next = [...prev]; next[index] = cycleStatus(prev[index], true, index); return next; });
-        } else {
-          setFather(prev => { const next = [...prev]; next[index] = cycleStatus(prev[index], false, index); return next; });
-        }
+        if (who === "mother" && index < 2) return; // Mutterschutz ist fix
+        const set = who === "mother" ? setMother : setFather;
+        set(prev => { const next = [...prev]; next[index] = cycleStatus(prev[index], who === "mother", index); return next; });
       }, []);
 
-      const loadPreset = useCallback((key) => {
-        setMother(PRESETS[key].mother.slice());
-        setFather(PRESETS[key].father.slice());
+      const loadParetoPoint = useCallback((c) => {
+        setMother(c.plan.mother.slice());
+        setFather(c.plan.father.slice());
       }, []);
 
       const resetAll = useCallback(() => {
-        setMother(Array(24).fill(STATUS.NONE));
-        setFather(Array(24).fill(STATUS.NONE));
+        setMother(BASELINE_MOTHER.slice());
+        setFather(BASELINE_FATHER.slice());
       }, []);
-
-      const validation = useMemo(() => validate(mother, father), [mother, father]);
-
-      const financials = useMemo(() => {
-        let motherTotal = 0, fatherTotal = 0, simultaneousMonths = 0, lastActiveMonth = 0;
-        const monthlyDetail = [];
-        for (let i = 0; i < 24; i++) {
-          let mAmount = 0, fAmount = 0;
-          const m = mother[i], f = father[i];
-          if (m === STATUS.MUTTERSCHUTZ) mAmount = motherNet;
-          else if (m === STATUS.BASIS) mAmount = motherEG.basis;
-          else if (m === STATUS.PLUS || m === STATUS.BONUS) mAmount = motherEG.plus;
-          if (f === STATUS.BASIS) fAmount = fatherEG.basis;
-          else if (f === STATUS.PLUS || f === STATUS.BONUS) fAmount = fatherEG.plus;
-          motherTotal += mAmount; fatherTotal += fAmount;
-          if (m !== STATUS.NONE && f !== STATUS.NONE) simultaneousMonths++;
-          if (m !== STATUS.NONE || f !== STATUS.NONE) lastActiveMonth = i + 1;
-          monthlyDetail.push({ month: i + 1, mAmount, fAmount, total: mAmount + fAmount });
-        }
-        return { motherTotal, fatherTotal, total: motherTotal + fatherTotal, simultaneousMonths, lastActiveMonth, monthlyDetail };
-      }, [mother, father, motherNet, fatherNet, motherEG, fatherEG]);
-
       return (
         <div style={{
           fontFamily: "'IBM Plex Sans', 'SF Pro Display', -apple-system, sans-serif",
           maxWidth: 1152, margin: "0 auto", padding: "24px 16px",
           color: "#1a1a2e",
         }}>
-          <div style={{ marginBottom: 32 }}>
+          <div style={{ marginBottom: 28 }}>
             <h1 style={{ fontSize: 28, fontWeight: 700, margin: 0, letterSpacing: "-0.5px", color: "#1a1a2e" }}>
               {t.h1}
             </h1>
@@ -382,37 +856,77 @@
             )}
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
-            {[[t.mother, motherNet, setMotherNet, motherEG], [t.father, fatherNet, setFatherNet, fatherEG]].map(([label, net, setNet, eg]) => (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 10 }}>
+            {[[t.mother, mGross, setMGross, mCls, setMCls, mTZ, setMTZ, prm.M],
+              [t.father, fGross, setFGross, fCls, setFCls, fTZ, setFTZ, prm.F]].map(([label, gross, setGross, cls, setCls, tz, setTz, P]) => (
               <div key={label} style={{ background: "#fff", borderRadius: 10, padding: 16, border: "1px solid #e0dfd8" }}>
                 <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>
-                  {label} – {t.egNet}
+                  {label} – {t.inc.gross}
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <input type="range" min={1000} max={5000} step={50} value={net}
-                    onChange={e => setNet(Number(e.target.value))} style={{ flex: 1 }}/>
-                  <span style={{ fontSize: 18, fontWeight: 600, fontVariantNumeric: "tabular-nums", minWidth: 70, textAlign: "right" }}>
-                    {net.toLocaleString("de-DE")} €
+                  <input type="range" min={0} max={120000} step={1000} value={gross}
+                    onChange={e => setGross(Number(e.target.value))} style={{ flex: 1 }}/>
+                  <span style={{ fontSize: 17, fontWeight: 600, fontVariantNumeric: "tabular-nums", minWidth: 86, textAlign: "right" }}>
+                    {gross.toLocaleString("de-DE")} €
                   </span>
                 </div>
-                <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
-                  → Basis: {eg.basis.toLocaleString("de-DE")} € · Plus: {eg.plus.toLocaleString("de-DE")} €
-                  {eg.basis === 1800 && <span style={{ color: "#059669", fontWeight: 600 }}> (Cap)</span>}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
+                  <span style={{ fontSize: 11, color: "#888" }}>{t.inc.cls}:</span>
+                  {['III', 'IV', 'V'].map(c => (
+                    <button key={c} onClick={() => setCls(c)} style={{
+                      minWidth: 36, padding: "4px 8px", borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600,
+                      border: `1.5px solid ${cls === c ? "#2563eb" : "#d0cfc8"}`,
+                      background: cls === c ? "#2563eb" : "#fff", color: cls === c ? "#fff" : "#1a1a2e",
+                    }}>{c}</button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: "#888", marginTop: 10, marginBottom: 4 }}>{t.inc.tz}: <strong>{tz} %</strong></div>
+                <input type="range" min={0} max={80} step={5} value={tz}
+                  onChange={e => setTz(Number(e.target.value))} style={{ width: "100%" }}/>
+                <div style={{ fontSize: 12, color: "#888", marginTop: 8, lineHeight: 1.6 }}>
+                  {t.inc.egNetto(fmt(P.eg.nettoVor))} · {t.inc.netLine(fmt(P.net))}<br/>
+                  {t.inc.egLine(fmt(P.eg.basisFull), fmt(P.eg.plusTZ), tz)}
+                  {P.eg.basisFull === 1800 && <span style={{ color: "#059669", fontWeight: 600 }}> (Cap)</span>}
                 </div>
               </div>
             ))}
           </div>
+          <div style={{ fontSize: 11, color: "#999", marginBottom: 16, lineHeight: 1.5 }}>{t.inc.tzSub} {t.inc.clsHint}</div>
 
-          <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
-            {Object.entries(PRESETS).map(([key, p]) => (
-              <button key={key} onClick={() => loadPreset(key)} style={{
-                background: "#fff", border: "1px solid #d0cfc8", borderRadius: 8,
-                padding: "8px 14px", fontSize: 12, cursor: "pointer", textAlign: "left",
-                lineHeight: 1.4, flex: "1 1 180px", color: "#1a1a2e",
-              }}>
-                <div style={{ fontWeight: 700 }}>{p.name}</div>
-              </button>
-            ))}
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 24, alignItems: "flex-end" }}>
+            <div>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>{t.birthMonthLabel}</div>
+              <select value={birthMonth} onChange={e => setBirthMonth(Number(e.target.value))}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #d0cfc8", fontSize: 13, background: "#fff", color: "#1a1a2e" }}>
+                {t.monthNames.map((nm, i) => <option key={i} value={i + 1}>{nm}</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>
+                {t.children} <span style={{ textTransform: "none", letterSpacing: 0, color: "#aaa" }}>· {t.childrenSub}</span>
+              </div>
+              <div style={{ display: "flex", gap: 4 }}>
+                {[1,2,3,4].map(n => (
+                  <button key={n} onClick={() => setNumChildren(n)} style={{
+                    width: 38, height: 38, borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600,
+                    border: `1.5px solid ${numChildren === n ? "#2563eb" : "#d0cfc8"}`,
+                    background: numChildren === n ? "#2563eb" : "#fff", color: numChildren === n ? "#fff" : "#1a1a2e",
+                  }}>{n}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20, marginBottom: 24 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>
+              {t.pareto.title}
+            </div>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: "#666", lineHeight: 1.6 }}>{t.pareto.sub}</p>
+            <ParetoChart fronts={pareto.fronts} baseKonto={pareto.baseKonto} current={currentOnChart}
+              onPick={loadParetoPoint} stale={prm !== debPrm}/>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
             <button onClick={resetAll} style={{
               background: "#fff", border: "1px solid #d0cfc8", borderRadius: 8,
               padding: "8px 14px", fontSize: 12, cursor: "pointer", minWidth: 80, color: "#1a1a2e",
@@ -436,13 +950,13 @@
                         background: "#fafaf7", minWidth: 38, borderLeft: i === 14 ? "2px dashed #ccc" : "none",
                       }}>
                         {label}
-                        {i < 2 && <div style={{ fontSize: 8, color: "#dc2626", fontWeight: 400 }}>MuSch</div>}
+                        {i < 2 && <div style={{ fontSize: 8, color: "#dc2626", fontWeight: 400 }}>{t.statusLabels.mutterschutz}</div>}
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {[["mother", mother, motherEG, motherNet], ["father", father, fatherEG, null]].map(([who, plan, eg, net]) => (
+                  {[["mother", mother, prm.M], ["father", father, prm.F]].map(([who, plan, P]) => (
                     <tr key={who}>
                       <td style={{
                         padding: "6px 12px", fontSize: 12, fontWeight: 600,
@@ -450,23 +964,25 @@
                       }}>{who === "mother" ? t.mother : t.father}</td>
                       {plan.map((status, i) => {
                         const colors = STATUS_COLORS[status];
+                        const fixed = who === "mother" && i < 2;
+                        const amount = status === MU ? P.net
+                          : status === "basis" ? P.eg.basisFull
+                          : (status === "plus" || status === "bonus") ? P.eg.plusTZ : null;
                         return (
                           <td key={i} onClick={() => handleCellClick(who, i)} style={{
-                            padding: 2, textAlign: "center", cursor: "pointer",
+                            padding: 2, textAlign: "center", cursor: fixed ? "default" : "pointer",
                             borderLeft: i === 14 ? "2px dashed #ccc" : "none", borderBottom: "1px solid #eee",
                           }}>
                             <div style={{
                               background: colors.bg, color: colors.text,
-                              border: `1.5px solid ${status === STATUS.NONE ? "#ddd" : colors.border}`,
+                              border: `1.5px solid ${status === N ? "#ddd" : colors.border}`,
                               borderRadius: 5, padding: "6px 2px", fontSize: 10, fontWeight: 600,
                               userSelect: "none", lineHeight: 1.2,
                             }}>
-                              {STATUS_LABELS[status]}
-                              {status !== STATUS.NONE && (
+                              {t.statusLabels[status]}
+                              {amount != null && (
                                 <div style={{ fontSize: 9, fontWeight: 400, opacity: 0.85, marginTop: 1 }}>
-                                  {status === STATUS.MUTTERSCHUTZ ? `${net.toLocaleString("de-DE")}€`
-                                    : status === STATUS.BASIS ? `${eg.basis.toLocaleString("de-DE")}€`
-                                    : `${eg.plus.toLocaleString("de-DE")}€`}
+                                  {fmt(amount)}€
                                 </div>
                               )}
                             </div>
@@ -494,7 +1010,6 @@
               </table>
             </div>
           </div>
-
           {(validation.errors.length > 0 || validation.warnings.length > 0) && (
             <div style={{ marginBottom: 24 }}>
               {validation.errors.map((e, i) => (
@@ -514,19 +1029,19 @@
             </div>
           )}
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginBottom: 24 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 24 }}>
             {[
-              { label: t.statTotal, value: `${financials.total.toLocaleString("de-DE")} €`, sub: t.statTotalSub(financials.motherTotal.toLocaleString("de-DE"), financials.fatherTotal.toLocaleString("de-DE")), accent: "#1a1a2e" },
-              { label: t.statDuration, value: t.statDurationVal(financials.lastActiveMonth), sub: t.statDurationSub(financials.lastActiveMonth), accent: "#2563eb" },
-              { label: t.statShared, value: `${financials.simultaneousMonths}`, sub: t.statSharedSub, accent: "#059669" },
-              { label: t.statBudget, value: `${validation.totalBudget.toFixed(1)} / 14`, sub: t.statBudgetSub((14 - validation.totalBudget).toFixed(1)), accent: validation.totalBudget > 14 ? "#dc2626" : "#7c3aed" },
+              { label: t.stats.cost, value: `${fmt(cost)} €`, sub: t.stats.costSub, accent: "#dc2626" },
+              { label: t.stats.free, value: `${result.freeTime.toFixed(1)} ${t.stats.freeUnit}`, sub: `${t.mother}: ${result.freeM.toFixed(1)} · ${t.father}: ${result.freeF.toFixed(1)}. ${t.stats.freeSub}`, accent: "#059669" },
+              { label: t.stats.eg, value: `${fmt(result.egM + result.egF)} €`, sub: t.stats.egSub(fmt(result.egM), fmt(result.egF)), accent: "#2563eb" },
+              { label: t.stats.budget, value: `${validation.totalBudget.toFixed(1)} / 14`, sub: t.stats.budgetSub((14 - validation.totalBudget).toFixed(1)), accent: validation.totalBudget > 14 ? "#dc2626" : "#7c3aed" },
             ].map((card, i) => (
               <div key={i} style={{
                 background: "#fff", borderRadius: 10, padding: 16, border: "1px solid #e0dfd8",
                 borderTop: `3px solid ${card.accent}`,
               }}>
                 <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>{card.label}</div>
-                <div style={{ fontSize: 24, fontWeight: 700, color: card.accent, fontVariantNumeric: "tabular-nums" }}>{card.value}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: card.accent, fontVariantNumeric: "tabular-nums" }}>{card.value}</div>
                 <div style={{ fontSize: 11, color: "#999", marginTop: 4, lineHeight: 1.4 }}>{card.sub}</div>
               </div>
             ))}
@@ -545,11 +1060,11 @@
                   <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%" }}>
                     <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", width: "100%", height: "100%" }}>
                       <div style={{
-                        background: mother[i] === STATUS.MUTTERSCHUTZ ? "#dc2626" : mother[i] === STATUS.BASIS ? "#2563eb" : mother[i] === STATUS.BONUS ? "#059669" : "#7c3aed",
+                        background: mother[i] === MU ? "#dc2626" : mother[i] === "basis" ? "#2563eb" : mother[i] === "bonus" ? "#059669" : "#7c3aed",
                         height: `${mH}%`, borderRadius: "3px 3px 0 0", opacity: d.mAmount > 0 ? 1 : 0,
                       }} />
                       <div style={{
-                        background: father[i] === STATUS.BASIS ? "#93c5fd" : father[i] === STATUS.BONUS ? "#6ee7b7" : "#c4b5fd",
+                        background: father[i] === "basis" ? "#93c5fd" : father[i] === "bonus" ? "#6ee7b7" : "#c4b5fd",
                         height: `${fH}%`, borderRadius: "0 0 3px 3px", opacity: d.fAmount > 0 ? 1 : 0,
                       }} />
                     </div>
@@ -565,27 +1080,23 @@
             </div>
           </div>
 
-          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20 }}>
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20, marginBottom: 24 }}>
             <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 12 }}>
               {t.budgetTitle}
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13 }}>
-              <div>
-                <div style={{ fontWeight: 600, marginBottom: 6 }}>{t.mother}</div>
-                <div style={{ color: "#555", lineHeight: 1.8 }}>
-                  {t.budgetBasisMusch} {validation.motherBasis} {t.budgetMonths} = {validation.motherBasis} {t.budgetBm}<br/>
-                  {t.budgetPlus} {validation.motherPlus} {t.budgetMonths} = {(validation.motherPlus * 0.5).toFixed(1)} {t.budgetBm}<br/>
-                  {t.budgetBonus} {validation.motherBonus} {t.budgetMonths} {t.budgetExtra}
+              {[[t.mother, validation.motherBasis, validation.motherPlus, validation.motherBonus, validation.motherFrei],
+                [t.father, validation.fatherBasis, validation.fatherPlus, validation.fatherBonus, validation.fatherFrei]].map(([who, basis, plus, bonus, frei]) => (
+                <div key={who}>
+                  <div style={{ fontWeight: 600, marginBottom: 6 }}>{who}</div>
+                  <div style={{ color: "#555", lineHeight: 1.8 }}>
+                    {t.budgetBasisMusch} {basis} {t.budgetMonths} = {basis} {t.budgetBm}<br/>
+                    {t.budgetPlus} {plus} {t.budgetMonths} = {(plus * 0.5).toFixed(1)} {t.budgetBm}<br/>
+                    {t.budgetBonus} {bonus} {t.budgetMonths} {t.budgetExtra}<br/>
+                    {t.budgetFrei} {frei} {t.budgetMonths} {t.budgetExtra}
+                  </div>
                 </div>
-              </div>
-              <div>
-                <div style={{ fontWeight: 600, marginBottom: 6 }}>{t.father}</div>
-                <div style={{ color: "#555", lineHeight: 1.8 }}>
-                  {t.budgetBasisMusch} {validation.fatherBasis} {t.budgetMonths} = {validation.fatherBasis} {t.budgetBm}<br/>
-                  {t.budgetPlus} {validation.fatherPlus} {t.budgetMonths} = {(validation.fatherPlus * 0.5).toFixed(1)} {t.budgetBm}<br/>
-                  {t.budgetBonus} {validation.fatherBonus} {t.budgetMonths} {t.budgetExtra}
-                </div>
-              </div>
+              ))}
             </div>
             <div style={{
               marginTop: 12, padding: "10px 14px", background: "#f8f7f4", borderRadius: 8,
@@ -604,8 +1115,88 @@
             </div>
           </div>
 
-          <div style={{ marginTop: 24, fontSize: 11, color: "#aaa", lineHeight: 1.6, textAlign: "center" }}>
-            {t.disclaimer[0]}<br/>{t.disclaimer[1]}<br/>{t.disclaimer[2]}
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20, marginBottom: 24 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>
+              {t.bmChart.title}
+            </div>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: "#666", lineHeight: 1.6 }}>{t.bmChart.sub}</p>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 130 }}>
+              {birthMonthCosts.map((c, i) => {
+                const maxC = Math.max(...birthMonthCosts, 1);
+                const minC = Math.min(...birthMonthCosts);
+                const isSel = i === birthMonth - 1;
+                const isMin = c === minC;
+                return (
+                  <div key={i} onClick={() => setBirthMonth(i + 1)} title={`${t.monthNames[i]}: ${fmt(c)} €`}
+                    style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%", cursor: "pointer" }}>
+                    <div style={{ fontSize: 9, color: isSel ? "#2563eb" : isMin ? "#059669" : "#aaa", fontWeight: isSel || isMin ? 700 : 400, marginBottom: 2, fontVariantNumeric: "tabular-nums" }}>
+                      {(c / 1000).toFixed(1)}k
+                    </div>
+                    <div style={{
+                      width: "100%", height: `${Math.max(2, c / maxC * 100)}%`, borderRadius: "3px 3px 0 0",
+                      background: isSel ? "#2563eb" : isMin ? "#059669" : "#d0cfc8",
+                    }} />
+                    <div style={{ fontSize: 9, color: isSel ? "#2563eb" : "#aaa", fontWeight: isSel ? 700 : 400, marginTop: 3 }}>
+                      {t.monthNames[i].slice(0, 3)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #e0dfd8", padding: 20 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 8 }}>
+              {t.tax.title}
+            </div>
+            <p style={{ margin: "0 0 16px", fontSize: 13, color: "#666", lineHeight: 1.6 }}>{t.tax.intro}</p>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 20 }}>
+              {[
+                { label: t.tax.ersatzBrutto, sub: t.tax.ersatzBruttoSub, value: `${fmt(result.ersatzBrutto)} €`, accent: "#2563eb" },
+                { label: t.tax.mehrsteuer, sub: t.tax.mehrsteuerSub, value: `− ${fmt(result.mehrsteuer)} €`, accent: "#dc2626" },
+                { label: t.tax.ersatzNetto, sub: t.tax.ersatzNettoSub, value: `${fmt(result.ersatzNetto)} €`, accent: "#059669" },
+                { label: t.tax.kindergeld, sub: t.tax.kindergeldSub(TAX.kindergeldMonth), value: `${fmt(result.kindergeld)} €`, accent: "#7c3aed" },
+              ].map((c, i) => (
+                <div key={i} style={{ background: "#fafaf7", borderRadius: 10, padding: 14, border: "1px solid #e0dfd8", borderTop: `3px solid ${c.accent}` }}>
+                  <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 6 }}>{c.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: c.accent, fontVariantNumeric: "tabular-nums" }}>{c.value}</div>
+                  <div style={{ fontSize: 10, color: "#999", marginTop: 4, lineHeight: 1.4 }}>{c.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#888", marginBottom: 10 }}>{t.tax.yearTitle}</div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560, fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: "#888" }}>
+                    <th style={{ textAlign: "left", padding: "6px 8px", borderBottom: "2px solid #e0dfd8" }}>{t.tax.colYear}</th>
+                    {[t.tax.colWork, t.tax.colErsatz, t.tax.colZvE, t.tax.colTax, t.tax.colMehr, t.tax.colKg, t.tax.colKonto].map((h, i) => (
+                      <th key={i} style={{ textAlign: "right", padding: "6px 8px", borderBottom: "2px solid #e0dfd8", color: i === 4 ? "#dc2626" : "#888", whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.years.map((r) => (
+                    <tr key={r.y} style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+                      <td style={{ textAlign: "left", padding: "6px 8px", borderBottom: "1px solid #eee", fontWeight: 600, whiteSpace: "nowrap" }}>{t.tax.yearLabel(r.y)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee" }}>{fmt(r.work)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee", color: "#2563eb" }}>{fmt(r.ersatz)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee" }}>{fmt(r.zvE)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee" }}>{fmt(r.est)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee", color: "#dc2626" }}>{fmt(r.mehrsteuer)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee", color: "#7c3aed" }}>{fmt(r.kindergeld)}</td>
+                      <td style={{ padding: "6px 8px", borderBottom: "1px solid #eee", fontWeight: 600 }}>{fmt(r.konto)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 24, fontSize: 10.5, color: "#aaa", lineHeight: 1.6 }}>
+            {t.disclaimer.map((d, i) => <div key={i} style={{ marginBottom: 4 }}>{d}</div>)}
           </div>
         </div>
       );
