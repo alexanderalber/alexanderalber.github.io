@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local LLM Frontier - Alexander Alber</title>
+  <meta name="description" content="What is the best language model your GPU can run locally? Pick your VRAM, context length and KV cache precision and see which open-weight models fit, how fast they run, and which closed frontier model they roughly match.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/local-llm-frontier.html">
+  <meta property="og:title" content="Local LLM Frontier - what can your GPU run?">
+  <meta property="og:description" content="VRAM math (weights + KV cache) for current open-weight models, honest quality bands on a shared intelligence index, and rough speed estimates. Which local model matches GPT-4o? Find out.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/local-llm-frontier.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Multi-button segmented control (same pattern as the input-shaper tool). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active):not(:disabled),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+
+    .lf-card { border: 1px solid #334155; border-radius: 8px; padding: 14px 16px;
+      background: rgba(15,23,42,.55); }
+    .lf-chartwrap { position: relative; }
+    .lf-tip { position: absolute; pointer-events: none; z-index: 5;
+      background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+      padding: 8px 10px; font-size: 12px; line-height: 1.55; color: #cbd5e1;
+      max-width: 260px; transform: translate(-50%, -100%); white-space: nowrap; }
+    .lf-legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px;
+      color: #94a3b8; margin: 4px 2px 6px; }
+    .lf-legend span::before { content: ""; display: inline-block; width: 9px; height: 9px;
+      border-radius: 50%; margin-right: 6px; background: var(--dot); vertical-align: -1px; }
+    .lf-legend span.lf-legendnote::before { content: none; }
+    .lf-table { font-size: 13.5px; }
+    .lf-table th { cursor: pointer; user-select: none; white-space: nowrap; }
+    .lf-table th, .lf-table td { padding: 6px 10px; }
+    .lf-table td.num, .lf-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .lf-dim td { color: #64748b; }
+    .lf-input { max-width: 110px; display: inline-block; margin: 0; padding: 4px 10px;
+      height: auto; font-size: 14px; }
+    .lf-note { border: 1px solid #78350f; background: rgba(120,53,15,.15); border-radius: 8px;
+      padding: 10px 14px; color: #d9a05b; font-size: 13px; }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Local LLM Frontier",
+    "description": "Interactive visualization of which open-weight language models fit on a given GPU: VRAM math for weights and KV cache across quantization levels and context lengths, quality bands on a shared intelligence index, equivalence to closed frontier models, and rough token throughput estimates.",
+    "url": "https://alber.me/miscellaneous/tools/local-llm-frontier.html",
+    "applicationCategory": "DeveloperApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">&larr; Miscellaneous</a>
+    </p>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Local LLM Frontier</h1>
+        <p style="color:#94a3b8;max-width:70ch">What is the best language model your GPU can run? Pick your VRAM budget, context length and KV cache precision: the chart shows which open-weight models fit at which quantization, how good they are on a shared intelligence index, and which closed frontier model that roughly corresponds to.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Math core: plain JS (no JSX, no DOM) so it can be extracted and
+       unit-tested in Node (notes/dev/llm.test.mjs). All quantities in GiB
+       (1024^3 bytes), which is what GPU "GB" actually means.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="llmcore">
+  window.LLMCore = (function () {
+    'use strict';
+    var GIB = 1073741824;
+    var OVERHEAD_GIB = 0.8;    // CUDA context + compute buffers, flat estimate
+    var FIT_MARGIN = 0.97;     // usable share of nominal VRAM
+    var EFF_LO = 0.5, EFF_HI = 0.7; // memory-bandwidth efficiency of decode
+
+    function weightsGiB(paramsB, bpw) {
+      return paramsB * 1e9 * bpw / 8 / GIB;
+    }
+
+    // arch.kv_groups: [{n_layers, n_kv_heads, head_dim, window|null}]
+    // Sliding-window layers cache at most `window` tokens; linear-attention
+    // layers are simply absent from the groups (constant state ~ overhead).
+    function kvGiB(arch, context, bytesPerElem) {
+      var ctx = Math.min(context, arch.max_context || context);
+      var bytes = 0;
+      (arch.kv_groups || []).forEach(function (g) {
+        var toks = g.window ? Math.min(ctx, g.window) : ctx;
+        bytes += 2 * g.n_layers * g.n_kv_heads * g.head_dim * toks * bytesPerElem;
+      });
+      return bytes / GIB;
+    }
+
+    function vramNeeded(model, bpw, context, bytesPerElem) {
+      var w = weightsGiB(model.params_b, bpw);
+      var kv = kvGiB(model.arch, context, bytesPerElem);
+      return { weights: w, kv: kv, total: w + kv + OVERHEAD_GIB };
+    }
+
+    // Quant penalty is relative (percent of score); worst case hits the low
+    // end of the band, best case the high end.
+    function adjScore(score, penPct) {
+      return {
+        mid: score.mid * (1 - penPct.mid / 100),
+        lo: score.lo * (1 - penPct.hi / 100),
+        hi: score.hi * (1 - penPct.lo / 100)
+      };
+    }
+
+    // Rough decode throughput from memory bandwidth; MoE reads only active
+    // params per token. Returns null when bandwidth is unknown.
+    function speedRange(activeParamsB, bpw, bwGBps) {
+      if (!bwGBps) return null;
+      var bytesPerTok = activeParamsB * 1e9 * bpw / 8;
+      return { lo: bwGBps * 1e9 * EFF_LO / bytesPerTok, hi: bwGBps * 1e9 * EFF_HI / bytesPerTok };
+    }
+
+    function modelQuants(model, meta) {
+      if (model.quants) return meta.quants.filter(function (q) { return model.quants.indexOf(q.id) >= 0; });
+      return meta.quants.filter(function (q) { return q.id !== 'mxfp4'; });
+    }
+
+    // Per model: the highest-quality quant that fits the budget at the given
+    // context; if none fits, fall back to the smallest config (marked !fits).
+    function evaluate(data, opts) {
+      return data.models.map(function (m) {
+        var best = null, min = null;
+        modelQuants(m, data.meta).forEach(function (q) {
+          var need = vramNeeded(m, q.bpw, opts.context, opts.bytesPerElem);
+          var pen = data.meta.quant_penalties_pct[q.id] || { mid: 0, lo: 0, hi: 0 };
+          var cfg = { quant: q, need: need, score: adjScore(m.score, pen),
+                      fits: need.total <= opts.budgetGiB * FIT_MARGIN };
+          if (!min || need.total < min.need.total) min = cfg;
+          if (cfg.fits && (!best || cfg.score.mid > best.score.mid)) best = cfg;
+        });
+        var chosen = best || min;
+        return {
+          model: m, fits: !!best, cfg: chosen, minNeed: min.need.total,
+          speed: speedRange(m.active_params_b, chosen.quant.bpw, opts.bwGBps)
+        };
+      });
+    }
+
+    function bestPick(rows) {
+      var b = null;
+      rows.forEach(function (r) {
+        if (!r.fits) return;
+        if (!b || r.cfg.score.mid > b.cfg.score.mid ||
+            (r.cfg.score.mid === b.cfg.score.mid && r.cfg.need.total < b.cfg.need.total)) b = r;
+      });
+      return b;
+    }
+
+    // Pareto frontier over fitting configs: more VRAM must buy more quality.
+    function pareto(rows) {
+      var fit = rows.filter(function (r) { return r.fits; })
+        .slice().sort(function (a, b) { return a.cfg.need.total - b.cfg.need.total; });
+      var out = [], mx = -Infinity;
+      fit.forEach(function (r) { if (r.cfg.score.mid > mx) { mx = r.cfg.score.mid; out.push(r); } });
+      return out;
+    }
+
+    // Which closed anchors does a score band cover / sit between?
+    function equivalence(band, anchors) {
+      var within = anchors.filter(function (a) { return a.score.mid >= band.lo && a.score.mid <= band.hi; });
+      var below = null, above = null;
+      anchors.forEach(function (a) {
+        if (a.score.mid < band.lo && (!below || a.score.mid > below.score.mid)) below = a;
+        if (a.score.mid > band.hi && (!above || a.score.mid < above.score.mid)) above = a;
+      });
+      return { within: within, below: below, above: above };
+    }
+
+    // ── Trend over time ──────────────────────────────────────────────────
+    // Built from release dates within ONE snapshot, so every score sits on
+    // the same index version (cross-snapshot indices get rebased and are
+    // not comparable).
+    function ymToNum(ym) { var p = ym.split('-'); return parseInt(p[0], 10) * 12 + parseInt(p[1], 10) - 1; }
+    function numToYm(n) { var y = Math.floor(n / 12), m = n % 12 + 1; return y + '-' + (m < 10 ? '0' : '') + m; }
+
+    // Frontier events: dates where a newly released model raised the best
+    // score that fits the budget. Input: rows from evaluate().
+    function trendEvents(rows) {
+      var fit = rows.filter(function (r) { return r.fits && r.model.released; })
+        .slice().sort(function (a, b) {
+          return ymToNum(a.model.released) - ymToNum(b.model.released) || a.cfg.score.mid - b.cfg.score.mid;
+        });
+      var out = [], mx = -Infinity;
+      fit.forEach(function (r) {
+        if (r.cfg.score.mid > mx) { mx = r.cfg.score.mid; out.push({ t: ymToNum(r.model.released), score: r.cfg.score.mid, row: r }); }
+      });
+      return out;
+    }
+
+    // The index is bounded, so the trend is fitted linearly in log-odds
+    // space (logit of score/ceiling) and mapped back through the sigmoid:
+    // extrapolations saturate instead of marching through the ceiling.
+    // The ceiling itself is NOT 100: unbounded "eventually reaches
+    // omniscience" is its own unrealistic assumption. Instead it is a
+    // weighted average of 100 and the current best reference model,
+    // reflecting that progress plausibly slows as it nears the frontier
+    // rather than sailing past it indefinitely. The weight is a modeling
+    // choice, not a measurement; CEIL_TO_100 = 0.5 is a plain average of
+    // "no ceiling" and "capped at today's best", deliberately simple.
+    var Z_FLOOR = 0.1, BAND_K = 2, CEIL_TO_100 = 0.5;
+    function trendCeiling(anchors) {
+      var top = anchors.reduce(function (a, b) { return b.score.mid > a.score.mid ? b : a; });
+      return CEIL_TO_100 * 100 + (1 - CEIL_TO_100) * top.score.mid;
+    }
+    function logitC(y, ceil) { var p = Math.min(0.99, Math.max(0.01, y / ceil)); return Math.log(p / (1 - p)); }
+    function invLogitC(z, ceil) { return ceil / (1 + Math.exp(-z)); }
+    function fitTrend(events, ceil) {
+      if (events.length < 3) return null;
+      ceil = ceil || 100;
+      var n = events.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+      events.forEach(function (e) { var z = logitC(e.score, ceil); sx += e.t; sy += z; sxx += e.t * e.t; sxy += e.t * z; });
+      var Sxx = sxx - sx * sx / n;
+      if (!Sxx) return null;
+      var xbar = sx / n;
+      var slope = (sxy - sx * sy / n) / Sxx, intercept = sy / n - slope * xbar;
+      var sse = 0;
+      events.forEach(function (e) { var d = logitC(e.score, ceil) - (intercept + slope * e.t); sse += d * d; });
+      var s = Math.max(Math.sqrt(sse / (n - 2)), Z_FLOOR);
+      return { slope: slope, intercept: intercept, n: n, xbar: xbar, Sxx: Sxx, s: s, ceil: ceil };
+    }
+
+    // Band of the fitted mean at month t, back-transformed to index units.
+    function trendPredict(fit, t) {
+      var mid = fit.intercept + fit.slope * t;
+      var half = BAND_K * fit.s * Math.sqrt(1 / fit.n + (t - fit.xbar) * (t - fit.xbar) / fit.Sxx);
+      return { mid: invLogitC(mid, fit.ceil), lo: invLogitC(mid - half, fit.ceil), hi: invLogitC(mid + half, fit.ceil) };
+    }
+
+    // First month >= tStart at which the chosen band edge reaches target
+    // (numeric scan; the edges are not straight lines). Null if the target
+    // is at or above the modeled ceiling (never reached) or not within 20
+    // years, which is as good as never.
+    function trendCrossing(fit, target, tStart, edge) {
+      edge = edge || 'mid';
+      if (target >= fit.ceil) return null;
+      for (var t = tStart; t <= tStart + 240; t += 0.25) {
+        if (trendPredict(fit, t)[edge] >= target) return t;
+      }
+      return null;
+    }
+
+    return {
+      GIB: GIB, OVERHEAD_GIB: OVERHEAD_GIB, FIT_MARGIN: FIT_MARGIN,
+      EFF_LO: EFF_LO, EFF_HI: EFF_HI,
+      weightsGiB: weightsGiB, kvGiB: kvGiB, vramNeeded: vramNeeded,
+      adjScore: adjScore, speedRange: speedRange, modelQuants: modelQuants,
+      evaluate: evaluate, bestPick: bestPick, pareto: pareto, equivalence: equivalence,
+      ymToNum: ymToNum, numToYm: numToYm, logitC: logitC, invLogitC: invLogitC,
+      trendEvents: trendEvents, trendCeiling: trendCeiling, fitTrend: fitTrend,
+      trendPredict: trendPredict, trendCrossing: trendCrossing
+    };
+  })();
+  </script>
+
+  <script type="text/babel">
+  const { useState, useEffect, useRef, useMemo } = React;
+  const C = window.LLMCore;
+
+  const DATA_FILES = [
+    { id: '2026-07', label: 'July 2026', file: '/assets/files/llm-landscape-2026-07.json' }
+  ];
+
+  const GPUS = [
+    { id: '3060',    label: 'RTX 3060 12GB',      vram: 12, bw: 360 },
+    { id: '4060ti',  label: 'RTX 4060 Ti 16GB',   vram: 16, bw: 288 },
+    { id: '4070tis', label: 'RTX 4070 Ti S 16GB', vram: 16, bw: 672 },
+    { id: '3090',    label: 'RTX 3090 24GB',      vram: 24, bw: 936 },
+    { id: '4090',    label: 'RTX 4090 24GB',      vram: 24, bw: 1008 },
+    { id: '5090',    label: 'RTX 5090 32GB',      vram: 32, bw: 1792 },
+    { id: '2x3090',  label: '2× RTX 3090 48GB', vram: 48, bw: 936 },
+    { id: 'pro6000', label: 'RTX Pro 6000 96GB', vram: 96, bw: 1792 },
+    { id: 'custom',  label: 'Custom', vram: null, bw: null }
+  ];
+
+  const CONTEXTS = [
+    { v: 4096, label: '4k' }, { v: 8192, label: '8k' }, { v: 16384, label: '16k' },
+    { v: 32768, label: '32k' }, { v: 65536, label: '64k' }, { v: 131072, label: '128k' }
+  ];
+
+  const COL = {
+    fit: '#0ea5a0', miss: '#475569', pick: '#d97706',
+    text: '#cbd5e1', label: '#94a3b8', foot: '#64748b', faint: '#475569',
+    grid: '#1e293b', anchor: '#334155', surface: '#0f172a', err: '#64748b'
+  };
+
+  const fmt1 = x => (Math.round(x * 10) / 10).toFixed(1);
+  const fmt0 = x => String(Math.round(x));
+  const band = s => fmt0(s.lo) + '–' + fmt0(s.hi);
+  const spd = s => s ? '~' + fmt0(s.lo) + '–' + fmt0(s.hi) + ' tok/s' : 'n/a';
+
+  function eqSentence(eq) {
+    if (eq.within.length) {
+      const names = eq.within.map(a => a.label).join(' / ');
+      return { main: 'roughly ' + names + ' class', sub: eq.below ? 'clearly above ' + eq.below.label : null };
+    }
+    if (eq.below && eq.above) return { main: 'between ' + eq.below.label + ' and ' + eq.above.label, sub: null };
+    if (eq.above) return { main: 'below ' + eq.above.label, sub: null };
+    if (eq.below) return { main: 'beyond ' + eq.below.label, sub: null };
+    return { main: '', sub: null };
+  }
+
+  // ── Controls ────────────────────────────────────────────────────────────
+  function Seg({ options, value, onChange }) {
+    return (
+      <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap' }}>
+        {options.map(o => (
+          <button key={o.value} className={'lang-seg' + (o.value === value ? ' active' : '')}
+            onClick={() => onChange(o.value)}>{o.label}</button>
+        ))}
+      </div>
+    );
+  }
+
+  function Row({ label, children }) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
+        <span style={{ color: COL.label, fontSize: 13, minWidth: 92 }}>{label}</span>
+        {children}
+      </div>
+    );
+  }
+
+  // ── Scatter chart ───────────────────────────────────────────────────────
+  const W = 760, H = 460, M = { l: 46, r: 148, t: 14, b: 42 };
+
+  function niceCeil(x) {
+    const steps = [8, 12, 16, 24, 32, 48, 64, 80, 92, 96, 112, 128, 160, 192, 256];
+    for (const s of steps) if (x <= s) return s;
+    return Math.ceil(x / 64) * 64;
+  }
+
+  // Nudge overlapping right-edge labels apart (lines stay at their true y).
+  function spreadYs(ys, minGap) {
+    const order = ys.map((y, i) => ({ y, i })).sort((a, b) => a.y - b.y);
+    const out = [];
+    let prev = -Infinity;
+    order.forEach(o => { const ny = Math.max(o.y, prev + minGap); out[o.i] = ny; prev = ny; });
+    return out;
+  }
+
+  function Chart({ rows, anchors, budget, best }) {
+    const [hover, setHover] = useState(null);
+    const wrapRef = useRef(null);
+
+    // 92 GB floor so the workstation class (RTX Pro 6000) is always in view.
+    const xmax = niceCeil(Math.max(92, budget * 1.15, ...rows.map(r => r.cfg.need.total) ));
+    const ymax = 100; // fixed 0-100 index scale
+    const X = v => M.l + v / xmax * (W - M.l - M.r);
+    const Y = v => H - M.b - v / ymax * (H - M.t - M.b);
+
+    const pts = rows.map(r => ({ r, x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
+    const frontier = C.pareto(rows).map(r => ({ x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
+
+    const xticks = [];
+    const xstep = xmax <= 32 ? 4 : xmax <= 96 ? 8 : 16;
+    for (let v = 0; v <= xmax; v += xstep) xticks.push(v);
+    const yticks = [];
+    for (let v = 0; v <= ymax; v += 10) yticks.push(v);
+
+    function onMove(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * W / rect.width;
+      const my = (e.clientY - rect.top) * H / rect.height;
+      let nearest = null, dmin = 26 * 26;
+      pts.forEach(p => {
+        const d = (p.x - mx) * (p.x - mx) + (p.y - my) * (p.y - my);
+        if (d < dmin) { dmin = d; nearest = p; }
+      });
+      if (nearest && wrapRef.current) {
+        const wrect = wrapRef.current.getBoundingClientRect();
+        setHover({ p: nearest, left: nearest.x / W * wrect.width, top: nearest.y / H * wrect.height - 10 });
+      } else setHover(null);
+    }
+
+    return (
+      <div className="lf-chartwrap" ref={wrapRef}>
+        <svg viewBox={'0 0 ' + W + ' ' + H} style={{ width: '100%', display: 'block', background: COL.surface, borderRadius: 8 }}
+          onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+          {/* grid */}
+          {yticks.map(v => <line key={'gy' + v} x1={M.l} x2={W - M.r} y1={Y(v)} y2={Y(v)} stroke={COL.grid} strokeWidth="1" />)}
+          {xticks.map(v => <line key={'gx' + v} x1={X(v)} x2={X(v)} y1={M.t} y2={H - M.b} stroke={COL.grid} strokeWidth="1" />)}
+          {/* axis tick labels */}
+          {yticks.map(v => <text key={'ty' + v} x={M.l - 7} y={Y(v) + 3.5} textAnchor="end" fontSize="11" fill={COL.foot} style={{ fontVariantNumeric: 'tabular-nums' }}>{v}</text>)}
+          {xticks.map(v => <text key={'tx' + v} x={X(v)} y={H - M.b + 16} textAnchor="middle" fontSize="11" fill={COL.foot} style={{ fontVariantNumeric: 'tabular-nums' }}>{v}</text>)}
+          <text x={(M.l + W - M.r) / 2} y={H - 6} textAnchor="middle" fontSize="12" fill={COL.label}>VRAM needed (GB) at chosen context</text>
+          <text x={14} y={(M.t + H - M.b) / 2} textAnchor="middle" fontSize="12" fill={COL.label} transform={'rotate(-90 14 ' + (M.t + H - M.b) / 2 + ')'}>intelligence index</text>
+
+          {/* closed-model anchor lines */}
+          {(() => {
+            const lys = spreadYs(anchors.map(a => Y(a.score.mid)), 12);
+            return anchors.map((a, i) => (
+              <g key={a.id}>
+                <line x1={M.l} x2={W - M.r} y1={Y(a.score.mid)} y2={Y(a.score.mid)} stroke={COL.anchor} strokeWidth="1" strokeDasharray="4 4" />
+                <text x={W - M.r + 6} y={lys[i] + 3.5} fontSize="11" fill={COL.label}>{a.label}</text>
+              </g>
+            ));
+          })()}
+
+          {/* VRAM budget line */}
+          <line x1={X(budget)} x2={X(budget)} y1={M.t} y2={H - M.b} stroke={COL.fit} strokeWidth="1.5" opacity="0.75" />
+          <text x={X(budget) + 5} y={M.t + 11} fontSize="11" fill={COL.fit}>{fmt0(budget)} GB budget</text>
+
+          {/* Pareto frontier through fitting configs */}
+          {frontier.length > 1 &&
+            <polyline points={frontier.map(p => p.x + ',' + p.y).join(' ')} fill="none" stroke={COL.fit} strokeWidth="2" opacity="0.55" strokeLinejoin="round" strokeLinecap="round" />}
+
+          {/* uncertainty bands + dots */}
+          {pts.map(({ r, x, y }) => {
+            const isBest = best && r.model.id === best.model.id;
+            const col = isBest ? COL.pick : r.fits ? COL.fit : COL.miss;
+            return (
+              <g key={r.model.id}>
+                <line x1={x} x2={x} y1={Y(r.cfg.score.lo)} y2={Y(r.cfg.score.hi)} stroke={COL.err} strokeWidth="1.5" opacity="0.55" />
+                <circle cx={x} cy={y} r={isBest ? 6 : 4.5} fill={col} stroke={COL.surface} strokeWidth="2" />
+              </g>
+            );
+          })}
+
+          {/* direct label on the best pick only */}
+          {best && (() => {
+            const x = X(best.cfg.need.total), y = Y(best.cfg.score.mid);
+            const flip = x > W - M.r - 130;
+            return <text x={flip ? x - 10 : x + 10} y={y - 8} fontSize="12" fill={COL.text} textAnchor={flip ? 'end' : 'start'}>{best.model.label}</text>;
+          })()}
+        </svg>
+        {hover && (
+          <div className="lf-tip" style={{ left: hover.left, top: hover.top }}>
+            <strong style={{ color: '#e2e8f0' }}>{hover.p.r.model.label}</strong><br />
+            {hover.p.r.fits
+              ? <>best quant that fits: {hover.p.r.cfg.quant.label}<br /></>
+              : <>does not fit ({hover.p.r.cfg.quant.label} needs {fmt1(hover.p.r.minNeed)} GB)<br /></>}
+            VRAM: {fmt1(hover.p.r.cfg.need.total)} GB ({fmt1(hover.p.r.cfg.need.weights)} weights + {fmt1(hover.p.r.cfg.need.kv)} KV)<br />
+            index: {fmt0(hover.p.r.cfg.score.mid)} (band {band(hover.p.r.cfg.score)}){hover.p.r.model.score_estimated ? ' · estimated' : ''}<br />
+            speed: {spd(hover.p.r.speed)} · released {hover.p.r.model.released}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Trend over time ─────────────────────────────────────────────────────
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const fmtYm = n => MONTHS[n % 12] + ' ' + Math.floor(n / 12);
+
+  function TrendChart({ rows, anchors, snapshot }) {
+    const [hover, setHover] = useState(null);
+    const wrapRef = useRef(null);
+    const events = C.trendEvents(rows);
+    const ceil = C.trendCeiling(anchors);
+    const fit = C.fitTrend(events, ceil);
+    const nowT = C.ymToNum(snapshot);
+
+    if (!events.length) return (
+      <p style={{ color: COL.label, fontSize: 14 }}>No model in the dataset ever fit this budget at the chosen context, so there is no local history to extrapolate.</p>
+    );
+
+    const cur = events[events.length - 1].score;
+    const horizon = 18;
+    const t0 = events[0].t - 2, t1 = nowT + horizon;
+    const ymax = 100; // fixed 0-100 index scale
+    const X = t => M.l + (t - t0) / (t1 - t0) * (W - M.l - M.r);
+    const Y = v => H - M.b - v / ymax * (H - M.t - M.b);
+
+    // prediction band sampled monthly across history and extrapolation
+    const samples = [];
+    if (fit) for (let t = t0; t <= t1 + 0.001; t += 1) samples.push({ t, p: C.trendPredict(fit, t) });
+    const clampY = v => Y(Math.max(0, Math.min(v, ymax)));
+
+    const yticks = [];
+    for (let v = 0; v <= ymax; v += 10) yticks.push(v);
+    const xticks = [];
+    for (let t = Math.ceil(t0 / 12) * 12; t <= t1; t += 12) xticks.push(t);
+
+    function onMove(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * W / rect.width;
+      const my = (e.clientY - rect.top) * H / rect.height;
+      let nearest = null, dmin = 26 * 26;
+      events.forEach(ev => {
+        const d = (X(ev.t) - mx) ** 2 + (Y(ev.score) - my) ** 2;
+        if (d < dmin) { dmin = d; nearest = ev; }
+      });
+      if (nearest && wrapRef.current) {
+        const wrect = wrapRef.current.getBoundingClientRect();
+        setHover({ ev: nearest, left: X(nearest.t) / W * wrect.width, top: Y(nearest.score) / H * wrect.height - 10 });
+      } else setHover(null);
+    }
+
+    return (
+      <div className="lf-chartwrap" ref={wrapRef}>
+        <svg viewBox={'0 0 ' + W + ' ' + H} style={{ width: '100%', display: 'block', background: COL.surface, borderRadius: 8 }}
+          onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+          {yticks.map(v => <line key={'gy' + v} x1={M.l} x2={W - M.r} y1={Y(v)} y2={Y(v)} stroke={COL.grid} strokeWidth="1" />)}
+          {xticks.map(t => <line key={'gx' + t} x1={X(t)} x2={X(t)} y1={M.t} y2={H - M.b} stroke={COL.grid} strokeWidth="1" />)}
+          {yticks.map(v => <text key={'ty' + v} x={M.l - 7} y={Y(v) + 3.5} textAnchor="end" fontSize="11" fill={COL.foot} style={{ fontVariantNumeric: 'tabular-nums' }}>{v}</text>)}
+          {xticks.map(t => <text key={'tx' + t} x={X(t)} y={H - M.b + 16} textAnchor="middle" fontSize="11" fill={COL.foot}>{Math.floor(t / 12)}</text>)}
+          <text x={(M.l + W - M.r) / 2} y={H - 6} textAnchor="middle" fontSize="12" fill={COL.label}>model release date</text>
+          <text x={14} y={(M.t + H - M.b) / 2} textAnchor="middle" fontSize="12" fill={COL.label} transform={'rotate(-90 14 ' + (M.t + H - M.b) / 2 + ')'}>best index that fits this GPU</text>
+
+          {(() => {
+            const items = anchors.map(a => ({ key: a.id, y: a.score.mid, label: a.label, ceiling: false }))
+              .concat([{ key: 'ceiling', y: ceil, label: 'modeled ceiling', ceiling: true }]);
+            const lys = spreadYs(items.map(it => Y(it.y)), 12);
+            return items.map((it, i) => (
+              <g key={it.key}>
+                <line x1={M.l} x2={W - M.r} y1={Y(it.y)} y2={Y(it.y)}
+                  stroke={it.ceiling ? COL.foot : COL.anchor} strokeWidth="1"
+                  strokeDasharray={it.ceiling ? '2 3' : '4 4'} opacity={it.ceiling ? 0.8 : 1} />
+                <text x={W - M.r + 6} y={lys[i] + 3.5} fontSize={it.ceiling ? 10 : 11} fill={it.ceiling ? COL.foot : COL.label}>{it.label}</text>
+              </g>
+            ));
+          })()}
+
+          {/* today marker */}
+          <line x1={X(nowT)} x2={X(nowT)} y1={M.t} y2={H - M.b} stroke={COL.anchor} strokeWidth="1" />
+          <text x={X(nowT) + 4} y={M.t + 11} fontSize="11" fill={COL.foot}>today</text>
+
+          {/* prediction band (widens away from the data) + fitted mid line */}
+          {fit && <>
+            <polygon points={
+              samples.map(s => X(s.t) + ',' + clampY(s.p.hi)).join(' ') + ' ' +
+              samples.slice().reverse().map(s => X(s.t) + ',' + clampY(s.p.lo)).join(' ')}
+              fill={COL.fit} opacity="0.10" />
+            <polyline points={samples.map(s => X(s.t) + ',' + Y(s.p.mid)).join(' ')}
+              fill="none" stroke={COL.fit} strokeWidth="1.5" strokeDasharray="5 4" opacity="0.7" />
+          </>}
+
+          {/* frontier events */}
+          {events.map(ev => (
+            <circle key={ev.row.model.id} cx={X(ev.t)} cy={Y(ev.score)} r="4.5" fill={COL.fit} stroke={COL.surface} strokeWidth="2" />
+          ))}
+        </svg>
+        {hover && (
+          <div className="lf-tip" style={{ left: hover.left, top: hover.top }}>
+            <strong style={{ color: '#e2e8f0' }}>{hover.ev.row.model.label}</strong> ({hover.ev.row.model.released})<br />
+            new local best: index {fmt0(hover.ev.score)} at {hover.ev.row.cfg.quant.label}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function TrendSection({ rows, anchors, snapshot }) {
+    const events = C.trendEvents(rows);
+    const ceil = C.trendCeiling(anchors);
+    const fit = C.fitTrend(events, ceil);
+    const nowT = C.ymToNum(snapshot);
+    const cur = events.length ? events[events.length - 1].score : null;
+    const top = anchors.slice().sort((a, b) => b.score.mid - a.score.mid)[0];
+
+    let sentence = null;
+    if (fit && top && cur != null) {
+      if (cur >= top.score.mid) {
+        sentence = <>A {top.label}-class model already fits this GPU. The frontier says hello.</>;
+      } else {
+        const tMid = C.trendCrossing(fit, top.score.mid, nowT, 'mid');
+        const tEarly = C.trendCrossing(fit, top.score.mid, nowT, 'hi');
+        const tLate = C.trendCrossing(fit, top.score.mid, nowT, 'lo');
+        sentence = tMid == null
+          ? (top.score.mid >= ceil
+              ? <>The modeled ceiling for this trend ({fmt0(ceil)}) sits below {top.label}'s index ({fmt0(top.score.mid)}), so this fit never gets there. That says more about the ceiling assumption than about {top.label}.</>
+              : <>The fitted trend stays below this level for the foreseeable future (flat pace). Buy VRAM instead.</>)
+          : <>If the pace of the last {events[events.length - 1].t - events[0].t} months simply continues, a model of
+              <strong style={{ color: '#e2e8f0' }}> {top.label}</strong> class (index {fmt0(top.score.mid)}) fits this GPU around
+              <strong style={{ color: '#e2e8f0' }}> {fmtYm(Math.round(tMid))}</strong>
+              {' '}(band: {tEarly != null ? fmtYm(Math.round(tEarly)) : '?'} to {tLate != null ? fmtYm(Math.round(tLate)) : 'not in sight'}).</>;
+      }
+    }
+
+    return (
+      <>
+        <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>If this pace continues</h2>
+        <p style={{ color: COL.label, fontSize: 14, maxWidth: '78ch' }}>
+          Each dot is the moment a newly released open-weight model raised the best quality this GPU can run
+          (at the context and KV settings above). The dashed curve is a trend fit through those moments
+          (linear in log-odds, so it flattens as it nears a modeled ceiling instead of marching to 100),
+          the shaded band its uncertainty, extended 18 months ahead. The ceiling ({fmt0(ceil)}) is not a
+          measurement: it is a deliberately cautious assumption, an average of "no ceiling" (100) and
+          "capped near today's best reference model" ({top ? top.label + ', ' + fmt0(top.score.mid) : '?'}),
+          so the curve does not simply sail past current frontier quality forever.
+        </p>
+        {sentence && <div className="lf-card" style={{ marginBottom: 14 }}><p style={{ margin: 0, color: COL.text }}>{sentence}</p></div>}
+        {!fit && events.length > 0 &&
+          <p style={{ color: COL.foot, fontSize: 13 }}>Fewer than three frontier events at this budget; no extrapolation, the history alone is shown.</p>}
+        <TrendChart rows={rows} anchors={anchors} snapshot={snapshot} />
+        <p style={{ fontSize: 11, color: COL.foot, marginTop: 6, lineHeight: 1.6 }}>
+          Naive trend fit (linear in log-odds of the bounded index) over {events.length} data points, within one benchmark snapshot. Progress arrives in jumps,
+          benchmarks saturate and get rebased, and past pace guarantees nothing. Treat the date as entertainment with error bars.
+        </p>
+      </>
+    );
+  }
+
+  // ── Best pick card ──────────────────────────────────────────────────────
+  function BestCard({ best, rows, anchors, budget }) {
+    if (!best) return (
+      <div className="lf-card" style={{ marginBottom: 18 }}>
+        <p style={{ margin: 0, color: COL.label }}>Nothing in the dataset fits this budget at the chosen context. Try a shorter context or 8-bit KV cache.</p>
+      </div>
+    );
+    const eq = eqSentence(C.equivalence(best.cfg.score, anchors));
+    const fastest = rows.filter(r => r.fits && r.speed && r.model.id !== best.model.id &&
+      r.cfg.score.mid >= 0.75 * best.cfg.score.mid)
+      .sort((a, b) => b.speed.lo - a.speed.lo)[0];
+    return (
+      <div className="lf-card" style={{ marginBottom: 18 }}>
+        <p style={{ margin: 0, fontSize: 12, color: COL.foot, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Best you can run</p>
+        <p style={{ margin: '4px 0 2px', fontSize: 22, color: '#e2e8f0', fontWeight: 600 }}>
+          {best.model.label} <span style={{ color: COL.label, fontWeight: 400, fontSize: 16 }}>at {best.cfg.quant.label}</span>
+        </p>
+        <p style={{ margin: '2px 0', color: COL.text }}>
+          Quality: <strong style={{ color: '#e2e8f0' }}>{eq.main}</strong>
+          {eq.sub ? <span style={{ color: COL.label }}> ({eq.sub})</span> : null}
+        </p>
+        <p style={{ margin: '2px 0', fontSize: 14, color: COL.label }}>
+          index {fmt0(best.cfg.score.mid)} (band {band(best.cfg.score)}{best.model.score_estimated ? ', estimated' : ''})
+          {' · '}{fmt1(best.cfg.need.total)} of {fmt0(budget)} GB
+          {' · '}{spd(best.speed)}
+          {best.model.moe ? ' · MoE, ' + best.model.active_params_b + 'B active' : ''}
+        </p>
+        {fastest && fastest.speed.lo > (best.speed ? best.speed.hi : 0) &&
+          <p style={{ margin: '6px 0 0', fontSize: 13, color: COL.foot }}>
+            Faster alternative: {fastest.model.label} at {fastest.cfg.quant.label}, {spd(fastest.speed)}, index {fmt0(fastest.cfg.score.mid)} (band {band(fastest.cfg.score)}).
+          </p>}
+      </div>
+    );
+  }
+
+  // ── Table (the chart's accessible twin) ─────────────────────────────────
+  function Table({ rows, budget }) {
+    const [sort, setSort] = useState({ key: 'score', dir: -1 });
+    const val = r => sort.key === 'score' ? r.cfg.score.mid
+      : sort.key === 'vram' ? r.cfg.need.total
+      : sort.key === 'speed' ? (r.speed ? r.speed.lo : -1)
+      : r.model.released;
+    const sorted = rows.slice().sort((a, b) => (val(a) < val(b) ? 1 : val(a) > val(b) ? -1 : 0) * sort.dir);
+    const th = (key, label, num) => (
+      <th className={num ? 'num' : ''} onClick={() => setSort(s => ({ key, dir: s.key === key ? -s.dir : -1 }))}
+        title="Click to sort">{label}{sort.key === key ? (sort.dir === -1 ? ' ▾' : ' ▴') : ''}</th>
+    );
+    return (
+      <figure style={{ overflowX: 'auto' }}>
+        <table className="lf-table">
+          <thead>
+            <tr>
+              <th onClick={() => setSort(s => ({ key: 'score', dir: -1 }))}>Model</th>
+              <th>Params</th>
+              <th>Best quant</th>
+              {th('vram', 'VRAM (GB)', true)}
+              {th('score', 'Index (band)', true)}
+              {th('speed', '~tok/s', true)}
+              {th('released', 'Released', false)}
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(r => (
+              <tr key={r.model.id} className={r.fits ? '' : 'lf-dim'}>
+                <td>{r.model.label}</td>
+                <td>{r.model.moe ? r.model.params_b + 'B (A' + r.model.active_params_b + 'B)' : r.model.params_b + 'B'}</td>
+                <td>{r.fits ? r.cfg.quant.label : 'needs ≥ ' + fmt1(r.minNeed) + ' GB'}</td>
+                <td className="num">{fmt1(r.cfg.need.total)}</td>
+                <td className="num">{fmt0(r.cfg.score.mid)} ({band(r.cfg.score)}){r.model.score_estimated ? ' *' : ''}</td>
+                <td className="num">{r.speed ? fmt0(r.speed.lo) + '–' + fmt0(r.speed.hi) : 'n/a'}</td>
+                <td>{r.model.released}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <figcaption style={{ fontSize: 11, color: COL.foot }}>
+          Greyed rows do not fit the {fmt0(budget)} GB budget at the chosen context. * = index score estimated, not directly reported. Click column headers to sort.
+        </figcaption>
+      </figure>
+    );
+  }
+
+  // ── App ─────────────────────────────────────────────────────────────────
+  function App() {
+    const [data, setData] = useState(null);
+    const [err, setErr] = useState(null);
+    const [gpu, setGpu] = useState('3090');
+    const [customVram, setCustomVram] = useState(24);
+    const [customBw, setCustomBw] = useState('');
+    const [context, setContext] = useState(16384);
+    const [kv, setKv] = useState(2); // bytes per element: 2 = FP16, 1 = Q8
+
+    useEffect(() => {
+      fetch(DATA_FILES[0].file)
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(setData).catch(e => setErr(String(e)));
+    }, []);
+
+    const preset = GPUS.find(g => g.id === gpu);
+    const budget = preset.vram != null ? preset.vram : (parseFloat(customVram) || 0);
+    const bw = preset.vram != null ? preset.bw : (parseFloat(customBw) || null);
+
+    const rows = useMemo(() => data
+      ? C.evaluate(data, { context, bytesPerElem: kv, budgetGiB: budget, bwGBps: bw })
+      : [], [data, context, kv, budget, bw]);
+    const best = useMemo(() => C.bestPick(rows), [rows]);
+
+    return (
+      <div className="container">
+        <h1 style={{ fontSize: '1.5rem', color: COL.text, marginBottom: 8 }}>Local LLM Frontier</h1>
+        <p style={{ color: COL.label, maxWidth: '70ch' }}>
+          What is the best language model your GPU can run? Pick your VRAM budget, context length and KV cache
+          precision: the chart shows which open-weight models fit at which quantization, how good they are on a
+          shared intelligence index, and which closed frontier model that roughly corresponds to.
+        </p>
+
+        {err && <div className="lf-note">Could not load the model dataset ({err}). Reload the page to retry.</div>}
+        {!data && !err && <p style={{ color: COL.foot }}>Loading model data&hellip;</p>}
+
+        {data && <>
+          {data.meta.status === 'provisional' &&
+            <div className="lf-note" style={{ marginBottom: 14 }}>
+              Provisional dataset ({data.meta.snapshot}): several scores and architecture details are estimates
+              with widened uncertainty bands. Treat rankings between nearby models as ties.
+            </div>}
+
+          <div style={{ marginBottom: 14 }}>
+            <Row label="GPU:">
+              <Seg options={GPUS.map(g => ({ value: g.id, label: g.label }))} value={gpu} onChange={setGpu} />
+            </Row>
+            {gpu === 'custom' &&
+              <Row label="Custom:">
+                <input className="lf-input" type="number" min="1" max="512" step="1" value={customVram}
+                  onChange={e => setCustomVram(e.target.value)} aria-label="VRAM in GB" />
+                <span style={{ color: COL.foot, fontSize: 12 }}>GB VRAM</span>
+                <input className="lf-input" type="number" min="0" step="10" value={customBw} placeholder="e.g. 936"
+                  onChange={e => setCustomBw(e.target.value)} aria-label="Memory bandwidth in GB/s" />
+                <span style={{ color: COL.foot, fontSize: 12 }}>GB/s bandwidth (optional, for speed estimates)</span>
+              </Row>}
+            <Row label="Context:">
+              <Seg options={CONTEXTS.map(c => ({ value: c.v, label: c.label }))} value={context} onChange={setContext} />
+            </Row>
+            <Row label="KV cache:">
+              <Seg options={[{ value: 2, label: 'FP16' }, { value: 1, label: 'Q8' }]} value={kv} onChange={setKv} />
+            </Row>
+          </div>
+
+          <BestCard best={best} rows={rows} anchors={data.anchors} budget={budget} />
+
+          <div className="lf-legend" aria-hidden="true">
+            <span style={{ '--dot': COL.fit }}>fits your GPU</span>
+            <span style={{ '--dot': COL.pick }}>best pick</span>
+            <span style={{ '--dot': COL.miss }}>too big</span>
+            <span className="lf-legendnote" style={{ color: COL.foot }}>dashed lines: closed reference models &middot; vertical bars: uncertainty band</span>
+          </div>
+          <Chart rows={rows} anchors={data.anchors} budget={budget} best={best} />
+
+          <TrendSection rows={rows} anchors={data.anchors} snapshot={data.meta.snapshot} />
+
+          <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>All models</h2>
+          <Table rows={rows} budget={budget} />
+
+          <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>Assumptions</h2>
+          <ul style={{ fontSize: 13, color: COL.label, lineHeight: 1.7 }}>
+            <li>Weights: parameters &times; bits-per-weight / 8, using typical effective GGUF sizes
+              ({data.meta.quants.map(q => q.label.replace(/ \(.*/, '') + ' ' + q.bpw).join(', ')} bits per weight). GB means GiB, matching how VRAM is marketed.</li>
+            <li>KV cache: 2 &times; layers &times; KV heads &times; head dim &times; context &times; bytes per element, per attention type
+              (sliding-window layers cap at their window; linear-attention layers hold no per-token cache). Plus a flat {C.OVERHEAD_GIB} GB
+              runtime overhead; a config "fits" when it needs at most {Math.round(C.FIT_MARGIN * 100)}% of nominal VRAM.</li>
+            <li>Quality: composite intelligence index ({data.meta.scale.name}), reasoning mode where available. Quantization
+              degradation is applied as a relative penalty with wide uncertainty, since public evidence is thin. The bands are the honest
+              part of this tool: differences within overlapping bands are not meaningful.</li>
+            <li>Speed: decode is memory-bound, so tok/s &asymp; bandwidth &times; {C.EFF_LO}&ndash;{C.EFF_HI} / bytes-per-token
+              (active parameters &times; bits / 8). Prompt processing and multi-GPU splits are not modeled; reasoning modes spend many
+              tokens thinking before answering.</li>
+          </ul>
+
+          <p style={{ marginTop: 24, fontSize: 11, color: COL.foot, lineHeight: 1.7 }}>
+            Data snapshot: {data.meta.snapshot}{data.meta.status === 'provisional' ? ' (provisional)' : ''} &middot;
+            index: {data.meta.scale.name} &middot; benchmarks: {data.meta.scale.benchmarks_used.join(', ')} &middot;
+            sources: {data.meta.scale.sources.map((s, i) => <React.Fragment key={s}>{i > 0 ? ', ' : ''}<a href={s} style={{ color: COL.foot }}>{s.replace(/^https?:\/\/(www\.)?/, '').replace(/\/.*$/, '')}</a></React.Fragment>)}.
+          </p>
+          <p style={{ marginTop: 8, fontSize: 10, color: COL.faint, lineHeight: 1.6 }}>
+            All numbers are estimates for orientation, not guarantees; actual VRAM use and speed depend on runtime, batch size and driver.
+            Model and benchmark names belong to their respective owners. This project is not affiliated with any of them.
+            Private hobby project, non-commercial.
+          </p>
+        </>}
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <footer class="container">
+    <small>&copy; 2026 Franziska and Alexander Alber &middot; <a href="/">alber.me</a> &middot; Feedback welcome: feedback@alber.me &middot; <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
