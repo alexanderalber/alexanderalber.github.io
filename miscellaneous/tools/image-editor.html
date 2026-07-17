@@ -296,6 +296,26 @@
           }
           return out;
         }
+        case 'overlay': {
+          const out = cloneCanvas(inC); const ctx = out.getContext('2d');
+          const img = op.img; if (!img) return out;
+          const iw = img.width, ih = img.height, N = WARP_GRID, c = op.corners;
+          // warp the overlay into a transparent temp canvas, then composite it once
+          // with the chosen opacity (avoids seam artifacts at low opacity)
+          const tmp = newCanvas(w, h); const tctx = tmp.getContext('2d');
+          for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+            const u0 = i / N, u1 = (i + 1) / N, v0 = j / N, v1 = (j + 1) / N;
+            const s00 = { x: u0 * iw, y: v0 * ih }, s10 = { x: u1 * iw, y: v0 * ih },
+                  s11 = { x: u1 * iw, y: v1 * ih }, s01 = { x: u0 * iw, y: v1 * ih };
+            const d00 = IMG.bilinearPoint(c, u0, v0), d10 = IMG.bilinearPoint(c, u1, v0),
+                  d11 = IMG.bilinearPoint(c, u1, v1), d01 = IMG.bilinearPoint(c, u0, v1);
+            drawTriangle(tctx, img, [s00, s10, s11], [d00, d10, d11]);
+            drawTriangle(tctx, img, [s00, s11, s01], [d00, d11, d01]);
+          }
+          ctx.globalAlpha = op.opacity == null ? 1 : op.opacity;
+          ctx.drawImage(tmp, 0, 0);
+          return out;
+        }
         case 'stroke': {
           const out = cloneCanvas(inC); const ctx = out.getContext('2d');
           ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -353,8 +373,27 @@
     /* ---------- op factory / labels ---------- */
     const OP_LABEL = {
       rotate: 'Rotate', flip: 'Flip', crop: 'Crop', resize: 'Resize',
-      warp: 'Corner warp', stroke: 'Brush', text: 'Text', pixelate: 'Pixelate'
+      warp: 'Corner warp', stroke: 'Brush', text: 'Text', pixelate: 'Pixelate', overlay: 'Overlay image'
     };
+    // shallow-clone an op, deep-copying the mutable params we edit during a drag but
+    // keeping any image (canvas) by reference (image ops are not JSON-serializable)
+    function pointInPoly(p, pts) {
+      let inside = false;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
+        if (((yi > p.y) !== (yj > p.y)) && (p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi)) inside = !inside;
+      }
+      return inside;
+    }
+    function cloneOp(op) {
+      const c = { ...op };
+      if (op.corners) c.corners = op.corners.map(p => ({ ...p }));
+      if (op.rect) c.rect = { ...op.rect };
+      if (op.paths) c.paths = op.paths.map(p => p.map(q => ({ ...q })));
+      if (op.outline) c.outline = { ...op.outline };
+      if (op.shadow) c.shadow = { ...op.shadow };
+      return c;
+    }
     function opLabel(op) {
       if (op.type === 'rotate') return 'Rotate ' + ((((op.quarter % 4) + 4) % 4) * 90) + '°';
       if (op.type === 'flip') return 'Flip ' + (op.axis === 'h' ? 'horizontal' : 'vertical');
@@ -380,7 +419,8 @@
       }
     }
 
-    const HANDLE_OPS = { crop: 1, warp: 1, pixelate: 1, text: 1, stroke: 1 };
+    const HANDLE_OPS = { crop: 1, warp: 1, pixelate: 1, text: 1, stroke: 1, overlay: 1 };
+    const WARP_OPS = { warp: 1, overlay: 1 };   // corner-handle ops that use the padded viewport
 
     /* ============================================================ App ============================================================ */
     function App() {
@@ -397,6 +437,7 @@
       const rafRef = useRef(0);
       const [, forceHist] = useState(0);
       const fileInput = useRef(null);
+      const overlayInput = useRef(null);
       const canvasRef = useRef(null);
       const svgRef = useRef(null);
       const dragRef = useRef(null);
@@ -497,7 +538,7 @@
 
       // when warping, zoom out to a FIXED padded viewport (constant regardless of where
       // the corners are) so the zoom does not jump around; the margin is slider-adjustable
-      const warpVp = (selOp && selOp.type === 'warp' && inDims) ? (() => {
+      const warpVp = (selOp && WARP_OPS[selOp.type] && inDims) ? (() => {
         const padX = Math.round(inDims.w * warpMargin), padY = Math.round(inDims.h * warpMargin);
         return { x: -padX, y: -padY, w: inDims.w + 2 * padX, h: inDims.h + 2 * padY };
       })() : null;
@@ -554,6 +595,24 @@
         if (last && last.type === 'flip' && last.axis === axis) { commit(ops.slice(0, -1), null); return; }
         const op = { id: uid(), type: 'flip', enabled: true, axis }; commit([...ops, op], null);
       }
+      function addOverlayFile(file) {
+        if (!source || !file || file.type.indexOf('image/') !== 0) return;
+        createImageBitmap(file).then(bmp => {
+          const scale = Math.min(1, WORKING_MAX / Math.max(bmp.width, bmp.height));
+          const iw = Math.max(1, Math.round(bmp.width * scale)), ih = Math.max(1, Math.round(bmp.height * scale));
+          const cv = newCanvas(iw, ih); cv.getContext('2d').drawImage(bmp, 0, 0, iw, ih);
+          if (bmp.close) bmp.close();
+          const d = curDims, ar = iw / ih;
+          let w = d.w * 0.5, h = w / ar;
+          if (h > d.h * 0.6) { h = d.h * 0.6; w = h * ar; }
+          const x = (d.w - w) / 2, y = (d.h - h) / 2;
+          const op = {
+            id: uid(), type: 'overlay', enabled: true, img: cv, opacity: 1,
+            corners: [{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }]
+          };
+          commit([...ops, op], op.id);
+        }).catch(() => alert('Could not read that image.'));
+      }
       function updateOp(id, patch) {
         const key = id + ':' + Object.keys(patch).join(',');
         commitEdit(ops.map(o => o.id === id ? { ...o, ...patch } : o), key);
@@ -582,8 +641,7 @@
       }
       function beginDraft() {
         // start a live editing session cloned from the committed op
-        const clone = JSON.parse(JSON.stringify(ops.find(o => o.id === selId)));
-        return clone;
+        return cloneOp(ops.find(o => o.id === selId));
       }
       function setLive(draftOp) {
         setLiveOps(ops.map(o => o.id === selId ? draftOp : o));
@@ -599,10 +657,12 @@
         const p = evtPoint(e);
         const hr = 10 / p.scale; // hit radius in input px
         const draft = beginDraft();
-        if (selOp.type === 'warp') {
+        if (WARP_OPS[selOp.type]) {
           let idx = -1, best = hr;
           draft.corners.forEach((c, i) => { const dd = Math.hypot(c.x - p.x, c.y - p.y); if (dd < best) { best = dd; idx = i; } });
-          dragRef.current = { draft, mode: idx >= 0 ? 'corner' : null, idx };
+          if (idx >= 0) dragRef.current = { draft, mode: 'corner', idx };
+          else if (pointInPoly(p, draft.corners)) dragRef.current = { draft, mode: 'moveQuad', start: { x: p.x, y: p.y }, orig: draft.corners.map(c => ({ ...c })) };
+          else dragRef.current = null;
         } else if (selOp.type === 'text') {
           dragRef.current = { draft, mode: 'move', off: { x: p.x - draft.x, y: p.y - draft.y } };
         } else if (selOp.type === 'stroke') {
@@ -623,6 +683,10 @@
         const dr = dragRef.current; if (!dr || !dr.mode) return;
         const p = evtPoint(e); const d = dr.draft;
         if (dr.mode === 'corner') { d.corners[dr.idx] = { x: p.x, y: p.y }; }
+        else if (dr.mode === 'moveQuad') {
+          const dx = p.x - dr.start.x, dy = p.y - dr.start.y;
+          d.corners = dr.orig.map(c => ({ x: c.x + dx, y: c.y + dy }));
+        }
         else if (dr.mode === 'move') { d.x = p.x - dr.off.x; d.y = p.y - dr.off.y; }
         else if (dr.mode === 'draw') { d.paths[d.paths.length - 1].push({ x: p.x, y: p.y }); }
         else if (dr.mode === 'moveRect') {
@@ -685,6 +749,8 @@
           </div>
           <input type="file" accept="image/*" ref={fileInput} style={{ display: 'none' }}
                  onChange={e => { if (e.target.files[0]) onFile(e.target.files[0]); e.target.value = ''; }} />
+          <input type="file" accept="image/*" ref={overlayInput} style={{ display: 'none' }}
+                 onChange={e => { if (e.target.files[0]) addOverlayFile(e.target.files[0]); e.target.value = ''; }} />
 
           <div className="ie-wrap">
             {/* ---------- stage ---------- */}
@@ -710,8 +776,8 @@
                         {cs.map((c, i) => <rect key={i} x={c[0] - handleR} y={c[1] - handleR} width={handleR * 2} height={handleR * 2} fill="#fff" stroke="#111" strokeWidth={strokeW} />)}
                       </g>;
                     })()}
-                    {/* warp quad (with the fixed output frame shown dashed) */}
-                    {selOp.type === 'warp' && (() => {
+                    {/* warp / overlay quad (with the base frame shown dashed) */}
+                    {WARP_OPS[selOp.type] && (() => {
                       const c = selOp.corners;
                       return <g>
                         <rect x={0} y={0} width={inDims.w} height={inDims.h} fill="none"
@@ -744,6 +810,7 @@
                 <button className="ie-tool-btn" onClick={() => addOp('text')}>Text</button>
                 <button className="ie-tool-btn" onClick={() => addOp('pixelate')}>Pixelate</button>
                 <button className="ie-tool-btn" onClick={() => addOp('warp')}>Corner warp</button>
+                <button className="ie-tool-btn" onClick={() => overlayInput.current.click()}>Overlay image</button>
               </div>
 
               <div className="ie-history">
@@ -887,6 +954,23 @@
               <div className="ie-field"><label>Offset Y: {op.shadow.dy}</label><input type="range" min={-Math.round(op.size / 3)} max={Math.round(op.size / 3)} value={op.shadow.dy} onChange={e => onChange({ shadow: { ...op.shadow, dy: +e.target.value } })} /></div>
             </div>
           </div>}
+        </div>;
+      }
+      if (op.type === 'overlay') {
+        const opa = op.opacity == null ? 1 : op.opacity;
+        const straighten = () => {
+          const xs = op.corners.map(c => c.x), ys = op.corners.map(c => c.y);
+          const x0 = Math.min.apply(null, xs), y0 = Math.min.apply(null, ys);
+          const x1 = Math.max.apply(null, xs), y1 = Math.max.apply(null, ys);
+          onChange({ corners: [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }] });
+        };
+        return <div className="ie-controls"><h4>{title}</h4>
+          <p style={{ fontSize: '.78rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>Drag a corner to warp, or drag the middle to move the overlay. The dashed rectangle is the base image.</p>
+          <div className="ie-field"><label>Opacity: {Math.round(opa * 100)}%</label>
+            <input type="range" min="0.05" max="1" step="0.05" value={opa} onChange={e => onChange({ opacity: +e.target.value })} /></div>
+          <div className="ie-field"><label>Working margin: {Math.round(warpMargin * 100)}% per side</label>
+            <input type="range" min="0" max="2" step="0.05" value={warpMargin} onChange={e => onMargin(+e.target.value)} /></div>
+          <button className="secondary" style={{ width: '100%', margin: 0 }} onClick={straighten}>Straighten to rectangle</button>
         </div>;
       }
       if (op.type === 'warp') {
