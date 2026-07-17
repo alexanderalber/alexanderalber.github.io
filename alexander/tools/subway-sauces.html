@@ -14,6 +14,32 @@
   <link rel="stylesheet" href="/assets/css/pico.min.css">
   <link rel="stylesheet" href="/assets/css/custom.css">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+
+  <!-- ── Saucen-Guide Animationen: Keyframes (prefix sg- vermeidet Kollisionen) ── -->
+  <style>
+    @keyframes sg-draw{ to { stroke-dashoffset:0 } }
+    @keyframes sg-move{
+      0%{ transform:translate(24px,112px) rotate(-15deg) }
+      12.5%{ transform:translate(77.1px,95.5px) rotate(2deg) }
+      25%{ transform:translate(132.2px,109.8px) rotate(7deg) }
+      37.5%{ transform:translate(188.2px,115.9px) rotate(-5deg) }
+      50%{ transform:translate(238.1px,89px) rotate(-11deg) }
+      62.5%{ transform:translate(292.1px,71.7px) rotate(-3deg) }
+      75%{ transform:translate(348.8px,73.9px) rotate(4deg) }
+      87.5%{ transform:translate(403.6px,89.5px) rotate(8deg) }
+      100%{ transform:translate(456px,112px) rotate(10deg) }
+    }
+    @keyframes sg-squeeze{ from{ transform:scaleY(1) } to { transform:scaleY(.92) } }
+    @keyframes sg-drip{
+      0%{ transform:translateY(-6px); opacity:0 }
+      16%{ opacity:1 }
+      80%{ opacity:1 }
+      100%{ transform:translateY(96px); opacity:0 }
+    }
+    @keyframes sg-fade-out{ from{ opacity:1 } to { opacity:0 } }
+    @keyframes sg-fade-in{ from{ opacity:0 } to { opacity:1 } }
+  </style>
+
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/babel.min.js"></script>
@@ -77,9 +103,15 @@
   </main>
 
   <script type="text/babel">
-    const { useState, useMemo, useEffect } = React;
+    const { useState, useMemo, useEffect, useRef, useLayoutEffect } = React;
 
     const LANG = localStorage.getItem('lang') || 'de';
+
+    /* ── Animations-Einstellungen (deine gewählten Werte) ── */
+    const SQUEEZE_MS = 1000;  // Dauer, in der die Flasche die Saucenlinie zeichnet
+    const FLIP_MS    = 600;   // Dauer der Spalten-Umsortierung
+    const IDLE_MS    = 8000;  // Wartezeit ohne Interaktion bis zum Saucentropfen
+    const FADE_MS    = 500;   // Aus-/Einblenden beim Übergang
 
     const MENUS = [
       { id: 'de_2026_06', labelDe: 'Deutschland Juni 2026', labelEn: 'Germany June 2026', file: '/assets/files/subway_de_2026_06.json' },
@@ -151,6 +183,13 @@
       return (0.299 * r + 0.587 * g + 0.114 * b) > 145 ? '#1e293b' : '#f1f5f9';
     }
 
+    /* ── Tropfen-Pfad: Spitze oben, runder Bauch unten ── */
+    function dropPath(x, y) {
+      return `M${x},${y - 13} C ${x + 9},${y - 3} ${x + 8.5},${y + 4} ${x + 8.5},${y + 5}`
+           + ` A 8.5 8.5 0 1 1 ${x - 8.5},${y + 5}`
+           + ` C ${x - 9},${y - 3} ${x},${y - 13} Z`;
+    }
+
     /* ── Layout constants ── */
     const LEFT = 182;  // sandwich label width
     const CW   = 42;   // cell width
@@ -158,6 +197,34 @@
     const TOP  = 142;  // space above cells for rotated column headers
     const RPAD = 112;  // right pad (accommodates diagonal label overhang)
     const BPAD = 12;
+
+    /* ── Animation #1: Squeeze-Flasche zeichnet die Saucenlinie ── */
+    function SauceLoader({ fading, loadingText }) {
+      const body = '#cbd5e1', cap = '#8b98a8', sauce = '#0e9a9a';
+      return (
+        <div style={{padding:'44px 0 60px', minHeight:210, animation: fading ? `sg-fade-out ${FADE_MS}ms ease forwards` : 'none'}}>
+          <svg width={480} height={160} style={{maxWidth:'100%', display:'block', overflow:'visible'}}>
+            {/* Saucenlinie – wird per stroke-dashoffset linear enthüllt */}
+            <path
+              d="M24,112 C 90,60 150,150 214,104 S 344,58 456,112"
+              fill="none" stroke="#0e9a9a" strokeWidth={9}
+              strokeLinecap="round" strokeLinejoin="round" pathLength={100}
+              style={{strokeDasharray:100, strokeDashoffset:100, animation:`sg-draw ${SQUEEZE_MS}ms linear forwards`}}
+            />
+            {/* Flasche – Düsenspitze im lokalen Ursprung (0,0), fährt entlang derselben Kurve */}
+            <g style={{transformBox:'view-box', transformOrigin:'0px 0px', animation:`sg-move ${SQUEEZE_MS}ms linear forwards`}}>
+              <rect x={-16} y={-78} width={32} height={52} rx={9} fill={body}
+                    style={{transformOrigin:'0px -26px', animation:'sg-squeeze 300ms ease-in-out infinite alternate'}}/>
+              <rect x={-9} y={-84} width={18} height={8} rx={2} fill={cap}/>
+              <rect x={-6} y={-26} width={12} height={15} rx={3} fill={cap}/>
+              <path d="M-6,-12 L6,-12 L0,0 Z" fill={cap}/>
+              <circle cx={0} cy={0} r={3.5} fill={sauce}/>
+            </g>
+            <text x={24} y={150} fontSize={13} fill="#64748b" fontFamily="inherit">{loadingText}</text>
+          </svg>
+        </div>
+      );
+    }
 
     /* ── Component ── */
     function SubwaySauces() {
@@ -169,12 +236,45 @@
       const [sorted,   setSorted]   = useState(true);
       const [selected, setSelected] = useState(null);
 
+      // Übergangsphase: 'squeeze' → 'fadeout' → 'fadein' → 'done'
+      const [phase, setPhase] = useState('squeeze');
+      const [drip,  setDrip]  = useState(null);
+
+      const cellsSvgRef  = useRef(null);
+      const prevOrderRef = useRef(null);
+      const lastMoveRef  = useRef(0);
+
+      // Menüwechsel: Flasche zeichnen (min. SQUEEZE_MS, wartet auf fetch) → ausblenden → Tabelle einblenden
       useEffect(() => {
         setData(null);
         setSelected(null);
+        setDrip(null);
+        setPhase('squeeze');
+
+        let cancelled = false;
+        const timers = [];
+        const t0 = Date.now();
+
         fetch(menu.file)
           .then(r => r.json())
-          .then(setData);
+          .then(json => {
+            if (cancelled) return;
+            setData(json);
+            const wait = Math.max(0, SQUEEZE_MS - (Date.now() - t0));
+            timers.push(setTimeout(() => {
+              if (cancelled) return;
+              setPhase('fadeout');                         // 2) Flasche + Linie ausblenden
+              timers.push(setTimeout(() => {
+                if (cancelled) return;
+                setPhase('fadein');                        // 3) Tabelle einblenden
+                timers.push(setTimeout(() => {
+                  if (!cancelled) setPhase('done');
+                }, FADE_MS));
+              }, FADE_MS));
+            }, wait));
+          });
+
+        return () => { cancelled = true; timers.forEach(clearTimeout); };
       }, [menu]);
 
       const sandwiches = useMemo(() => data ? Object.keys(data.matrix) : [], [data]);
@@ -192,19 +292,68 @@
         });
       }, [data, sandwiches, visibleSandwiches, sorted]);
 
+      // ── Animation #3: FLIP – Spalten gleiten an ihre neue Position ──
+      useLayoutEffect(() => {
+        const svg = cellsSvgRef.current;
+        const cur = sauces;
+        const prev = prevOrderRef.current;
+        prevOrderRef.current = cur;
+        if (!svg || !prev || prev.length !== cur.length) return;
+        const oldIndex = {}; prev.forEach((k, i) => oldIndex[k] = i);
+        let changed = false;
+        cur.forEach((k, i) => { if (oldIndex[k] !== i) changed = true; });
+        if (!changed) return;
+        svg.querySelectorAll('[data-col]').forEach(node => {
+          const k = node.getAttribute('data-col');
+          const oi = oldIndex[k], ni = cur.indexOf(k);
+          if (oi == null || oi === ni) return;
+          const dx = (oi - ni) * CW;
+          node.style.transition = 'none';
+          node.style.transform = `translateX(${ni * CW + dx}px)`;
+          node.getBoundingClientRect();               // reflow erzwingen
+          requestAnimationFrame(() => {
+            node.style.transition = `transform ${FLIP_MS}ms cubic-bezier(.4,0,.2,1)`;
+            node.style.transform = `translateX(${ni * CW}px)`;
+          });
+        });
+      }, [sauces]);
+
+      // ── Animation #5: Idle-Tropfen ──
+      useEffect(() => {
+        if (phase !== 'done' || drip) return;   // nur wenn fertig & kein Tropfen aktiv
+        let id = setTimeout(fire, IDLE_MS);
+        function fire() {
+          if (!data) return;
+          const vs = selected ? sandwiches.filter(s => s === selected) : sandwiches;
+          if (!vs.length || !sauces.length) return;
+          const ci = Math.floor(Math.random() * sauces.length);
+          const ri = Math.floor(Math.random() * vs.length);
+          const score = data.matrix[vs[ri]][sauces[ci]];
+          setDrip({
+            key: Date.now(),
+            x: ci * CW + CW / 2,
+            y: TOP + ri * CH + CH - 3,
+            color: rgbStr(scoreToRgb(score, colormap)),
+          });
+        }
+        function onMove() {
+          const n = Date.now();
+          if (n - lastMoveRef.current < 400) return;
+          lastMoveRef.current = n;
+          clearTimeout(id);
+          id = setTimeout(fire, IDLE_MS);
+        }
+        window.addEventListener('pointermove', onMove);
+        return () => { clearTimeout(id); window.removeEventListener('pointermove', onMove); };
+      }, [phase, drip, data, sauces, selected, colormap, sandwiches]);
+
       const sauceLabel = key =>
         (LANG === 'en' && data.labels?.sauces?.en?.[key]) || key;
 
       const svgW = LEFT + sauces.length * CW + RPAD;
       const svgH = TOP  + visibleSandwiches.length * CH + BPAD;
 
-      if (!data) {
-        return (
-          <div className="container" style={{paddingTop: 32}}>
-            <p style={{color:'#94a3b8'}}>{t.loading}</p>
-          </div>
-        );
-      }
+      const showLoader = phase === 'squeeze' || phase === 'fadeout' || !data;
 
       return (
         <div className="container" style={{paddingTop:'var(--pico-spacing)', paddingBottom:40}}>
@@ -270,96 +419,109 @@
             </div>
           </div>
 
-          {/* ── Heatmap ── */}
-          <div style={{display:'flex', alignItems:'flex-start'}}>
+          {/* ── Heatmap-Bereich: Loader (squeeze/fadeout) oder Tabelle (fadein/done) ── */}
+          {showLoader ? (
+            <SauceLoader fading={phase === 'fadeout'} loadingText={t.loading} />
+          ) : (
+            <div style={{display:'flex', alignItems:'flex-start', animation: phase === 'fadein' ? `sg-fade-in ${FADE_MS}ms ease both` : 'none'}}>
 
-            {/* ─ Left: sticky sandwich labels ─ */}
-            <svg
-              width={LEFT}
-              height={svgH}
-              style={{display:'block', fontFamily:'inherit', flexShrink:0}}
-            >
-              {visibleSandwiches.map((sandwich, ri) => {
-                const cy = TOP + ri * CH + CH / 2;
-                return (
-                  <text
-                    key={'row-' + ri}
-                    x={LEFT - 8}
-                    y={cy}
-                    textAnchor="end"
-                    dominantBaseline="middle"
-                    fontSize={13}
-                    fill="#cbd5e1"
-                    style={{userSelect:'none', cursor:'pointer'}}
-                    onClick={() => setSelected(selected === sandwich ? null : sandwich)}
-                  >
-                    {sandwich}
-                  </text>
-                );
-              })}
-            </svg>
-
-            {/* ─ Right: scrollable sauce labels + cells ─ */}
-            <div style={{overflowX:'auto'}}>
+              {/* ─ Left: sticky sandwich labels ─ */}
               <svg
-                width={sauces.length * CW + RPAD}
+                width={LEFT}
                 height={svgH}
-                style={{display:'block', fontFamily:'inherit'}}
+                style={{display:'block', fontFamily:'inherit', flexShrink:0}}
               >
-                {/* ─ Sauce column labels ─ */}
-                {sauces.map((sauce, ci) => {
-                  const ax = ci * CW + CW / 2;
-                  const ay = TOP - 2;
+                {visibleSandwiches.map((sandwich, ri) => {
+                  const cy = TOP + ri * CH + CH / 2;
                   return (
                     <text
-                      key={'col-' + ci}
-                      transform={`translate(${ax},${ay}) rotate(-45)`}
-                      textAnchor="start"
-                      dominantBaseline="auto"
+                      key={'row-' + ri}
+                      x={LEFT - 8}
+                      y={cy}
+                      textAnchor="end"
+                      dominantBaseline="middle"
                       fontSize={13}
-                      fill="#94a3b8"
-                      style={{userSelect:'none'}}
+                      fill="#cbd5e1"
+                      style={{userSelect:'none', cursor:'pointer'}}
+                      onClick={() => setSelected(selected === sandwich ? null : sandwich)}
                     >
-                      {sauceLabel(sauce)}
+                      {sandwich}
                     </text>
                   );
                 })}
-
-                {/* ─ Cells ─ */}
-                {visibleSandwiches.flatMap((sandwich, ri) =>
-                  sauces.map((sauce, ci) => {
-                    const score = data.matrix[sandwich][sauce];
-                    const rgb   = scoreToRgb(score, colormap);
-                    const x = ci * CW;
-                    const y = TOP + ri * CH;
-                    return (
-                      <g key={ri + '-' + ci}>
-                        <rect
-                          x={x + 1} y={y + 1}
-                          width={CW - 2} height={CH - 2}
-                          rx={3}
-                          fill={rgbStr(rgb)}
-                        />
-                        <text
-                          x={x + CW / 2}
-                          y={y + CH / 2}
-                          textAnchor="middle"
-                          dominantBaseline="middle"
-                          fontSize={11}
-                          fontWeight={Math.abs(score) === 3 ? 700 : 400}
-                          fill={textColorForBg(rgb)}
-                          style={{pointerEvents:'none', userSelect:'none'}}
-                        >
-                          {score > 0 ? '+' + score : score}
-                        </text>
-                      </g>
-                    );
-                  })
-                )}
               </svg>
-            </div>
 
-          </div>
+              {/* ─ Right: scrollable sauce labels + cells ─ */}
+              <div style={{overflowX:'auto'}}>
+                <svg
+                  ref={cellsSvgRef}
+                  width={sauces.length * CW + RPAD}
+                  height={svgH}
+                  style={{display:'block', fontFamily:'inherit'}}
+                >
+                  {/* ─ Eine <g data-col> pro Spalte: Label + Zellen, per translateX positioniert (FLIP) ─ */}
+                  {sauces.map((sauce, ci) => (
+                    <g
+                      key={sauce}
+                      data-col={sauce}
+                      style={{transform:`translateX(${ci * CW}px)`, transition:`transform ${FLIP_MS}ms cubic-bezier(.4,0,.2,1)`}}
+                    >
+                      <text
+                        transform={`translate(${CW / 2},${TOP - 2}) rotate(-45)`}
+                        textAnchor="start"
+                        dominantBaseline="auto"
+                        fontSize={13}
+                        fill="#94a3b8"
+                        style={{userSelect:'none'}}
+                      >
+                        {sauceLabel(sauce)}
+                      </text>
+                      {visibleSandwiches.map((sandwich, ri) => {
+                        const score = data.matrix[sandwich][sauce];
+                        const rgb   = scoreToRgb(score, colormap);
+                        const y = TOP + ri * CH;
+                        return (
+                          <g key={ri}>
+                            <rect
+                              x={1} y={y + 1}
+                              width={CW - 2} height={CH - 2}
+                              rx={3}
+                              fill={rgbStr(rgb)}
+                            />
+                            <text
+                              x={CW / 2}
+                              y={y + CH / 2}
+                              textAnchor="middle"
+                              dominantBaseline="middle"
+                              fontSize={11}
+                              fontWeight={Math.abs(score) === 3 ? 700 : 400}
+                              fill={textColorForBg(rgb)}
+                              style={{pointerEvents:'none', userSelect:'none'}}
+                            >
+                              {score > 0 ? '+' + score : score}
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </g>
+                  ))}
+
+                  {/* ─ Idle-Tropfen ─ */}
+                  {drip && (
+                    <g
+                      key={drip.key}
+                      onAnimationEnd={() => setDrip(null)}
+                      style={{animation:'sg-drip 1.9s cubic-bezier(.55,0,.85,.4) forwards'}}
+                    >
+                      <path d={dropPath(drip.x, drip.y)} fill={drip.color} stroke="rgba(0,0,0,.28)" strokeWidth={1}/>
+                      <ellipse cx={drip.x - 2.6} cy={drip.y + 2} rx={1.8} ry={3} fill="rgba(255,255,255,.5)"/>
+                    </g>
+                  )}
+                </svg>
+              </div>
+
+            </div>
+          )}
 
           {/* ── Source note ── */}
           <p style={{marginTop:24, fontSize:11, color:'#64748b', lineHeight:1.7}}>
