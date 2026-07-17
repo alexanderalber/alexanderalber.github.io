@@ -476,6 +476,36 @@
       return { byTA: byTA, byT: byT, byShort: byShort };
     }
 
+    // v5 search corpus: title + author + series name as one key per book; the
+    // volume titles (vt) are kept separate so the UI can say WHY a series card
+    // matched ("vol. 3 · …") instead of silently surfacing an unrelated-looking name.
+    function buildSearchIndex(books) {
+      const base = books.map(function (b) {
+        return normKey(b.t + ' ' + b.a + (b.s ? ' ' + b.s : ''));
+      });
+      const vols = books.map(function (b) {
+        return b.vt ? b.vt.map(function (v) { return normKey(v[1]); }) : null;
+      });
+      return { base: base, vols: vols };
+    }
+
+    // Substring search over the index. Returns up to `limit` hits as
+    // [{ i, vol }] where vol is the matching [num, title] pair when the hit came
+    // only through a volume title (null for direct title/author/series matches).
+    function searchCatalog(books, sidx, query, limit) {
+      const q = normKey(query);
+      const out = [];
+      if (q.length < 2) return out;
+      for (let i = 0; i < books.length && out.length < limit; i++) {
+        if (sidx.base[i].includes(q)) out.push({ i: i, vol: null });
+        else if (sidx.vols[i]) {
+          const k = sidx.vols[i].findIndex(function (t) { return t.includes(q); });
+          if (k >= 0) out.push({ i: i, vol: books[i].vt[k] });
+        }
+      }
+      return out;
+    }
+
     // Resolve a catalog index from a normalized (title, author) pair: exact match first,
     // then author-lastname, then title-only / short-title when unique. null = no safe match.
     function resolveByName(prep, index, title, author) {
@@ -574,7 +604,8 @@
       smoothGrid: smoothGrid, loo: loo, clusterRated: clusterRated,
       detectDelim: detectDelim, parseCSV: parseCSV, csvField: csvField, exportCSV: exportCSV,
       normKey: normKey, buildMatchIndex: buildMatchIndex, importRatings: importRatings,
-      resolveByName: resolveByName, remapEntries: remapEntries
+      resolveByName: resolveByName, remapEntries: remapEntries,
+      buildSearchIndex: buildSearchIndex, searchCatalog: searchCatalog
     };
   })();
   </script>
@@ -750,6 +781,40 @@
     }
 
     /* ── Small shared components ───────────────────────────────────────── */
+    // v5 series display (handoff §4): series entries show under their series name.
+    // b.t stays the catalog/remap key (CSV export, localStorage) — never dispTitle there.
+    const dispTitle = b => b.s || b.t;
+    // The representative title (usually vol 1) is shown only when it adds anything:
+    // not equal to the series name and not already in the volume list.
+    function repTitle(b) {
+      if (!b.s || M.normKey(b.t) === M.normKey(b.s)) return null;
+      if (b.vt && b.vt.some(v => M.normKey(v[1]) === M.normKey(b.t))) return null;
+      return b.t;
+    }
+    // Numbered volume titles from `vt`; long series collapse behind "… and N more".
+    // vt is capped at 20 by the export, so the count can understate very long series.
+    function VolList({ b, collapsed = 4 }) {
+      const [open, setOpen] = useState(false);
+      if (!b.vt || !b.vt.length) return null;
+      const items = open ? b.vt : b.vt.slice(0, collapsed);
+      const rest = b.vt.length - items.length;
+      return (
+        <div style={{ fontSize: 12, color: C.label, lineHeight: 1.6, margin: '2px 0 6px' }}>
+          {items.map(([n, t]) => (
+            <div key={n} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span style={{ color: C.foot, fontVariantNumeric: 'tabular-nums' }}>{String(n)}</span> · {t}
+            </div>
+          ))}
+          {(rest > 0 || open) && (
+            <a href="#" style={{ color: C.foot, fontSize: 11.5 }}
+              onClick={e => { e.preventDefault(); setOpen(!open); }}>
+              {open ? 'show fewer' : `… and ${rest} more`}
+            </a>
+          )}
+        </div>
+      );
+    }
+
     function Seg({ options, value, onChange }) {
       return (
         <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap' }}>
@@ -1003,7 +1068,7 @@
           </svg>
           {hover && (
             <div className="rec-tip" style={{ left: Math.min(sx(hover.r) / W * 100, 72) + '%', top: 4 }}>
-              <strong>{model.prep.books[hover.j].t}</strong><br />
+              <strong>{dispTitle(model.prep.books[hover.j])}</strong><br />
               rank {fmtN(hover.r + 1)} · {hover.mean.toFixed(1)}★<br />
               model band {hover.loe.toFixed(1)}–{hover.upe.toFixed(1)} · prediction {hover.lo.toFixed(1)}–{hover.up.toFixed(1)}
             </div>
@@ -1028,17 +1093,21 @@
 
     function QuestionCard({ model, comp, idx, nerd, onRate, onUnknown, onSkip, onNotInterested }) {
       const b = model.prep.books[idx];
+      const rep = repTitle(b);
       // Fixed geometry so cards don't jostle as long/short titles rotate through:
-      // title reserves 2 lines, meta lines are single-line ellipsis, controls pinned bottom.
+      // title reserves 2 lines, meta lines are single-line ellipsis, controls pinned
+      // bottom. Series cards grow with their volume list (owner-approved).
       const clamp2 = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
         overflow: 'hidden', minHeight: '2.7em' };
       const oneLine = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
       return (
         <div className="rec-card" style={{ display: 'flex', flexDirection: 'column', minHeight: 178 }}>
-          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{b.t}</div>
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{dispTitle(b)}</div>
           <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px', ...oneLine }}>
-            {b.a}{b.y ? ` · ${b.y}` : ''}{b.s ? ' · series' : ''}
+            {b.a}{b.y ? ` · ${b.y}` : ''}{b.s && !b.vt ? ' · series' : ''}
           </div>
+          {rep && <div style={{ fontSize: 12, color: C.label, ...oneLine }}>{rep}</div>}
+          <VolList b={b} collapsed={3} />
           <div style={{ marginBottom: 8, ...oneLine }}>
             <TagChips tags={b.g} />
             <span style={{ fontSize: 11.5, color: C.foot }}> · {POP(b.n)}</span>
@@ -1069,18 +1138,9 @@
         return cand.slice(0, 6);
       }, [comp, ratings, unknown, skipped, notInterested]);
 
-      const results = useMemo(() => {
-        const q = M.normKey(query);
-        if (q.length < 2) return [];
-        const out = [];
-        for (let j = 0; j < model.prep.n; j++) {
-          if (model.searchKeys[j].includes(q)) {
-            out.push(j);
-            if (out.length >= 8) break;
-          }
-        }
-        return out;
-      }, [query]);
+      const results = useMemo(
+        () => M.searchCatalog(model.prep.books, model.searchIdx, query, 8),
+        [query, model]);
 
       const ratedList = useMemo(() => [...ratings.entries()].reverse(), [ratings]);
 
@@ -1114,21 +1174,29 @@
           </div>
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 8px' }}>Rate a specific book</h3>
-          <input type="search" placeholder="Search by title or author…" value={query}
+          <input type="search" placeholder="Search by title, series, volume or author…" value={query}
             onChange={e => setQuery(e.target.value)} style={{ maxWidth: 420, marginBottom: 8 }} />
           {query.length >= 2 && results.length === 0 &&
             <p style={{ fontSize: 12.5, color: C.foot }}>No match in the {fmtN(model.prep.n)}-book catalog.</p>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
-            {results.map(j => {
+            {results.map(({ i: j, vol }) => {
               const b = model.prep.books[j];
+              const rep = repTitle(b);
               return (
                 <div key={j} className="rec-card" style={{ padding: 10 }}>
-                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{b.t}</div>
-                  <div style={{ fontSize: 12, color: C.label, marginBottom: 6 }}>
+                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{dispTitle(b)}</div>
+                  <div style={{ fontSize: 12, color: C.label, marginBottom: 2 }}>
                     {b.a}{b.y ? ` · ${b.y}` : ''}
                     {ratings.has(j) && <span style={{ color: C.gold }}> · rated {ratings.get(j).toFixed(1)}★</span>}
                   </div>
-                  <RateSlider initial={ratings.get(j)} onCommit={v => onRate(j, v)} />
+                  {vol && <div style={{ fontSize: 11.5, color: C.teal, marginBottom: 2 }}>
+                    matched vol. {String(vol[0])} · {vol[1]}
+                  </div>}
+                  {rep && <div style={{ fontSize: 12, color: C.label }}>{rep}</div>}
+                  <VolList b={b} collapsed={5} />
+                  <div style={{ marginTop: 4 }}>
+                    <RateSlider initial={ratings.get(j)} onCommit={v => onRate(j, v)} />
+                  </div>
                 </div>
               );
             })}
@@ -1149,7 +1217,7 @@
                 <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', borderBottom: `1px solid #1e293b`, flexWrap: 'wrap' }}>
                   <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', background: ratingColor(r), border: '1px solid #f1f5f9', flexShrink: 0 }} />
                   <span style={{ flex: '1 1 220px', fontSize: 13.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {b.t} <span style={{ color: C.foot, fontSize: 12 }}>· {b.a}</span>
+                    {dispTitle(b)} <span style={{ color: C.foot, fontSize: 12 }}>· {b.a}</span>
                   </span>
                   {nerd && <span style={{ fontSize: 11.5, color: C.foot }} title={LEV_TIP}>leverage {comp.lev[j].toFixed(3)}</span>}
                   <div style={{ flex: '0 0 190px' }}>
@@ -1213,14 +1281,14 @@
         const pos = arr.filter(x => x[1] > 0);
         if (!pos.length) return null;
         return pos.sort((x, y) => y[1] - x[1]).slice(0, 3)
-          .map(([i]) => model.prep.books[i].t);
+          .map(([i]) => dispTitle(model.prep.books[i]));
       }, [comp, idx]);
       return (
         <div style={{ padding: '9px 0', borderBottom: '1px solid #1e293b' }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
             <span style={{ color: C.foot, fontSize: 12, minWidth: 26, fontVariantNumeric: 'tabular-nums' }}>#{rank}</span>
             <span style={{ flex: '1 1 260px', fontSize: 14, color: C.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {b.t}
+              {dispTitle(b)}
               <span style={{ color: C.label, fontWeight: 400, fontSize: 12.5 }}> · {b.a}{b.y ? ` · ${b.y}` : ''}</span>
             </span>
             <TagChips tags={b.g} />
@@ -1244,6 +1312,7 @@
               <span title={LEV_TIP}>leverage {comp.lev[idx].toFixed(3)}</span>
             </div>
           )}
+          {b.vt && <div style={{ paddingLeft: 36 }}><VolList b={b} collapsed={3} /></div>}
           {b.vols && <div style={{ paddingLeft: 36 }}><FunnelMini vols={b.vols} ret={b.ret} explain={explain} /></div>}
           <div style={{ display: 'flex', alignItems: 'center', gap: 16, paddingLeft: 36, marginTop: 5, flexWrap: 'wrap' }}>
             <div style={{ flex: '0 0 200px' }}>
@@ -1436,7 +1505,7 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
-                <strong>{model.prep.books[tip.j].t}</strong><br />
+                <strong>{dispTitle(model.prep.books[tip.j])}</strong><br />
                 {model.prep.books[tip.j].a}<br />
                 P(like) {pct(comp.plike[tip.j])} · match p{Math.round(matchPct[tip.j])}
                 {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
@@ -1622,7 +1691,7 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 12, 0)}%` }}>
-                <strong>{model.prep.books[tip.j].t}</strong><br />
+                <strong>{dispTitle(model.prep.books[tip.j])}</strong><br />
                 {model.prep.books[tip.j].a}<br />
                 {ratings.has(tip.j)
                   ? <span style={{ color: C.gold }}>your rating: {ratings.get(tip.j).toFixed(1)}★</span>
@@ -1807,7 +1876,7 @@
                 <text key={w.j} x={TX(g2b(w.cx))} y={TY(g2b(w.cx), g2r(w.cy))} textAnchor="middle"
                   dominantBaseline="middle" fontSize={11} fill="#f1f5f9"
                   stroke="#0b1220" strokeWidth={2.6} style={{ paintOrder: 'stroke', fontWeight: 600, pointerEvents: 'none' }}>
-                  {trunc(model.prep.books[w.j].t, 22)}
+                  {trunc(dispTitle(model.prep.books[w.j]), 22)}
                 </text>
               ))}
               {/* Current-dial marker. */}
@@ -1816,7 +1885,7 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
-                <strong>{model.prep.books[tip.j].t}</strong><br />
+                <strong>{dispTitle(model.prep.books[tip.j])}</strong><br />
                 {model.prep.books[tip.j].a}<br />
                 {Math.round(tip.bl * 100)}% rating · risk {tip.rk >= 0 ? '+' : ''}{tip.rk.toFixed(2)}
                 {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
@@ -1890,7 +1959,7 @@
         const rmse = Math.sqrt(res.reduce((s, p) => s + (p.pred - p.actual) ** 2, 0) / res.length);
         return {
           rmse,
-          pts: res.map(p => ({ ...p, title: model.prep.books[p.idx].t }))
+          pts: res.map(p => ({ ...p, title: dispTitle(model.prep.books[p.idx]) }))
         };
       }, [ratedArr]);
 
@@ -2032,7 +2101,7 @@
                   {members.map(j => (
                     <div key={j} style={{ fontSize: 12.5, color: C.text, display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
                       <span style={{ width: 8, height: 8, borderRadius: '50%', background: ratingColor(ratings.get(j)), flexShrink: 0 }} />
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.prep.books[j].t}</span>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{dispTitle(model.prep.books[j])}</span>
                       <span style={{ color: C.foot, marginLeft: 'auto' }}>{ratings.get(j).toFixed(1)}</span>
                     </div>
                   ))}
@@ -2052,7 +2121,7 @@
               {niArr.map(j => (
                 <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '5px 0', borderBottom: '1px solid #1e293b' }}>
                   <span style={{ flex: '1 1 220px', fontSize: 13, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {model.prep.books[j].t} <span style={{ color: C.foot, fontSize: 12 }}>· {model.prep.books[j].a}</span>
+                    {dispTitle(model.prep.books[j])} <span style={{ color: C.foot, fontSize: 12 }}>· {model.prep.books[j].a}</span>
                   </span>
                   <button className="rec-x" title="Remove from not-interested" onClick={() => onNotInterestedRemove(j)}>✕</button>
                 </div>
@@ -2148,7 +2217,7 @@
             // (military-sf, space-opera) over blanket tags (fantasy, scifi, ya, childrens).
             const tagIdf = {};
             for (const [tag, cnt] of Object.entries(tagCounts)) tagIdf[tag] = Math.log(prep.n / cnt);
-            const searchKeys = prep.books.map(b => M.normKey(b.t + ' ' + b.a));
+            const searchIdx = M.buildSearchIndex(prep.books);   // t + a + s + vt titles
             const gridBase = M.smoothGrid(prep, base.plike, 60, 40, 0.08);
             const matchIndex = M.buildMatchIndex(prep);
             // Hydrate persisted state against this catalog (remaps on version mismatch).
@@ -2159,7 +2228,7 @@
             if (hyd.lost.length) setLost(hyd.lost);
             setModel({
               prep, base, baseCiMean: ciSum / prep.n, tagList, tagIdf, yMin, yMax,
-              searchKeys, gridBase, matchIndex
+              searchIdx, gridBase, matchIndex
             });
             setYearState([yMin, yMax]);
           })
