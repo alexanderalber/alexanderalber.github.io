@@ -353,10 +353,11 @@
   // ── Scatter chart ───────────────────────────────────────────────────────
   const W = 760, H = 460, M = { l: 46, r: 148, t: 14, b: 42 };
 
-  function niceCeil(x) {
-    const steps = [8, 12, 16, 24, 32, 48, 64, 80, 92, 96, 112, 128, 160, 192, 256];
-    for (const s of steps) if (x <= s) return s;
-    return Math.ceil(x / 64) * 64;
+  // Log-axis right edge: smallest clean cap that covers the data; 96 GB floor
+  // keeps the workstation class (RTX Pro 6000) in view.
+  function xAxisMax(need) {
+    const caps = [96, 128, 192, 256, 384, 512];
+    return caps.find(v => v >= need) || Math.ceil(need / 128) * 128;
   }
 
   // Nudge overlapping right-edge labels apart (lines stay at their true y).
@@ -372,18 +373,19 @@
     const [hover, setHover] = useState(null);
     const wrapRef = useRef(null);
 
-    // 92 GB floor so the workstation class (RTX Pro 6000) is always in view.
-    const xmax = niceCeil(Math.max(92, budget * 1.15, ...rows.map(r => r.cfg.need.total) ));
-    const ymax = 100; // fixed 0-100 index scale
-    const X = v => M.l + v / xmax * (W - M.l - M.r);
+    // Log x-axis: VRAM spans a wide range and the interesting models cluster low.
+    const xmin = 2;
+    const xmax = xAxisMax(Math.max(92, budget * 1.05, ...rows.map(r => r.cfg.need.total)));
+    const lx = v => Math.log(Math.max(v, xmin));
+    const X = v => M.l + (lx(v) - lx(xmin)) / (lx(xmax) - lx(xmin)) * (W - M.l - M.r);
+    // Dynamic y-top: tightest scale that still shows the top anchor, plus headroom.
+    const ymax = Math.min(100, Math.ceil((Math.max(...anchors.map(a => a.score.hi), ...rows.map(r => r.cfg.score.hi)) + 5) / 5) * 5);
     const Y = v => H - M.b - v / ymax * (H - M.t - M.b);
 
     const pts = rows.map(r => ({ r, x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
     const frontier = C.pareto(rows).map(r => ({ x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
 
-    const xticks = [];
-    const xstep = xmax <= 32 ? 4 : xmax <= 96 ? 8 : 16;
-    for (let v = 0; v <= xmax; v += xstep) xticks.push(v);
+    const xticks = [2, 4, 8, 16, 32, 64, 96, 128, 192, 256].filter(v => v >= xmin && v <= xmax);
     const yticks = [];
     for (let v = 0; v <= ymax; v += 10) yticks.push(v);
 
@@ -472,6 +474,12 @@
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const fmtYm = n => MONTHS[n % 12] + ' ' + Math.floor(n / 12);
 
+  // The log-odds regression / extrapolation is kept in the code but hidden for
+  // now: on the current data its arrival dates are not realistic, so we show the
+  // frontier history only and let the reader extend the trend by eye. Flip this
+  // back to true (and the fitTrend/trendPredict/trendCrossing machinery revives).
+  const SHOW_TREND_FIT = false;
+
   function TrendChart({ rows, anchors, snapshot }) {
     const [hover, setHover] = useState(null);
     const wrapRef = useRef(null);
@@ -485,9 +493,9 @@
     );
 
     const cur = events[events.length - 1].score;
-    const horizon = 18;
+    const horizon = SHOW_TREND_FIT ? 18 : 3; // little future room when only history is shown
     const t0 = events[0].t - 2, t1 = nowT + horizon;
-    const ymax = 100; // fixed 0-100 index scale
+    const ymax = Math.min(100, Math.ceil((Math.max(...anchors.map(a => a.score.hi), ...events.map(e => e.score), SHOW_TREND_FIT ? ceil : 0) + 5) / 5) * 5);
     const X = t => M.l + (t - t0) / (t1 - t0) * (W - M.l - M.r);
     const Y = v => H - M.b - v / ymax * (H - M.t - M.b);
 
@@ -528,8 +536,8 @@
           <text x={14} y={(M.t + H - M.b) / 2} textAnchor="middle" fontSize="12" fill={COL.label} transform={'rotate(-90 14 ' + (M.t + H - M.b) / 2 + ')'}>best index that fits this GPU</text>
 
           {(() => {
-            const items = anchors.map(a => ({ key: a.id, y: a.score.mid, label: a.label, ceiling: false }))
-              .concat([{ key: 'ceiling', y: ceil, label: 'modeled ceiling', ceiling: true }]);
+            const items = anchors.map(a => ({ key: a.id, y: a.score.mid, label: a.label, ceiling: false }));
+            if (SHOW_TREND_FIT) items.push({ key: 'ceiling', y: ceil, label: 'modeled ceiling', ceiling: true });
             const lys = spreadYs(items.map(it => Y(it.y)), 12);
             return items.map((it, i) => (
               <g key={it.key}>
@@ -546,7 +554,7 @@
           <text x={X(nowT) + 4} y={M.t + 11} fontSize="11" fill={COL.foot}>today</text>
 
           {/* prediction band (widens away from the data) + fitted mid line */}
-          {fit && <>
+          {SHOW_TREND_FIT && fit && <>
             <polygon points={
               samples.map(s => X(s.t) + ',' + clampY(s.p.hi)).join(' ') + ' ' +
               samples.slice().reverse().map(s => X(s.t) + ',' + clampY(s.p.lo)).join(' ')}
@@ -599,23 +607,23 @@
 
     return (
       <>
-        <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>If this pace continues</h2>
+        <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>{SHOW_TREND_FIT ? 'If this pace continues' : 'Local frontier over time'}</h2>
         <p style={{ color: COL.label, fontSize: 14, maxWidth: '78ch' }}>
           Each dot is the moment a newly released open-weight model raised the best quality this GPU can run
-          (at the context and KV settings above). The dashed curve is a trend fit through those moments
-          (linear in log-odds, so it flattens as it nears a modeled ceiling instead of marching to 100),
-          the shaded band its uncertainty, extended 18 months ahead. The ceiling ({fmt0(ceil)}) is not a
-          measurement: it is a deliberately cautious assumption, an average of "no ceiling" (100) and
-          "capped near today's best reference model" ({top ? top.label + ', ' + fmt0(top.score.mid) : '?'}),
-          so the curve does not simply sail past current frontier quality forever.
+          (at the context and KV settings above), read against the same closed reference lines as above.
+          {SHOW_TREND_FIT
+            ? <> The dashed curve is a trend fit through those moments (linear in log-odds, flattening as it
+                nears a modeled ceiling of {fmt0(ceil)} rather than marching to 100), the shaded band its
+                uncertainty, extended 18 months ahead.</>
+            : <> Extend the trend by eye: how far the next open-weight releases might climb, and when, is left to you.</>}
         </p>
-        {sentence && <div className="lf-card" style={{ marginBottom: 14 }}><p style={{ margin: 0, color: COL.text }}>{sentence}</p></div>}
-        {!fit && events.length > 0 &&
-          <p style={{ color: COL.foot, fontSize: 13 }}>Fewer than three frontier events at this budget; no extrapolation, the history alone is shown.</p>}
+        {SHOW_TREND_FIT && sentence && <div className="lf-card" style={{ marginBottom: 14 }}><p style={{ margin: 0, color: COL.text }}>{sentence}</p></div>}
         <TrendChart rows={rows} anchors={anchors} snapshot={snapshot} />
         <p style={{ fontSize: 11, color: COL.foot, marginTop: 6, lineHeight: 1.6 }}>
-          Naive trend fit (linear in log-odds of the bounded index) over {events.length} data points, within one benchmark snapshot. Progress arrives in jumps,
-          benchmarks saturate and get rebased, and past pace guarantees nothing. Treat the date as entertainment with error bars.
+          {events.length} frontier steps within one benchmark snapshot.
+          {SHOW_TREND_FIT
+            ? <> Naive trend fit in log-odds of the bounded index. Progress arrives in jumps, benchmarks saturate and get rebased, and past pace guarantees nothing. Treat the date as entertainment with error bars.</>
+            : <> The index gets rebased over time, so different snapshots are not comparable and this history stops at the current one.</>}
         </p>
       </>
     );
