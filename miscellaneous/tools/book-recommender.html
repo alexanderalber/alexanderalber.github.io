@@ -1,0 +1,1505 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Book Recommender - Alexander Alber</title>
+  <meta name="description" content="Rate the fantasy &amp; sci-fi books you know and get recommendations with calibrated probabilities, honest uncertainty bands and a taste map. Runs fully in your browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/book-recommender.html">
+  <meta property="og:title" content="Book Recommender – Fantasy &amp; Sci-Fi with Calibrated Uncertainty">
+  <meta property="og:description" content="Rate the fantasy &amp; sci-fi books you know and get recommendations with calibrated probabilities, honest uncertainty bands and a taste map. Runs fully in your browser.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/book-recommender.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Multi-button segmented control (same pattern as the input-shaper tool). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+
+    .rec-card { border: 1px solid #334155; border-radius: 8px; padding: 12px;
+      background: rgba(15,23,42,.55); }
+    .rec-pill { display:inline-block; border:1px solid #334155; border-radius:999px;
+      padding:2px 10px; margin:0 6px 6px 0; font-size:12.5px; color:#94a3b8;
+      background:transparent; cursor:pointer; line-height:1.5; }
+    .rec-pill.on { border-color:#0fb5ad; color:#0fb5ad; background:rgba(15,181,173,.09); }
+    .rec-x { background:none; border:none; color:#64748b; cursor:pointer; font-size:15px;
+      padding:2px 6px; line-height:1; }
+    .rec-x:hover { color:#cbd5e1; }
+    .rec-tip { position:absolute; pointer-events:none; background:#0f172a;
+      border:1px solid #334155; border-radius:6px; padding:6px 9px; font-size:12.5px;
+      color:#cbd5e1; max-width:260px; z-index:30; line-height:1.5; }
+    .rec-svgwrap { position:relative; }
+    .rec-svgwrap svg { display:block; width:100%; height:auto; }
+
+    /* Dual-handle range slider (pattern from namenfinder, dark palette) */
+    .dual-thumb { position:absolute; left:0; width:100%; top:50%; transform:translateY(-50%);
+      height:0; pointer-events:none; -webkit-appearance:none; appearance:none;
+      background:transparent; outline:none; margin:0; padding:0; border:0; }
+    .dual-thumb::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px;
+      border-radius:50%; background:#0fb5ad; cursor:pointer; pointer-events:all;
+      border:2.5px solid #0f172a; box-shadow:0 1px 5px rgba(15,181,173,.4); }
+    .dual-thumb::-moz-range-thumb { width:16px; height:16px; border-radius:50%;
+      background:#0fb5ad; cursor:pointer; pointer-events:all;
+      border:2.5px solid #0f172a; box-shadow:0 1px 5px rgba(15,181,173,.4); }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Book Recommender",
+    "description": "Rate the fantasy & sci-fi books you know and get personalized recommendations with calibrated probabilities, honest uncertainty bands and a 2-D taste map. All computation runs client-side in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/book-recommender.html",
+    "applicationCategory": "EntertainmentApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">← Miscellaneous</a>
+    </p>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Book Recommender</h1>
+        <p style="color:#94a3b8;max-width:70ch">Fantasy &amp; sci-fi recommendations with calibrated uncertainty. Rate the books you know, watch the model's uncertainty collapse, and get recommendations with honest probabilities — computed entirely in your browser.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Math core: plain JS (no JSX) so it can be unit-tested in Node. -->
+  <script id="recmath">
+  window.RecMath = (function () {
+    'use strict';
+
+    function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+    function clip(x, lo, hi) { return Math.min(hi, Math.max(lo, x)); }
+
+    // Deterministic PRNG for the exposure negatives (fixed seed => stable questions).
+    function mulberry32(seed) {
+      return function () {
+        let t = (seed += 0x6D2B79F5);
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // Cholesky decomposition of a symmetric positive definite matrix (row-major).
+    function cholesky(A, n) {
+      const L = new Float64Array(n * n);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j <= i; j++) {
+          let s = A[i * n + j];
+          for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
+          if (i === j) L[i * n + j] = Math.sqrt(Math.max(s, 1e-12));
+          else L[i * n + j] = s / L[j * n + j];
+        }
+      }
+      return L;
+    }
+
+    // Solves A x = b given L with A = L Lᵀ.
+    function cholSolve(L, n, b) {
+      const y = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = b[i];
+        for (let k = 0; k < i; k++) s -= L[i * n + k] * y[k];
+        y[i] = s / L[i * n + i];
+      }
+      const x = new Float64Array(n);
+      for (let i = n - 1; i >= 0; i--) {
+        let s = y[i];
+        for (let k = i + 1; k < n; k++) s -= L[k * n + i] * x[k];
+        x[i] = s / L[i * n + i];
+      }
+      return x;
+    }
+
+    // qᵀ A⁻¹ q = ‖L⁻¹q‖² ; q lives at qs[off .. off+n).
+    function quadForm(L, n, qs, off) {
+      const y = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = qs[off + i];
+        for (let k = 0; k < i; k++) s -= L[i * n + k] * y[k];
+        y[i] = s / L[i * n + i];
+      }
+      let t = 0;
+      for (let i = 0; i < n; i++) t += y[i] * y[i];
+      return t;
+    }
+
+    // Strip trailing store-metadata junk from raw catalog strings (display only —
+    // the data itself is never modified).
+    function cleanTitle(t) {
+      return String(t).replace(/\s*(?:Series\s+)?Publisher:.*$/i, '').replace(/\s*Format:.*$/i, '').trim();
+    }
+    function cleanAuthor(a) {
+      return String(a).replace(/\s*Format:.*$/i, '').replace(/\s*Publisher:.*$/i, '').trim();
+    }
+
+    // One-time setup: dequantize vectors into flat arrays (never per access).
+    function prepare(data) {
+      const meta = data.meta, books = data.books, n = books.length;
+      const D = meta.k + 1;                       // 33: leading bias column + k factors
+      const KE = meta.k_exp;
+      const qs = new Float64Array(n * D);
+      const evs = new Float64Array(n * KE);
+      const bias = new Float64Array(n), eb = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const b = books[i];
+        qs[i * D] = meta.bias_col;                // the crucial 1.0 (user-offset dimension)
+        for (let d = 0; d < meta.k; d++) qs[i * D + 1 + d] = b.v[d] * meta.vec_scale;
+        for (let d = 0; d < KE; d++) evs[i * KE + d] = b.ev[d] * meta.exp_scale;
+        bias[i] = b.b;
+        eb[i] = b.eb;
+      }
+      return { meta, books, n, D, KE, qs, evs, bias, eb };
+    }
+
+    // Ridge fold-in over the rated set: A = λI + Σ qqᵀ, u = A⁻¹ Σ q(r−μ−b).
+    function foldIn(prep, rated) {
+      const { meta, D, qs, bias } = prep;
+      const A = new Float64Array(D * D);
+      for (let a = 0; a < D; a++) A[a * D + a] = meta.lambda;
+      const rhs = new Float64Array(D);
+      for (const [i, r] of rated) {
+        const off = i * D, resid = r - meta.mu - bias[i];
+        for (let a = 0; a < D; a++) {
+          const qa = qs[off + a];
+          rhs[a] += qa * resid;
+          for (let b2 = a; b2 < D; b2++) A[a * D + b2] += qa * qs[off + b2];
+        }
+      }
+      for (let a = 0; a < D; a++) for (let b2 = 0; b2 < a; b2++) A[a * D + b2] = A[b2 * D + a];
+      const L = cholesky(A, D);
+      const u = rated.length ? cholSolve(L, D, rhs) : new Float64Array(D);
+      return { L, u };
+    }
+
+    // Per-book mean (unclipped!), predictive variance (incl. noise term), leverage, P(like).
+    function predictAll(prep, L, u) {
+      const { meta, n, D, qs, bias } = prep;
+      const m = new Float64Array(n), va = new Float64Array(n);
+      const lev = new Float64Array(n), plike = new Float64Array(n);
+      for (let j = 0; j < n; j++) {
+        const off = j * D;
+        let dot = 0;
+        for (let d = 0; d < D; d++) dot += qs[off + d] * u[d];
+        m[j] = meta.mu + bias[j] + dot;
+        lev[j] = quadForm(L, D, qs, off);
+        va[j] = meta.sigma2 * lev[j] + meta.sigma2;    // + σ² noise term — do not drop
+        const z = (m[j] - meta.like_thr) / Math.sqrt(va[j]);
+        plike[j] = sigmoid(meta.like_a * z + meta.like_b);
+      }
+      return { m, va, lev, plike };
+    }
+
+    // EASE ranking: all rated books count (stars irrelevant); rated => −∞.
+    function easeScores(prep, ratedIdx) {
+      const { meta, books, n } = prep;
+      const s = new Float64Array(n);
+      for (const i of ratedIdx) {
+        const nb = books[i].nb || [];
+        for (let k = 0; k < nb.length; k++) s[nb[k][0]] += nb[k][1] * meta.ease_scale;
+      }
+      for (const i of ratedIdx) s[i] = -Infinity;
+      return s;
+    }
+
+    // Exposure fold-in: ridge-logistic Newton for u_e (16-dim). posIdx: rated books
+    // ("I know it"), negIdx: explicit "don't know it" answers, plus seeded random negatives.
+    function exposureU(prep, posIdx, negIdx, seed, nRandNeg) {
+      const { meta, n, KE, evs, eb } = prep;
+      const taken = new Set();
+      for (const i of posIdx) taken.add(i);
+      for (const i of negIdx) taken.add(i);
+      const rnd = mulberry32(seed);
+      const rand = [];
+      const target = Math.min(nRandNeg, n - taken.size);
+      while (rand.length < target) {
+        const j = Math.floor(rnd() * n);
+        if (!taken.has(j)) { taken.add(j); rand.push(j); }
+      }
+      const rows = [];
+      for (const i of posIdx) rows.push([i, 1]);
+      for (const i of negIdx) rows.push([i, 0]);
+      for (const i of rand) rows.push([i, 0]);
+      const u = new Float64Array(KE);
+      for (let it = 0; it < 5; it++) {
+        const H = new Float64Array(KE * KE), g = new Float64Array(KE);
+        for (let a = 0; a < KE; a++) {
+          H[a * KE + a] = meta.exp_lambda;
+          g[a] = -meta.exp_lambda * u[a];
+        }
+        for (const [i, y] of rows) {
+          const off = i * KE;
+          let s = meta.exp_intercept + eb[i];       // fixed offset, not a learned parameter
+          for (let d = 0; d < KE; d++) s += evs[off + d] * u[d];
+          const p = sigmoid(s), w = Math.max(p * (1 - p), 1e-6), e = y - p;
+          for (let a = 0; a < KE; a++) {
+            g[a] += evs[off + a] * e;
+            for (let b2 = a; b2 < KE; b2++) H[a * KE + b2] += w * evs[off + a] * evs[off + b2];
+          }
+        }
+        for (let a = 0; a < KE; a++) for (let b2 = 0; b2 < a; b2++) H[a * KE + b2] = H[b2 * KE + a];
+        const Lh = cholesky(H, KE);
+        const du = cholSolve(Lh, KE, g);
+        for (let d = 0; d < KE; d++) u[d] += du[d];
+      }
+      return u;
+    }
+
+    function pKnowAll(prep, ue) {
+      const { meta, n, KE, evs, eb } = prep;
+      const p = new Float64Array(n);
+      for (let j = 0; j < n; j++) {
+        let s = meta.exp_intercept + eb[j];
+        const off = j * KE;
+        for (let d = 0; d < KE; d++) s += evs[off + d] * ue[d];
+        p[j] = sigmoid(s);
+      }
+      return p;
+    }
+
+    // Everything the UI needs after a rating change, in one pass.
+    function recompute(prep, rated, unknownArr) {
+      const { L, u } = foldIn(prep, rated);
+      const pred = predictAll(prep, L, u);
+      const ratedIdx = rated.map(function (x) { return x[0]; });
+      const ease = easeScores(prep, ratedIdx);
+      const ue = exposureU(prep, ratedIdx, unknownArr, 20260707, 200);
+      const pknow = pKnowAll(prep, ue);
+      const qscore = new Float64Array(prep.n);
+      let ciSum = 0;
+      const zc = 1.6449 * prep.meta.c90;
+      for (let j = 0; j < prep.n; j++) {
+        qscore[j] = pknow[j] * pred.lev[j];
+        ciSum += 2 * Math.min(zc * Math.sqrt(pred.va[j]), 2);   // display cap ±2
+      }
+      return {
+        u: u, L: L, m: pred.m, va: pred.va, lev: pred.lev, plike: pred.plike,
+        ease: ease, pknow: pknow, qscore: qscore, ciMean: ciSum / prep.n,
+        nRated: rated.length
+      };
+    }
+
+    // Nadaraya-Watson smoothed grid over the UMAP square [-1,1]²: divide kernel-weighted
+    // sum by kernel mass (avoids edge artefacts); cells without mass stay neutral.
+    function smoothGrid(prep, w, gw, gh, bw) {
+      const { n, books } = prep;
+      const num = new Float64Array(gw * gh), den = new Float64Array(gw * gh);
+      const inv2h2 = 1 / (2 * bw * bw), rad = 3 * bw;
+      for (let i = 0; i < n; i++) {
+        const bx = books[i].mx, by = books[i].my, wi = w[i];
+        const c0 = Math.max(0, Math.floor((bx - rad + 1) * gw / 2 - 0.5));
+        const c1 = Math.min(gw - 1, Math.ceil((bx + rad + 1) * gw / 2 - 0.5));
+        const r0 = Math.max(0, Math.floor((by - rad + 1) * gh / 2 - 0.5));
+        const r1 = Math.min(gh - 1, Math.ceil((by + rad + 1) * gh / 2 - 0.5));
+        for (let r = r0; r <= r1; r++) {
+          const cy = -1 + (r + 0.5) * 2 / gh, dy = cy - by;
+          for (let c = c0; c <= c1; c++) {
+            const cx = -1 + (c + 0.5) * 2 / gw, dx = cx - bx;
+            const k = Math.exp(-(dx * dx + dy * dy) * inv2h2);
+            num[r * gw + c] += k * wi;
+            den[r * gw + c] += k;
+          }
+        }
+      }
+      return { num: num, den: den, gw: gw, gh: gh };
+    }
+
+    // Leave-one-out: for each rated book, rebuild A WITHOUT it and predict it.
+    function loo(prep, rated) {
+      const out = [];
+      for (let k = 0; k < rated.length; k++) {
+        const sub = rated.filter(function (_, j) { return j !== k; });
+        const fi = foldIn(prep, sub);
+        const i = rated[k][0], off = i * prep.D;
+        let dot = 0;
+        for (let d = 0; d < prep.D; d++) dot += prep.qs[off + d] * fi.u[d];
+        const m = prep.meta.mu + prep.bias[i] + dot;
+        out.push({ idx: i, actual: rated[k][1], pred: clip(m, 1, 5) });
+      }
+      return out;
+    }
+
+    // Agglomerative clustering (average linkage, cosine distance in factor space,
+    // bias column excluded) of the rated books into at most maxK groups.
+    function clusterRated(prep, idxs, maxK) {
+      const { D, qs } = prep;
+      const k = D - 1;
+      const vecs = idxs.map(function (i) {
+        const v = new Float64Array(k);
+        let nrm = 0;
+        for (let d = 0; d < k; d++) { v[d] = qs[i * D + 1 + d]; nrm += v[d] * v[d]; }
+        nrm = Math.sqrt(nrm) || 1;
+        for (let d = 0; d < k; d++) v[d] /= nrm;
+        return v;
+      });
+      function cos(a, b) {
+        let s = 0;
+        for (let d = 0; d < k; d++) s += vecs[a][d] * vecs[b][d];
+        return 1 - s;
+      }
+      let clusters = idxs.map(function (_, i) { return [i]; });
+      while (clusters.length > Math.max(1, maxK)) {
+        let bi = -1, bj = -1, bd = Infinity;
+        for (let i = 0; i < clusters.length; i++) {
+          for (let j = i + 1; j < clusters.length; j++) {
+            let s = 0, cnt = 0;
+            for (const a of clusters[i]) for (const b of clusters[j]) { s += cos(a, b); cnt++; }
+            const d = s / cnt;
+            if (d < bd) { bd = d; bi = i; bj = j; }
+          }
+        }
+        clusters[bi] = clusters[bi].concat(clusters[bj]);
+        clusters.splice(bj, 1);
+      }
+      return clusters.map(function (c) { return c.map(function (ci) { return idxs[ci]; }); });
+    }
+
+    // ── CSV ────────────────────────────────────────────────────────────────
+    function detectDelim(text) {
+      const line = text.slice(0, text.indexOf('\n') < 0 ? text.length : text.indexOf('\n'));
+      const counts = [',', ';', '\t'].map(function (d) { return line.split(d).length; });
+      if (counts[1] > counts[0] && counts[1] > counts[2]) return ';';
+      if (counts[2] > counts[0] && counts[2] > counts[1]) return '\t';
+      return ',';
+    }
+
+    function parseCSV(text, delim) {
+      delim = delim || detectDelim(text);
+      const rows = [];
+      let row = [], field = '', inQ = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inQ) {
+          if (ch === '"') {
+            if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false;
+          } else field += ch;
+        } else if (ch === '"') inQ = true;
+        else if (ch === delim) { row.push(field); field = ''; }
+        else if (ch === '\n' || ch === '\r') {
+          if (ch === '\r' && text[i + 1] === '\n') i++;
+          row.push(field); field = '';
+          if (row.length > 1 || row[0] !== '') rows.push(row);
+          row = [];
+        } else field += ch;
+      }
+      if (field !== '' || row.length) { row.push(field); if (row.length > 1 || row[0] !== '') rows.push(row); }
+      return rows;
+    }
+
+    function csvField(s) {
+      s = String(s);
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+
+    function exportCSV(rows) {
+      const lines = ['title,author,rating'];
+      for (const r of rows) lines.push([csvField(r[0]), csvField(r[1]), r[2]].join(','));
+      return lines.join('\r\n');
+    }
+
+    // Diacritics-free, punctuation-free matching key.
+    function normKey(s) {
+      return String(s).toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
+        .replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+    }
+
+    function buildMatchIndex(prep) {
+      const byTA = new Map(), byT = new Map(), byShort = new Map();
+      function put(map, key, i) {
+        if (!key) return;
+        if (map.has(key) && map.get(key) !== i) map.set(key, -1);   // ambiguous
+        else map.set(key, i);
+      }
+      prep.books.forEach(function (b, i) {
+        const t = cleanTitle(b.t), a = cleanAuthor(b.a);
+        const kt = normKey(t), ka = normKey(a);
+        put(byTA, kt + '|' + ka, i);
+        const last = ka.split(' ').pop();
+        if (last && last !== ka) put(byTA, kt + '|' + last, i);
+        put(byT, kt, i);
+        const short = normKey(t.split(':')[0]);
+        if (short && short !== kt) put(byShort, short, i);
+      });
+      return { byTA: byTA, byT: byT, byShort: byShort };
+    }
+
+    // Tolerant import: header detection (title / author / rating, incl. "My Rating"),
+    // headerless fallback (columns 0,1,2), match via normalized (title, author).
+    function importRatings(prep, index, text) {
+      const rows = parseCSV(text);
+      if (!rows.length) return { matched: [], notFound: [], skipped: 0, error: 'File is empty.' };
+      let start = 0, ct = 0, ca = 1, cr = 2;
+      const head = rows[0].map(function (h) { return normKey(h); });
+      const it = head.findIndex(function (h) { return /^(title|book title|book|name)$/.test(h); });
+      const ia = head.findIndex(function (h) { return /author/.test(h); });
+      const ir = head.findIndex(function (h) { return /(my )?(rating|stars|score)$/.test(h) && !/average|avg/.test(h); });
+      if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; }
+      else if (rows[0].length < 3) return { matched: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
+      const matched = [], notFound = [];
+      let skipped = 0;
+      for (let i = start; i < rows.length; i++) {
+        const row = rows[i];
+        const title = (row[ct] || '').trim();
+        if (!title) continue;
+        const author = ca >= 0 ? (row[ca] || '').trim() : '';
+        const r = parseFloat(String(row[cr] || '').replace(',', '.'));
+        if (!(r >= 0.5 && r <= 5)) { skipped++; continue; }
+        const kt = normKey(cleanTitle(title)), ka = normKey(cleanAuthor(author));
+        let idx = index.byTA.get(kt + '|' + ka);
+        if (idx == null && ka) idx = index.byTA.get(kt + '|' + ka.split(' ').pop());
+        if (idx == null || idx === -1) { const c = index.byT.get(kt); idx = (c != null && c !== -1) ? c : null; }
+        if (idx == null || idx === -1) { const c = index.byShort.get(normKey(title.split(':')[0])); idx = (c != null && c !== -1) ? c : null; }
+        if (idx == null || idx === -1) notFound.push(title);
+        else matched.push([idx, clip(r, 1, 5)]);
+      }
+      return { matched: matched, notFound: notFound, skipped: skipped, error: null };
+    }
+
+    return {
+      sigmoid: sigmoid, clip: clip, mulberry32: mulberry32,
+      cholesky: cholesky, cholSolve: cholSolve, quadForm: quadForm,
+      cleanTitle: cleanTitle, cleanAuthor: cleanAuthor,
+      prepare: prepare, foldIn: foldIn, predictAll: predictAll, easeScores: easeScores,
+      exposureU: exposureU, pKnowAll: pKnowAll, recompute: recompute,
+      smoothGrid: smoothGrid, loo: loo, clusterRated: clusterRated,
+      detectDelim: detectDelim, parseCSV: parseCSV, csvField: csvField, exportCSV: exportCSV,
+      normKey: normKey, buildMatchIndex: buildMatchIndex, importRatings: importRatings
+    };
+  })();
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+    const M = window.RecMath;
+
+    /* ── Constants ─────────────────────────────────────────────────────── */
+    const STORE_KEY = 'book-recommender-v1';
+    const C = {
+      text: '#cbd5e1', label: '#94a3b8', foot: '#64748b', disc: '#475569',
+      grid: '#334155', axis: '#64748b', teal: '#0fb5ad', gold: '#d9a441',
+      card: '#0f172a', border: '#334155'
+    };
+    // Site-wide diverging colormap ("hollywood").
+    const CMAP = { neg: [255, 140, 66], mid: [245, 245, 245], pos: [0, 139, 139] };
+    function cmap(t) {   // t in [-1, 1]
+      t = Math.max(-1, Math.min(1, t));
+      const a = t < 0 ? CMAP.neg : CMAP.pos, f = Math.abs(t);
+      const c = [0, 1, 2].map(i => Math.round(CMAP.mid[i] + (a[i] - CMAP.mid[i]) * f));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+    const ratingColor = r => cmap((r - 3) / 2);
+    const avgColor = a => cmap(Math.max(-1, Math.min(1, a - 4)));
+    const fmtN = n => n.toLocaleString('en-US');
+    const pct = p => Math.round(p * 100) + '%';
+
+    function loadStore() {
+      try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch (e) { return {}; }
+    }
+
+    /* ── Small shared components ───────────────────────────────────────── */
+    function Seg({ options, value, onChange }) {
+      return (
+        <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap' }}>
+          {options.map(o => (
+            <button key={o.id} className={'lang-seg' + (value === o.id ? ' active' : '')}
+              onClick={() => onChange(o.id)}>{o.label}</button>
+          ))}
+        </div>
+      );
+    }
+
+    function RateSlider({ initial, onCommit, width }) {
+      const [val, setVal] = useState(initial != null ? initial : 3.5);
+      useEffect(() => { setVal(initial != null ? initial : 3.5); }, [initial]);
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: width || '100%' }}>
+          <input type="range" min={1} max={5} step={0.1} value={val}
+            onChange={e => setVal(+e.target.value)}
+            onPointerUp={() => onCommit(val)}
+            onKeyUp={e => { if (e.key.startsWith('Arrow')) onCommit(+e.target.value); }}
+            style={{ flex: 1, margin: 0 }} />
+          <span style={{ color: C.text, fontVariantNumeric: 'tabular-nums', fontSize: 14, minWidth: 40 }}>
+            {val.toFixed(1)}★
+          </span>
+        </div>
+      );
+    }
+
+    function DualRange({ label, min, max, lo, hi, allLabel, onChange }) {
+      const pLo = ((lo - min) / (max - min)) * 100;
+      const pHi = ((hi - min) / (max - min)) * 100;
+      const active = lo > min || hi < max;
+      return (
+        <div style={{ flex: '1 1 200px', minWidth: 180, maxWidth: 320 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</span>
+            <span style={{ fontSize: 12.5, color: active ? C.text : C.foot }}>
+              {active ? `${lo} – ${hi}` : allLabel}
+            </span>
+          </div>
+          <div style={{ position: 'relative', height: 20, margin: '0 6px' }}>
+            <div style={{ position: 'absolute', top: '50%', left: 0, right: 0, height: 4,
+              transform: 'translateY(-50%)', background: C.grid, borderRadius: 2, pointerEvents: 'none' }}>
+              <div style={{ position: 'absolute', height: '100%', borderRadius: 2,
+                left: `${pLo}%`, right: `${100 - pHi}%`, background: active ? C.teal : C.grid }} />
+            </div>
+            <input type="range" className="dual-thumb" min={min} max={max} value={lo}
+              onChange={e => onChange(Math.min(+e.target.value, hi - 1), hi)}
+              style={{ zIndex: lo >= hi - 4 ? 5 : 3 }} />
+            <input type="range" className="dual-thumb" min={min} max={max} value={hi}
+              onChange={e => onChange(lo, Math.max(+e.target.value, lo + 1))}
+              style={{ zIndex: 4 }} />
+          </div>
+        </div>
+      );
+    }
+
+    function PLikeBar({ p }) {
+      return (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <strong style={{ color: C.text, fontVariantNumeric: 'tabular-nums', fontSize: 15 }}>{pct(p)}</strong>
+          <span style={{ display: 'inline-block', width: 54, height: 6, background: C.grid, borderRadius: 3, overflow: 'hidden' }}>
+            <span style={{ display: 'block', width: `${p * 100}%`, height: '100%', background: C.teal }} />
+          </span>
+        </span>
+      );
+    }
+
+    function TagChips({ tags }) {
+      return (
+        <span style={{ fontSize: 11.5, color: C.foot }}>
+          {(tags || []).join(' · ')}
+        </span>
+      );
+    }
+
+    /* ── Filters (shared by Recommendations, Scatter, Map) ─────────────── */
+    function Filters({ model, selTags, setSelTags, yearLo, yearHi, setYear, hiddenNoYear }) {
+      const { tagList, yMin, yMax } = model;
+      const yearActive = yearLo > yMin || yearHi < yMax;
+      return (
+        <div style={{ margin: '10px 0 16px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: 18 }}>
+            <div style={{ flex: '2 1 340px' }}>
+              <div style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+                Subgenres {selTags.size > 0 && <span style={{ color: C.foot, fontWeight: 400, textTransform: 'none' }}>(books must match all selected)</span>}
+              </div>
+              <div>
+                {tagList.map(([tag, cnt]) => (
+                  <button key={tag} className={'rec-pill' + (selTags.has(tag) ? ' on' : '')}
+                    onClick={() => {
+                      const s = new Set(selTags);
+                      s.has(tag) ? s.delete(tag) : s.add(tag);
+                      setSelTags(s);
+                    }}>{tag}</button>
+                ))}
+                {selTags.size > 0 &&
+                  <button className="rec-pill" style={{ borderStyle: 'dashed' }}
+                    onClick={() => setSelTags(new Set())}>× clear</button>}
+              </div>
+            </div>
+            <DualRange label="Year" min={yMin} max={yMax} lo={yearLo} hi={yearHi}
+              allLabel="all" onChange={setYear} />
+          </div>
+          {yearActive && hiddenNoYear > 0 &&
+            <p style={{ fontSize: 11.5, color: C.foot, margin: '6px 0 0' }}>
+              {hiddenNoYear} books without a known publication year are hidden while the year filter is active.
+            </p>}
+        </div>
+      );
+    }
+
+    /* ── Posterior collapse chart ──────────────────────────────────────── */
+    function PosteriorChart({ model, comp }) {
+      const [hover, setHover] = useState(null);
+      const W = 760, H = 260, L = 38, R = 12, T = 14, B = 30;
+      const zc = 1.6449 * model.prep.meta.c90;
+
+      const data = useMemo(() => {
+        const n = model.prep.n;
+        const order = Array.from({ length: n }, (_, i) => i)
+          .sort((a, b) => comp.m[b] - comp.m[a]);
+        const pts = [];
+        for (let r = 0; r < n; r += 5) {          // downsampled polyline support points
+          const j = order[r];
+          const hw = Math.min(zc * Math.sqrt(comp.va[j]), 2);
+          pts.push({
+            r, j,
+            mean: M.clip(comp.m[j], 1, 5),
+            up: M.clip(comp.m[j] + hw, 1, 5),
+            lo: M.clip(comp.m[j] - hw, 1, 5)
+          });
+        }
+        return { pts, n };
+      }, [comp]);
+
+      const sx = r => L + (r / (data.n - 1)) * (W - L - R);
+      const sy = v => T + (1 - (v - 1) / 4) * (H - T - B);
+      const line = key => data.pts.map(p => `${sx(p.r).toFixed(1)},${sy(p[key]).toFixed(1)}`).join(' ');
+      const band = data.pts.map(p => `${sx(p.r).toFixed(1)},${sy(p.up).toFixed(1)}`).join(' ') + ' ' +
+        [...data.pts].reverse().map(p => `${sx(p.r).toFixed(1)},${sy(p.lo).toFixed(1)}`).join(' ');
+
+      const onMove = e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const fx = (e.clientX - rect.left) / rect.width * W;
+        const r = Math.round((fx - L) / (W - L - R) * (data.n - 1));
+        if (r < 0 || r > data.n - 1) { setHover(null); return; }
+        const p = data.pts[Math.min(data.pts.length - 1, Math.round(r / 5))];
+        setHover(p);
+      };
+
+      return (
+        <div className="rec-svgwrap">
+          <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+            {[1, 2, 3, 4, 5].map(v => (
+              <g key={v}>
+                <line x1={L} y1={sy(v)} x2={W - R} y2={sy(v)} stroke={C.grid} strokeWidth={1} opacity={0.6} />
+                <text x={L - 6} y={sy(v)} textAnchor="end" dominantBaseline="middle" fontSize={11} fill={C.axis}>{v}★</text>
+              </g>
+            ))}
+            <polygon points={band} fill={C.teal} opacity={0.16} />
+            <polyline points={line('up')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.55} />
+            <polyline points={line('lo')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.55} />
+            <polyline points={line('mean')} fill="none" stroke={C.teal} strokeWidth={2} />
+            <text x={(L + W - R) / 2} y={H - 6} textAnchor="middle" fontSize={11} fill={C.axis}>
+              all {fmtN(data.n)} books, ranked by expected rating
+            </text>
+            {hover && (
+              <g>
+                <line x1={sx(hover.r)} y1={T} x2={sx(hover.r)} y2={H - B} stroke={C.axis} strokeWidth={1} strokeDasharray="2 3" />
+                <circle cx={sx(hover.r)} cy={sy(hover.mean)} r={3.5} fill={C.teal} stroke="#0f172a" strokeWidth={1.5} />
+              </g>
+            )}
+          </svg>
+          {hover && (
+            <div className="rec-tip" style={{ left: Math.min(sx(hover.r) / W * 100, 72) + '%', top: 4 }}>
+              <strong>{M.cleanTitle(model.prep.books[hover.j].t)}</strong><br />
+              rank {fmtN(hover.r + 1)} · {hover.mean.toFixed(1)}★, 90% band {hover.lo.toFixed(1)}–{hover.up.toFixed(1)}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ── Rate tab ──────────────────────────────────────────────────────── */
+    function QuestionCard({ model, comp, idx, nerd, onRate, onUnknown, onSkip }) {
+      const b = model.prep.books[idx];
+      return (
+        <div className="rec-card">
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35 }}>{M.cleanTitle(b.t)}</div>
+          <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px' }}>
+            {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}{b.s ? ' · series' : ''}
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <TagChips tags={b.g} />
+            <span style={{ fontSize: 11.5, color: C.foot }}> · {fmtN(b.n)} raters</span>
+            {nerd && <span style={{ fontSize: 11.5, color: C.foot }}> · P(you know it) {pct(comp.pknow[idx])} · leverage {comp.lev[idx].toFixed(3)}</span>}
+          </div>
+          <RateSlider onCommit={v => onRate(idx, v)} />
+          <div style={{ display: 'flex', gap: 14, marginTop: 8 }}>
+            <a href="#" style={{ fontSize: 12.5, color: C.label }} onClick={e => { e.preventDefault(); onUnknown(idx); }}>Don't know it</a>
+            <a href="#" style={{ fontSize: 12.5, color: C.foot }} onClick={e => { e.preventDefault(); onSkip(idx); }}>Skip</a>
+          </div>
+        </div>
+      );
+    }
+
+    function RateTab({ model, comp, ratings, unknown, skipped, nerd, onRate, onRemove, onUnknown, onSkip, onClearUnknown, onReset }) {
+      const [query, setQuery] = useState('');
+
+      const questions = useMemo(() => {
+        const cand = [];
+        for (let j = 0; j < model.prep.n; j++) {
+          if (ratings.has(j) || unknown.has(j) || skipped.has(j)) continue;
+          cand.push(j);
+        }
+        cand.sort((a, b) => comp.qscore[b] - comp.qscore[a]);
+        return cand.slice(0, 6);
+      }, [comp, ratings, unknown, skipped]);
+
+      const results = useMemo(() => {
+        const q = M.normKey(query);
+        if (q.length < 2) return [];
+        const out = [];
+        for (let j = 0; j < model.prep.n; j++) {
+          if (model.searchKeys[j].includes(q)) {
+            out.push(j);
+            if (out.length >= 8) break;
+          }
+        }
+        return out;
+      }, [query]);
+
+      const ratedList = useMemo(() => [...ratings.entries()].reverse(), [ratings]);
+
+      return (
+        <div>
+          <h3 style={{ fontSize: 16, color: C.text, margin: '18px 0 2px' }}>Watch the posterior collapse</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 8px', maxWidth: '72ch' }}>
+            The model's expected rating for every book in the catalog (middle line) with its 90% uncertainty
+            band. Each rating you add narrows the band — the fan collapses as the model learns your taste.
+          </p>
+          <PosteriorChart model={model} comp={comp} />
+          <p style={{ fontSize: 12.5, color: C.label, margin: '4px 0 0' }}>
+            Mean 90% interval: <strong style={{ color: C.text }}>±{(comp.ciMean / 2).toFixed(2)}★</strong>
+            <span style={{ color: C.foot }}> (before any ratings: ±{(model.baseCiMean / 2).toFixed(2)}★)</span>
+          </p>
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 2px' }}>
+            {comp.nRated === 0 ? 'Do you know these?' : 'Keep going — do you know these?'}
+          </h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px', maxWidth: '72ch' }}>
+            Questions are chosen to be books you probably know <em>and</em> that tell the model the most
+            (expected variance reduction). "Don't know it" also teaches it what to ask next.
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12 }}>
+            {questions.map(j => (
+              <QuestionCard key={j} model={model} comp={comp} idx={j} nerd={nerd}
+                onRate={onRate} onUnknown={onUnknown} onSkip={onSkip} />
+            ))}
+          </div>
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 8px' }}>Rate a specific book</h3>
+          <input type="search" placeholder="Search by title or author…" value={query}
+            onChange={e => setQuery(e.target.value)} style={{ maxWidth: 420, marginBottom: 8 }} />
+          {query.length >= 2 && results.length === 0 &&
+            <p style={{ fontSize: 12.5, color: C.foot }}>No match in the 2,538-book catalog.</p>}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
+            {results.map(j => {
+              const b = model.prep.books[j];
+              return (
+                <div key={j} className="rec-card" style={{ padding: 10 }}>
+                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{M.cleanTitle(b.t)}</div>
+                  <div style={{ fontSize: 12, color: C.label, marginBottom: 6 }}>
+                    {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}
+                    {ratings.has(j) && <span style={{ color: C.gold }}> · rated {ratings.get(j).toFixed(1)}★</span>}
+                  </div>
+                  <RateSlider initial={ratings.get(j)} onCommit={v => onRate(j, v)} />
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, margin: '26px 0 8px' }}>
+            <h3 style={{ fontSize: 16, color: C.text, margin: 0 }}>Your ratings ({ratings.size})</h3>
+            {ratings.size > 0 &&
+              <a href="#" style={{ fontSize: 12.5, color: C.foot }}
+                onClick={e => { e.preventDefault(); onReset(); }}>Reset everything</a>}
+          </div>
+          {ratings.size === 0 &&
+            <p style={{ fontSize: 12.5, color: C.foot }}>Nothing rated yet — answer a card above or search for a book you know.</p>}
+          <div>
+            {ratedList.map(([j, r]) => {
+              const b = model.prep.books[j];
+              return (
+                <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', borderBottom: `1px solid #1e293b`, flexWrap: 'wrap' }}>
+                  <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', background: ratingColor(r), border: '1px solid #f1f5f9', flexShrink: 0 }} />
+                  <span style={{ flex: '1 1 220px', fontSize: 13.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {M.cleanTitle(b.t)} <span style={{ color: C.foot, fontSize: 12 }}>· {M.cleanAuthor(b.a)}</span>
+                  </span>
+                  {nerd && <span style={{ fontSize: 11.5, color: C.foot }}>leverage {comp.lev[j].toFixed(3)}</span>}
+                  <div style={{ flex: '0 0 190px' }}>
+                    <RateSlider initial={r} onCommit={v => onRate(j, v)} />
+                  </div>
+                  <button className="rec-x" title="Remove rating" onClick={() => onRemove(j)}>✕</button>
+                </div>
+              );
+            })}
+          </div>
+          {unknown.size > 0 &&
+            <p style={{ fontSize: 12.5, color: C.foot, marginTop: 10 }}>
+              You marked {unknown.size} book{unknown.size > 1 ? 's' : ''} as unknown (used only to pick better questions, never for recommendations). {' '}
+              <a href="#" style={{ color: C.foot }} onClick={e => { e.preventDefault(); onClearUnknown(); }}>Clear</a>
+            </p>}
+        </div>
+      );
+    }
+
+    /* ── Recommendations tab ───────────────────────────────────────────── */
+    function FunnelMini({ vols, ret }) {
+      const maxN = Math.max(...vols.map(v => v[0]), 1);
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 5, flexWrap: 'wrap' }}>
+          <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, width: 120 }}>
+            {vols.slice(0, 8).map((v, i) => (
+              <span key={i} title={`Vol. ${i + 1}: ${fmtN(v[0])} raters, ${v[1].toFixed(2)}★ avg`}
+                style={{ display: 'block', height: 5, width: `${Math.max(3, v[0] / maxN * 100)}%`,
+                  background: avgColor(v[1]), borderRadius: 2 }} />
+            ))}
+          </span>
+          <span style={{ fontSize: 11.5, color: C.foot }}>
+            series · {vols.length} vols{ret != null ? ` · ${Math.round(ret * 100)}% read on past vol. 1` : ''}
+          </span>
+        </div>
+      );
+    }
+
+    function RecRow({ model, comp, idx, rank, nerd }) {
+      const b = model.prep.books[idx];
+      const zc = 1.6449 * model.prep.meta.c90;
+      const hw = Math.min(zc * Math.sqrt(comp.va[idx]), 2);
+      const stars = M.clip(comp.m[idx], 1, 5);
+      return (
+        <div style={{ padding: '9px 0', borderBottom: '1px solid #1e293b' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ color: C.foot, fontSize: 12, minWidth: 26, fontVariantNumeric: 'tabular-nums' }}>#{rank}</span>
+            <span style={{ flex: '1 1 260px', fontSize: 14, color: C.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {M.cleanTitle(b.t)}
+              <span style={{ color: C.label, fontWeight: 400, fontSize: 12.5 }}> · {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}</span>
+            </span>
+            <TagChips tags={b.g} />
+            <PLikeBar p={comp.plike[idx]} />
+          </div>
+          {nerd && (
+            <div style={{ fontSize: 12, color: C.label, marginTop: 3, paddingLeft: 36 }}>
+              {stars.toFixed(2)}★ ±{hw.toFixed(2)}
+              {' · '}P(like) baseline {pct(model.base.plike[idx])}{comp.nRated > 0 ? <span> → for you <strong style={{ color: C.text }}>{pct(comp.plike[idx])}</strong></span> : null}
+              {comp.nRated > 0 && Number.isFinite(comp.ease[idx]) ? ` · match ${comp.ease[idx].toFixed(3)}` : ''}
+              {` · ${fmtN(b.n)} raters · leverage ${comp.lev[idx].toFixed(3)}`}
+            </div>
+          )}
+          {b.vols && <div style={{ paddingLeft: 36 }}><FunnelMini vols={b.vols} ret={b.ret} /></div>}
+        </div>
+      );
+    }
+
+    function RecsTab({ model, comp, filtered, nerd, sortMode, setSortMode }) {
+      const [topN, setTopN] = useState(40);
+      const zc = 1.6449 * model.prep.meta.c90;
+
+      const sorted = useMemo(() => {
+        const key = {
+          match: j => (comp.nRated > 0 ? comp.ease[j] : model.prep.books[j].n),
+          plike: j => comp.plike[j],
+          lcb: j => comp.m[j] - zc * Math.sqrt(comp.va[j]),
+          ucb: j => comp.m[j] + zc * Math.sqrt(comp.va[j])
+        }[sortMode] || (j => comp.ease[j]);
+        return filtered.slice().sort((a, b) => {
+          const d = key(b) - key(a);
+          return d !== 0 ? d : model.prep.books[b].n - model.prep.books[a].n;
+        });
+      }, [filtered, comp, sortMode]);
+
+      const sortOpts = [
+        { id: 'match', label: comp.nRated > 0 ? 'Match' : 'Popular (baseline)' },
+        { id: 'plike', label: 'P(like)' },
+        ...(nerd ? [{ id: 'lcb', label: 'Safe bets (LCB)' }, { id: 'ucb', label: 'Moonshots (UCB)' }] : [])
+      ];
+
+      return (
+        <div>
+          {comp.nRated === 0 &&
+            <p style={{ fontSize: 13, color: C.gold, margin: '10px 0' }}>
+              Cold start: this is the unpersonalized popularity baseline. Rate a few books on the Rate tab and this list becomes yours.
+            </p>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', margin: '10px 0' }}>
+            <span style={{ color: C.label, fontSize: 13 }}>Sort:</span>
+            <Seg options={sortOpts} value={sortMode} onChange={setSortMode} />
+          </div>
+          <div>
+            {sorted.slice(0, topN).map((j, i) => (
+              <RecRow key={j} model={model} comp={comp} idx={j} rank={i + 1} nerd={nerd} />
+            ))}
+          </div>
+          {sorted.length > topN &&
+            <button className="lang-seg" style={{ marginTop: 12 }} onClick={() => setTopN(topN + 40)}>
+              Show 40 more ({fmtN(sorted.length - topN)} left)
+            </button>}
+          {sorted.length === 0 &&
+            <p style={{ fontSize: 13, color: C.foot }}>No books match the current filters.</p>}
+        </div>
+      );
+    }
+
+    /* ── Scatter tab ───────────────────────────────────────────────────── */
+    function ScatterTab({ model, comp, filtered, matchPct, nerd }) {
+      const [tip, setTip] = useState(null);
+      const W = 760, H = 470, L = 46, R = 14, T = 18, B = 40;
+      const zc = 1.6449 * model.prep.meta.c90;
+
+      const pts = useMemo(() => filtered.map(j => ({
+        j,
+        x: L + (matchPct[j] / 100) * (W - L - R),
+        y: T + (1 - comp.plike[j]) * (H - T - B),
+        r: 1.2 + 1.2 * Math.log10(Math.max(model.prep.books[j].n, 10))
+      })), [filtered, comp, matchPct]);
+
+      const onMove = e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const fx = (e.clientX - rect.left) / rect.width * W;
+        const fy = (e.clientY - rect.top) / rect.height * H;
+        let best = null, bd = 400;   // 20px radius
+        for (const p of pts) {
+          const d = (p.x - fx) * (p.x - fx) + (p.y - fy) * (p.y - fy);
+          if (d < bd) { bd = d; best = p; }
+        }
+        setTip(best ? { ...best, px: fx / W * 100, py: fy / H * 100 } : null);
+      };
+
+      const qlabel = { fontSize: 11, fill: C.disc, letterSpacing: '0.06em' };
+
+      return (
+        <div>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '10px 0', maxWidth: '76ch' }}>
+            Every unrated book: horizontal = how strongly it matches what you read
+            ({comp.nRated > 0 ? 'co-reading signal, percentile' : 'popularity percentile — rate books to personalize'}),
+            vertical = calibrated probability you'd rate it 4★ or higher. Size ~ number of raters.
+          </p>
+          <div className="rec-svgwrap">
+            <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
+              {[0, 25, 50, 75, 100].map(v => (
+                <g key={v}>
+                  <line x1={L + v / 100 * (W - L - R)} y1={T} x2={L + v / 100 * (W - L - R)} y2={H - B} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                  <line x1={L} y1={T + (1 - v / 100) * (H - T - B)} x2={W - R} y2={T + (1 - v / 100) * (H - T - B)} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                  <text x={L + v / 100 * (W - L - R)} y={H - B + 16} textAnchor="middle" fontSize={10.5} fill={C.axis}>{v}</text>
+                  <text x={L - 8} y={T + (1 - v / 100) * (H - T - B)} textAnchor="end" dominantBaseline="middle" fontSize={10.5} fill={C.axis}>{v}%</text>
+                </g>
+              ))}
+              <text x={(L + W - R) / 2} y={H - 8} textAnchor="middle" fontSize={11.5} fill={C.axis}>taste match (percentile)</text>
+              <text x={13} y={(T + H - B) / 2} textAnchor="middle" fontSize={11.5} fill={C.axis} transform={`rotate(-90 13 ${(T + H - B) / 2})`}>P(you'd like it)</text>
+              <text x={W - R - 6} y={T + 14} textAnchor="end" style={qlabel}>SAFE BETS</text>
+              <text x={L + 6} y={T + 14} style={qlabel}>BROAD APPEAL</text>
+              <text x={W - R - 6} y={H - B - 8} textAnchor="end" style={qlabel}>NICHE GAMBLES</text>
+              <text x={L + 6} y={H - B - 8} style={qlabel}>LONG SHOTS</text>
+              {pts.map(p => (
+                <circle key={p.j} cx={p.x} cy={p.y} r={p.r} fill={C.teal} opacity={0.45}
+                  stroke={tip && tip.j === p.j ? '#f1f5f9' : 'none'} strokeWidth={1.5} />
+              ))}
+            </svg>
+            {tip && (
+              <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
+                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
+                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                P(like) {pct(comp.plike[tip.j])} · match p{Math.round(matchPct[tip.j])}
+                {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {fmtN(model.prep.books[tip.j].n)} raters</span>}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Taste map tab ─────────────────────────────────────────────────── */
+    function MapTab({ model, comp, ratings, passes, showTerrain, setShowTerrain }) {
+      const [tip, setTip] = useState(null);
+      const W = 760, H = 540, P = 10;
+      const GW = 60, GH = 40, BW = 0.08;
+
+      const grid = useMemo(() => {
+        if (comp.nRated === 0) return null;
+        const cur = M.smoothGrid(model.prep, comp.plike, GW, GH, BW);
+        const cells = [];
+        for (let r = 0; r < GH; r++) {
+          for (let c = 0; c < GW; c++) {
+            const i = r * GW + c;
+            if (cur.den[i] < 0.15) continue;      // no kernel mass -> stay neutral
+            const delta = cur.num[i] / cur.den[i] - model.gridBase.num[i] / model.gridBase.den[i];
+            if (Math.abs(delta) < 0.012) continue;
+            cells.push({ c, r, t: Math.max(-1, Math.min(1, delta / 0.25)) });
+          }
+        }
+        return cells;
+      }, [comp]);
+
+      const sx = mx => P + (mx + 1) / 2 * (W - 2 * P);
+      const sy = my => P + (my + 1) / 2 * (H - 2 * P);
+      const cw = (W - 2 * P) / GW, ch = (H - 2 * P) / GH;
+
+      const onMove = e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const fx = (e.clientX - rect.left) / rect.width * W;
+        const fy = (e.clientY - rect.top) / rect.height * H;
+        let best = null, bd = 324;   // 18px
+        for (let j = 0; j < model.prep.n; j++) {
+          if (!passes[j] && !ratings.has(j)) continue;
+          const dx = sx(model.prep.books[j].mx) - fx, dy = sy(model.prep.books[j].my) - fy;
+          const d = dx * dx + dy * dy;
+          if (d < bd) { bd = d; best = j; }
+        }
+        setTip(best != null ? { j: best, px: fx / W * 100, py: fy / H * 100 } : null);
+      };
+
+      return (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0' }}>
+            <span style={{ color: C.label, fontSize: 13 }}>Taste terrain:</span>
+            <Seg options={[{ id: 'on', label: 'On' }, { id: 'off', label: 'Off' }]}
+              value={showTerrain ? 'on' : 'off'} onChange={v => setShowTerrain(v === 'on')} />
+            {showTerrain && comp.nRated > 0 && (
+              <span style={{ fontSize: 11.5, color: C.foot, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 70, height: 8, borderRadius: 4, display: 'inline-block',
+                  background: `linear-gradient(90deg, ${cmap(-1)}, ${cmap(0)}, ${cmap(1)})` }} />
+                less likely → more likely (vs. your baseline)
+              </span>
+            )}
+          </div>
+          {comp.nRated === 0 &&
+            <p style={{ fontSize: 12.5, color: C.foot, margin: '4px 0 8px' }}>
+              The terrain appears once you've rated a few books — it shows where in taste-space your P(like) rises above the baseline.
+            </p>}
+          <div className="rec-svgwrap">
+            <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
+              <rect x={0} y={0} width={W} height={H} fill="#0b1220" rx={8} />
+              {showTerrain && grid && grid.map((cell, i) => (
+                <rect key={i} x={P + cell.c * cw} y={P + cell.r * ch} width={cw + 0.5} height={ch + 0.5}
+                  fill={cmap(cell.t)} opacity={0.42} shapeRendering="crispEdges" />
+              ))}
+              {model.prep.books.map((b, j) => ratings.has(j) ? null : (
+                <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={2}
+                  fill={C.foot} opacity={passes[j] ? 0.75 : 0.12} />
+              ))}
+              {[...ratings.entries()].map(([j, r]) => (
+                <circle key={'r' + j} cx={sx(model.prep.books[j].mx)} cy={sy(model.prep.books[j].my)}
+                  r={5.5} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5} />
+              ))}
+            </svg>
+            {tip && (
+              <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 12, 0)}%` }}>
+                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
+                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                {ratings.has(tip.j)
+                  ? <span style={{ color: C.gold }}>your rating: {ratings.get(tip.j).toFixed(1)}★</span>
+                  : <span>P(like) {pct(comp.plike[tip.j])}</span>}
+              </div>
+            )}
+          </div>
+          <p style={{ fontSize: 11.5, color: C.foot, marginTop: 6 }}>
+            2-D projection (UMAP, cosine) of the taste space: similar books sit together, but distances are not metric.
+            Outlined markers are your rated books, colored by your rating. Filters from the Recommendations tab dim non-matching books.
+          </p>
+        </div>
+      );
+    }
+
+    /* ── Model tab ─────────────────────────────────────────────────────── */
+    function LOOChart({ pts, rmse }) {
+      const W = 360, H = 360, L = 38, R = 10, T = 10, B = 36;
+      const s = v => ({ x: L + (v - 1) / 4 * (W - L - R), y: T + (1 - (v - 1) / 4) * (H - T - B) });
+      return (
+        <div className="rec-svgwrap" style={{ maxWidth: 400 }}>
+          <svg viewBox={`0 0 ${W} ${H}`}>
+            {[1, 2, 3, 4, 5].map(v => (
+              <g key={v}>
+                <line x1={s(v).x} y1={T} x2={s(v).x} y2={H - B} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                <line x1={L} y1={s(v).y} x2={W - R} y2={s(v).y} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                <text x={s(v).x} y={H - B + 15} textAnchor="middle" fontSize={10.5} fill={C.axis}>{v}</text>
+                <text x={L - 7} y={s(v).y} textAnchor="end" dominantBaseline="middle" fontSize={10.5} fill={C.axis}>{v}</text>
+              </g>
+            ))}
+            <line x1={s(1).x} y1={s(1).y} x2={s(5).x} y2={s(5).y} stroke={C.disc} strokeWidth={1} strokeDasharray="4 4" />
+            {pts.map((p, i) => (
+              <circle key={i} cx={s(p.pred).x} cy={s(p.actual).y} r={5} fill={C.gold} opacity={0.75}>
+                <title>{p.title}: predicted {p.pred.toFixed(1)}, you said {p.actual.toFixed(1)}</title>
+              </circle>
+            ))}
+            <text x={(L + W - R) / 2} y={H - 6} textAnchor="middle" fontSize={11} fill={C.axis}>predicted (from your other ratings)</text>
+            <text x={12} y={(T + H - B) / 2} textAnchor="middle" fontSize={11} fill={C.axis} transform={`rotate(-90 12 ${(T + H - B) / 2})`}>your actual rating</text>
+          </svg>
+        </div>
+      );
+    }
+
+    function ModelTab({ model, comp, ratings, onImport }) {
+      const [report, setReport] = useState(null);
+      const meta = model.prep.meta;
+      const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
+
+      const looData = useMemo(() => {
+        if (ratedArr.length < 3) return null;
+        const res = M.loo(model.prep, ratedArr);
+        const rmse = Math.sqrt(res.reduce((s, p) => s + (p.pred - p.actual) ** 2, 0) / res.length);
+        return {
+          rmse,
+          pts: res.map(p => ({ ...p, title: M.cleanTitle(model.prep.books[p.idx].t) }))
+        };
+      }, [ratedArr]);
+
+      const clusters = useMemo(() => {
+        if (ratedArr.length < 4) return null;
+        const idxs = ratedArr.map(x => x[0]);
+        const maxK = Math.max(1, Math.min(5, Math.round(Math.sqrt(idxs.length))));
+        return M.clusterRated(model.prep, idxs, maxK).map(members => {
+          const counts = {};
+          for (const i of members) for (const g of model.prep.books[i].g || []) counts[g] = (counts[g] || 0) + 1;
+          const label = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 2).map(x => x[0]).join(' · ');
+          return { label: label || 'mixed', members: members.slice().sort((a, b) => ratings.get(b) - ratings.get(a)) };
+        });
+      }, [ratedArr]);
+
+      const doExport = () => {
+        const rows = ratedArr.map(([j, r]) => [
+          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1)
+        ]);
+        const blob = new Blob([M.exportCSV(rows)], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'my-book-ratings.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      };
+
+      const doImport = e => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = M.importRatings(model.prep, model.matchIndex, String(reader.result));
+          setReport(res);
+          if (!res.error && res.matched.length) onImport(res.matched);
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      const dt = { fontSize: 12.5, color: C.foot };
+      const dd = { fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums' };
+
+      return (
+        <div style={{ maxWidth: '80ch' }}>
+          <h3 style={{ fontSize: 16, color: C.text, margin: '18px 0 4px' }}>Self-calibration (leave-one-out)</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
+            Each of your rated books is predicted from your <em>other</em> ratings only (the model matrix is
+            rebuilt without it). If the model understands your taste, points hug the diagonal.
+          </p>
+          {looData ? (
+            <div>
+              <LOOChart pts={looData.pts} rmse={looData.rmse} />
+              <p style={{ fontSize: 13, color: C.label, marginTop: 6 }}>
+                Your leave-one-out RMSE: <strong style={{ color: C.text }}>{looData.rmse.toFixed(2)}★</strong>
+                <span style={{ color: C.foot }}> · cold-start baseline: 0.95★{ratedArr.length < 5 ? ' · (needs ~5+ ratings to be meaningful)' : ''}</span>
+              </p>
+            </div>
+          ) : <p style={{ fontSize: 12.5, color: C.foot }}>Rate at least 3 books to see this.</p>}
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Your taste clusters</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
+            Agglomerative clustering (cosine, in the 32-dim factor space) of your rated books, labeled by dominant subgenres.
+          </p>
+          {clusters ? (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
+              {clusters.map((cl, i) => (
+                <div key={i} className="rec-card" style={{ padding: 10 }}>
+                  <div style={{ fontSize: 12.5, color: C.teal, fontWeight: 600, marginBottom: 6 }}>
+                    {cl.label} <span style={{ color: C.foot, fontWeight: 400 }}>({cl.members.length})</span>
+                  </div>
+                  {cl.members.map(j => (
+                    <div key={j} style={{ fontSize: 12.5, color: C.text, display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: ratingColor(ratings.get(j)), flexShrink: 0 }} />
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{M.cleanTitle(model.prep.books[j].t)}</span>
+                      <span style={{ color: C.foot, marginLeft: 'auto' }}>{ratings.get(j).toFixed(1)}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          ) : <p style={{ fontSize: 12.5, color: C.foot }}>Rate at least 4 books to see this.</p>}
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>How it works</h3>
+          <details style={{ marginTop: 6 }}>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Ranking — which books to suggest</summary>
+            <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
+              An item-item linear model (EASE) was trained offline; each catalog book keeps its top-20 neighbor
+              weights. Your score for a candidate is the sum of weights from every book you rated — stars
+              deliberately don't matter here, because even a book you disliked reveals what you read
+              (filtering by stars measured worse). Rated books are excluded from the list. With zero ratings
+              you see the popularity baseline.
+            </p>
+          </details>
+          <details>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Stars &amp; P(like) — calibrated uncertainty</summary>
+            <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
+              A 32-factor matrix factorization (plus item bias and a user-offset dimension) was trained offline.
+              Your taste vector is folded in by ridge regression over your ratings —
+              <code style={{ fontSize: 11.5 }}> u = (λI + Σqqᵀ)⁻¹ Σq(r−μ−b)</code>, solved by Cholesky on a 33×33
+              matrix, live in your browser. Expected stars are μ + b + q·u; the predictive variance
+              σ²(qᵀA⁻¹q) + σ² feeds a Platt-calibrated sigmoid for P(you'd rate it ≥ 4★). On held-out readers,
+              the 90% intervals cover 90.4% and every P(like) decile is within ±2 points of reality.
+            </p>
+          </details>
+          <details>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Onboarding questions — what to ask next</summary>
+            <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
+              A separate 16-factor exposure model estimates P(you know this book) — updated from your
+              "don't know it" answers by a small ridge-logistic fit (5 Newton steps, fixed random negatives).
+              Questions maximize P(you know it) × qᵀA⁻¹q: books you can probably answer <em>and</em> that
+              shrink the model's uncertainty the most (D-optimal design, light version).
+            </p>
+          </details>
+          <details>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Model card — the numbers</summary>
+            <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '3px 18px', width: 'fit-content', marginTop: 8 }}>
+              <span style={dt}>Catalog</span><span style={dd}>2,538 books &amp; series (1,432 series entries)</span>
+              <span style={dt}>Training data</span><span style={dd}>a large corpus of public book ratings</span>
+              <span style={dt}>Factors k</span><span style={dd}>32 (+ bias column), σ² = 0.646, λ = 2.0</span>
+              <span style={dt}>Star fold-in RMSE</span><span style={dd}>0.85★ at 10 ratings (cold: 0.95★)</span>
+              <span style={dt}>90% coverage</span><span style={dd}>90.4% (nominal 90%)</span>
+              <span style={dt}>P(like) calibration</span><span style={dd}>Brier 0.155 (base rate 0.181)</span>
+              <span style={dt}>Ranking recall@20</span><span style={dd}>0.30 at 10 ratings (popularity: 0.03)</span>
+              <span style={dt}>Ranking hit@10</span><span style={dd}>0.76 (popularity: 0.15)</span>
+              <span style={dt}>Exposure AUC</span><span style={dd}>0.81 at 10 answers (popularity: 0.77)</span>
+            </div>
+          </details>
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Export / import your ratings</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
+            CSV with columns <code style={{ fontSize: 11.5 }}>title,author,rating</code>. Import also understands
+            common library exports (e.g. <code style={{ fontSize: 11.5 }}>Title / Author / My Rating</code>);
+            matching uses normalized title + author. Note: series are cataloged under their first volume's title.
+          </p>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button className="lang-seg" onClick={doExport} disabled={ratings.size === 0}>Export CSV</button>
+            <label className="lang-seg" style={{ cursor: 'pointer', marginBottom: 0 }}>
+              Import CSV…
+              <input type="file" accept=".csv,text/csv,text/plain" onChange={doImport} style={{ display: 'none' }} />
+            </label>
+          </div>
+          {report && (
+            <div style={{ marginTop: 10, fontSize: 12.5, color: C.label }}>
+              {report.error ? <span style={{ color: C.gold }}>{report.error}</span> : (
+                <span>
+                  <strong style={{ color: C.text }}>{report.matched.length} matched</strong>
+                  {' / '}{report.notFound.length} not found
+                  {report.skipped > 0 ? ` · ${report.skipped} rows without a rating skipped` : ''}
+                  {report.notFound.length > 0 && (
+                    <details style={{ marginTop: 4 }}>
+                      <summary style={{ cursor: 'pointer', color: C.foot }}>Not found</summary>
+                      <span style={{ color: C.foot }}>{report.notFound.slice(0, 40).join(' · ')}{report.notFound.length > 40 ? ' · …' : ''}</span>
+                    </details>
+                  )}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ── App ───────────────────────────────────────────────────────────── */
+    function App() {
+      const [model, setModel] = useState(null);
+      const [loadErr, setLoadErr] = useState(null);
+      const [ratings, setRatings] = useState(() => {
+        const s = loadStore();
+        return new Map(Object.entries(s.r || {}).map(([k, v]) => [+k, +v]));
+      });
+      const [unknown, setUnknown] = useState(() => new Set(loadStore().u || []));
+      const [detail, setDetail] = useState(() => loadStore().d === 'nerd' ? 'nerd' : 'casual');
+      const [showTerrain, setShowTerrain] = useState(() => loadStore().h !== false);
+      const [skipped, setSkipped] = useState(() => new Set());   // session only
+      const [tab, setTab] = useState('rate');
+      const [selTags, setSelTags] = useState(() => new Set());
+      const [year, setYearState] = useState(null);               // [lo, hi] once model known
+      const [sortMode, setSortMode] = useState('match');
+      const nerd = detail === 'nerd';
+
+      useEffect(() => {
+        fetch('/assets/files/books-recsys-v1.json')
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(data => {
+            const prep = M.prepare(data);
+            const cold = M.foldIn(prep, []);
+            const base = M.predictAll(prep, cold.L, cold.u);
+            const zc = 1.6449 * prep.meta.c90;
+            let ciSum = 0;
+            for (let j = 0; j < prep.n; j++) ciSum += 2 * Math.min(zc * Math.sqrt(base.va[j]), 2);
+            const tagCounts = {};
+            let yMin = 3000, yMax = 0;
+            for (const b of prep.books) {
+              for (const g of b.g || []) tagCounts[g] = (tagCounts[g] || 0) + 1;
+              if (b.y) { yMin = Math.min(yMin, b.y); yMax = Math.max(yMax, b.y); }
+            }
+            const tagList = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).filter(x => x[1] >= 10);
+            const searchKeys = prep.books.map(b => M.normKey(b.t + ' ' + b.a));
+            const gridBase = M.smoothGrid(prep, base.plike, 60, 40, 0.08);
+            setModel({
+              prep, base, baseCiMean: ciSum / prep.n, tagList, yMin, yMax,
+              searchKeys, gridBase, matchIndex: M.buildMatchIndex(prep)
+            });
+            setYearState([yMin, yMax]);
+          })
+          .catch(e => setLoadErr(String(e)));
+      }, []);
+
+      // Persist (small writes; recompute is separate).
+      useEffect(() => {
+        const r = {};
+        for (const [k, v] of ratings) r[k] = Math.round(v * 10) / 10;
+        try {
+          localStorage.setItem(STORE_KEY, JSON.stringify({ r, u: [...unknown], d: detail, h: showTerrain }));
+        } catch (e) { /* storage full/blocked — tool still works, just not persistent */ }
+      }, [ratings, unknown, detail, showTerrain]);
+
+      const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
+      const unknownArr = useMemo(() => [...unknown], [unknown]);
+
+      const comp = useMemo(() => model && M.recompute(model.prep, ratedArr, unknownArr),
+        [model, ratedArr, unknownArr]);
+
+      // Percentile of the ranking signal among unrated books (stable across filters).
+      const matchPct = useMemo(() => {
+        if (!comp) return null;
+        const unrated = [];
+        for (let j = 0; j < model.prep.n; j++) if (!ratings.has(j)) unrated.push(j);
+        const key = comp.nRated > 0 ? (j => comp.ease[j]) : (j => model.prep.books[j].n);
+        unrated.sort((a, b) => key(a) - key(b) || model.prep.books[a].n - model.prep.books[b].n);
+        const out = new Float64Array(model.prep.n);
+        unrated.forEach((j, i) => { out[j] = unrated.length > 1 ? i / (unrated.length - 1) * 100 : 50; });
+        return out;
+      }, [comp]);
+
+      // Filter pass array + filtered unrated list (shared by recs/scatter/map).
+      const filterData = useMemo(() => {
+        if (!model || !year) return null;
+        const yearActive = year[0] > model.yMin || year[1] < model.yMax;
+        const passes = new Array(model.prep.n).fill(false);
+        const filtered = [];
+        let hiddenNoYear = 0;
+        for (let j = 0; j < model.prep.n; j++) {
+          const b = model.prep.books[j];
+          let ok = true;
+          for (const t of selTags) if (!(b.g || []).includes(t)) { ok = false; break; }
+          if (ok && yearActive) {
+            if (b.y == null) { ok = false; hiddenNoYear++; }
+            else if (b.y < year[0] || b.y > year[1]) ok = false;
+          }
+          passes[j] = ok;
+          if (ok && !ratings.has(j)) filtered.push(j);
+        }
+        return { passes, filtered, hiddenNoYear };
+      }, [model, year, selTags, ratings]);
+
+      if (loadErr) {
+        return (
+          <div className="container">
+            <h1 style={{ fontSize: '1.5rem', color: C.text }}>Book Recommender</h1>
+            <p style={{ color: C.gold }}>Could not load the model data ({loadErr}).</p>
+            <p style={{ color: C.label, fontSize: 13 }}>
+              If you opened this page from disk (file://), fetch is blocked — serve it over HTTP instead.
+            </p>
+          </div>
+        );
+      }
+      if (!model || !comp || !filterData) {
+        return (
+          <div className="container">
+            <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 8 }}>Book Recommender</h1>
+            <p style={{ color: C.label }}>Loading the model (1.2 MB, one-time)…</p>
+          </div>
+        );
+      }
+
+      const onRate = (j, v) => {
+        setRatings(prev => { const m = new Map(prev); m.set(j, v); return m; });
+        setUnknown(prev => { if (!prev.has(j)) return prev; const s = new Set(prev); s.delete(j); return s; });
+      };
+      const onRemove = j => setRatings(prev => { const m = new Map(prev); m.delete(j); return m; });
+      const onUnknown = j => setUnknown(prev => new Set(prev).add(j));
+      const onSkip = j => setSkipped(prev => new Set(prev).add(j));
+      const onReset = () => {
+        if (!window.confirm('Delete all your ratings and answers? This cannot be undone.')) return;
+        setRatings(new Map()); setUnknown(new Set()); setSkipped(new Set());
+        try { localStorage.removeItem(STORE_KEY); } catch (e) {}
+      };
+      const onImport = matched => {
+        setRatings(prev => { const m = new Map(prev); for (const [j, r] of matched) m.set(j, r); return m; });
+      };
+      const setDetailMode = d => {
+        setDetail(d);
+        if (d === 'casual') setSortMode(m => (m === 'lcb' || m === 'ucb') ? 'match' : m);
+      };
+
+      const TABS = [
+        { id: 'rate', label: `Rate${ratings.size ? ` (${ratings.size})` : ''}` },
+        { id: 'recs', label: 'Recommendations' },
+        { id: 'scatter', label: 'Scatter' },
+        { id: 'map', label: 'Taste map' },
+        { id: 'model', label: 'Model' }
+      ];
+
+      return (
+        <div className="container">
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+            <hgroup style={{ marginBottom: 8 }}>
+              <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 4 }}>Book Recommender</h1>
+              <p style={{ color: C.label, marginBottom: 0 }}>Fantasy &amp; sci-fi recommendations with calibrated uncertainty</p>
+            </hgroup>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingTop: 6 }}>
+              <span style={{ fontSize: 12, color: C.foot }}>Detail:</span>
+              <Seg options={[{ id: 'casual', label: 'Casual' }, { id: 'nerd', label: 'Nerd' }]}
+                value={detail} onChange={setDetailMode} />
+            </div>
+          </div>
+
+          <div style={{ margin: '10px 0 4px' }}>
+            <Seg options={TABS} value={tab} onChange={setTab} />
+          </div>
+
+          {(tab === 'recs' || tab === 'scatter' || tab === 'map') &&
+            <Filters model={model} selTags={selTags} setSelTags={setSelTags}
+              yearLo={year[0]} yearHi={year[1]} setYear={(lo, hi) => setYearState([lo, hi])}
+              hiddenNoYear={filterData.hiddenNoYear} />}
+
+          {tab === 'rate' &&
+            <RateTab model={model} comp={comp} ratings={ratings} unknown={unknown} skipped={skipped}
+              nerd={nerd} onRate={onRate} onRemove={onRemove} onUnknown={onUnknown} onSkip={onSkip}
+              onClearUnknown={() => setUnknown(new Set())} onReset={onReset} />}
+          {tab === 'recs' &&
+            <RecsTab model={model} comp={comp} filtered={filterData.filtered} nerd={nerd}
+              sortMode={sortMode} setSortMode={setSortMode} />}
+          {tab === 'scatter' &&
+            <ScatterTab model={model} comp={comp} filtered={filterData.filtered} matchPct={matchPct} nerd={nerd} />}
+          {tab === 'map' &&
+            <MapTab model={model} comp={comp} ratings={ratings} passes={filterData.passes}
+              showTerrain={showTerrain} setShowTerrain={setShowTerrain} />}
+          {tab === 'model' &&
+            <ModelTab model={model} comp={comp} ratings={ratings} onImport={onImport} />}
+
+          <p style={{ marginTop: 30, fontSize: 11, color: C.foot, lineHeight: 1.7 }}>
+            Recommendation model trained offline on a large corpus of public book ratings — 2,538 fantasy &amp; sci-fi
+            books and series. Everything on this page runs entirely in your browser: your ratings are stored only on
+            your device (localStorage) and never leave it.
+          </p>
+          <p style={{ marginTop: 8, fontSize: 10, color: C.disc, lineHeight: 1.6 }}>
+            Private, non-commercial hobby project. Predictions are statistical estimates with honest
+            uncertainty, not endorsements. Not affiliated with any bookseller or publisher.
+          </p>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
