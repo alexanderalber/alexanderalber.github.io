@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>E-Book Converter - Alexander Alber</title>
-  <meta name="description" content="Convert EPUB, MOBI, AZW3 and TXT e-books in your browser. Nothing is uploaded: the file never leaves your device.">
+  <meta name="description" content="Convert EPUB, MOBI, AZW3 and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/ebook-converter.html">
   <meta property="og:title" content="E-Book Converter - fully offline, in your browser">
-  <meta property="og:description" content="Convert EPUB, MOBI, AZW3 and TXT e-books in your browser. Nothing is uploaded: the file never leaves your device.">
+  <meta property="og:description" content="Convert EPUB, MOBI, AZW3 and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/ebook-converter.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -42,6 +42,14 @@
     .ec-kv dd { color: #cbd5e1; margin: 0; }
     .ec-field label { color: #94a3b8; font-size: 13px; margin-bottom: 4px; display: block; }
     .ec-field input { margin-bottom: 10px; }
+    .ec-machine { display: block; width: 100%; max-width: 660px; margin: 0 auto 18px; }
+    .ec-preview { border: 1px solid #334155; border-radius: 8px; padding: 22px 26px;
+      background: rgba(15,23,42,.55); color: #cbd5e1; max-height: 70vh; overflow-y: auto;
+      line-height: 1.65; font-size: 15px; }
+    .ec-preview img { max-width: 100%; height: auto; }
+    .ec-preview h1, .ec-preview h2, .ec-preview h3, .ec-preview h4 { color: #e2e8f0; }
+    .ec-preview a { color: #0fb5ad; cursor: default; }
+    .ec-preview table { font-size: 14px; }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -51,7 +59,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "E-Book Converter",
-    "description": "Convert e-books between EPUB, MOBI, AZW3 and plain text. All parsing and writing happens client-side in the browser; no file is ever uploaded.",
+    "description": "Convert e-books between EPUB, MOBI, AZW3, Markdown, HTML, LaTeX, DOCX, Pandoc bundle and plain text. All parsing and writing happens client-side in the browser; no file is ever uploaded.",
     "url": "https://alber.me/miscellaneous/tools/ebook-converter.html",
     "applicationCategory": "UtilityApplication",
     "inLanguage": "en",
@@ -2435,10 +2443,1039 @@
       return book;
     }
 
+    // ══ Markdown writer ══════════════════════════════════════════════════════
+    // A downcast, not a serialization: the section XHTML is walked and re-said
+    // in CommonMark. Markup that Markdown cannot express survives as plain text.
+    // Images need a place to live outside a single .md file, so imageHref decides
+    // their fate: a mapping function keeps them (the Pandoc bundle does this),
+    // null drops them like the TXT writer does.
+
+    function mdEscapeText(s) {
+      return s.replace(/([\\`*_\[\]])/g, '\\$1');
+    }
+    function mdUnescape(s) {
+      return s.replace(/\\([\\`*_\[\]])/g, '$1');
+    }
+    function mdWrap(mark, inner) {
+      const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(inner);
+      return m[2] ? m[1] + mark + m[2] + mark + m[3] : inner;
+    }
+    function mdHref(href) {
+      return href.replace(/[()\s]/g, function (c) {
+        return c === '(' ? '%28' : c === ')' ? '%29' : '%20';
+      });
+    }
+
+    const MD_CONTAINERS = { div: 1, section: 1, article: 1, header: 1, footer: 1, main: 1, aside: 1, nav: 1, center: 1, figure: 1, dl: 1, details: 1 };
+    const MD_BLOCKS = { p: 1, h1: 1, h2: 1, h3: 1, h4: 1, h5: 1, h6: 1, blockquote: 1, ul: 1, ol: 1, pre: 1, hr: 1, table: 1, figcaption: 1, dt: 1, dd: 1 };
+
+    function mdImage(node, opts) {
+      const src = node.attrs.src || '';
+      let name = baseOf(src.split('#')[0].split('?')[0]);
+      try { name = decodeURIComponent(name); } catch (e) { /* keep as-is */ }
+      const href = opts.imageHref ? opts.imageHref(name, src) : null;
+      if (!href) {
+        if (opts.stats) opts.stats.imagesDropped++;
+        return '';
+      }
+      const alt = mdEscapeText((node.attrs.alt || '').replace(/\s+/g, ' ').trim());
+      return '![' + alt + '](' + mdHref(href) + ')';
+    }
+
+    function mdInline(children, opts) {
+      let s = '';
+      for (const ch of children) {
+        if (!isElement(ch)) { s += mdEscapeText(ch.value.replace(/\s+/g, ' ')); continue; }
+        const n = localName(ch.name);
+        if (n === 'script' || n === 'style') continue;
+        if (n === 'br') { s += '\\\n'; continue; }
+        if (n === 'img') { s += mdImage(ch, opts); continue; }
+        const inner = mdInline(ch.children, opts);
+        if (n === 'em' || n === 'i' || n === 'cite' || n === 'var') s += mdWrap('*', inner);
+        else if (n === 'strong' || n === 'b') s += mdWrap('**', inner);
+        else if (n === 's' || n === 'del' || n === 'strike') s += mdWrap('~~', inner);
+        else if (n === 'code' || n === 'kbd' || n === 'samp' || n === 'tt') {
+          const t = mdUnescape(inner).trim();
+          if (t) s += /`/.test(t) ? '`` ' + t + ' ``' : '`' + t + '`';
+        } else if (n === 'a') {
+          const href = ch.attrs.href || '';
+          // Only real URLs become links: internal e-book hrefs have no meaning
+          // inside one flat Markdown file, so their text stays and they go.
+          // Unless the text is pure symbols ("[>]", arrows): that was navigation
+          // chrome, and without its target it goes too.
+          if (/^[A-Za-z][\w+.-]*:/.test(href)) {
+            const label = inner.trim() || href;
+            s += '[' + label + '](' + mdHref(href) + ')';
+          } else if (/[\p{L}\p{N}]/u.test(inner)) s += inner;
+        } else s += inner;
+      }
+      return s;
+    }
+
+    // Lines inside cells and list items would break the table/list syntax.
+    function mdFlatten(s) {
+      return s.replace(/\\\n/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function mdList(node, opts) {
+      const ordered = localName(node.name) === 'ol';
+      const lines = [];
+      kids(node, 'li').forEach(function (li, i) {
+        const marker = ordered ? (i + 1) + '. ' : '- ';
+        const nested = [];
+        const rest = [];
+        for (const c of li.children) {
+          const n = isElement(c) ? localName(c.name) : '';
+          if (n === 'ul' || n === 'ol') nested.push(c);
+          else rest.push(c);
+        }
+        const inner = [];
+        mdBlocks(rest, opts, inner);
+        lines.push(marker + mdFlatten(inner.join(' ')));
+        const indent = ' '.repeat(marker.length);
+        for (const nl of nested) {
+          for (const l of mdList(nl, opts)) lines.push(indent + l);
+        }
+      });
+      return lines;
+    }
+
+    function mdTable(node, opts) {
+      const grid = findAll(node, 'tr').map(function (tr) {
+        return tr.children
+          .filter(function (c) { return isElement(c) && /^(td|th)$/.test(localName(c.name)); })
+          .map(function (c) { return mdFlatten(mdInline(c.children, opts)).replace(/\|/g, '\\|'); });
+      }).filter(function (r) { return r.length; });
+      if (!grid.length) return '';
+      const cols = Math.max.apply(null, grid.map(function (r) { return r.length; }));
+      const row = function (r) {
+        const cells = [];
+        for (let i = 0; i < cols; i++) cells.push(r[i] || '');
+        return '| ' + cells.join(' | ') + ' |';
+      };
+      const sep = [];
+      for (let i = 0; i < cols; i++) sep.push('---');
+      const out = [row(grid[0]), '| ' + sep.join(' | ') + ' |'];
+      for (let i = 1; i < grid.length; i++) out.push(row(grid[i]));
+      return out.join('\n');
+    }
+
+    function mdBlocks(children, opts, out) {
+      let run = [];
+      const flush = function () {
+        const t = run.join('').replace(/^[\s\\]+|[\s\\]+$/g, '');
+        if (t) out.push(t);
+        run = [];
+      };
+      for (const ch of children) {
+        const n = isElement(ch) ? localName(ch.name) : '#text';
+        if (n === '#text' || (!MD_BLOCKS[n] && !MD_CONTAINERS[n])) {
+          run.push(mdInline([ch], opts));
+          continue;
+        }
+        flush();
+        if (MD_CONTAINERS[n]) { mdBlocks(ch.children, opts, out); continue; }
+        if (/^h[1-6]$/.test(n)) {
+          const t = mdFlatten(mdInline(ch.children, opts));
+          if (t) out.push('#'.repeat(+n.charAt(1)) + ' ' + t);
+        } else if (n === 'p' || n === 'figcaption' || n === 'dt' || n === 'dd') {
+          const t = mdInline(ch.children, opts).trim();
+          if (t) out.push(t);
+        } else if (n === 'blockquote') {
+          const inner = [];
+          mdBlocks(ch.children, opts, inner);
+          const q = inner.join('\n\n').split('\n').map(function (l) {
+            return ('> ' + l).replace(/\s+$/, '');
+          }).join('\n');
+          if (q) out.push(q);
+        } else if (n === 'ul' || n === 'ol') {
+          const lines = mdList(ch, opts);
+          if (lines.length) out.push(lines.join('\n'));
+        } else if (n === 'pre') {
+          const raw = rawTextOf(ch).replace(/\r\n?/g, '\n').replace(/^\n+|\s+$/g, '');
+          out.push('```\n' + raw + '\n```');
+        } else if (n === 'hr') {
+          out.push('---');
+        } else if (n === 'table') {
+          const t = mdTable(ch, opts);
+          if (t) out.push(t);
+        }
+      }
+      flush();
+    }
+
+    function htmlToMarkdown(html, opts) {
+      const out = [];
+      mdBlocks(parseXML(html).children, opts || {}, out);
+      return out.join('\n\n');
+    }
+
+    // Books often mark chapter titles as bold paragraphs rather than heading
+    // tags, which would downcast to mere bold text. The section title from the
+    // TOC knows better: it becomes a ## heading unless the content already
+    // starts with one. A first block that is just the title in bold would then
+    // say everything twice, so it is replaced rather than kept.
+    function mdSection(s, opts) {
+      const md = htmlToMarkdown(s.html, opts);
+      if (!md) return '';
+      const title = (s.title || '').trim();
+      // "Section 12" is our own fallback for untitled sections, not the book's
+      // structure; inventing headings from it would decorate the front matter.
+      if (!title || /^Section \d+$/.test(title) || md.charAt(0) === '#') return md;
+      const heading = '## ' + mdFlatten(mdEscapeText(title));
+      const blocks = md.split('\n\n');
+      const firstPlain = blocks[0].replace(/[*~\\]|\n/g, '').replace(/\s+/g, ' ').trim();
+      if (firstPlain.toLowerCase() === title.replace(/\s+/g, ' ').toLowerCase()) {
+        blocks[0] = heading;
+        return blocks.join('\n\n');
+      }
+      return heading + '\n\n' + md;
+    }
+
+    // The sections without any front matter: writeMd puts a # title above it,
+    // the Pandoc bundle carries title and author in its YAML header instead.
+    function mdBody(book, opts) {
+      const chunks = [];
+      for (const s of book.sections) {
+        const md = mdSection(s, opts);
+        if (md) chunks.push(md);
+      }
+      return chunks.join('\n\n');
+    }
+
+    function writeMd(book) {
+      const opts = { imageHref: null, stats: { imagesDropped: 0 } };
+      const chunks = [];
+      if (book.meta.title) chunks.push('# ' + mdFlatten(mdEscapeText(book.meta.title)));
+      if (book.meta.author) chunks.push('by ' + mdFlatten(mdEscapeText(book.meta.author)));
+      const body = mdBody(book, opts);
+      if (body) chunks.push(body);
+      return encodeUtf8(chunks.join('\n\n') + '\n');
+    }
+
+    // ══ HTML writer ══════════════════════════════════════════════════════════
+    // One self-contained document: a small inline stylesheet, images as data:
+    // URIs, the TOC as a <nav> of anchors. Opens anywhere, fetches nothing.
+
+    function b64(bytes) { return btoa(bytesToBinaryString(bytes)); }
+
+    // Shared by the HTML writer and the MOBI writer's cousin above: an internal
+    // href is "#frag", "<id>.xhtml" or "text/<id>.xhtml#frag".
+    function resolveSectionHref(href, fromSec, secIndex) {
+      if (!href || /^[A-Za-z][\w+.-]*:/.test(href)) return null;
+      const hash = href.indexOf('#');
+      const path = hash < 0 ? href : href.slice(0, hash);
+      const frag = hash < 0 ? '' : href.slice(hash + 1);
+      if (!path) return (fromSec in secIndex) ? { sec: fromSec, frag: frag } : null;
+      const m = /([^/]+)\.x?html?$/i.exec(path);
+      if (!m || !(m[1] in secIndex)) return null;
+      return { sec: m[1], frag: frag };
+    }
+
+    function writeHtml(book) {
+      const title = book.meta.title || 'Untitled';
+      const secIndex = {};
+      book.sections.forEach(function (s, i) { secIndex[s.id] = i; });
+
+      const dataUris = {};
+      for (const entry of book.resources) {
+        if (/^image\//.test(entry[1].mime)) {
+          dataUris[entry[0]] = 'data:' + entry[1].mime + ';base64,' + b64(entry[1].bytes);
+        }
+      }
+
+      // Element ids get the section id as prefix so they stay unique in one
+      // document; the section wrapper itself keeps the bare section id.
+      const anchorFor = function (r) { return r.frag ? r.sec + '-' + r.frag : r.sec; };
+
+      const bodies = book.sections.map(function (s) {
+        const root = parseXML(s.html);
+        const strip = function (node) {
+          node.children = node.children.filter(function (c) {
+            if (isElement(c)) {
+              const n = localName(c.name);
+              if (n === 'script' || n === 'style' || n === 'link' || n === 'iframe') return false;
+              strip(c);
+            }
+            return true;
+          });
+        };
+        strip(root);
+        walkElements(root, function (el) {
+          if (el.attrs.id) el.attrs.id = s.id + '-' + el.attrs.id;
+          for (const k of Object.keys(el.attrs)) {
+            if (/^on/i.test(k)) delete el.attrs[k];
+          }
+          // The publisher stylesheets are discarded, so half-applied inline
+          // colors would fight our light/dark scheme (dark gray text on the
+          // dark background, say). Colors go; spacing and alignment stay.
+          delete el.attrs.color;
+          delete el.attrs.bgcolor;
+          delete el.attrs.text;
+          if (el.attrs.style) {
+            const kept = el.attrs.style.split(';').filter(function (d) {
+              const prop = (d.split(':')[0] || '').trim();
+              return d.trim() && !/color|background/i.test(prop);
+            });
+            if (kept.length) el.attrs.style = kept.join(';');
+            else delete el.attrs.style;
+          }
+        });
+        for (const img of findAll(root, 'img')) {
+          const src = img.attrs.src || '';
+          if (/^data:/i.test(src)) continue;
+          let name = baseOf(src.split('#')[0].split('?')[0]);
+          try { name = decodeURIComponent(name); } catch (e) { /* keep as-is */ }
+          if (dataUris[name]) img.attrs.src = dataUris[name];
+          else delete img.attrs.src; // no resource, no remote fetch: it goes below
+        }
+        for (const a of findAll(root, 'a')) {
+          const href = a.attrs.href;
+          if (!href) continue;
+          if (/^[A-Za-z][\w+.-]*:/.test(href)) continue; // real URLs stay links
+          const r = resolveSectionHref(href, s.id, secIndex);
+          if (r) a.attrs.href = '#' + anchorFor(r);
+          else delete a.attrs.href;
+        }
+        return toXml(root).replace(/<img\b(?![^<>]*\bsrc=)[^<>]*\/?>/gi, '');
+      });
+
+      const toc = book.toc.length ? book.toc : book.sections.map(function (s, i) {
+        return { title: s.title || ('Section ' + (i + 1)), href: 'text/' + s.id + '.xhtml', level: 0 };
+      });
+
+      // Readers usually put the cover on its own spine page; only add one to the
+      // header when no section markup shows it already.
+      const coverUri = book.meta.coverRes ? dataUris[book.meta.coverRes] : '';
+      const coverShown = !!book.meta.coverRes && book.sections.some(function (s) {
+        return s.html.indexOf(book.meta.coverRes) >= 0;
+      });
+
+      const out = [];
+      out.push('<!doctype html>');
+      out.push('<html lang="' + escapeAttr(book.meta.language || 'en') + '">');
+      out.push('<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">');
+      out.push('<title>' + escapeText(title) + '</title>');
+      out.push('<style>');
+      out.push('body{font-family:Georgia,"Times New Roman",serif;line-height:1.6;max-width:42em;margin:0 auto;padding:2rem 1rem 4rem;background:#fff;color:#1c1c1c}');
+      out.push('img{max-width:100%;height:auto}');
+      out.push('nav.ec-toc ol{list-style:none;padding-left:0}');
+      out.push('section.ec-section{margin-top:3rem}');
+      out.push('@media (prefers-color-scheme:dark){body{background:#141414;color:#d6d6d6}a{color:#6ecfca}}');
+      out.push('</style></head><body>');
+      out.push('<header>');
+      if (coverUri && !coverShown) out.push('<p><img src="' + coverUri + '" alt="Cover"/></p>');
+      out.push('<h1>' + escapeText(title) + '</h1>');
+      if (book.meta.author) out.push('<p>' + escapeText(book.meta.author) + '</p>');
+      out.push('</header>');
+      if (toc.length > 1) {
+        out.push('<nav class="ec-toc"><h2>Contents</h2><ol>');
+        for (const t of toc) {
+          const r = resolveSectionHref(t.href, '', secIndex);
+          const pad = t.level ? ' style="margin-left:' + (t.level * 1.2).toFixed(1) + 'em"' : '';
+          const label = escapeText(t.title || '');
+          out.push(r
+            ? '<li' + pad + '><a href="#' + escapeAttr(anchorFor(r)) + '">' + label + '</a></li>'
+            : '<li' + pad + '>' + label + '</li>');
+        }
+        out.push('</ol></nav>');
+      }
+      book.sections.forEach(function (s, i) {
+        out.push('<section class="ec-section" id="' + escapeAttr(s.id) + '">');
+        out.push(bodies[i]);
+        out.push('</section>');
+      });
+      out.push('</body></html>');
+      return encodeUtf8(out.join('\n'));
+    }
+
+    // ══ LaTeX writer ═════════════════════════════════════════════════════════
+    // The Markdown downcast spoken in LaTeX. Ten characters are magic in text
+    // mode; a single-pass replace escapes them exactly once. A lone .tex file
+    // can no more carry images than a lone .md, so they are dropped here too;
+    // the Pandoc bundle is the road to LaTeX with images.
+
+    const TEX_SPECIALS = {
+      '\\': '\\textbackslash{}', '&': '\\&', '%': '\\%', '$': '\\$', '#': '\\#',
+      '_': '\\_', '{': '\\{', '}': '\\}',
+      '~': '\\textasciitilde{}', '^': '\\textasciicircum{}',
+    };
+    function texEscape(s) {
+      return s.replace(/[\\&%$#_{}~^]/g, function (c) { return TEX_SPECIALS[c]; });
+    }
+    // hyperref reads its URL argument nearly verbatim, but %, #, & and braces
+    // still need help.
+    function texUrl(href) {
+      return href
+        .replace(/[{}]/g, function (c) { return c === '{' ? '%7B' : '%7D'; })
+        .replace(/([%#&])/g, '\\$1');
+    }
+    // Line breaks inside a heading, cell or \item argument break the syntax.
+    function texFlatten(s) {
+      return s.replace(/\\\\\n/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    function texCmd(cmd, inner) {
+      const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(inner);
+      return m[2] ? m[1] + '\\' + cmd + '{' + m[2] + '}' + m[3] : inner;
+    }
+
+    function texInline(children, opts) {
+      let s = '';
+      for (const ch of children) {
+        if (!isElement(ch)) { s += texEscape(ch.value.replace(/\s+/g, ' ')); continue; }
+        const n = localName(ch.name);
+        if (n === 'script' || n === 'style') continue;
+        if (n === 'br') { s += '\\\\\n'; continue; }
+        if (n === 'img') {
+          if (opts.stats) opts.stats.imagesDropped++;
+          continue;
+        }
+        const inner = texInline(ch.children, opts);
+        if (n === 'em' || n === 'i' || n === 'cite' || n === 'var') s += texCmd('emph', inner);
+        else if (n === 'strong' || n === 'b') s += texCmd('textbf', inner);
+        else if (n === 's' || n === 'del' || n === 'strike') s += texCmd('sout', inner);
+        else if (n === 'code' || n === 'kbd' || n === 'samp' || n === 'tt') s += texCmd('texttt', inner);
+        else if (n === 'sub') s += texCmd('textsubscript', inner);
+        else if (n === 'sup') s += texCmd('textsuperscript', inner);
+        else if (n === 'a') {
+          const href = ch.attrs.href || '';
+          // Same rule as the Markdown writer: real URLs become links, internal
+          // hrefs keep only their text, symbol-only navigation chrome goes.
+          if (/^[A-Za-z][\w+.-]*:/.test(href)) {
+            const label = inner.trim() || texEscape(href);
+            s += '\\href{' + texUrl(href) + '}{' + label + '}';
+          } else if (/[\p{L}\p{N}]/u.test(inner)) s += inner;
+        } else s += inner;
+      }
+      return s;
+    }
+
+    function texList(node, opts, out) {
+      const env = localName(node.name) === 'ol' ? 'enumerate' : 'itemize';
+      const lines = ['\\begin{' + env + '}'];
+      for (const li of kids(node, 'li')) {
+        const nested = [];
+        const rest = [];
+        for (const c of li.children) {
+          const n = isElement(c) ? localName(c.name) : '';
+          if (n === 'ul' || n === 'ol') nested.push(c);
+          else rest.push(c);
+        }
+        const inner = [];
+        texBlocks(rest, opts, inner);
+        lines.push('\\item ' + texFlatten(inner.join(' ')));
+        for (const nl of nested) {
+          const sub = [];
+          texList(nl, opts, sub);
+          for (const l of sub[0].split('\n')) lines.push('  ' + l);
+        }
+      }
+      lines.push('\\end{' + env + '}');
+      out.push(lines.join('\n'));
+    }
+
+    function texTable(node, opts) {
+      const grid = findAll(node, 'tr').map(function (tr) {
+        return tr.children
+          .filter(function (c) { return isElement(c) && /^(td|th)$/.test(localName(c.name)); })
+          .map(function (c) { return texFlatten(texInline(c.children, opts)); });
+      }).filter(function (r) { return r.length; });
+      if (!grid.length) return '';
+      const cols = Math.max.apply(null, grid.map(function (r) { return r.length; }));
+      const row = function (r) {
+        const cells = [];
+        for (let i = 0; i < cols; i++) cells.push(r[i] || '');
+        return cells.join(' & ') + ' \\\\';
+      };
+      const lines = ['\\begin{center}\\begin{tabular}{' + 'l'.repeat(cols) + '}'];
+      lines.push(row(grid[0]));
+      lines.push('\\hline');
+      for (let i = 1; i < grid.length; i++) lines.push(row(grid[i]));
+      lines.push('\\end{tabular}\\end{center}');
+      return lines.join('\n');
+    }
+
+    const TEX_HEADINGS = ['chapter', 'section', 'subsection', 'subsubsection', 'paragraph', 'subparagraph'];
+
+    function texBlocks(children, opts, out) {
+      let run = [];
+      const flush = function () {
+        // Leading backslashes are commands here, not escapes; only trailing
+        // whitespace and dangling \\ line breaks get trimmed.
+        const t = run.join('').replace(/^\s+/, '').replace(/(\s|\\\\)+$/, '');
+        if (t) out.push(t);
+        run = [];
+      };
+      for (const ch of children) {
+        const n = isElement(ch) ? localName(ch.name) : '#text';
+        if (n === '#text' || (!MD_BLOCKS[n] && !MD_CONTAINERS[n])) {
+          run.push(texInline([ch], opts));
+          continue;
+        }
+        flush();
+        if (MD_CONTAINERS[n]) { texBlocks(ch.children, opts, out); continue; }
+        if (/^h[1-6]$/.test(n)) {
+          const t = texFlatten(texInline(ch.children, opts));
+          if (t) out.push('\\' + TEX_HEADINGS[+n.charAt(1) - 1] + '{' + t + '}');
+        } else if (n === 'p' || n === 'figcaption' || n === 'dt' || n === 'dd') {
+          const t = texInline(ch.children, opts).trim();
+          if (t) out.push(t);
+        } else if (n === 'blockquote') {
+          const inner = [];
+          texBlocks(ch.children, opts, inner);
+          if (inner.length) out.push('\\begin{quote}\n' + inner.join('\n\n') + '\n\\end{quote}');
+        } else if (n === 'ul' || n === 'ol') {
+          texList(ch, opts, out);
+        } else if (n === 'pre') {
+          // \end{verbatim} inside the content would end the environment early;
+          // dropping its backslash defuses it at the cost of one character.
+          const raw = rawTextOf(ch).replace(/\r\n?/g, '\n').replace(/^\n+|\s+$/g, '')
+            .replace(/\\(end\s*\{\s*verbatim\s*\})/gi, '$1');
+          out.push('\\begin{verbatim}\n' + raw + '\n\\end{verbatim}');
+        } else if (n === 'hr') {
+          out.push('\\begin{center}* * *\\end{center}');
+        } else if (n === 'table') {
+          const t = texTable(ch, opts);
+          if (t) out.push(t);
+        }
+      }
+      flush();
+    }
+
+    function htmlToLatex(html, opts) {
+      const out = [];
+      texBlocks(parseXML(html).children, opts || {}, out);
+      return out.join('\n\n');
+    }
+
+    // Same reasoning as mdSection: the TOC knows the chapter titles even when
+    // the book marks them as mere bold paragraphs. Here they become \chapter.
+    function texSection(s, opts) {
+      const tex = htmlToLatex(s.html, opts);
+      if (!tex) return '';
+      const title = (s.title || '').trim();
+      if (!title || /^Section \d+$/.test(title) || /^\\(chapter|section|subsection)\b/.test(tex)) return tex;
+      const heading = '\\chapter{' + texFlatten(texEscape(title)) + '}';
+      const blocks = tex.split('\n\n');
+      const firstPlain = blocks[0]
+        .replace(/\\\\/g, ' ')
+        .replace(/\\([&%$#_])/g, '$1')
+        .replace(/\\[A-Za-z]+/g, '')
+        .replace(/[{}]/g, '')
+        .replace(/\s+/g, ' ').trim();
+      if (firstPlain.toLowerCase() === title.replace(/\s+/g, ' ').toLowerCase()) {
+        blocks[0] = heading;
+        return blocks.join('\n\n');
+      }
+      return heading + '\n\n' + tex;
+    }
+
+    const TEX_BABEL = { de: 'ngerman', fr: 'french', es: 'spanish', it: 'italian', nl: 'dutch', pt: 'portuguese' };
+
+    function writeLatex(book) {
+      const opts = { imageHref: null, stats: { imagesDropped: 0 } };
+      const out = [];
+      out.push('\\documentclass[11pt]{book}');
+      out.push('\\usepackage[utf8]{inputenc}');
+      out.push('\\usepackage[T1]{fontenc}');
+      const lang = TEX_BABEL[(book.meta.language || '').slice(0, 2).toLowerCase()];
+      if (lang) out.push('\\usepackage[' + lang + ']{babel}');
+      out.push('\\usepackage[normalem]{ulem}');
+      out.push('\\usepackage{hyperref}');
+      out.push('\\title{' + texFlatten(texEscape(book.meta.title || 'Untitled')) + '}');
+      out.push('\\author{' + texFlatten(texEscape(book.meta.author || '')) + '}');
+      out.push('\\date{}');
+      out.push('');
+      out.push('\\begin{document}');
+      out.push('\\frontmatter');
+      out.push('\\maketitle');
+      out.push('\\tableofcontents');
+      out.push('\\mainmatter');
+      for (const s of book.sections) {
+        const tex = texSection(s, opts);
+        if (!tex) continue;
+        out.push('');
+        // Readers start every spine file on a fresh page. \chapter brings its
+        // own page break; everything else (front matter, the book's own TOC
+        // page) needs an explicit one or it flows into the previous chapter.
+        if (!/^\\chapter/.test(tex)) out.push('\\clearpage');
+        out.push(tex);
+      }
+      out.push('');
+      out.push('\\end{document}');
+      return encodeUtf8(out.join('\n') + '\n');
+    }
+
+    // ══ Pandoc bundle writer ═════════════════════════════════════════════════
+    // pandoc turns Markdown into nearly anything, but a single .md cannot hold
+    // the images. The bundle can: book.md with a YAML metadata header next to a
+    // media/ folder, zipped. Unpack it and run
+    //   pandoc book.md -o book.docx
+    // (or .pdf, .tex, whatever pandoc speaks) and the images come along.
+
+    function yamlStr(s) {
+      return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ') + '"';
+    }
+
+    async function writePandoc(book) {
+      const media = new Map(); // resource key -> zip path
+      const used = new Set();
+      for (const entry of book.resources) {
+        if (!/^image\//.test(entry[1].mime)) continue;
+        const base = entry[0].replace(/[\\/:*?"<>|\s]/g, '_') || 'image';
+        let path = 'media/' + base;
+        let i = 2;
+        while (used.has(path)) { path = 'media/' + i + '_' + base; i++; }
+        used.add(path);
+        media.set(entry[0], path);
+      }
+      const opts = {
+        stats: { imagesDropped: 0 },
+        imageHref: function (name) { return media.get(name) || null; },
+      };
+      const yaml = ['---'];
+      yaml.push('title: ' + yamlStr(book.meta.title || 'Untitled'));
+      if (book.meta.author) yaml.push('author: ' + yamlStr(book.meta.author));
+      if (book.meta.language) yaml.push('lang: ' + yamlStr(book.meta.language));
+      if (book.meta.date) yaml.push('date: ' + yamlStr(book.meta.date));
+      if (book.meta.publisher) yaml.push('publisher: ' + yamlStr(book.meta.publisher));
+      if (book.meta.coverRes && media.has(book.meta.coverRes)) {
+        yaml.push('cover-image: ' + yamlStr(media.get(book.meta.coverRes)));
+      }
+      yaml.push('---');
+      const md = yaml.join('\n') + '\n\n' + mdBody(book, opts) + '\n';
+      const entries = [{ name: 'book.md', bytes: encodeUtf8(md) }];
+      for (const entry of media) {
+        entries.push({ name: entry[1], bytes: book.resources.get(entry[0]).bytes });
+      }
+      return zipWrite(entries);
+    }
+
+    // ══ DOCX writer ══════════════════════════════════════════════════════════
+    // A .docx is a zip of OOXML parts; the zip module already exists, so this
+    // is one more downcast plus boilerplate. Headings go through named styles
+    // (Heading1..6), never through font sizes, so Word's navigation pane and
+    // "update table of contents" work on the result. Images are embedded as
+    // word/media/* parts with real dimensions read from their headers.
+
+    function imageDims(bytes, mime) {
+      try {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        if (mime === 'image/png' && bytes.length >= 24) {
+          return { w: dv.getUint32(16), h: dv.getUint32(20) };
+        }
+        if (mime === 'image/gif' && bytes.length >= 10) {
+          return { w: bytes[6] | (bytes[7] << 8), h: bytes[8] | (bytes[9] << 8) };
+        }
+        if (mime === 'image/jpeg') {
+          let i = 2;
+          while (i + 9 < bytes.length) {
+            if (bytes[i] !== 0xFF) { i++; continue; }
+            const m = bytes[i + 1];
+            if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
+              return { h: dv.getUint16(i + 5), w: dv.getUint16(i + 7) };
+            }
+            if (m === 0xD8 || (m >= 0xD0 && m <= 0xD9)) { i += 2; continue; }
+            i += 2 + dv.getUint16(i + 2);
+          }
+        }
+      } catch (e) { /* fall through */ }
+      return null;
+    }
+
+    const DOCX_IMAGE_EXT = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif' };
+    const DOCX_MAX_CX = 5731510; // usable A4 width (page minus margins) in EMU
+
+    function wRun(text, fmt) {
+      let rpr = '';
+      if (fmt.style) rpr += '<w:rStyle w:val="' + fmt.style + '"/>';
+      if (fmt.code) rpr += '<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/>';
+      if (fmt.b) rpr += '<w:b/>';
+      if (fmt.i) rpr += '<w:i/>';
+      if (fmt.strike) rpr += '<w:strike/>';
+      if (fmt.sub) rpr += '<w:vertAlign w:val="subscript"/>';
+      else if (fmt.sup) rpr += '<w:vertAlign w:val="superscript"/>';
+      return '<w:r>' + (rpr ? '<w:rPr>' + rpr + '</w:rPr>' : '')
+        + '<w:t xml:space="preserve">' + escapeText(text) + '</w:t></w:r>';
+    }
+
+    function wPara(runs, props) {
+      return '<w:p>' + (props ? '<w:pPr>' + props + '</w:pPr>' : '') + runs.join('') + '</w:p>';
+    }
+
+    function docxImage(node, ctx) {
+      const src = node.attrs.src || '';
+      let name = baseOf(src.split('#')[0].split('?')[0]);
+      try { name = decodeURIComponent(name); } catch (e) { /* keep as-is */ }
+      const res = ctx.book.resources.get(name);
+      const ext = res && DOCX_IMAGE_EXT[res.mime];
+      if (!ext) { ctx.stats.imagesDropped++; return ''; }
+      let img = ctx.imagesByName.get(name);
+      if (!img) {
+        const dims = imageDims(res.bytes, res.mime) || { w: 300, h: 400 };
+        let cx = Math.max(1, Math.round(dims.w * 9525));
+        let cy = Math.max(1, Math.round(dims.h * 9525));
+        if (cx > DOCX_MAX_CX) { cy = Math.max(1, Math.round(cy * DOCX_MAX_CX / cx)); cx = DOCX_MAX_CX; }
+        const k = ctx.images.length + 1;
+        img = { rid: 'rIdImg' + k, path: 'media/img' + k + '.' + ext, bytes: res.bytes, cx: cx, cy: cy, n: k };
+        ctx.images.push(img);
+        ctx.imagesByName.set(name, img);
+      }
+      return '<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">'
+        + '<wp:extent cx="' + img.cx + '" cy="' + img.cy + '"/>'
+        + '<wp:docPr id="' + img.n + '" name="img' + img.n + '"/>'
+        + '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        + '<pic:pic><pic:nvPicPr><pic:cNvPr id="' + img.n + '" name="img' + img.n + '"/><pic:cNvPicPr/></pic:nvPicPr>'
+        + '<pic:blipFill><a:blip r:embed="' + img.rid + '"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+        + '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="' + img.cx + '" cy="' + img.cy + '"/></a:xfrm>'
+        + '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
+        + '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+    }
+
+    function docxHasInk(nodes) {
+      for (const nd of nodes) {
+        if (!isElement(nd)) { if (nd.value.trim()) return true; continue; }
+        const n = localName(nd.name);
+        if (n === 'script' || n === 'style') continue;
+        if (n === 'img') return true;
+        if (docxHasInk(nd.children)) return true;
+      }
+      return false;
+    }
+
+    function docxInline(children, fmt, ctx, out) {
+      for (const ch of children) {
+        if (!isElement(ch)) {
+          const t = ch.value.replace(/\s+/g, ' ');
+          if (t) out.push(wRun(t, fmt));
+          continue;
+        }
+        const n = localName(ch.name);
+        if (n === 'script' || n === 'style') continue;
+        if (n === 'br') { out.push('<w:r><w:br/></w:r>'); continue; }
+        if (n === 'img') { const d = docxImage(ch, ctx); if (d) out.push(d); continue; }
+        if (n === 'a') {
+          const href = ch.attrs.href || '';
+          if (/^[A-Za-z][\w+.-]*:/.test(href)) {
+            const inner = [];
+            docxInline(ch.children, Object.assign({}, fmt, { style: 'Hyperlink' }), ctx, inner);
+            if (inner.length) {
+              const rid = 'rIdHl' + (ctx.hyperlinks.length + 1);
+              ctx.hyperlinks.push({ rid: rid, href: href });
+              out.push('<w:hyperlink r:id="' + rid + '">' + inner.join('') + '</w:hyperlink>');
+            }
+          } else if (/[\p{L}\p{N}]/u.test(textOf(ch))) {
+            // Same rule as the other writers: internal links keep their text,
+            // symbol-only navigation chrome goes.
+            docxInline(ch.children, fmt, ctx, out);
+          }
+          continue;
+        }
+        const f = Object.assign({}, fmt);
+        if (n === 'em' || n === 'i' || n === 'cite' || n === 'var') f.i = true;
+        else if (n === 'strong' || n === 'b') f.b = true;
+        else if (n === 's' || n === 'del' || n === 'strike') f.strike = true;
+        else if (n === 'code' || n === 'kbd' || n === 'samp' || n === 'tt') f.code = true;
+        else if (n === 'sub') f.sub = true;
+        else if (n === 'sup') f.sup = true;
+        docxInline(ch.children, f, ctx, out);
+      }
+    }
+
+    function docxList(node, depth, parentDecimal, ctx, out) {
+      const ordered = localName(node.name) === 'ol';
+      // Bullets can all share one numbering instance; every top-level ordered
+      // list needs its own so Word restarts it at 1.
+      const numId = ordered ? (parentDecimal || ctx.newDecimalNum()) : 1;
+      for (const li of kids(node, 'li')) {
+        const nested = [];
+        const rest = [];
+        for (const c of li.children) {
+          const n = isElement(c) ? localName(c.name) : '';
+          if (n === 'ul' || n === 'ol') nested.push(c);
+          else rest.push(c);
+        }
+        const runs = [];
+        docxInline(rest, {}, ctx, runs);
+        if (runs.length) {
+          out.push('<w:p><w:pPr><w:numPr><w:ilvl w:val="' + Math.min(depth, 8)
+            + '"/><w:numId w:val="' + numId + '"/></w:numPr></w:pPr>' + runs.join('') + '</w:p>');
+        }
+        for (const nl of nested) {
+          docxList(nl, depth + 1, ordered ? numId : null, ctx, out);
+        }
+      }
+    }
+
+    const DOCX_BORDER = '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+      + '<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+      + '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+      + '<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+      + '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+      + '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>';
+
+    function docxTable(node, ctx) {
+      const rows = findAll(node, 'tr').map(function (tr, ri) {
+        const cells = tr.children
+          .filter(function (c) { return isElement(c) && /^(td|th)$/.test(localName(c.name)); })
+          .map(function (c) {
+            const th = localName(c.name) === 'th' || ri === 0;
+            const runs = [];
+            docxInline(c.children, th ? { b: true } : {}, ctx, runs);
+            return '<w:tc><w:tcPr/>' + wPara(runs, '') + '</w:tc>';
+          });
+        return cells.length ? '<w:tr>' + cells.join('') + '</w:tr>' : '';
+      }).filter(function (r) { return r; });
+      if (!rows.length) return '';
+      return '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>'
+        + DOCX_BORDER + '</w:tblBorders></w:tblPr>' + rows.join('') + '</w:tbl>';
+    }
+
+    function docxBlocks(children, ctx, out, para) {
+      let inline = [];
+      const flush = function () {
+        if (docxHasInk(inline)) {
+          const runs = [];
+          docxInline(inline, {}, ctx, runs);
+          if (runs.length) out.push(wPara(runs, para));
+        }
+        inline = [];
+      };
+      for (const ch of children) {
+        const n = isElement(ch) ? localName(ch.name) : '#text';
+        if (n === '#text' || (!MD_BLOCKS[n] && !MD_CONTAINERS[n])) {
+          inline.push(ch);
+          continue;
+        }
+        flush();
+        if (MD_CONTAINERS[n]) { docxBlocks(ch.children, ctx, out, para); continue; }
+        if (/^h[1-6]$/.test(n)) {
+          const runs = [];
+          docxInline(ch.children, {}, ctx, runs);
+          if (runs.length) out.push(wPara(runs, '<w:pStyle w:val="Heading' + n.charAt(1) + '"/>'));
+        } else if (n === 'p' || n === 'figcaption' || n === 'dt' || n === 'dd') {
+          if (!docxHasInk(ch.children)) continue;
+          const runs = [];
+          docxInline(ch.children, {}, ctx, runs);
+          if (runs.length) out.push(wPara(runs, para));
+        } else if (n === 'blockquote') {
+          docxBlocks(ch.children, ctx, out, '<w:pStyle w:val="Quote"/>');
+        } else if (n === 'ul' || n === 'ol') {
+          docxList(ch, 0, null, ctx, out);
+        } else if (n === 'pre') {
+          const lines = rawTextOf(ch).replace(/\r\n?/g, '\n').replace(/^\n+|\s+$/g, '').split('\n');
+          const runs = [];
+          lines.forEach(function (l, i) {
+            if (i) runs.push('<w:r><w:br/></w:r>');
+            if (l) runs.push(wRun(l, {}));
+          });
+          if (runs.length) out.push(wPara(runs, '<w:pStyle w:val="CodeBlock"/>'));
+        } else if (n === 'hr') {
+          out.push(wPara([wRun('* * *', {})], '<w:jc w:val="center"/>'));
+        } else if (n === 'table') {
+          const t = docxTable(ch, ctx);
+          // Word merges adjacent tables and chokes on a table as the very last
+          // body element; the empty paragraph prevents both.
+          if (t) { out.push(t); out.push('<w:p/>'); }
+        }
+      }
+      flush();
+    }
+
+    // The first real block element, looking through div/section wrappers, or a
+    // signal that the section starts with bare text.
+    function docxFirstBlock(node) {
+      for (const c of node.children) {
+        if (!isElement(c)) { if (c.value.trim()) return { text: true }; continue; }
+        const n = localName(c.name);
+        if (n === 'script' || n === 'style') continue;
+        if (MD_CONTAINERS[n]) {
+          const r = docxFirstBlock(c);
+          if (r) return r;
+          continue;
+        }
+        return { el: c, parent: node };
+      }
+      return null;
+    }
+
+    function docxSection(s, ctx, out, isFirst) {
+      const root = parseXML(s.html);
+      if (!isFirst) out.push('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+      // Same chapter synthesis as the Markdown and LaTeX writers: the TOC title
+      // becomes a Heading1 unless the content already starts with a heading; a
+      // first block that is just the title in bold is replaced, not repeated.
+      const title = (s.title || '').trim();
+      const fb = docxFirstBlock(root);
+      const startsHeading = !!(fb && fb.el && /^h[1-3]$/.test(localName(fb.el.name)));
+      if (title && !/^Section \d+$/.test(title) && !startsHeading) {
+        if (fb && fb.el) {
+          const plain = textOf(fb.el).replace(/\s+/g, ' ').trim();
+          if (plain.toLowerCase() === title.replace(/\s+/g, ' ').toLowerCase()) {
+            fb.parent.children.splice(fb.parent.children.indexOf(fb.el), 1);
+          }
+        }
+        out.push(wPara([wRun(title, {})], '<w:pStyle w:val="Heading1"/>'));
+      }
+      docxBlocks(root.children, ctx, out, '');
+    }
+
+    const DOCX_STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+      + '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+      + '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/>'
+      + '<w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault>'
+      + '<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+      + '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+      + '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/>'
+      + '<w:pPr><w:spacing w:before="2400" w:after="240"/><w:jc w:val="center"/></w:pPr>'
+      + '<w:rPr><w:b/><w:sz w:val="56"/></w:rPr></w:style>'
+      + '<w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/>'
+      + '<w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:sz w:val="28"/></w:rPr></w:style>'
+      + [36, 32, 28, 26, 24, 22].map(function (sz, i) {
+        return '<w:style w:type="paragraph" w:styleId="Heading' + (i + 1) + '">'
+          + '<w:name w:val="heading ' + (i + 1) + '"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>'
+          + '<w:pPr><w:keepNext/><w:spacing w:before="360" w:after="180"/><w:outlineLvl w:val="' + i + '"/></w:pPr>'
+          + '<w:rPr><w:b/><w:sz w:val="' + sz + '"/></w:rPr></w:style>';
+      }).join('')
+      + '<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/>'
+      + '<w:pPr><w:ind w:left="720" w:right="720"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>'
+      + '<w:style w:type="paragraph" w:styleId="CodeBlock"><w:name w:val="Code Block"/><w:basedOn w:val="Normal"/>'
+      + '<w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/><w:sz w:val="20"/></w:rPr></w:style>'
+      + '<w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/>'
+      + '<w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>'
+      + '</w:styles>';
+
+    function docxNumbering(decimalCount) {
+      const lvls = function (fmt) {
+        const out = [];
+        for (let i = 0; i < 9; i++) {
+          out.push('<w:lvl w:ilvl="' + i + '"><w:start w:val="1"/><w:numFmt w:val="' + fmt + '"/>'
+            + '<w:lvlText w:val="' + (fmt === 'bullet' ? '•' : '%' + (i + 1) + '.') + '"/>'
+            + '<w:lvlJc w:val="left"/><w:pPr><w:ind w:left="' + (720 * (i + 1)) + '" w:hanging="360"/></w:pPr></w:lvl>');
+        }
+        return out.join('');
+      };
+      const nums = ['<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'];
+      for (let i = 0; i < decimalCount; i++) {
+        nums.push('<w:num w:numId="' + (i + 2) + '"><w:abstractNumId w:val="1"/></w:num>');
+      }
+      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        + '<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="multilevel"/>' + lvls('bullet') + '</w:abstractNum>'
+        + '<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="multilevel"/>' + lvls('decimal') + '</w:abstractNum>'
+        + nums.join('') + '</w:numbering>';
+    }
+
+    async function writeDocx(book) {
+      const ctx = {
+        book: book,
+        images: [],
+        imagesByName: new Map(),
+        hyperlinks: [],
+        decimalCount: 0,
+        stats: { imagesDropped: 0 },
+      };
+      ctx.newDecimalNum = function () { ctx.decimalCount++; return ctx.decimalCount + 1; };
+
+      const body = [];
+      // Same rule as the HTML writer: the cover goes on the title page unless
+      // some section markup already shows it.
+      const coverShown = !!book.meta.coverRes && book.sections.some(function (s) {
+        return s.html.indexOf(book.meta.coverRes) >= 0;
+      });
+      if (book.meta.coverRes && !coverShown) {
+        const d = docxImage({ attrs: { src: book.meta.coverRes } }, ctx);
+        if (d) body.push(wPara([d], '<w:jc w:val="center"/>'));
+      }
+      if (book.meta.title) body.push(wPara([wRun(book.meta.title, {})], '<w:pStyle w:val="Title"/>'));
+      if (book.meta.author) body.push(wPara([wRun(book.meta.author, {})], '<w:pStyle w:val="Subtitle"/>'));
+      book.sections.forEach(function (s) {
+        docxSection(s, ctx, body, body.length === 0);
+      });
+
+      const doc = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        + ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        + ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+        + ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+        + ' xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        + '<w:body>' + body.join('')
+        + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+        + '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>'
+        + '</w:sectPr></w:body></w:document>';
+
+      const RELNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
+      const docRels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + '<Relationship Id="rId1" Type="' + RELNS + 'styles" Target="styles.xml"/>'
+        + '<Relationship Id="rId2" Type="' + RELNS + 'numbering" Target="numbering.xml"/>'];
+      for (const img of ctx.images) {
+        docRels.push('<Relationship Id="' + img.rid + '" Type="' + RELNS + 'image" Target="' + img.path + '"/>');
+      }
+      for (const hl of ctx.hyperlinks) {
+        docRels.push('<Relationship Id="' + hl.rid + '" Type="' + RELNS + 'hyperlink" Target="'
+          + escapeAttr(hl.href) + '" TargetMode="External"/>');
+      }
+      docRels.push('</Relationships>');
+
+      const contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        + '<Default Extension="xml" ContentType="application/xml"/>'
+        + '<Default Extension="png" ContentType="image/png"/>'
+        + '<Default Extension="jpeg" ContentType="image/jpeg"/>'
+        + '<Default Extension="gif" ContentType="image/gif"/>'
+        + '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        + '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        + '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'
+        + '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        + '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+        + '</Types>';
+
+      const rootRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + '<Relationship Id="rId1" Type="' + RELNS + 'officeDocument" Target="word/document.xml"/>'
+        + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        + '<Relationship Id="rId3" Type="' + RELNS + 'extended-properties" Target="docProps/app.xml"/>'
+        + '</Relationships>';
+
+      const core = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
+        + ' xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        + '<dc:title>' + escapeText(book.meta.title || 'Untitled') + '</dc:title>'
+        + (book.meta.author ? '<dc:creator>' + escapeText(book.meta.author) + '</dc:creator>' : '')
+        + (book.meta.language ? '<dc:language>' + escapeText(book.meta.language) + '</dc:language>' : '')
+        + '</cp:coreProperties>';
+
+      const app = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+        + '<Application>alber.me e-book converter</Application></Properties>';
+
+      const entries = [
+        { name: '[Content_Types].xml', bytes: encodeUtf8(contentTypes) },
+        { name: '_rels/.rels', bytes: encodeUtf8(rootRels) },
+        { name: 'docProps/core.xml', bytes: encodeUtf8(core) },
+        { name: 'docProps/app.xml', bytes: encodeUtf8(app) },
+        { name: 'word/document.xml', bytes: encodeUtf8(doc) },
+        { name: 'word/styles.xml', bytes: encodeUtf8(DOCX_STYLES) },
+        { name: 'word/numbering.xml', bytes: encodeUtf8(docxNumbering(ctx.decimalCount)) },
+        { name: 'word/_rels/document.xml.rels', bytes: encodeUtf8(docRels.join('')) },
+      ];
+      for (const img of ctx.images) {
+        entries.push({ name: 'word/' + img.path, bytes: img.bytes });
+      }
+      return zipWrite(entries);
+    }
+
     const WRITERS = {
       epub: { write: writeEpub, ext: 'epub', mime: 'application/epub+zip' },
       mobi: { write: writeMobi, ext: 'mobi', mime: 'application/x-mobipocket-ebook' },
       txt: { write: writeTxt, ext: 'txt', mime: 'text/plain;charset=utf-8' },
+      md: { write: writeMd, ext: 'md', mime: 'text/markdown;charset=utf-8' },
+      html: { write: writeHtml, ext: 'html', mime: 'text/html;charset=utf-8' },
+      latex: { write: writeLatex, ext: 'tex', mime: 'text/x-tex;charset=utf-8' },
+      docx: { write: writeDocx, ext: 'docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+      pandoc: { write: writePandoc, ext: 'pandoc.zip', mime: 'application/zip' },
     };
 
     async function write(book, target) {
@@ -2447,7 +3484,24 @@
       return { bytes: await w.write(book), ext: w.ext, mime: w.mime };
     }
 
+    // Single source of truth for what the machine can read and write. 'planned'
+    // marks roadmap formats: shown dimmed in the diagram, never offered as a
+    // live target or accepted as input. Every id with write:true must have an
+    // entry in WRITERS above.
+    const FORMATS = {
+      epub:   { label: 'EPUB',          read: true,      write: true,      exts: ['.epub'] },
+      mobi:   { label: 'MOBI',          read: true,      write: true,      exts: ['.mobi', '.prc'] },
+      azw3:   { label: 'AZW3',          read: true,      write: false,     exts: ['.azw3', '.azw'] },
+      txt:    { label: 'Plain text',    read: true,      write: true,      exts: ['.txt'] },
+      md:     { label: 'Markdown',      read: 'planned', write: true,      exts: ['.md', '.markdown'] },
+      html:   { label: 'HTML',          read: 'planned', write: true,      exts: ['.html', '.htm'] },
+      latex:  { label: 'LaTeX',         read: false,     write: true,      exts: ['.tex'] },
+      docx:   { label: 'DOCX',          read: false,     write: true,      exts: ['.docx'] },
+      pandoc: { label: 'Pandoc bundle', read: false,     write: true,      exts: ['.zip'] },
+    };
+
     return {
+      formats: FORMATS,
       // pipeline
       sniff: sniff, read: read, write: write, makeLog: makeLog,
       targets: Object.keys(WRITERS),
@@ -2458,6 +3512,9 @@
       decodeEntities: decodeEntities, escapeXml: escapeXml,
       resolvePath: resolvePath, htmlToText: htmlToText, decodeText: decodeText,
       readEpub: readEpub, writeEpub: writeEpub, readTxt: readTxt, writeTxt: writeTxt,
+      writeMd: writeMd, writeHtml: writeHtml, htmlToMarkdown: htmlToMarkdown,
+      writeLatex: writeLatex, writePandoc: writePandoc, writeDocx: writeDocx,
+      htmlToLatex: htmlToLatex, texEscape: texEscape, imageDims: imageDims,
       emptyBook: emptyBook, addResource: addResource, sniffImageMime: sniffImageMime,
       encodeUtf8: encodeUtf8, decodeUtf8: decodeUtf8,
       readPalmDB: readPalmDB, parseMobiHeader: parseMobiHeader,
@@ -2471,20 +3528,222 @@
   <script type="text/babel">
     // No async/await in here: this block goes through preset-env, which would
     // rewrite async functions to regeneratorRuntime (not loaded). Promises only.
-    const { useState, useRef, useCallback } = React;
+    const { useState, useRef, useCallback, useEffect, useMemo } = React;
     const Core = window.EbookCore;
 
-    const FORMAT_LABEL = { epub: 'EPUB', mobi: 'MOBI', azw3: 'AZW3', txt: 'Text' };
-    const TARGETS = [
-      { id: 'epub', label: 'EPUB' },
-      { id: 'mobi', label: 'MOBI' },
-      { id: 'txt', label: 'Plain text' },
-    ];
+    // Everything below derives from the core FORMATS registry, so the diagram,
+    // the target buttons and the file input can never disagree.
+    const FORMATS = Core.formats;
+    const TARGETS = Object.keys(FORMATS)
+      .filter((id) => FORMATS[id].write === true)
+      .map((id) => ({ id, label: FORMATS[id].label }));
+    const ACCEPT = Object.keys(FORMATS)
+      .filter((id) => FORMATS[id].read === true)
+      .map((id) => FORMATS[id].exts.join(','))
+      .join(',') + ',application/epub+zip,text/plain';
 
     function fmtSize(n) {
       if (n < 1024) return n + ' B';
       if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
       return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    // ---- machine diagram -------------------------------------------------
+
+    function Machine({ detected, target }) {
+      const ids = Object.keys(FORMATS);
+      const inputs = ids.filter((id) => FORMATS[id].read);
+      const outputs = ids.filter((id) => FORMATS[id].write);
+      const rowH = 26;
+      const H = Math.max(inputs.length, outputs.length) * rowH + 30;
+      const boxW = 130, boxH = H - 34;
+      const boxX = 255, boxY = 17;
+      const iconScale = 2.8;
+      const iconSize = 24 * iconScale;
+      const iconX = boxX + boxW / 2 - iconSize / 2;
+      const iconY = boxY + boxH / 2 - iconSize / 2 - 12;
+      const rowY = (i, n) => (H - n * rowH) / 2 + rowH * i + rowH / 2;
+
+      const arrowRow = (id, i, n, isInput) => {
+        const f = FORMATS[id];
+        const planned = (isInput ? f.read : f.write) === 'planned';
+        const hi = isInput ? detected === id : !!detected && target === id;
+        const yc = rowY(i, n);
+        const stroke = hi ? '#0fb5ad' : '#475569';
+        return (
+          <g key={id} opacity={planned ? 0.38 : 1}>
+            <text
+              x={isInput ? 118 : 522} y={yc + 4}
+              textAnchor={isInput ? 'end' : 'start'} fontSize={12.5}
+              fill={hi ? '#0fb5ad' : '#94a3b8'} fontWeight={hi ? 600 : 400}
+            >
+              {f.label}
+              {planned && <tspan fontSize={9.5} fill="#64748b"> soon</tspan>}
+            </text>
+            <line
+              x1={isInput ? 128 : 395} y1={yc} x2={isInput ? 243 : 510} y2={yc}
+              stroke={stroke} strokeWidth={hi ? 2 : 1.5}
+              strokeDasharray={planned ? '4 3' : 'none'}
+              markerEnd={hi ? 'url(#ecArrHi)' : 'url(#ecArr)'}
+            />
+          </g>
+        );
+      };
+
+      return (
+        <svg
+          className="ec-machine" viewBox={'0 0 640 ' + H}
+          role="img" aria-label="Diagram of supported input and output formats"
+        >
+          <defs>
+            <marker id="ecArr" viewBox="0 0 10 10" refX="8" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="#475569" />
+            </marker>
+            <marker id="ecArrHi" viewBox="0 0 10 10" refX="8" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="#0fb5ad" />
+            </marker>
+          </defs>
+          <rect x={boxX} y={boxY} width={boxW} height={boxH} rx={14}
+            fill="rgba(15,23,42,.55)" stroke="#334155" strokeWidth={1.5} />
+          <g
+            transform={'translate(' + iconX + ',' + iconY + ') scale(' + iconScale + ')'}
+            fill="none" stroke="#94a3b8" strokeWidth={1.1}
+            strokeLinecap="round" strokeLinejoin="round"
+          >
+            <path d="M5 7a2 2 0 0 0-2 2v11" />
+            <path d="M5.803 18H5a2 2 0 1 0 0 4h9.5a.5.5 0 0 0 .5-.5v-.5" />
+            <path d="M9 15V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2z" />
+          </g>
+          <text x={boxX + boxW / 2} y={iconY + iconSize + 26} textAnchor="middle"
+            fontSize={11} fill="#64748b">in-page converter</text>
+          {inputs.map((id, i) => arrowRow(id, i, inputs.length, true))}
+          {outputs.map((id, i) => arrowRow(id, i, outputs.length, false))}
+        </svg>
+      );
+    }
+
+    // ---- preview tab -----------------------------------------------------
+
+    function sectionTitles(book) {
+      return book.sections.map((s, i) => {
+        const t = book.toc.find(
+          (e) => e.href && s.href && e.href.split('#')[0] === s.href
+        );
+        if (t && t.title) return t.title;
+        const m = /<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/i.exec(s.html || '');
+        if (m) {
+          const txt = Core.decodeEntities(m[1].replace(/<[^>]+>/g, '')).trim();
+          if (txt) return txt;
+        }
+        return 'Section ' + (i + 1);
+      });
+    }
+
+    function findResource(book, sec, src) {
+      const clean = decodeURIComponent(src.split('#')[0].split('?')[0]).replace(/^\.\//, '');
+      if (book.resources.has(clean)) return book.resources.get(clean);
+      const stack = [];
+      (sec.href || '').split('/').slice(0, -1).concat(clean.split('/')).forEach((p) => {
+        if (p === '..') stack.pop();
+        else if (p !== '.' && p !== '') stack.push(p);
+      });
+      const resolved = stack.join('/');
+      if (book.resources.has(resolved)) return book.resources.get(resolved);
+      const bn = clean.split('/').pop();
+      const hit = Array.from(book.resources.entries()).find((e) => e[0].split('/').pop() === bn);
+      return hit ? hit[1] : null;
+    }
+
+    // Renders the book's own markup, so scrub it first: no scripts, no event
+    // handlers, no live links, and no external requests. Internal images are
+    // swapped to object URLs; everything else that could fetch is dropped.
+    function sanitizeSection(book, idx) {
+      const sec = book.sections[idx];
+      const doc = new DOMParser().parseFromString(sec.html || '', 'text/html');
+      const urls = [];
+      doc.querySelectorAll('script,iframe,object,embed,link,style,base,form,video,audio,source')
+        .forEach((n) => n.remove());
+      doc.querySelectorAll('*').forEach((el) => {
+        Array.from(el.attributes).forEach((a) => {
+          if (/^on/i.test(a.name)) el.removeAttribute(a.name);
+        });
+        // Publisher stylesheets are gone, so inline colors would fight the
+        // dark preview pane (dark gray text on dark blue, say). Colors go.
+        el.removeAttribute('color');
+        el.removeAttribute('bgcolor');
+        const style = el.getAttribute('style');
+        if (style) {
+          const kept = style.split(';').filter((d) => {
+            const prop = (d.split(':')[0] || '').trim();
+            return d.trim() && !/color|background/i.test(prop);
+          });
+          if (kept.length) el.setAttribute('style', kept.join(';'));
+          else el.removeAttribute('style');
+        }
+      });
+      doc.querySelectorAll('a').forEach((a) => a.removeAttribute('href'));
+      doc.querySelectorAll('img').forEach((img) => {
+        const src = img.getAttribute('src') || '';
+        if (/^data:image\//i.test(src)) return;
+        if (!src || /^[a-z][a-z0-9+.-]*:/i.test(src)) { img.remove(); return; }
+        const r = findResource(book, sec, src);
+        if (r) {
+          const u = URL.createObjectURL(new Blob([r.bytes], { type: r.mime }));
+          urls.push(u);
+          img.setAttribute('src', u);
+        } else {
+          img.remove();
+        }
+      });
+      return { html: doc.body.innerHTML, urls };
+    }
+
+    function PreviewTab({ book }) {
+      const [idx, setIdx] = useState(0);
+      const [html, setHtml] = useState('');
+      const urlsRef = useRef([]);
+      const titles = useMemo(() => (book ? sectionTitles(book) : []), [book]);
+
+      useEffect(() => { setIdx(0); }, [book]);
+      useEffect(() => {
+        if (!book || !book.sections[idx]) { setHtml(''); return undefined; }
+        const res = sanitizeSection(book, idx);
+        urlsRef.current = res.urls;
+        setHtml(res.html);
+        return () => {
+          urlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+          urlsRef.current = [];
+        };
+      }, [book, idx]);
+
+      if (!book) {
+        return <p style={{ color: '#64748b' }}>Load a book on the Convert tab first.</p>;
+      }
+      return (
+        <div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+            <button className="lang-seg" disabled={idx === 0}
+              onClick={() => setIdx(idx - 1)}>&#8592;</button>
+            <select
+              value={idx} onChange={(e) => setIdx(Number(e.target.value))}
+              style={{ flex: 1, minWidth: 180, marginBottom: 0, maxWidth: 480 }}
+            >
+              {titles.map((t, i) => (
+                <option key={i} value={i}>{(i + 1) + ' / ' + titles.length + ' · ' + t}</option>
+              ))}
+            </select>
+            <button className="lang-seg" disabled={idx >= book.sections.length - 1}
+              onClick={() => setIdx(idx + 1)}>&#8594;</button>
+          </div>
+          <div className="ec-preview" dangerouslySetInnerHTML={{ __html: html }} />
+          <p style={{ fontSize: 11, color: '#64748b', marginTop: 8 }}>
+            Rendered from the parsed book, exactly what a writer would receive. Publisher
+            styles are stripped, links are disabled, and nothing is fetched from the network.
+          </p>
+        </div>
+      );
     }
 
     function App() {
@@ -2497,7 +3756,24 @@
       const [over, setOver] = useState(false);
       const [target, setTarget] = useState('epub');
       const [result, setResult] = useState(null);
+      const [tab, setTab] = useState(
+        localStorage.getItem('ebook_mode') === 'nerd' ? 'nerdconvert' : 'convert'
+      );
       const inputRef = useRef(null);
+
+      const TABS = [
+        { id: 'convert', label: 'Convert' },
+        { id: 'nerdconvert', label: 'Convert (for nerds)' },
+        { id: 'preview', label: 'Preview' },
+      ];
+      const isConvert = tab === 'convert' || tab === 'nerdconvert';
+      const nerd = tab === 'nerdconvert';
+
+      const pickTab = (id) => {
+        setTab(id);
+        if (id === 'convert') localStorage.setItem('ebook_mode', 'simple');
+        if (id === 'nerdconvert') localStorage.setItem('ebook_mode', 'nerd');
+      };
 
       const reset = () => {
         setBook(null); setLog([]); setError(''); setResult(null);
@@ -2563,9 +3839,22 @@
         <div className="container" style={{ maxWidth: 860 }}>
           <h1 style={{ fontSize: '1.5rem', color: '#cbd5e1', marginBottom: 8 }}>E-Book Converter</h1>
           <p style={{ color: '#94a3b8', maxWidth: '70ch' }}>
-            Convert e-books between EPUB, MOBI, AZW3 and plain text. Everything happens inside this
-            page: your file is never uploaded, and it stays on your device.
+            Convert e-books entirely inside this page: the diagram shows what goes in and what
+            comes out. Your file is never uploaded, and it stays on your device.
           </p>
+
+          <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 18 }}>
+            {TABS.map((t) => (
+              <button key={t.id}
+                className={'lang-seg' + (tab === t.id ? ' active' : '')}
+                onClick={() => pickTab(t.id)}>{t.label}</button>
+            ))}
+          </div>
+
+          {tab === 'preview' && <PreviewTab book={book} />}
+
+          {isConvert && <React.Fragment>
+          <Machine detected={book ? book.sourceFormat : null} target={target} />
 
           <div
             className={'ec-drop' + (over ? ' over' : '')}
@@ -2586,7 +3875,7 @@
             <input
               ref={inputRef}
               type="file"
-              accept=".epub,.mobi,.azw3,.azw,.prc,.txt,application/epub+zip,text/plain"
+              accept={ACCEPT}
               style={{ display: 'none' }}
               onChange={(e) => loadFile(e.target.files && e.target.files[0])}
             />
@@ -2605,7 +3894,8 @@
             <div className="ec-card" style={{ marginBottom: 18 }}>
               <dl className="ec-kv" style={{ marginBottom: 14 }}>
                 <dt>File</dt><dd>{fileName} ({fmtSize(fileSize)})</dd>
-                <dt>Detected</dt><dd>{FORMAT_LABEL[book.sourceFormat] || book.sourceFormat}</dd>
+                <dt>Detected</dt>
+                <dd>{FORMATS[book.sourceFormat] ? FORMATS[book.sourceFormat].label : book.sourceFormat}</dd>
                 <dt>Content</dt>
                 <dd>{book.sections.length} sections · {imageCount} images · {book.toc.length} TOC entries</dd>
               </dl>
@@ -2638,6 +3928,12 @@
                 ))}
               </div>
 
+              {target === 'pandoc' && (
+                <p style={{ fontSize: 12, color: '#64748b', marginTop: -6, marginBottom: 12 }}>
+                  A zip with book.md (YAML metadata header) and a media/ folder for the images.
+                  Unpack it and run: pandoc book.md -o book.docx
+                </p>
+              )}
               <button onClick={convert} disabled={busy} style={{ width: 'auto' }}>
                 Convert
               </button>
@@ -2653,17 +3949,21 @@
             </div>
           )}
 
-          {log.length > 0 && (
+          {nerd && log.length > 0 && (
             <ul className="ec-log" style={{ marginBottom: 18 }}>
               {log.map((l, i) => (
                 <li key={i} className={l.level === 'warn' ? 'warn' : ''}>{l.msg}</li>
               ))}
             </ul>
           )}
+          </React.Fragment>}
 
           <p style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>
-            Reads EPUB, MOBI, AZW3 and plain text; writes EPUB, MOBI and plain text. Encrypted files
-            cannot be opened. Formats implemented from their public descriptions.
+            Reads EPUB, MOBI, AZW3 and plain text; writes EPUB, MOBI, Markdown, HTML, LaTeX,
+            DOCX, Pandoc bundle and plain text. Encrypted files cannot be opened. Formats
+            implemented from their public descriptions. A single Markdown or LaTeX file cannot
+            carry images; they are left out there. The Pandoc bundle keeps them: a zip with
+            book.md and media/.
           </p>
           <p style={{ fontSize: 10, color: '#475569', marginTop: 0 }}>
             This project is not affiliated with or endorsed by Amazon; "Kindle" and "Amazon" are used
