@@ -104,6 +104,16 @@
 
     const DEFAULT_B = 1.06;
 
+    /* ── Bayes-Parameter für den b-Fit ──
+       Prior b ~ N(1,06; TAU²), Rauschen einer Einzelzeit im log-Raum ≈ SIGMA
+       (Tagesform, Strecke, Wetter ≈ 2,5 %). Der Posterior ist dann Ridge-
+       Regression Richtung Prior mit Gewicht LAMBDA = (SIGMA/TAU)². */
+    const SIGMA = 0.025;
+    const TAU = 0.02;
+    const LAMBDA = (SIGMA / TAU) * (SIGMA / TAU);
+    const NU0 = 4;        // Prior-Gewicht der Rauschannahme in Pseudo-Läufen
+    const Z80 = 1.2816;   // z-Wert für das 10.–90. Perzentil
+
     const DISTANCES = [
       { key: '1k',   km: 1,        de: '1 km',         en: '1 km' },
       { key: '1mi',  km: 1.609344, de: '1 Meile',      en: '1 mile' },
@@ -135,16 +145,15 @@
         implausibleTime: 'Unplausibel für diese Distanz – wird ignoriert',
         custom: 'Andere …',
         exponentHead: 'Ermüdungsexponent b',
-        expAuto: 'Automatisch',
-        expManual: 'Manuell',
-        expFitted: n => `Aus deinen ${n} Zeiten angepasst:`,
-        expDefault: 'Standardwert (eine Eingabe genügt nicht zum Anpassen):',
-        expManualLabel: 'Gewählter Wert:',
-        expExplain: 'Riegel-Formel: T₂ = T₁ · (D₂/D₁)ᵇ. Je größer b, desto stärker fällt dein Tempo mit der Distanz ab. Typisch sind 1,04–1,09; der klassische Riegel-Wert ist 1,06.',
+        expFitted: n => `Aus deinen ${n} Zeiten geschätzt:`,
+        expDefault: 'Riegel-Standardwert (deine Eingaben grenzen b noch nicht ein):',
+        expWeight: w => `b beruht zu ${w} % auf deinen Zeiten und zu ${100 - w} % auf dem Riegel-Prior 1,06. Weit auseinanderliegende Distanzen und mehr Zeiten erhöhen das Datengewicht.`,
+        expExplain: 'Riegel-Formel: T₂ = T₁ · (D₂/D₁)ᵇ. Je größer b, desto stärker fällt dein Tempo mit der Distanz ab. Typisch sind 1,04–1,09; der klassische Riegel-Wert ist 1,06. Bei wenigen oder nah beieinanderliegenden Zeiten bleibt die Schätzung nahe 1,06 und wandert erst mit informativeren Daten zu deinem persönlichen Wert.',
         interpLow: 'Sehr ausdauerstark – dein Tempo fällt über die Distanz ungewöhnlich wenig ab.',
         interpTypical: 'Typischer Bereich – dein Tempoabfall über die Distanz entspricht dem üblichen Muster.',
         interpHigh: 'Dein Tempo fällt über die Distanz überdurchschnittlich stark ab – die langen Prognosen sind entsprechend vorsichtig.',
-        interpBad: 'b < 1: Deine längere Strecke ist im Schnitt schneller als die kürzere – bitte Eingaben prüfen.',
+        interpUnclear: 'Deine Zeiten liegen noch zu nah beieinander, um deinen Tempoabfall vom üblichen Muster zu unterscheiden – die Schätzung stützt sich überwiegend auf den Prior.',
+        interpBad: 'Deine längere Strecke ist im Schnitt schneller als die kürzere – bitte Eingaben prüfen.',
         resultsHead: 'Prognosen',
         colDistance: 'Distanz',
         colTime: 'Zeit',
@@ -154,12 +163,14 @@
         extrapNote: '* Weit außerhalb deiner eingegebenen Distanzen – Prognose unsicher.',
         chartHead: 'Pace über Distanz',
         legendCurve: 'Prognosekurve',
+        legendBand: '10.–90. Perzentil',
         legendInput: 'Deine Eingaben',
         axisX: 'Distanz [km, log]',
         axisY: 'Pace [min/km]',
         tooltipPace: 'Pace',
+        tooltipRange: '10.–90. Perzentil',
         emptyHint: 'Gib mindestens eine Zeit ein, um Prognosen zu sehen.',
-        methodology: 'Modell: Riegel-Formel (Peter Riegel, 1981), T₂ = T₁ · (D₂/D₁)ᵇ. Ab zwei Eingaben wird b per Regression im log-log-Raum an deine Zeiten angepasst. Annahme: angemessenes Training für die jeweilige Zieldistanz – die Formel weiß nicht, ob du lange Läufe gewohnt bist. Prognosen deutlich außerhalb der eingegebenen Distanzen sind mit Vorsicht zu genießen.',
+        methodology: 'Modell: Riegel-Formel (Peter Riegel, 1981), T₂ = T₁ · (D₂/D₁)ᵇ. Der Exponent b wird bayessch geschätzt: Normal-Prior um 1,06 (Streuung 0,02), Rauschen einer Einzelzeit ≈ 2,5 % als Vorannahme, mit der Streuung deiner Eingaben nachgeschätzt – widersprüchliche Zeiten verbreitern das Band. Der Posterior mischt deine Zeiten und den Prior nach ihrer Aussagekraft. Das Band im Diagramm zeigt das 10.–90. Perzentil für eine einzelne Wettkampfzeit – inklusive Tagesform, nicht nur die Unsicherheit der Kurve. Annahme: angemessenes Training für die jeweilige Zieldistanz – die Formel weiß nicht, ob du lange Läufe gewohnt bist. Prognosen deutlich außerhalb der eingegebenen Distanzen sind mit Vorsicht zu genießen.',
         disclaimer: 'Privates Hobbyprojekt, keine Trainingsberatung.',
       },
       en: {
@@ -177,16 +188,15 @@
         implausibleTime: 'Implausible for this distance – ignored',
         custom: 'Other …',
         exponentHead: 'Fatigue exponent b',
-        expAuto: 'Automatic',
-        expManual: 'Manual',
-        expFitted: n => `Fitted to your ${n} times:`,
-        expDefault: 'Default value (one entry is not enough to fit):',
-        expManualLabel: 'Chosen value:',
-        expExplain: 'Riegel formula: T₂ = T₁ · (D₂/D₁)ᵇ. The larger b, the more your pace drops with distance. Typical values are 1.04–1.09; the classic Riegel value is 1.06.',
+        expFitted: n => `Estimated from your ${n} times:`,
+        expDefault: 'Riegel default (your entries do not constrain b yet):',
+        expWeight: w => `b is based ${w}% on your times and ${100 - w}% on the Riegel prior of 1.06. Distances far apart and more entries increase the data weight.`,
+        expExplain: 'Riegel formula: T₂ = T₁ · (D₂/D₁)ᵇ. The larger b, the more your pace drops with distance. Typical values are 1.04–1.09; the classic Riegel value is 1.06. With few or closely spaced times the estimate stays near 1.06 and only moves towards your personal value as the data becomes more informative.',
         interpLow: 'Very endurance-strong – your pace drops unusually little with distance.',
         interpTypical: 'Typical range – your pace decay over distance matches the usual pattern.',
         interpHigh: 'Your pace drops more than average with distance – the long-distance predictions are correspondingly cautious.',
-        interpBad: 'b < 1: your longer distance is faster on average than the shorter one – please check your entries.',
+        interpUnclear: 'Your times are still too close together to tell your pace decay apart from the usual pattern – the estimate mostly rests on the prior.',
+        interpBad: 'Your longer distance is faster on average than the shorter one – please check your entries.',
         resultsHead: 'Predictions',
         colDistance: 'Distance',
         colTime: 'Time',
@@ -196,12 +206,14 @@
         extrapNote: '* Far outside your entered distances – prediction uncertain.',
         chartHead: 'Pace over distance',
         legendCurve: 'Prediction curve',
+        legendBand: '10th–90th percentile',
         legendInput: 'Your entries',
         axisX: 'Distance [km, log]',
         axisY: 'Pace [min/km]',
         tooltipPace: 'Pace',
+        tooltipRange: '10th–90th percentile',
         emptyHint: 'Enter at least one time to see predictions.',
-        methodology: 'Model: Riegel formula (Peter Riegel, 1981), T₂ = T₁ · (D₂/D₁)ᵇ. With two or more entries, b is fitted to your times by regression in log-log space. Assumption: adequate training for the target distance – the formula does not know whether you are used to long runs. Predictions well outside your entered distances should be taken with a grain of salt.',
+        methodology: 'Model: Riegel formula (Peter Riegel, 1981), T₂ = T₁ · (D₂/D₁)ᵇ. The exponent b is estimated in a Bayesian way: normal prior around 1.06 (sd 0.02), single-race noise ≈ 2.5% as a prior assumption, re-estimated from the scatter of your entries – inconsistent times widen the band. The posterior blends your times and the prior according to how informative the data is. The band in the chart shows the 10th–90th percentile for a single race result – including day-to-day form, not just the uncertainty of the curve. Assumption: adequate training for the target distance – the formula does not know whether you are used to long runs. Predictions well outside your entered distances should be taken with a grain of salt.',
         disclaimer: 'Personal hobby project, not training advice.',
       },
     };
@@ -246,34 +258,63 @@
         { minimumFractionDigits: digits, maximumFractionDigits: digits });
     }
 
-    /* ── Riegel-Fit: log T = log a + b · log D ── */
-    function fitRiegel(points, manualB) {
+    /* ── Riegel-Fit: log T = log a + b · log D, b bayessch geschätzt ──
+       Posterior-Mittel = (Sxy + λ·b₀)/(Sxx + λ): präzisionsgewichtete Mischung
+       aus OLS-Steigung und Prior b₀ = 1,06. Sxx (Streuung der log-Distanzen)
+       steuert das Datengewicht – weit auseinanderliegende Distanzen zählen mehr.
+       Sonderfälle (1 Punkt, gleiche Distanzen ⇒ Sxx = 0 ⇒ b = b₀) fallen
+       automatisch heraus. */
+    function fitRiegel(points) {
       if (!points.length) return null;
+      const n = points.length;
       const xs = points.map(p => Math.log(p.km));
       const ys = points.map(p => Math.log(p.sec));
-      const xm = xs.reduce((a, v) => a + v, 0) / xs.length;
-      const ym = ys.reduce((a, v) => a + v, 0) / ys.length;
+      const xm = xs.reduce((a, v) => a + v, 0) / n;
+      const ym = ys.reduce((a, v) => a + v, 0) / n;
 
-      let b, fitted = false;
-      if (manualB != null) {
-        b = manualB;
-      } else if (points.length >= 2) {
-        let sxx = 0, sxy = 0;
-        for (let i = 0; i < xs.length; i++) {
-          sxx += (xs[i] - xm) * (xs[i] - xm);
-          sxy += (xs[i] - xm) * (ys[i] - ym);
-        }
-        if (sxx > 1e-9) { b = sxy / sxx; fitted = true; }
-        else b = DEFAULT_B;   // alle Eingaben auf derselben Distanz
-      } else {
-        b = DEFAULT_B;
+      let sxx = 0, sxy = 0;
+      for (let i = 0; i < n; i++) {
+        sxx += (xs[i] - xm) * (xs[i] - xm);
+        sxy += (xs[i] - xm) * (ys[i] - ym);
       }
 
-      // Achsenabschnitt immer als Mittel über alle Punkte (bei fixem b = kleinste Quadrate)
+      const b = (sxy + LAMBDA * DEFAULT_B) / (sxx + LAMBDA);
+      const dataWeight = sxx / (sxx + LAMBDA);
+
+      // Achsenabschnitt: flacher Prior auf log a ⇒ Mittel über alle Punkte
       const lna = ym - b * xm;
       const a = Math.exp(lna);
       if (!isFinite(a) || !isFinite(b)) return null;
-      return { a, b, fitted, predict: km => a * Math.pow(km, b) };
+      const predict = km => a * Math.pow(km, b);
+
+      // Rauschniveau aus den Residuen mitschätzen (konjugiertes Update):
+      // Prior σ₀ zählt wie NU0 Pseudo-Läufe. Widersprüchliche Eingaben erzeugen
+      // Residuen (der Ridge-Fit geht nicht exakt durch die Punkte) ⇒ breiteres
+      // Band; konsistente Eingaben bestätigen σ₀ und engen das Band leicht ein.
+      let rss = 0;
+      for (let i = 0; i < n; i++) {
+        const r = ys[i] - (lna + b * xs[i]);
+        rss += r * r;
+      }
+      const s2 = (NU0 * SIGMA * SIGMA + rss) / (NU0 + n);
+      const bVar = s2 / (sxx + LAMBDA);
+
+      // Prädiktive Unsicherheit einer einzelnen Wettkampfzeit bei km:
+      // Tagesform (σ̂²) + Niveau (σ̂²/n) + Steigung ((Δx)²·Var b);
+      // im zentrierten Modell sind die Anteile unkorreliert
+      const sdLog = km => {
+        const dx = Math.log(km) - xm;
+        return Math.sqrt(s2 * (1 + 1 / n) + dx * dx * bVar);
+      };
+      return {
+        a, b, dataWeight,
+        // rohe OLS-Steigung (unregularisiert) – nur für Plausibilitätswarnungen
+        olsB: sxx > 1e-9 ? sxy / sxx : null,
+        fitted: dataWeight > 0.005,
+        predict,
+        lo: km => predict(km) * Math.exp(-Z80 * sdLog(km)),
+        hi: km => predict(km) * Math.exp(Z80 * sdLog(km)),
+      };
     }
 
     /* ── Chart-Geometrie ── */
@@ -290,9 +331,13 @@
 
       const pace = km => fit.predict(km) / km;   // s/km
 
-      // y-Bereich: Kurve über [1,50] plus Eingabepunkte, auf 30 s gerundet
+      // y-Bereich: Kurve samt Band über [1,50] plus Eingabepunkte, auf 30 s gerundet
       const { yLo, yHi, yTicks } = useMemo(() => {
-        const paces = [pace(KM_MIN), pace(KM_MAX), ...points.map(p => p.sec / p.km)];
+        const paces = [
+          fit.lo(KM_MIN) / KM_MIN, fit.hi(KM_MIN) / KM_MIN,
+          fit.lo(KM_MAX) / KM_MAX, fit.hi(KM_MAX) / KM_MAX,
+          ...points.map(p => p.sec / p.km),
+        ];
         let lo = Math.min(...paces), hi = Math.max(...paces);
         const pad = Math.max((hi - lo) * 0.12, 12);
         lo = Math.max(0, Math.floor((lo - pad) / 30) * 30);
@@ -310,13 +355,20 @@
 
       const sy = p => T + (1 - (p - yLo) / (yHi - yLo)) * (CHH - T - B);
 
-      const curve = useMemo(() => {
-        const pts = [];
+      const { curve, band } = useMemo(() => {
+        const mid = [], up = [], dn = [];
         for (let i = 0; i <= 80; i++) {
           const km = Math.exp(lnMin + (i / 80) * (lnMax - lnMin));
-          pts.push(sx(km).toFixed(1) + ',' + sy(pace(km)).toFixed(1));
+          const x = sx(km).toFixed(1);
+          mid.push(x + ',' + sy(pace(km)).toFixed(1));
+          up.push(x + ',' + sy(fit.hi(km) / km).toFixed(1));
+          dn.push(x + ',' + sy(fit.lo(km) / km).toFixed(1));
         }
-        return 'M' + pts.join(' L');
+        // Band: obere Kante hin, untere zurück, geschlossen
+        return {
+          curve: 'M' + mid.join(' L'),
+          band: 'M' + up.join(' L') + ' L' + dn.reverse().join(' L') + ' Z',
+        };
       }, [fit, yLo, yHi]);
 
       const xTicks = [1, 2, 3, 5, 10, 21.0975, 42.195];
@@ -378,6 +430,9 @@
               <text x={(L + CW - R) / 2} y={CHH - 4} textAnchor="middle" fontSize={11} fill={COL_AXIS}>{t.axisX}</text>
               <text transform={'translate(12,' + ((T + CHH - B) / 2) + ') rotate(-90)'} textAnchor="middle" fontSize={11} fill={COL_AXIS}>{t.axisY}</text>
 
+              {/* Konfidenzband (10.–90. Perzentil) */}
+              <path d={band} fill={COL_CURVE} opacity={0.14} stroke="none" />
+
               {/* Prognosekurve */}
               <path d={curve} fill="none" stroke={COL_CURVE} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
 
@@ -410,7 +465,8 @@
               }}>
                 <strong style={{ color: '#cbd5e1', fontSize: 14, fontVariantNumeric: 'tabular-nums' }}>{fmtTime(fit.predict(hover.km))}</strong>
                 <span style={{ marginLeft: 6 }}>{hoverLabel}</span><br />
-                {t.tooltipPace}: <span style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{fmtPace(hoverPace)} min/km</span>
+                {t.tooltipPace}: <span style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{fmtPace(hoverPace)} min/km</span><br />
+                {t.tooltipRange}: <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtTime(fit.lo(hover.km))} – {fmtTime(fit.hi(hover.km))}</span>
               </div>
             )}
           </div>
@@ -446,8 +502,6 @@
       const t = STRINGS[LANG] || STRINGS.de;
 
       const [rows, setRows] = useState(initialRows);
-      const [expMode, setExpMode] = useState('auto');
-      const [manualB, setManualB] = useState(DEFAULT_B);
 
       const updateRow = (id, patch) =>
         setRows(rows.map(r => r.id === id ? { ...r, ...patch } : r));
@@ -465,13 +519,17 @@
         return km && sec && paceOk(km, sec) ? { km, sec } : null;
       }).filter(Boolean), [rows]);
 
-      const fit = useMemo(
-        () => fitRiegel(points, expMode === 'manual' ? manualB : null),
-        [points, expMode, manualB]);
+      const fit = useMemo(() => fitRiegel(points), [points]);
 
       const b = fit ? fit.b : DEFAULT_B;
+      /* Einordnung anhand der Daten, nicht des regularisierten Posteriors:
+         die b<1-Warnung prüft die rohe OLS-Steigung (der Posterior wird vom
+         Prior fast immer über 1 gezogen), und typisch/untypisch wird nur
+         behauptet, wenn die Daten die Schätzung dominieren – sonst würde die
+         Regularisierung untypische Läufer fälschlich als typisch einordnen. */
       const interp =
-        b < 1.0  ? { text: t.interpBad, warn: true } :
+        fit && fit.olsB != null && fit.olsB < 1.0 ? { text: t.interpBad, warn: true } :
+        fit && fit.dataWeight < 0.5 ? { text: t.interpUnclear } :
         b < 1.03 ? { text: t.interpLow } :
         b <= 1.09 ? { text: t.interpTypical } :
         { text: t.interpHigh };
@@ -550,33 +608,17 @@
 
           {/* ── Exponent ── */}
           <h3 style={{ fontSize: 15, color: '#cbd5e1', marginBottom: 10 }}>{t.exponentHead}</h3>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
-            <div style={{ display: 'flex' }}>
-              <button className={'lang-seg' + (expMode === 'auto' ? ' active' : '')} onClick={() => setExpMode('auto')}>{t.expAuto}</button>
-              <button className={'lang-seg' + (expMode === 'manual' ? ' active' : '')} onClick={() => setExpMode('manual')}>{t.expManual}</button>
-            </div>
-            {expMode === 'auto' && fit && (
-              <span style={{ color: '#94a3b8', fontSize: 13 }}>
-                {fit.fitted ? t.expFitted(points.length) : t.expDefault}{' '}
-                <strong style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(b, 3)}</strong>
-              </span>
-            )}
-            {expMode === 'manual' && (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
-                <input
-                  type="range" min={1.0} max={1.15} step={0.005} value={manualB}
-                  onChange={e => setManualB(Number(e.target.value))}
-                  aria-label={t.exponentHead}
-                  style={{ width: 200, margin: 0 }}
-                />
-                <span style={{ color: '#94a3b8', fontSize: 13 }}>
-                  {t.expManualLabel} <strong style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(manualB, 3)}</strong>
-                </span>
-              </span>
-            )}
-          </div>
-          {fit && fit.fitted && expMode === 'auto' && (
-            <p style={{ color: interp.warn ? '#e05260' : '#94a3b8', fontSize: 13, margin: '0 0 6px' }}>{interp.text}</p>
+          {fit && (
+            <p style={{ color: '#94a3b8', fontSize: 13, margin: '0 0 8px' }}>
+              {fit.fitted ? t.expFitted(points.length) : t.expDefault}{' '}
+              <strong style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(b, 3)}</strong>
+            </p>
+          )}
+          {fit && fit.fitted && (
+            <React.Fragment>
+              <p style={{ color: interp.warn ? '#e05260' : '#94a3b8', fontSize: 13, margin: '0 0 6px' }}>{interp.text}</p>
+              <p style={{ color: '#64748b', fontSize: 12, margin: '0 0 6px' }}>{t.expWeight(Math.round(fit.dataWeight * 100))}</p>
+            </React.Fragment>
           )}
           <p style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6, maxWidth: 680, margin: '0 0 24px' }}>{t.expExplain}</p>
 
@@ -633,6 +675,10 @@
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#94a3b8' }}>
                   <svg width={22} height={10}><line x1={1} y1={5} x2={21} y2={5} stroke={COL_CURVE} strokeWidth={2} strokeLinecap="round" /></svg>
                   {t.legendCurve}
+                </span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#94a3b8' }}>
+                  <svg width={22} height={12}><rect x={1} y={1} width={20} height={10} rx={2} fill={COL_CURVE} opacity={0.25} /></svg>
+                  {t.legendBand}
                 </span>
                 {points.length > 0 && (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#94a3b8' }}>

@@ -152,15 +152,6 @@
       return t;
     }
 
-    // Strip trailing store-metadata junk from raw catalog strings (display only,
-    // the data itself is never modified).
-    function cleanTitle(t) {
-      return String(t).replace(/\s*(?:Series\s+)?Publisher:.*$/i, '').replace(/\s*Format:.*$/i, '').trim();
-    }
-    function cleanAuthor(a) {
-      return String(a).replace(/\s*Format:.*$/i, '').replace(/\s*Publisher:.*$/i, '').trim();
-    }
-
     // One-time setup: dequantize vectors into flat arrays (never per access).
     function prepare(data) {
       const meta = data.meta, books = data.books, n = books.length;
@@ -219,15 +210,27 @@
     }
 
     // EASE ranking: all rated books count (stars irrelevant); rated => −∞.
+    // v3 stores a per-book weight scale `ns` (source book of the nb list); v2 had one
+    // global meta.ease_scale — with per-book scales the multiply no longer cancels in
+    // the ranking, so it is mandatory. Also collects, per candidate, the contribution
+    // of every rated source book ("because you rated X and Y").
     function easeScores(prep, ratedIdx) {
       const { meta, books, n } = prep;
       const s = new Float64Array(n);
+      const contrib = new Map();                 // candidate idx -> [[srcIdx, weight], ...]
       for (const i of ratedIdx) {
         const nb = books[i].nb || [];
-        for (let k = 0; k < nb.length; k++) s[nb[k][0]] += nb[k][1] * meta.ease_scale;
+        const scale = books[i].ns !== undefined ? books[i].ns : meta.ease_scale;
+        for (let k = 0; k < nb.length; k++) {
+          const j = nb[k][0], w = nb[k][1] * scale;
+          s[j] += w;
+          let arr = contrib.get(j);
+          if (!arr) contrib.set(j, arr = []);
+          arr.push([i, w]);
+        }
       }
-      for (const i of ratedIdx) s[i] = -Infinity;
-      return s;
+      for (const i of ratedIdx) { s[i] = -Infinity; contrib.delete(i); }
+      return { s: s, contrib: contrib };
     }
 
     // Exposure fold-in: ridge-logistic Newton for u_e (16-dim). posIdx: rated books
@@ -290,7 +293,7 @@
       const { L, u } = foldIn(prep, rated);
       const pred = predictAll(prep, L, u);
       const ratedIdx = rated.map(function (x) { return x[0]; });
-      const ease = easeScores(prep, ratedIdx);
+      const er = easeScores(prep, ratedIdx);
       const ue = exposureU(prep, ratedIdx, unknownArr, 20260707, 200);
       const pknow = pKnowAll(prep, ue);
       const qscore = new Float64Array(prep.n);
@@ -305,7 +308,7 @@
       }
       return {
         u: u, L: L, m: pred.m, va: pred.va, lev: pred.lev, plike: pred.plike,
-        ease: ease, pknow: pknow, qscore: qscore, ciMean: ciSum / prep.n,
+        ease: er.s, easeContrib: er.contrib, pknow: pknow, qscore: qscore, ciMean: ciSum / prep.n,
         nRated: rated.length
       };
     }
@@ -424,10 +427,14 @@
 
     // rows: [title, author, rating, book_id?, status?]. The book_id column lets our own
     // export round-trip exactly even when a (title, author) pair is ambiguous; the status
-    // column carries "don't know it" markers (rating left blank). Foreign CSVs have neither
-    // and fall back to name matching / plain ratings.
-    function exportCSV(rows) {
-      const lines = ['title,author,rating,book_id,status'];
+    // column carries "don't know it" / "not-interested" markers (rating left blank).
+    // Foreign CSVs have neither and fall back to name matching / plain ratings.
+    // catalogVersion (if the model provides one) is written as a comment header so a
+    // re-import can tell whether the book_ids are still valid for the loaded catalog.
+    function exportCSV(rows, catalogVersion) {
+      const lines = [];
+      if (catalogVersion) lines.push('# catalog_version: ' + catalogVersion);
+      lines.push('title,author,rating,book_id,status');
       for (const r of rows) lines.push([
         csvField(r[0]), csvField(r[1]), r[2] != null ? r[2] : '',
         r[3] != null ? r[3] : '', r[4] != null ? r[4] : ''
@@ -449,7 +456,7 @@
         else map.set(key, i);
       }
       prep.books.forEach(function (b, i) {
-        const t = cleanTitle(b.t), a = cleanAuthor(b.a);
+        const t = String(b.t), a = String(b.a);
         const kt = normKey(t), ka = normKey(a);
         put(byTA, kt + '|' + ka, i);
         const last = ka.split(' ').pop();
@@ -461,35 +468,73 @@
       return { byTA: byTA, byT: byT, byShort: byShort };
     }
 
-    // Tolerant import: header detection (title / author / rating, incl. "My Rating"),
-    // headerless fallback (columns 0,1,2), match via normalized (title, author). A "status"
-    // column of "unknown" (our own export) marks a "don't know it" answer -> unknown[].
+    // Resolve a catalog index from a normalized (title, author) pair: exact match first,
+    // then author-lastname, then title-only / short-title when unique. null = no safe match.
+    function resolveByName(prep, index, title, author) {
+      const kt = normKey(title), ka = normKey(author || '');
+      let idx = index.byTA.get(kt + '|' + ka);
+      if (idx == null && ka) idx = index.byTA.get(kt + '|' + ka.split(' ').pop());
+      if (idx == null || idx === -1) { const c = index.byT.get(kt); idx = (c != null && c !== -1) ? c : null; }
+      if (idx == null || idx === -1) { const c = index.byShort.get(normKey(String(title).split(':')[0])); idx = (c != null && c !== -1) ? c : null; }
+      return (idx == null || idx === -1) ? null : idx;
+    }
+
+    // Remap stored entries ({t, a, ...}) onto the current catalog after a catalog_version
+    // change: book_ids are only valid within one catalog_version, titles are the migration
+    // key. Returns mapped [[idx, entry]] and the entries that could not be matched.
+    function remapEntries(prep, index, entries) {
+      const mapped = [], lost = [], seen = new Set();
+      for (const e of entries) {
+        const idx = resolveByName(prep, index, e.t || '', e.a || '');
+        if (idx == null || seen.has(idx)) lost.push(e);
+        else { seen.add(idx); mapped.push([idx, e]); }
+      }
+      return { mapped: mapped, lost: lost };
+    }
+
+    // Tolerant import: header detection (title / author / rating, incl. "My Rating" and
+    // suffixed forms like "Rating (out of 10)"), headerless fallback (columns 0,1,2). A
+    // "status" column (our own export) routes rows to unknown[] / notInterested[].
+    // book_ids are NEVER trusted blindly: they are used directly only when the file's
+    // catalog_version comment matches the loaded catalog AND the row title matches the
+    // catalog title (cheap spot-check against hand-edits); otherwise rows resolve by
+    // normalized name with the (title-verified) book_id as tiebreaker for ambiguities.
     function importRatings(prep, index, text) {
+      text = String(text);
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);   // strip BOM
+      let fileVersion = null;                     // leading "# key: value" comment lines
+      while (text.startsWith('#')) {
+        const nl = text.indexOf('\n');
+        const line = nl < 0 ? text : text.slice(0, nl);
+        const mv = line.match(/^#\s*catalog_version:\s*([0-9a-f]+)\s*$/i);
+        if (mv) fileVersion = mv[1].toLowerCase();
+        text = nl < 0 ? '' : text.slice(nl + 1);
+      }
+      const versionOk = fileVersion != null && prep.meta.catalog_version != null &&
+        fileVersion === String(prep.meta.catalog_version).toLowerCase();
       const rows = parseCSV(text);
-      if (!rows.length) return { matched: [], unknown: [], notFound: [], skipped: 0, error: 'File is empty.' };
+      if (!rows.length) return { matched: [], unknown: [], notInterested: [], notFound: [], skipped: 0, error: 'File is empty.' };
       let start = 0, ct = 0, ca = 1, cr = 2, cid = -1, cst = -1;
       const head = rows[0].map(function (h) { return normKey(h); });
       const it = head.findIndex(function (h) { return /^(title|book title|book|name)$/.test(h); });
       const ia = head.findIndex(function (h) { return /author/.test(h); });
-      const ir = head.findIndex(function (h) { return /(my )?(rating|stars|score)$/.test(h) && !/average|avg/.test(h); });
+      const ir = head.findIndex(function (h) { return /(rating|stars|score)/.test(h) && !/average|avg/.test(h); });
       const iid = head.findIndex(function (h) { return /^(book id|id)$/.test(h); });
       const ist = head.findIndex(function (h) { return /^status$/.test(h); });
       if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; cid = iid; cst = ist; }
-      else if (rows[0].length < 3) return { matched: [], unknown: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
-      const matched = [], unknown = [], notFound = [];
+      else if (rows[0].length < 3) return { matched: [], unknown: [], notInterested: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
+      const matched = [], unknown = [], notInterested = [], notFound = [];
       let skipped = 0;
-      // Resolve a catalog index from an explicit book_id (our own export) or normalized name.
       const resolve = function (title, author, bidRaw) {
-        if (cid >= 0 && bidRaw != null) {
-          const bid = parseInt(String(bidRaw), 10);
-          if (Number.isInteger(bid) && bid >= 0 && bid < prep.n) return bid;
+        // A book_id is only ever a candidate if its catalog title matches the row title.
+        let bid = null;
+        if (cid >= 0 && bidRaw != null && String(bidRaw).trim() !== '') {
+          const b = parseInt(String(bidRaw), 10);
+          if (Number.isInteger(b) && b >= 0 && b < prep.n && normKey(prep.books[b].t) === normKey(title)) bid = b;
         }
-        const kt = normKey(cleanTitle(title)), ka = normKey(cleanAuthor(author));
-        let idx = index.byTA.get(kt + '|' + ka);
-        if (idx == null && ka) idx = index.byTA.get(kt + '|' + ka.split(' ').pop());
-        if (idx == null || idx === -1) { const c = index.byT.get(kt); idx = (c != null && c !== -1) ? c : null; }
-        if (idx == null || idx === -1) { const c = index.byShort.get(normKey(title.split(':')[0])); idx = (c != null && c !== -1) ? c : null; }
-        return (idx == null || idx === -1) ? null : idx;
+        if (versionOk && bid != null) return bid;
+        const byName = resolveByName(prep, index, title, author);
+        return byName != null ? byName : bid;     // bid breaks name-ambiguity ties
       };
       for (let i = start; i < rows.length; i++) {
         const row = rows[i];
@@ -498,9 +543,10 @@
         const author = ca >= 0 ? (row[ca] || '').trim() : '';
         const bidRaw = cid >= 0 ? row[cid] : null;
         const status = cst >= 0 ? normKey(row[cst] || '') : '';
-        if (status === 'unknown') {              // "don't know it" marker from our own export
+        if (status === 'unknown' || status === 'not interested') {   // markers from our own export
           const idx = resolve(title, author, bidRaw);
-          if (idx == null) notFound.push(title); else unknown.push(idx);
+          if (idx == null) notFound.push(title);
+          else (status === 'unknown' ? unknown : notInterested).push(idx);
           continue;
         }
         const r = parseFloat(String(row[cr] || '').replace(',', '.'));
@@ -509,18 +555,18 @@
         if (idx == null) notFound.push(title);
         else matched.push([idx, clip(r, 1, 5)]);
       }
-      return { matched: matched, unknown: unknown, notFound: notFound, skipped: skipped, error: null };
+      return { matched: matched, unknown: unknown, notInterested: notInterested, notFound: notFound, skipped: skipped, error: null };
     }
 
     return {
       sigmoid: sigmoid, clip: clip, mulberry32: mulberry32,
       cholesky: cholesky, cholSolve: cholSolve, quadForm: quadForm,
-      cleanTitle: cleanTitle, cleanAuthor: cleanAuthor,
       prepare: prepare, foldIn: foldIn, predictAll: predictAll, easeScores: easeScores,
       exposureU: exposureU, pKnowAll: pKnowAll, recompute: recompute,
       smoothGrid: smoothGrid, loo: loo, clusterRated: clusterRated,
       detectDelim: detectDelim, parseCSV: parseCSV, csvField: csvField, exportCSV: exportCSV,
-      normKey: normKey, buildMatchIndex: buildMatchIndex, importRatings: importRatings
+      normKey: normKey, buildMatchIndex: buildMatchIndex, importRatings: importRatings,
+      resolveByName: resolveByName, remapEntries: remapEntries
     };
   })();
   </script>
@@ -654,6 +700,47 @@
       try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch (e) { return {}; }
     }
 
+    // Reconcile the persisted store with the loaded catalog. Store schema v2:
+    //   { v: <catalog_version the ids were saved against>,
+    //     r: { "<id>": {s, t, a} }, u: [ids], h: [skipped ids],
+    //     ni: { "<id>": {t, a} }, sh: <showTerrain bool> }
+    // ids are only valid within one catalog_version. On mismatch, rated and
+    // not-interested entries are remapped by (title, author) — that's why titles are
+    // stored per entry; unmatched ratings are reported (lost). u/h carry only ids, so
+    // on mismatch they are dropped (costs re-asked questions, no data). The legacy v1
+    // schema ({r: {id: stars}, u, h: bool}) predates versioning and is trusted as-is.
+    function hydrateStore(prep, matchIndex) {
+      const s = loadStore();
+      const out = { ratings: new Map(), unknown: new Set(), skipped: new Set(),
+        ni: new Set(), showTerrain: true, lost: [] };
+      const inRange = j => Number.isInteger(j) && j >= 0 && j < prep.n;
+      if (!('v' in s)) {                          // legacy schema (or empty store)
+        out.showTerrain = s.h !== false;
+        for (const [k, v] of Object.entries(s.r || {})) if (inRange(+k)) out.ratings.set(+k, +v);
+        for (const j of s.u || []) if (inRange(j)) out.unknown.add(j);
+        return out;
+      }
+      out.showTerrain = s.sh !== false;
+      const metaV = prep.meta.catalog_version || null;
+      if ((s.v || null) === metaV) {              // same catalog: ids are valid
+        for (const [k, e] of Object.entries(s.r || {})) if (inRange(+k)) out.ratings.set(+k, +e.s);
+        for (const j of s.u || []) if (inRange(j)) out.unknown.add(j);
+        for (const j of s.h || []) if (inRange(j)) out.skipped.add(j);
+        for (const k of Object.keys(s.ni || {})) if (inRange(+k)) out.ni.add(+k);
+      } else {                                    // catalog changed: remap by title
+        const entries = Object.values(s.r || {}).map(e => ({ t: e.t, a: e.a, s: +e.s }));
+        const rm = M.remapEntries(prep, matchIndex, entries);
+        for (const [idx, e] of rm.mapped) out.ratings.set(idx, M.clip(e.s, 1, 5));
+        out.lost = rm.lost;
+        const niRm = M.remapEntries(prep, matchIndex, Object.values(s.ni || {}));
+        for (const [idx] of niRm.mapped) if (!out.ratings.has(idx)) out.ni.add(idx);
+      }
+      // Ratings win every collision (a store written by the old import bug could hold a
+      // book as rated AND unknown, which double-counts in the exposure model).
+      for (const j of out.ratings.keys()) { out.unknown.delete(j); out.skipped.delete(j); out.ni.delete(j); }
+      return out;
+    }
+
     /* ── Small shared components ───────────────────────────────────────── */
     function Seg({ options, value, onChange }) {
       return (
@@ -668,13 +755,19 @@
 
     function RateSlider({ initial, onCommit, width }) {
       const [val, setVal] = useState(initial != null ? initial : 3.5);
-      useEffect(() => { setVal(initial != null ? initial : 3.5); }, [initial]);
+      // Commit only when the value actually changed since mount/last commit: a stray
+      // pointerup over the slider (e.g. a text-selection drag released here) must not
+      // create a phantom 3.5★ rating. Any key that moves a range input (arrows, Home,
+      // End, PageUp/Down) sets the flag via onChange, so keyup can commit uniformly.
+      const dirty = useRef(false);
+      useEffect(() => { setVal(initial != null ? initial : 3.5); dirty.current = false; }, [initial]);
+      const commit = v => { if (dirty.current) { dirty.current = false; onCommit(v); } };
       return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: width || '100%' }}>
           <input type="range" min={1} max={5} step={0.1} value={val}
-            onChange={e => setVal(+e.target.value)}
-            onPointerUp={() => onCommit(val)}
-            onKeyUp={e => { if (e.key.startsWith('Arrow')) onCommit(+e.target.value); }}
+            onChange={e => { dirty.current = true; setVal(+e.target.value); }}
+            onPointerUp={e => commit(+e.target.value)}
+            onKeyUp={e => commit(+e.target.value)}
             style={{ flex: 1, margin: 0 }} />
           <span style={{ color: C.text, fontVariantNumeric: 'tabular-nums', fontSize: 14, minWidth: 40 }}>
             {val.toFixed(1)}★
@@ -723,10 +816,10 @@
                 left: `${pLo}%`, right: `${100 - pHi}%`, background: active ? C.teal : C.grid }} />
             </div>
             <input type="range" className="dual-thumb" min={min} max={max} value={lo}
-              onChange={e => onChange(Math.min(+e.target.value, hi - 1), hi)}
+              onChange={e => onChange(Math.min(+e.target.value, hi), hi)}
               style={{ zIndex: lo >= hi - 4 ? 6 : 4 }} />
             <input type="range" className="dual-thumb" min={min} max={max} value={hi}
-              onChange={e => onChange(lo, Math.max(+e.target.value, lo + 1))}
+              onChange={e => onChange(lo, Math.max(+e.target.value, lo))}
               style={{ zIndex: 5 }} />
           </div>
         </div>
@@ -753,7 +846,7 @@
     }
 
     /* ── Filters (shared by Recommendations, Scatter, Map) ─────────────── */
-    function Filters({ model, selTags, setSelTags, yearLo, yearHi, setYear, hiddenNoYear }) {
+    function Filters({ model, selTags, setSelTags, yearLo, yearHi, setYear, hideYA, setHideYA, maxVols, setMaxVols, hiddenNoYear }) {
       const { tagList, yMin, yMax } = model;
       const yearActive = yearLo > yMin || yearHi < yMax;
       return (
@@ -775,6 +868,20 @@
                 {selTags.size > 0 &&
                   <button className="rec-pill" style={{ borderStyle: 'dashed' }}
                     onClick={() => setSelTags(new Set())}>× clear</button>}
+              </div>
+            </div>
+            <div style={{ flex: '1 1 260px' }}>
+              <div style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+                Exclude
+              </div>
+              <div>
+                <button className={'rec-pill' + (hideYA ? ' on' : '')}
+                  onClick={() => setHideYA(!hideYA)}>no YA / children's</button>
+                {[3, 5, 10].map(n => (
+                  <button key={n} className={'rec-pill' + (maxVols === n ? ' on' : '')}
+                    title={`Hide series longer than ${n} volumes`}
+                    onClick={() => setMaxVols(maxVols === n ? 0 : n)}>series ≤ {n} vols</button>
+                ))}
               </div>
             </div>
             <DualRange label="Year" min={yMin} max={yMax} lo={yearLo} hi={yearHi}
@@ -800,12 +907,22 @@
         const order = Array.from({ length: n }, (_, i) => i)
           .sort((a, b) => comp.m[b] - comp.m[a]);
         const raw = [];
-        for (let r = 0; r < n; r += 5) {          // downsampled polyline support points
+        // Downsampled polyline support points; the last rank is always included so the
+        // mean line reaches the right edge.
+        for (let r = 0; r < n; r += 5) {
           const j = order[r];
           raw.push({
             r, j,
             hw: Math.min(zc * Math.sqrt(comp.va[j]), 2),                 // full prediction interval
             hwe: Math.min(zc * Math.sqrt(sigma2 * comp.lev[j]), 2)       // epistemic only (drop +σ² floor)
+          });
+        }
+        if (n > 1 && (n - 1) % 5 !== 0) {
+          const j = order[n - 1];
+          raw.push({
+            r: n - 1, j,
+            hw: Math.min(zc * Math.sqrt(comp.va[j]), 2),
+            hwe: Math.min(zc * Math.sqrt(sigma2 * comp.lev[j]), 2)
           });
         }
         // Rolling median on the band half-widths: single high-variance books spike the
@@ -878,7 +995,7 @@
           </svg>
           {hover && (
             <div className="rec-tip" style={{ left: Math.min(sx(hover.r) / W * 100, 72) + '%', top: 4 }}>
-              <strong>{M.cleanTitle(model.prep.books[hover.j].t)}</strong><br />
+              <strong>{model.prep.books[hover.j].t}</strong><br />
               rank {fmtN(hover.r + 1)} · {hover.mean.toFixed(1)}★<br />
               model band {hover.loe.toFixed(1)}–{hover.upe.toFixed(1)} · prediction {hover.lo.toFixed(1)}–{hover.up.toFixed(1)}
             </div>
@@ -898,7 +1015,10 @@
     }
 
     /* ── Rate tab ──────────────────────────────────────────────────────── */
-    function QuestionCard({ model, comp, idx, nerd, onRate, onUnknown, onSkip }) {
+    // Click-only external search link — no request is made until the user clicks.
+    const goodreadsUrl = b => 'https://www.goodreads.com/search?q=' + encodeURIComponent(b.t + ' ' + b.a);
+
+    function QuestionCard({ model, comp, idx, nerd, onRate, onUnknown, onSkip, onNotInterested }) {
       const b = model.prep.books[idx];
       // Fixed geometry so cards don't jostle as long/short titles rotate through:
       // title reserves 2 lines, meta lines are single-line ellipsis, controls pinned bottom.
@@ -907,9 +1027,9 @@
       const oneLine = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
       return (
         <div className="rec-card" style={{ display: 'flex', flexDirection: 'column', minHeight: 178 }}>
-          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{M.cleanTitle(b.t)}</div>
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{b.t}</div>
           <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px', ...oneLine }}>
-            {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}{b.s ? ' · series' : ''}
+            {b.a}{b.y ? ` · ${b.y}` : ''}{b.s ? ' · series' : ''}
           </div>
           <div style={{ marginBottom: 8, ...oneLine }}>
             <TagChips tags={b.g} />
@@ -918,8 +1038,9 @@
           </div>
           <div style={{ marginTop: 'auto' }}>
             <RateSlider onCommit={v => onRate(idx, v)} />
-            <div style={{ display: 'flex', gap: 14, marginTop: 8 }}>
+            <div style={{ display: 'flex', gap: 14, marginTop: 8, flexWrap: 'wrap' }}>
               <a href="#" style={{ fontSize: 12.5, color: C.label }} onClick={e => { e.preventDefault(); onUnknown(idx); }}>Don't know it</a>
+              <a href="#" style={{ fontSize: 12.5, color: C.foot }} onClick={e => { e.preventDefault(); onNotInterested(idx); }}>Not interested</a>
               <a href="#" style={{ fontSize: 12.5, color: C.foot }} onClick={e => { e.preventDefault(); onSkip(idx); }}>Skip</a>
             </div>
           </div>
@@ -927,18 +1048,18 @@
       );
     }
 
-    function RateTab({ model, comp, ratings, unknown, skipped, nerd, onRate, onRemove, onUnknown, onSkip, onClearUnknown, onReset }) {
+    function RateTab({ model, comp, ratings, unknown, skipped, notInterested, nerd, onRate, onRemove, onUnknown, onSkip, onNotInterested, onClearUnknown, onClearSkipped, onReset }) {
       const [query, setQuery] = useState('');
 
       const questions = useMemo(() => {
         const cand = [];
         for (let j = 0; j < model.prep.n; j++) {
-          if (ratings.has(j) || unknown.has(j) || skipped.has(j)) continue;
+          if (ratings.has(j) || unknown.has(j) || skipped.has(j) || notInterested.has(j)) continue;
           cand.push(j);
         }
         cand.sort((a, b) => comp.qscore[b] - comp.qscore[a]);
         return cand.slice(0, 6);
-      }, [comp, ratings, unknown, skipped]);
+      }, [comp, ratings, unknown, skipped, notInterested]);
 
       const results = useMemo(() => {
         const q = M.normKey(query);
@@ -980,7 +1101,7 @@
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12, maxWidth: 1040 }}>
             {questions.map(j => (
               <QuestionCard key={j} model={model} comp={comp} idx={j} nerd={nerd}
-                onRate={onRate} onUnknown={onUnknown} onSkip={onSkip} />
+                onRate={onRate} onUnknown={onUnknown} onSkip={onSkip} onNotInterested={onNotInterested} />
             ))}
           </div>
 
@@ -988,15 +1109,15 @@
           <input type="search" placeholder="Search by title or author…" value={query}
             onChange={e => setQuery(e.target.value)} style={{ maxWidth: 420, marginBottom: 8 }} />
           {query.length >= 2 && results.length === 0 &&
-            <p style={{ fontSize: 12.5, color: C.foot }}>No match in the 2,538-book catalog.</p>}
+            <p style={{ fontSize: 12.5, color: C.foot }}>No match in the {fmtN(model.prep.n)}-book catalog.</p>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
             {results.map(j => {
               const b = model.prep.books[j];
               return (
                 <div key={j} className="rec-card" style={{ padding: 10 }}>
-                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{M.cleanTitle(b.t)}</div>
+                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{b.t}</div>
                   <div style={{ fontSize: 12, color: C.label, marginBottom: 6 }}>
-                    {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}
+                    {b.a}{b.y ? ` · ${b.y}` : ''}
                     {ratings.has(j) && <span style={{ color: C.gold }}> · rated {ratings.get(j).toFixed(1)}★</span>}
                   </div>
                   <RateSlider initial={ratings.get(j)} onCommit={v => onRate(j, v)} />
@@ -1020,7 +1141,7 @@
                 <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', borderBottom: `1px solid #1e293b`, flexWrap: 'wrap' }}>
                   <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', background: ratingColor(r), border: '1px solid #f1f5f9', flexShrink: 0 }} />
                   <span style={{ flex: '1 1 220px', fontSize: 13.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {M.cleanTitle(b.t)} <span style={{ color: C.foot, fontSize: 12 }}>· {M.cleanAuthor(b.a)}</span>
+                    {b.t} <span style={{ color: C.foot, fontSize: 12 }}>· {b.a}</span>
                   </span>
                   {nerd && <span style={{ fontSize: 11.5, color: C.foot }} title={LEV_TIP}>leverage {comp.lev[j].toFixed(3)}</span>}
                   <div style={{ flex: '0 0 190px' }}>
@@ -1035,6 +1156,11 @@
             <p style={{ fontSize: 12.5, color: C.foot, marginTop: 10 }}>
               You marked {unknown.size} book{unknown.size > 1 ? 's' : ''} as unknown (used only to pick better questions, never for recommendations). {' '}
               <a href="#" style={{ color: C.foot }} onClick={e => { e.preventDefault(); onClearUnknown(); }}>Clear</a>
+            </p>}
+          {skipped.size > 0 &&
+            <p style={{ fontSize: 12.5, color: C.foot, marginTop: 4 }}>
+              You skipped {skipped.size} question{skipped.size > 1 ? 's' : ''}. {' '}
+              <a href="#" style={{ color: C.foot }} onClick={e => { e.preventDefault(); onClearSkipped(); }}>Ask again</a>
             </p>}
         </div>
       );
@@ -1054,30 +1180,47 @@
           </span>
           <span style={{ fontSize: 11.5, color: C.foot, lineHeight: 1.5 }}>
             {explain && (
-              <span>Series drop-off: each bar is a volume, length = how widely read, color = how well received.<br /></span>
+              <span>Series drop-off: each bar is a volume, length = how widely read, color = how well received.
+                Bar lengths reflect the rating volume of each volume's listings, not readership — compare
+                volumes with care.<br /></span>
             )}
-            {vols.length} volumes{ret != null ? `, ${Math.round(ret * 100)}% went on to vol. 2` : ''}.
+            {vols.length > 8 ? `first 8 of ${vols.length} volumes` : `${vols.length} volumes`}
+            {ret != null ? `, ${Math.round(ret * 100)}% went on to vol. 2` : ''}.
           </span>
         </div>
       );
     }
 
-    function RecRow({ model, comp, idx, rank, nerd, explain }) {
+    function RecRow({ model, comp, idx, rank, nerd, explain, onRate, onNotInterested }) {
       const b = model.prep.books[idx];
       const zc = 1.6449 * model.prep.meta.c90;
       const hw = Math.min(zc * Math.sqrt(comp.va[idx]), 2);
       const stars = M.clip(comp.m[idx], 1, 5);
+      // Top-3 contributors to this book's EASE score ("because you rated X and Y").
+      const because = useMemo(() => {
+        const arr = comp.easeContrib && comp.easeContrib.get(idx);
+        if (!arr || !arr.length) return null;
+        return arr.slice().sort((x, y) => y[1] - x[1]).slice(0, 3)
+          .map(([i]) => model.prep.books[i].t);
+      }, [comp, idx]);
       return (
         <div style={{ padding: '9px 0', borderBottom: '1px solid #1e293b' }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
             <span style={{ color: C.foot, fontSize: 12, minWidth: 26, fontVariantNumeric: 'tabular-nums' }}>#{rank}</span>
             <span style={{ flex: '1 1 260px', fontSize: 14, color: C.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {M.cleanTitle(b.t)}
-              <span style={{ color: C.label, fontWeight: 400, fontSize: 12.5 }}> · {M.cleanAuthor(b.a)}{b.y ? ` · ${b.y}` : ''}</span>
+              {b.t}
+              <span style={{ color: C.label, fontWeight: 400, fontSize: 12.5 }}> · {b.a}{b.y ? ` · ${b.y}` : ''}</span>
             </span>
             <TagChips tags={b.g} />
             <PLikeBar p={comp.plike[idx]} />
           </div>
+          {because && (
+            <div style={{ fontSize: 11.5, color: C.foot, marginTop: 3, paddingLeft: 36 }}>
+              because you rated {because.map((t, i) => (
+                <span key={i}>{i > 0 ? (i === because.length - 1 ? ' and ' : ', ') : ''}<em style={{ color: C.label }}>{t}</em></span>
+              ))}
+            </div>
+          )}
           {nerd && (
             <div style={{ fontSize: 12, color: C.label, marginTop: 3, paddingLeft: 36 }}>
               {stars.toFixed(2)}★ ±{hw.toFixed(2)}
@@ -1088,12 +1231,24 @@
             </div>
           )}
           {b.vols && <div style={{ paddingLeft: 36 }}><FunnelMini vols={b.vols} ret={b.ret} explain={explain} /></div>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16, paddingLeft: 36, marginTop: 5, flexWrap: 'wrap' }}>
+            <div style={{ flex: '0 0 200px' }}>
+              <RateSlider onCommit={v => onRate(idx, v)} />
+            </div>
+            <a href="#" style={{ fontSize: 12, color: C.foot }}
+              onClick={e => { e.preventDefault(); onNotInterested(idx); }}>Not interested</a>
+            <a href={goodreadsUrl(b)} target="_blank" rel="noopener noreferrer"
+              style={{ fontSize: 12, color: C.foot }}>Goodreads ↗</a>
+          </div>
         </div>
       );
     }
 
-    function RecsTab({ model, comp, filtered, nerd, blend, risk, setBlend, setRisk }) {
+    function RecsTab({ model, comp, filtered, nerd, blend, risk, setBlend, setRisk, onRate, onNotInterested }) {
       const [topN, setTopN] = useState(40);
+      // "Show 40 more" only makes sense for the list it extended: collapse back to 40
+      // whenever filters, dials or ratings change the ranking.
+      useEffect(() => setTopN(40), [filtered, comp, blend, risk]);
       const zc = 1.6449 * model.prep.meta.c90;
       const matchLabel = comp.nRated > 0 ? 'Match' : 'Popular';
 
@@ -1140,7 +1295,8 @@
               const shown = sorted.slice(0, topN);
               const firstSeriesIdx = shown.findIndex(j => model.prep.books[j].vols);
               return shown.map((j, i) => (
-                <RecRow key={j} model={model} comp={comp} idx={j} rank={i + 1} nerd={nerd} explain={i === firstSeriesIdx} />
+                <RecRow key={j} model={model} comp={comp} idx={j} rank={i + 1} nerd={nerd}
+                  explain={i === firstSeriesIdx} onRate={onRate} onNotInterested={onNotInterested} />
               ));
             })()}
           </div>
@@ -1259,8 +1415,8 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
-                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
-                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                <strong>{model.prep.books[tip.j].t}</strong><br />
+                {model.prep.books[tip.j].a}<br />
                 P(like) {pct(comp.plike[tip.j])} · match p{Math.round(matchPct[tip.j])}
                 {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
               </div>
@@ -1342,24 +1498,41 @@
         return () => el.removeEventListener('wheel', onWheel);
       }, []);
 
-      const endDrag = () => { drag.current = null; };
+      // Drag lives on window listeners so panning survives leaving the SVG (fast pans
+      // no longer abort at the edge); `dragging` is React state so the cursor style
+      // actually re-renders to "grabbing" (a ref alone never triggered a re-render).
+      const [dragging, setDragging] = useState(false);
 
       const onPointerDown = e => {
         if (view.z <= 1) return;
+        const el = svgRef.current;
+        if (!el) return;
         drag.current = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy };
+        setDragging(true);
         setTip(null);
+        const move = ev => {
+          if (!drag.current) return;
+          const rect = el.getBoundingClientRect();
+          const dpx = (ev.clientX - drag.current.x) / rect.width * W;
+          const dpy = (ev.clientY - drag.current.y) / rect.height * H;
+          setView(v => clampView(v.z, drag.current.ox + dpx, drag.current.oy + dpy));
+        };
+        const up = () => {
+          drag.current = null;
+          setDragging(false);
+          window.removeEventListener('mousemove', move);
+          window.removeEventListener('mouseup', up);
+        };
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', up);
+        e.preventDefault();
       };
 
       const onMove = e => {
+        if (drag.current) return;                  // window listener handles the pan
         const rect = e.currentTarget.getBoundingClientRect();
         const fx = (e.clientX - rect.left) / rect.width * W;
         const fy = (e.clientY - rect.top) / rect.height * H;
-        if (drag.current) {
-          const dpx = (e.clientX - drag.current.x) / rect.width * W;
-          const dpy = (e.clientY - drag.current.y) / rect.height * H;
-          setView(v => clampView(v.z, drag.current.ox + dpx, drag.current.oy + dpy));
-          return;
-        }
         let best = null, bd = 324;   // 18px hit radius in screen space
         for (let j = 0; j < model.prep.n; j++) {
           if (!passes[j] && !ratings.has(j)) continue;
@@ -1395,9 +1568,9 @@
               The terrain appears once you've rated a few books - it shows which regions of taste-space you'd like more (or less) than your overall average.
             </p>}
           <div className="rec-svgwrap">
-            <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => { setTip(null); endDrag(); }}
-              onMouseDown={onPointerDown} onMouseUp={endDrag} onDoubleClick={() => setView({ z: 1, ox: 0, oy: 0 })}
-              style={{ cursor: view.z > 1 ? (drag.current ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }}>
+            <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}
+              onMouseDown={onPointerDown} onDoubleClick={() => setView({ z: 1, ox: 0, oy: 0 })}
+              style={{ cursor: view.z > 1 ? (dragging ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }}>
               <defs>
                 <clipPath id="mapclip"><rect x={0} y={0} width={W} height={H} rx={8} /></clipPath>
                 <filter id="mapsoften" x="-4%" y="-4%" width="108%" height="108%">
@@ -1428,8 +1601,8 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 12, 0)}%` }}>
-                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
-                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                <strong>{model.prep.books[tip.j].t}</strong><br />
+                {model.prep.books[tip.j].a}<br />
                 {ratings.has(tip.j)
                   ? <span style={{ color: C.gold }}>your rating: {ratings.get(tip.j).toFixed(1)}★</span>
                   : <span>P(like) {pct(comp.plike[tip.j])}</span>}
@@ -1610,7 +1783,7 @@
                 <text key={w.j} x={TX(g2b(w.cx))} y={TY(g2b(w.cx), g2r(w.cy))} textAnchor="middle"
                   dominantBaseline="middle" fontSize={11} fill="#f1f5f9"
                   stroke="#0b1220" strokeWidth={2.6} style={{ paintOrder: 'stroke', fontWeight: 600, pointerEvents: 'none' }}>
-                  {trunc(M.cleanTitle(model.prep.books[w.j].t), 22)}
+                  {trunc(model.prep.books[w.j].t, 22)}
                 </text>
               ))}
               {/* Current-dial marker. */}
@@ -1619,8 +1792,8 @@
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
-                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
-                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                <strong>{model.prep.books[tip.j].t}</strong><br />
+                {model.prep.books[tip.j].a}<br />
                 {Math.round(tip.bl * 100)}% rating · risk {tip.rk >= 0 ? '+' : ''}{tip.rk.toFixed(2)}
                 {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
               </div>
@@ -1636,7 +1809,7 @@
     }
 
     /* ── Model tab ─────────────────────────────────────────────────────── */
-    function LOOChart({ pts, rmse }) {
+    function LOOChart({ pts }) {
       const [tip, setTip] = useState(null);
       const W = 360, H = 360, L = 38, R = 10, T = 10, B = 36;
       const s = v => ({ x: L + (v - 1) / 4 * (W - L - R), y: T + (1 - (v - 1) / 4) * (H - T - B) });
@@ -1693,7 +1866,7 @@
         const rmse = Math.sqrt(res.reduce((s, p) => s + (p.pred - p.actual) ** 2, 0) / res.length);
         return {
           rmse,
-          pts: res.map(p => ({ ...p, title: M.cleanTitle(model.prep.books[p.idx].t) }))
+          pts: res.map(p => ({ ...p, title: model.prep.books[p.idx].t }))
         };
       }, [ratedArr]);
 
@@ -1709,7 +1882,7 @@
           </p>
           {looData ? (
             <div>
-              <LOOChart pts={looData.pts} rmse={looData.rmse} />
+              <LOOChart pts={looData.pts} />
               <p style={{ fontSize: 13, color: C.label, marginTop: 6 }}>
                 Your leave-one-out RMSE: <strong style={{ color: C.text }}>{looData.rmse.toFixed(2)}★</strong>
                 <span style={{ color: C.foot }}> · cold-start baseline: 0.95★{ratedArr.length < 5 ? ' · (needs ~5+ ratings to be meaningful)' : ''}</span>
@@ -1721,8 +1894,8 @@
           <details style={{ marginTop: 6 }}>
             <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Ranking - which books to suggest</summary>
             <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
-              An item-item linear model (EASE) was trained offline; each catalog book keeps its top-20 neighbor
-              weights. Your score for a candidate is the sum of weights from every book you rated - stars
+              An item-item linear model (EASE) was trained offline; each catalog book keeps its
+              top-{model.prep.meta.ease_k || 20} neighbor weights. Your score for a candidate is the sum of weights from every book you rated - stars
               deliberately don't matter here, because even a book you disliked reveals what you read
               (filtering by stars measured worse). Rated books are excluded from the list. With zero ratings
               you see the popularity baseline.
@@ -1751,7 +1924,7 @@
           <details>
             <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Model card - the numbers</summary>
             <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '3px 18px', width: 'fit-content', marginTop: 8 }}>
-              <span style={dt}>Catalog</span><span style={dd}>2,538 books &amp; series (1,432 series entries)</span>
+              <span style={dt}>Catalog</span><span style={dd}>{fmtN(model.prep.n)} books &amp; series ({fmtN(model.prep.books.reduce((s, b) => s + (b.s ? 1 : 0), 0))} series entries)</span>
               <span style={dt}>Training data</span><span style={dd}>a large corpus of public book ratings</span>
               <span style={dt}>Factors k</span><span style={dd}>32 (+ bias column), σ² = 0.646, λ = 2.0</span>
               <span style={dt}>Star fold-in RMSE</span><span style={dd}>0.85★ at 10 ratings (cold: 0.95★)</span>
@@ -1767,10 +1940,11 @@
     }
 
     /* ── Your data tab (clusters + export/import + reset) ──────────────── */
-    function YourDataTab({ model, ratings, unknown, onImport, onReset }) {
+    function YourDataTab({ model, ratings, unknown, notInterested, onImport, onNotInterestedRemove, onReset }) {
       const [report, setReport] = useState(null);
       const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
       const unknownArr = useMemo(() => [...unknown], [unknown]);
+      const niArr = useMemo(() => [...notInterested], [notInterested]);
 
       // Cluster names removed for now; singletons hidden (a lone book isn't a cluster).
       const clusters = useMemo(() => {
@@ -1784,17 +1958,23 @@
 
       const doExport = () => {
         const rows = ratedArr.map(([j, r]) => [
-          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1), j, ''
+          model.prep.books[j].t, model.prep.books[j].a, r.toFixed(1), j, ''
         ]);
         for (const j of unknownArr) rows.push([
-          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), '', j, 'unknown'
+          model.prep.books[j].t, model.prep.books[j].a, '', j, 'unknown'
         ]);
-        const blob = new Blob([M.exportCSV(rows)], { type: 'text/csv;charset=utf-8' });
+        for (const j of niArr) rows.push([
+          model.prep.books[j].t, model.prep.books[j].a, '', j, 'not-interested'
+        ]);
+        const blob = new Blob([M.exportCSV(rows, model.prep.meta.catalog_version)], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(blob);
+        a.href = url;
         a.download = 'my-book-ratings.csv';
         a.click();
-        URL.revokeObjectURL(a.href);
+        // Revoking synchronously after click() is racy per spec (broke downloads in
+        // Safari/Firefox historically) — give the download a moment to start.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
       };
 
       const doImport = e => {
@@ -1804,7 +1984,7 @@
         reader.onload = () => {
           const res = M.importRatings(model.prep, model.matchIndex, String(reader.result));
           setReport(res);
-          if (!res.error) onImport(res.matched, res.unknown);
+          if (!res.error) onImport(res.matched, res.unknown, res.notInterested);
         };
         reader.readAsText(file);
         e.target.value = '';
@@ -1828,7 +2008,7 @@
                   {members.map(j => (
                     <div key={j} style={{ fontSize: 12.5, color: C.text, display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
                       <span style={{ width: 8, height: 8, borderRadius: '50%', background: ratingColor(ratings.get(j)), flexShrink: 0 }} />
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{M.cleanTitle(model.prep.books[j].t)}</span>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.prep.books[j].t}</span>
                       <span style={{ color: C.foot, marginLeft: 'auto' }}>{ratings.get(j).toFixed(1)}</span>
                     </div>
                   ))}
@@ -1837,16 +2017,35 @@
             </div>
           )}
 
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Not interested ({niArr.length})</h3>
+          {niArr.length === 0
+            ? <p style={{ fontSize: 12.5, color: C.foot, margin: '0 0 10px' }}>
+                Books you mark as "not interested" (on question cards or recommendations) are hidden from
+                questions and recommendations. They show up here so you can change your mind.
+              </p>
+            : (
+            <div style={{ margin: '0 0 10px' }}>
+              {niArr.map(j => (
+                <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '5px 0', borderBottom: '1px solid #1e293b' }}>
+                  <span style={{ flex: '1 1 220px', fontSize: 13, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {model.prep.books[j].t} <span style={{ color: C.foot, fontSize: 12 }}>· {model.prep.books[j].a}</span>
+                  </span>
+                  <button className="rec-x" title="Remove from not-interested" onClick={() => onNotInterestedRemove(j)}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Export / import your ratings</h3>
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
             CSV with columns <code style={{ fontSize: 11.5 }}>title,author,rating</code>. Your export also carries
-            your "don't know it" answers (as a <code style={{ fontSize: 11.5 }}>status</code> column) so a
-            re-import restores them. Import also understands common library exports (e.g.
+            your "don't know it" and "not interested" answers (as a <code style={{ fontSize: 11.5 }}>status</code> column)
+            so a re-import restores them. Import also understands common library exports (e.g.
             <code style={{ fontSize: 11.5 }}> Title / Author / My Rating</code>); matching uses normalized title +
             author. Note: series are cataloged under their first volume's title.
           </p>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <button className="lang-seg" onClick={doExport} disabled={ratings.size === 0 && unknown.size === 0}>Export CSV</button>
+            <button className="lang-seg" onClick={doExport} disabled={ratings.size === 0 && unknown.size === 0 && niArr.length === 0}>Export CSV</button>
             <label className="lang-seg" style={{ cursor: 'pointer', marginBottom: 0 }}>
               Import CSV…
               <input type="file" accept=".csv,text/csv,text/plain" onChange={doImport} style={{ display: 'none' }} />
@@ -1858,6 +2057,7 @@
                 <span>
                   <strong style={{ color: C.text }}>{report.matched.length} matched</strong>
                   {report.unknown && report.unknown.length > 0 ? ` · ${report.unknown.length} "don't know it" restored` : ''}
+                  {report.notInterested && report.notInterested.length > 0 ? ` · ${report.notInterested.length} "not interested" restored` : ''}
                   {' · '}{report.notFound.length} not found
                   {report.skipped > 0 ? ` · ${report.skipped} rows without a rating skipped` : ''}
                   {report.notFound.length > 0 && (
@@ -1875,7 +2075,7 @@
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
             Deletes all your ratings and "don't know it" answers from this device. This cannot be undone.
           </p>
-          <button style={RESET_BTN} onClick={onReset} disabled={ratings.size === 0 && unknown.size === 0}>
+          <button style={RESET_BTN} onClick={onReset} disabled={ratings.size === 0 && unknown.size === 0 && niArr.length === 0}>
             Reset everything
           </button>
         </div>
@@ -1886,16 +2086,19 @@
     function App() {
       const [model, setModel] = useState(null);
       const [loadErr, setLoadErr] = useState(null);
-      const [ratings, setRatings] = useState(() => {
-        const s = loadStore();
-        return new Map(Object.entries(s.r || {}).map(([k, v]) => [+k, +v]));
-      });
-      const [unknown, setUnknown] = useState(() => new Set(loadStore().u || []));
-      const [showTerrain, setShowTerrain] = useState(() => loadStore().h !== false);
-      const [skipped, setSkipped] = useState(() => new Set());   // session only
+      // All persisted state hydrates from localStorage only after the catalog is loaded
+      // (ids may need a title-based remap against the new catalog_version).
+      const [ratings, setRatings] = useState(() => new Map());
+      const [unknown, setUnknown] = useState(() => new Set());
+      const [skipped, setSkipped] = useState(() => new Set());
+      const [notInterested, setNotInterested] = useState(() => new Set());
+      const [showTerrain, setShowTerrain] = useState(true);
+      const [lost, setLost] = useState(null);     // ratings the catalog swap couldn't remap
       const [tab, setTab] = useState('rate');
       const [selTags, setSelTags] = useState(() => new Set());
       const [year, setYearState] = useState(null);               // [lo, hi] once model known
+      const [hideYA, setHideYA] = useState(false);               // exclude ya/childrens tags
+      const [maxVols, setMaxVols] = useState(0);                 // 0 = any; else max series length
       const [blend, setBlend] = useState(0.5);                   // ranking dial: 0 = Match, 1 = Rating
       const [risk, setRisk] = useState(0);                       // risk dial: -1 = Safe (LCB) … +1 = Moonshot (UCB)
       const nerd = true;                                         // always on (casual mode removed)
@@ -1923,23 +2126,39 @@
             for (const [tag, cnt] of Object.entries(tagCounts)) tagIdf[tag] = Math.log(prep.n / cnt);
             const searchKeys = prep.books.map(b => M.normKey(b.t + ' ' + b.a));
             const gridBase = M.smoothGrid(prep, base.plike, 60, 40, 0.08);
+            const matchIndex = M.buildMatchIndex(prep);
+            // Hydrate persisted state against this catalog (remaps on version mismatch).
+            // Batched with setModel, so the persist effect only ever sees hydrated state.
+            const hyd = hydrateStore(prep, matchIndex);
+            setRatings(hyd.ratings); setUnknown(hyd.unknown); setSkipped(hyd.skipped);
+            setNotInterested(hyd.ni); setShowTerrain(hyd.showTerrain);
+            if (hyd.lost.length) setLost(hyd.lost);
             setModel({
               prep, base, baseCiMean: ciSum / prep.n, tagList, tagIdf, yMin, yMax,
-              searchKeys, gridBase, matchIndex: M.buildMatchIndex(prep)
+              searchKeys, gridBase, matchIndex
             });
             setYearState([yMin, yMax]);
           })
           .catch(e => setLoadErr(String(e)));
       }, []);
 
-      // Persist (small writes; recompute is separate).
+      // Persist (small writes; recompute is separate). Store schema v2 — see hydrateStore.
+      // Titles/authors are stored per entry: they are the migration key when a future
+      // catalog_version shifts the book_ids.
       useEffect(() => {
+        if (!model) return;                        // never overwrite before hydration
+        const books = model.prep.books;
         const r = {};
-        for (const [k, v] of ratings) r[k] = Math.round(v * 10) / 10;
+        for (const [j, v] of ratings) r[j] = { s: Math.round(v * 10) / 10, t: books[j].t, a: books[j].a };
+        const ni = {};
+        for (const j of notInterested) ni[j] = { t: books[j].t, a: books[j].a };
         try {
-          localStorage.setItem(STORE_KEY, JSON.stringify({ r, u: [...unknown], h: showTerrain }));
+          localStorage.setItem(STORE_KEY, JSON.stringify({
+            v: model.prep.meta.catalog_version || null,
+            r, u: [...unknown], h: [...skipped], ni, sh: showTerrain
+          }));
         } catch (e) { /* storage full/blocked - tool still works, just not persistent */ }
-      }, [ratings, unknown, showTerrain]);
+      }, [model, ratings, unknown, skipped, notInterested, showTerrain]);
 
       const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
       const unknownArr = useMemo(() => [...unknown], [unknown]);
@@ -1968,8 +2187,10 @@
         let hiddenNoYear = 0;
         for (let j = 0; j < model.prep.n; j++) {
           const b = model.prep.books[j];
-          let ok = true;
-          for (const t of selTags) if (!(b.g || []).includes(t)) { ok = false; break; }
+          let ok = !notInterested.has(j);
+          if (ok) for (const t of selTags) if (!(b.g || []).includes(t)) { ok = false; break; }
+          if (ok && hideYA && (b.g || []).some(t => t === 'ya' || t === 'childrens')) ok = false;
+          if (ok && maxVols > 0 && b.vols && b.vols.length > maxVols) ok = false;
           if (ok && yearActive) {
             if (b.y == null) { ok = false; hiddenNoYear++; }
             else if (b.y < year[0] || b.y > year[1]) ok = false;
@@ -1978,7 +2199,7 @@
           if (ok && !ratings.has(j)) filtered.push(j);
         }
         return { passes, filtered, hiddenNoYear };
-      }, [model, year, selTags, ratings]);
+      }, [model, year, selTags, ratings, notInterested, hideYA, maxVols]);
 
       if (loadErr) {
         return (
@@ -1995,7 +2216,7 @@
         return (
           <div className="container">
             <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 8 }}>Book Recommender</h1>
-            <p style={{ color: C.label }}>Loading the model (1.2 MB, one-time)…</p>
+            <p style={{ color: C.label }}>Loading the model (one-time download)…</p>
           </div>
         );
       }
@@ -2003,23 +2224,35 @@
       const onRate = (j, v) => {
         setRatings(prev => { const m = new Map(prev); m.set(j, v); return m; });
         setUnknown(prev => { if (!prev.has(j)) return prev; const s = new Set(prev); s.delete(j); return s; });
+        setNotInterested(prev => { if (!prev.has(j)) return prev; const s = new Set(prev); s.delete(j); return s; });
       };
       const onRemove = j => setRatings(prev => { const m = new Map(prev); m.delete(j); return m; });
       const onUnknown = j => setUnknown(prev => new Set(prev).add(j));
       const onSkip = j => setSkipped(prev => new Set(prev).add(j));
+      const onNotInterested = j => {
+        setNotInterested(prev => new Set(prev).add(j));
+        setRatings(prev => { if (!prev.has(j)) return prev; const m = new Map(prev); m.delete(j); return m; });
+      };
+      const onNotInterestedRemove = j =>
+        setNotInterested(prev => { const s = new Set(prev); s.delete(j); return s; });
       const onReset = () => {
-        if (!window.confirm('Delete all your ratings and answers? This cannot be undone.')) return;
-        setRatings(new Map()); setUnknown(new Set()); setSkipped(new Set());
+        if (!window.confirm('Delete all your ratings and answers ("don\'t know it", skipped, not interested)? This cannot be undone.')) return;
+        setRatings(new Map()); setUnknown(new Set()); setSkipped(new Set()); setNotInterested(new Set());
         try { localStorage.removeItem(STORE_KEY); } catch (e) {}
       };
-      const onImport = (matched, unknownIdx) => {
-        setRatings(prev => { const m = new Map(prev); for (const [j, r] of matched) m.set(j, r); return m; });
-        setUnknown(prev => {
-          const s = new Set(prev);
-          for (const j of (unknownIdx || [])) s.add(j);
-          for (const [j] of matched) s.delete(j);   // a rated book is known
-          return s;
-        });
+      // Merge an import. Ratings win every collision: a book that ends up rated must not
+      // simultaneously sit in unknown (it would count as y=1 AND y=0 in the exposure
+      // model and skew the counters) or in not-interested.
+      const onImport = (matched, unknownIdx, niIdx) => {
+        const merged = new Map(ratings);
+        for (const [j, r] of matched) merged.set(j, r);
+        const u = new Set(unknown);
+        for (const j of (unknownIdx || [])) u.add(j);
+        for (const j of merged.keys()) u.delete(j);
+        const ni = new Set(notInterested);
+        for (const j of (niIdx || [])) ni.add(j);
+        for (const j of merged.keys()) ni.delete(j);
+        setRatings(merged); setUnknown(u); setNotInterested(ni);
       };
       const TABS = [
         { id: 'rate', label: `Rate${ratings.size ? ` (${ratings.size})` : ''}` },
@@ -2042,18 +2275,36 @@
             <Seg options={TABS} value={tab} onChange={setTab} />
           </div>
 
+          {lost && lost.length > 0 && (
+            <div className="rec-card" style={{ borderColor: '#b45309', margin: '12px 0' }}>
+              <p style={{ fontSize: 13, color: C.gold, margin: '0 0 6px' }}>
+                The book catalog was updated. {lost.length} saved entr{lost.length > 1 ? 'ies' : 'y'} could
+                not be matched to the new catalog and {lost.length > 1 ? 'were' : 'was'} removed:
+              </p>
+              <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 8px' }}>
+                {lost.map(e => `${e.t}${e.a ? ` (${e.a})` : ''}${e.s ? ` – ${(+e.s).toFixed(1)}★` : ''}`).join(' · ')}
+              </p>
+              <button className="lang-seg" onClick={() => setLost(null)}>Dismiss</button>
+            </div>
+          )}
+
           {(tab === 'recs' || tab === 'toppick' || tab === 'scatter' || tab === 'map') &&
             <Filters model={model} selTags={selTags} setSelTags={setSelTags}
               yearLo={year[0]} yearHi={year[1]} setYear={(lo, hi) => setYearState([lo, hi])}
+              hideYA={hideYA} setHideYA={setHideYA} maxVols={maxVols} setMaxVols={setMaxVols}
               hiddenNoYear={filterData.hiddenNoYear} />}
 
           {tab === 'rate' &&
             <RateTab model={model} comp={comp} ratings={ratings} unknown={unknown} skipped={skipped}
+              notInterested={notInterested}
               nerd={nerd} onRate={onRate} onRemove={onRemove} onUnknown={onUnknown} onSkip={onSkip}
-              onClearUnknown={() => setUnknown(new Set())} onReset={onReset} />}
+              onNotInterested={onNotInterested}
+              onClearUnknown={() => setUnknown(new Set())} onClearSkipped={() => setSkipped(new Set())}
+              onReset={onReset} />}
           {tab === 'recs' &&
             <RecsTab model={model} comp={comp} filtered={filterData.filtered} nerd={nerd}
-              blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk} />}
+              blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk}
+              onRate={onRate} onNotInterested={onNotInterested} />}
           {tab === 'toppick' &&
             <TopPickTab model={model} comp={comp} filtered={filterData.filtered}
               blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk} nerd={nerd} />}
@@ -2065,10 +2316,11 @@
           {tab === 'model' &&
             <ModelTab model={model} comp={comp} ratings={ratings} />}
           {tab === 'yourdata' &&
-            <YourDataTab model={model} ratings={ratings} unknown={unknown} onImport={onImport} onReset={onReset} />}
+            <YourDataTab model={model} ratings={ratings} unknown={unknown} notInterested={notInterested}
+              onImport={onImport} onNotInterestedRemove={onNotInterestedRemove} onReset={onReset} />}
 
           <p style={{ marginTop: 30, fontSize: 11, color: C.foot, lineHeight: 1.7 }}>
-            Recommendation model trained offline on a large corpus of public book ratings - 2,538 fantasy &amp; sci-fi
+            Recommendation model trained offline on a large corpus of public book ratings - {fmtN(model.prep.n)} fantasy &amp; sci-fi
             books and series. Everything on this page runs entirely in your browser: your ratings are stored only on
             your device (localStorage) and never leave it.
           </p>
