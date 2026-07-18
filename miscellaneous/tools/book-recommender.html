@@ -193,7 +193,7 @@
 
     // Per-book mean (unclipped!), predictive variance (incl. noise term), leverage, P(like).
     function predictAll(prep, L, u) {
-      const { meta, n, D, qs, bias } = prep;
+      const { meta, books, n, D, qs, bias } = prep;
       const m = new Float64Array(n), va = new Float64Array(n);
       const lev = new Float64Array(n), plike = new Float64Array(n);
       for (let j = 0; j < n; j++) {
@@ -202,34 +202,42 @@
         for (let d = 0; d < D; d++) dot += qs[off + d] * u[d];
         m[j] = meta.mu + bias[j] + dot;
         lev[j] = quadForm(L, D, qs, off);
-        va[j] = meta.sigma2 * lev[j] + meta.sigma2;    // + σ² noise term - do not drop
+        // Noise term is per-book since v4 (`f` = relative rating-noise variance,
+        // shrunk, mean ≈ 1): polarizing books get wider intervals. v3 JSON has
+        // no `f` → 1 → exactly the old global-σ² formula. Do not drop the term.
+        const fj = books[j].f !== undefined ? books[j].f : 1;
+        va[j] = meta.sigma2 * (lev[j] + fj);
         const z = (m[j] - meta.like_thr) / Math.sqrt(va[j]);
         plike[j] = sigmoid(meta.like_a * z + meta.like_b);
       }
       return { m, va, lev, plike };
     }
 
-    // EASE ranking: all rated books count (stars irrelevant); rated => −∞.
+    // EASE ranking: rated books count with a star-dependent sign — 1-2★ books push
+    // their neighbors DOWN (β=−0.5; −1.0 costs measurable recall, don't increase)
+    // instead of boosting their own sequels. Rated => −∞.
     // v3 stores a per-book weight scale `ns` (source book of the nb list); v2 had one
     // global meta.ease_scale — with per-book scales the multiply no longer cancels in
     // the ranking, so it is mandatory. Also collects, per candidate, the contribution
-    // of every rated source book ("because you rated X and Y").
-    function easeScores(prep, ratedIdx) {
+    // of every rated source book ("because you rated X and Y"); contributions can be
+    // negative since the star weighting.
+    function easeScores(prep, rated) {
       const { meta, books, n } = prep;
       const s = new Float64Array(n);
       const contrib = new Map();                 // candidate idx -> [[srcIdx, weight], ...]
-      for (const i of ratedIdx) {
+      for (const [i, stars] of rated) {
         const nb = books[i].nb || [];
         const scale = books[i].ns !== undefined ? books[i].ns : meta.ease_scale;
+        const wr = stars <= 2 ? -0.5 : 1;
         for (let k = 0; k < nb.length; k++) {
-          const j = nb[k][0], w = nb[k][1] * scale;
+          const j = nb[k][0], w = nb[k][1] * scale * wr;
           s[j] += w;
           let arr = contrib.get(j);
           if (!arr) contrib.set(j, arr = []);
           arr.push([i, w]);
         }
       }
-      for (const i of ratedIdx) { s[i] = -Infinity; contrib.delete(i); }
+      for (const [i] of rated) { s[i] = -Infinity; contrib.delete(i); }
       return { s: s, contrib: contrib };
     }
 
@@ -293,7 +301,7 @@
       const { L, u } = foldIn(prep, rated);
       const pred = predictAll(prep, L, u);
       const ratedIdx = rated.map(function (x) { return x[0]; });
-      const er = easeScores(prep, ratedIdx);
+      const er = easeScores(prep, rated);
       const ue = exposureU(prep, ratedIdx, unknownArr, 20260707, 200);
       const pknow = pKnowAll(prep, ue);
       const qscore = new Float64Array(prep.n);
@@ -1197,10 +1205,14 @@
       const hw = Math.min(zc * Math.sqrt(comp.va[idx]), 2);
       const stars = M.clip(comp.m[idx], 1, 5);
       // Top-3 contributors to this book's EASE score ("because you rated X and Y").
+      // Only positive weights: since the 1-2★ down-weighting, contributions can be
+      // negative, and "because you rated X" would be wrong for a book you disliked.
       const because = useMemo(() => {
         const arr = comp.easeContrib && comp.easeContrib.get(idx);
-        if (!arr || !arr.length) return null;
-        return arr.slice().sort((x, y) => y[1] - x[1]).slice(0, 3)
+        if (!arr) return null;
+        const pos = arr.filter(x => x[1] > 0);
+        if (!pos.length) return null;
+        return pos.sort((x, y) => y[1] - x[1]).slice(0, 3)
           .map(([i]) => model.prep.books[i].t);
       }, [comp, idx]);
       return (
@@ -1225,7 +1237,9 @@
             <div style={{ fontSize: 12, color: C.label, marginTop: 3, paddingLeft: 36 }}>
               {stars.toFixed(2)}★ ±{hw.toFixed(2)}
               {' · '}P(like) <strong style={{ color: C.text }}>{pct(comp.plike[idx])}</strong>
-              {comp.nRated > 0 && Number.isFinite(comp.ease[idx]) ? ` · match ${comp.ease[idx].toFixed(3)}` : ''}
+              {comp.nRated > 0 && Number.isFinite(comp.ease[idx])
+                ? (comp.ease[idx] !== 0 ? ` · match ${comp.ease[idx].toFixed(3)}` : ' · no co-reading signal')
+                : ''}
               {` · ${POP(b.n)} · `}
               <span title={LEV_TIP}>leverage {comp.lev[idx].toFixed(3)}</span>
             </div>
@@ -1262,13 +1276,16 @@
         if (n === 0) return [];
         const matchKey = comp.nRated > 0 ? (j => comp.ease[j]) : (j => model.prep.books[j].n);
         const ratingKey = j => M.clip(comp.m[j] + risk * zc * Math.sqrt(comp.va[j]), 1, 5);
-        const pctMap = keyFn => {
-          const order = filtered.slice().sort((a, b) => keyFn(a) - keyFn(b) || model.prep.books[a].n - model.prep.books[b].n);
-          const p = new Float64Array(model.prep.n);
-          order.forEach((j, i) => { p[j] = n > 1 ? i / (n - 1) : 0.5; });
+        const pctMap = (pool, keyFn) => {
+          const order = pool.slice().sort((a, b) => keyFn(a) - keyFn(b) || model.prep.books[a].n - model.prep.books[b].n);
+          const p = new Float64Array(model.prep.n);   // books outside the pool stay 0
+          order.forEach((j, i) => { p[j] = order.length > 1 ? i / (order.length - 1) : 0.5; });
           return p;
         };
-        const mp = pctMap(matchKey), rp = pctMap(ratingKey);
+        // Match percentile only over books with a positive co-reading signal — see the
+        // matchPct comment in App. No-signal books contribute 0 to the blend score.
+        const matchPool = comp.nRated > 0 ? filtered.filter(j => comp.ease[j] > 0) : filtered;
+        const mp = pctMap(matchPool, matchKey), rp = pctMap(filtered, ratingKey);
         const score = j => (1 - blend) * mp[j] + blend * rp[j];
         return filtered.slice().sort((a, b) => score(b) - score(a) || model.prep.books[b].n - model.prep.books[a].n);
       }, [filtered, comp, blend, risk]);
@@ -1325,7 +1342,9 @@
       const sy = pl => T + (1 - (pl - ymin) / (1 - ymin)) * (H - T - B);
       const visible = p => p.mp >= xmin && p.pl >= ymin;
 
-      const pts = useMemo(() => filtered.map(j => ({
+      // Books without a co-reading signal have no match percentile (NaN) and are
+      // left off the plot entirely — a footnote reports how many.
+      const pts = useMemo(() => filtered.filter(j => Number.isFinite(matchPct[j])).map(j => ({
         j,
         mp: matchPct[j],
         pl: comp.plike[j],
@@ -1334,6 +1353,7 @@
         // clearly visible 2.2-9px spread.
         r: Math.max(2.2, Math.min(9, 1.6 + 2.2 * (Math.log10(Math.max(model.prep.books[j].n, 10)) - 1)))
       })), [filtered, comp, matchPct]);
+      const noSignal = filtered.length - pts.length;
 
       const onMove = e => {
         const rect = e.currentTarget.getBoundingClientRect();
@@ -1362,6 +1382,7 @@
             ({comp.nRated > 0 ? 'co-reading signal, percentile' : 'popularity percentile - rate books to personalize'}),
             vertical = calibrated probability you'd rate it 4★ or higher. Size ~ how widely read,
             color = expected rating for you.
+            {noSignal > 0 && <span style={{ color: C.foot }}> {fmtN(noSignal)} book{noSignal > 1 ? 's' : ''} with no co-reading signal yet (nothing you rated links to them) {noSignal > 1 ? 'are' : 'is'} not shown — rate more books to place them.</span>}
           </p>
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: 20, flexWrap: 'wrap', margin: '10px 0 6px' }}>
             <Slider label="Zoom" min={0} max={1} step={0.01} value={zoom} onChange={setZoom}
@@ -1644,13 +1665,16 @@
         if (n === 0) return null;
         const books = model.prep.books;
         const matchKey = comp.nRated > 0 ? (j => comp.ease[j]) : (j => books[j].n);
-        const pctMap = keyFn => {
-          const order = filtered.slice().sort((a, b) => keyFn(a) - keyFn(b) || books[a].n - books[b].n);
-          const p = new Float64Array(model.prep.n);
-          order.forEach((j, i) => { p[j] = n > 1 ? i / (n - 1) : 0.5; });
+        const pctMap = (pool, keyFn) => {
+          const order = pool.slice().sort((a, b) => keyFn(a) - keyFn(b) || books[a].n - books[b].n);
+          const p = new Float64Array(model.prep.n);   // books outside the pool stay 0
+          order.forEach((j, i) => { p[j] = order.length > 1 ? i / (order.length - 1) : 0.5; });
           return p;
         };
-        const mp = pctMap(matchKey);
+        // Same signal-pool rule as RecsTab, or the map's winners would diverge from
+        // the Recommendations #1 the tooltip promises.
+        const matchPool = comp.nRated > 0 ? filtered.filter(j => comp.ease[j] > 0) : filtered;
+        const mp = pctMap(matchPool, matchKey);
         const riskAt = (i, N) => N > 1 ? 1 - 2 * i / (N - 1) : 0;   // row 0 (top) = +1 moonshots
         const blendAt = (i, N) => N > 1 ? i / (N - 1) : 0;          // col 0 (left) = match/popular
         const winnerIn = (bl, rp, pool) => {                        // argmax over a candidate pool
@@ -1664,14 +1688,14 @@
         // Stage 1 — candidate winners over the full pool on a coarse grid.
         const cand = new Set();
         for (let r = 0; r < CAND; r++) {
-          const rp = pctMap(j => M.clip(comp.m[j] + riskAt(r, CAND) * zc * Math.sqrt(comp.va[j]), 1, 5));
+          const rp = pctMap(filtered, j => M.clip(comp.m[j] + riskAt(r, CAND) * zc * Math.sqrt(comp.va[j]), 1, 5));
           for (let c = 0; c < CAND; c++) cand.add(winnerIn(blendAt(c, CAND), rp, filtered));
         }
         const pool = [...cand];
         // Stage 2 — fine field over candidates only.
         const fr = res, field = new Int32Array(fr * fr);
         for (let r = 0; r < fr; r++) {
-          const rp = pctMap(j => M.clip(comp.m[j] + riskAt(r, fr) * zc * Math.sqrt(comp.va[j]), 1, 5));
+          const rp = pctMap(filtered, j => M.clip(comp.m[j] + riskAt(r, fr) * zc * Math.sqrt(comp.va[j]), 1, 5));
           for (let c = 0; c < fr; c++) field[r * fr + c] = winnerIn(blendAt(c, fr), rp, pool);
         }
         // Winners by area (for labels + centroid) and one contour set per winner.
@@ -2167,14 +2191,22 @@
         [model, ratedArr, unknownArr]);
 
       // Percentile of the ranking signal among unrated books (stable across filters).
+      // Personalized mode ranks only books with a positive co-reading signal: with few
+      // ratings most of the catalog has ease == 0, and ranking a book's tiny signal
+      // against that mass inflated every percentile (feedback: "Twilight 98% match").
+      // No-signal books get NaN = "no percentile"; consumers must handle it.
       const matchPct = useMemo(() => {
         if (!comp) return null;
-        const unrated = [];
-        for (let j = 0; j < model.prep.n; j++) if (!ratings.has(j)) unrated.push(j);
+        const pool = [];
+        for (let j = 0; j < model.prep.n; j++) {
+          if (ratings.has(j)) continue;
+          if (comp.nRated > 0 && !(comp.ease[j] > 0)) continue;
+          pool.push(j);
+        }
         const key = comp.nRated > 0 ? (j => comp.ease[j]) : (j => model.prep.books[j].n);
-        unrated.sort((a, b) => key(a) - key(b) || model.prep.books[a].n - model.prep.books[b].n);
-        const out = new Float64Array(model.prep.n);
-        unrated.forEach((j, i) => { out[j] = unrated.length > 1 ? i / (unrated.length - 1) * 100 : 50; });
+        pool.sort((a, b) => key(a) - key(b) || model.prep.books[a].n - model.prep.books[b].n);
+        const out = new Float64Array(model.prep.n).fill(NaN);
+        pool.forEach((j, i) => { out[j] = pool.length > 1 ? i / (pool.length - 1) * 100 : 50; });
         return out;
       }, [comp]);
 
