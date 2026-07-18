@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="de" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'de');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM-Detektor - Alexander Alber</title>
+  <meta name="description" content="Englischen Text einfügen und eine kalibrierte Wahrscheinlichkeit schätzen lassen, dass er von einem Sprachmodell geschrieben wurde. Mit Markierung typischer KI-Phrasen, Bayesfaktor und offengelegter Methodik, komplett im Browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/llm-detector.html">
+  <link rel="alternate" hreflang="de" href="https://alber.me/miscellaneous/tools/llm-detector.html">
+  <link rel="alternate" hreflang="en" href="https://alber.me/miscellaneous/tools/llm-detector.html?lang=en">
+  <link rel="alternate" hreflang="x-default" href="https://alber.me/miscellaneous/tools/llm-detector.html">
+  <meta property="og:title" content="LLM-Detektor">
+  <meta property="og:description" content="Englischen Text einfügen und eine kalibrierte Wahrscheinlichkeit schätzen lassen, dass er von einem Sprachmodell stammt - mit markierten KI-Phrasen und offengelegter Methodik, komplett im Browser.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/llm-detector.html">
+  <meta property="og:type" content="website">
+  <script>if(new URLSearchParams(location.search).get('lang')==='en')document.querySelector('link[rel=canonical]').href+='?lang=en';</script>
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+
+  <style>
+    .ld-wrap { max-width: 920px; }
+
+    /* Eingabebereich: transparentes Textfeld über einer deckungsgleichen
+       Backdrop, die die erkannten Spans einfärbt (Muster wie im Token-Zähler). */
+    .ld-editor { position: relative; min-height: 230px; }
+    .ld-editor .ld-input,
+    .ld-editor .ld-backdrop {
+      box-sizing: border-box; width: 100%; min-height: 230px; margin: 0;
+      padding: 14px 16px; border: 1px solid var(--pico-form-element-border-color, rgba(255,255,255,.18));
+      border-radius: 11px; font-family: inherit; font-size: 1rem; line-height: 1.6;
+      letter-spacing: normal; tab-size: 4;
+      white-space: pre-wrap; overflow-wrap: break-word; word-break: normal;
+    }
+    .ld-backdrop {
+      position: absolute; inset: 0; overflow: hidden;
+      color: #e2e8f0; background: var(--pico-form-element-background-color, var(--pico-card-background-color));
+      border-color: transparent; pointer-events: none; user-select: none; z-index: 1;
+    }
+    .ld-backdrop mark {
+      background: transparent; color: inherit; border-radius: 3px;
+      padding: 0; box-decoration-break: clone; -webkit-box-decoration-break: clone;
+    }
+    .ld-mk-ai { background: rgba(251,191,36,.24); box-shadow: 0 1px 0 rgba(251,191,36,.55) inset; }
+    .ld-mk-conn { background: rgba(56,189,248,.20); }
+    .ld-input {
+      position: relative; z-index: 2; resize: vertical;
+      background: transparent; color: transparent;
+      -webkit-text-fill-color: transparent; caret-color: var(--pico-primary);
+    }
+    .ld-input::placeholder { color: var(--pico-muted-color); -webkit-text-fill-color: var(--pico-muted-color); opacity: 1; }
+    .ld-input::selection { background: rgba(148,163,184,.35); }
+
+    .ld-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 0; }
+    .ld-toolbar .spacer { flex: 1 1 auto; }
+    .ld-btn {
+      font-size: .82rem; padding: 6px 12px; border-radius: 7px;
+      background: transparent; color: var(--pico-muted-color);
+      border: 1px solid var(--pico-muted-border-color, rgba(255,255,255,.14));
+      cursor: pointer; line-height: 1.2; width: auto; margin: 0;
+    }
+    .ld-btn:hover { color: var(--pico-primary); border-color: var(--pico-primary); }
+    .ld-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: .72rem; color: var(--pico-muted-color); margin-top: 10px; }
+    .ld-legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+    /* Ergebnis */
+    .ld-result {
+      margin: 22px 0 8px; padding: 18px 20px; border-radius: 13px;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-card-border-color, rgba(255,255,255,.08));
+    }
+    .ld-num { font-size: 2.9rem; font-weight: 700; line-height: 1.05; font-variant-numeric: tabular-nums; }
+    .ld-verdict { font-size: .95rem; color: #cbd5e1; margin-top: 6px; }
+    .ld-band-label { font-size: .74rem; color: var(--pico-muted-color); margin-top: 10px; }
+
+    /* Unsicherheitsband auf einer 0-100-Skala */
+    .ld-scale { position: relative; height: 34px; margin-top: 6px; }
+    .ld-scale .track {
+      position: absolute; left: 0; right: 0; top: 12px; height: 8px;
+      border-radius: 5px; background: linear-gradient(90deg, rgba(52,211,153,.30), rgba(148,163,184,.22), rgba(251,191,36,.32));
+    }
+    .ld-scale .band {
+      position: absolute; top: 9px; height: 14px; border-radius: 7px;
+      background: color-mix(in srgb, var(--pico-primary) 42%, transparent);
+    }
+    .ld-scale .pin {
+      position: absolute; top: 4px; width: 3px; height: 24px; border-radius: 2px;
+      background: #e2e8f0; transform: translateX(-1px);
+    }
+    .ld-scale .ends {
+      position: absolute; left: 0; right: 0; top: 24px;
+      display: flex; justify-content: space-between; font-size: .66rem; color: #64748b;
+    }
+
+    /* Enthaltung */
+    .ld-abstain {
+      margin: 22px 0 8px; padding: 18px 20px; border-radius: 13px;
+      background: var(--pico-card-background-color);
+      border: 1px dashed rgba(148,163,184,.32);
+    }
+    .ld-abstain .h { font-size: 1.05rem; color: #cbd5e1; }
+    .ld-abstain .d { font-size: .84rem; color: #94a3b8; margin-top: 7px; line-height: 1.6; }
+
+    .ld-idle { margin: 22px 0 8px; font-size: .86rem; color: #64748b; }
+    .ld-prehint {
+      font-size: .76rem; color: #94a3b8; margin: 0 0 10px;
+      padding: 8px 12px; border-radius: 8px;
+      background: rgba(56,189,248,.07); border: 1px solid rgba(56,189,248,.16);
+    }
+
+    /* Methodik */
+    .ld-details { margin-top: 20px; }
+    .ld-details > summary { cursor: pointer; font-size: .84rem; color: #94a3b8; }
+    .ld-details > summary:hover { color: var(--pico-primary); }
+    .ld-details .body { margin-top: 12px; font-size: .8rem; color: #94a3b8; line-height: 1.7; }
+    .ld-sub { font-size: .74rem; text-transform: uppercase; letter-spacing: .045em; color: #64748b; margin: 18px 0 8px; }
+
+    /* Feature-Balken: signierte Beiträge, Mittelachse */
+    .ld-feats { display: grid; gap: 5px; }
+    .ld-feat { display: grid; grid-template-columns: minmax(0, 1fr) 116px 62px; gap: 10px; align-items: center; font-size: .76rem; }
+    .ld-feat .nm { color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ld-feat .bar { position: relative; height: 13px; background: rgba(148,163,184,.09); border-radius: 3px; }
+    .ld-feat .bar .axis { position: absolute; left: 50%; top: -1px; bottom: -1px; width: 1px; background: rgba(148,163,184,.35); }
+    .ld-feat .bar .fill { position: absolute; top: 2px; height: 9px; border-radius: 2px; }
+    .ld-feat .bar .fill.pos { background: rgba(251,191,36,.75); }
+    .ld-feat .bar .fill.neg { background: rgba(52,211,153,.7); }
+    .ld-feat .val { color: #64748b; text-align: right; font-variant-numeric: tabular-nums; }
+
+    .ld-kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 8px; }
+    .ld-kv .k { font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: #64748b; }
+    .ld-kv .v { font-size: 1.05rem; color: #cbd5e1; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+    .ld-note { margin-top: 22px; font-size: .78rem; color: var(--pico-muted-color); line-height: 1.7; }
+    .ld-privacy { margin-top: 8px; font-size: .72rem; color: #475569; line-height: 1.6; }
+    .ld-warn { color: #fbbf24; font-size: .8rem; margin-top: 10px; }
+  </style>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script src="/assets/js/llm-detector.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "LLM Detector",
+    "description": "Paste English text and get a calibrated probability that it was written by a large language model, with typical AI phrases highlighted, a Bayes factor and the methodology laid open. Runs fully in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/llm-detector.html",
+    "applicationCategory": "UtilityApplication",
+    "inLanguage": "de",
+    "author": {
+      "@type": "Person",
+      "@id": "https://alber.me/alexander/#person",
+      "name": "Alexander Alber",
+      "url": "https://alber.me/alexander/"
+    },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+        <li class="lang-switcher">
+          <button class="lang-seg" data-lang="en">EN</button><button class="lang-seg" data-lang="de">DE</button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script>
+    (function () {
+      var urlLang = new URLSearchParams(location.search).get('lang');
+      if (urlLang === 'en' || urlLang === 'de') { try { localStorage.setItem('lang', urlLang); } catch (e) {} }
+      var l = urlLang;
+      if (l !== 'en' && l !== 'de') { try { l = localStorage.getItem('lang') || 'de'; } catch (e) { l = 'de'; } }
+      document.querySelectorAll('.lang-seg').forEach(function (btn) {
+        if (btn.getAttribute('data-lang') === l) btn.classList.add('active');
+        btn.onclick = function () {
+          var lang = btn.getAttribute('data-lang');
+          try { localStorage.setItem('lang', lang); } catch (e) {}
+          var url = new URL(location.href);
+          if (lang === 'de') url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
+          location.replace(url.href);
+        };
+      });
+    })();
+  </script>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">← Sonstiges</a>
+    </p>
+    <script>if((localStorage.getItem('lang')||'de')==='en')document.currentScript.previousElementSibling.querySelector('a').textContent='← Miscellaneous';</script>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">LLM-Detektor</h1>
+        <p style="color:#94a3b8;max-width:70ch">Englischen Text einfügen und schätzen lassen, wie wahrscheinlich er von einem Sprachmodell stammt.</p>
+      </div>
+    </div>
+  </main>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useRef } = React;
+    const LANG = localStorage.getItem('lang') || 'de';
+
+    const MODEL_URL = "/assets/files/llm-detector-model.json";
+    const DEBOUNCE_MS = 220;        // gegen Flackern, nicht wegen Laufzeit
+    const HL_CAP = 20000;           // ab hier keine Einfärbung mehr (Backdrop-Kosten)
+    const ENGINE = typeof window !== 'undefined' ? window.llmDetector : null;
+
+    // Breite des Unsicherheitsbands: reine UI-Darstellung, kein Modell-Output.
+    const BAND = { high: 0.05, medium: 0.12, low: 0.20 };
+
+    const STRINGS = {
+      de: {
+        title: "LLM-Detektor",
+        subtitle: "Englischen Text einfügen - das Modell schätzt, wie wahrscheinlich er von einem Sprachmodell geschrieben wurde.",
+        prehint: "Das Modell kann nur Englisch. Bei deutschen oder anderssprachigen Texten enthält es sich einer Aussage.",
+        placeholder: "Englischen Text hier einfügen …",
+        clear: "Leeren",
+        sampleAi: "Beispiel: KI",
+        sampleHuman: "Beispiel: Mensch",
+        hlOn: "Markierung: an",
+        hlOff: "Markierung: aus",
+        legendAi: "typische KI-Phrasen",
+        legendConn: "Verbindungswörter",
+        loading: "Modell wird geladen …",
+        loadError: "Das Modell konnte nicht geladen werden - ohne die Modelldatei ist keine Schätzung möglich.",
+        noEngine: "Die Detektor-Engine konnte nicht geladen werden.",
+        idle: "Noch kein Text. Ab etwa 50 Wörtern gibt das Modell eine Schätzung ab.",
+        probLabel: "geschätzte Wahrscheinlichkeit, dass der Text von einem LLM stammt",
+        bandLabel: c => `Darstellungsband bei Konfidenz „${c}“ - die Schätzung ist nicht auf den Prozentpunkt genau.`,
+        confLow: "niedrig", confMedium: "mittel", confHigh: "hoch",
+        endHuman: "eher Mensch", endLlm: "eher LLM",
+        verdictStrongLlm: "Deutliche Hinweise auf einen LLM-generierten Text.",
+        verdictLeanLlm: "Tendenz Richtung LLM, aber kein klares Bild.",
+        verdictUnclear: "Kein klares Signal in die eine oder andere Richtung.",
+        verdictLeanHuman: "Tendenz Richtung menschlich geschrieben.",
+        verdictStrongHuman: "Deutliche Hinweise auf einen menschlich geschriebenen Text.",
+        lowConfHint: "Bei niedriger Konfidenz ist die Zahl mit Vorsicht zu lesen - kurzer Text oder ein Wert nahe der Mitte.",
+        abstainShortH: "Zu wenig Signal für eine Aussage",
+        abstainShortD: n => `Der Text hat ${n} ${n === 1 ? "Wort" : "Wörter"}. Unter 50 Wörtern sind die statistischen Merkmale zu verrauscht, um sinnvoll zu schätzen - deshalb gibt es hier bewusst keine Zahl.`,
+        abstainLangH: "Für dieses Tool nur Englisch",
+        abstainLangD: "Der Text wurde nicht als Englisch erkannt. Das Modell wurde ausschließlich auf englischen Texten trainiert und enthält sich bei allem anderen, statt eine Zahl zu erfinden.",
+        abstainLangRatio: r => `Erkannter Englisch-Anteil: ${Math.round(r * 100)} %.`,
+        methodSummary: "Methodik, Grenzen und Details",
+        limitsH: "Grenzen",
+        limits: [
+          "Nur Englisch. Andere Sprachen führen zur Enthaltung.",
+          "Unter 50 Wörtern gibt es keine Schätzung; knapp darüber ist das Signal noch dünn.",
+          "Englisch von Nicht-Muttersprachlern ist ein bekanntes Falsch-Positiv-Muster: gleichförmiger Stil sieht für das Modell LLM-ähnlich aus.",
+          "Neuere Modelle sind schwerer zu erkennen als die aus 2023. Welches Modell einen Text geschrieben hat, sagt das Tool nicht.",
+          "Das Ergebnis ist ein Anhaltspunkt, kein Beweis. Für Konsequenzen gegenüber einer Person reicht es nicht.",
+        ],
+        howH: "Wie es funktioniert",
+        howP: "Der Text wird auf zwölf stilistische und statistische Merkmale reduziert - Satzlängen und ihre Schwankung, Wortschatzvielfalt, Interpunktion, Dichte von Verbindungswörtern und typischen KI-Phrasen sowie die Überraschung eines kleinen Zeichenmodells. Ein Gradient-Boosting-Modell verrechnet diese Merkmale, das Ergebnis wird anschließend kalibriert. Kalibriert heißt: von den Texten, für die hier 80 % steht, stammen tatsächlich etwa 80 % von einem LLM.",
+        qualityH: "Güte",
+        qualityP: "AUROC 0,89 auf einem gemischten Testsatz, 0,94 auf ausschließlich modernen Modellen, 0,96 auf einem ungesehenen Themen-Holdout. Kalibrierungsfehler (ECE) 0,006.",
+        featH: "Was den Ausschlag gegeben hat",
+        featP: "Signierte Beiträge auf der Log-Odds-Skala, absteigend nach Stärke. Nach rechts (gelb) schiebt Richtung LLM, nach links (grün) Richtung Mensch. Die Balken sind relativ zueinander zu lesen, nicht als Prozentpunkte der Wahrscheinlichkeit oben.",
+        bfH: "Bayesfaktor",
+        bfP: "Die Prozentzahl oben hängt daran, wie häufig LLM-Texte im Trainingsmix waren (etwa 53 %). Das ist ein künstlicher Mix, nicht die Häufigkeit in deinem Umfeld. Der Bayesfaktor ist davon unabhängig: er sagt, wie viel wahrscheinlicher dieser Text unter „LLM“ ist als unter „Mensch“. Faustregel: um 1 herum kein Signal, 3 bis 10 moderat, über 10 stark; entsprechend unter 1/3 Richtung Mensch.",
+        bfK: "Bayesfaktor",
+        bfLog: "log₁₀",
+        rawK: "Score vor Kalibrierung",
+        wcK: "Wörter",
+        confK: "Konfidenz",
+        hlCap: "Der Text ist zu lang für die farbige Markierung - die Schätzung bleibt davon unberührt.",
+        privacy: "Alles läuft lokal in deinem Browser. Kein Text wird gesendet, gespeichert oder getrackt.",
+        disclaimer: "Privates Hobbyprojekt, unkommerziell. Das Tool trifft keine Aussage über eine bestimmte Person und ist nicht dafür gedacht, jemandem etwas nachzuweisen.",
+        sampleAiText: "It is important to note that the integration of artificial intelligence into modern workflows represents a significant paradigm shift. Moreover, organizations must carefully consider the implications of these technologies across multiple dimensions. By leveraging advanced capabilities, teams can unlock new efficiencies and drive meaningful outcomes. Furthermore, it is essential to recognize that successful adoption depends not merely on the technology itself, but on the surrounding processes and culture. In conclusion, while challenges undoubtedly remain, the potential benefits are substantial, and stakeholders would be well advised to approach this transition with both enthusiasm and appropriate caution.",
+        sampleHumanText: "I spent most of Saturday trying to get the old lawnmower running again. The thing is probably older than I am, and every spring it needs some kind of coaxing. This time the carburettor was gummed up, which I only figured out after taking half the engine apart on the kitchen table, much to my wife's delight. Cleaned it with an old toothbrush and some petrol. It coughed twice, then caught, and I mowed the lawn in the dark because by then it was nearly nine. Neighbours must think I'm mad. Worth it though, I'm not buying a new one just because the old one sulks.",
+      },
+      en: {
+        title: "LLM Detector",
+        subtitle: "Paste English text - the model estimates how likely it was written by a language model.",
+        prehint: "The model only handles English. For German or other languages it abstains instead of guessing.",
+        placeholder: "Paste English text here …",
+        clear: "Clear",
+        sampleAi: "Sample: AI",
+        sampleHuman: "Sample: human",
+        hlOn: "Highlighting: on",
+        hlOff: "Highlighting: off",
+        legendAi: "typical AI phrases",
+        legendConn: "connector words",
+        loading: "Loading model …",
+        loadError: "The model could not be loaded - without the model file no estimate is possible.",
+        noEngine: "The detector engine could not be loaded.",
+        idle: "No text yet. From about 50 words on, the model will give an estimate.",
+        probLabel: "estimated probability that this text came from an LLM",
+        bandLabel: c => `Display band at “${c}” confidence - the estimate is not accurate to the percentage point.`,
+        confLow: "low", confMedium: "medium", confHigh: "high",
+        endHuman: "leans human", endLlm: "leans LLM",
+        verdictStrongLlm: "Strong indications of LLM-generated text.",
+        verdictLeanLlm: "Leans towards LLM, but the picture is not clear.",
+        verdictUnclear: "No clear signal either way.",
+        verdictLeanHuman: "Leans towards human-written.",
+        verdictStrongHuman: "Strong indications of human-written text.",
+        lowConfHint: "At low confidence, read the number carefully - short text, or a value close to the middle.",
+        abstainShortH: "Too little signal for a statement",
+        abstainShortD: n => `The text has ${n} ${n === 1 ? "word" : "words"}. Below 50 words the statistical features are too noisy to estimate from, so there is deliberately no number here.`,
+        abstainLangH: "This tool only handles English",
+        abstainLangD: "The text was not recognised as English. The model was trained on English only and abstains on anything else rather than inventing a number.",
+        abstainLangRatio: r => `Detected English share: ${Math.round(r * 100)} %.`,
+        methodSummary: "Methodology, limits and details",
+        limitsH: "Limits",
+        limits: [
+          "English only. Other languages lead to abstention.",
+          "Below 50 words there is no estimate; just above it the signal is still thin.",
+          "English written by non-native speakers is a known false-positive pattern: an even, uniform style looks LLM-like to the model.",
+          "Recent models are harder to spot than the 2023 generation. The tool does not say which model wrote a text.",
+          "The result is an indication, not proof. It is not enough to act on against a person.",
+        ],
+        howH: "How it works",
+        howP: "The text is reduced to twelve stylistic and statistical features - sentence lengths and their variation, lexical diversity, punctuation, the density of connector words and typical AI phrases, and the surprisal of a small character model. A gradient boosting model combines these features, and the result is then calibrated. Calibrated means: of the texts this tool puts at 80 %, roughly 80 % really are from an LLM.",
+        qualityH: "Quality",
+        qualityP: "AUROC 0.89 on a mixed test set, 0.94 on modern models only, 0.96 on an unseen topic holdout. Calibration error (ECE) 0.006.",
+        featH: "What drove the result",
+        featP: "Signed contributions on the log-odds scale, sorted by strength. To the right (amber) pushes towards LLM, to the left (green) towards human. Read the bars relative to each other, not as percentage points of the probability above.",
+        bfH: "Bayes factor",
+        bfP: "The percentage above depends on how common LLM texts were in the training mix (about 53 %). That is an artificial mix, not the rate in your own surroundings. The Bayes factor is independent of it: it says how much more likely this text is under “LLM” than under “human”. Rule of thumb: around 1 no signal, 3 to 10 moderate, above 10 strong; below 1/3 correspondingly towards human.",
+        bfK: "Bayes factor",
+        bfLog: "log₁₀",
+        rawK: "Score before calibration",
+        wcK: "Words",
+        confK: "Confidence",
+        hlCap: "The text is too long for coloured highlighting - the estimate itself is unaffected.",
+        privacy: "Everything runs locally in your browser. No text is sent, stored or tracked.",
+        disclaimer: "A private, non-commercial hobby project. The tool makes no statement about any particular person and is not meant to prove anything against anyone.",
+        sampleAiText: "It is important to note that the integration of artificial intelligence into modern workflows represents a significant paradigm shift. Moreover, organizations must carefully consider the implications of these technologies across multiple dimensions. By leveraging advanced capabilities, teams can unlock new efficiencies and drive meaningful outcomes. Furthermore, it is essential to recognize that successful adoption depends not merely on the technology itself, but on the surrounding processes and culture. In conclusion, while challenges undoubtedly remain, the potential benefits are substantial, and stakeholders would be well advised to approach this transition with both enthusiasm and appropriate caution.",
+        sampleHumanText: "I spent most of Saturday trying to get the old lawnmower running again. The thing is probably older than I am, and every spring it needs some kind of coaxing. This time the carburettor was gummed up, which I only figured out after taking half the engine apart on the kitchen table, much to my wife's delight. Cleaned it with an old toothbrush and some petrol. It coughed twice, then caught, and I mowed the lawn in the dark because by then it was nearly nine. Neighbours must think I'm mad. Worth it though, I'm not buying a new one just because the old one sulks.",
+      },
+    };
+
+    const t = STRINGS[LANG] || STRINGS.de;
+    const LOCALE = LANG === 'de' ? 'de-DE' : 'en-GB';
+
+    const clamp01 = x => Math.max(0, Math.min(1, x));
+    const pct = x => Math.round(x * 100);
+    const fmtNum = (x, d) => x.toLocaleString(LOCALE, { minimumFractionDigits: d, maximumFractionDigits: d });
+
+    // Dieselbe Normalisierung wie die Engine, damit die Span-Offsets passen.
+    function normalizeText(s) {
+      return s.replace(/\r\n/g, "\n").normalize("NFC");
+    }
+
+    function verdictFor(p) {
+      if (p >= 0.85) return t.verdictStrongLlm;
+      if (p >= 0.6) return t.verdictLeanLlm;
+      if (p > 0.4) return t.verdictUnclear;
+      if (p > 0.15) return t.verdictLeanHuman;
+      return t.verdictStrongHuman;
+    }
+
+    function probColor(p) {
+      if (p >= 0.7) return '#fbbf24';
+      if (p <= 0.3) return '#34d399';
+      return '#cbd5e1';
+    }
+
+    // Spans in nicht überlappende Segmente auflösen; KI-Phrasen gewinnen
+    // gegenüber Verbindungswörtern, wenn sie sich überschneiden.
+    function buildSegments(normText, spans) {
+      const marks = [];
+      (spans.ai_phrases || []).forEach(s => marks.push({ start: s.start, end: s.end, kind: 'ai' }));
+      (spans.connectors || []).forEach(s => marks.push({ start: s.start, end: s.end, kind: 'conn' }));
+      marks.sort((a, b) => a.start - b.start || (a.kind === 'ai' ? -1 : 1));
+
+      const out = [];
+      let cursor = 0;
+      for (const m of marks) {
+        const start = Math.max(m.start, cursor);
+        if (start >= m.end || m.end > normText.length) continue;
+        if (start > cursor) out.push({ text: normText.slice(cursor, start), kind: null });
+        out.push({ text: normText.slice(start, m.end), kind: m.kind });
+        cursor = m.end;
+      }
+      if (cursor < normText.length) out.push({ text: normText.slice(cursor), kind: null });
+      return out;
+    }
+
+    function Scale({ p, band }) {
+      const lo = clamp01(p - band), hi = clamp01(p + band);
+      return (
+        <div className="ld-scale">
+          <div className="track"></div>
+          <div className="band" style={{ left: (lo * 100) + '%', width: ((hi - lo) * 100) + '%' }}></div>
+          <div className="pin" style={{ left: (p * 100) + '%' }}></div>
+          <div className="ends"><span>0 % · {t.endHuman}</span><span>{t.endLlm} · 100 %</span></div>
+        </div>
+      );
+    }
+
+    function Features({ features }) {
+      const sorted = [...features].sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution));
+      const max = Math.max(...sorted.map(f => Math.abs(f.contribution)), 1e-6);
+      return (
+        <div className="ld-feats">
+          {sorted.map(f => {
+            const rel = Math.abs(f.contribution) / max;   // 0..1 der halben Balkenbreite
+            const w = rel * 50;
+            const pos = f.contribution > 0;
+            return (
+              <div className="ld-feat" key={f.name}>
+                <span className="nm" title={f.humanLabel[LANG] || f.name}>{f.humanLabel[LANG] || f.name}</span>
+                <span className="bar">
+                  <span className="axis"></span>
+                  <span
+                    className={'fill ' + (pos ? 'pos' : 'neg')}
+                    style={pos ? { left: '50%', width: w + '%' } : { right: '50%', width: w + '%' }}
+                  ></span>
+                </span>
+                <span className="val">{(f.contribution >= 0 ? '+' : '−') + fmtNum(Math.abs(f.contribution), 2)}</span>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function Detector() {
+      const [text, setText] = useState('');
+      const [debounced, setDebounced] = useState('');
+      const [model, setModel] = useState(null);
+      const [modelError, setModelError] = useState(false);
+      const [highlight, setHighlight] = useState(true);
+      const taRef = useRef(null);
+      const backdropRef = useRef(null);
+
+      useEffect(() => {
+        let alive = true;
+        fetch(MODEL_URL)
+          .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+          .then(m => { if (alive) setModel(m); })
+          .catch(() => { if (alive) setModelError(true); });
+        return () => { alive = false; };
+      }, []);
+
+      useEffect(() => {
+        const id = setTimeout(() => setDebounced(text), DEBOUNCE_MS);
+        return () => clearTimeout(id);
+      }, [text]);
+
+      const result = useMemo(() => {
+        if (!ENGINE || !model || !debounced.trim()) return null;
+        try {
+          return ENGINE.detect(debounced, model);
+        } catch (e) {
+          return { error: true };
+        }
+      }, [debounced, model]);
+
+      const normText = useMemo(() => normalizeText(text), [text]);
+      const tooLongForHl = normText.length > HL_CAP;
+
+      const segments = useMemo(() => {
+        if (!highlight || tooLongForHl) return null;
+        if (!result || result.abstain || result.error || !result.spans) return null;
+        // Spans gelten für den debounceten Text; solange getippt wird, passen sie
+        // nicht mehr auf den aktuellen Inhalt - dann lieber nicht einfärben.
+        if (normalizeText(debounced) !== normText) return null;
+        return buildSegments(normText, result.spans);
+      }, [highlight, tooLongForHl, result, normText, debounced]);
+
+      const syncScroll = () => {
+        if (taRef.current && backdropRef.current) {
+          backdropRef.current.scrollTop = taRef.current.scrollTop;
+          backdropRef.current.scrollLeft = taRef.current.scrollLeft;
+        }
+      };
+
+      const confWord = c => c === 'high' ? t.confHigh : c === 'low' ? t.confLow : t.confMedium;
+
+      return (
+        <div className="container ld-wrap">
+          <h1 style={{ fontSize: '1.5rem', color: '#cbd5e1', marginBottom: 8 }}>{t.title}</h1>
+          <p style={{ color: '#94a3b8', maxWidth: '70ch' }}>{t.subtitle}</p>
+
+          <p className="ld-prehint">{t.prehint}</p>
+
+          <div className="ld-editor">
+            <div className="ld-backdrop" ref={backdropRef} aria-hidden="true">
+              {segments
+                ? segments.map((s, i) => (
+                    s.kind
+                      ? <mark key={i} className={s.kind === 'ai' ? 'ld-mk-ai' : 'ld-mk-conn'}>{s.text}</mark>
+                      : <span key={i}>{s.text}</span>
+                  ))
+                : text}
+              {'\n'}
+            </div>
+            <textarea
+              ref={taRef}
+              className="ld-input"
+              value={text}
+              onChange={e => setText(e.target.value)}
+              onScroll={syncScroll}
+              placeholder={t.placeholder}
+              spellCheck={false}
+              autoFocus
+            />
+          </div>
+
+          <div className="ld-toolbar">
+            <button className="ld-btn" onClick={() => setText('')}>{t.clear}</button>
+            <button className="ld-btn" onClick={() => setText(t.sampleAiText)}>{t.sampleAi}</button>
+            <button className="ld-btn" onClick={() => setText(t.sampleHumanText)}>{t.sampleHuman}</button>
+            <span className="spacer"></span>
+            <button className="ld-btn" onClick={() => setHighlight(v => !v)}>
+              {highlight ? t.hlOn : t.hlOff}
+            </button>
+          </div>
+
+          {highlight && !tooLongForHl && (
+            <div className="ld-legend">
+              <span><span className="sw ld-mk-ai"></span>{t.legendAi}</span>
+              <span><span className="sw ld-mk-conn"></span>{t.legendConn}</span>
+            </div>
+          )}
+          {tooLongForHl && <p className="ld-privacy" style={{ marginTop: 8 }}>{t.hlCap}</p>}
+
+          {!ENGINE && <p className="ld-warn">{t.noEngine}</p>}
+          {ENGINE && modelError && <p className="ld-warn">{t.loadError}</p>}
+          {ENGINE && !model && !modelError && <p className="ld-idle">{t.loading}</p>}
+
+          {ENGINE && model && !result && <p className="ld-idle">{t.idle}</p>}
+
+          {result && result.error && <p className="ld-warn">{t.loadError}</p>}
+
+          {result && !result.error && result.abstain && (
+            <div className="ld-abstain">
+              {result.notes && result.notes.indexOf('unsupported_language') !== -1 ? (
+                <>
+                  <div className="h">{t.abstainLangH}</div>
+                  <div className="d">
+                    {t.abstainLangD}
+                    {result.language_ratios && typeof result.language_ratios.en === 'number' &&
+                      ' ' + t.abstainLangRatio(result.language_ratios.en)}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="h">{t.abstainShortH}</div>
+                  <div className="d">{t.abstainShortD(result.word_count)}</div>
+                </>
+              )}
+            </div>
+          )}
+
+          {result && !result.error && !result.abstain && (
+            <>
+              <div className="ld-result">
+                <div className="ld-num" style={{ color: probColor(result.probability) }}>
+                  {pct(result.probability)} %
+                </div>
+                <div style={{ fontSize: '.78rem', color: '#64748b', marginTop: 4, maxWidth: '54ch' }}>
+                  {t.probLabel}
+                </div>
+                <div className="ld-verdict">{verdictFor(result.probability)}</div>
+
+                <Scale p={result.probability} band={BAND[result.confidence] || BAND.medium} />
+                <div className="ld-band-label">{t.bandLabel(confWord(result.confidence))}</div>
+                {result.confidence === 'low' && (
+                  <div className="ld-band-label" style={{ color: '#94a3b8' }}>{t.lowConfHint}</div>
+                )}
+              </div>
+
+              <details className="ld-details">
+                <summary>{t.methodSummary}</summary>
+                <div className="body">
+                  <div className="ld-kv">
+                    <div><div className="k">{t.confK}</div><div className="v">{confWord(result.confidence)}</div></div>
+                    <div><div className="k">{t.wcK}</div><div className="v">{result.word_count.toLocaleString(LOCALE)}</div></div>
+                    {typeof result.bayes_factor === 'number' && (
+                      <div><div className="k">{t.bfK}</div><div className="v">{fmtNum(result.bayes_factor, result.bayes_factor >= 10 ? 0 : 2)}</div></div>
+                    )}
+                    <div><div className="k">{t.rawK}</div><div className="v">{fmtNum(result.probability_raw, 3)}</div></div>
+                  </div>
+
+                  <div className="ld-sub">{t.featH}</div>
+                  <p style={{ marginTop: 0 }}>{t.featP}</p>
+                  <Features features={result.features} />
+
+                  {typeof result.bayes_factor === 'number' && (
+                    <>
+                      <div className="ld-sub">{t.bfH}</div>
+                      <p style={{ marginTop: 0 }}>{t.bfP}</p>
+                    </>
+                  )}
+
+                  <div className="ld-sub">{t.howH}</div>
+                  <p style={{ marginTop: 0 }}>{t.howP}</p>
+
+                  <div className="ld-sub">{t.qualityH}</div>
+                  <p style={{ marginTop: 0 }}>{t.qualityP}</p>
+
+                  <div className="ld-sub">{t.limitsH}</div>
+                  <ul style={{ marginTop: 0 }}>
+                    {t.limits.map((l, i) => <li key={i}>{l}</li>)}
+                  </ul>
+                </div>
+              </details>
+            </>
+          )}
+
+          {(!result || result.abstain || result.error) && (
+            <details className="ld-details">
+              <summary>{t.methodSummary}</summary>
+              <div className="body">
+                <div className="ld-sub">{t.howH}</div>
+                <p style={{ marginTop: 0 }}>{t.howP}</p>
+                <div className="ld-sub">{t.qualityH}</div>
+                <p style={{ marginTop: 0 }}>{t.qualityP}</p>
+                <div className="ld-sub">{t.limitsH}</div>
+                <ul style={{ marginTop: 0 }}>
+                  {t.limits.map((l, i) => <li key={i}>{l}</li>)}
+                </ul>
+              </div>
+            </details>
+          )}
+
+          <p className="ld-privacy" style={{ marginTop: 22 }}>{t.privacy}</p>
+          <p className="ld-privacy">{t.disclaimer}</p>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<Detector />);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="/datenschutz.html">Datenschutz</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+  <script>/* privacy-label-i18n */if(document.documentElement.lang==='en'){var _pl=document.querySelector('footer a[href="/datenschutz.html"]');if(_pl)_pl.textContent='Privacy';}</script>
+</body>
+</html>
