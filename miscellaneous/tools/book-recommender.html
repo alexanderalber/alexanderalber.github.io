@@ -85,7 +85,7 @@
     <div id="root">
       <div class="container">
         <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Book Recommender</h1>
-        <p style="color:#94a3b8;max-width:70ch">Fantasy &amp; sci-fi recommendations with calibrated uncertainty. Rate the books you know, watch the model's uncertainty collapse, and get recommendations with honest probabilities — computed entirely in your browser.</p>
+        <p style="color:#94a3b8;max-width:70ch">Fantasy &amp; sci-fi recommendations with calibrated uncertainty. Rate the books you know, watch the model's uncertainty collapse, and get recommendations with honest probabilities - computed entirely in your browser.</p>
       </div>
     </div>
   </main>
@@ -152,7 +152,7 @@
       return t;
     }
 
-    // Strip trailing store-metadata junk from raw catalog strings (display only —
+    // Strip trailing store-metadata junk from raw catalog strings (display only,
     // the data itself is never modified).
     function cleanTitle(t) {
       return String(t).replace(/\s*(?:Series\s+)?Publisher:.*$/i, '').replace(/\s*Format:.*$/i, '').trim();
@@ -211,7 +211,7 @@
         for (let d = 0; d < D; d++) dot += qs[off + d] * u[d];
         m[j] = meta.mu + bias[j] + dot;
         lev[j] = quadForm(L, D, qs, off);
-        va[j] = meta.sigma2 * lev[j] + meta.sigma2;    // + σ² noise term — do not drop
+        va[j] = meta.sigma2 * lev[j] + meta.sigma2;    // + σ² noise term - do not drop
         const z = (m[j] - meta.like_thr) / Math.sqrt(va[j]);
         plike[j] = sigmoid(meta.like_a * z + meta.like_b);
       }
@@ -523,10 +523,19 @@
       const c = [0, 1, 2].map(i => Math.round(CMAP.mid[i] + (a[i] - CMAP.mid[i]) * f));
       return `rgb(${c[0]},${c[1]},${c[2]})`;
     }
+    // Broad umbrella tags: many books carry them (and the source data mis-tags some
+    // adult SF as "childrens"), so cluster labels use at most one of these.
+    const UMBRELLA = new Set(['fantasy', 'scifi', 'ya', 'childrens']);
+    // Statistical leverage: how far a book sits outside the taste directions your ratings
+    // pinned down. High = the model extrapolates → wider uncertainty band.
+    const LEV_TIP = 'How far this book sits outside the taste directions your ratings have pinned down. Higher = the model is extrapolating, so its uncertainty band is wider. It also drives which books the onboarding asks you about.';
     const ratingColor = r => cmap((r - 3) / 2);
     const avgColor = a => cmap(Math.max(-1, Math.min(1, a - 4)));
     const fmtN = n => n.toLocaleString('en-US');
     const pct = p => Math.round(p * 100) + '%';
+    // Qualitative popularity / reception buckets used for the UI labels.
+    const POP = n => n < 150 ? 'niche' : n < 1000 ? 'lesser-known' : n < 5000 ? 'popular' : 'widely read';
+    const RECEPT = a => a < 3.6 ? 'mixed reception' : a < 4.0 ? 'well received' : a < 4.3 ? 'highly rated' : 'acclaimed';
 
     function loadStore() {
       try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch (e) { return {}; }
@@ -557,6 +566,22 @@
           <span style={{ color: C.text, fontVariantNumeric: 'tabular-nums', fontSize: 14, minWidth: 40 }}>
             {val.toFixed(1)}★
           </span>
+        </div>
+      );
+    }
+
+    function Slider({ label, min, max, step, value, onChange, leftLabel, rightLabel, readout }) {
+      return (
+        <div style={{ flex: '1 1 260px', minWidth: 240, maxWidth: 430 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+            <span style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</span>
+            <span style={{ fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums' }}>{readout}</span>
+          </div>
+          <input type="range" min={min} max={max} step={step} value={value}
+            onChange={e => onChange(+e.target.value)} style={{ width: '100%', margin: 0 }} />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.foot, marginTop: 1 }}>
+            <span>{leftLabel}</span><span>{rightLabel}</span>
+          </div>
         </div>
       );
     }
@@ -655,17 +680,26 @@
         const n = model.prep.n;
         const order = Array.from({ length: n }, (_, i) => i)
           .sort((a, b) => comp.m[b] - comp.m[a]);
-        const pts = [];
+        const raw = [];
         for (let r = 0; r < n; r += 5) {          // downsampled polyline support points
           const j = order[r];
-          const hw = Math.min(zc * Math.sqrt(comp.va[j]), 2);
-          pts.push({
-            r, j,
-            mean: M.clip(comp.m[j], 1, 5),
-            up: M.clip(comp.m[j] + hw, 1, 5),
-            lo: M.clip(comp.m[j] - hw, 1, 5)
-          });
+          raw.push({ r, j, hw: Math.min(zc * Math.sqrt(comp.va[j]), 2) });
         }
+        // Rolling median on the band half-width: single high-variance books spike the
+        // fan while the mean curve stays smooth. Median (radius 2) clips those honest
+        // outliers without flattening genuinely wide regions.
+        const pts = raw.map((p, i) => {
+          const win = [];
+          for (let k = Math.max(0, i - 2); k <= Math.min(raw.length - 1, i + 2); k++) win.push(raw[k].hw);
+          win.sort((a, b) => a - b);
+          const hw = win[win.length >> 1];
+          return {
+            r: p.r, j: p.j,
+            mean: M.clip(comp.m[p.j], 1, 5),
+            up: M.clip(comp.m[p.j] + hw, 1, 5),
+            lo: M.clip(comp.m[p.j] - hw, 1, 5)
+          };
+        });
         return { pts, n };
       }, [comp]);
 
@@ -733,8 +767,8 @@
           </div>
           <div style={{ marginBottom: 8, ...oneLine }}>
             <TagChips tags={b.g} />
-            <span style={{ fontSize: 11.5, color: C.foot }}> · {fmtN(b.n)} raters</span>
-            {nerd && <span style={{ fontSize: 11.5, color: C.foot }}> · P(known) {pct(comp.pknow[idx])} · lev {comp.lev[idx].toFixed(3)}</span>}
+            <span style={{ fontSize: 11.5, color: C.foot }}> · {POP(b.n)}</span>
+            {nerd && <span style={{ fontSize: 11.5, color: C.foot }}> · P(known) {pct(comp.pknow[idx])} · <span title={LEV_TIP}>lev {comp.lev[idx].toFixed(3)}</span></span>}
           </div>
           <div style={{ marginTop: 'auto' }}>
             <RateSlider onCommit={v => onRate(idx, v)} />
@@ -780,7 +814,7 @@
           <h3 style={{ fontSize: 16, color: C.text, margin: '18px 0 2px' }}>Watch the posterior collapse</h3>
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 8px', maxWidth: '72ch' }}>
             The model's expected rating for every book in the catalog (middle line) with its 90% uncertainty
-            band. Each rating you add narrows the band — the fan collapses as the model learns your taste.
+            band. Each rating you add narrows the band - the fan collapses as the model learns your taste.
           </p>
           <PosteriorChart model={model} comp={comp} />
           <p style={{ fontSize: 12.5, color: C.label, margin: '4px 0 0' }}>
@@ -789,7 +823,7 @@
           </p>
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 2px' }}>
-            {comp.nRated === 0 ? 'Do you know these?' : 'Keep going — do you know these?'}
+            {comp.nRated === 0 ? 'Do you know these?' : 'Keep going - do you know these?'}
           </h3>
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px', maxWidth: '72ch' }}>
             Questions are chosen to be books you probably know <em>and</em> that tell the model the most
@@ -830,7 +864,7 @@
                 onClick={e => { e.preventDefault(); onReset(); }}>Reset everything</a>}
           </div>
           {ratings.size === 0 &&
-            <p style={{ fontSize: 12.5, color: C.foot }}>Nothing rated yet — answer a card above or search for a book you know.</p>}
+            <p style={{ fontSize: 12.5, color: C.foot }}>Nothing rated yet - answer a card above or search for a book you know.</p>}
           <div>
             {ratedList.map(([j, r]) => {
               const b = model.prep.books[j];
@@ -840,7 +874,7 @@
                   <span style={{ flex: '1 1 220px', fontSize: 13.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {M.cleanTitle(b.t)} <span style={{ color: C.foot, fontSize: 12 }}>· {M.cleanAuthor(b.a)}</span>
                   </span>
-                  {nerd && <span style={{ fontSize: 11.5, color: C.foot }}>leverage {comp.lev[j].toFixed(3)}</span>}
+                  {nerd && <span style={{ fontSize: 11.5, color: C.foot }} title={LEV_TIP}>leverage {comp.lev[j].toFixed(3)}</span>}
                   <div style={{ flex: '0 0 190px' }}>
                     <RateSlider initial={r} onCommit={v => onRate(j, v)} />
                   </div>
@@ -859,26 +893,28 @@
     }
 
     /* ── Recommendations tab ───────────────────────────────────────────── */
-    function FunnelMini({ vols, ret }) {
+    function FunnelMini({ vols, ret, explain }) {
       const maxN = Math.max(...vols.map(v => v[0]), 1);
       return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 6, flexWrap: 'wrap' }}>
-          <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, width: 130 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginTop: 6, flexWrap: 'wrap' }}>
+          <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, width: 130, paddingTop: 2 }}>
             {vols.slice(0, 8).map((v, i) => (
-              <span key={i} title={`Vol. ${i + 1}: ${fmtN(v[0])} people rated it, ${v[1].toFixed(2)}★ average`}
+              <span key={i} title={`Vol. ${i + 1}: ${POP(v[0])}, ${RECEPT(v[1])}`}
                 style={{ display: 'block', height: 5, width: `${Math.max(3, v[0] / maxN * 100)}%`,
                   background: avgColor(v[1]), borderRadius: 2 }} />
             ))}
           </span>
           <span style={{ fontSize: 11.5, color: C.foot, lineHeight: 1.5 }}>
-            Series drop-off — each bar is a volume; length = how many rated it, color = its avg ★.
-            {' '}{vols.length} volumes{ret != null ? `, ${Math.round(ret * 100)}% went on to vol. 2` : ''}.
+            {explain && (
+              <span>Series drop-off: each bar is a volume, length = how widely read, color = how well received.<br /></span>
+            )}
+            {vols.length} volumes{ret != null ? `, ${Math.round(ret * 100)}% went on to vol. 2` : ''}.
           </span>
         </div>
       );
     }
 
-    function RecRow({ model, comp, idx, rank, nerd }) {
+    function RecRow({ model, comp, idx, rank, nerd, explain }) {
       const b = model.prep.books[idx];
       const zc = 1.6449 * model.prep.meta.c90;
       const hw = Math.min(zc * Math.sqrt(comp.va[idx]), 2);
@@ -897,53 +933,70 @@
           {nerd && (
             <div style={{ fontSize: 12, color: C.label, marginTop: 3, paddingLeft: 36 }}>
               {stars.toFixed(2)}★ ±{hw.toFixed(2)}
-              {' · '}P(like) baseline {pct(model.base.plike[idx])}{comp.nRated > 0 ? <span> → for you <strong style={{ color: C.text }}>{pct(comp.plike[idx])}</strong></span> : null}
+              {' · '}P(like) <strong style={{ color: C.text }}>{pct(comp.plike[idx])}</strong>
               {comp.nRated > 0 && Number.isFinite(comp.ease[idx]) ? ` · match ${comp.ease[idx].toFixed(3)}` : ''}
-              {` · ${fmtN(b.n)} raters · leverage ${comp.lev[idx].toFixed(3)}`}
+              {` · ${POP(b.n)} · `}
+              <span title={LEV_TIP}>leverage {comp.lev[idx].toFixed(3)}</span>
             </div>
           )}
-          {b.vols && <div style={{ paddingLeft: 36 }}><FunnelMini vols={b.vols} ret={b.ret} /></div>}
+          {b.vols && <div style={{ paddingLeft: 36 }}><FunnelMini vols={b.vols} ret={b.ret} explain={explain} /></div>}
         </div>
       );
     }
 
-    function RecsTab({ model, comp, filtered, nerd, sortMode, setSortMode }) {
+    function RecsTab({ model, comp, filtered, nerd, blend, risk, setBlend, setRisk }) {
       const [topN, setTopN] = useState(40);
       const zc = 1.6449 * model.prep.meta.c90;
+      const matchLabel = comp.nRated > 0 ? 'Match' : 'Popular';
 
+      // Two orthogonal dials combined on percentiles (over the filtered pool), so the
+      // unbounded Match score and the 1-5 rating share one scale:
+      //   score = (1-blend)·pct(match) + blend·pct(risk-adjusted rating)
+      // Endpoints reproduce the single-criterion sorts; risk shifts the rating estimate
+      // by up to one full band (-1 = lower bound / safe, +1 = upper bound / moonshot).
       const sorted = useMemo(() => {
-        const key = {
-          match: j => (comp.nRated > 0 ? comp.ease[j] : model.prep.books[j].n),
-          plike: j => comp.plike[j],
-          lcb: j => comp.m[j] - zc * Math.sqrt(comp.va[j]),
-          ucb: j => comp.m[j] + zc * Math.sqrt(comp.va[j])
-        }[sortMode] || (j => comp.ease[j]);
-        return filtered.slice().sort((a, b) => {
-          const d = key(b) - key(a);
-          return d !== 0 ? d : model.prep.books[b].n - model.prep.books[a].n;
-        });
-      }, [filtered, comp, sortMode]);
+        const n = filtered.length;
+        if (n === 0) return [];
+        const matchKey = comp.nRated > 0 ? (j => comp.ease[j]) : (j => model.prep.books[j].n);
+        const ratingKey = j => M.clip(comp.m[j] + risk * zc * Math.sqrt(comp.va[j]), 1, 5);
+        const pctMap = keyFn => {
+          const order = filtered.slice().sort((a, b) => keyFn(a) - keyFn(b) || model.prep.books[a].n - model.prep.books[b].n);
+          const p = new Float64Array(model.prep.n);
+          order.forEach((j, i) => { p[j] = n > 1 ? i / (n - 1) : 0.5; });
+          return p;
+        };
+        const mp = pctMap(matchKey), rp = pctMap(ratingKey);
+        const score = j => (1 - blend) * mp[j] + blend * rp[j];
+        return filtered.slice().sort((a, b) => score(b) - score(a) || model.prep.books[b].n - model.prep.books[a].n);
+      }, [filtered, comp, blend, risk]);
 
-      const sortOpts = [
-        { id: 'match', label: comp.nRated > 0 ? 'Match' : 'Popular (baseline)' },
-        { id: 'plike', label: 'P(like)' },
-        ...(nerd ? [{ id: 'lcb', label: 'Safe bets (LCB)' }, { id: 'ucb', label: 'Moonshots (UCB)' }] : [])
-      ];
+      const riskReadout = Math.abs(risk) < 0.02 ? 'expected rating'
+        : `${risk > 0 ? 'optimistic' : 'safe'} · ${risk > 0 ? '+' : ''}${risk.toFixed(2)} × band`;
 
       return (
         <div>
           {comp.nRated === 0 &&
             <p style={{ fontSize: 13, color: C.gold, margin: '10px 0' }}>
-              Cold start: this is the unpersonalized popularity baseline. Rate a few books on the Rate tab and this list becomes yours.
+              Cold start: nothing rated yet, so this list is unpersonalized (population averages). Rate a few books on the Rate tab and it becomes yours.
             </p>}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', margin: '10px 0' }}>
-            <span style={{ color: C.label, fontSize: 13 }}>Sort:</span>
-            <Seg options={sortOpts} value={sortMode} onChange={setSortMode} />
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 26, margin: '12px 0 6px' }}>
+            <Slider label="Ranking" min={0} max={1} step={0.01} value={blend} onChange={setBlend}
+              leftLabel={matchLabel} rightLabel="Rating"
+              readout={`${Math.round((1 - blend) * 100)}% ${matchLabel.toLowerCase()} · ${Math.round(blend * 100)}% rating`} />
+            <Slider label="Risk" min={-1} max={1} step={0.01} value={risk} onChange={setRisk}
+              leftLabel="Safe bets" rightLabel="Moonshots" readout={riskReadout} />
           </div>
+          <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 12px' }}>
+            Risk tilts the predicted rating by up to one uncertainty band (Safe = lower bound, Moonshots = upper). It only moves the ranking as far as the dial leans toward Rating.
+          </p>
           <div>
-            {sorted.slice(0, topN).map((j, i) => (
-              <RecRow key={j} model={model} comp={comp} idx={j} rank={i + 1} nerd={nerd} />
-            ))}
+            {(() => {
+              const shown = sorted.slice(0, topN);
+              const firstSeriesIdx = shown.findIndex(j => model.prep.books[j].vols);
+              return shown.map((j, i) => (
+                <RecRow key={j} model={model} comp={comp} idx={j} rank={i + 1} nerd={nerd} explain={i === firstSeriesIdx} />
+              ));
+            })()}
           </div>
           {sorted.length > topN &&
             <button className="lang-seg" style={{ marginTop: 12 }} onClick={() => setTopN(topN + 40)}>
@@ -958,14 +1011,26 @@
     /* ── Scatter tab ───────────────────────────────────────────────────── */
     function ScatterTab({ model, comp, filtered, matchPct, nerd }) {
       const [tip, setTip] = useState(null);
+      const [zoom, setZoom] = useState(0);
       const W = 760, H = 470, L = 46, R = 14, T = 18, B = 40;
       const zc = 1.6449 * model.prep.meta.c90;
 
+      // Zoom anchored on the top-right (SAFE BETS) corner: at full zoom the
+      // visible window shrinks to match 75-100 (x) and P(like) 75-100% (y).
+      const xmin = zoom * 75;        // taste-match percentile lower bound
+      const ymin = zoom * 0.75;      // P(like) lower bound
+      const sx = mp => L + ((mp - xmin) / (100 - xmin)) * (W - L - R);
+      const sy = pl => T + (1 - (pl - ymin) / (1 - ymin)) * (H - T - B);
+      const visible = p => p.mp >= xmin && p.pl >= ymin;
+
       const pts = useMemo(() => filtered.map(j => ({
         j,
-        x: L + (matchPct[j] / 100) * (W - L - R),
-        y: T + (1 - comp.plike[j]) * (H - T - B),
-        r: 1.2 + 1.2 * Math.log10(Math.max(model.prep.books[j].n, 10))
+        mp: matchPct[j],
+        pl: comp.plike[j],
+        mv: comp.m[j],   // expected rating -> point color
+        // radius grows with the log of the popularity signal, clamped to a
+        // clearly visible 2.2-9px spread.
+        r: Math.max(2.2, Math.min(9, 1.6 + 2.2 * (Math.log10(Math.max(model.prep.books[j].n, 10)) - 1)))
       })), [filtered, comp, matchPct]);
 
       const onMove = e => {
@@ -974,48 +1039,84 @@
         const fy = (e.clientY - rect.top) / rect.height * H;
         let best = null, bd = 400;   // 20px radius
         for (const p of pts) {
-          const d = (p.x - fx) * (p.x - fx) + (p.y - fy) * (p.y - fy);
+          if (!visible(p)) continue;
+          const dx = sx(p.mp) - fx, dy = sy(p.pl) - fy;
+          const d = dx * dx + dy * dy;
           if (d < bd) { bd = d; best = p; }
         }
-        setTip(best ? { ...best, px: fx / W * 100, py: fy / H * 100 } : null);
+        setTip(best ? { j: best.j, px: fx / W * 100, py: fy / H * 100 } : null);
       };
 
       const qlabel = { fontSize: 11, fill: C.disc, letterSpacing: '0.06em' };
+      // Fixed data-value gridlines: the 75% line stays the 75% line and simply
+      // slides toward the axis as you zoom, keeping only those still in view.
+      const xticks = [0, 25, 50, 75, 100].filter(v => v >= xmin - 1e-9);
+      const yticks = [0, 0.25, 0.5, 0.75, 1].filter(v => v >= ymin - 1e-9);
 
       return (
         <div>
           <p style={{ fontSize: 12.5, color: C.label, margin: '10px 0', maxWidth: '76ch' }}>
             Every unrated book: horizontal = how strongly it matches what you read
-            ({comp.nRated > 0 ? 'co-reading signal, percentile' : 'popularity percentile — rate books to personalize'}),
-            vertical = calibrated probability you'd rate it 4★ or higher. Size ~ number of raters.
+            ({comp.nRated > 0 ? 'co-reading signal, percentile' : 'popularity percentile - rate books to personalize'}),
+            vertical = calibrated probability you'd rate it 4★ or higher. Size ~ how widely read,
+            color = expected rating for you.
           </p>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 20, flexWrap: 'wrap', margin: '10px 0 6px' }}>
+            <Slider label="Zoom" min={0} max={1} step={0.01} value={zoom} onChange={setZoom}
+              leftLabel="full view" rightLabel="top-right corner"
+              readout={zoom > 0 ? `${Math.round(xmin)}–100` : 'off'} />
+            <span style={{ fontSize: 11.5, color: C.foot, display: 'inline-flex', alignItems: 'center', gap: 6, paddingBottom: 2 }}>
+              {[3, 4, 5].map(s => (
+                <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ width: 11, height: 11, borderRadius: 3, background: avgColor(s), display: 'inline-block' }} />
+                  {s}★
+                </span>
+              ))}
+            </span>
+          </div>
           <div className="rec-svgwrap">
             <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
-              {[0, 25, 50, 75, 100].map(v => (
-                <g key={v}>
-                  <line x1={L + v / 100 * (W - L - R)} y1={T} x2={L + v / 100 * (W - L - R)} y2={H - B} stroke={C.grid} strokeWidth={1} opacity={0.5} />
-                  <line x1={L} y1={T + (1 - v / 100) * (H - T - B)} x2={W - R} y2={T + (1 - v / 100) * (H - T - B)} stroke={C.grid} strokeWidth={1} opacity={0.5} />
-                  <text x={L + v / 100 * (W - L - R)} y={H - B + 16} textAnchor="middle" fontSize={10.5} fill={C.axis}>{v}</text>
-                  <text x={L - 8} y={T + (1 - v / 100) * (H - T - B)} textAnchor="end" dominantBaseline="middle" fontSize={10.5} fill={C.axis}>{v}%</text>
+              <defs>
+                <clipPath id="scplot">
+                  <rect x={L} y={T} width={W - L - R} height={H - T - B} />
+                </clipPath>
+              </defs>
+              {xticks.map((v, i) => (
+                <g key={'x' + i}>
+                  <line x1={sx(v)} y1={T} x2={sx(v)} y2={H - B} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                  <text x={sx(v)} y={H - B + 16} textAnchor="middle" fontSize={10.5} fill={C.axis}>{Math.round(v)}</text>
+                </g>
+              ))}
+              {yticks.map((v, i) => (
+                <g key={'y' + i}>
+                  <line x1={L} y1={sy(v)} x2={W - R} y2={sy(v)} stroke={C.grid} strokeWidth={1} opacity={0.5} />
+                  <text x={L - 8} y={sy(v)} textAnchor="end" dominantBaseline="middle" fontSize={10.5} fill={C.axis}>{Math.round(v * 100)}%</text>
                 </g>
               ))}
               <text x={(L + W - R) / 2} y={H - 8} textAnchor="middle" fontSize={11.5} fill={C.axis}>taste match (percentile)</text>
               <text x={13} y={(T + H - B) / 2} textAnchor="middle" fontSize={11.5} fill={C.axis} transform={`rotate(-90 13 ${(T + H - B) / 2})`}>P(you'd like it)</text>
-              <text x={W - R - 6} y={T + 14} textAnchor="end" style={qlabel}>SAFE BETS</text>
-              <text x={L + 6} y={T + 14} style={qlabel}>BROAD APPEAL</text>
-              <text x={W - R - 6} y={H - B - 8} textAnchor="end" style={qlabel}>NICHE GAMBLES</text>
-              <text x={L + 6} y={H - B - 8} style={qlabel}>LONG SHOTS</text>
-              {pts.map(p => (
-                <circle key={p.j} cx={p.x} cy={p.y} r={p.r} fill={C.teal} opacity={0.45}
-                  stroke={tip && tip.j === p.j ? '#f1f5f9' : 'none'} strokeWidth={1.5} />
-              ))}
+              {/* Fixed plot frame: a constant boundary even when the 0-lines scroll out of view. */}
+              <rect x={L} y={T} width={W - L - R} height={H - T - B} fill="none" stroke={C.grid} strokeWidth={1} />
+              {/* Points + quadrant labels are clipped to the plot box so anything that
+                  slides out under zoom is hidden cleanly (axis labels stay outside). */}
+              <g clipPath="url(#scplot)">
+                {/* Quadrant labels anchored to their data corners so they slide with the zoom. */}
+                <text x={sx(100) - 6} y={sy(1) + 14} textAnchor="end" style={qlabel}>SAFE BETS</text>
+                <text x={sx(0) + 6} y={sy(1) + 14} style={qlabel}>BROAD APPEAL</text>
+                <text x={sx(100) - 6} y={sy(0) - 8} textAnchor="end" style={qlabel}>NICHE GAMBLES</text>
+                <text x={sx(0) + 6} y={sy(0) - 8} style={qlabel}>LONG SHOTS</text>
+                {pts.filter(visible).map(p => (
+                  <circle key={p.j} cx={sx(p.mp)} cy={sy(p.pl)} r={p.r} fill={avgColor(p.mv)} opacity={0.5}
+                    stroke={tip && tip.j === p.j ? '#f1f5f9' : 'none'} strokeWidth={1.5} />
+                ))}
+              </g>
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
                 <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
                 {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
                 P(like) {pct(comp.plike[tip.j])} · match p{Math.round(matchPct[tip.j])}
-                {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {fmtN(model.prep.books[tip.j].n)} raters</span>}
+                {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
               </div>
             )}
           </div>
@@ -1046,7 +1147,7 @@
         }
         if (!raw.length) return [];
         // ...centered on the mean lift (a uniform global offset carries no spatial
-        // information — the interesting signal is which regions are hotter/cooler
+        // information - the interesting signal is which regions are hotter/cooler
         // than your overall taste)...
         const mean = sum / raw.length;
         const mags = raw.map(x => Math.abs(x.delta - mean)).sort((a, b) => a - b);
@@ -1084,16 +1185,21 @@
             <Seg options={[{ id: 'on', label: 'On' }, { id: 'off', label: 'Off' }]}
               value={showTerrain ? 'on' : 'off'} onChange={v => setShowTerrain(v === 'on')} />
             {showTerrain && comp.nRated > 0 && (
-              <span style={{ fontSize: 11.5, color: C.foot, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ width: 70, height: 8, borderRadius: 4, display: 'inline-block',
-                  background: `linear-gradient(90deg, ${cmap(-1)}, ${cmap(0)}, ${cmap(1)})` }} />
-                cooler ← relative to your average → hotter
+              <span style={{ fontSize: 11.5, color: C.foot, display: 'inline-flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ width: 12, height: 12, borderRadius: 3, background: cmap(1), display: 'inline-block' }} />
+                  teal = you'd like more than average
+                </span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ width: 12, height: 12, borderRadius: 3, background: cmap(-1), display: 'inline-block' }} />
+                  orange = less
+                </span>
               </span>
             )}
           </div>
           {comp.nRated === 0 &&
             <p style={{ fontSize: 12.5, color: C.foot, margin: '4px 0 8px' }}>
-              The terrain appears once you've rated a few books — it shows which regions of taste-space you'd like more (or less) than your overall average.
+              The terrain appears once you've rated a few books - it shows which regions of taste-space you'd like more (or less) than your overall average.
             </p>}
           <div className="rec-svgwrap">
             <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
@@ -1131,11 +1237,26 @@
 
     /* ── Model tab ─────────────────────────────────────────────────────── */
     function LOOChart({ pts, rmse }) {
+      const [tip, setTip] = useState(null);
       const W = 360, H = 360, L = 38, R = 10, T = 10, B = 36;
       const s = v => ({ x: L + (v - 1) / 4 * (W - L - R), y: T + (1 - (v - 1) / 4) * (H - T - B) });
+      const px = p => s(p.pred).x, py = p => s(p.actual).y;
+
+      const onMove = e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const fx = (e.clientX - rect.left) / rect.width * W;
+        const fy = (e.clientY - rect.top) / rect.height * H;
+        let best = null, bd = 400;   // 20px
+        for (const p of pts) {
+          const d = (px(p) - fx) ** 2 + (py(p) - fy) ** 2;
+          if (d < bd) { bd = d; best = p; }
+        }
+        setTip(best ? { p: best, x: fx / W * 100, y: fy / H * 100 } : null);
+      };
+
       return (
         <div className="rec-svgwrap" style={{ maxWidth: 400 }}>
-          <svg viewBox={`0 0 ${W} ${H}`}>
+          <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
             {[1, 2, 3, 4, 5].map(v => (
               <g key={v}>
                 <line x1={s(v).x} y1={T} x2={s(v).x} y2={H - B} stroke={C.grid} strokeWidth={1} opacity={0.5} />
@@ -1146,13 +1267,18 @@
             ))}
             <line x1={s(1).x} y1={s(1).y} x2={s(5).x} y2={s(5).y} stroke={C.disc} strokeWidth={1} strokeDasharray="4 4" />
             {pts.map((p, i) => (
-              <circle key={i} cx={s(p.pred).x} cy={s(p.actual).y} r={5} fill={C.gold} opacity={0.75}>
-                <title>{p.title}: predicted {p.pred.toFixed(1)}, you said {p.actual.toFixed(1)}</title>
-              </circle>
+              <circle key={i} cx={px(p)} cy={py(p)} r={tip && tip.p === p ? 6.5 : 5} fill={C.gold}
+                opacity={0.8} stroke={tip && tip.p === p ? '#f1f5f9' : 'none'} strokeWidth={1.5} />
             ))}
             <text x={(L + W - R) / 2} y={H - 6} textAnchor="middle" fontSize={11} fill={C.axis}>predicted (from your other ratings)</text>
             <text x={12} y={(T + H - B) / 2} textAnchor="middle" fontSize={11} fill={C.axis} transform={`rotate(-90 12 ${(T + H - B) / 2})`}>your actual rating</text>
           </svg>
+          {tip && (
+            <div className="rec-tip" style={{ left: `min(${tip.x}%, 55%)`, top: `${Math.max(tip.y - 12, 0)}%` }}>
+              <strong>{tip.p.title}</strong><br />
+              predicted {tip.p.pred.toFixed(1)}, you said {tip.p.actual.toFixed(1)}
+            </div>
+          )}
         </div>
       );
     }
@@ -1179,13 +1305,19 @@
         return M.clusterRated(model.prep, idxs, maxK).map(members => {
           const counts = {};
           for (const i of members) for (const g of model.prep.books[i].g || []) counts[g] = (counts[g] || 0) + 1;
-          // Require a tag to appear in ≥2 books of a larger cluster, then rank by
-          // count × inverse tag frequency so distinctive subgenres win the label.
+          // Rank tags by count times inverse frequency, but label with distinctive
+          // subgenres first and at most ONE broad umbrella tag: the source data tags
+          // several adult SF books "childrens", which otherwise produced silly labels
+          // like "scifi, childrens" for a military-SF cluster.
           const minSup = members.length >= 3 ? 2 : 1;
-          let scored = Object.entries(counts).filter(([, c]) => c >= minSup)
-            .map(([g, c]) => [g, c * (model.tagIdf[g] || 1)]);
-          if (!scored.length) scored = Object.entries(counts).map(([g, c]) => [g, c]);
-          const label = scored.sort((a, b) => b[1] - a[1]).slice(0, 2).map(x => x[0]).join(' · ');
+          const rank = (arr) => arr.map(([g, c]) => [g, c * (model.tagIdf[g] || 1)]).sort((a, b) => b[1] - a[1]);
+          let kept = Object.entries(counts).filter(([, c]) => c >= minSup);
+          if (!kept.length) kept = Object.entries(counts);
+          const specific = rank(kept.filter(([g]) => !UMBRELLA.has(g)));
+          const umbrella = rank(kept.filter(([g]) => UMBRELLA.has(g)));
+          const picks = specific.slice(0, 2);
+          if (picks.length < 2 && umbrella.length) picks.push(umbrella[0]);   // at most one umbrella tag
+          const label = picks.slice(0, 2).map(x => x[0]).join(', ');
           return { label: label || 'mixed', members: members.slice().sort((a, b) => ratings.get(b) - ratings.get(a)) };
         });
       }, [ratedArr]);
@@ -1260,20 +1392,20 @@
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>How it works</h3>
           <details style={{ marginTop: 6 }}>
-            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Ranking — which books to suggest</summary>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Ranking - which books to suggest</summary>
             <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
               An item-item linear model (EASE) was trained offline; each catalog book keeps its top-20 neighbor
-              weights. Your score for a candidate is the sum of weights from every book you rated — stars
+              weights. Your score for a candidate is the sum of weights from every book you rated - stars
               deliberately don't matter here, because even a book you disliked reveals what you read
               (filtering by stars measured worse). Rated books are excluded from the list. With zero ratings
               you see the popularity baseline.
             </p>
           </details>
           <details>
-            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Stars &amp; P(like) — calibrated uncertainty</summary>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Stars &amp; P(like) - calibrated uncertainty</summary>
             <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
               A 32-factor matrix factorization (plus item bias and a user-offset dimension) was trained offline.
-              Your taste vector is folded in by ridge regression over your ratings —
+              Your taste vector is folded in by ridge regression over your ratings -
               <code style={{ fontSize: 11.5 }}> u = (λI + Σqqᵀ)⁻¹ Σq(r−μ−b)</code>, solved by Cholesky on a 33×33
               matrix, live in your browser. Expected stars are μ + b + q·u; the predictive variance
               σ²(qᵀA⁻¹q) + σ² feeds a Platt-calibrated sigmoid for P(you'd rate it ≥ 4★). On held-out readers,
@@ -1281,16 +1413,16 @@
             </p>
           </details>
           <details>
-            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Onboarding questions — what to ask next</summary>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Onboarding questions - what to ask next</summary>
             <p style={{ fontSize: 12.5, color: C.label, lineHeight: 1.7, marginTop: 6 }}>
-              A separate 16-factor exposure model estimates P(you know this book) — updated from your
+              A separate 16-factor exposure model estimates P(you know this book) - updated from your
               "don't know it" answers by a small ridge-logistic fit (5 Newton steps, fixed random negatives).
               Questions maximize P(you know it) × qᵀA⁻¹q: books you can probably answer <em>and</em> that
               shrink the model's uncertainty the most (D-optimal design, light version).
             </p>
           </details>
           <details>
-            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Model card — the numbers</summary>
+            <summary style={{ fontSize: 13, color: C.label, cursor: 'pointer' }}>Model card - the numbers</summary>
             <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '3px 18px', width: 'fit-content', marginTop: 8 }}>
               <span style={dt}>Catalog</span><span style={dd}>2,538 books &amp; series (1,432 series entries)</span>
               <span style={dt}>Training data</span><span style={dd}>a large corpus of public book ratings</span>
@@ -1347,14 +1479,14 @@
         return new Map(Object.entries(s.r || {}).map(([k, v]) => [+k, +v]));
       });
       const [unknown, setUnknown] = useState(() => new Set(loadStore().u || []));
-      const [detail, setDetail] = useState(() => loadStore().d === 'nerd' ? 'nerd' : 'casual');
       const [showTerrain, setShowTerrain] = useState(() => loadStore().h !== false);
       const [skipped, setSkipped] = useState(() => new Set());   // session only
       const [tab, setTab] = useState('rate');
       const [selTags, setSelTags] = useState(() => new Set());
       const [year, setYearState] = useState(null);               // [lo, hi] once model known
-      const [sortMode, setSortMode] = useState('match');
-      const nerd = detail === 'nerd';
+      const [blend, setBlend] = useState(0.5);                   // ranking dial: 0 = Match, 1 = Rating
+      const [risk, setRisk] = useState(0);                       // risk dial: -1 = Safe (LCB) … +1 = Moonshot (UCB)
+      const nerd = true;                                         // always on (casual mode removed)
 
       useEffect(() => {
         fetch('/assets/files/books-recsys-v1.json')
@@ -1393,9 +1525,9 @@
         const r = {};
         for (const [k, v] of ratings) r[k] = Math.round(v * 10) / 10;
         try {
-          localStorage.setItem(STORE_KEY, JSON.stringify({ r, u: [...unknown], d: detail, h: showTerrain }));
-        } catch (e) { /* storage full/blocked — tool still works, just not persistent */ }
-      }, [ratings, unknown, detail, showTerrain]);
+          localStorage.setItem(STORE_KEY, JSON.stringify({ r, u: [...unknown], h: showTerrain }));
+        } catch (e) { /* storage full/blocked - tool still works, just not persistent */ }
+      }, [ratings, unknown, showTerrain]);
 
       const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
       const unknownArr = useMemo(() => [...unknown], [unknown]);
@@ -1442,7 +1574,7 @@
             <h1 style={{ fontSize: '1.5rem', color: C.text }}>Book Recommender</h1>
             <p style={{ color: C.gold }}>Could not load the model data ({loadErr}).</p>
             <p style={{ color: C.label, fontSize: 13 }}>
-              If you opened this page from disk (file://), fetch is blocked — serve it over HTTP instead.
+              If you opened this page from disk (file://), fetch is blocked - serve it over HTTP instead.
             </p>
           </div>
         );
@@ -1471,11 +1603,6 @@
       const onImport = matched => {
         setRatings(prev => { const m = new Map(prev); for (const [j, r] of matched) m.set(j, r); return m; });
       };
-      const setDetailMode = d => {
-        setDetail(d);
-        if (d === 'casual') setSortMode(m => (m === 'lcb' || m === 'ucb') ? 'match' : m);
-      };
-
       const TABS = [
         { id: 'rate', label: `Rate${ratings.size ? ` (${ratings.size})` : ''}` },
         { id: 'recs', label: 'Recommendations' },
@@ -1486,17 +1613,10 @@
 
       return (
         <div className="container">
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-            <hgroup style={{ marginBottom: 8 }}>
-              <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 4 }}>Book Recommender</h1>
-              <p style={{ color: C.label, marginBottom: 0 }}>Fantasy &amp; sci-fi recommendations with calibrated uncertainty</p>
-            </hgroup>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingTop: 6 }}>
-              <span style={{ fontSize: 12, color: C.foot }}>Detail:</span>
-              <Seg options={[{ id: 'casual', label: 'Casual' }, { id: 'nerd', label: 'Nerd' }]}
-                value={detail} onChange={setDetailMode} />
-            </div>
-          </div>
+          <hgroup style={{ marginBottom: 8 }}>
+            <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 4 }}>Book Recommender</h1>
+            <p style={{ color: C.label, marginBottom: 0 }}>Fantasy &amp; sci-fi recommendations with calibrated uncertainty</p>
+          </hgroup>
 
           <div style={{ margin: '10px 0 4px' }}>
             <Seg options={TABS} value={tab} onChange={setTab} />
@@ -1513,7 +1633,7 @@
               onClearUnknown={() => setUnknown(new Set())} onReset={onReset} />}
           {tab === 'recs' &&
             <RecsTab model={model} comp={comp} filtered={filterData.filtered} nerd={nerd}
-              sortMode={sortMode} setSortMode={setSortMode} />}
+              blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk} />}
           {tab === 'scatter' &&
             <ScatterTab model={model} comp={comp} filtered={filterData.filtered} matchPct={matchPct} nerd={nerd} />}
           {tab === 'map' &&
@@ -1523,7 +1643,7 @@
             <ModelTab model={model} comp={comp} ratings={ratings} onImport={onImport} />}
 
           <p style={{ marginTop: 30, fontSize: 11, color: C.foot, lineHeight: 1.7 }}>
-            Recommendation model trained offline on a large corpus of public book ratings — 2,538 fantasy &amp; sci-fi
+            Recommendation model trained offline on a large corpus of public book ratings - 2,538 fantasy &amp; sci-fi
             books and series. Everything on this page runs entirely in your browser: your ratings are stored only on
             your device (localStorage) and never leave it.
           </p>
