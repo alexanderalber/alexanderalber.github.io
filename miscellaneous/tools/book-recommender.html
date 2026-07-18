@@ -529,6 +529,83 @@
     // Statistical leverage: how far a book sits outside the taste directions your ratings
     // pinned down. High = the model extrapolates → wider uncertainty band.
     const LEV_TIP = 'How far this book sits outside the taste directions your ratings have pinned down. Higher = the model is extrapolating, so its uncertainty band is wider. It also drives which books the onboarding asks you about.';
+    // Marching squares for the top-pick map: trace the borders between adjacent
+    // grid cells won by different books as smooth vector polylines (white contours on
+    // the dark surface — no fills, no colour). `field` is a categorical fr×fr grid.
+    // For one region label we build a binary mask and emit the midpoint iso-contour,
+    // then chain the segments into loops and Chaikin-smooth them.
+    function regionContours(field, fr, label) {
+      const inside = (r, c) => (r >= 0 && r < fr && c >= 0 && c < fr && field[r * fr + c] === label) ? 1 : 0;
+      const segs = [];   // each [[x0,y0],[x1,y1]] in grid-sample coordinates (0..fr-1)
+      for (let r = 0; r < fr - 1; r++) for (let c = 0; c < fr - 1; c++) {
+        const tl = inside(r, c), tr = inside(r, c + 1), br = inside(r + 1, c + 1), bl = inside(r + 1, c);
+        const sum = tl + tr + br + bl;
+        if (sum === 0 || sum === 4) continue;
+        const top = [c + 0.5, r], right = [c + 1, r + 0.5], bottom = [c + 0.5, r + 1], left = [c, r + 0.5];
+        const cross = [];                         // edges whose endpoints differ carry a crossing
+        if (tl !== tr) cross.push(top);
+        if (tr !== br) cross.push(right);
+        if (br !== bl) cross.push(bottom);
+        if (bl !== tl) cross.push(left);
+        if (cross.length === 2) segs.push([cross[0], cross[1]]);
+        else if (cross.length === 4) {            // saddle — pair consistently to avoid a crossing
+          if (tl === 1) { segs.push([top, left]); segs.push([right, bottom]); }
+          else { segs.push([top, right]); segs.push([bottom, left]); }
+        }
+      }
+      if (!segs.length) return [];
+      // Chain segments sharing an endpoint into polylines/loops.
+      const key = p => Math.round(p[0] * 2) + ',' + Math.round(p[1] * 2);
+      const adj = new Map();                       // point key → [{pt, seg, edge}]
+      segs.forEach((s, i) => {
+        for (const e of [0, 1]) {
+          const k = key(s[e]);
+          if (!adj.has(k)) adj.set(k, []);
+          adj.get(k).push({ pt: s[e], other: s[1 - e], seg: i });
+        }
+      });
+      const used = new Array(segs.length).fill(false);
+      const lines = [];
+      const startFrom = (si, sp, ep) => {
+        const line = [sp, ep];
+        used[si] = true;
+        let cur = ep;
+        for (;;) {
+          const cands = (adj.get(key(cur)) || []).filter(a => !used[a.seg]);
+          if (!cands.length) break;
+          const nx = cands[0];
+          used[nx.seg] = true;
+          cur = nx.other;
+          line.push(cur);
+          if (key(cur) === key(sp)) break;          // closed loop
+        }
+        return line;
+      };
+      for (let i = 0; i < segs.length; i++) {
+        if (used[i]) continue;
+        lines.push(startFrom(i, segs[i][0], segs[i][1]));
+      }
+      return lines.map(l => chaikin(l, 2));
+    }
+    // Chaikin corner-cutting; keeps closed loops closed.
+    function chaikin(pts, iters) {
+      let p = pts;
+      for (let it = 0; it < iters; it++) {
+        if (p.length < 3) break;
+        const closed = p[0][0] === p[p.length - 1][0] && p[0][1] === p[p.length - 1][1];
+        const out = [];
+        if (!closed) out.push(p[0]);
+        const N = closed ? p.length - 1 : p.length;
+        for (let i = 0; i < (closed ? N : N - 1); i++) {
+          const a = p[i % N], b = p[(i + 1) % N];
+          out.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25]);
+          out.push([a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+        }
+        if (closed) out.push(out[0]); else out.push(p[p.length - 1]);
+        p = out;
+      }
+      return p;
+    }
     const ratingColor = r => cmap((r - 3) / 2);
     const avgColor = a => cmap(Math.max(-1, Math.min(1, a - 4)));
     const fmtN = n => n.toLocaleString('en-US');
@@ -986,6 +1063,11 @@
             <Slider label="Risk" min={-1} max={1} step={0.01} value={risk} onChange={setRisk}
               leftLabel="Safe bets" rightLabel="Moonshots" readout={riskReadout} />
           </div>
+          <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 4px' }}>
+            {comp.nRated > 0
+              ? <><strong style={{ color: C.label }}>Match</strong> ranks by what readers of your books also read — regardless of how <em>you</em> rated them. <strong style={{ color: C.label }}>Rating</strong> ranks by the stars you'd probably give.</>
+              : <><strong style={{ color: C.label }}>Popular</strong> ranks by overall popularity. <strong style={{ color: C.label }}>Rating</strong> ranks by predicted stars. Rate a few books to unlock a personalized Match.</>}
+          </p>
           <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 12px' }}>
             Risk tilts the predicted rating by up to one uncertainty band (Safe = lower bound, Moonshots = upper). It only moves the ranking as far as the dial leans toward Rating.
           </p>
@@ -1230,6 +1312,196 @@
           <p style={{ fontSize: 11.5, color: C.foot, marginTop: 6 }}>
             2-D projection (UMAP, cosine) of the taste space: similar books sit together, but distances are not metric.
             Outlined markers are your rated books, colored by your rating. Filters from the Recommendations tab dim non-matching books.
+          </p>
+        </div>
+      );
+    }
+
+    /* ── Top-pick map tab ──────────────────────────────────────────────── */
+    // Rasterize the (blend, risk) plane the Recommendations dials span and paint each
+    // cell by the book that ranks #1 there — an approximate Voronoi/decision-region map.
+    function TopPickTab({ model, comp, filtered, blend, risk, setBlend, setRisk, nerd }) {
+      const [tip, setTip] = useState(null);
+      const [res, setRes] = useState(192);   // fine render resolution (contour smoothness)
+      const CAND = 80;   // coarse grid used only to collect the set of possible winners
+      const W = 760, H = 560, L = 30, R = 150, T = 24, B = 40;
+      const plotW = W - L - R, plotH = H - T - B;
+      const cy0 = T + plotH / 2;             // risk = 0 sits at mid-height (the fan's axis)
+      const zc = 1.6449 * model.prep.meta.c90;
+      const matchLabel = comp.nRated > 0 ? 'Match' : 'Popular';
+
+      // The field replicates RecsTab's scoring rule EXACTLY so a clicked cell's winner
+      // equals the Recommendations #1. mp (match percentile) is constant over the whole
+      // plane; rp (rating percentile) depends only on risk → one sort per risk row.
+      // Two-stage for a smooth-but-cheap render: a coarse pass collects the (small) set of
+      // books that ever win, then the fine field argmaxes over only that candidate set — so
+      // we can raster at high resolution (smooth contours) without an O(res²·n) blow-up.
+      // We then trace the borders between differing winners as vector contours (marching
+      // squares) instead of painting cells — white lines on the dark surface, no fills.
+      const G = useMemo(() => {
+        const n = filtered.length;
+        if (n === 0) return null;
+        const books = model.prep.books;
+        const matchKey = comp.nRated > 0 ? (j => comp.ease[j]) : (j => books[j].n);
+        const pctMap = keyFn => {
+          const order = filtered.slice().sort((a, b) => keyFn(a) - keyFn(b) || books[a].n - books[b].n);
+          const p = new Float64Array(model.prep.n);
+          order.forEach((j, i) => { p[j] = n > 1 ? i / (n - 1) : 0.5; });
+          return p;
+        };
+        const mp = pctMap(matchKey);
+        const riskAt = (i, N) => N > 1 ? 1 - 2 * i / (N - 1) : 0;   // row 0 (top) = +1 moonshots
+        const blendAt = (i, N) => N > 1 ? i / (N - 1) : 0;          // col 0 (left) = match/popular
+        const winnerIn = (bl, rp, pool) => {                        // argmax over a candidate pool
+          let best = -1, bestScore = -Infinity, bestN = -1;
+          for (let k = 0; k < pool.length; k++) {
+            const j = pool[k], s = (1 - bl) * mp[j] + bl * rp[j], nj = books[j].n;
+            if (s > bestScore || (s === bestScore && nj > bestN)) { bestScore = s; best = j; bestN = nj; }
+          }
+          return best;
+        };
+        // Stage 1 — candidate winners over the full pool on a coarse grid.
+        const cand = new Set();
+        for (let r = 0; r < CAND; r++) {
+          const rp = pctMap(j => M.clip(comp.m[j] + riskAt(r, CAND) * zc * Math.sqrt(comp.va[j]), 1, 5));
+          for (let c = 0; c < CAND; c++) cand.add(winnerIn(blendAt(c, CAND), rp, filtered));
+        }
+        const pool = [...cand];
+        // Stage 2 — fine field over candidates only.
+        const fr = res, field = new Int32Array(fr * fr);
+        for (let r = 0; r < fr; r++) {
+          const rp = pctMap(j => M.clip(comp.m[j] + riskAt(r, fr) * zc * Math.sqrt(comp.va[j]), 1, 5));
+          for (let c = 0; c < fr; c++) field[r * fr + c] = winnerIn(blendAt(c, fr), rp, pool);
+        }
+        // Winners by area (for labels + centroid) and one contour set per winner.
+        const area = new Map(), sumc = new Map(), sumr = new Map();
+        for (let r = 0; r < fr; r++) for (let c = 0; c < fr; c++) {
+          const j = field[r * fr + c];
+          area.set(j, (area.get(j) || 0) + 1);
+          sumc.set(j, (sumc.get(j) || 0) + c);
+          sumr.set(j, (sumr.get(j) || 0) + r);
+        }
+        const winners = [...area.entries()]
+          .map(([j, a]) => ({ j, area: a, cx: sumc.get(j) / a, cy: sumr.get(j) / a }))
+          .sort((p, q) => q.area - p.area);
+        const contours = [];
+        for (const w of winners) for (const line of regionContours(field, fr, w.j)) contours.push(line);
+        return { field, fr, winners, contours, total: fr * fr };
+      }, [filtered, comp, res]);
+
+      // Triangle (fan) layout: at blend = 0 (pure match) risk has no effect, so the whole
+      // left edge collapses to a single apex; the risk range fans open as blend → 1, where
+      // its influence is full. x = blend; the shown half-height of the risk axis scales ∝ blend.
+      const TX = b => L + b * plotW;
+      const TY = (b, r) => cy0 - r * b * (plotH / 2);
+      const g2b = gx => gx / (G.fr - 1);
+      const g2r = gy => 1 - 2 * gy / (G.fr - 1);
+      const pathD = line => line.map((p, i) => {
+        const b = g2b(p[0]);
+        return (i ? 'L' : 'M') + TX(b).toFixed(1) + ' ' + TY(b, g2r(p[1])).toFixed(1);
+      }).join(' ');
+      const triPath = `M ${TX(0)} ${cy0} L ${TX(1)} ${TY(1, 1)} L ${TX(1)} ${TY(1, -1)} Z`;
+
+      const locate = e => {
+        if (!G) return null;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const fx = (e.clientX - rect.left) / rect.width * W;
+        const fy = (e.clientY - rect.top) / rect.height * H;
+        const bl = (fx - L) / plotW;
+        if (bl < 0 || bl > 1) return null;
+        const halfH = bl * plotH / 2;
+        const rk = halfH < 1e-6 ? 0 : (cy0 - fy) / halfH;
+        if (rk < -1 || rk > 1) return null;                 // outside the triangle
+        const c = Math.max(0, Math.min(G.fr - 1, Math.round(bl * (G.fr - 1))));
+        const r = Math.max(0, Math.min(G.fr - 1, Math.round((1 - rk) / 2 * (G.fr - 1))));
+        return { j: G.field[r * G.fr + c], bl, rk, px: fx / W * 100, py: fy / H * 100 };
+      };
+      const onMove = e => setTip(locate(e));
+      const onClick = e => { const h = locate(e); if (h) { setBlend(h.bl); setRisk(h.rk); } };
+
+      const labels = G ? G.winners.filter(w => w.area / G.total > 0.05).slice(0, 5) : [];
+      const trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
+      const xticks = [0, 0.25, 0.5, 0.75, 1], yticks = [1, 0.5, 0, -0.5, -1];
+
+      return (
+        <div>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '10px 0', maxWidth: '78ch' }}>
+            The two Recommendations dials span a space; each white region is the set of dial settings for
+            which one book sits at <strong>rank #1</strong>. It's a triangle: at the left apex (pure {matchLabel},
+            blend 0) risk has no effect, so it collapses to a point; the Risk axis fans open toward the right
+            (blend 1 = Rating), where risk carries full weight. Click anywhere to send those settings to the
+            Recommendations tab.
+          </p>
+          {comp.nRated === 0 &&
+            <p style={{ fontSize: 13, color: C.gold, margin: '10px 0' }}>
+              Cold start: nothing rated yet, so the map is unpersonalized (popularity vs. population rating).
+              Rate a few books on the Rate tab and it becomes yours.
+            </p>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0 8px' }}>
+            <span style={{ color: C.label, fontSize: 13 }}>Resolution:</span>
+            <Seg options={[{ id: '128', label: 'Coarse' }, { id: '192', label: 'Medium' }, { id: '288', label: 'Fine' }]}
+              value={String(res)} onChange={v => setRes(+v)} />
+          </div>
+          {!G &&
+            <p style={{ fontSize: 13, color: C.foot }}>No books match the current filters.</p>}
+          {G &&
+          <div className="rec-svgwrap">
+            <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)} onClick={onClick}
+              style={{ position: 'relative', cursor: 'pointer' }}>
+              {/* Dark plotting triangle — outline in the same white as the inner contours. */}
+              <path d={triPath} fill="#0b1220" stroke="#e2e8f0" strokeWidth={1.1} strokeOpacity={0.82}
+                strokeLinejoin="round" />
+              {/* Blend (x) axis along the bottom. */}
+              {xticks.map((v, i) => (
+                <g key={'x' + i}>
+                  <line x1={TX(v)} y1={T + plotH} x2={TX(v)} y2={T + plotH + 5} stroke={C.axis} strokeWidth={1} />
+                  <text x={TX(v)} y={T + plotH + 17} textAnchor="middle" fontSize={10.5} fill={C.axis}>{v}</text>
+                </g>
+              ))}
+              <text x={L + plotW / 2} y={H - 3} textAnchor="middle" fontSize={11.5} fill={C.axis}>
+                Weighting ({matchLabel} → Rating)
+              </text>
+              {/* Risk (y) axis up the right (fully-open) edge. */}
+              {yticks.map((v, i) => (
+                <g key={'y' + i}>
+                  <line x1={TX(1)} y1={TY(1, v)} x2={TX(1) + 5} y2={TY(1, v)} stroke={C.axis} strokeWidth={1} />
+                  <text x={TX(1) + 9} y={TY(1, v)} textAnchor="start" dominantBaseline="middle" fontSize={10.5} fill={C.axis}>
+                    {v > 0 ? '+' + v : v}
+                  </text>
+                </g>
+              ))}
+              <text x={TX(1) + 40} y={TY(1, 0)} textAnchor="middle" fontSize={11.5} fill={C.axis}
+                transform={`rotate(-90 ${TX(1) + 40} ${TY(1, 0)})`}>Risk (safe −1 · moonshot +1)</text>
+              {/* Decision-region contours: white borders between differing rank-#1 winners. */}
+              {G.contours.map((line, i) => (
+                <path key={'ct' + i} d={pathD(line)} fill="none" stroke="#e2e8f0" strokeWidth={1.1}
+                  opacity={0.82} strokeLinejoin="round" strokeLinecap="round" style={{ pointerEvents: 'none' }} />
+              ))}
+              {/* On-map labels for the largest regions; the tooltip covers the small ones. */}
+              {labels.map(w => (
+                <text key={w.j} x={TX(g2b(w.cx))} y={TY(g2b(w.cx), g2r(w.cy))} textAnchor="middle"
+                  dominantBaseline="middle" fontSize={11} fill="#f1f5f9"
+                  stroke="#0b1220" strokeWidth={2.6} style={{ paintOrder: 'stroke', fontWeight: 600, pointerEvents: 'none' }}>
+                  {trunc(M.cleanTitle(model.prep.books[w.j].t), 22)}
+                </text>
+              ))}
+              {/* Current-dial marker. */}
+              <circle cx={TX(blend)} cy={TY(blend, risk)} r={6} fill="none" stroke="#f1f5f9" strokeWidth={2} />
+              <circle cx={TX(blend)} cy={TY(blend, risk)} r={1.6} fill="#f1f5f9" />
+            </svg>
+            {tip && (
+              <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
+                <strong>{M.cleanTitle(model.prep.books[tip.j].t)}</strong><br />
+                {M.cleanAuthor(model.prep.books[tip.j].a)}<br />
+                {Math.round(tip.bl * 100)}% rating · risk {tip.rk >= 0 ? '+' : ''}{tip.rk.toFixed(2)}
+                {nerd && <span><br />{M.clip(comp.m[tip.j], 1, 5).toFixed(2)}★ ±{Math.min(zc * Math.sqrt(comp.va[tip.j]), 2).toFixed(2)} · {POP(model.prep.books[tip.j].n)}</span>}
+              </div>
+            )}
+          </div>}
+          <p style={{ fontSize: 11.5, color: C.foot, marginTop: 6, maxWidth: '78ch' }}>
+            Each region is the set of dial settings for which one book wins rank #1; white contours are the
+            borders where the winner changes. Largest regions are labelled; hover any region (including small
+            ones) for its book. The white ring marks your current dials.
           </p>
         </div>
       );
@@ -1606,6 +1878,7 @@
       const TABS = [
         { id: 'rate', label: `Rate${ratings.size ? ` (${ratings.size})` : ''}` },
         { id: 'recs', label: 'Recommendations' },
+        { id: 'toppick', label: 'Top-pick map' },
         { id: 'scatter', label: 'Scatter' },
         { id: 'map', label: 'Taste map' },
         { id: 'model', label: 'Model' }
@@ -1622,7 +1895,7 @@
             <Seg options={TABS} value={tab} onChange={setTab} />
           </div>
 
-          {(tab === 'recs' || tab === 'scatter' || tab === 'map') &&
+          {(tab === 'recs' || tab === 'toppick' || tab === 'scatter' || tab === 'map') &&
             <Filters model={model} selTags={selTags} setSelTags={setSelTags}
               yearLo={year[0]} yearHi={year[1]} setYear={(lo, hi) => setYearState([lo, hi])}
               hiddenNoYear={filterData.hiddenNoYear} />}
@@ -1634,6 +1907,9 @@
           {tab === 'recs' &&
             <RecsTab model={model} comp={comp} filtered={filterData.filtered} nerd={nerd}
               blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk} />}
+          {tab === 'toppick' &&
+            <TopPickTab model={model} comp={comp} filtered={filterData.filtered}
+              blend={blend} risk={risk} setBlend={setBlend} setRisk={setRisk} nerd={nerd} />}
           {tab === 'scatter' &&
             <ScatterTab model={model} comp={comp} filtered={filterData.filtered} matchPct={matchPct} nerd={nerd} />}
           {tab === 'map' &&
