@@ -1,0 +1,2683 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>E-Book Converter - Alexander Alber</title>
+  <meta name="description" content="Convert EPUB, MOBI, AZW3 and TXT e-books in your browser. Nothing is uploaded: the file never leaves your device.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/ebook-converter.html">
+  <meta property="og:title" content="E-Book Converter - fully offline, in your browser">
+  <meta property="og:description" content="Convert EPUB, MOBI, AZW3 and TXT e-books in your browser. Nothing is uploaded: the file never leaves your device.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/ebook-converter.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Multi-button segmented control (same pattern as the input-shaper tool). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active):not(:disabled),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+    .seg-row .lang-seg:disabled { opacity: .38; cursor: not-allowed; }
+
+    .ec-card { border: 1px solid #334155; border-radius: 8px; padding: 14px;
+      background: rgba(15,23,42,.55); }
+    .ec-drop { border: 1.5px dashed #334155; border-radius: 10px; padding: 34px 18px;
+      text-align: center; background: rgba(15,23,42,.35); cursor: pointer;
+      transition: border-color .15s, background .15s; }
+    .ec-drop:hover, .ec-drop.over { border-color: #0fb5ad; background: rgba(15,181,173,.07); }
+    .ec-drop.over { border-style: solid; }
+    .ec-log { font-family: var(--pico-font-family-monospace, monospace); font-size: 12px;
+      line-height: 1.75; color: #94a3b8; margin: 0; padding: 0; list-style: none; }
+    .ec-log li::before { content: "› "; color: #475569; }
+    .ec-log li.warn { color: #d97706; }
+    .ec-log li.warn::before { content: "! "; color: #d97706; }
+    .ec-err { border: 1px solid #7f1d1d; background: rgba(127,29,29,.15); border-radius: 8px;
+      padding: 12px 14px; color: #fca5a5; font-size: 14px; }
+    .ec-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13.5px; }
+    .ec-kv dt { color: #64748b; }
+    .ec-kv dd { color: #cbd5e1; margin: 0; }
+    .ec-field label { color: #94a3b8; font-size: 13px; margin-bottom: 4px; display: block; }
+    .ec-field input { margin-bottom: 10px; }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "E-Book Converter",
+    "description": "Convert e-books between EPUB, MOBI, AZW3 and plain text. All parsing and writing happens client-side in the browser; no file is ever uploaded.",
+    "url": "https://alber.me/miscellaneous/tools/ebook-converter.html",
+    "applicationCategory": "UtilityApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">← Miscellaneous</a>
+    </p>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">E-Book Converter</h1>
+        <p style="color:#94a3b8;max-width:70ch">Convert EPUB, MOBI, AZW3 and plain text. Everything runs in your browser: the file is never uploaded.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ──────────────────────────────────────────────────────────────────────────
+       Format core: plain JS (no JSX) so it can be unit-tested in Node.
+       All async/await lives here on purpose. The babel block below is run
+       through preset-env, which would compile async functions down to
+       regeneratorRuntime, and that runtime is not loaded anywhere.
+       So: Promises in the UI, await only in here.
+
+       Written from the public format descriptions (MobileRead wiki). No code
+       from Calibre or KindleUnpack (both GPLv3) was copied or translated.
+       ────────────────────────────────────────────────────────────────────── -->
+  <script id="ebookcore">
+  window.EbookCore = (function () {
+    'use strict';
+
+    // ══ byte helpers ═════════════════════════════════════════════════════════
+
+    function concatBytes(chunks) {
+      let n = 0;
+      for (const c of chunks) n += c.length;
+      const out = new Uint8Array(n);
+      let o = 0;
+      for (const c of chunks) { out.set(c, o); o += c.length; }
+      return out;
+    }
+
+    const UTF8 = { enc: new TextEncoder(), };
+    function encodeUtf8(s) { return UTF8.enc.encode(s); }
+    function decodeUtf8(b) { return new TextDecoder('utf-8').decode(b); }
+
+    // Decode a text file whose encoding we do not know. Strict UTF-8 first;
+    // if that throws, the file is almost certainly a legacy single-byte one.
+    function decodeText(bytes) {
+      if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+        return { text: decodeUtf8(bytes.subarray(3)), encoding: 'utf-8 (BOM)' };
+      }
+      if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+        return { text: new TextDecoder('utf-16le').decode(bytes.subarray(2)), encoding: 'utf-16le' };
+      }
+      if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+        return { text: new TextDecoder('utf-16be').decode(bytes.subarray(2)), encoding: 'utf-16be' };
+      }
+      try {
+        return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), encoding: 'utf-8' };
+      } catch (e) {
+        return { text: new TextDecoder('windows-1252').decode(bytes), encoding: 'windows-1252' };
+      }
+    }
+
+    // A byte-per-character string, so that string indices equal byte offsets.
+    // TextDecoder cannot do this: in the Encoding Standard both "latin1" and
+    // "iso-8859-1" are aliases for windows-1252, which remaps 0x80..0x9F to
+    // other code points and would corrupt those bytes on the way back.
+    function bytesToBinaryString(bytes) {
+      const CHUNK = 0x8000;
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+      }
+      return parts.join('');
+    }
+    function binaryStringToBytes(s) {
+      const out = new Uint8Array(s.length);
+      for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xFF;
+      return out;
+    }
+
+    function sniffImageMime(b) {
+      if (b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+      if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+      if (b.length > 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif';
+      if (b.length > 2 && b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
+      if (b.length > 12 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+      return null;
+    }
+
+    const MIME_BY_EXT = {
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+      bmp: 'image/bmp', webp: 'image/webp', svg: 'image/svg+xml',
+      css: 'text/css', ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2',
+      xhtml: 'application/xhtml+xml', html: 'application/xhtml+xml', htm: 'application/xhtml+xml',
+      ncx: 'application/x-dtbncx+xml', opf: 'application/oebps-package+xml',
+    };
+    const EXT_BY_MIME = {
+      'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/bmp': 'bmp',
+      'image/webp': 'webp', 'image/svg+xml': 'svg', 'text/css': 'css',
+      'font/ttf': 'ttf', 'font/otf': 'otf', 'font/woff': 'woff', 'font/woff2': 'woff2',
+      'application/font-woff': 'woff', 'application/vnd.ms-opentype': 'otf',
+    };
+    function extOf(path) {
+      const m = /\.([A-Za-z0-9]+)$/.exec(path);
+      return m ? m[1].toLowerCase() : '';
+    }
+    function mimeForPath(path) { return MIME_BY_EXT[extOf(path)] || 'application/octet-stream'; }
+
+    // ══ CRC32 + deflate ══════════════════════════════════════════════════════
+
+    const CRC_TABLE = (function () {
+      const t = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c >>> 0;
+      }
+      return t;
+    })();
+
+    function crc32(buf) {
+      let c = 0xFFFFFFFF;
+      for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    // Push bytes through a (De)CompressionStream. The write side must not be
+    // awaited before the read loop starts, or backpressure deadlocks on inputs
+    // bigger than the internal queue.
+    async function pumpStream(stream, bytes) {
+      const writer = stream.writable.getWriter();
+      const written = (async () => { await writer.write(bytes); await writer.close(); })();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) break;
+        chunks.push(r.value);
+      }
+      await written;
+      return concatBytes(chunks);
+    }
+
+    function deflateRaw(bytes) { return pumpStream(new CompressionStream('deflate-raw'), bytes); }
+    function inflateRaw(bytes) { return pumpStream(new DecompressionStream('deflate-raw'), bytes); }
+
+    // ══ ZIP ══════════════════════════════════════════════════════════════════
+
+    const SIG_EOCD = 0x06054b50;
+    const SIG_EOCD64_LOC = 0x07064b50;
+    const SIG_EOCD64 = 0x06064b50;
+    const SIG_CD = 0x02014b50;
+    const SIG_LOCAL = 0x04034b50;
+
+    // Read a ZIP into { path -> Uint8Array }.
+    async function zipRead(bytes) {
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      let eocd = -1;
+      const scanFrom = Math.max(0, bytes.length - 65557 - 22);
+      for (let i = bytes.length - 22; i >= scanFrom; i--) {
+        if (dv.getUint32(i, true) === SIG_EOCD) { eocd = i; break; }
+      }
+      if (eocd < 0) throw new Error('Not a ZIP archive (no end-of-central-directory record).');
+
+      let count = dv.getUint16(eocd + 10, true);
+      let cdOffset = dv.getUint32(eocd + 16, true);
+
+      // ZIP64: the 32-bit fields are saturated and the real values live in the
+      // ZIP64 EOCD record, which the locator right before the EOCD points at.
+      if (cdOffset === 0xFFFFFFFF || count === 0xFFFF) {
+        const loc = eocd - 20;
+        if (loc >= 0 && dv.getUint32(loc, true) === SIG_EOCD64_LOC) {
+          const z64 = Number(dv.getBigUint64(loc + 8, true));
+          if (dv.getUint32(z64, true) !== SIG_EOCD64) throw new Error('Damaged ZIP64 record.');
+          count = Number(dv.getBigUint64(z64 + 32, true));
+          cdOffset = Number(dv.getBigUint64(z64 + 48, true));
+        }
+      }
+
+      const files = new Map();
+      let p = cdOffset;
+      for (let i = 0; i < count; i++) {
+        if (dv.getUint32(p, true) !== SIG_CD) throw new Error('Damaged ZIP central directory.');
+        const flags = dv.getUint16(p + 8, true);
+        const method = dv.getUint16(p + 10, true);
+        let compSize = dv.getUint32(p + 20, true);
+        let uncompSize = dv.getUint32(p + 24, true);
+        const nameLen = dv.getUint16(p + 28, true);
+        const extraLen = dv.getUint16(p + 30, true);
+        const commentLen = dv.getUint16(p + 32, true);
+        let localOff = dv.getUint32(p + 42, true);
+        const name = decodeUtf8(bytes.subarray(p + 46, p + 46 + nameLen));
+
+        if (compSize === 0xFFFFFFFF || uncompSize === 0xFFFFFFFF || localOff === 0xFFFFFFFF) {
+          const ex = p + 46 + nameLen;
+          let q = ex;
+          while (q < ex + extraLen - 3) {
+            const id = dv.getUint16(q, true);
+            const size = dv.getUint16(q + 2, true);
+            if (id === 0x0001) {
+              let r = q + 4;
+              if (uncompSize === 0xFFFFFFFF) { uncompSize = Number(dv.getBigUint64(r, true)); r += 8; }
+              if (compSize === 0xFFFFFFFF) { compSize = Number(dv.getBigUint64(r, true)); r += 8; }
+              if (localOff === 0xFFFFFFFF) { localOff = Number(dv.getBigUint64(r, true)); r += 8; }
+              break;
+            }
+            q += 4 + size;
+          }
+        }
+        p += 46 + nameLen + extraLen + commentLen;
+
+        if (name.endsWith('/')) continue; // directory entry
+        if (flags & 0x0001) throw new Error('This file is encrypted and cannot be converted.');
+
+        // The local header repeats the name and may carry a different extra
+        // field length, so the data offset must be read from the local header.
+        if (dv.getUint32(localOff, true) !== SIG_LOCAL) throw new Error('Damaged ZIP local header for ' + name);
+        const lNameLen = dv.getUint16(localOff + 26, true);
+        const lExtraLen = dv.getUint16(localOff + 28, true);
+        const dataOff = localOff + 30 + lNameLen + lExtraLen;
+        const raw = bytes.subarray(dataOff, dataOff + compSize);
+
+        if (method === 0) files.set(name, raw.slice());
+        else if (method === 8) files.set(name, await inflateRaw(raw));
+        else throw new Error('Unsupported ZIP compression method ' + method + ' in ' + name);
+      }
+      return files;
+    }
+
+    function dosTime(d) {
+      const time = ((d.getHours() & 31) << 11) | ((d.getMinutes() & 63) << 5) | ((d.getSeconds() / 2) & 31);
+      const date = (((d.getFullYear() - 1980) & 127) << 9) | (((d.getMonth() + 1) & 15) << 5) | (d.getDate() & 31);
+      return { time, date };
+    }
+
+    // entries: [{ name, bytes, store? }]. The first entry is written exactly as
+    // given; for EPUB that must be an uncompressed "mimetype" with no extra field.
+    async function zipWrite(entries, when) {
+      const { time, date } = dosTime(when || new Date());
+      const locals = [];
+      const central = [];
+      let offset = 0;
+
+      for (const e of entries) {
+        const nameBytes = encodeUtf8(e.name);
+        const crc = crc32(e.bytes);
+        let method = 0;
+        let payload = e.bytes;
+        if (!e.store && e.bytes.length > 0) {
+          const def = await deflateRaw(e.bytes);
+          if (def.length < e.bytes.length) { method = 8; payload = def; }
+        }
+        const flags = e.store ? 0 : 0x0800; // 0x0800 = names are UTF-8
+
+        const lh = new Uint8Array(30 + nameBytes.length);
+        const ldv = new DataView(lh.buffer);
+        ldv.setUint32(0, SIG_LOCAL, true);
+        ldv.setUint16(4, 20, true);
+        ldv.setUint16(6, flags, true);
+        ldv.setUint16(8, method, true);
+        ldv.setUint16(10, time, true);
+        ldv.setUint16(12, date, true);
+        ldv.setUint32(14, crc, true);
+        ldv.setUint32(18, payload.length, true);
+        ldv.setUint32(22, e.bytes.length, true);
+        ldv.setUint16(26, nameBytes.length, true);
+        ldv.setUint16(28, 0, true);
+        lh.set(nameBytes, 30);
+        locals.push(lh, payload);
+
+        const ch = new Uint8Array(46 + nameBytes.length);
+        const cdv = new DataView(ch.buffer);
+        cdv.setUint32(0, SIG_CD, true);
+        cdv.setUint16(4, 20, true);
+        cdv.setUint16(6, 20, true);
+        cdv.setUint16(8, flags, true);
+        cdv.setUint16(10, method, true);
+        cdv.setUint16(12, time, true);
+        cdv.setUint16(14, date, true);
+        cdv.setUint32(16, crc, true);
+        cdv.setUint32(20, payload.length, true);
+        cdv.setUint32(24, e.bytes.length, true);
+        cdv.setUint16(28, nameBytes.length, true);
+        cdv.setUint16(30, 0, true);
+        cdv.setUint16(32, 0, true);
+        cdv.setUint16(34, 0, true);
+        cdv.setUint16(36, 0, true);
+        cdv.setUint32(38, 0, true);
+        cdv.setUint32(42, offset, true);
+        ch.set(nameBytes, 46);
+        central.push(ch);
+
+        offset += lh.length + payload.length;
+      }
+
+      const cdBytes = concatBytes(central);
+      const end = new Uint8Array(22);
+      const edv = new DataView(end.buffer);
+      edv.setUint32(0, SIG_EOCD, true);
+      edv.setUint16(8, entries.length, true);
+      edv.setUint16(10, entries.length, true);
+      edv.setUint32(12, cdBytes.length, true);
+      edv.setUint32(16, offset, true);
+      return concatBytes([concatBytes(locals), cdBytes, end]);
+    }
+
+    // ══ minimal XML ══════════════════════════════════════════════════════════
+    // DOMParser is not available in Node, and MOBI markup is too broken for it
+    // anyway. This is a tolerant scanner, enough for OPF / NCX / nav / container.
+
+    const NAMED_ENTITIES = {
+      amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+      mdash: '—', ndash: '–', hellip: '…', middot: '·',
+      lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”',
+      bdquo: '„', sbquo: '‚', laquo: '«', raquo: '»',
+      auml: 'ä', ouml: 'ö', uuml: 'ü', Auml: 'Ä', Ouml: 'Ö',
+      Uuml: 'Ü', szlig: 'ß', eacute: 'é', egrave: 'è',
+      agrave: 'à', ccedil: 'ç', copy: '©', reg: '®',
+      trade: '™', deg: '°', euro: '€', pound: '£', shy: '­',
+    };
+
+    function decodeEntities(s) {
+      if (s.indexOf('&') < 0) return s;
+      return s.replace(/&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/g, function (m, e) {
+        if (e.charAt(0) === '#') {
+          const cp = (e.charAt(1) === 'x' || e.charAt(1) === 'X')
+            ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+          if (!isFinite(cp) || cp <= 0 || cp > 0x10FFFF) return m;
+          try { return String.fromCodePoint(cp); } catch (err) { return m; }
+        }
+        return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, e) ? NAMED_ENTITIES[e] : m;
+      });
+    }
+
+    function escapeXml(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c];
+      });
+    }
+
+    // Attribute values may be double-quoted, single-quoted, unquoted (HTML4) or
+    // absent entirely (<td nowrap>). MOBI markup uses all four.
+    const ATTR_RE = /([A-Za-z_:][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*)))?/g;
+
+    function parseAttrs(s) {
+      const out = {};
+      ATTR_RE.lastIndex = 0;
+      let m;
+      while ((m = ATTR_RE.exec(s))) {
+        if (!m[0]) { ATTR_RE.lastIndex++; continue; }
+        const key = m[1].toLowerCase();
+        const val = m[2] !== undefined ? m[2]
+          : m[3] !== undefined ? m[3]
+            : m[4] !== undefined && m[4] !== '' ? m[4]
+              : key; // valueless attribute: XHTML wants name="name"
+        out[key] = decodeEntities(val);
+      }
+      return out;
+    }
+
+    const VOID_TAGS = { br: 1, img: 1, hr: 1, meta: 1, link: 1, input: 1, area: 1, base: 1, col: 1, embed: 1, source: 1, track: 1, wbr: 1 };
+
+    // An open <p> is ended by any block-level tag, and list/table cells end their
+    // own kind. Without this, unclosed MOBI paragraphs nest inside one another.
+    const ENDS_P = { p: 1, div: 1, h1: 1, h2: 1, h3: 1, h4: 1, h5: 1, h6: 1, blockquote: 1, table: 1, ul: 1, ol: 1, pre: 1, hr: 1, section: 1, article: 1, figure: 1 };
+    const SELF_ENDING = { li: { li: 1 }, td: { td: 1, th: 1 }, th: { td: 1, th: 1 }, tr: { tr: 1, td: 1, th: 1 }, dd: { dd: 1, dt: 1 }, dt: { dd: 1, dt: 1 }, option: { option: 1 } };
+
+    function textNode(v) { return { name: '#text', value: v }; }
+
+    // Tolerant scanner. Text is kept as ordered child nodes so the tree can be
+    // serialized back out as well-formed XML, which is how messy MOBI markup is
+    // turned into the XHTML that EPUB requires.
+    function parseXML(str) {
+      const root = { name: '#root', attrs: {}, children: [] };
+      const stack = [root];
+      const re = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/([A-Za-z_][\w:.-]*)\s*>|<([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]*))?)*)\s*(\/?)>|([^<]+)|(<)/g;
+      let m;
+      while ((m = re.exec(str))) {
+        const top = stack[stack.length - 1];
+        if (m[1] !== undefined) {
+          top.children.push(textNode(m[1]));
+        } else if (m[2] !== undefined) {
+          const close = m[2].toLowerCase();
+          for (let i = stack.length - 1; i > 0; i--) {
+            if (stack[i].name === close) { stack.length = i; break; }
+          }
+        } else if (m[3] !== undefined) {
+          const name = m[3].toLowerCase();
+          const ln = localName(name);
+          // implicit closes
+          for (;;) {
+            const openName = stack.length > 1 ? localName(stack[stack.length - 1].name) : '';
+            if (!openName) break;
+            const selfEnd = SELF_ENDING[ln];
+            if (openName === 'p' && ENDS_P[ln]) { stack.pop(); continue; }
+            if (selfEnd && selfEnd[openName]) { stack.pop(); continue; }
+            break;
+          }
+          const node = { name: name, attrs: parseAttrs(m[4] || ''), children: [] };
+          stack[stack.length - 1].children.push(node);
+          if (!m[5] && !VOID_TAGS[ln]) stack.push(node);
+        } else if (m[6] !== undefined) {
+          top.children.push(textNode(decodeEntities(m[6])));
+        } else if (m[7] !== undefined) {
+          top.children.push(textNode('<')); // a stray "<" that starts no tag
+        }
+      }
+      return root;
+    }
+
+    function escapeText(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function escapeAttr(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    }
+
+    // Serialize back to well-formed XML. Entities were decoded during parsing and
+    // are re-escaped here, so an undefined entity like &foo; comes back out as
+    // literal text rather than breaking the XHTML.
+    function serializeXml(node, out) {
+      out = out || [];
+      if (node.name === '#text') { out.push(escapeText(node.value)); return out; }
+      const isRoot = node.name === '#root';
+      if (!isRoot) {
+        out.push('<', node.name);
+        for (const k of Object.keys(node.attrs)) out.push(' ', k, '="', escapeAttr(node.attrs[k]), '"');
+        if (VOID_TAGS[localName(node.name)]) { out.push('/>'); return out; }
+        out.push('>');
+      }
+      for (const c of node.children) serializeXml(c, out);
+      if (!isRoot) out.push('</', node.name, '>');
+      return out;
+    }
+    function toXml(node) { return serializeXml(node, []).join(''); }
+
+    function localName(n) {
+      const i = n.indexOf(':');
+      return i < 0 ? n : n.slice(i + 1);
+    }
+    function isElement(n) { return n.name !== '#text'; }
+    function findAll(node, name, out) {
+      out = out || [];
+      for (const c of node.children) {
+        if (!isElement(c)) continue;
+        if (localName(c.name) === name) out.push(c);
+        findAll(c, name, out);
+      }
+      return out;
+    }
+    function findOne(node, name) {
+      const all = findAll(node, name);
+      return all.length ? all[0] : null;
+    }
+    function walkElements(node, fn) {
+      for (const c of node.children) {
+        if (!isElement(c)) continue;
+        fn(c);
+        walkElements(c, fn);
+      }
+    }
+    function kids(node, name) {
+      return node.children.filter(function (c) { return isElement(c) && localName(c.name) === name; });
+    }
+    function textOf(node) {
+      if (!node) return '';
+      return rawTextOf(node).replace(/\s+/g, ' ').trim();
+    }
+    function rawTextOf(node) {
+      if (node.name === '#text') return node.value;
+      let s = '';
+      for (const c of node.children) s += rawTextOf(c);
+      return s;
+    }
+
+    // ══ path helpers ═════════════════════════════════════════════════════════
+
+    function dirOf(path) {
+      const i = path.lastIndexOf('/');
+      return i < 0 ? '' : path.slice(0, i);
+    }
+    function baseOf(path) {
+      const i = path.lastIndexOf('/');
+      return i < 0 ? path : path.slice(i + 1);
+    }
+    // Resolve a relative href against a directory, collapsing . and ..
+    function resolvePath(baseDir, rel) {
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rel)) return null; // http:, data:, mailto:
+      let parts = (rel.charAt(0) === '/')
+        ? rel.slice(1).split('/')
+        : (baseDir ? baseDir.split('/') : []).concat(rel.split('/'));
+      const out = [];
+      for (const p of parts) {
+        if (p === '' || p === '.') continue;
+        if (p === '..') out.pop();
+        else out.push(p);
+      }
+      return out.join('/');
+    }
+    function splitFrag(href) {
+      const i = href.indexOf('#');
+      return i < 0 ? { path: href, frag: '' } : { path: href.slice(0, i), frag: href.slice(i) };
+    }
+    function sanitizeName(name) {
+      return name.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'file';
+    }
+
+    // ══ the intermediate representation ══════════════════════════════════════
+    //
+    //   Book = {
+    //     meta:      { title, author, language, publisher, date, identifier, coverRes },
+    //     sections:  [ { id, title, html, css: [resName] } ],   // in reading order
+    //     resources: Map<resName, { mime, bytes }>,             // flat, no directories
+    //     toc:       [ { title, href, level } ]                 // href = "text/<id>.xhtml#frag"
+    //   }
+    //
+    // Every reader produces this, every writer consumes it. Section markup refers
+    // to resources as "../res/<resName>" and to other sections as "<id>.xhtml",
+    // because sections are written to text/ and resources to res/.
+
+    function emptyBook() {
+      return {
+        meta: { title: '', author: '', language: 'en', publisher: '', date: '', identifier: '', coverRes: '' },
+        sections: [],
+        resources: new Map(),
+        toc: [],
+      };
+    }
+
+    // Allocate a unique flat resource name.
+    function addResource(book, preferredName, mime, bytes) {
+      let base = sanitizeName(baseOf(preferredName));
+      const wantExt = EXT_BY_MIME[mime];
+      if (wantExt && extOf(base) !== wantExt) base = base.replace(/\.[A-Za-z0-9]+$/, '') + '.' + wantExt;
+      let name = base;
+      let i = 2;
+      while (book.resources.has(name)) {
+        name = base.replace(/(\.[A-Za-z0-9]+)?$/, function (ext) { return '-' + i + (ext || ''); });
+        i++;
+      }
+      book.resources.set(name, { mime: mime, bytes: bytes });
+      return name;
+    }
+
+    const RES_ATTR_RE = /\s(src|href|xlink:href|poster)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+
+    // Point every relative link in a section at the flat layout the writers use.
+    // pathMap: original zip path -> "../res/x" or "sec-0002.xhtml"
+    function rewriteLinks(html, baseDir, pathMap) {
+      return html.replace(RES_ATTR_RE, function (m, attr, dq, sq) {
+        const raw = dq !== undefined ? dq : sq;
+        const sf = splitFrag(raw);
+        if (!sf.path) return m; // pure "#anchor", stays valid
+        const abs = resolvePath(baseDir, sf.path);
+        if (abs === null) return m; // absolute URL, leave alone
+        const target = pathMap[abs];
+        if (!target) return m;
+        return ' ' + attr + '="' + escapeXml(target + sf.frag) + '"';
+      });
+    }
+
+    function bodyInner(xhtml) {
+      const m = /<body([^>]*)>([\s\S]*?)<\/body\s*>/i.exec(xhtml);
+      if (m) {
+        // Link targets and styling hooks often sit on the body element itself,
+        // which does not survive into the new file. Keep them on a wrapper, or
+        // those links would point at nothing.
+        const attrs = parseAttrs(m[1]);
+        let keep = '';
+        if (attrs.id) keep += ' id="' + escapeAttr(attrs.id) + '"';
+        if (attrs['class']) keep += ' class="' + escapeAttr(attrs['class']) + '"';
+        return keep ? '<div' + keep + '>' + m[2] + '</div>' : m[2];
+      }
+      // No body tag (some MOBI-derived fragments): strip any head/html wrapper.
+      return xhtml.replace(/<\?xml[\s\S]*?\?>/gi, '')
+        .replace(/<!DOCTYPE[\s\S]*?>/gi, '')
+        .replace(/<\/?html[^>]*>/gi, '')
+        .replace(/<head[\s\S]*?<\/head\s*>/gi, '');
+    }
+
+    function titleFromHtml(html) {
+      const h = /<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]\s*>/i.exec(html);
+      if (h) {
+        const t = decodeEntities(h[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+        if (t) return t.slice(0, 120);
+      }
+      return '';
+    }
+
+    // ══ EPUB reader ══════════════════════════════════════════════════════════
+
+    async function readEpub(bytes, log) {
+      const files = await zipRead(bytes);
+
+      const containerRaw = files.get('META-INF/container.xml');
+      if (!containerRaw) throw new Error('This ZIP file is not an EPUB (META-INF/container.xml is missing).');
+      if (files.has('META-INF/encryption.xml')) {
+        throw new Error('This EPUB is encrypted and cannot be converted.');
+      }
+      const rootfile = findOne(parseXML(decodeUtf8(containerRaw)), 'rootfile');
+      const opfPath = rootfile && rootfile.attrs['full-path'];
+      if (!opfPath || !files.has(opfPath)) throw new Error('EPUB is damaged: the OPF package file is missing.');
+
+      const opfDir = dirOf(opfPath);
+      const opf = parseXML(decodeUtf8(files.get(opfPath)));
+      const book = emptyBook();
+
+      const metaNode = findOne(opf, 'metadata');
+      if (metaNode) {
+        const first = function (n) { const e = findOne(metaNode, n); return e ? textOf(e) : ''; };
+        book.meta.title = first('title');
+        book.meta.author = first('creator');
+        book.meta.language = first('language') || 'en';
+        book.meta.publisher = first('publisher');
+        book.meta.date = first('date');
+        book.meta.identifier = first('identifier');
+      }
+
+      // manifest: id -> { path, mime, properties }
+      const manifest = {};
+      const manifestNode = findOne(opf, 'manifest');
+      for (const item of (manifestNode ? kids(manifestNode, 'item') : [])) {
+        const href = item.attrs.href;
+        if (!href) continue;
+        const abs = resolvePath(opfDir, href);
+        if (abs === null) continue;
+        manifest[item.attrs.id] = {
+          path: abs,
+          mime: item.attrs['media-type'] || mimeForPath(abs),
+          properties: item.attrs.properties || '',
+        };
+      }
+
+      // cover id: EPUB2 <meta name="cover">, EPUB3 properties="cover-image"
+      let coverId = '';
+      for (const m of findAll(opf, 'meta')) {
+        if ((m.attrs.name || '').toLowerCase() === 'cover' && m.attrs.content) coverId = m.attrs.content;
+      }
+      if (!coverId) {
+        for (const id of Object.keys(manifest)) {
+          if (/\bcover-image\b/.test(manifest[id].properties)) { coverId = id; break; }
+        }
+      }
+
+      const spineNode = findOne(opf, 'spine');
+      const spineIds = [];
+      for (const ref of (spineNode ? kids(spineNode, 'itemref') : [])) {
+        if (ref.attrs.idref && manifest[ref.attrs.idref]) spineIds.push(ref.attrs.idref);
+      }
+      if (!spineIds.length) throw new Error('EPUB is damaged: the spine is empty.');
+
+      const spinePaths = new Set(spineIds.map(function (id) { return manifest[id].path; }));
+
+      // Resources are everything in the manifest that is not a spine document
+      // and not a navigation file. Keep an original-path -> flat-name map so the
+      // links inside the sections can be rewritten.
+      const pathMap = {};
+      const NAV_MIME = { 'application/x-dtbncx+xml': 1, 'application/oebps-package+xml': 1 };
+      let imageCount = 0;
+      for (const id of Object.keys(manifest)) {
+        const it = manifest[id];
+        if (spinePaths.has(it.path)) continue;
+        if (NAV_MIME[it.mime]) continue;
+        if (/\bnav\b/.test(it.properties)) continue;
+        const data = files.get(it.path);
+        if (!data) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
+        const flat = addResource(book, it.path, it.mime, data);
+        pathMap[it.path] = '../res/' + flat;
+        if (/^image\//.test(it.mime)) imageCount++;
+        if (id === coverId) book.meta.coverRes = flat;
+      }
+
+      // Section ids first, so cross-links between chapters can be resolved.
+      const secIdByPath = {};
+      spineIds.forEach(function (id, i) {
+        const secId = 'sec-' + String(i + 1).padStart(4, '0');
+        secIdByPath[manifest[id].path] = secId;
+        pathMap[manifest[id].path] = secId + '.xhtml';
+      });
+
+      for (let i = 0; i < spineIds.length; i++) {
+        const it = manifest[spineIds[i]];
+        const raw = files.get(it.path);
+        if (!raw) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
+        const doc = decodeUtf8(raw);
+        const secDir = dirOf(it.path);
+
+        const css = [];
+        const linkRe = /<link\b[^>]*>/gi;
+        let lm;
+        while ((lm = linkRe.exec(doc))) {
+          const a = parseAttrs(lm[0]);
+          if (!a.href || !/stylesheet/i.test(a.rel || '')) continue;
+          const abs = resolvePath(secDir, splitFrag(a.href).path);
+          const flat = abs !== null && pathMap[abs];
+          if (flat) css.push(flat.replace('../res/', ''));
+        }
+
+        const html = rewriteLinks(bodyInner(doc), secDir, pathMap);
+        const titleTag = /<title[^>]*>([\s\S]*?)<\/title\s*>/i.exec(doc);
+        book.sections.push({
+          id: secIdByPath[it.path],
+          title: (titleTag ? decodeEntities(titleTag[1]).trim() : '') || titleFromHtml(html),
+          html: html,
+          css: css,
+        });
+      }
+
+      book.toc = readEpubToc(files, opf, manifest, opfDir, secIdByPath);
+      log.info('EPUB: ' + book.sections.length + ' sections, ' + imageCount + ' images, '
+        + book.toc.length + ' TOC entries');
+      return book;
+    }
+
+    // Prefer the EPUB3 nav document, fall back to the EPUB2 NCX.
+    function readEpubToc(files, opf, manifest, opfDir, secIdByPath) {
+      const toHref = function (basePath, src) {
+        const sf = splitFrag(src);
+        const abs = resolvePath(dirOf(basePath), sf.path);
+        const secId = abs !== null && secIdByPath[abs];
+        return secId ? 'text/' + secId + '.xhtml' + sf.frag : null;
+      };
+
+      let navPath = '';
+      for (const id of Object.keys(manifest)) {
+        if (/\bnav\b/.test(manifest[id].properties)) { navPath = manifest[id].path; break; }
+      }
+      if (navPath && files.has(navPath)) {
+        const doc = parseXML(decodeUtf8(files.get(navPath)));
+        for (const nav of findAll(doc, 'nav')) {
+          const type = nav.attrs['epub:type'] || nav.attrs.type || '';
+          if (type && type.indexOf('toc') < 0) continue;
+          const out = [];
+          const walk = function (ol, level) {
+            for (const li of kids(ol, 'li')) {
+              const a = findOne(li, 'a');
+              if (a && a.attrs.href) {
+                const href = toHref(navPath, a.attrs.href);
+                if (href) out.push({ title: textOf(a) || 'Section', href: href, level: level });
+              }
+              for (const sub of kids(li, 'ol')) walk(sub, level + 1);
+            }
+          };
+          for (const ol of kids(nav, 'ol')) walk(ol, 0);
+          if (out.length) return out;
+        }
+      }
+
+      let ncxPath = '';
+      const spineNode = findOne(opf, 'spine');
+      const tocId = spineNode && spineNode.attrs.toc;
+      if (tocId && manifest[tocId]) ncxPath = manifest[tocId].path;
+      if (!ncxPath) {
+        for (const id of Object.keys(manifest)) {
+          if (manifest[id].mime === 'application/x-dtbncx+xml') { ncxPath = manifest[id].path; break; }
+        }
+      }
+      if (ncxPath && files.has(ncxPath)) {
+        const doc = parseXML(decodeUtf8(files.get(ncxPath)));
+        const map = findOne(doc, 'navMap'.toLowerCase());
+        const out = [];
+        const walk = function (node, level) {
+          for (const np of kids(node, 'navpoint')) {
+            const content = findOne(np, 'content');
+            const label = findOne(np, 'navlabel');
+            const src = content && content.attrs.src;
+            if (src) {
+              const href = toHref(ncxPath, src);
+              if (href) out.push({ title: textOf(label) || 'Section', href: href, level: level });
+            }
+            walk(np, level + 1);
+          }
+        };
+        if (map) walk(map, 0);
+        if (out.length) return out;
+      }
+      return [];
+    }
+
+    // ══ EPUB writer ══════════════════════════════════════════════════════════
+
+    function xhtmlDoc(title, lang, cssNames, body) {
+      const links = cssNames.map(function (c) {
+        return '  <link rel="stylesheet" type="text/css" href="../res/' + escapeXml(c) + '"/>\n';
+      }).join('');
+      return '<?xml version="1.0" encoding="utf-8"?>\n'
+        + '<!DOCTYPE html>\n'
+        + '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="' + escapeXml(lang) + '" lang="' + escapeXml(lang) + '">\n'
+        + '<head>\n  <meta charset="utf-8"/>\n  <title>' + escapeXml(title) + '</title>\n'
+        + links
+        + '</head>\n<body>\n' + body + '\n</body>\n</html>\n';
+    }
+
+    async function writeEpub(book) {
+      const lang = book.meta.language || 'en';
+      const title = book.meta.title || 'Untitled';
+      const uid = book.meta.identifier || ('urn:uuid:' + fakeUuid(title + '|' + book.meta.author));
+      const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+
+      const resList = Array.from(book.resources.keys());
+      const resId = {};
+      resList.forEach(function (name, i) { resId[name] = 'res-' + (i + 1); });
+
+      const manifestItems = [];
+      manifestItems.push('    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>');
+      manifestItems.push('    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>');
+      for (const s of book.sections) {
+        manifestItems.push('    <item id="' + s.id + '" href="text/' + s.id + '.xhtml" media-type="application/xhtml+xml"/>');
+      }
+      for (const name of resList) {
+        const r = book.resources.get(name);
+        const props = (name === book.meta.coverRes) ? ' properties="cover-image"' : '';
+        manifestItems.push('    <item id="' + resId[name] + '" href="res/' + escapeXml(name) + '" media-type="'
+          + escapeXml(r.mime) + '"' + props + '/>');
+      }
+
+      const spineItems = book.sections.map(function (s) {
+        return '    <itemref idref="' + s.id + '"/>';
+      });
+
+      const coverMeta = book.meta.coverRes
+        ? '    <meta name="cover" content="' + resId[book.meta.coverRes] + '"/>\n' : '';
+      const optional = function (tag, val) {
+        return val ? '    <dc:' + tag + '>' + escapeXml(val) + '</dc:' + tag + '>\n' : '';
+      };
+
+      const opf = '<?xml version="1.0" encoding="utf-8"?>\n'
+        + '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">\n'
+        + '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        + '    <dc:identifier id="bookid">' + escapeXml(uid) + '</dc:identifier>\n'
+        + '    <dc:title>' + escapeXml(title) + '</dc:title>\n'
+        + '    <dc:language>' + escapeXml(lang) + '</dc:language>\n'
+        + optional('creator', book.meta.author)
+        + optional('publisher', book.meta.publisher)
+        + optional('date', book.meta.date)
+        + '    <meta property="dcterms:modified">' + now + '</meta>\n'
+        + coverMeta
+        + '  </metadata>\n'
+        + '  <manifest>\n' + manifestItems.join('\n') + '\n  </manifest>\n'
+        + '  <spine toc="ncx">\n' + spineItems.join('\n') + '\n  </spine>\n'
+        + '</package>\n';
+
+      // A TOC is mandatory in EPUB3; fall back to one entry per section.
+      const toc = book.toc.length ? book.toc : book.sections.map(function (s, i) {
+        return { title: s.title || ('Section ' + (i + 1)), href: 'text/' + s.id + '.xhtml', level: 0 };
+      });
+
+      const navItems = toc.map(function (t) {
+        return '      <li><a href="' + escapeXml(t.href) + '">' + escapeXml(t.title) + '</a></li>';
+      }).join('\n');
+      const nav = '<?xml version="1.0" encoding="utf-8"?>\n'
+        + '<!DOCTYPE html>\n'
+        + '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="'
+        + escapeXml(lang) + '" lang="' + escapeXml(lang) + '">\n'
+        + '<head>\n  <meta charset="utf-8"/>\n  <title>' + escapeXml(title) + '</title>\n</head>\n'
+        + '<body>\n  <nav epub:type="toc" id="toc">\n    <h1>Contents</h1>\n    <ol>\n'
+        + navItems + '\n    </ol>\n  </nav>\n</body>\n</html>\n';
+
+      const ncxItems = toc.map(function (t, i) {
+        return '    <navPoint id="np-' + (i + 1) + '" playOrder="' + (i + 1) + '">\n'
+          + '      <navLabel><text>' + escapeXml(t.title) + '</text></navLabel>\n'
+          + '      <content src="' + escapeXml(t.href) + '"/>\n'
+          + '    </navPoint>';
+      }).join('\n');
+      const ncx = '<?xml version="1.0" encoding="utf-8"?>\n'
+        + '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+        + '  <head>\n    <meta name="dtb:uid" content="' + escapeXml(uid) + '"/>\n'
+        + '    <meta name="dtb:depth" content="1"/>\n'
+        + '    <meta name="dtb:totalPageCount" content="0"/>\n'
+        + '    <meta name="dtb:maxPageNumber" content="0"/>\n  </head>\n'
+        + '  <docTitle><text>' + escapeXml(title) + '</text></docTitle>\n'
+        + '  <navMap>\n' + ncxItems + '\n  </navMap>\n</ncx>\n';
+
+      const container = '<?xml version="1.0" encoding="utf-8"?>\n'
+        + '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        + '  <rootfiles>\n'
+        + '    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n'
+        + '  </rootfiles>\n</container>\n';
+
+      // The mimetype entry must come first and be stored uncompressed, or strict
+      // readers reject the archive.
+      const entries = [
+        { name: 'mimetype', bytes: encodeUtf8('application/epub+zip'), store: true },
+        { name: 'META-INF/container.xml', bytes: encodeUtf8(container) },
+        { name: 'OEBPS/content.opf', bytes: encodeUtf8(opf) },
+        { name: 'OEBPS/nav.xhtml', bytes: encodeUtf8(nav) },
+        { name: 'OEBPS/toc.ncx', bytes: encodeUtf8(ncx) },
+      ];
+      for (const s of book.sections) {
+        entries.push({
+          name: 'OEBPS/text/' + s.id + '.xhtml',
+          bytes: encodeUtf8(xhtmlDoc(s.title || title, lang, s.css || [], s.html)),
+        });
+      }
+      for (const name of resList) {
+        entries.push({ name: 'OEBPS/res/' + name, bytes: book.resources.get(name).bytes });
+      }
+      return zipWrite(entries);
+    }
+
+    // Deterministic pseudo-UUID from the title, so re-converting the same book
+    // does not produce a new identifier every time.
+    function fakeUuid(seed) {
+      let h1 = 0x9e3779b9, h2 = 0x85ebca6b;
+      for (let i = 0; i < seed.length; i++) {
+        h1 = Math.imul(h1 ^ seed.charCodeAt(i), 0x01000193) >>> 0;
+        h2 = Math.imul(h2 + seed.charCodeAt(i) + i, 0x85ebca6b) >>> 0;
+      }
+      const hex = function (x) { return ('00000000' + x.toString(16)).slice(-8); };
+      const a = hex(h1), b = hex(h2), c = hex((h1 ^ h2) >>> 0), d = hex(Math.imul(h1, h2) >>> 0);
+      return a + '-' + b.slice(0, 4) + '-4' + b.slice(5, 8) + '-a' + c.slice(1, 4) + '-' + c.slice(4) + d.slice(0, 4);
+    }
+
+    // ══ plain text ═══════════════════════════════════════════════════════════
+
+    const BLOCK_TAGS = 'address|article|aside|blockquote|div|dl|dd|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul';
+
+    function htmlToText(html) {
+      let s = html;
+      s = s.replace(/<(script|style)[\s\S]*?<\/\1\s*>/gi, '');
+      s = s.replace(/<!--[\s\S]*?-->/g, '');
+      s = s.replace(/<br\s*\/?>/gi, '\n');
+      s = s.replace(/<\/(?:h[1-6]|p|div|li|blockquote|tr|pre|section|article)\s*>/gi, '\n\n');
+      s = s.replace(new RegExp('<(?:' + BLOCK_TAGS + ')\\b[^>]*>', 'gi'), '\n');
+      s = s.replace(/<[^>]+>/g, '');
+      s = decodeEntities(s);
+      s = s.replace(/ /g, ' ');
+      s = s.replace(/[ \t]+/g, ' ');
+      s = s.replace(/ *\n */g, '\n');
+      s = s.replace(/\n{3,}/g, '\n\n');
+      return s.trim();
+    }
+
+    function writeTxt(book) {
+      const parts = [];
+      if (book.meta.title) parts.push(book.meta.title);
+      if (book.meta.author) parts.push('by ' + book.meta.author);
+      let head = parts.join('\n');
+      const chunks = head ? [head + '\n\n'] : [];
+      for (const s of book.sections) {
+        const body = htmlToText(s.html);
+        if (!body) continue;
+        chunks.push('\n\n' + body + '\n');
+      }
+      return encodeUtf8(chunks.join('').replace(/\n{3,}/g, '\n\n').trim() + '\n');
+    }
+
+    // A heading is a short standalone line that either says "Chapter N" (in a few
+    // languages) or is a bare/roman numeral. Anything looser starts splitting
+    // ordinary sentences apart.
+    const HEADING_RE = /^(?:(?:chapter|kapitel|part|teil|book|buch|prologue|prolog|epilogue|epilog|section)\b.{0,60}|[IVXLC]{1,7}\.?|\d{1,3}\.?)$/i;
+
+    function readTxt(bytes, log) {
+      const dec = decodeText(bytes);
+      const book = emptyBook();
+      const text = dec.text.replace(/\r\n?/g, '\n');
+
+      const lines = text.split('\n');
+      const marks = [];
+      for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (!t || t.length > 70 || !HEADING_RE.test(t)) continue;
+        const blankBefore = i === 0 || lines[i - 1].trim() === '';
+        const blankAfter = i === lines.length - 1 || lines[i + 1].trim() === '';
+        if (blankBefore && blankAfter) marks.push({ line: i, title: t });
+      }
+
+      const cuts = [];
+      if (marks.length >= 2) {
+        if (marks[0].line > 0) cuts.push({ line: 0, title: '' });
+        for (const m of marks) cuts.push(m);
+      } else {
+        cuts.push({ line: 0, title: '' });
+      }
+
+      for (let c = 0; c < cuts.length; c++) {
+        const from = cuts[c].line;
+        const to = (c + 1 < cuts.length) ? cuts[c + 1].line : lines.length;
+        const chunk = lines.slice(from, to).join('\n').trim();
+        if (!chunk) continue;
+        const id = 'sec-' + String(book.sections.length + 1).padStart(4, '0');
+        const title = cuts[c].title || ('Section ' + (book.sections.length + 1));
+        const paras = chunk.split(/\n\s*\n/).map(function (p) { return p.trim(); }).filter(Boolean);
+        // The heading line, if we found one, becomes an <h2> instead of a paragraph.
+        let html = '';
+        let startAt = 0;
+        if (cuts[c].title && paras.length && paras[0].split('\n')[0].trim() === cuts[c].title) {
+          const first = paras[0].split('\n').slice(1).join('\n').trim();
+          html += '<h2>' + escapeXml(cuts[c].title) + '</h2>\n';
+          if (first) html += '<p>' + escapeXml(first).replace(/\n/g, '<br/>') + '</p>\n';
+          startAt = 1;
+        }
+        for (let i = startAt; i < paras.length; i++) {
+          html += '<p>' + escapeXml(paras[i]).replace(/\n/g, '<br/>') + '</p>\n';
+        }
+        book.sections.push({ id: id, title: title, html: html, css: [] });
+        book.toc.push({ title: title, href: 'text/' + id + '.xhtml', level: 0 });
+      }
+
+      if (!book.sections.length) throw new Error('The text file is empty.');
+      log.info('Text: ' + dec.encoding + ', ' + book.sections.length + ' sections'
+        + (marks.length >= 2 ? ' (split on ' + marks.length + ' headings)' : ' (no chapter headings found)'));
+      return book;
+    }
+
+    // ══ PalmDB container ═════════════════════════════════════════════════════
+    // A .mobi/.azw3 is a Palm database: a 78-byte header, a record-offset table,
+    // then the records. Record 0 holds the PalmDOC + MOBI headers.
+
+    function readPalmDB(bytes) {
+      if (bytes.length < 80) throw new Error('File is too small to be an e-book.');
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const type = decodeUtf8(bytes.subarray(60, 64));
+      const creator = decodeUtf8(bytes.subarray(64, 68));
+      const numRecords = dv.getUint16(76, false); // PalmDB is big-endian throughout
+      const offsets = [];
+      for (let i = 0; i < numRecords; i++) {
+        const p = 78 + i * 8;
+        if (p + 4 > bytes.length) throw new Error('Damaged record table.');
+        offsets.push(dv.getUint32(p, false));
+      }
+      const records = [];
+      for (let i = 0; i < numRecords; i++) {
+        const start = offsets[i];
+        const end = (i + 1 < numRecords) ? offsets[i + 1] : bytes.length;
+        if (start > bytes.length || end > bytes.length || end < start) {
+          records.push(new Uint8Array(0));
+        } else {
+          records.push(bytes.subarray(start, end));
+        }
+      }
+      return { type: type, creator: creator, records: records };
+    }
+
+    // ══ PalmDOC (LZ77) ═══════════════════════════════════════════════════════
+
+    function palmdocDecompress(input) {
+      let out = new Uint8Array(Math.max(4096, input.length * 4));
+      let n = 0;
+      const need = function (extra) {
+        if (n + extra <= out.length) return;
+        let cap = out.length * 2;
+        while (cap < n + extra) cap *= 2;
+        const bigger = new Uint8Array(cap);
+        bigger.set(out.subarray(0, n));
+        out = bigger;
+      };
+      let i = 0;
+      while (i < input.length) {
+        const c = input[i++];
+        if (c === 0) {
+          need(1); out[n++] = 0;
+        } else if (c <= 8) {
+          // literal run of c bytes
+          need(c);
+          for (let j = 0; j < c && i < input.length; j++) out[n++] = input[i++];
+        } else if (c <= 0x7F) {
+          need(1); out[n++] = c;
+        } else if (c >= 0xC0) {
+          // space + the low 7 bits as a character
+          need(2); out[n++] = 0x20; out[n++] = c ^ 0x80;
+        } else {
+          // 0x80..0xBF: two-byte back-reference
+          if (i >= input.length) break;
+          const c2 = input[i++];
+          const pair = (c << 8) | c2;
+          const dist = (pair >> 3) & 0x07FF;
+          const len = (pair & 0x07) + 3;
+          if (dist === 0 || dist > n) continue; // corrupt reference, skip
+          need(len);
+          let src = n - dist;
+          for (let j = 0; j < len; j++) { out[n] = out[src]; n++; src++; }
+        }
+      }
+      return out.subarray(0, n);
+    }
+
+    // ══ HUFF/CDIC ════════════════════════════════════════════════════════════
+    // The other MOBI compression. The HUFF record carries two tables: a 256-entry
+    // dictionary of codes indexed by the top byte of the bit stream, and a
+    // min/max code table per code length. Symbols that are not terminal point
+    // into the CDIC records, whose slices may themselves be compressed, so
+    // decoding recurses.
+
+    const POW2 = (function () {
+      const p = new Float64Array(41);
+      p[0] = 1;
+      for (let i = 1; i <= 40; i++) p[i] = p[i - 1] * 2;
+      return p;
+    })();
+    const U32 = 4294967296;
+
+    function readHuffTables(huffRec, cdicRecs) {
+      if (huffRec.length < 24 || decodeUtf8(huffRec.subarray(0, 4)) !== 'HUFF') {
+        throw new Error('Damaged file: the HUFF record is not where the header says.');
+      }
+      const dv = new DataView(huffRec.buffer, huffRec.byteOffset, huffRec.byteLength);
+      const off1 = dv.getUint32(8, false);
+      const off2 = dv.getUint32(12, false);
+
+      // Fast table: indexed by the top byte of the code, gives code length,
+      // a terminal flag, and the running symbol boundary.
+      const len1 = new Uint8Array(256);
+      const term1 = new Uint8Array(256);
+      const max1 = new Float64Array(256);
+      for (let i = 0; i < 256; i++) {
+        const v = dv.getUint32(off1 + i * 4, false);
+        const codeLen = v & 0x1F;
+        if (!codeLen) throw new Error('Damaged HUFF table.');
+        len1[i] = codeLen;
+        term1[i] = (v & 0x80) ? 1 : 0;
+        max1[i] = ((v >>> 8) + 1) * POW2[32 - codeLen] % U32 - 1;
+      }
+
+      // Per-length table: the smallest and largest code of each length 1..32.
+      const mincode = new Float64Array(33);
+      const maxcode = new Float64Array(33);
+      for (let i = 1; i <= 32; i++) {
+        const lo = dv.getUint32(off2 + (i - 1) * 8, false);
+        const hi = dv.getUint32(off2 + (i - 1) * 8 + 4, false);
+        mincode[i] = lo * POW2[32 - i] % U32;
+        maxcode[i] = (hi + 1) * POW2[32 - i] % U32 - 1;
+      }
+
+      // CDIC records hold the phrase dictionary: a 16-byte header, a table of
+      // 2-byte offsets, and at each offset a length word plus the phrase bytes.
+      // A phrase that is not flagged terminal is itself HUFF-compressed.
+      const dictionary = [];
+      for (const cd of cdicRecs) {
+        if (cd.length < 16 || decodeUtf8(cd.subarray(0, 4)) !== 'CDIC') continue;
+        const cdv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+        const phrases = cdv.getUint32(8, false);
+        const codeLen = cdv.getUint32(12, false);
+        const n = Math.min(1 << codeLen, phrases - dictionary.length);
+        for (let i = 0; i < n; i++) {
+          const off = cdv.getUint16(16 + i * 2, false);
+          if (16 + off + 2 > cd.length) break;
+          const blockLen = cdv.getUint16(16 + off, false);
+          const len = blockLen & 0x7FFF;
+          const start = 16 + off + 2;
+          dictionary.push({
+            terminal: (blockLen & 0x8000) !== 0,
+            bytes: cd.subarray(start, Math.min(start + len, cd.length)),
+          });
+        }
+      }
+      return { len1: len1, term1: term1, max1: max1, mincode: mincode, maxcode: maxcode, dictionary: dictionary };
+    }
+
+    // Read the 32 bits starting at an arbitrary bit position. Five bytes are 40
+    // bits, well inside the exact-integer range of a double, so this needs no
+    // 64-bit type.
+    function peek32(data, bitPos) {
+      const byte = bitPos >>> 3;
+      const shift = bitPos & 7;
+      let acc = 0;
+      for (let i = 0; i < 5; i++) {
+        const p = byte + i;
+        acc = acc * 256 + (p < data.length ? data[p] : 0);
+      }
+      return Math.floor(acc / POW2[8 - shift]) % U32;
+    }
+
+    function huffDecompress(input, t, depth) {
+      depth = depth || 0;
+      const totalBits = input.length * 8;
+      const chunks = [];
+      let total = 0;
+      let pos = 0;
+
+      while (pos < totalBits) {
+        const code = peek32(input, pos);
+        const top = Math.floor(code / 16777216);
+        let codeLen = t.len1[top];
+        let maxcode = t.max1[top];
+        if (!t.term1[top]) {
+          // The top byte was not enough: find the true length by walking the
+          // per-length table until the code falls inside that length's range.
+          while (codeLen <= 32 && code < t.mincode[codeLen]) codeLen++;
+          if (codeLen > 32) break;
+          maxcode = t.maxcode[codeLen];
+        }
+        pos += codeLen;
+        if (pos > totalBits) break;
+
+        const r = Math.floor((maxcode - code) / POW2[32 - codeLen]);
+        const entry = t.dictionary[r];
+        if (!entry) break;
+        let bytes = entry.bytes;
+        if (!entry.terminal) {
+          if (depth > 4) break; // malformed: phrases must bottom out
+          bytes = huffDecompress(bytes, t, depth + 1);
+        }
+        chunks.push(bytes);
+        total += bytes.length;
+      }
+
+      const out = new Uint8Array(total);
+      let o = 0;
+      for (const c of chunks) { out.set(c, o); o += c.length; }
+      return out;
+    }
+
+    // ══ MOBI header ══════════════════════════════════════════════════════════
+
+    const EXTH_AUTHOR = 100, EXTH_PUBLISHER = 101, EXTH_PUBDATE = 106,
+      EXTH_KF8_BOUNDARY = 121, EXTH_COVER_OFFSET = 201, EXTH_THUMB_OFFSET = 202,
+      EXTH_UPDATED_TITLE = 503, EXTH_LANGUAGE = 524;
+
+    function u32(dv, off) { return dv.getUint32(off, false); }
+
+    function parseMobiHeader(rec0) {
+      const dv = new DataView(rec0.buffer, rec0.byteOffset, rec0.byteLength);
+      const h = {
+        compression: dv.getUint16(0, false),
+        textLength: u32(dv, 4),
+        textRecordCount: dv.getUint16(8, false),
+        textRecordSize: dv.getUint16(10, false),
+        encryption: dv.getUint16(12, false),
+      };
+      h.hasMobi = rec0.length > 20 && decodeUtf8(rec0.subarray(16, 20)) === 'MOBI';
+      if (h.hasMobi) {
+        const M = 16; // the MOBI header starts right after the PalmDOC header
+        h.headerLength = u32(dv, M + 0x04);
+        h.mobiType = u32(dv, M + 0x08);
+        h.textEncoding = u32(dv, M + 0x0C);
+        h.fileVersion = u32(dv, M + 0x14);
+        h.firstNonBookIndex = u32(dv, M + 0x40);
+        h.fullNameOffset = u32(dv, M + 0x44);
+        h.fullNameLength = u32(dv, M + 0x48);
+        h.firstImageIndex = u32(dv, M + 0x5C);
+        h.huffRecord = u32(dv, M + 0x60);
+        h.huffCount = u32(dv, M + 0x64);
+        h.exthFlags = u32(dv, M + 0x70);
+        h.drmOffset = h.headerLength >= 0xA0 ? u32(dv, M + 0x98) : 0xFFFFFFFF;
+        h.drmCount = h.headerLength >= 0xA0 ? u32(dv, M + 0x9C) : 0;
+        h.firstContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB0, false) : 1;
+        h.lastContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB2, false) : 0;
+        // Only meaningful when the header is long enough to contain the field.
+        // The flags proper are the low 16 bits of the word at 0xE0.
+        h.extraFlags = h.headerLength >= 0xE4 ? (u32(dv, M + 0xE0) & 0xFFFF) : 0;
+        h.exth = (h.exthFlags & 0x40) ? parseExth(rec0, M + h.headerLength) : {};
+        if (h.fullNameLength && h.fullNameOffset + h.fullNameLength <= rec0.length) {
+          h.fullName = decodeMobiText(
+            rec0.subarray(h.fullNameOffset, h.fullNameOffset + h.fullNameLength), h.textEncoding);
+        }
+      } else {
+        h.textEncoding = 1252;
+        h.fileVersion = 0;
+        h.exth = {};
+        h.extraFlags = 0;
+        h.firstImageIndex = 0xFFFFFFFF;
+      }
+      return h;
+    }
+
+    function parseExth(rec0, off) {
+      const out = {};
+      if (off + 12 > rec0.length) return out;
+      if (decodeUtf8(rec0.subarray(off, off + 4)) !== 'EXTH') return out;
+      const dv = new DataView(rec0.buffer, rec0.byteOffset, rec0.byteLength);
+      const count = u32(dv, off + 8);
+      let p = off + 12;
+      for (let i = 0; i < count && p + 8 <= rec0.length; i++) {
+        const type = u32(dv, p);
+        const len = u32(dv, p + 4);
+        if (len < 8 || p + len > rec0.length) break;
+        const data = rec0.subarray(p + 8, p + len);
+        if (!(type in out)) out[type] = data;
+        p += len;
+      }
+      return out;
+    }
+
+    function decodeMobiText(bytes, encoding) {
+      return new TextDecoder(encoding === 65001 ? 'utf-8' : 'windows-1252').decode(bytes);
+    }
+
+    // Text records carry trailing bytes (index data, multibyte overlap) that are
+    // not part of the book text and must be cut before decompression. Their sizes
+    // are stored as backwards-growing variable-length integers at the record end.
+    function trailingEntrySize(rec, size) {
+      let bitpos = 0;
+      let result = 0;
+      let s = size;
+      for (;;) {
+        if (s <= 0) return result;
+        const v = rec[s - 1];
+        result |= (v & 0x7F) << bitpos;
+        bitpos += 7;
+        s -= 1;
+        if ((v & 0x80) !== 0 || bitpos >= 28) return result;
+      }
+    }
+
+    function trailingSize(rec, flags) {
+      let num = 0;
+      let size = rec.length;
+      let test = flags >> 1;
+      while (test) {
+        if (test & 1) num += trailingEntrySize(rec, size - num);
+        test >>= 1;
+      }
+      if (flags & 1) {
+        // multibyte overlap: the low two bits of the last byte give the count
+        num += (rec[size - num - 1] & 0x3) + 1;
+      }
+      return num;
+    }
+
+    function decompressText(pdb, h, log) {
+      const decoders = { 1: 'none', 2: 'PalmDOC', 17480: 'HUFF/CDIC' };
+      if (!decoders[h.compression]) throw new Error('Unknown compression type ' + h.compression + '.');
+
+      let huffTables = null;
+      if (h.compression === 17480) {
+        if (!h.huffCount || !pdb.records[h.huffRecord]) throw new Error('Damaged file: HUFF tables are missing.');
+        const cdics = [];
+        for (let i = 1; i < h.huffCount; i++) {
+          const r = pdb.records[h.huffRecord + i];
+          if (r) cdics.push(r);
+        }
+        huffTables = readHuffTables(pdb.records[h.huffRecord], cdics);
+      }
+
+      const parts = [];
+      let total = 0;
+      for (let i = 1; i <= h.textRecordCount; i++) {
+        const rec = pdb.records[i];
+        if (!rec) break;
+        const trail = h.extraFlags ? trailingSize(rec, h.extraFlags) : 0;
+        const body = rec.subarray(0, Math.max(0, rec.length - trail));
+        let out;
+        if (h.compression === 1) out = body.slice();
+        else if (h.compression === 2) out = palmdocDecompress(body);
+        else out = huffDecompress(body, huffTables);
+        parts.push(out);
+        total += out.length;
+      }
+      let text = new Uint8Array(total);
+      let o = 0;
+      for (const p of parts) { text.set(p, o); o += p.length; }
+      if (h.textLength && h.textLength < text.length) text = text.subarray(0, h.textLength);
+      log.info('Compression: ' + decoders[h.compression] + ', '
+        + h.textRecordCount + ' text records, ' + text.length + ' bytes of markup');
+      return text;
+    }
+
+    // Images live in the records from firstImageIndex onwards, mixed in with
+    // index and end-of-file records. Register the ones that really are images.
+    function collectImages(pdb, h, book, log) {
+      const byIndex = {};
+      const first = h.firstImageIndex;
+      if (!first || first === 0xFFFFFFFF || first >= pdb.records.length) return byIndex;
+      let skipped = 0;
+      for (let i = first; i < pdb.records.length; i++) {
+        const rec = pdb.records[i];
+        if (!rec || rec.length < 16) continue;
+        const mime = sniffImageMime(rec);
+        if (!mime) { skipped++; continue; }
+        const num = i - first + 1; // recindex is 1-based from firstImageIndex
+        const ext = EXT_BY_MIME[mime] || 'img';
+        const name = addResource(book, 'img-' + String(num).padStart(5, '0') + '.' + ext, mime, rec.slice());
+        byIndex[num] = name;
+      }
+      const cover = h.exth[EXTH_COVER_OFFSET];
+      if (cover && cover.length >= 4) {
+        const off = new DataView(cover.buffer, cover.byteOffset, cover.byteLength).getUint32(0, false);
+        const name = byIndex[off + 1];
+        if (name) book.meta.coverRes = name;
+      }
+      const count = Object.keys(byIndex).length;
+      log.info('Images: ' + count + ' extracted' + (skipped ? ' (' + skipped + ' non-image records skipped)' : ''));
+      return byIndex;
+    }
+
+    function exthText(h, id) {
+      const v = h.exth[id];
+      return v ? decodeMobiText(v, h.textEncoding).trim() : '';
+    }
+
+    // ══ MOBI 6 ═══════════════════════════════════════════════════════════════
+
+    function readMobi6(pdb, h, log) {
+      const book = emptyBook();
+      book.meta.title = exthText(h, EXTH_UPDATED_TITLE) || h.fullName || '';
+      book.meta.author = exthText(h, EXTH_AUTHOR);
+      book.meta.publisher = exthText(h, EXTH_PUBLISHER);
+      book.meta.date = exthText(h, EXTH_PUBDATE);
+      book.meta.language = exthText(h, EXTH_LANGUAGE) || 'en';
+
+      const imageByIndex = collectImages(pdb, h, book, log);
+      const textBytes = decompressText(pdb, h, log);
+
+      // filepos values are byte offsets into this markup, so the anchors have to
+      // be injected in the byte domain, before the text is decoded.
+      const bin = bytesToBinaryString(textBytes);
+
+      // A filepos should point at the start of a tag, but not every producer is
+      // careful. Pull one that lands inside a tag back to that tag, otherwise the
+      // anchor would be spliced into the middle of it and destroy the markup.
+      const snap = function (pos) {
+        const lt = bin.lastIndexOf('<', pos);
+        if (lt < 0 || lt === pos) return pos;
+        const gt = bin.indexOf('>', lt);
+        return (gt >= pos) ? lt : pos;
+      };
+
+      const targets = [];
+      const fpRe = /filepos\s*=\s*['"]?(\d+)/gi;
+      let fm;
+      const seen = {};
+      while ((fm = fpRe.exec(bin))) {
+        const v = parseInt(fm[1], 10);
+        if (!seen[v] && v > 0 && v < bin.length) { seen[v] = 1; targets.push({ id: v, at: snap(v) }); }
+      }
+      targets.sort(function (a, b) { return a.at - b.at; });
+
+      const marked = [];
+      let prev = 0;
+      for (const t of targets) {
+        marked.push(bin.slice(prev, t.at), '<a id="fp' + t.id + '"></a>');
+        prev = t.at;
+      }
+      marked.push(bin.slice(prev));
+      const withAnchors = marked.join('').replace(/filepos\s*=\s*['"]?(\d+)['"]?/gi, function (m, d) {
+        return 'href="#fp' + parseInt(d, 10) + '"';
+      });
+
+      let html = decodeMobiText(binaryStringToBytes(withAnchors), h.textEncoding);
+
+      // Mobipocket-only markup that has no XHTML equivalent.
+      html = html.replace(/<\/?(?:guide|reference)\b[^>]*>/gi, '');
+
+      const pieces = html.split(/<mbp:pagebreak[^>]*>/i);
+      const raw = pieces.map(function (p) { return p.trim(); }).filter(function (p) { return p.length > 0; });
+      const chapters = raw.length ? raw : [html];
+
+      // Section ids first: an anchor may be referenced from a different chapter.
+      const parsed = chapters.map(function (c) { return parseXML(c); });
+      const secIds = parsed.map(function (_, i) { return 'sec-' + String(i + 1).padStart(4, '0'); });
+      const secOfAnchor = {};
+      parsed.forEach(function (root, i) {
+        for (const a of findAll(root, 'a')) {
+          if (a.attrs.id) secOfAnchor[a.attrs.id] = secIds[i];
+        }
+      });
+
+      let missingImages = 0;
+      parsed.forEach(function (root, i) {
+        for (const img of findAll(root, 'img')) {
+          const ri = img.attrs.recindex || img.attrs.recnum || img.attrs.lowrecindex;
+          const name = ri && imageByIndex[parseInt(ri, 10)];
+          delete img.attrs.recindex;
+          delete img.attrs.recnum;
+          delete img.attrs.lowrecindex;
+          if (name) {
+            img.attrs.src = '../res/' + name;
+            if (!img.attrs.alt) img.attrs.alt = '';
+          } else {
+            missingImages++;
+            img.attrs.src = '';
+            img.attrs.alt = '';
+          }
+        }
+        for (const a of findAll(root, 'a')) {
+          const href = a.attrs.href;
+          if (!href || href.charAt(0) !== '#') continue;
+          const sec = secOfAnchor[href.slice(1)];
+          if (sec) a.attrs.href = (sec === secIds[i] ? '' : sec + '.xhtml') + href;
+        }
+      });
+
+      parsed.forEach(function (root, i) {
+        const htmlOut = bodyInner(toXml(root));
+        const title = titleFromHtml(htmlOut) || ('Section ' + (i + 1));
+        book.sections.push({ id: secIds[i], title: title, html: htmlOut, css: [] });
+      });
+
+      if (missingImages) log.warn(missingImages + ' image references could not be resolved and were dropped.');
+
+      const toc = buildMobiToc(book);
+      book.toc = toc.entries;
+      applyTocTitles(book);
+      log.info('MOBI: ' + book.sections.length + ' sections'
+        + (raw.length ? ' (split on page breaks)' : ' (no page breaks found)')
+        + ', ' + book.toc.length + ' TOC entries (' + toc.source + ')');
+      return book;
+    }
+
+    // MOBI keeps its table of contents in binary index records, but it also ships
+    // a plain contents page whose links carry the chapter names. That page is the
+    // section that links into the most other sections, and reading it back gives
+    // the real chapter titles instead of "Section 7".
+    function buildMobiToc(book) {
+      let best = null;
+      for (const s of book.sections) {
+        const links = [];
+        const distinct = {};
+        const re = /<a\b[^>]*\bhref="(sec-\d{4}\.xhtml[^"]*)"[^>]*>([\s\S]*?)<\/a\s*>/gi;
+        let m;
+        while ((m = re.exec(s.html))) {
+          const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+          if (!title) continue;
+          distinct[m[1].slice(0, 8)] = 1;
+          links.push({ title: title.slice(0, 120), href: 'text/' + m[1], level: 0 });
+        }
+        const n = Object.keys(distinct).length;
+        if (n >= 3 && (!best || n > best.count)) best = { count: n, entries: links };
+      }
+      if (best) return { entries: best.entries, source: 'from the contents page' };
+
+      // No contents page: fall back to the first heading of each section.
+      const entries = [];
+      for (const s of book.sections) {
+        const m = /<(h[1-3])\b[^>]*>([\s\S]*?)<\/\1\s*>/i.exec(s.html);
+        if (!m) continue;
+        const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+        if (!title) continue;
+        entries.push({
+          title: title.slice(0, 120),
+          href: 'text/' + s.id + '.xhtml',
+          level: Math.min(parseInt(m[1].charAt(1), 10) - 1, 2),
+        });
+      }
+      return { entries: entries, source: entries.length ? 'from headings' : 'none found' };
+    }
+
+    // Give each section the name the table of contents uses for it.
+    function applyTocTitles(book) {
+      const byId = {};
+      for (const t of book.toc) {
+        const m = /^text\/(sec-\d{4})\.xhtml/.exec(t.href);
+        if (m && !byId[m[1]]) byId[m[1]] = t.title;
+      }
+      for (const s of book.sections) {
+        if (byId[s.id]) s.title = byId[s.id];
+      }
+    }
+
+    // ══ KF8 (AZW3) ═══════════════════════════════════════════════════════════
+    //
+    // A KF8 file does not store its XHTML files as files. It stores one long
+    // markup blob plus index records that say how to cut it up:
+    //   skeleton index  one entry per output file: the frame of the file (its
+    //                   <html>/<head>/<body> and structural divs) as a byte range
+    //   fragment index  one entry per chunk of body content: which file it belongs
+    //                   to, where in that file's skeleton it has to be inserted
+    //   NCX index       the table of contents
+    // Rebuilding a file means taking its skeleton and inserting its chunks, which
+    // follow the skeleton in the blob, at the recorded positions.
+
+    // Index integers are big-endian, 7 bits per byte, and the last byte of a value
+    // is the one with the high bit set.
+    function idxVarint(bytes, p) {
+      let v = 0;
+      while (p.i < bytes.length) {
+        const b = bytes[p.i++];
+        v = (v * 128) + (b & 0x7F);
+        if (b & 0x80) break;
+      }
+      return v;
+    }
+
+    function popcount(n) {
+      let c = 0;
+      while (n) { c += n & 1; n >>= 1; }
+      return c;
+    }
+
+    // TAGX declares which tags an index entry can carry and which bit of the
+    // entry's control byte says whether (and how often) a tag is present.
+    function parseTagx(rec, off) {
+      if (off + 12 > rec.length || decodeUtf8(rec.subarray(off, off + 4)) !== 'TAGX') return null;
+      const dv = new DataView(rec.buffer, rec.byteOffset, rec.byteLength);
+      const len = u32(dv, off + 4);
+      const controlBytes = u32(dv, off + 8);
+      const tags = [];
+      for (let p = off + 12; p + 4 <= off + len && p + 4 <= rec.length; p += 4) {
+        tags.push({ tag: rec[p], num: rec[p + 1], mask: rec[p + 2], end: rec[p + 3] });
+      }
+      return { controlBytes: controlBytes, tags: tags };
+    }
+
+    function parseIndexRecord(rec, tagx, encoding) {
+      const out = [];
+      const dv = new DataView(rec.buffer, rec.byteOffset, rec.byteLength);
+      const idxt = u32(dv, 0x14);
+      const count = u32(dv, 0x18);
+      if (idxt + 4 + count * 2 > rec.length) return out;
+      if (decodeUtf8(rec.subarray(idxt, idxt + 4)) !== 'IDXT') return out;
+
+      for (let k = 0; k < count; k++) {
+        const off = dv.getUint16(idxt + 4 + k * 2, false);
+        const end = (k + 1 < count) ? dv.getUint16(idxt + 6 + k * 2, false) : idxt;
+        if (off >= rec.length || end > rec.length || end <= off) continue;
+        const nameLen = rec[off];
+        const name = decodeMobiText(rec.subarray(off + 1, off + 1 + nameLen), encoding);
+        const p = { i: off + 1 + nameLen };
+        const control = rec.subarray(p.i, p.i + tagx.controlBytes);
+        p.i += tagx.controlBytes;
+
+        const tags = {};
+        let ci = 0;
+        for (const t of tagx.tags) {
+          if (t.end & 1) { ci++; continue; }       // end of a control byte's tags
+          if (ci >= control.length) break;
+          let value = control[ci] & t.mask;
+          if (!value) continue;                     // tag absent from this entry
+          let n;
+          if (value === t.mask) {
+            // All bits of the mask set: either a single group, or, if the mask has
+            // room for more than one, a count that follows as its own integer.
+            n = popcount(t.mask) > 1 ? idxVarint(rec, p) : t.num;
+          } else {
+            let m = t.mask;
+            while ((m & 1) === 0) { m >>= 1; value >>= 1; }
+            n = value * t.num;
+          }
+          const vals = [];
+          for (let j = 0; j < n && p.i < end; j++) vals.push(idxVarint(rec, p));
+          tags[t.tag] = vals;
+        }
+        out.push({ name: name, tags: tags });
+      }
+      return out;
+    }
+
+    const INDEX_STOPPERS = { INDX: 1, FDST: 1, FLIS: 1, FCIS: 1, SRCS: 1, DATP: 1, RESC: 1 };
+
+    // An index is a header record, then its entry records, then its CNCX records
+    // (the string pool the entries point into).
+    function parseIndex(pdb, start, limit) {
+      const hdr = pdb.records[start];
+      if (!hdr || hdr.length < 0x30 || decodeUtf8(hdr.subarray(0, 4)) !== 'INDX') return null;
+      const dv = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength);
+      const tagx = parseTagx(hdr, u32(dv, 0x04));
+      if (!tagx) return null;                       // not an index header, an entry record
+      const nRecs = u32(dv, 0x18);
+      const rawEnc = u32(dv, 0x1C);
+      const encoding = (rawEnc === 1252) ? 1252 : 65001;
+
+      const entries = [];
+      let r = start + 1;
+      for (let k = 0; k < nRecs && r < limit; k++, r++) {
+        const rec = pdb.records[r];
+        if (!rec || decodeUtf8(rec.subarray(0, 4)) !== 'INDX') break;
+        for (const e of parseIndexRecord(rec, tagx, encoding)) entries.push(e);
+      }
+
+      // CNCX strings: length-prefixed, addressed as recordIndex * 0x10000 + offset.
+      const cncx = {};
+      for (let ci = 0; r < limit; r++, ci++) {
+        const rec = pdb.records[r];
+        if (!rec || rec.length < 2) break;
+        if (INDEX_STOPPERS[decodeUtf8(rec.subarray(0, 4))]) break;
+        const p = { i: 0 };
+        while (p.i < rec.length) {
+          const at = p.i;
+          const len = idxVarint(rec, p);
+          if (!len || p.i + len > rec.length) break;
+          cncx[ci * 0x10000 + at] = decodeMobiText(rec.subarray(p.i, p.i + len), encoding);
+          p.i += len;
+        }
+      }
+      return { entries: entries, cncx: cncx, tags: tagx.tags, end: r };
+    }
+
+    // Which index is which is decided by what the entries look like, not by header
+    // offsets: the skeleton entries are named SKEL0000000n, the fragment entries
+    // are named by their byte position, and only the NCX carries parent/child tags.
+    function findIndexes(pdb, h, log) {
+      const limit = Math.min(
+        h.firstImageIndex && h.firstImageIndex < pdb.records.length ? h.firstImageIndex : pdb.records.length,
+        pdb.records.length);
+      const found = { skel: null, frag: null, ncx: null };
+      let i = (h.textRecordCount || 0) + 1;
+      while (i < limit) {
+        const idx = parseIndex(pdb, i, limit);
+        if (!idx) { i++; continue; }
+        const first = idx.entries.length ? idx.entries[0] : null;
+        const hasTag = function (t) { return idx.tags.some(function (x) { return x.tag === t; }); };
+        if (first && /^SKEL/.test(first.name)) found.skel = found.skel || idx;
+        else if (hasTag(21) || hasTag(22)) found.ncx = found.ncx || idx;
+        else if (hasTag(3) && hasTag(4) && first && /^\d+$/.test(first.name)) found.frag = found.frag || idx;
+        i = Math.max(idx.end, i + 1);
+      }
+      return found;
+    }
+
+    // The blob is divided into flows: flow 0 is the markup, the rest are CSS and
+    // other side files referenced as kindle:flow:.
+    function kf8Flows(pdb, h, rawLen) {
+      for (let i = (h.textRecordCount || 0) + 1; i < pdb.records.length; i++) {
+        const r = pdb.records[i];
+        if (!r || r.length < 12 || decodeUtf8(r.subarray(0, 4)) !== 'FDST') continue;
+        const dv = new DataView(r.buffer, r.byteOffset, r.byteLength);
+        const n = u32(dv, 8);
+        const spans = [];
+        for (let k = 0; k < n && 12 + k * 8 + 8 <= r.length; k++) {
+          spans.push([u32(dv, 12 + k * 8), u32(dv, 16 + k * 8)]);
+        }
+        if (spans.length) return spans;
+      }
+      return [[0, rawLen]];
+    }
+
+    // kindle: URIs count in base 32 (digits 0-9 then A-V).
+    function fromBase32(s) {
+      const v = parseInt(s, 32);
+      return isFinite(v) ? v : -1;
+    }
+
+    function readKF8(pdb, h, log) {
+      const book = emptyBook();
+      book.meta.title = exthText(h, EXTH_UPDATED_TITLE) || h.fullName || '';
+      book.meta.author = exthText(h, EXTH_AUTHOR);
+      book.meta.publisher = exthText(h, EXTH_PUBLISHER);
+      book.meta.date = exthText(h, EXTH_PUBDATE);
+      book.meta.language = exthText(h, EXTH_LANGUAGE) || 'en';
+
+      const imageByIndex = collectImages(pdb, h, book, log);
+      const rawBytes = decompressText(pdb, h, log);
+      const raw = bytesToBinaryString(rawBytes); // byte offsets are string indices here
+      const flows = kf8Flows(pdb, h, raw.length);
+
+      const idx = findIndexes(pdb, h, log);
+      if (!idx.skel || !idx.frag) {
+        throw new Error('This AZW3 file has no usable index records and cannot be converted.');
+      }
+
+      // ── rebuild the files ──────────────────────────────────────────────────
+      const skels = idx.skel.entries;
+      const frags = idx.frag.entries;
+      const files = [];        // reassembled markup, one per skeleton
+      const ranges = [];       // byte range in the blob -> file index, for links
+      const fragInfo = [];     // per fragment: its file and its aid
+      let fragPtr = 0;
+      let mismatched = 0;
+
+      for (let i = 0; i < skels.length; i++) {
+        const geom = skels[i].tags[6] || [0, 0];
+        const skelPos = geom[0];
+        const skelLen = geom[1];
+        const chunkCount = (skels[i].tags[1] || [0])[0];
+        let text = raw.slice(skelPos, skelPos + skelLen);
+        ranges.push({ from: skelPos, to: skelPos + skelLen, file: i });
+
+        let base = skelPos + skelLen; // the chunks follow the skeleton in the blob
+        for (let c = 0; c < chunkCount && fragPtr < frags.length; c++, fragPtr++) {
+          const f = frags[fragPtr];
+          const fileNum = (f.tags[3] || [i])[0];
+          const len = (f.tags[6] || [0, 0])[1];
+          if (fileNum !== i) mismatched++;
+          const insertAt = parseInt(f.name, 10) - skelPos;
+          const chunk = raw.slice(base, base + len);
+          if (insertAt >= 0 && insertAt <= text.length) {
+            text = text.slice(0, insertAt) + chunk + text.slice(insertAt);
+          } else {
+            text += chunk;
+          }
+          // The CNCX string is an XPath like //*[@aid='A7'], the aid is the anchor.
+          const sel = idx.frag.cncx[(f.tags[2] || [-1])[0]] || '';
+          const am = /@aid=['"]?([A-Za-z0-9]+)/.exec(sel);
+          fragInfo.push({ file: fileNum, aid: am ? am[1] : '', rawStart: base });
+          ranges.push({ from: base, to: base + len, file: fileNum });
+          base += len;
+        }
+        files.push(text);
+      }
+      if (mismatched) log.warn(mismatched + ' content chunks named a different file than expected.');
+
+      // Every position link points at an element carrying an aid attribute, so a
+      // scan of the blob gives the map from byte position to anchor. An element
+      // that already has an id keeps it, and then that id is the anchor, not the
+      // aid, because the aid is dropped when the file is written out.
+      const aidAt = {};
+      const anchorOfAid = {};
+      const aidRe = /<[^<>]*\said\s*=\s*['"]?([A-Za-z0-9]+)[^<>]*>/g;
+      let am;
+      while ((am = aidRe.exec(raw))) {
+        const im = /\sid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/.exec(am[0]);
+        const anchor = im ? (im[1] !== undefined ? im[1] : im[2] !== undefined ? im[2] : im[3]) : am[1];
+        aidAt[am.index] = anchor;
+        anchorOfAid[am[1]] = anchor;
+      }
+
+      const fileAt = function (pos) {
+        for (const r of ranges) if (pos >= r.from && pos < r.to) return r.file;
+        return -1;
+      };
+
+      const secId = function (i) { return 'sec-' + String(i + 1).padStart(4, '0'); };
+
+      // A kindle:pos link names a chunk (fid) and an offset inside that chunk.
+      const resolvePos = function (fid, off, fromFile) {
+        const f = (fid >= 0 && fid < fragInfo.length) ? fragInfo[fid] : null;
+        if (!f) return null;
+        const aid = aidAt[f.rawStart + off] || anchorOfAid[f.aid] || f.aid;
+        const path = (f.file === fromFile) ? '' : secId(f.file) + '.xhtml';
+        return path + (aid ? '#' + aid : '');
+      };
+
+      // ── flows: CSS and anything else referenced as kindle:flow ─────────────
+      const flowRes = {};
+      const flowName = function (n) {
+        if (flowRes[n]) return flowRes[n];
+        if (n <= 0 || n >= flows.length) return null;
+        let css = raw.slice(flows[n][0], flows[n][1]);
+        css = decodeMobiText(binaryStringToBytes(css), 65001);
+        css = css.replace(/kindle:embed:([A-Za-z0-9]+)(\?[^)'"\s]*)?/gi, function (m, b32) {
+          const res = imageByIndex[fromBase32(b32)];
+          return res ? '../res/' + res : m;
+        });
+        const name = addResource(book, 'flow-' + String(n).padStart(4, '0') + '.css',
+          'text/css', encodeUtf8(css));
+        flowRes[n] = name;
+        return name;
+      };
+
+      // ── rewrite each file into XHTML ───────────────────────────────────────
+      let unresolved = 0;
+      files.forEach(function (bin, i) {
+        const html = decodeMobiText(binaryStringToBytes(bin), 65001);
+        const root = parseXML(html);
+        const css = [];
+
+        for (const link of findAll(root, 'link')) {
+          const href = link.attrs.href || '';
+          const fm = /^kindle:flow:([A-Za-z0-9]+)/i.exec(href);
+          if (!fm) continue;
+          const name = flowName(fromBase32(fm[1]));
+          if (name && css.indexOf(name) < 0) css.push(name);
+        }
+
+        walkElements(root, function (el) {
+          if (el.attrs.aid) {
+            if (!el.attrs.id) el.attrs.id = el.attrs.aid;
+            delete el.attrs.aid;
+          }
+          const src = el.attrs.src || '';
+          const em = /^kindle:embed:([A-Za-z0-9]+)/i.exec(src);
+          if (em) {
+            const res = imageByIndex[fromBase32(em[1])];
+            if (res) {
+              el.attrs.src = '../res/' + res;
+              if (localName(el.name) === 'img' && !el.attrs.alt) el.attrs.alt = '';
+            } else {
+              unresolved++;
+              el.attrs.src = '';
+            }
+          }
+          const href = el.attrs.href || '';
+          const pm = /^kindle:pos:fid:([A-Za-z0-9]+):off:([A-Za-z0-9]+)/i.exec(href);
+          if (pm) {
+            const target = resolvePos(fromBase32(pm[1]), fromBase32(pm[2]), i);
+            if (target) el.attrs.href = target;
+            else { unresolved++; delete el.attrs.href; }
+          } else if (/^kindle:/i.test(href)) {
+            delete el.attrs.href;
+          }
+        });
+
+        const body = bodyInner(toXml(root));
+        book.sections.push({
+          id: secId(i),
+          title: titleFromHtml(body) || ('Section ' + (i + 1)),
+          html: body,
+          css: css,
+        });
+      });
+      if (unresolved) log.warn(unresolved + ' internal references could not be resolved and were dropped.');
+
+      // ── table of contents ──────────────────────────────────────────────────
+      // NCX entry tags: 1 = position, 2 = length, 3 = label (into the CNCX),
+      // 4 = depth, 6 = the chunk and offset the entry points at.
+      let tocSource = 'none found';
+      if (idx.ncx && idx.ncx.entries.length) {
+        idx.ncx.entries.forEach(function (e) {
+          const label = idx.ncx.cncx[(e.tags[3] || [-1])[0]] || '';
+          const posFid = e.tags[6];
+          let href = null;
+          if (posFid && posFid.length >= 2) href = resolvePos(posFid[0], posFid[1], -1);
+          if (!href && e.tags[1]) {
+            const pos = e.tags[1][0];
+            const file = fileAt(pos);
+            if (file >= 0) href = secId(file) + '.xhtml' + (aidAt[pos] ? '#' + aidAt[pos] : '');
+          }
+          if (!label || !href) return;
+          book.toc.push({
+            title: label.slice(0, 120),
+            href: 'text/' + href,
+            level: Math.min((e.tags[4] || [0])[0], 2),
+          });
+        });
+        if (book.toc.length) tocSource = 'from the index';
+      }
+      if (!book.toc.length) {
+        const fallback = buildMobiToc(book);
+        book.toc = fallback.entries;
+        tocSource = fallback.source;
+      }
+      applyTocTitles(book);
+
+      log.info('AZW3: ' + book.sections.length + ' files rebuilt from '
+        + skels.length + ' skeletons and ' + frags.length + ' content chunks, '
+        + book.toc.length + ' TOC entries (' + tocSource + ')');
+      return book;
+    }
+
+    // ══ MOBI / AZW3 entry point ══════════════════════════════════════════════
+
+    function readMobiFile(bytes, log) {
+      const pdb = readPalmDB(bytes);
+      const rec0 = pdb.records[0];
+      if (!rec0 || rec0.length < 16) throw new Error('Damaged file: the header record is missing.');
+      const h = parseMobiHeader(rec0);
+
+      // Two independent signals. Either one means the content is protected, and
+      // the conversion stops here.
+      if (h.encryption !== 0) throw new Error('This file is encrypted and cannot be converted.');
+      if (h.hasMobi && h.drmCount !== 0 && h.drmCount !== 0xFFFFFFFF) {
+        throw new Error('This file is encrypted and cannot be converted.');
+      }
+
+      // A combined file carries a MOBI6 part and a KF8 part; EXTH 121 says where
+      // the KF8 part starts. Prefer it, since it is the richer markup.
+      const boundaryRaw = h.exth[EXTH_KF8_BOUNDARY];
+      let boundary = 0;
+      if (boundaryRaw && boundaryRaw.length >= 4) {
+        boundary = new DataView(boundaryRaw.buffer, boundaryRaw.byteOffset, boundaryRaw.byteLength).getUint32(0, false);
+      }
+
+      if (h.fileVersion >= 8) {
+        return { book: readKF8(pdb, h, log), format: 'azw3' };
+      }
+      if (boundary > 0 && boundary < pdb.records.length) {
+        const inner = { type: pdb.type, creator: pdb.creator, records: pdb.records.slice(boundary) };
+        const ih = parseMobiHeader(inner.records[0]);
+        if (ih.hasMobi && ih.fileVersion >= 8) {
+          log.info('Combined file: using the KF8 part (record ' + boundary + ' onwards).');
+          // Record numbers in the KF8 header count from the KF8 part, and the DRM
+          // fields of that header have to be checked too.
+          if (ih.encryption !== 0 || (ih.drmCount !== 0 && ih.drmCount !== 0xFFFFFFFF)) {
+            throw new Error('This file is encrypted and cannot be converted.');
+          }
+          return { book: readKF8(inner, ih, log), format: 'azw3' };
+        }
+      }
+      return { book: readMobi6(pdb, h, log), format: 'mobi' };
+    }
+
+    // ══ PalmDOC compression ══════════════════════════════════════════════════
+    // The inverse of palmdocDecompress. Back-references reach at most 2047 bytes
+    // back and cover 3 to 10 bytes, so candidate positions are kept in a hash
+    // chain keyed by the next three bytes.
+
+    function palmdocCompress(input) {
+      const n = input.length;
+      const out = [];
+      const chain = new Map();
+      const addKey = function (p) {
+        if (p + 3 > n) return;
+        const key = (input[p] << 16) | (input[p + 1] << 8) | input[p + 2];
+        let list = chain.get(key);
+        if (!list) { list = []; chain.set(key, list); }
+        list.unshift(p);
+        if (list.length > 24) list.length = 24;
+      };
+      // Bytes that the format cannot carry on their own (0x01-0x08, 0x80-0xFF)
+      // travel in a run of up to eight, introduced by a count byte.
+      const lit = [];
+      const flushLit = function () {
+        let k = 0;
+        while (k < lit.length) {
+          const take = Math.min(8, lit.length - k);
+          out.push(take);
+          for (let j = 0; j < take; j++) out.push(lit[k + j]);
+          k += take;
+        }
+        lit.length = 0;
+      };
+
+      let i = 0;
+      while (i < n) {
+        let bestLen = 0, bestDist = 0;
+        if (i + 3 <= n) {
+          const key = (input[i] << 16) | (input[i + 1] << 8) | input[i + 2];
+          const list = chain.get(key);
+          if (list) {
+            const max = Math.min(10, n - i);
+            for (let k = 0; k < list.length; k++) {
+              const p = list[k];
+              const dist = i - p;
+              if (dist > 2047) break; // newest first, so everything after is further away
+              let len = 0;
+              while (len < max && input[p + len] === input[i + len]) len++;
+              if (len > bestLen) { bestLen = len; bestDist = dist; if (len === max) break; }
+            }
+          }
+        }
+        if (bestLen >= 3) {
+          flushLit();
+          const pair = 0x8000 | ((bestDist << 3) & 0x3FF8) | (bestLen - 3);
+          out.push((pair >> 8) & 0xFF, pair & 0xFF);
+          for (let j = 0; j < bestLen; j++) addKey(i + j);
+          i += bestLen;
+          continue;
+        }
+        const c = input[i];
+        // A space followed by an ASCII letter-range byte packs into one byte.
+        if (c === 0x20 && i + 1 < n && input[i + 1] >= 0x40 && input[i + 1] <= 0x7F) {
+          flushLit();
+          out.push(input[i + 1] ^ 0x80);
+          addKey(i); addKey(i + 1);
+          i += 2;
+          continue;
+        }
+        if (c === 0 || (c >= 0x09 && c <= 0x7F)) {
+          flushLit();
+          out.push(c);
+        } else {
+          lit.push(c);
+          if (lit.length === 8) flushLit();
+        }
+        addKey(i);
+        i++;
+      }
+      flushLit();
+      return new Uint8Array(out);
+    }
+
+    // ══ MOBI 6 writer ════════════════════════════════════════════════════════
+    // A MOBI6 is a Palm database around one HTML blob: the blob is cut into
+    // 4096-byte pieces and each piece is PalmDOC-compressed into its own record,
+    // the images follow as raw records, and the metadata sits in the EXTH block.
+    //
+    // Links inside the blob are byte offsets (filepos), and an offset is only
+    // known once the blob is complete. So the markup is assembled as a list of
+    // pieces with zero-width marks at the link targets; every filepos is first
+    // written as a fixed-width placeholder and then overwritten by the real
+    // offset, which is length-preserving and therefore does not move anything.
+
+    const LOCALE_BY_LANG = {
+      en: 9, de: 7, fr: 12, es: 10, it: 16, nl: 19, pt: 22, sv: 29, da: 6,
+      no: 20, fi: 11, pl: 21, ru: 25, cs: 5, tr: 31, ja: 17, zh: 4, ko: 18,
+    };
+
+    function pdbNameBytes(title) {
+      const ascii = (title || 'Untitled').replace(/[^A-Za-z0-9 _-]+/g, '_').trim().slice(0, 31);
+      const out = new Uint8Array(32);
+      out.set(encodeUtf8(ascii || 'Untitled').subarray(0, 31));
+      return out;
+    }
+
+    function buildExth(entries) {
+      let len = 12;
+      for (const e of entries) len += 8 + e.data.length;
+      const pad = (4 - (len % 4)) % 4;
+      const out = new Uint8Array(len + pad);
+      const dv = new DataView(out.buffer);
+      out.set(encodeUtf8('EXTH'), 0);
+      dv.setUint32(4, len + pad, false);
+      dv.setUint32(8, entries.length, false);
+      let p = 12;
+      for (const e of entries) {
+        dv.setUint32(p, e.type, false);
+        dv.setUint32(p + 4, 8 + e.data.length, false);
+        out.set(e.data, p + 8);
+        p += 8 + e.data.length;
+      }
+      return out;
+    }
+
+    function u32Bytes(v) {
+      const b = new Uint8Array(4);
+      new DataView(b.buffer).setUint32(0, v >>> 0, false);
+      return b;
+    }
+
+    function buildMobiMarkup(book) {
+      const secIndex = {};
+      book.sections.forEach(function (s, i) { secIndex[s.id] = i; });
+
+      // MOBI carries raster images only. Anything else (an SVG, say) has no record
+      // and its <img> is dropped rather than left pointing at nothing.
+      const imageIndex = {};
+      const imageNames = [];
+      for (const entry of book.resources) {
+        if (!/^image\/(jpeg|png|gif)$/.test(entry[1].mime)) continue;
+        imageNames.push(entry[0]);
+        imageIndex[entry[0]] = imageNames.length; // recindex is 1-based
+      }
+
+      const phKeys = [];
+      const ph = function (key) {
+        const i = phKeys.length;
+        phKeys.push(key);
+        return '#PH' + String(i).padStart(6, '0') + '#'; // exactly ten ASCII characters
+      };
+      const keyOf = function (sec, frag) { return sec + '#' + (frag || ''); };
+
+      const isExternal = function (href) { return /^[A-Za-z][\w+.-]*:/.test(href); };
+      // An internal href is either "#frag", "sec-0003.xhtml" or "text/sec-0003.xhtml#frag".
+      const resolveHref = function (href, fromSec) {
+        if (!href || isExternal(href)) return null;
+        const hash = href.indexOf('#');
+        const path = hash < 0 ? href : href.slice(0, hash);
+        const frag = hash < 0 ? '' : href.slice(hash + 1);
+        if (!path) return (fromSec in secIndex) ? { sec: fromSec, frag: frag } : null;
+        const m = /([^/]+)\.x?html?$/i.exec(path);
+        if (!m || !(m[1] in secIndex)) return null;
+        return { sec: m[1], frag: frag };
+      };
+
+      const needed = {}; // key -> { sec, frag }, the anchors something actually links to
+      const want = function (r) { needed[keyOf(r.sec, r.frag)] = r; return keyOf(r.sec, r.frag); };
+
+      // Rewrite the sections first: that registers the anchors and the placeholders.
+      const bodies = book.sections.map(function (s) {
+        const root = parseXML(s.html);
+        for (const img of findAll(root, 'img')) {
+          const src = (img.attrs.src || '').split('#')[0];
+          const seg = /([^/]+)$/.exec(src);
+          let name = seg ? seg[1] : '';
+          try { name = decodeURIComponent(name); } catch (e) { /* keep as-is */ }
+          const idx = imageIndex[name];
+          delete img.attrs.src;
+          if (idx) img.attrs.recindex = String(idx).padStart(5, '0');
+        }
+        for (const a of findAll(root, 'a')) {
+          const href = a.attrs.href;
+          if (!href || isExternal(href)) continue;
+          const r = resolveHref(href, s.id);
+          delete a.attrs.href; // a relative href would dangle in a MOBI
+          if (r) a.attrs.filepos = ph(want(r));
+        }
+        // An <img> without a record would render as a broken box, so it goes.
+        return toXml(root).replace(/<img\b(?![^<>]*\brecindex=)[^<>]*>/gi, '');
+      });
+
+      const toc = book.toc.length ? book.toc : book.sections.map(function (s, i) {
+        return { title: s.title || ('Section ' + (i + 1)), href: 'text/' + s.id + '.xhtml', level: 0 };
+      });
+
+      const parts = [];
+      const push = function (s) { parts.push(s); };
+      const mark = function (key) { parts.push({ mark: key }); };
+
+      push('<html><head><guide>');
+      push('<reference type="toc" title="Table of Contents" filepos="' + ph('#toc') + '"/>');
+      if (book.sections.length) {
+        push('<reference type="text" title="Beginning" filepos="'
+          + ph(want({ sec: book.sections[0].id, frag: '' })) + '"/>');
+      }
+      push('</guide></head><body>');
+
+      // The generated contents page. MOBI has no navigation document, so this is
+      // the table of contents the reader sees.
+      mark('#toc');
+      push('<div><h1>' + escapeXml(book.meta.title || 'Contents') + '</h1>');
+      for (const t of toc) {
+        const r = resolveHref(t.href, '');
+        const indent = t.level ? ' style="margin-left:' + (t.level * 1.2).toFixed(1) + 'em"' : '';
+        const label = escapeXml(t.title || '');
+        if (r) push('<p' + indent + '><a filepos="' + ph(want(r)) + '">' + label + '</a></p>');
+        else push('<p' + indent + '>' + label + '</p>');
+      }
+      push('</div>');
+
+      book.sections.forEach(function (s, i) {
+        push('<mbp:pagebreak/>');
+        mark(keyOf(s.id, ''));
+        push('<div>');
+        // Cut the serialized body at every anchor that is linked to, so the marks
+        // land exactly on the target tag.
+        const cuts = [];
+        for (const key in needed) {
+          const r = needed[key];
+          if (r.sec !== s.id || !r.frag) continue;
+          const esc = escapeAttr(r.frag).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const m = new RegExp('<[^<>]*\\sid\\s*=\\s*"' + esc + '"').exec(bodies[i]);
+          if (m) cuts.push({ at: m.index, key: key });
+        }
+        cuts.sort(function (a, b) { return a.at - b.at; });
+        let prev = 0;
+        for (const c of cuts) {
+          if (c.at < prev) continue;
+          push(bodies[i].slice(prev, c.at));
+          mark(c.key);
+          prev = c.at;
+        }
+        push(bodies[i].slice(prev));
+        push('</div>');
+      });
+      push('</body></html>');
+
+      // First pass: byte offsets of the marks. Second pass: fill the placeholders.
+      const offsets = {};
+      let cur = 0;
+      const texts = [];
+      for (const p of parts) {
+        if (typeof p === 'string') { texts.push(p); cur += encodeUtf8(p).length; }
+        else if (!(p.mark in offsets)) offsets[p.mark] = cur;
+      }
+      const filled = texts.join('').replace(/#PH(\d{6})#/g, function (all, d) {
+        const key = phKeys[parseInt(d, 10)];
+        const off = offsets[key];
+        // An unresolved target points at the contents page rather than nowhere.
+        return String(off === undefined ? (offsets['#toc'] || 0) : off).padStart(10, '0');
+      });
+
+      return { bytes: encodeUtf8(filled), imageNames: imageNames, imageIndex: imageIndex };
+    }
+
+    function writeMobi(book) {
+      const title = book.meta.title || 'Untitled';
+      const lang = (book.meta.language || 'en').slice(0, 2).toLowerCase();
+      const markup = buildMobiMarkup(book);
+      const textBytes = markup.bytes;
+
+      const RECSIZE = 4096;
+      const textRecs = [];
+      for (let p = 0; p < textBytes.length; p += RECSIZE) {
+        textRecs.push(palmdocCompress(textBytes.subarray(p, Math.min(p + RECSIZE, textBytes.length))));
+      }
+      if (!textRecs.length) textRecs.push(new Uint8Array(0));
+
+      const imageRecs = markup.imageNames.map(function (n) { return book.resources.get(n).bytes; });
+      const firstImage = 1 + textRecs.length;
+      const lastContent = firstImage + imageRecs.length - 1;
+
+      const exthEntries = [];
+      const textEntry = function (type, value) {
+        if (value) exthEntries.push({ type: type, data: encodeUtf8(String(value)) });
+      };
+      textEntry(EXTH_AUTHOR, book.meta.author);
+      textEntry(EXTH_PUBLISHER, book.meta.publisher);
+      textEntry(EXTH_PUBDATE, book.meta.date);
+      textEntry(EXTH_UPDATED_TITLE, title);
+      textEntry(EXTH_LANGUAGE, book.meta.language || 'en');
+      const coverIdx = markup.imageIndex[book.meta.coverRes];
+      if (coverIdx) {
+        // The cover is addressed by its offset from the first image record.
+        exthEntries.push({ type: EXTH_COVER_OFFSET, data: u32Bytes(coverIdx - 1) });
+      }
+      const exth = buildExth(exthEntries);
+
+      const MOBI_LEN = 232;
+      const fullName = encodeUtf8(title);
+      const fullNameOffset = 16 + MOBI_LEN + exth.length;
+      const rec0Len = fullNameOffset + Math.ceil((fullName.length + 2) / 4) * 4;
+      const rec0 = new Uint8Array(rec0Len);
+      const dv = new DataView(rec0.buffer);
+
+      // PalmDOC header
+      dv.setUint16(0, 2, false);                    // compression: PalmDOC
+      dv.setUint32(4, textBytes.length, false);     // uncompressed text length
+      dv.setUint16(8, textRecs.length, false);
+      dv.setUint16(10, RECSIZE, false);
+      dv.setUint16(12, 0, false);                   // encryption: none
+
+      // MOBI header
+      const M = 16;
+      rec0.set(encodeUtf8('MOBI'), M);
+      dv.setUint32(M + 0x04, MOBI_LEN, false);
+      dv.setUint32(M + 0x08, 2, false);             // type: book
+      dv.setUint32(M + 0x0C, 65001, false);         // text encoding: UTF-8
+      dv.setUint32(M + 0x10, uidFor(title + '|' + (book.meta.author || '')), false);
+      dv.setUint32(M + 0x14, 6, false);             // file version
+      for (let off = 0x18; off <= 0x3C; off += 4) dv.setUint32(M + off, 0xFFFFFFFF, false); // no indexes
+      dv.setUint32(M + 0x40, firstImage, false);    // first non-book record
+      dv.setUint32(M + 0x44, fullNameOffset, false);
+      dv.setUint32(M + 0x48, fullName.length, false);
+      dv.setUint32(M + 0x4C, LOCALE_BY_LANG[lang] || 9, false);
+      dv.setUint32(M + 0x58, 6, false);             // minimum reader version
+      dv.setUint32(M + 0x5C, firstImage, false);
+      dv.setUint32(M + 0x60, 0, false);             // no HUFF record
+      dv.setUint32(M + 0x70, 0x40, false);          // EXTH present
+      dv.setUint32(M + 0x94, 0xFFFFFFFF, false);
+      dv.setUint32(M + 0x98, 0xFFFFFFFF, false);    // DRM offset: none
+      dv.setUint32(M + 0x9C, 0, false);             // DRM count
+      dv.setUint16(M + 0xB0, 1, false);             // first content record
+      dv.setUint16(M + 0xB2, lastContent, false);   // last content record
+      dv.setUint32(M + 0xB4, 1, false);
+      dv.setUint32(M + 0xE0, 0, false);             // no trailing entries in the text records
+      dv.setUint32(M + 0xE4, 0xFFFFFFFF, false);
+      rec0.set(exth, 16 + MOBI_LEN);
+      rec0.set(fullName, fullNameOffset);
+
+      const records = [rec0].concat(textRecs, imageRecs, [new Uint8Array([0xE9, 0x8E, 0x0D, 0x0A])]);
+
+      // Palm database header, big-endian, followed by the record offset table.
+      const headerLen = 78 + records.length * 8 + 2;
+      let total = headerLen;
+      for (const r of records) total += r.length;
+      const out = new Uint8Array(total);
+      const odv = new DataView(out.buffer);
+      out.set(pdbNameBytes(title), 0);
+      const palmTime = Math.floor(Date.now() / 1000) + 2082844800; // Palm epoch is 1904
+      odv.setUint32(36, palmTime, false);
+      odv.setUint32(40, palmTime, false);
+      out.set(encodeUtf8('BOOK'), 60);
+      out.set(encodeUtf8('MOBI'), 64);
+      odv.setUint32(68, records.length * 2, false); // unique id seed
+      odv.setUint16(76, records.length, false);
+      let at = headerLen;
+      records.forEach(function (r, i) {
+        const p = 78 + i * 8;
+        odv.setUint32(p, at, false);
+        odv.setUint32(p + 4, i * 2, false); // attributes (0) plus a 3-byte unique id
+        out.set(r, at);
+        at += r.length;
+      });
+      return out;
+    }
+
+    function uidFor(seed) {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 0x01000193) >>> 0;
+      return h >>> 1; // keep it comfortably inside a signed 32-bit range
+    }
+
+    // ══ format detection ═════════════════════════════════════════════════════
+
+    function sniff(bytes) {
+      if (bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4B
+        && (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07)) return 'epub';
+      if (bytes.length > 68) {
+        const type = decodeUtf8(bytes.subarray(60, 68));
+        if (type === 'BOOKMOBI') return 'mobi';   // refined to azw3 by the reader
+        if (type === 'TEXtREAd') return 'mobi';
+      }
+      return 'txt';
+    }
+
+    // ══ orchestration ════════════════════════════════════════════════════════
+
+    function makeLog() {
+      const lines = [];
+      return {
+        lines: lines,
+        info: function (m) { lines.push({ level: 'info', msg: m }); },
+        warn: function (m) { lines.push({ level: 'warn', msg: m }); },
+      };
+    }
+
+    async function read(bytes, log) {
+      const kind = sniff(bytes);
+      if (kind === 'epub') {
+        const book = await readEpub(bytes, log);
+        book.sourceFormat = 'epub';
+        return book;
+      }
+      if (kind === 'mobi') {
+        const r = readMobiFile(bytes, log);
+        r.book.sourceFormat = r.format; // mobi or azw3, only the reader can tell
+        return r.book;
+      }
+      const book = readTxt(bytes, log);
+      book.sourceFormat = 'txt';
+      return book;
+    }
+
+    const WRITERS = {
+      epub: { write: writeEpub, ext: 'epub', mime: 'application/epub+zip' },
+      mobi: { write: writeMobi, ext: 'mobi', mime: 'application/x-mobipocket-ebook' },
+      txt: { write: writeTxt, ext: 'txt', mime: 'text/plain;charset=utf-8' },
+    };
+
+    async function write(book, target) {
+      const w = WRITERS[target];
+      if (!w) throw new Error('Cannot write ' + target + ' yet.');
+      return { bytes: await w.write(book), ext: w.ext, mime: w.mime };
+    }
+
+    return {
+      // pipeline
+      sniff: sniff, read: read, write: write, makeLog: makeLog,
+      targets: Object.keys(WRITERS),
+      // pieces, exported for the unit tests
+      zipRead: zipRead, zipWrite: zipWrite, crc32: crc32,
+      deflateRaw: deflateRaw, inflateRaw: inflateRaw,
+      parseXML: parseXML, findOne: findOne, findAll: findAll, textOf: textOf,
+      decodeEntities: decodeEntities, escapeXml: escapeXml,
+      resolvePath: resolvePath, htmlToText: htmlToText, decodeText: decodeText,
+      readEpub: readEpub, writeEpub: writeEpub, readTxt: readTxt, writeTxt: writeTxt,
+      emptyBook: emptyBook, addResource: addResource, sniffImageMime: sniffImageMime,
+      encodeUtf8: encodeUtf8, decodeUtf8: decodeUtf8,
+      readPalmDB: readPalmDB, parseMobiHeader: parseMobiHeader,
+      parseIndex: parseIndex, findIndexes: findIndexes,
+      palmdocDecompress: palmdocDecompress, palmdocCompress: palmdocCompress,
+      writeMobi: writeMobi, readMobiFile: readMobiFile,
+    };
+  })();
+  </script>
+
+  <script type="text/babel">
+    // No async/await in here: this block goes through preset-env, which would
+    // rewrite async functions to regeneratorRuntime (not loaded). Promises only.
+    const { useState, useRef, useCallback } = React;
+    const Core = window.EbookCore;
+
+    const FORMAT_LABEL = { epub: 'EPUB', mobi: 'MOBI', azw3: 'AZW3', txt: 'Text' };
+    const TARGETS = [
+      { id: 'epub', label: 'EPUB' },
+      { id: 'mobi', label: 'MOBI' },
+      { id: 'txt', label: 'Plain text' },
+    ];
+
+    function fmtSize(n) {
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function App() {
+      const [book, setBook] = useState(null);
+      const [fileName, setFileName] = useState('');
+      const [fileSize, setFileSize] = useState(0);
+      const [log, setLog] = useState([]);
+      const [error, setError] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [over, setOver] = useState(false);
+      const [target, setTarget] = useState('epub');
+      const [result, setResult] = useState(null);
+      const inputRef = useRef(null);
+
+      const reset = () => {
+        setBook(null); setLog([]); setError(''); setResult(null);
+        setFileName(''); setFileSize(0);
+      };
+
+      const loadFile = useCallback((file) => {
+        if (!file) return;
+        reset();
+        setBusy(true);
+        setFileName(file.name);
+        setFileSize(file.size);
+        const logger = Core.makeLog();
+        file.arrayBuffer()
+          .then((buf) => Core.read(new Uint8Array(buf), logger))
+          .then((b) => {
+            setBook(b);
+            setLog(logger.lines.slice());
+            setTarget(b.sourceFormat === 'txt' ? 'epub' : 'epub');
+            setBusy(false);
+          })
+          .catch((e) => {
+            setLog(logger.lines.slice());
+            setError(e && e.message ? e.message : String(e));
+            setBusy(false);
+          });
+      }, []);
+
+      const convert = () => {
+        if (!book) return;
+        setBusy(true);
+        setError('');
+        setResult(null);
+        Core.write(book, target)
+          .then((out) => {
+            const base = fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book';
+            const blob = new Blob([out.bytes], { type: out.mime });
+            setResult({ url: URL.createObjectURL(blob), name: base + '.' + out.ext, size: out.bytes.length });
+            setBusy(false);
+          })
+          .catch((e) => {
+            setError(e && e.message ? e.message : String(e));
+            setBusy(false);
+          });
+      };
+
+      const imageCount = book
+        ? Array.from(book.resources.values()).filter((r) => /^image\//.test(r.mime)).length
+        : 0;
+
+      const setMeta = (key, value) => {
+        setBook((b) => {
+          if (!b) return b;
+          const next = Object.assign({}, b);
+          next.meta = Object.assign({}, b.meta);
+          next.meta[key] = value;
+          return next;
+        });
+        setResult(null);
+      };
+
+      return (
+        <div className="container" style={{ maxWidth: 860 }}>
+          <h1 style={{ fontSize: '1.5rem', color: '#cbd5e1', marginBottom: 8 }}>E-Book Converter</h1>
+          <p style={{ color: '#94a3b8', maxWidth: '70ch' }}>
+            Convert e-books between EPUB, MOBI, AZW3 and plain text. Everything happens inside this
+            page: your file is never uploaded, and it stays on your device.
+          </p>
+
+          <div
+            className={'ec-drop' + (over ? ' over' : '')}
+            onClick={() => inputRef.current && inputRef.current.click()}
+            onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+            onDragLeave={() => setOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setOver(false);
+              if (e.dataTransfer.files && e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+            }}
+            style={{ marginBottom: 18 }}
+          >
+            <div style={{ color: '#cbd5e1', fontSize: 15, marginBottom: 4 }}>
+              Drop an e-book here, or click to choose one
+            </div>
+            <div style={{ color: '#64748b', fontSize: 13 }}>EPUB, MOBI, AZW3 or TXT</div>
+            <input
+              ref={inputRef}
+              type="file"
+              accept=".epub,.mobi,.azw3,.azw,.prc,.txt,application/epub+zip,text/plain"
+              style={{ display: 'none' }}
+              onChange={(e) => loadFile(e.target.files && e.target.files[0])}
+            />
+          </div>
+
+          {busy && <p style={{ color: '#94a3b8' }}>Working…</p>}
+
+          {error && (
+            <div className="ec-err" style={{ marginBottom: 18 }}>
+              <strong>Could not convert this file.</strong>
+              <div style={{ marginTop: 4 }}>{error}</div>
+            </div>
+          )}
+
+          {book && (
+            <div className="ec-card" style={{ marginBottom: 18 }}>
+              <dl className="ec-kv" style={{ marginBottom: 14 }}>
+                <dt>File</dt><dd>{fileName} ({fmtSize(fileSize)})</dd>
+                <dt>Detected</dt><dd>{FORMAT_LABEL[book.sourceFormat] || book.sourceFormat}</dd>
+                <dt>Content</dt>
+                <dd>{book.sections.length} sections · {imageCount} images · {book.toc.length} TOC entries</dd>
+              </dl>
+
+              <div className="ec-field" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 14px' }}>
+                <div>
+                  <label htmlFor="ec-title">Title</label>
+                  <input id="ec-title" type="text" value={book.meta.title}
+                    onChange={(e) => setMeta('title', e.target.value)} />
+                </div>
+                <div>
+                  <label htmlFor="ec-author">Author</label>
+                  <input id="ec-author" type="text" value={book.meta.author}
+                    onChange={(e) => setMeta('author', e.target.value)} />
+                </div>
+              </div>
+
+              <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
+                Convert to
+              </label>
+              <div className="seg-row" style={{ display: 'flex', marginBottom: 14 }}>
+                {TARGETS.map((t) => (
+                  <button
+                    key={t.id}
+                    className={'lang-seg' + (target === t.id ? ' active' : '')}
+                    onClick={() => { setTarget(t.id); setResult(null); }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+
+              <button onClick={convert} disabled={busy} style={{ width: 'auto' }}>
+                Convert
+              </button>
+
+              {result && (
+                <p style={{ marginTop: 14, marginBottom: 0 }}>
+                  <a href={result.url} download={result.name} style={{ fontWeight: 600 }}>
+                    Download {result.name}
+                  </a>
+                  <span style={{ color: '#64748b', fontSize: 13 }}> ({fmtSize(result.size)})</span>
+                </p>
+              )}
+            </div>
+          )}
+
+          {log.length > 0 && (
+            <ul className="ec-log" style={{ marginBottom: 18 }}>
+              {log.map((l, i) => (
+                <li key={i} className={l.level === 'warn' ? 'warn' : ''}>{l.msg}</li>
+              ))}
+            </ul>
+          )}
+
+          <p style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>
+            Reads EPUB, MOBI, AZW3 and plain text; writes EPUB, MOBI and plain text. Encrypted files
+            cannot be opened. Formats implemented from their public descriptions.
+          </p>
+          <p style={{ fontSize: 10, color: '#475569', marginTop: 0 }}>
+            This project is not affiliated with or endorsed by Amazon; "Kindle" and "Amazon" are used
+            only to name the file formats. Personal hobby project, non-commercial.
+          </p>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
