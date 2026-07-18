@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="de" data-theme="dark" data-section="alexander">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Babyschlaf, Stillen &amp; Schreien – Alexander Alber</title>
+  <meta name="description" content="Interaktive Verteilungskurven für Babyschlaf, Stillfrequenz und Schreien im ersten Lebensjahr.">
+  <link rel="canonical" href="https://alber.me/alexander/tools/baby-basics.html">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/alexander/">About</a></li>
+        <li><a href="/alexander/publications.html">Publications</a></li>
+        <li><a href="/alexander/writing.html">Writing</a></li>
+        <li><a href="/alexander/projects.html">Projects &amp; Art</a></li>
+        <li><a href="/alexander/miscellaneous.html" aria-current="page">Miscellaneous</a></li>
+        <li><a href="/alexander/cv.html">CV</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/alexander/visualizations-for-parents.html">← Visualizations for Parents</a>
+    </p>
+    <div id="root"></div>
+  </main>
+
+  <script type="text/babel">
+    const { useState, useMemo, useRef } = React;
+
+    // ─── DATA ────────────────────────────────────────────────────────────────
+    // All arrays: [week, P10, P25, P50, P75, P90]
+    // Week 0 = birth, week 52 = 12 months
+
+    // Total sleep h/24h
+    // Iglowstein 2003 (direct percentiles at 1,3,6,9,12 Mo); 0–4wk from Galland 2012
+    // P10=M−1.28·SD, P25=M−0.67·SD, P75=M+0.67·SD, P90=M+1.28·SD
+    const SLEEP_TOTAL = [
+      [ 0, 13.4, 14.7, 16.5, 18.0, 19.0], // Galland 2012: M≈16.5, SD≈2.0 (newborn); cap P90 at 19
+      [ 4, 11.9, 13.2, 14.5, 15.8, 17.1], // M=14.5, SD=2.0
+      [13, 12.2, 13.3, 14.5, 15.7, 16.8], // M=14.5, SD=1.8 (Iglowstein ~3 Mo interpolated)
+      [26, 11.8, 12.9, 14.2, 15.5, 16.6], // Iglowstein 6 Mo: M=14.2, SD=1.9
+      [39, 11.7, 12.8, 13.9, 15.0, 16.1], // Iglowstein 9 Mo: M=13.9, SD=1.7
+      [52, 12.4, 13.1, 13.9, 14.7, 15.4], // Iglowstein 12 Mo: M=13.9, SD=1.2
+    ];
+
+    // Longest continuous night stretch h
+    // Henderson 2010 (M±SD per month → normal assumption); 0–3wk estimated
+    const SLEEP_STRETCH = [
+      [ 0, 0.5, 1.0, 1.8, 2.6, 3.3],
+      [ 4, 1.2, 2.0, 3.5, 5.0, 6.3],
+      [ 8, 1.8, 3.0, 4.8, 6.6, 8.0],
+      [13, 3.5, 5.2, 6.8, 8.4, 9.8],  // M=6.8, SD≈1.9
+      [17, 5.0, 6.5, 7.8, 9.1, 10.3], // M=7.8, SD≈1.8
+      [26, 6.8, 7.8, 9.0, 10.2, 11.2],// M=9.0, SD≈1.5
+      [39, 7.4, 8.5, 9.5, 10.5, 11.5],
+      [52, 8.2, 9.1, 10.1, 11.1, 11.9],
+    ];
+
+    // Breastfeeding frequency meals/day — Kent 2006 (1–6 Mo) + AAP/WHO for later months
+    // Note: right-skewed distribution; P90 adjusted upward
+    const FEED_BF = [
+      [ 0, 7.0, 8.5, 10.5, 13.0, 15.0],
+      [ 4, 7.0, 9.0, 11.0, 13.0, 15.5],
+      [ 8, 6.5, 8.3, 10.0, 11.7, 13.5],
+      [13, 5.5, 7.0,  8.5, 10.0, 11.5],
+      [22, 4.5, 6.0,  7.5,  9.0, 10.5],
+      [26, 3.8, 5.0,  6.0,  7.2,  8.5], // Beikosteinführung
+      [39, 2.5, 3.5,  4.5,  5.5,  6.5],
+      [52, 2.0, 3.0,  4.0,  5.0,  6.0],
+    ];
+
+    // Formula frequency meals/day — AAP HealthyChildren + DARLING (Heinig 1993)
+    const FEED_FF = [
+      [ 0, 5.0, 6.0, 7.5, 9.0, 10.5],
+      [ 4, 5.0, 6.0, 7.5, 9.0, 10.5],
+      [ 8, 4.5, 5.5, 6.5, 7.5,  8.5],
+      [13, 4.0, 5.0, 6.0, 7.0,  8.0],
+      [22, 3.5, 4.3, 5.0, 5.7,  6.5],
+      [26, 3.5, 4.3, 5.0, 5.7,  6.5],
+      [39, 2.5, 3.3, 4.0, 4.7,  5.5],
+      [52, 2.0, 2.5, 3.0, 3.5,  4.2],
+    ];
+
+    // Crying+fussing h/day
+    // Wolke 2017 (weeks 1–12, meta-analysis n=8,690); Vermillet 2022 (3–12 Mo, n=7,580)
+    // Right-skewed → P10 clamped at 0, P90 slightly inflated vs. simple normal
+    const CRYING = [
+      [ 0, 0.4, 0.9, 1.95, 2.75, 3.60],
+      [ 1, 0.4, 0.9, 1.95, 2.75, 3.60],
+      [ 3, 0.3, 0.9, 1.97, 2.80, 3.70],
+      [ 5, 0.4, 1.1, 2.22, 3.05, 3.90], // peak Wolke 2017: M=133min, SD=70min
+      [ 8, 0.4, 1.0, 1.80, 2.45, 3.15],
+      [11, 0.0, 0.5, 1.13, 1.68, 2.20],
+      [13, 0.0, 0.3, 0.92, 1.45, 1.95],
+      [17, 0.0, 0.3, 0.83, 1.30, 1.80],
+      [22, 0.0, 0.2, 0.75, 1.20, 1.65],
+      [26, 0.0, 0.2, 0.67, 1.08, 1.55],
+      [35, 0.0, 0.2, 0.63, 1.00, 1.45],
+      [52, 0.0, 0.2, 0.58, 0.93, 1.38],
+    ];
+
+    // ─── HELPERS ─────────────────────────────────────────────────────────────
+    const fmtDE = d => d.toLocaleDateString("de-DE",{day:"2-digit",month:"short",year:"2-digit"});
+
+    function lerp(data, wk, col) {
+      if (wk <= data[0][0]) return data[0][col];
+      if (wk >= data[data.length-1][0]) return data[data.length-1][col];
+      let i = 1;
+      while (i < data.length && data[i][0] < wk) i++;
+      const a = data[i-1], b = data[i];
+      const t = (wk - a[0]) / (b[0] - a[0]);
+      return a[col] + t * (b[col] - a[col]);
+    }
+
+    // Closed area path: forward along low percentile, back along high percentile
+    function band(data, colLow, colHigh, xOf, yOf) {
+      const fwd = data.map(d => `${xOf(d[0])},${yOf(d[colLow])}`).join(" L ");
+      const bwd = [...data].reverse().map(d => `${xOf(d[0])},${yOf(d[colHigh])}`).join(" L ");
+      return `M ${fwd} L ${bwd} Z`;
+    }
+
+    function line(data, col, xOf, yOf) {
+      return data.map((d,i) => `${i?"L":"M"}${xOf(d[0])},${yOf(d[col])}`).join(" ");
+    }
+
+    // ─── COMPONENT ───────────────────────────────────────────────────────────
+    function BabyBasics() {
+      const [bdayStr,  setBdayStr]  = useState(() => {
+        const d = new Date(); d.setMonth(d.getMonth() - 3); return d.toISOString().slice(0,10);
+      });
+      const [todayStr, setTodayStr] = useState(new Date().toISOString().slice(0,10));
+      const [feeding,  setFeeding]  = useState("bf");        // "bf"|"ff"|"both"
+      const [showStretch, setShowStretch] = useState(true);
+      const [tip, setTip] = useState(null);
+      const svgRef = useRef(null);
+
+      const bday  = useMemo(() => new Date(bdayStr  + "T12:00:00"), [bdayStr]);
+      const today = useMemo(() => new Date(todayStr + "T12:00:00"), [todayStr]);
+      const ageWk = useMemo(() => (today - bday) / (7 * 86400000), [bday, today]);
+      const showToday = ageWk >= 0 && ageWk <= 52;
+
+      // ── SVG layout ─────────────────────────────────────────────────────────
+      const W  = 1180;
+      const ML = 54, MR = 52;
+      const pw = W - ML - MR;
+      const PH0 = 338;  // sleep panel (+30%)
+      const PH1 = 208;  // feeding panel (−20%)
+      const PH2 = 208;  // crying panel  (−20%)
+      const GAP = 28;
+      const MT = 22;
+
+      const panels = [
+        { y: MT,                       h: PH0, yMin: 0,  yMax: 19, label: "Schlaf gesamt (h / 24 h)",       yticks: [2,4,6,8,10,12,14,16,18], yfmt: v=>`${v}h` },
+        { y: MT + PH0 + GAP,           h: PH1, yMin: 0,  yMax: 16, label: "Mahlzeiten pro Tag",              yticks: [2,4,6,8,10,12,14], yfmt: v=>`${v}×`   },
+        { y: MT + PH0 + PH1 + 2*GAP,  h: PH2, yMin: 0,  yMax: 4,  label: "Schreien & Quengeln (h / Tag)",  yticks: [0.5,1,1.5,2,2.5,3,3.5], yfmt: v=>`${v}h` },
+      ];
+      const totalH = MT + PH0 + PH1 + PH2 + 2*GAP + 28;
+
+      const xOf = wk => ML + (wk / 52) * pw;
+      const yOf = (v, p) => p.y + p.h - ((v - p.yMin) / (p.yMax - p.yMin)) * p.h;
+
+      const X_TICKS = [0,4,8,13,17,22,26,30,35,39,43,48,52];
+      const MO_LABELS = {0:"Geb.",4:"1M",8:"2M",13:"3M",17:"4M",22:"5M",26:"6M",30:"7M",35:"8M",39:"9M",43:"10M",48:"11M",52:"12M"};
+
+      const handleMove = e => {
+        if (!svgRef.current) return;
+        const rect = svgRef.current.getBoundingClientRect();
+        const svgX = (e.clientX - rect.left) * (W / rect.width);
+        const wk = Math.max(0, Math.min(52, (svgX - ML) / pw * 52));
+        setTip({
+          wk,
+          wkR: Math.round(wk),
+          sleep:   lerp(SLEEP_TOTAL,   wk, 3),
+          p25s:    lerp(SLEEP_TOTAL,   wk, 2), p75s: lerp(SLEEP_TOTAL, wk, 4),
+          stretch: lerp(SLEEP_STRETCH, wk, 3),
+          feedBf:  lerp(FEED_BF,       wk, 3),
+          feedFf:  lerp(FEED_FF,       wk, 3),
+          cry:     lerp(CRYING,        wk, 3),
+          p25c:    lerp(CRYING,        wk, 2), p75c: lerp(CRYING, wk, 4),
+        });
+      };
+
+      const inp = {border:"1px solid #e2e8f0",borderRadius:8,padding:"5px 10px",
+        fontSize:13,color:"#0f172a",background:"white",fontFamily:"inherit"};
+
+      const btnStyle = (active, col) => ({
+        padding:"5px 14px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",
+        border:`1.5px solid ${active ? col : "#e2e8f0"}`,
+        background: active ? col : "white",
+        color: active ? "white" : "#64748b",
+        transition:"all .15s",
+      });
+
+      const showBf = feeding === "bf" || feeding === "both";
+      const showFf = feeding === "ff" || feeding === "both";
+      const colBf = "#10b981", colFf = "#f97316", colSleep = "#3b82f6", colStretch = "#8b5cf6", colCry = "#f43f5e";
+
+      return (
+        <div style={{fontFamily:"system-ui,sans-serif",background:"#f8fafc",minHeight:"100vh",padding:16}}>
+        <div style={{maxWidth:1240,margin:"0 auto"}}>
+
+          {/* ── HEADER CARD ── */}
+          <div style={{background:"white",borderRadius:12,border:"1px solid #e2e8f0",
+            padding:"18px 24px",marginBottom:12,
+            display:"flex",alignItems:"flex-start",justifyContent:"space-between",flexWrap:"wrap",gap:16}}>
+            <div style={{flex:1,minWidth:320}}>
+              <h1 style={{fontSize:21,fontWeight:700,color:"#0f172a",margin:"0 0 4px"}}>
+                Babyschlaf, Stillen &amp; Schreien – Verteilungen
+              </h1>
+              <p style={{fontSize:11,color:"#94a3b8",margin:"0 0 14px",lineHeight:1.5}}>
+                Quellen: Iglowstein 2003 (Schlaf gesamt, n=493, direkte Perzentile) · Henderson 2010 (Nachtsequenz, n=75) ·
+                Kent 2006 (Stillfrequenz, n=71) · AAP/ESPGHAN (Flasche) · Wolke 2017 (Schreien, n=8.690) ·
+                Vermillet 2022 (Schreien 3–12 Mo, n=7.580) — Bänder außer Schlaf gesamt aus Mittel ± SD rekonstruiert (Normalverteilungsannahme, approximativ).
+              </p>
+              <div style={{display:"flex",flexWrap:"wrap",gap:12,alignItems:"center"}}>
+                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"#64748b"}}>
+                  Geburtsdatum
+                  <input type="date" value={bdayStr} onChange={e=>setBdayStr(e.target.value)} style={inp}/>
+                </label>
+                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"#64748b"}}>
+                  Heute
+                  <input type="date" value={todayStr} onChange={e=>setTodayStr(e.target.value)} style={inp}/>
+                </label>
+                {showToday && <span style={{fontSize:13,color:"#94a3b8"}}>
+                  Alter: <strong style={{color:"#dc2626"}}>{Math.round(ageWk)} Wo · {(ageWk/4.33).toFixed(1)} Mo</strong>
+                </span>}
+              </div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:10,minWidth:220}}>
+              <div>
+                <div style={{fontSize:11,color:"#94a3b8",fontWeight:700,marginBottom:5,letterSpacing:.5}}>ERNÄHRUNG</div>
+                <div style={{display:"flex",gap:6}}>
+                  {[["bf","Brust",colBf],["ff","Flasche",colFf],["both","Beides","#6366f1"]].map(([k,lbl,col])=>(
+                    <button key={k} onClick={()=>setFeeding(k)} style={btnStyle(feeding===k,col)}>{lbl}</button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={{fontSize:11,color:"#94a3b8",fontWeight:700,marginBottom:5,letterSpacing:.5}}>EINBLENDUNGEN</div>
+                <button onClick={()=>setShowStretch(s=>!s)} style={btnStyle(showStretch,colStretch)}>
+                  Längste Nachtsequenz
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* ── CHART ── */}
+          <div style={{background:"white",borderRadius:12,border:"1px solid #e2e8f0",
+            padding:"16px 8px 8px",overflowX:"auto"}}>
+            <svg ref={svgRef} width={W} height={totalH}
+              style={{display:"block",cursor:"crosshair"}}
+              onMouseMove={handleMove}
+              onMouseLeave={()=>setTip(null)}>
+
+              {/* Panel backgrounds + y-grids */}
+              {panels.map((p,pi) => (
+                <g key={pi}>
+                  <rect x={ML} y={p.y} width={pw} height={p.h} fill="white" stroke="#e2e8f0"/>
+                  {p.yticks.map(v => (
+                    <g key={v}>
+                      <line x1={ML} y1={yOf(v,p)} x2={ML+pw} y2={yOf(v,p)}
+                        stroke="#e2e8f0" strokeDasharray="2,3"/>
+                      <text x={ML-6} y={yOf(v,p)+4} textAnchor="end" fill="#94a3b8" fontSize={10}>
+                        {p.yfmt(v)}
+                      </text>
+                    </g>
+                  ))}
+                  {/* Panel label */}
+                  <text x={ML+10} y={p.y+17} fill="#64748b" fontSize={12} fontWeight={700}>{p.label}</text>
+                </g>
+              ))}
+
+              {/* X-axis ticks across all panels */}
+              {X_TICKS.map(wk => (
+                <g key={wk}>
+                  <line x1={xOf(wk)} y1={panels[0].y} x2={xOf(wk)} y2={panels[2].y+panels[2].h}
+                    stroke={wk===0||wk===52?"#cbd5e1":"#e2e8f0"}
+                    strokeWidth={wk===0||wk===52?1.5:1}
+                    strokeDasharray={wk===0||wk===52?undefined:"2,4"}/>
+                  <text x={xOf(wk)} y={panels[2].y+panels[2].h+16}
+                    textAnchor="middle" fill="#94a3b8" fontSize={10}>
+                    {MO_LABELS[wk]}
+                  </text>
+                </g>
+              ))}
+
+              {/* Beikost marker at week 26 */}
+              {[0,1,2].map(pi=>(
+                <line key={pi} x1={xOf(26)} y1={panels[pi].y} x2={xOf(26)} y2={panels[pi].y+panels[pi].h}
+                  stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="5,3" opacity={0.55}/>
+              ))}
+              <text x={xOf(26)} y={panels[0].y-8} textAnchor="middle"
+                fill="#f59e0b" fontSize={10} fontWeight={700}>Zufütterung (WHO: ~6 Mo)</text>
+
+              {/* ── SLEEP PANEL ── */}
+              {(() => {
+                const p = panels[0];
+                const yf = v => yOf(v, p);
+                return <>
+                  {/* Total sleep bands */}
+                  <path d={band(SLEEP_TOTAL,1,5,xOf,yf)} fill={colSleep} opacity={0.08}/>
+                  <path d={band(SLEEP_TOTAL,2,4,xOf,yf)} fill={colSleep} opacity={0.18}/>
+                  <path d={line(SLEEP_TOTAL,3,xOf,yf)} fill="none" stroke={colSleep} strokeWidth={2.5}/>
+                  {/* Percentile labels at right edge */}
+                  {[1,2,3,4,5].map((ci,i) => {
+                    const last = SLEEP_TOTAL[SLEEP_TOTAL.length-1];
+                    return <text key={ci} x={xOf(last[0])+4} y={yf(last[ci])+4}
+                      fill={colSleep} fontSize={9} fontWeight={ci===3?700:400} opacity={ci===3?1:0.6}>
+                      {["P10","P25","P50","P75","P90"][i]}
+                    </text>;
+                  })}
+
+                  {/* Longest stretch overlay */}
+                  {showStretch && <>
+                    <path d={band(SLEEP_STRETCH,1,5,xOf,yf)} fill={colStretch} opacity={0.07}/>
+                    <path d={band(SLEEP_STRETCH,2,4,xOf,yf)} fill={colStretch} opacity={0.13}/>
+                    <path d={line(SLEEP_STRETCH,3,xOf,yf)} fill="none"
+                      stroke={colStretch} strokeWidth={2} strokeDasharray="7,3"/>
+                    {[1,5].map((ci,i) => {
+                      const last = SLEEP_STRETCH[SLEEP_STRETCH.length-1];
+                      return <text key={ci} x={xOf(last[0])+4} y={yf(last[ci])+4}
+                        fill={colStretch} fontSize={9} opacity={0.6}>{["P10","P90"][i]}</text>;
+                    })}
+                    {/* "P50 Nacht" label */}
+                    {(() => {
+                      const last = SLEEP_STRETCH[SLEEP_STRETCH.length-1];
+                      return <text x={xOf(last[0])+4} y={yf(last[3])-5}
+                        fill={colStretch} fontSize={9} fontWeight={700}>P50 Nacht</text>;
+                    })()}
+                    {/* Legend swatch in panel */}
+                    <rect x={ML+10} y={p.y+p.h-26} width={20} height={4} rx={2} fill={colStretch} opacity={0.4}/>
+                    <line x1={ML+12} y1={p.y+p.h-24} x2={ML+28} y2={p.y+p.h-24}
+                      stroke={colStretch} strokeWidth={2} strokeDasharray="5,2"/>
+                    <text x={ML+34} y={p.y+p.h-20} fill={colStretch} fontSize={10} opacity={0.85}>
+                      Längste Nachtsequenz
+                    </text>
+                  </>}
+                </>;
+              })()}
+
+              {/* ── FEEDING PANEL ── */}
+              {(() => {
+                const p = panels[1];
+                const yf = v => yOf(v, p);
+                return <>
+                  {showBf && <>
+                    <path d={band(FEED_BF,1,5,xOf,yf)} fill={colBf} opacity={0.09}/>
+                    <path d={band(FEED_BF,2,4,xOf,yf)} fill={colBf} opacity={0.19}/>
+                    <path d={line(FEED_BF,3,xOf,yf)} fill="none" stroke={colBf} strokeWidth={2.5}/>
+                    {(() => {
+                      const last = FEED_BF[FEED_BF.length-1];
+                      return <>
+                        <text x={xOf(last[0])+4} y={yf(last[5])+4} fill={colBf} fontSize={9} opacity={0.6}>P90</text>
+                        <text x={xOf(last[0])+4} y={yf(last[3])+4} fill={colBf} fontSize={10} fontWeight={700}>Brust</text>
+                        <text x={xOf(last[0])+4} y={yf(last[1])+4} fill={colBf} fontSize={9} opacity={0.6}>P10</text>
+                      </>;
+                    })()}
+                  </>}
+                  {showFf && <>
+                    <path d={band(FEED_FF,1,5,xOf,yf)} fill={colFf} opacity={0.09}/>
+                    <path d={band(FEED_FF,2,4,xOf,yf)} fill={colFf} opacity={0.19}/>
+                    <path d={line(FEED_FF,3,xOf,yf)} fill="none" stroke={colFf} strokeWidth={2.5}/>
+                    {(() => {
+                      const last = FEED_FF[FEED_FF.length-1];
+                      return <>
+                        <text x={xOf(last[0])+4} y={yf(last[5])+4} fill={colFf} fontSize={9} opacity={0.6}>P90</text>
+                        <text x={xOf(last[0])+4} y={yf(last[3])+4} fill={colFf} fontSize={10} fontWeight={700}>Flasche</text>
+                        <text x={xOf(last[0])+4} y={yf(last[1])+4} fill={colFf} fontSize={9} opacity={0.6}>P10</text>
+                      </>;
+                    })()}
+                  </>}
+                </>;
+              })()}
+
+              {/* ── CRYING PANEL ── */}
+              {(() => {
+                const p = panels[2];
+                const yf = v => yOf(v, p);
+                return <>
+                  {/* Wessel colic threshold: >3h/day */}
+                  <line x1={ML} y1={yf(3)} x2={ML+pw} y2={yf(3)}
+                    stroke="#dc2626" strokeWidth={1.5} strokeDasharray="6,4" opacity={0.35}/>
+                  <text x={ML+6} y={yf(3)-5} fill="#dc2626" fontSize={10} opacity={0.65}>
+                    Kolik-Grenze (Wessel &gt; 3 h)
+                  </text>
+
+                  <path d={band(CRYING,1,5,xOf,yf)} fill={colCry} opacity={0.09}/>
+                  <path d={band(CRYING,2,4,xOf,yf)} fill={colCry} opacity={0.19}/>
+                  <path d={line(CRYING,3,xOf,yf)} fill="none" stroke={colCry} strokeWidth={2.5}/>
+                  {[1,2,3,4,5].map((ci,i) => {
+                    const last = CRYING[CRYING.length-1];
+                    return <text key={ci} x={xOf(last[0])+4} y={yf(last[ci])+4}
+                      fill={colCry} fontSize={9} fontWeight={ci===3?700:400} opacity={ci===3?1:0.6}>
+                      {["P10","P25","P50","P75","P90"][i]}
+                    </text>;
+                  })}
+                </>;
+              })()}
+
+              {/* ── TODAY MARKER ── */}
+              {showToday && (() => {
+                const tx = xOf(ageWk);
+                const toLeft = ageWk > 36;
+                const lx = toLeft ? tx - 7 : tx + 7;
+                const anchor = toLeft ? "end" : "start";
+                const dot = (dataset, p, col, label, color, fmt, bold) => {
+                  const v = lerp(dataset, ageWk, col);
+                  const cy = yOf(v, p);
+                  return <g key={`${label}`}>
+                    <circle cx={tx} cy={cy} r={bold ? 4 : 2.5}
+                      fill="white" stroke={color} strokeWidth={bold ? 2 : 1.5}/>
+                    <text x={lx} y={cy + 4} textAnchor={anchor}
+                      fill={color} fontSize={bold ? 11 : 9} fontWeight={bold ? 700 : 400}>
+                      {label}: {fmt(v)}
+                    </text>
+                  </g>;
+                };
+                const hfmt = v => `${v.toFixed(1)} h`;
+                const mfmt = v => `${Math.round(v * 60)} min`;
+                const ffmt = v => `${v.toFixed(1)}×`;
+                return <>
+                  <line x1={tx} y1={panels[0].y} x2={tx} y2={panels[2].y + panels[2].h}
+                    stroke="#dc2626" strokeWidth={1.5} strokeDasharray="4,3"/>
+                  <text x={tx} y={panels[0].y - 8} textAnchor="middle"
+                    fill="#dc2626" fontSize={10} fontWeight={600}>{fmtDE(today)}</text>
+
+                  {/* Sleep panel intersections */}
+                  {[1,2,3,4,5].map((col,i) =>
+                    dot(SLEEP_TOTAL, panels[0], col, ["P10","P25","P50","P75","P90"][i], colSleep, hfmt, col===3)
+                  )}
+                  {showStretch && dot(SLEEP_STRETCH, panels[0], 3, "Nacht P50", colStretch, hfmt, true)}
+
+                  {/* Feeding panel intersections */}
+                  {showBf && dot(FEED_BF, panels[1], 3, "Brust P50", colBf, ffmt, true)}
+                  {showBf && dot(FEED_BF, panels[1], 1, "P10", colBf, ffmt, false)}
+                  {showBf && dot(FEED_BF, panels[1], 5, "P90", colBf, ffmt, false)}
+                  {showFf && dot(FEED_FF, panels[1], 3, "Flasche P50", colFf, ffmt, true)}
+                  {showFf && dot(FEED_FF, panels[1], 1, "P10 ", colFf, ffmt, false)}
+                  {showFf && dot(FEED_FF, panels[1], 5, "P90 ", colFf, ffmt, false)}
+
+                  {/* Crying panel intersections */}
+                  {[1,2,3,4,5].map((col,i) =>
+                    dot(CRYING, panels[2], col, ["P10","P25","P50","P75","P90"][i], colCry, mfmt, col===3)
+                  )}
+                </>;
+              })()}
+
+              {/* ── TOOLTIP CROSSHAIR ── */}
+              {tip && (
+                <line x1={xOf(tip.wk)} y1={panels[0].y}
+                  x2={xOf(tip.wk)} y2={panels[2].y+panels[2].h}
+                  stroke="#94a3b8" strokeWidth={1} strokeDasharray="2,3" opacity={0.6}/>
+              )}
+
+            </svg>
+
+            {/* ── TOOLTIP BAR ── */}
+            <div style={{
+              minHeight:44,padding:"10px 16px",borderTop:"1px solid #f1f5f9",
+              display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:12,color:"#64748b"
+            }}>
+              {tip ? <>
+                <strong style={{color:"#0f172a"}}>
+                  Woche {tip.wkR} &nbsp;·&nbsp; ≈ {(tip.wkR/4.33).toFixed(1)} Monate
+                </strong>
+                <span>
+                  🛏 Schlaf P50: <strong style={{color:colSleep}}>{tip.sleep.toFixed(1)} h</strong>
+                  <span style={{color:"#94a3b8"}}> (P25–P75: {tip.p25s.toFixed(1)}–{tip.p75s.toFixed(1)} h)</span>
+                </span>
+                {showStretch && <span>
+                  🌙 Nachtsequenz P50: <strong style={{color:colStretch}}>{tip.stretch.toFixed(1)} h</strong>
+                </span>}
+                {showBf && <span>
+                  🤱 Brust P50: <strong style={{color:colBf}}>{tip.feedBf.toFixed(1)}×/Tag</strong>
+                </span>}
+                {showFf && <span>
+                  🍼 Flasche P50: <strong style={{color:colFf}}>{tip.feedFf.toFixed(1)}×/Tag</strong>
+                </span>}
+                <span>
+                  😢 Schreien P50: <strong style={{color:colCry}}>{Math.round(tip.cry*60)} min/Tag</strong>
+                  <span style={{color:"#94a3b8"}}> (P25–P75: {Math.round(tip.p25c*60)}–{Math.round(tip.p75c*60)} min)</span>
+                </span>
+              </> : (
+                <span style={{color:"#cbd5e1"}}>Maus über das Diagramm bewegen für Details …</span>
+              )}
+            </div>
+          </div>
+
+          {/* ── LEGEND ── */}
+          <div style={{background:"white",borderRadius:12,border:"1px solid #e2e8f0",
+            padding:"12px 20px",marginTop:12,display:"flex",gap:20,flexWrap:"wrap",alignItems:"center"}}>
+            <span style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:.5}}>LEGENDE</span>
+            {[
+              {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="#64748b" opacity={0.15}/>, label:"P10–P90 (80 % aller Kinder)"},
+              {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="#475569" opacity={0.35}/>, label:"P25–P75 (mittlere 50 %)"},
+              {render:<line x1={2} y1={8} x2={30} y2={8} stroke="#0f172a" strokeWidth={2.5}/>, label:"Median (P50)"},
+              {render:<><line x1={2} y1={8} x2={30} y2={8} stroke={colStretch} strokeWidth={2} strokeDasharray="6,3"/></>, label:"Längste Nachtsequenz (P50, gestrichelt)"},
+            ].map(({render,label},i)=>(
+              <span key={i} style={{display:"flex",alignItems:"center",gap:7,fontSize:12,color:"#64748b"}}>
+                <svg width={32} height={16}>{render}</svg>{label}
+              </span>
+            ))}
+            <span style={{fontSize:11,color:"#94a3b8",marginLeft:"auto",maxWidth:340,textAlign:"right",lineHeight:1.4}}>
+              Verteilungen teils unter Normalverteilungsannahme aus publizierten Mittel + SD geschätzt — nicht gleichwertig mit WHO-Wachstumskurven. Details in TEMP.md.
+            </span>
+          </div>
+
+        </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<BabyBasics/>);
+  </script>
+</body>
+</html>
