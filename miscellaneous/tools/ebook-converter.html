@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>E-Book Converter - Alexander Alber</title>
-  <meta name="description" content="Convert EPUB, MOBI, AZW3 and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
+  <meta name="description" content="Convert EPUB, MOBI, AZW3, Markdown, HTML and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/ebook-converter.html">
   <meta property="og:title" content="E-Book Converter - fully offline, in your browser">
-  <meta property="og:description" content="Convert EPUB, MOBI, AZW3 and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
+  <meta property="og:description" content="Convert EPUB, MOBI, AZW3, Markdown, HTML and TXT e-books to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, Pandoc bundle or plain text in your browser. Nothing is uploaded: the file never leaves your device.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/ebook-converter.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -35,6 +35,13 @@
     .ec-log li::before { content: "› "; color: #475569; }
     .ec-log li.warn { color: #d97706; }
     .ec-log li.warn::before { content: "! "; color: #d97706; }
+    .ec-snips li::before { content: "· "; color: #475569; }
+    .ec-snips mark { background: rgba(15,181,173,.22); color: #e2e8f0;
+      padding: 0 1px; border-radius: 2px; }
+    .ec-edit { border: 1px solid #334155; border-radius: 8px; background: rgba(15,23,42,.35);
+      padding: 10px 14px; margin-bottom: 14px; }
+    .ec-edit summary { cursor: pointer; color: #94a3b8; font-size: 14px; }
+    .ec-edit[open] summary { margin-bottom: 12px; }
     .ec-err { border: 1px solid #7f1d1d; background: rgba(127,29,29,.15); border-radius: 8px;
       padding: 12px 14px; color: #fca5a5; font-size: 14px; }
     .ec-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13.5px; }
@@ -88,7 +95,7 @@
     <div id="root">
       <div class="container">
         <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">E-Book Converter</h1>
-        <p style="color:#94a3b8;max-width:70ch">Convert EPUB, MOBI, AZW3 and plain text. Everything runs in your browser: the file is never uploaded.</p>
+        <p style="color:#94a3b8;max-width:70ch">Convert EPUB, MOBI, AZW3, Markdown, HTML and plain text. Everything runs in your browser: the file is never uploaded.</p>
       </div>
     </div>
   </main>
@@ -4165,6 +4172,230 @@
       pandoc: { label: 'Pandoc bundle', read: false,     write: true,      exts: ['.zip'] },
     };
 
+    // ══ book editing ═════════════════════════════════════════════════════════
+    // Transforms for the loaded book, used by the nerd tab. All of them work
+    // on the text content of a section's markup, never on tags or attributes.
+
+    // Tags whose text content the typography cleaner must not touch.
+    const TYPO_SKIP_TAGS = {
+      pre: 1, code: 1, kbd: 1, samp: 1, tt: 1, script: 1, style: 1,
+      math: 1, svg: 1, textarea: 1,
+    };
+
+    function escapeTextNode(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Split markup into tags/comments and text runs, decode entities, hand
+    // every text run to fn and re-escape its return value. skipTags (may be
+    // null) marks elements whose content passes through untouched. onTag, if
+    // given, sees every tag, for transforms that track context across tags.
+    function mapTextNodes(html, fn, skipTags, onTag) {
+      const parts = String(html).split(/(<!--[\s\S]*?-->|<[^>]*>)/);
+      const out = [];
+      let skip = 0;
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        if (!p) continue;
+        if (p.charAt(0) === '<') {
+          const m = /^<\s*(\/?)([A-Za-z][A-Za-z0-9:-]*)/.exec(p);
+          if (m && skipTags
+              && Object.prototype.hasOwnProperty.call(skipTags, m[2].toLowerCase())
+              && p.slice(-2) !== '/>') {
+            if (m[1]) skip = Math.max(0, skip - 1);
+            else skip++;
+          }
+          if (onTag && skip === 0) onTag(p);
+          out.push(p);
+          continue;
+        }
+        if (skip > 0) { out.push(p); continue; }
+        out.push(escapeTextNode(fn(decodeEntities(p))));
+      }
+      return out.join('');
+    }
+
+    const EM_DASH = String.fromCharCode(0x2014);
+
+    const TYPO_STYLES = {
+      en: { dqOpen: '“', dqClose: '”', sqOpen: '‘', sqClose: '’' },
+      de: { dqOpen: '„', dqClose: '“', sqOpen: '‚', sqClose: '‘' },
+    };
+
+    const TYPO_WORD_RE = /[0-9A-Za-zÀ-ɏͰ-ϿЀ-ӿ]/;
+    const TYPO_BLOCK_RE = new RegExp('^<\\s*/?(?:' + BLOCK_TAGS + '|br|body|html)\\b', 'i');
+
+    // Would a quote right after this character be an opening one?
+    function typoOpens(prev) {
+      return !prev || prev === EM_DASH
+        || /[-\s([{–„“‚‘«‹]/.test(prev);
+    }
+
+    // Straight quotes to typographic ones (German or English set), triple dots
+    // to an ellipsis, hyphen runs to dashes. Opening vs closing is decided
+    // from the previous visible character; that context survives inline tags
+    // and resets at block boundaries. Existing typographic characters and the
+    // content of code-like tags are left alone.
+    function smartenHtml(html, lang) {
+      const st = TYPO_STYLES[lang === 'de' ? 'de' : 'en'];
+      const counts = { quotes: 0, apostrophes: 0, ellipses: 0, dashes: 0 };
+      let prev = '';
+      let sqDepth = 0;
+      const out = mapTextNodes(html, function (text) {
+        let t = text.replace(/\.\.\.+/g, function () {
+          counts.ellipses++;
+          return '…';
+        });
+        // -- and --- between other characters; runs of four or more are left
+        // alone (often used as a divider). German style keeps the en dash.
+        t = t.replace(/(^|[^-])(-{2,3})(?!-)/g, function (m0, pre, run) {
+          counts.dashes++;
+          return pre + (lang === 'de' ? '–' : (run.length === 3 ? EM_DASH : '–'));
+        });
+        // A lone hyphen between spaces is being used as a dash.
+        t = t.replace(/(^|\s)-(?=\s)/g, function (m0, pre) {
+          counts.dashes++;
+          return pre + '–';
+        });
+        let res = '';
+        for (let i = 0; i < t.length; i++) {
+          const c = t.charAt(i);
+          if (c === '"') {
+            const rep = typoOpens(prev) ? st.dqOpen : st.dqClose;
+            counts.quotes++;
+            res += rep;
+            prev = rep;
+            continue;
+          }
+          if (c === "'") {
+            const next = t.charAt(i + 1);
+            const wordBefore = !!prev && TYPO_WORD_RE.test(prev);
+            const wordAfter = !!next && TYPO_WORD_RE.test(next);
+            let rep;
+            if (wordBefore && wordAfter) {
+              rep = '’'; counts.apostrophes++;          // it's, geht's
+            } else if (sqDepth > 0 && !wordAfter) {
+              rep = st.sqClose; sqDepth--; counts.quotes++;  // closing single quote
+            } else if (typoOpens(prev) && wordAfter && !/[0-9]/.test(next)) {
+              rep = st.sqOpen; sqDepth++; counts.quotes++;   // opening single quote
+            } else {
+              rep = '’'; counts.apostrophes++;          // Albers', '90s
+            }
+            res += rep;
+            prev = rep;
+            continue;
+          }
+          res += c;
+          prev = /\s/.test(c) ? ' ' : c;
+        }
+        return res;
+      }, TYPO_SKIP_TAGS, function (tag) {
+        if (TYPO_BLOCK_RE.test(tag)) { prev = ''; sqDepth = 0; }
+      });
+      return { html: out, counts: counts };
+    }
+
+    // langOverride: 'de' or 'en' forces the style; otherwise meta.language
+    // decides (German rules for de*, English rules for everything else).
+    function cleanTypography(book, langOverride) {
+      const lang = langOverride
+        || (String(book.meta.language || 'en').toLowerCase().indexOf('de') === 0 ? 'de' : 'en');
+      const counts = { quotes: 0, apostrophes: 0, ellipses: 0, dashes: 0 };
+      const sections = book.sections.map(function (sec) {
+        const r = smartenHtml(sec.html || '', lang);
+        counts.quotes += r.counts.quotes;
+        counts.apostrophes += r.counts.apostrophes;
+        counts.ellipses += r.counts.ellipses;
+        counts.dashes += r.counts.dashes;
+        return Object.assign({}, sec, { html: r.html });
+      });
+      return {
+        book: Object.assign({}, book, { sections: sections }),
+        counts: counts,
+        language: lang,
+      };
+    }
+
+    function escapeRegExp(s) {
+      return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function buildSearchRx(query, opts) {
+      if (!query) return { error: 'Enter a search term first.' };
+      let rx;
+      try {
+        rx = new RegExp(
+          opts && opts.regex ? query : escapeRegExp(query),
+          'g' + (opts && opts.matchCase ? '' : 'i')
+        );
+      } catch (e) {
+        return { error: 'Invalid regular expression: ' + (e && e.message ? e.message : e) };
+      }
+      if (rx.test('')) return { error: 'This pattern would match the empty string.' };
+      rx.lastIndex = 0;
+      return { rx: rx };
+    }
+
+    // Search the text content of every section. Matches cannot span markup:
+    // a phrase interrupted by an inline tag will not be found.
+    function bookFind(book, query, opts) {
+      const b = buildSearchRx(query, opts);
+      if (b.error) return { error: b.error, total: 0, sections: [], snippets: [] };
+      const rx = b.rx;
+      const perSection = [];
+      const snippets = [];
+      let total = 0;
+      book.sections.forEach(function (sec, si) {
+        let count = 0;
+        mapTextNodes(sec.html || '', function (text) {
+          rx.lastIndex = 0;
+          let m;
+          while ((m = rx.exec(text))) {
+            count++;
+            if (snippets.length < 40) {
+              snippets.push({
+                section: si,
+                before: text.slice(Math.max(0, m.index - 34), m.index),
+                match: m[0],
+                after: text.slice(m.index + m[0].length, m.index + m[0].length + 34),
+              });
+            }
+            if (m.index === rx.lastIndex) rx.lastIndex++;
+          }
+          return text;
+        }, null);
+        if (count > 0) perSection.push({ section: si, count: count });
+        total += count;
+      });
+      return { total: total, sections: perSection, snippets: snippets };
+    }
+
+    // Replace across the whole book. In plain mode the replacement is taken
+    // literally; in regex mode $1, $2, ... work as usual.
+    function bookReplace(book, query, replacement, opts) {
+      const b = buildSearchRx(query, opts);
+      if (b.error) return { error: b.error, total: 0, book: book };
+      const rx = b.rx;
+      const rep = opts && opts.regex
+        ? String(replacement)
+        : String(replacement).replace(/\$/g, '$$$$');
+      let total = 0;
+      const sections = book.sections.map(function (sec) {
+        let changed = false;
+        const html = mapTextNodes(sec.html || '', function (text) {
+          rx.lastIndex = 0;
+          const n = (text.match(rx) || []).length;
+          if (n === 0) return text;
+          total += n;
+          changed = true;
+          rx.lastIndex = 0;
+          return text.replace(rx, rep);
+        }, null);
+        return changed ? Object.assign({}, sec, { html: html }) : sec;
+      });
+      return { book: Object.assign({}, book, { sections: sections }), total: total };
+    }
+
     return {
       formats: FORMATS,
       // pipeline
@@ -4188,6 +4419,10 @@
       parseIndex: parseIndex, findIndexes: findIndexes,
       palmdocDecompress: palmdocDecompress, palmdocCompress: palmdocCompress,
       writeMobi: writeMobi, readMobiFile: readMobiFile,
+      // book editing
+      mapTextNodes: mapTextNodes, smartenHtml: smartenHtml,
+      cleanTypography: cleanTypography, bookFind: bookFind, bookReplace: bookReplace,
+      escapeRegExp: escapeRegExp,
     };
   })();
   </script>
@@ -4413,6 +4648,155 @@
       );
     }
 
+    // ---- edit tools (nerd tab) -------------------------------------------
+
+    function EditTools({ book, onBook }) {
+      const [typoLang, setTypoLang] = useState('auto');
+      const [typoMsg, setTypoMsg] = useState('');
+      const [query, setQuery] = useState('');
+      const [replacement, setReplacement] = useState('');
+      const [useRegex, setUseRegex] = useState(false);
+      const [matchCase, setMatchCase] = useState(false);
+      const [found, setFound] = useState(null);
+      const [srMsg, setSrMsg] = useState(null);
+      const titles = useMemo(() => sectionTitles(book), [book]);
+
+      // Any change to the book makes an old match preview stale.
+      useEffect(() => { setFound(null); }, [book]);
+
+      const autoLang = String(book.meta.language || 'en').toLowerCase().indexOf('de') === 0
+        ? 'German' : 'English';
+
+      const runTypo = () => {
+        setSrMsg(null);
+        const r = Core.cleanTypography(book, typoLang === 'auto' ? undefined : typoLang);
+        const c = r.counts;
+        const total = c.quotes + c.apostrophes + c.ellipses + c.dashes;
+        if (total > 0) onBook(r.book);
+        setTypoMsg(total > 0
+          ? 'Changed ' + c.quotes + ' quotes, ' + c.apostrophes + ' apostrophes, '
+            + c.ellipses + ' ellipses and ' + c.dashes + ' dashes ('
+            + (r.language === 'de' ? 'German' : 'English') + ' style).'
+          : 'Nothing to change: no straight quotes, triple dots or hyphen runs found.');
+      };
+
+      const runFind = () => {
+        setTypoMsg('');
+        setSrMsg(null);
+        setFound(Core.bookFind(book, query, { regex: useRegex, matchCase: matchCase }));
+      };
+
+      const runReplace = () => {
+        setTypoMsg('');
+        const r = Core.bookReplace(book, query, replacement, { regex: useRegex, matchCase: matchCase });
+        if (r.error) { setFound(null); setSrMsg({ text: r.error, warn: true }); return; }
+        if (r.total > 0) onBook(r.book);
+        setSrMsg({
+          text: r.total > 0
+            ? 'Replaced ' + r.total + (r.total === 1 ? ' occurrence.' : ' occurrences.')
+            : 'No matches.',
+          warn: false,
+        });
+      };
+
+      const clip = (s) => (s || '').replace(/\s+/g, ' ');
+
+      return (
+        <details className="ec-edit">
+          <summary>Edit the loaded book</summary>
+
+          <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
+            Typography: straight quotes become typographic ones, three dots an ellipsis,
+            hyphen runs proper dashes. Code blocks are left alone. Applies to the loaded
+            book; convert afterwards.
+          </label>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+            <div className="seg-row" style={{ display: 'flex' }}>
+              {[['auto', 'Auto: ' + autoLang], ['de', 'German'], ['en', 'English']].map((o) => (
+                <button key={o[0]}
+                  className={'lang-seg' + (typoLang === o[0] ? ' active' : '')}
+                  onClick={() => setTypoLang(o[0])}>{o[1]}</button>
+              ))}
+            </div>
+            <button onClick={runTypo} style={{ width: 'auto', marginBottom: 0 }}>
+              Clean up typography
+            </button>
+          </div>
+          {typoMsg && (
+            <p style={{ fontSize: 13, color: '#0fb5ad', marginBottom: 6 }}>{typoMsg}</p>
+          )}
+
+          <hr style={{ borderColor: '#334155', margin: '14px 0' }} />
+
+          <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
+            Search and replace across the whole book, on the text only, never on the markup.
+            A phrase interrupted by formatting (say, a word in italics) will not match.
+          </label>
+          <div className="ec-field" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 14px' }}>
+            <div>
+              <label htmlFor="ec-find">Search for</label>
+              <input id="ec-find" type="text" value={query}
+                onChange={(e) => { setQuery(e.target.value); setFound(null); setSrMsg(null); }} />
+            </div>
+            <div>
+              <label htmlFor="ec-repl">Replace with</label>
+              <input id="ec-repl" type="text" value={replacement}
+                onChange={(e) => setReplacement(e.target.value)} />
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
+            <label style={{ fontSize: 13, color: '#94a3b8', marginBottom: 0 }}>
+              <input type="checkbox" checked={useRegex}
+                onChange={(e) => { setUseRegex(e.target.checked); setFound(null); setSrMsg(null); }} />
+              {' '}Regular expression
+            </label>
+            <label style={{ fontSize: 13, color: '#94a3b8', marginBottom: 0 }}>
+              <input type="checkbox" checked={matchCase}
+                onChange={(e) => { setMatchCase(e.target.checked); setFound(null); setSrMsg(null); }} />
+              {' '}Match case
+            </label>
+            <button className="lang-seg" onClick={runFind}>Find</button>
+            <button className="lang-seg" onClick={runReplace}>Replace all</button>
+          </div>
+
+          {found && found.error && (
+            <p style={{ fontSize: 13, color: '#d97706', margin: '6px 0 0' }}>{found.error}</p>
+          )}
+          {srMsg && (
+            <p style={{ fontSize: 13, color: srMsg.warn ? '#d97706' : '#0fb5ad', margin: '6px 0 0' }}>
+              {srMsg.text}
+            </p>
+          )}
+          {found && !found.error && (
+            <div style={{ marginTop: 6 }}>
+              <p style={{ fontSize: 13, color: '#cbd5e1', margin: '0 0 6px' }}>
+                {found.total === 0
+                  ? 'No matches.'
+                  : found.total + (found.total === 1 ? ' match in ' : ' matches in ')
+                    + found.sections.length
+                    + (found.sections.length === 1 ? ' section:' : ' sections:')}
+              </p>
+              {found.snippets.length > 0 && (
+                <ul className="ec-log ec-snips" style={{ marginBottom: 0 }}>
+                  {found.snippets.map((s, i) => (
+                    <li key={i}>
+                      <span style={{ color: '#64748b' }}>{clip(titles[s.section]).slice(0, 28) + ': '}</span>
+                      {'…' + clip(s.before)}
+                      <mark>{clip(s.match)}</mark>
+                      {clip(s.after) + '…'}
+                    </li>
+                  ))}
+                  {found.total > found.snippets.length && (
+                    <li>plus {found.total - found.snippets.length} more matches not shown</li>
+                  )}
+                </ul>
+              )}
+            </div>
+          )}
+        </details>
+      );
+    }
+
     function App() {
       const [book, setBook] = useState(null);
       const [fileName, setFileName] = useState('');
@@ -4538,7 +4922,7 @@
             <div style={{ color: '#cbd5e1', fontSize: 15, marginBottom: 4 }}>
               Drop an e-book here, or click to choose one
             </div>
-            <div style={{ color: '#64748b', fontSize: 13 }}>EPUB, MOBI, AZW3 or TXT</div>
+            <div style={{ color: '#64748b', fontSize: 13 }}>EPUB, MOBI, AZW3, TXT, Markdown or HTML</div>
             <input
               ref={inputRef}
               type="file"
@@ -4601,6 +4985,10 @@
                   Unpack it and run: pandoc book.md -o book.docx
                 </p>
               )}
+              {nerd && (
+                <EditTools book={book} onBook={(b) => { setBook(b); setResult(null); }} />
+              )}
+
               <button onClick={convert} disabled={busy} style={{ width: 'auto' }}>
                 Convert
               </button>
@@ -4626,7 +5014,7 @@
           </React.Fragment>}
 
           <p style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>
-            Reads EPUB, MOBI, AZW3 and plain text; writes EPUB, MOBI, Markdown, HTML, LaTeX,
+            Reads EPUB, MOBI, AZW3, Markdown, HTML and plain text; writes EPUB, MOBI, Markdown, HTML, LaTeX,
             DOCX, Pandoc bundle and plain text. Encrypted files cannot be opened. Formats
             implemented from their public descriptions. A single Markdown or LaTeX file cannot
             carry images; they are left out there. The Pandoc bundle keeps them: a zip with
