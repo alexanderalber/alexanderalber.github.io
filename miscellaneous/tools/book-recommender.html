@@ -297,7 +297,10 @@
       let ciSum = 0;
       const zc = 1.6449 * prep.meta.c90;
       for (let j = 0; j < prep.n; j++) {
-        qscore[j] = pknow[j] * pred.lev[j];
+        // Favor books the user is likely to actually know (pknow²): leverage peaks exactly
+        // in unread regions, so weighting pknow more strongly stops onboarding from
+        // fixating on obscure high-leverage books the user just marks "don't know".
+        qscore[j] = pknow[j] * pknow[j] * pred.lev[j];
         ciSum += 2 * Math.min(zc * Math.sqrt(pred.va[j]), 2);   // display cap ±2
       }
       return {
@@ -419,12 +422,16 @@
       return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     }
 
-    // rows: [title, author, rating, book_id?]. The trailing book_id column lets our
-    // own export round-trip exactly even when a (title, author) pair is ambiguous in
-    // the catalog; foreign CSVs simply won't have it and fall back to name matching.
+    // rows: [title, author, rating, book_id?, status?]. The book_id column lets our own
+    // export round-trip exactly even when a (title, author) pair is ambiguous; the status
+    // column carries "don't know it" markers (rating left blank). Foreign CSVs have neither
+    // and fall back to name matching / plain ratings.
     function exportCSV(rows) {
-      const lines = ['title,author,rating,book_id'];
-      for (const r of rows) lines.push([csvField(r[0]), csvField(r[1]), r[2], r[3] != null ? r[3] : ''].join(','));
+      const lines = ['title,author,rating,book_id,status'];
+      for (const r of rows) lines.push([
+        csvField(r[0]), csvField(r[1]), r[2] != null ? r[2] : '',
+        r[3] != null ? r[3] : '', r[4] != null ? r[4] : ''
+      ].join(','));
       return lines.join('\r\n');
     }
 
@@ -455,40 +462,54 @@
     }
 
     // Tolerant import: header detection (title / author / rating, incl. "My Rating"),
-    // headerless fallback (columns 0,1,2), match via normalized (title, author).
+    // headerless fallback (columns 0,1,2), match via normalized (title, author). A "status"
+    // column of "unknown" (our own export) marks a "don't know it" answer -> unknown[].
     function importRatings(prep, index, text) {
       const rows = parseCSV(text);
-      if (!rows.length) return { matched: [], notFound: [], skipped: 0, error: 'File is empty.' };
-      let start = 0, ct = 0, ca = 1, cr = 2, cid = -1;
+      if (!rows.length) return { matched: [], unknown: [], notFound: [], skipped: 0, error: 'File is empty.' };
+      let start = 0, ct = 0, ca = 1, cr = 2, cid = -1, cst = -1;
       const head = rows[0].map(function (h) { return normKey(h); });
       const it = head.findIndex(function (h) { return /^(title|book title|book|name)$/.test(h); });
       const ia = head.findIndex(function (h) { return /author/.test(h); });
       const ir = head.findIndex(function (h) { return /(my )?(rating|stars|score)$/.test(h) && !/average|avg/.test(h); });
       const iid = head.findIndex(function (h) { return /^(book id|id)$/.test(h); });
-      if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; cid = iid; }
-      else if (rows[0].length < 3) return { matched: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
-      const matched = [], notFound = [];
+      const ist = head.findIndex(function (h) { return /^status$/.test(h); });
+      if (it >= 0 && ir >= 0) { start = 1; ct = it; ca = ia; cr = ir; cid = iid; cst = ist; }
+      else if (rows[0].length < 3) return { matched: [], unknown: [], notFound: [], skipped: 0, error: 'Could not find title/author/rating columns.' };
+      const matched = [], unknown = [], notFound = [];
       let skipped = 0;
-      for (let i = start; i < rows.length; i++) {
-        const row = rows[i];
-        const title = (row[ct] || '').trim();
-        if (!title) continue;
-        const author = ca >= 0 ? (row[ca] || '').trim() : '';
-        const r = parseFloat(String(row[cr] || '').replace(',', '.'));
-        if (!(r >= 0.5 && r <= 5)) { skipped++; continue; }
-        if (cid >= 0) {                            // exact re-import from our own export
-          const bid = parseInt(String(row[cid]), 10);
-          if (Number.isInteger(bid) && bid >= 0 && bid < prep.n) { matched.push([bid, clip(r, 1, 5)]); continue; }
+      // Resolve a catalog index from an explicit book_id (our own export) or normalized name.
+      const resolve = function (title, author, bidRaw) {
+        if (cid >= 0 && bidRaw != null) {
+          const bid = parseInt(String(bidRaw), 10);
+          if (Number.isInteger(bid) && bid >= 0 && bid < prep.n) return bid;
         }
         const kt = normKey(cleanTitle(title)), ka = normKey(cleanAuthor(author));
         let idx = index.byTA.get(kt + '|' + ka);
         if (idx == null && ka) idx = index.byTA.get(kt + '|' + ka.split(' ').pop());
         if (idx == null || idx === -1) { const c = index.byT.get(kt); idx = (c != null && c !== -1) ? c : null; }
         if (idx == null || idx === -1) { const c = index.byShort.get(normKey(title.split(':')[0])); idx = (c != null && c !== -1) ? c : null; }
-        if (idx == null || idx === -1) notFound.push(title);
+        return (idx == null || idx === -1) ? null : idx;
+      };
+      for (let i = start; i < rows.length; i++) {
+        const row = rows[i];
+        const title = (row[ct] || '').trim();
+        if (!title) continue;
+        const author = ca >= 0 ? (row[ca] || '').trim() : '';
+        const bidRaw = cid >= 0 ? row[cid] : null;
+        const status = cst >= 0 ? normKey(row[cst] || '') : '';
+        if (status === 'unknown') {              // "don't know it" marker from our own export
+          const idx = resolve(title, author, bidRaw);
+          if (idx == null) notFound.push(title); else unknown.push(idx);
+          continue;
+        }
+        const r = parseFloat(String(row[cr] || '').replace(',', '.'));
+        if (!(r >= 0.5 && r <= 5)) { skipped++; continue; }
+        const idx = resolve(title, author, bidRaw);
+        if (idx == null) notFound.push(title);
         else matched.push([idx, clip(r, 1, 5)]);
       }
-      return { matched: matched, notFound: notFound, skipped: skipped, error: null };
+      return { matched: matched, unknown: unknown, notFound: notFound, skipped: skipped, error: null };
     }
 
     return {
@@ -515,12 +536,27 @@
       grid: '#334155', axis: '#64748b', teal: '#0fb5ad', gold: '#d9a441',
       card: '#0f172a', border: '#334155'
     };
+    // Prominent destructive-action button (Reset).
+    const RESET_BTN = { background: '#7f1d1d', border: '1px solid #b91c1c', color: '#fecaca',
+      borderRadius: 6, padding: '8px 16px', fontSize: 13.5, fontWeight: 600, cursor: 'pointer',
+      lineHeight: 1.3 };
     // Site-wide diverging colormap ("hollywood").
     const CMAP = { neg: [255, 140, 66], mid: [245, 245, 245], pos: [0, 139, 139] };
     function cmap(t) {   // t in [-1, 1]
       t = Math.max(-1, Math.min(1, t));
       const a = t < 0 ? CMAP.neg : CMAP.pos, f = Math.abs(t);
       const c = [0, 1, 2].map(i => Math.round(CMAP.mid[i] + (a[i] - CMAP.mid[i]) * f));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+    // Opaque cmap pre-blended toward the map background by `op`. Drawing terrain tiles
+    // fully opaque (instead of translucent) stops overlapping cell edges from doubling
+    // their alpha and painting bright grid-line seams.
+    const MAP_BG = [11, 18, 32];   // #0b1220
+    function cmapOpaque(t, op) {
+      t = Math.max(-1, Math.min(1, t));
+      const a = t < 0 ? CMAP.neg : CMAP.pos, f = Math.abs(t);
+      const fg = [0, 1, 2].map(i => CMAP.mid[i] + (a[i] - CMAP.mid[i]) * f);
+      const c = [0, 1, 2].map(i => Math.round(MAP_BG[i] + (fg[i] - MAP_BG[i]) * op));
       return `rgb(${c[0]},${c[1]},${c[2]})`;
     }
     // Broad umbrella tags: many books carry them (and the source data mis-tags some
@@ -647,13 +683,18 @@
       );
     }
 
-    function Slider({ label, min, max, step, value, onChange, leftLabel, rightLabel, readout }) {
+    function Slider({ label, min, max, step, value, onChange, leftLabel, rightLabel, readout, center }) {
+      const labelSpan = <span style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</span>;
       return (
         <div style={{ flex: '1 1 260px', minWidth: 240, maxWidth: 430 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-            <span style={{ fontSize: 12, color: C.label, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</span>
-            <span style={{ fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums' }}>{readout}</span>
-          </div>
+          {center ? (
+            <div style={{ textAlign: 'center', marginBottom: 4 }}>{labelSpan}</div>
+          ) : (
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              {labelSpan}
+              <span style={{ fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums' }}>{readout}</span>
+            </div>
+          )}
           <input type="range" min={min} max={max} step={step} value={value}
             onChange={e => onChange(+e.target.value)} style={{ width: '100%', margin: 0 }} />
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.foot, marginTop: 1 }}>
@@ -676,17 +717,17 @@
             </span>
           </div>
           <div style={{ position: 'relative', height: 20, margin: '0 6px' }}>
-            <div style={{ position: 'absolute', top: '50%', left: 0, right: 0, height: 4,
+            <div style={{ position: 'absolute', top: '50%', left: 0, right: 0, height: 4, zIndex: 1,
               transform: 'translateY(-50%)', background: C.grid, borderRadius: 2, pointerEvents: 'none' }}>
               <div style={{ position: 'absolute', height: '100%', borderRadius: 2,
                 left: `${pLo}%`, right: `${100 - pHi}%`, background: active ? C.teal : C.grid }} />
             </div>
             <input type="range" className="dual-thumb" min={min} max={max} value={lo}
               onChange={e => onChange(Math.min(+e.target.value, hi - 1), hi)}
-              style={{ zIndex: lo >= hi - 4 ? 5 : 3 }} />
+              style={{ zIndex: lo >= hi - 4 ? 6 : 4 }} />
             <input type="range" className="dual-thumb" min={min} max={max} value={hi}
               onChange={e => onChange(lo, Math.max(+e.target.value, lo + 1))}
-              style={{ zIndex: 4 }} />
+              style={{ zIndex: 5 }} />
           </div>
         </div>
       );
@@ -755,26 +796,36 @@
 
       const data = useMemo(() => {
         const n = model.prep.n;
+        const sigma2 = model.prep.meta.sigma2;
         const order = Array.from({ length: n }, (_, i) => i)
           .sort((a, b) => comp.m[b] - comp.m[a]);
         const raw = [];
         for (let r = 0; r < n; r += 5) {          // downsampled polyline support points
           const j = order[r];
-          raw.push({ r, j, hw: Math.min(zc * Math.sqrt(comp.va[j]), 2) });
+          raw.push({
+            r, j,
+            hw: Math.min(zc * Math.sqrt(comp.va[j]), 2),                 // full prediction interval
+            hwe: Math.min(zc * Math.sqrt(sigma2 * comp.lev[j]), 2)       // epistemic only (drop +σ² floor)
+          });
         }
-        // Rolling median on the band half-width: single high-variance books spike the
+        // Rolling median on the band half-widths: single high-variance books spike the
         // fan while the mean curve stays smooth. Median (radius 2) clips those honest
         // outliers without flattening genuinely wide regions.
-        const pts = raw.map((p, i) => {
+        const med = (key, i) => {
           const win = [];
-          for (let k = Math.max(0, i - 2); k <= Math.min(raw.length - 1, i + 2); k++) win.push(raw[k].hw);
+          for (let k = Math.max(0, i - 2); k <= Math.min(raw.length - 1, i + 2); k++) win.push(raw[k][key]);
           win.sort((a, b) => a - b);
-          const hw = win[win.length >> 1];
+          return win[win.length >> 1];
+        };
+        const pts = raw.map((p, i) => {
+          const hw = med('hw', i), hwe = med('hwe', i);
           return {
             r: p.r, j: p.j,
             mean: M.clip(comp.m[p.j], 1, 5),
             up: M.clip(comp.m[p.j] + hw, 1, 5),
-            lo: M.clip(comp.m[p.j] - hw, 1, 5)
+            lo: M.clip(comp.m[p.j] - hw, 1, 5),
+            upe: M.clip(comp.m[p.j] + hwe, 1, 5),
+            loe: M.clip(comp.m[p.j] - hwe, 1, 5)
           };
         });
         return { pts, n };
@@ -783,8 +834,10 @@
       const sx = r => L + (r / (data.n - 1)) * (W - L - R);
       const sy = v => T + (1 - (v - 1) / 4) * (H - T - B);
       const line = key => data.pts.map(p => `${sx(p.r).toFixed(1)},${sy(p[key]).toFixed(1)}`).join(' ');
-      const band = data.pts.map(p => `${sx(p.r).toFixed(1)},${sy(p.up).toFixed(1)}`).join(' ') + ' ' +
-        [...data.pts].reverse().map(p => `${sx(p.r).toFixed(1)},${sy(p.lo).toFixed(1)}`).join(' ');
+      const bandOf = (up, lo) => data.pts.map(p => `${sx(p.r).toFixed(1)},${sy(p[up]).toFixed(1)}`).join(' ') + ' ' +
+        [...data.pts].reverse().map(p => `${sx(p.r).toFixed(1)},${sy(p[lo]).toFixed(1)}`).join(' ');
+      const band = bandOf('up', 'lo');       // outer: full prediction interval
+      const bande = bandOf('upe', 'loe');    // inner: model (epistemic) uncertainty — this collapses
 
       const onMove = e => {
         const rect = e.currentTarget.getBoundingClientRect();
@@ -804,9 +857,14 @@
                 <text x={L - 6} y={sy(v)} textAnchor="end" dominantBaseline="middle" fontSize={11} fill={C.axis}>{v}★</text>
               </g>
             ))}
-            <polygon points={band} fill={C.teal} opacity={0.16} />
-            <polyline points={line('up')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.55} />
-            <polyline points={line('lo')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.55} />
+            {/* Outer: full prediction interval (a reader's actual rating). Inner: the
+                model's own uncertainty about the expected rating — this is what collapses. */}
+            <polygon points={band} fill={C.teal} opacity={0.10} />
+            <polyline points={line('up')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.30} />
+            <polyline points={line('lo')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.30} />
+            <polygon points={bande} fill={C.teal} opacity={0.26} />
+            <polyline points={line('upe')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.6} />
+            <polyline points={line('loe')} fill="none" stroke={C.teal} strokeWidth={1} opacity={0.6} />
             <polyline points={line('mean')} fill="none" stroke={C.teal} strokeWidth={2} />
             <text x={(L + W - R) / 2} y={H - 6} textAnchor="middle" fontSize={11} fill={C.axis}>
               all {fmtN(data.n)} books, ranked by expected rating
@@ -821,9 +879,20 @@
           {hover && (
             <div className="rec-tip" style={{ left: Math.min(sx(hover.r) / W * 100, 72) + '%', top: 4 }}>
               <strong>{M.cleanTitle(model.prep.books[hover.j].t)}</strong><br />
-              rank {fmtN(hover.r + 1)} · {hover.mean.toFixed(1)}★, 90% band {hover.lo.toFixed(1)}–{hover.up.toFixed(1)}
+              rank {fmtN(hover.r + 1)} · {hover.mean.toFixed(1)}★<br />
+              model band {hover.loe.toFixed(1)}–{hover.upe.toFixed(1)} · prediction {hover.lo.toFixed(1)}–{hover.up.toFixed(1)}
             </div>
           )}
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 11, color: C.foot, marginTop: 2 }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+              <span style={{ width: 14, height: 9, borderRadius: 2, background: C.teal, opacity: 0.5, display: 'inline-block' }} />
+              model uncertainty on the expected rating (this collapses as you rate)
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+              <span style={{ width: 14, height: 9, borderRadius: 2, background: C.teal, opacity: 0.18, display: 'inline-block' }} />
+              prediction interval for one reader's actual rating
+            </span>
+          </div>
         </div>
       );
     }
@@ -890,8 +959,10 @@
         <div>
           <h3 style={{ fontSize: 16, color: C.text, margin: '18px 0 2px' }}>Watch the posterior collapse</h3>
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 8px', maxWidth: '72ch' }}>
-            The model's expected rating for every book in the catalog (middle line) with its 90% uncertainty
-            band. Each rating you add narrows the band - the fan collapses as the model learns your taste.
+            The model's expected rating for every book in the catalog (middle line), shown with two bands:
+            the darker inner band is the model's uncertainty about that expected rating, and the faint outer
+            band adds the general noise term. Each rating you add narrows the
+            inner band, slowly.
           </p>
           <PosteriorChart model={model} comp={comp} />
           <p style={{ fontSize: 12.5, color: C.label, margin: '4px 0 0' }}>
@@ -934,11 +1005,11 @@
             })}
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, margin: '26px 0 8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, margin: '26px 0 8px', flexWrap: 'wrap' }}>
             <h3 style={{ fontSize: 16, color: C.text, margin: 0 }}>Your ratings ({ratings.size})</h3>
             {ratings.size > 0 &&
-              <a href="#" style={{ fontSize: 12.5, color: C.foot }}
-                onClick={e => { e.preventDefault(); onReset(); }}>Reset everything</a>}
+              <button style={{ ...RESET_BTN, padding: '6px 14px', fontSize: 13 }}
+                onClick={onReset}>Reset everything</button>}
           </div>
           {ratings.size === 0 &&
             <p style={{ fontSize: 12.5, color: C.foot }}>Nothing rated yet - answer a card above or search for a book you know.</p>}
@@ -1047,9 +1118,6 @@
         return filtered.slice().sort((a, b) => score(b) - score(a) || model.prep.books[b].n - model.prep.books[a].n);
       }, [filtered, comp, blend, risk]);
 
-      const riskReadout = Math.abs(risk) < 0.02 ? 'expected rating'
-        : `${risk > 0 ? 'optimistic' : 'safe'} · ${risk > 0 ? '+' : ''}${risk.toFixed(2)} × band`;
-
       return (
         <div>
           {comp.nRated === 0 &&
@@ -1058,18 +1126,14 @@
             </p>}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 26, margin: '12px 0 6px' }}>
             <Slider label="Ranking" min={0} max={1} step={0.01} value={blend} onChange={setBlend}
-              leftLabel={matchLabel} rightLabel="Rating"
-              readout={`${Math.round((1 - blend) * 100)}% ${matchLabel.toLowerCase()} · ${Math.round(blend * 100)}% rating`} />
+              leftLabel={matchLabel} rightLabel="Rating" center />
             <Slider label="Risk" min={-1} max={1} step={0.01} value={risk} onChange={setRisk}
-              leftLabel="Safe bets" rightLabel="Moonshots" readout={riskReadout} />
+              leftLabel="Safe bets" rightLabel="Moonshots" center />
           </div>
-          <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 4px' }}>
+          <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 12px' }}>
             {comp.nRated > 0
               ? <><strong style={{ color: C.label }}>Match</strong> ranks by what readers of your books also read — regardless of how <em>you</em> rated them. <strong style={{ color: C.label }}>Rating</strong> ranks by the stars you'd probably give.</>
               : <><strong style={{ color: C.label }}>Popular</strong> ranks by overall popularity. <strong style={{ color: C.label }}>Rating</strong> ranks by predicted stars. Rate a few books to unlock a personalized Match.</>}
-          </p>
-          <p style={{ fontSize: 11.5, color: C.foot, margin: '0 0 12px' }}>
-            Risk tilts the predicted rating by up to one uncertainty band (Safe = lower bound, Moonshots = upper). It only moves the ranking as far as the dial leans toward Rating.
           </p>
           <div>
             {(() => {
@@ -1209,6 +1273,9 @@
     /* ── Taste map tab ─────────────────────────────────────────────────── */
     function MapTab({ model, comp, ratings, passes, showTerrain, setShowTerrain }) {
       const [tip, setTip] = useState(null);
+      const [view, setView] = useState({ z: 1, ox: 0, oy: 0 });   // pan/zoom: screen = z·plot + o
+      const drag = useRef(null);
+      const svgRef = useRef(null);
       const W = 760, H = 540, P = 10;
       const GW = 60, GH = 40, BW = 0.08;
 
@@ -1246,14 +1313,58 @@
       const sy = my => P + (my + 1) / 2 * (H - 2 * P);
       const cw = (W - 2 * P) / GW, ch = (H - 2 * P) / GH;
 
+      // Clamp the pan offset so the (scaled) content always covers the plot box.
+      const clampView = (z, ox, oy) => ({
+        z,
+        ox: Math.max(W * (1 - z), Math.min(0, ox)),
+        oy: Math.max(H * (1 - z), Math.min(0, oy)),
+      });
+
+      // Wheel zoom via a native NON-passive listener: React's synthetic onWheel is passive,
+      // so preventDefault() there is ignored and the page scrolls while you zoom.
+      useEffect(() => {
+        const el = svgRef.current;
+        if (!el) return;
+        const onWheel = e => {
+          e.preventDefault();
+          const rect = el.getBoundingClientRect();
+          const fx = (e.clientX - rect.left) / rect.width * W;
+          const fy = (e.clientY - rect.top) / rect.height * H;
+          setView(v => {
+            const z2 = Math.max(1, Math.min(6, v.z * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+            if (z2 === v.z) return v;
+            // keep the point under the cursor fixed: screen = z·content + o
+            const cx = (fx - v.ox) / v.z, cy = (fy - v.oy) / v.z;
+            return clampView(z2, fx - z2 * cx, fy - z2 * cy);
+          });
+        };
+        el.addEventListener('wheel', onWheel, { passive: false });
+        return () => el.removeEventListener('wheel', onWheel);
+      }, []);
+
+      const endDrag = () => { drag.current = null; };
+
+      const onPointerDown = e => {
+        if (view.z <= 1) return;
+        drag.current = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy };
+        setTip(null);
+      };
+
       const onMove = e => {
         const rect = e.currentTarget.getBoundingClientRect();
         const fx = (e.clientX - rect.left) / rect.width * W;
         const fy = (e.clientY - rect.top) / rect.height * H;
-        let best = null, bd = 324;   // 18px
+        if (drag.current) {
+          const dpx = (e.clientX - drag.current.x) / rect.width * W;
+          const dpy = (e.clientY - drag.current.y) / rect.height * H;
+          setView(v => clampView(v.z, drag.current.ox + dpx, drag.current.oy + dpy));
+          return;
+        }
+        let best = null, bd = 324;   // 18px hit radius in screen space
         for (let j = 0; j < model.prep.n; j++) {
           if (!passes[j] && !ratings.has(j)) continue;
-          const dx = sx(model.prep.books[j].mx) - fx, dy = sy(model.prep.books[j].my) - fy;
+          const dx = (view.z * sx(model.prep.books[j].mx) + view.ox) - fx;
+          const dy = (view.z * sy(model.prep.books[j].my) + view.oy) - fy;
           const d = dx * dx + dy * dy;
           if (d < bd) { bd = d; best = j; }
         }
@@ -1284,20 +1395,36 @@
               The terrain appears once you've rated a few books - it shows which regions of taste-space you'd like more (or less) than your overall average.
             </p>}
           <div className="rec-svgwrap">
-            <svg viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => setTip(null)}>
+            <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} onMouseMove={onMove} onMouseLeave={() => { setTip(null); endDrag(); }}
+              onMouseDown={onPointerDown} onMouseUp={endDrag} onDoubleClick={() => setView({ z: 1, ox: 0, oy: 0 })}
+              style={{ cursor: view.z > 1 ? (drag.current ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }}>
+              <defs>
+                <clipPath id="mapclip"><rect x={0} y={0} width={W} height={H} rx={8} /></clipPath>
+                <filter id="mapsoften" x="-4%" y="-4%" width="108%" height="108%">
+                  <feGaussianBlur stdDeviation={Math.min(cw, ch) * 0.6} />
+                </filter>
+              </defs>
               <rect x={0} y={0} width={W} height={H} fill="#0b1220" rx={8} />
-              {showTerrain && grid && grid.map((cell, i) => (
-                <rect key={i} x={P + cell.c * cw} y={P + cell.r * ch} width={cw + 0.5} height={ch + 0.5}
-                  fill={cmap(cell.t)} opacity={cell.op} shapeRendering="crispEdges" />
-              ))}
-              {model.prep.books.map((b, j) => ratings.has(j) ? null : (
-                <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={2}
-                  fill={C.foot} opacity={passes[j] ? 0.75 : 0.12} />
-              ))}
-              {[...ratings.entries()].map(([j, r]) => (
-                <circle key={'r' + j} cx={sx(model.prep.books[j].mx)} cy={sy(model.prep.books[j].my)}
-                  r={5.5} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5} />
-              ))}
+              <g clipPath="url(#mapclip)" transform={`translate(${view.ox} ${view.oy}) scale(${view.z})`}>
+                {showTerrain && grid && grid.length > 0 && (
+                  <g filter="url(#mapsoften)">
+                    {/* opaque backdrop so the blur has the bg color to melt into, not transparency */}
+                    <rect x={0} y={0} width={W} height={H} fill="#0b1220" />
+                    {grid.map((cell, i) => (
+                      <rect key={i} x={P + cell.c * cw - 0.5} y={P + cell.r * ch - 0.5} width={cw + 1} height={ch + 1}
+                        fill={cmapOpaque(cell.t, cell.op)} />
+                    ))}
+                  </g>
+                )}
+                {model.prep.books.map((b, j) => ratings.has(j) ? null : (
+                  <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={passes[j] ? 2.4 : 2.1}
+                    fill={passes[j] ? '#a9b7ca' : C.foot} opacity={passes[j] ? 0.85 : 0.32} />
+                ))}
+                {[...ratings.entries()].map(([j, r]) => (
+                  <circle key={'r' + j} cx={sx(model.prep.books[j].mx)} cy={sy(model.prep.books[j].my)}
+                    r={5.5} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5} />
+                ))}
+              </g>
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 12, 0)}%` }}>
@@ -1312,6 +1439,7 @@
           <p style={{ fontSize: 11.5, color: C.foot, marginTop: 6 }}>
             2-D projection (UMAP, cosine) of the taste space: similar books sit together, but distances are not metric.
             Outlined markers are your rated books, colored by your rating. Filters from the Recommendations tab dim non-matching books.
+            Scroll to zoom, drag to pan, double-click to reset.
           </p>
         </div>
       );
@@ -1555,8 +1683,7 @@
       );
     }
 
-    function ModelTab({ model, comp, ratings, onImport }) {
-      const [report, setReport] = useState(null);
+    function ModelTab({ model, comp, ratings }) {
       const meta = model.prep.meta;
       const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
 
@@ -1569,55 +1696,6 @@
           pts: res.map(p => ({ ...p, title: M.cleanTitle(model.prep.books[p.idx].t) }))
         };
       }, [ratedArr]);
-
-      const clusters = useMemo(() => {
-        if (ratedArr.length < 4) return null;
-        const idxs = ratedArr.map(x => x[0]);
-        const maxK = Math.max(1, Math.min(5, Math.round(Math.sqrt(idxs.length))));
-        return M.clusterRated(model.prep, idxs, maxK).map(members => {
-          const counts = {};
-          for (const i of members) for (const g of model.prep.books[i].g || []) counts[g] = (counts[g] || 0) + 1;
-          // Rank tags by count times inverse frequency, but label with distinctive
-          // subgenres first and at most ONE broad umbrella tag: the source data tags
-          // several adult SF books "childrens", which otherwise produced silly labels
-          // like "scifi, childrens" for a military-SF cluster.
-          const minSup = members.length >= 3 ? 2 : 1;
-          const rank = (arr) => arr.map(([g, c]) => [g, c * (model.tagIdf[g] || 1)]).sort((a, b) => b[1] - a[1]);
-          let kept = Object.entries(counts).filter(([, c]) => c >= minSup);
-          if (!kept.length) kept = Object.entries(counts);
-          const specific = rank(kept.filter(([g]) => !UMBRELLA.has(g)));
-          const umbrella = rank(kept.filter(([g]) => UMBRELLA.has(g)));
-          const picks = specific.slice(0, 2);
-          if (picks.length < 2 && umbrella.length) picks.push(umbrella[0]);   // at most one umbrella tag
-          const label = picks.slice(0, 2).map(x => x[0]).join(', ');
-          return { label: label || 'mixed', members: members.slice().sort((a, b) => ratings.get(b) - ratings.get(a)) };
-        });
-      }, [ratedArr]);
-
-      const doExport = () => {
-        const rows = ratedArr.map(([j, r]) => [
-          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1), j
-        ]);
-        const blob = new Blob([M.exportCSV(rows)], { type: 'text/csv;charset=utf-8' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'my-book-ratings.csv';
-        a.click();
-        URL.revokeObjectURL(a.href);
-      };
-
-      const doImport = e => {
-        const file = e.target.files && e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const res = M.importRatings(model.prep, model.matchIndex, String(reader.result));
-          setReport(res);
-          if (!res.error && res.matched.length) onImport(res.matched);
-        };
-        reader.readAsText(file);
-        e.target.value = '';
-      };
 
       const dt = { fontSize: 12.5, color: C.foot };
       const dd = { fontSize: 12.5, color: C.text, fontVariantNumeric: 'tabular-nums' };
@@ -1638,29 +1716,6 @@
               </p>
             </div>
           ) : <p style={{ fontSize: 12.5, color: C.foot }}>Rate at least 3 books to see this.</p>}
-
-          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Your taste clusters</h3>
-          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
-            Agglomerative clustering (cosine, in the 32-dim factor space) of your rated books, labeled by dominant subgenres.
-          </p>
-          {clusters ? (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
-              {clusters.map((cl, i) => (
-                <div key={i} className="rec-card" style={{ padding: 10 }}>
-                  <div style={{ fontSize: 12.5, color: C.teal, fontWeight: 600, marginBottom: 6 }}>
-                    {cl.label} <span style={{ color: C.foot, fontWeight: 400 }}>({cl.members.length})</span>
-                  </div>
-                  {cl.members.map(j => (
-                    <div key={j} style={{ fontSize: 12.5, color: C.text, display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
-                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: ratingColor(ratings.get(j)), flexShrink: 0 }} />
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{M.cleanTitle(model.prep.books[j].t)}</span>
-                      <span style={{ color: C.foot, marginLeft: 'auto' }}>{ratings.get(j).toFixed(1)}</span>
-                    </div>
-                  ))}
-                </div>
-              ))}
-            </div>
-          ) : <p style={{ fontSize: 12.5, color: C.foot }}>Rate at least 4 books to see this.</p>}
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>How it works</h3>
           <details style={{ marginTop: 6 }}>
@@ -1707,15 +1762,91 @@
               <span style={dt}>Exposure AUC</span><span style={dd}>0.81 at 10 answers (popularity: 0.77)</span>
             </div>
           </details>
+        </div>
+      );
+    }
+
+    /* ── Your data tab (clusters + export/import + reset) ──────────────── */
+    function YourDataTab({ model, ratings, unknown, onImport, onReset }) {
+      const [report, setReport] = useState(null);
+      const ratedArr = useMemo(() => [...ratings.entries()], [ratings]);
+      const unknownArr = useMemo(() => [...unknown], [unknown]);
+
+      // Cluster names removed for now; singletons hidden (a lone book isn't a cluster).
+      const clusters = useMemo(() => {
+        if (ratedArr.length < 4) return null;
+        const idxs = ratedArr.map(x => x[0]);
+        const maxK = Math.max(1, Math.min(5, Math.round(Math.sqrt(idxs.length))));
+        return M.clusterRated(model.prep, idxs, maxK)
+          .map(members => members.slice().sort((a, b) => ratings.get(b) - ratings.get(a)))
+          .filter(members => members.length >= 2);
+      }, [ratedArr]);
+
+      const doExport = () => {
+        const rows = ratedArr.map(([j, r]) => [
+          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), r.toFixed(1), j, ''
+        ]);
+        for (const j of unknownArr) rows.push([
+          M.cleanTitle(model.prep.books[j].t), M.cleanAuthor(model.prep.books[j].a), '', j, 'unknown'
+        ]);
+        const blob = new Blob([M.exportCSV(rows)], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'my-book-ratings.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      };
+
+      const doImport = e => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = M.importRatings(model.prep, model.matchIndex, String(reader.result));
+          setReport(res);
+          if (!res.error) onImport(res.matched, res.unknown);
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      return (
+        <div style={{ maxWidth: '80ch' }}>
+          <h3 style={{ fontSize: 16, color: C.text, margin: '18px 0 4px' }}>Your taste clusters</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
+            Agglomerative clustering (cosine, in the 32-dim factor space) of your rated books. Groups of two or more are shown.
+          </p>
+          {clusters == null
+            ? <p style={{ fontSize: 12.5, color: C.foot }}>Rate at least 4 books to see this.</p>
+            : clusters.length === 0
+              ? <p style={{ fontSize: 12.5, color: C.foot }}>No multi-book clusters yet - rate a few more.</p>
+              : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
+              {clusters.map((members, i) => (
+                <div key={i} className="rec-card" style={{ padding: 10 }}>
+                  <div style={{ fontSize: 11.5, color: C.foot, marginBottom: 6 }}>{members.length} books</div>
+                  {members.map(j => (
+                    <div key={j} style={{ fontSize: 12.5, color: C.text, display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0' }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: ratingColor(ratings.get(j)), flexShrink: 0 }} />
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{M.cleanTitle(model.prep.books[j].t)}</span>
+                      <span style={{ color: C.foot, marginLeft: 'auto' }}>{ratings.get(j).toFixed(1)}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 4px' }}>Export / import your ratings</h3>
           <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
-            CSV with columns <code style={{ fontSize: 11.5 }}>title,author,rating</code>. Import also understands
-            common library exports (e.g. <code style={{ fontSize: 11.5 }}>Title / Author / My Rating</code>);
-            matching uses normalized title + author. Note: series are cataloged under their first volume's title.
+            CSV with columns <code style={{ fontSize: 11.5 }}>title,author,rating</code>. Your export also carries
+            your "don't know it" answers (as a <code style={{ fontSize: 11.5 }}>status</code> column) so a
+            re-import restores them. Import also understands common library exports (e.g.
+            <code style={{ fontSize: 11.5 }}> Title / Author / My Rating</code>); matching uses normalized title +
+            author. Note: series are cataloged under their first volume's title.
           </p>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <button className="lang-seg" onClick={doExport} disabled={ratings.size === 0}>Export CSV</button>
+            <button className="lang-seg" onClick={doExport} disabled={ratings.size === 0 && unknown.size === 0}>Export CSV</button>
             <label className="lang-seg" style={{ cursor: 'pointer', marginBottom: 0 }}>
               Import CSV…
               <input type="file" accept=".csv,text/csv,text/plain" onChange={doImport} style={{ display: 'none' }} />
@@ -1726,7 +1857,8 @@
               {report.error ? <span style={{ color: C.gold }}>{report.error}</span> : (
                 <span>
                   <strong style={{ color: C.text }}>{report.matched.length} matched</strong>
-                  {' / '}{report.notFound.length} not found
+                  {report.unknown && report.unknown.length > 0 ? ` · ${report.unknown.length} "don't know it" restored` : ''}
+                  {' · '}{report.notFound.length} not found
                   {report.skipped > 0 ? ` · ${report.skipped} rows without a rating skipped` : ''}
                   {report.notFound.length > 0 && (
                     <details style={{ marginTop: 4 }}>
@@ -1738,6 +1870,14 @@
               )}
             </div>
           )}
+
+          <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 6px' }}>Reset</h3>
+          <p style={{ fontSize: 12.5, color: C.label, margin: '0 0 10px' }}>
+            Deletes all your ratings and "don't know it" answers from this device. This cannot be undone.
+          </p>
+          <button style={RESET_BTN} onClick={onReset} disabled={ratings.size === 0 && unknown.size === 0}>
+            Reset everything
+          </button>
         </div>
       );
     }
@@ -1872,8 +2012,14 @@
         setRatings(new Map()); setUnknown(new Set()); setSkipped(new Set());
         try { localStorage.removeItem(STORE_KEY); } catch (e) {}
       };
-      const onImport = matched => {
+      const onImport = (matched, unknownIdx) => {
         setRatings(prev => { const m = new Map(prev); for (const [j, r] of matched) m.set(j, r); return m; });
+        setUnknown(prev => {
+          const s = new Set(prev);
+          for (const j of (unknownIdx || [])) s.add(j);
+          for (const [j] of matched) s.delete(j);   // a rated book is known
+          return s;
+        });
       };
       const TABS = [
         { id: 'rate', label: `Rate${ratings.size ? ` (${ratings.size})` : ''}` },
@@ -1881,12 +2027,13 @@
         { id: 'toppick', label: 'Top-pick map' },
         { id: 'scatter', label: 'Scatter' },
         { id: 'map', label: 'Taste map' },
-        { id: 'model', label: 'Model' }
+        { id: 'model', label: 'Model' },
+        { id: 'yourdata', label: 'Your data' }
       ];
 
       return (
         <div className="container">
-          <hgroup style={{ marginBottom: 8 }}>
+          <hgroup style={{ marginTop: 18, marginBottom: 8 }}>
             <h1 style={{ fontSize: '1.5rem', color: C.text, marginBottom: 4 }}>Book Recommender</h1>
             <p style={{ color: C.label, marginBottom: 0 }}>Fantasy &amp; sci-fi recommendations with calibrated uncertainty</p>
           </hgroup>
@@ -1916,7 +2063,9 @@
             <MapTab model={model} comp={comp} ratings={ratings} passes={filterData.passes}
               showTerrain={showTerrain} setShowTerrain={setShowTerrain} />}
           {tab === 'model' &&
-            <ModelTab model={model} comp={comp} ratings={ratings} onImport={onImport} />}
+            <ModelTab model={model} comp={comp} ratings={ratings} />}
+          {tab === 'yourdata' &&
+            <YourDataTab model={model} ratings={ratings} unknown={unknown} onImport={onImport} onReset={onReset} />}
 
           <p style={{ marginTop: 30, fontSize: 11, color: C.foot, lineHeight: 1.7 }}>
             Recommendation model trained offline on a large corpus of public book ratings - 2,538 fantasy &amp; sci-fi
