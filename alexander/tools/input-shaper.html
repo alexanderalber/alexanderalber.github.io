@@ -5,7 +5,7 @@
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'de');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Input-Shaping-Rechner – Alexander Alber</title>
-  <meta name="description" content="Interaktiver Rechner für Input Shaping: ZV-, ZVD-, ZVDD-, EI- und 2-Hump-EI-Shaper an einem gedämpften Feder-Masse-System. Zeitantwort, Sensitivitätskurve und Impulsfolge.">
+  <meta name="description" content="Interaktiver Rechner für Input Shaping: ZV-, MZV-, ZVD-, ZVDD-, EI- und Multi-Hump-EI-Shaper an einem gedämpften Feder-Masse-System. Zeitantwort, Sensitivitätskurve, Impulsfolge und Klipper-Konfiguration.">
   <link rel="canonical" href="https://alber.me/alexander/tools/input-shaper.html">
   <link rel="alternate" hreflang="de" href="https://alber.me/alexander/tools/input-shaper.html">
   <link rel="alternate" hreflang="en" href="https://alber.me/alexander/tools/input-shaper.html?lang=en">
@@ -33,7 +33,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Input-Shaping-Rechner",
-    "description": "Interaktiver Rechner für Input Shaping (ZV, ZVD, ZVDD, EI, 2-Hump-EI) an einem gedämpften Feder-Masse-System. Zeitantwort, Sensitivitätskurve und Impulsfolge.",
+    "description": "Interaktiver Rechner für Input Shaping (ZV, MZV, ZVD, ZVDD, EI, 2-/3-Hump-EI) an einem gedämpften Feder-Masse-System. Zeitantwort, Sensitivitätskurve, Impulsfolge und Klipper-Konfiguration.",
     "url": "https://alber.me/alexander/tools/input-shaper.html",
     "applicationCategory": "EducationalApplication",
     "inLanguage": "de",
@@ -88,9 +88,14 @@
   </main>
 
   <script type="text/babel">
-    const { useState, useMemo } = React;
+    const { useState, useMemo, useDeferredValue } = React;
 
     const LANG = localStorage.getItem('lang') || 'de';
+
+    /* Hover exists (desktop/mouse) → shaper explanations as hover tooltips.
+       On touch devices a focus-driven tooltip would pop up on every tap and
+       cover the buttons, so those get a static info block below the controls. */
+    const HAS_HOVER = window.matchMedia('(hover: hover)').matches;
 
     /* ── UI strings ──────────────────────────────────────────────────────── */
     const STRINGS = {
@@ -120,7 +125,7 @@
         axRho: "Frequenzverhältnis ρ",
         axResidual: "Restschwingung",
         overdamped: "Bei ζ ≥ 1 schwingt das System nicht – es gibt keine Restschwingung, die ein Shaper auslöschen könnte.",
-        source: "Methode nach W. Singhose et al., „Command Shaping for Flexible Systems“. ZV/ZVD/ZVDD und die negativen UM-ZV/PS/UM-EI-Shaper sind für jedes ζ exakt (mit zerfallsgewichteten Amplituden; bei UM-EI werden zusätzlich die Impuls-Zeiten so gelöst, dass der EI-Hügel die Toleranz V bei ρ = 1 trifft). Nur die EI- und 2-Hump-EI-Amplituden sind ungedämpft hergeleitet (exakt bei ζ = 0, Näherung für größere ζ). SNA-EI ist eine stetige Brücke positiver EI ↔ UM-EI mit fest vorgegebener negativer Amplitude a; der verbleibende Freiheitsgrad ist linear interpoliert (treue Lehr-Version, nicht der zeitoptimale SNA-Shaper der Literatur). Die Abtast-Analyse modelliert nur die Impuls-Zeit-Quantisierung; die Inversion gilt für das minimalphasige Modell 2. Ordnung.",
+        source: "Methode nach W. Singhose et al., „Command Shaping for Flexible Systems“. ZV/MZV (Klipper-Formel)/ZVD/ZVDD und die negativen UM-ZV/PS/UM-EI-Shaper sind für jedes ζ exakt (mit zerfallsgewichteten Amplituden; bei UM-EI werden zusätzlich die Impuls-Zeiten so gelöst, dass der EI-Hügel die Toleranz V bei ρ = 1 trifft). Nur die EI-, 2-Hump- und 3-Hump-EI-Amplituden sind ungedämpft hergeleitet (exakt bei ζ = 0, Näherung für größere ζ). SNA-EI ist eine stetige Brücke positiver EI ↔ UM-EI mit fest vorgegebener negativer Amplitude a; der verbleibende Freiheitsgrad ist linear interpoliert (treue Lehr-Version, nicht der zeitoptimale SNA-Shaper der Literatur). Die Abtast-Analyse modelliert nur die Impuls-Zeit-Quantisierung; die Inversion gilt für das minimalphasige Modell 2. Ordnung.",
         disclaimer: "Vereinfachtes Lehrmodell eines unterdämpften Schwingers 2. Ordnung (ein Mode). Privates Hobbyprojekt, ohne Gewähr.",
         about: "Input Shaping (Eingangsformung) faltet das Kommandosignal mit einer kurzen Impulsfolge, sodass sich die von den einzelnen Impulsen angeregten Schwingungen am Ende gegenseitig auslöschen. Dieselbe Idee steckt in der Resonanzkompensation von 3D-Druckern (Klipper/Marlin), in Kran- und Festplatten-Positioniersteuerungen.",
         command: "Kommando",
@@ -177,6 +182,7 @@
         optOut: "Ausgang",
         optBandLabel: "optimierter ρ-Bereich",
         optAbout: "Kein Verfahren aus der Literatur erschlägt alle Anforderungen gleichzeitig – also wirft dieses Tool eine Optimierung darauf. Entscheidungsvariablen sind die Kommando-Inkremente δₖ auf einem festen Raster; das Kommando ist ihre Laufsumme, der Ausgang x(t) = Σ δₖ·g(t−tₖ) ist linear in δ. Minimiert wird eine gewichtete Summe aus Restschwingung über einem ρ-Band um 1 (Robustheit – die ρ-Bandbreite legt fest, über welchen Frequenzbereich gemittelt wird, das Vibrations-Gewicht, wie stark das gegen die übrigen Ziele zählt), Tracking-Fehler (Geschwindigkeit) und Stellaufwand Σδ² (Glätte), unter den Nebenbedingungen Σδ = 1 (Sollwert erreicht) und |δₖ| ≤ δₘₐₓ (Aktor-Slew-Rate). „Negative Amplituden\" gibt den Inkrementen das Vorzeichen frei (Over-Drive, kürzer); „Monotoner Ausgang\" verbietet per Strafterm, dass der Ausgang in der dynamischen Phase zurückläuft (kein 0→0,8→0,6→1). Das Stellsignal-Modell schaltet zwischen Stufen (klassische Impuls-Treppe) und Rampen (abschnittsweise lineares Kommando) um – bei Rampen sind die Variablen die Steigungen, und die Aktor-Rate ist deren exakte Grenze statt nur einer Stufenhöhe. Gelöst per projiziertem Gradientenabstieg. Lehr-Demonstrator, kein produktionsreifer Regler.",
+        klipperNote: "Klipper (3D-Drucker): dieselbe Formung als [input_shaper]-Sektion – Klipper rechnet intern fest mit ζ = 0,1 und V = 5 %:",
       },
       en: {
         title: "Input Shaping Calculator",
@@ -204,7 +210,7 @@
         axRho: "Frequency ratio ρ",
         axResidual: "Residual vibration",
         overdamped: "For ζ ≥ 1 the system does not oscillate – there is no residual vibration for a shaper to cancel.",
-        source: "Method after W. Singhose et al., “Command Shaping for Flexible Systems”. ZV/ZVD/ZVDD and the negative UM-ZV/PS/UM-EI shapers are exact for any ζ (with decay-weighted amplitudes; UM-EI additionally solves the impulse times so the EI hump meets the tolerance V at ρ = 1). Only the EI and 2-hump EI amplitudes are derived undamped (exact at ζ = 0, an approximation for larger ζ). SNA-EI is a continuous bridge from the positive EI to UM-EI with a specified negative amplitude a; the remaining degree of freedom is linearly interpolated (a faithful teaching version, not the time-optimal SNA shaper of the literature). The sampling analysis models impulse-time quantisation only; the inversion applies to the minimum-phase second-order model.",
+        source: "Method after W. Singhose et al., “Command Shaping for Flexible Systems”. ZV/MZV (Klipper formula)/ZVD/ZVDD and the negative UM-ZV/PS/UM-EI shapers are exact for any ζ (with decay-weighted amplitudes; UM-EI additionally solves the impulse times so the EI hump meets the tolerance V at ρ = 1). Only the EI, 2-hump and 3-hump EI amplitudes are derived undamped (exact at ζ = 0, an approximation for larger ζ). SNA-EI is a continuous bridge from the positive EI to UM-EI with a specified negative amplitude a; the remaining degree of freedom is linearly interpolated (a faithful teaching version, not the time-optimal SNA shaper of the literature). The sampling analysis models impulse-time quantisation only; the inversion applies to the minimum-phase second-order model.",
         disclaimer: "Simplified teaching model of an under-damped second-order oscillator (single mode). Personal hobby project, no warranty.",
         about: "Input shaping convolves the command signal with a short sequence of impulses so that the vibrations excited by the individual impulses cancel each other out in the end. The same idea drives resonance compensation in 3D printers (Klipper/Marlin) and crane / hard-disk positioning control.",
         command: "command",
@@ -261,6 +267,7 @@
         optOut: "output",
         optBandLabel: "optimised ρ-band",
         optAbout: "No literature shaper satisfies every requirement at once – so this tool throws an optimisation at it. The decision variables are the command increments δₖ on a fixed grid; the command is their running sum and the output x(t) = Σ δₖ·g(t−tₖ) is linear in δ. It minimises a weighted sum of residual vibration over a ρ-band around 1 (robustness – the ρ-band width sets the frequency range averaged over, the vibration weight how strongly it counts against the other goals), tracking error (speed) and actuator effort Σδ² (smoothness), subject to Σδ = 1 (reach the set-point) and |δₖ| ≤ δₘₐₓ (actuator slew rate). “Negative amplitudes” frees the sign of the increments (over-drive, shorter); “Monotonic output” adds a penalty forbidding the output to move backwards during the transient (no 0→0.8→0.6→1). The command model switches between steps (the classic impulse staircase) and ramps (a piecewise-linear command) – with ramps the variables are the slopes and the actuator rate is their exact bound, not just a step height. Solved by projected gradient descent. A teaching demonstrator, not a production-ready controller.",
+        klipperNote: "Klipper (3D printers): the same shaping as an [input_shaper] section – Klipper internally assumes ζ = 0.1 and V = 5 % (fixed):",
       },
     };
 
@@ -268,7 +275,7 @@
        Each returns { t:[…], a:[…] } with times in seconds and amplitudes
        normalised to Σaᵢ = 1.  Δ = π/ω_d is the half damped period,
        K = e^(−ζπ/√(1−ζ²)) is the per-half-period decay.                    */
-    const SHAPERS = ['ZV', 'ZVD', 'ZVDD', 'EI', '2-Hump EI', 'UM-ZV', 'UM-EI', 'PS', 'SNA-EI'];
+    const SHAPERS = ['ZV', 'MZV', 'ZVD', 'ZVDD', 'EI', '2-Hump EI', '3-Hump EI', 'UM-ZV', 'UM-EI', 'PS', 'SNA-EI'];
 
     /* Full name + tl;dr of each shaper's design philosophy (for the tooltip) */
     const SHAPER_INFO = {
@@ -277,6 +284,13 @@
         tldr: {
           de: 'Kürzester Shaper (2 Impulse, ½ Periode). Löscht die Schwingung bei der Modellfrequenz exakt aus – dafür am empfindlichsten gegen Frequenzfehler.',
           en: 'Shortest shaper (2 impulses, ½ period). Cancels vibration exactly at the modelled frequency – but most sensitive to frequency errors.',
+        },
+      },
+      'MZV': {
+        name: { de: 'Modified Zero Vibration', en: 'Modified Zero Vibration' },
+        tldr: {
+          de: '3 Impulse über ¾ Periode – zwischen ZV und ZVD. Löscht die Schwingung bei der Designfrequenz exakt aus (zerfallsgewichtet, für jedes ζ) und ist etwas robuster als ZV. Klippers Standard-Empfehlung für 3D-Drucker, wenn die Resonanzmessung sauber ist.',
+          en: '3 impulses over ¾ of a period – between ZV and ZVD. Cancels vibration exactly at the design frequency (decay-weighted, any ζ) and is slightly more robust than ZV. Klipper’s default recommendation for 3D printers when the resonance measurement is clean.',
         },
       },
       'ZVD': {
@@ -303,8 +317,15 @@
       '2-Hump EI': {
         name: { de: '2-Hump Extra-Insensitive', en: 'Two-Hump Extra-Insensitive' },
         tldr: {
-          de: '4 Impulse. Wie EI, hält die Restschwingung aber über einen noch breiteren Frequenzbereich unter V (zwei Täler in der Kurve). Maximale Robustheit bei großer Frequenzunsicherheit – der längste hier.',
-          en: '4 impulses. Like EI, but keeps the residual below V across an even broader frequency range (two dips in the curve). Maximum robustness for large frequency uncertainty – the longest one here.',
+          de: '4 Impulse. Wie EI, hält die Restschwingung aber über einen noch breiteren Frequenzbereich unter V (zwei Täler in der Kurve). Viel Robustheit bei großer Frequenzunsicherheit für 1,5 Perioden Länge.',
+          en: '4 impulses. Like EI, but keeps the residual below V across an even broader frequency range (two dips in the curve). A lot of robustness for large frequency uncertainty at 1.5 periods of length.',
+        },
+      },
+      '3-Hump EI': {
+        name: { de: '3-Hump Extra-Insensitive', en: 'Three-Hump Extra-Insensitive' },
+        tldr: {
+          de: '5 Impulse, 2 Perioden – die EI-Familie zu Ende gedacht: hält die Restschwingung über den breitesten Frequenzbereich unter V (drei Täler in der Kurve). Für stark unsichere oder driftende Frequenzen; dafür der längste Shaper hier.',
+          en: '5 impulses, 2 periods – the EI family taken to its limit: keeps the residual below V across the widest frequency range (three dips in the curve). For very uncertain or drifting frequencies – at the cost of being the longest shaper here.',
         },
       },
       'UM-ZV': {
@@ -353,28 +374,23 @@
       };
     }
 
-    /* Negative unity-magnitude EI shaper: five impulses A = [+1,−1,+1,−1,+1] at
-       symmetric times t = [0, x₂T, ½x₅T, (x₅−x₂)T, x₅T]. The two free durations
+    /* ── Shared machinery for the five-impulse EI shapers (UM-EI, SNA-EI) ──
+       Both use symmetric times t = [0, x₂T, ½x₅T, (x₅−x₂)T, x₅T] with signs
+       [+,−,+,−,+]; only the impulse magnitudes differ. The two free durations
        (x₂, x₅) are fixed by the two EI conditions at the design frequency ρ = 1:
        the residual equals the tolerated hump V, and its slope is zero (ρ = 1 is
        the top of the hump). For ζ > 0 the amplitudes are decay-weighted just like
-       UM-ZV (aᵢ = ±e^{−ζωₙtᵢ}, ±1 only at ζ = 0): at ρ = 1 that weighting cancels
-       the system's own decay, so the effective impulse train is the symmetric ±1
-       design and the EI band (hump + two flanking zeros) survives the damping. A
-       strict ±1 train instead collapses the band into a single notch once the
-       per-cycle decay K drops well below 1. The 2×2 Newton then only has to slide
-       the times so the hump touches V at ρ = 1 for any ζ.
+       UM-ZV (aᵢ = ±magᵢ·e^{−ζωₙtᵢ}): at ρ = 1 that weighting cancels the system's
+       own decay, so the effective impulse train is the symmetric design and the
+       EI band (hump + two flanking zeros) survives the damping. A strict ±mag
+       train instead collapses the band into a single notch once the per-cycle
+       decay K drops well below 1. */
 
-       Step 1 seeds with the closed-form undamped solution (the symmetric ±1 train
-       reduces to M(ρ) = 1 + 2cos(γρ) − 2cos(βρ); the conditions become
-       2cosγ − 2cosβ + 1 + V = 0 and γsinγ − βsinβ = 0, γ = πx₅, β = π(x₅−2x₂)).
-       Step 2 refines (x₂, x₅) with a finite-difference 2×2 Newton on the damped
-       residual r(ρ): F₁ = r(1) − V, F₂ ∝ r′(1) ≈ r(1+δ) − r(1−δ).
-       At V = 0.05, ζ = 0 this gives ≈0.74·T — shorter than the positive EI (1·T)
-       because the negative impulses retract, the price being command over-drive. */
-    function umEIImpulses(V, zeta, d, wn) {
-      const T = 2 * d;                             // full damped period
-      /* 1 — undamped closed-form seed */
+    /* Undamped closed-form seed: the symmetric ±1 train reduces to
+       M(ρ) = 1 + 2cos(γρ) − 2cos(βρ) with γ = πx₅, β = π(x₅−2x₂); the EI
+       conditions become 2cosγ − 2cosβ + 1 + V = 0 and γsinγ − βsinβ = 0,
+       solved by a 2×2 Newton. */
+    function eiSeedGammaBeta(V) {
       let g = 2.3, b = 1.7;                        // good seed for V ∈ [0.01, 0.2]
       for (let it = 0; it < 40; it++) {
         const F1 = 2 * Math.cos(g) - 2 * Math.cos(b) + 1 + V;
@@ -386,23 +402,30 @@
         g -= (F1 * J22 - F2 * J12) / det;
         b -= (-F1 * J21 + F2 * J11) / det;
       }
-      let x5 = g / Math.PI;                        // outer impulse, fraction of period
-      let x2 = (x5 - b / Math.PI) / 2;             // first inner impulse
-      const x2Seed = x2, x5Seed = x5;
+      return { g, b };
+    }
 
-      /* 2 — refine against the true damped residual (no-op at ζ = 0).
-         The damped residual is oscillatory in the impulse times, so it has many
-         roots; only the one near the undamped seed is the short EI shaper. We keep
-         Newton on that branch by limiting each step and clamping (x₂, x₅) into a
-         box around the seed — otherwise it can wander off to a spurious solution
-         many periods long that still satisfies r(1) = V. */
-      const build = (a2, a5) => {
+    /* Builder factory: (x₂, x₅) → decay-weighted, Σ = 1 impulse train. */
+    function fiveImpulseBuild(mag, T, zeta, wn) {
+      return (a2, a5) => {
         const tt = [0, a2 * T, (a5 / 2) * T, (a5 - a2) * T, a5 * T];
-        const aa = [1, -1, 1, -1, 1].map((s, i) => s * Math.exp(-zeta * wn * tt[i]));  // decay-weighted (≡ ±1 at ζ = 0)
+        const aa = [1, -1, 1, -1, 1].map((s, i) => s * mag[i] * Math.exp(-zeta * wn * tt[i]));
         const sum = aa.reduce((p, v) => p + v, 0);
-        return { t: tt, a: aa.map(v => v / sum) };                                      // static gain 1
+        return { t: tt, a: aa.map(v => v / sum) };                // static gain 1
       };
-      const res   = (rho, a2, a5) => residualVibration(rho, build(a2, a5), zeta, wn);
+    }
+
+    /* Refine (x₂, x₅) against the true damped residual (no-op at ζ = 0) with a
+       finite-difference 2×2 Newton: F₁ = r(1) − V, F₂ ∝ r′(1) ≈ r(1+δ) − r(1−δ).
+       The damped residual is oscillatory in the impulse times, so it has many
+       roots; only the one near the undamped seed is the short EI shaper. We keep
+       Newton on that branch by limiting each step and clamping (x₂, x₅) into a
+       box around the seed — otherwise it can wander off to a spurious solution
+       many periods long that still satisfies r(1) = V. Returns the refined pair,
+       or the seed if the solve drifted off the branch or never reached V. */
+    function refineEITimes(build, V, zeta, wn, x2Seed, x5Seed) {
+      let x2 = x2Seed, x5 = x5Seed;
+      const res = (rho, a2, a5) => residualVibration(rho, build(a2, a5), zeta, wn);
       const dlt = 0.02, hx = 1e-3, maxStep = 0.05;
       const x5lo = 0.5 * x5Seed, x5hi = 1.6 * x5Seed;     // stay near the seed branch
       const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
@@ -423,11 +446,23 @@
         x2 = clamp(x2 - d2, 1e-3, x5 / 2 - 1e-3);
         if (mag < 1e-9) break;
       }
-      // reject a solve that drifted off the branch or never reached V → use the seed
       if (!isFinite(x2) || !isFinite(x5) || Math.abs(res(1, x2, x5) - V) > 5e-3) {
-        x2 = x2Seed; x5 = x5Seed;
+        return [x2Seed, x5Seed];
       }
-      return build(x2, x5);                        // decay-weighted, already Σ = 1
+      return [x2, x5];
+    }
+
+    /* Negative unity-magnitude EI shaper: A = [+1,−1,+1,−1,+1] (decay-weighted).
+       At V = 0.05, ζ = 0 this gives ≈0.74·T — shorter than the positive EI (1·T)
+       because the negative impulses retract, the price being command over-drive. */
+    function umEIImpulses(V, zeta, d, wn) {
+      const T = 2 * d;                             // full damped period
+      const { g, b } = eiSeedGammaBeta(V);
+      const x5 = g / Math.PI;                      // outer impulse, fraction of period
+      const x2 = (x5 - b / Math.PI) / 2;           // first inner impulse
+      const build = fiveImpulseBuild([1, 1, 1, 1, 1], T, zeta, wn);
+      const [r2, r5] = refineEITimes(build, V, zeta, wn, x2, x5);
+      return build(r2, r5);
     }
 
     /* Specified-Negative-Amplitude EI: same five-impulse symmetric structure as
@@ -435,66 +470,22 @@
        magnitude a specified by the aggressiveness slider (0…1). The remaining
        degree of freedom (p) is pinned by a linear bridge so the endpoints are
        exact: p(a) interpolates the positive-EI outer amplitude (1+V)/4 (a = 0) up
-       to 1 (a = 1, where this reduces to UM-EI). q follows from Σ = 1. The two
-       impulse times are then solved against the damped residual for hump = V and
-       zero slope at ρ = 1, exactly like UM-EI. Amplitudes decay-weighted for ζ>0.
+       to 1 (a = 1, where this reduces to UM-EI). q follows from Σ = 1. The seed
+       interpolates the two analytic endpoints in (γ, β) = (πx₅, π(x₅−2x₂)); the
+       times are then refined against the damped residual exactly like UM-EI.
        This is a smooth teaching bridge between positive EI and UM-EI, not the
        time-optimal SNA of the literature. */
     function snaEIImpulses(V, aNeg, zeta, d, wn) {
       const T = 2 * d;
       const p = (1 + V) / 4 + aNeg * (1 - (1 + V) / 4);
       const q = 1 - 2 * p + 2 * aNeg;
-      const mag = [p, aNeg, q, aNeg, p], sgn = [1, -1, 1, -1, 1];
-
-      /* seed = interpolation of the two analytic endpoints in (γ, β) = (πx₅, π(x₅−2x₂)) */
-      let g1 = 2.3, b1 = 1.7;                       // a = 1: UM-EI closed form
-      for (let it = 0; it < 40; it++) {
-        const F1 = 2 * Math.cos(g1) - 2 * Math.cos(b1) + 1 + V;
-        const F2 = g1 * Math.sin(g1) - b1 * Math.sin(b1);
-        const J11 = -2 * Math.sin(g1),               J12 =  2 * Math.sin(b1);
-        const J21 = Math.sin(g1) + g1 * Math.cos(g1), J22 = -(Math.sin(b1) + b1 * Math.cos(b1));
-        const det = J11 * J22 - J12 * J21;
-        if (Math.abs(det) < 1e-12) break;
-        g1 -= (F1 * J22 - F2 * J12) / det;
-        b1 -= (-F1 * J21 + F2 * J11) / det;
-      }
+      const { g: g1, b: b1 } = eiSeedGammaBeta(V);       // a = 1: UM-EI closed form
       const g0 = Math.PI, b0 = Math.acos((V - 1) / 2);   // a = 0: positive EI (x₅ = 1)
-      let x5 = (g0 + aNeg * (g1 - g0)) / Math.PI;
-      let x2 = (x5 - (b0 + aNeg * (b1 - b0)) / Math.PI) / 2;
-      const x2Seed = x2, x5Seed = x5;
-
-      /* refine (x₂, x₅) against the damped residual: r(1) = V and r′(1) = 0 */
-      const build = (a2, a5) => {
-        const tt = [0, a2 * T, (a5 / 2) * T, (a5 - a2) * T, a5 * T];
-        const aa = sgn.map((s, i) => s * mag[i] * Math.exp(-zeta * wn * tt[i]));
-        const sum = aa.reduce((u, v) => u + v, 0);
-        return { t: tt, a: aa.map(v => v / sum) };
-      };
-      const res = (rho, a2, a5) => residualVibration(rho, build(a2, a5), zeta, wn);
-      const dlt = 0.02, hx = 1e-3, maxStep = 0.05;
-      const x5lo = 0.5 * x5Seed, x5hi = 1.6 * x5Seed;
-      const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
-      const F = (a2, a5) => [res(1, a2, a5) - V, res(1 + dlt, a2, a5) - res(1 - dlt, a2, a5)];
-      for (let it = 0; it < 80; it++) {
-        const f   = F(x2, x5);
-        const f2p = F(x2 + hx, x5), f2m = F(x2 - hx, x5);
-        const f5p = F(x2, x5 + hx), f5m = F(x2, x5 - hx);
-        const J11 = (f2p[0] - f2m[0]) / (2 * hx), J12 = (f5p[0] - f5m[0]) / (2 * hx);
-        const J21 = (f2p[1] - f2m[1]) / (2 * hx), J22 = (f5p[1] - f5m[1]) / (2 * hx);
-        const det = J11 * J22 - J12 * J21;
-        if (!isFinite(det) || Math.abs(det) < 1e-14) break;
-        let d2 = ( f[0] * J22 - f[1] * J12) / det;
-        let d5 = (-f[0] * J21 + f[1] * J11) / det;
-        const mg = Math.abs(d2) + Math.abs(d5);
-        if (mg > maxStep) { const s = maxStep / mg; d2 *= s; d5 *= s; }
-        x5 = clamp(x5 - d5, x5lo, x5hi);
-        x2 = clamp(x2 - d2, 1e-3, x5 / 2 - 1e-3);
-        if (mg < 1e-9) break;
-      }
-      if (!isFinite(x2) || !isFinite(x5) || Math.abs(res(1, x2, x5) - V) > 5e-3) {
-        x2 = x2Seed; x5 = x5Seed;
-      }
-      return build(x2, x5);
+      const x5 = (g0 + aNeg * (g1 - g0)) / Math.PI;
+      const x2 = (x5 - (b0 + aNeg * (b1 - b0)) / Math.PI) / 2;
+      const build = fiveImpulseBuild([p, aNeg, q, aNeg, p], T, zeta, wn);
+      const [r2, r5] = refineEITimes(build, V, zeta, wn, x2, x5);
+      return build(r2, r5);
     }
 
     function shaperImpulses(type, f, zeta, V, m, aNeg) {
@@ -508,6 +499,12 @@
       switch (type) {
         case 'ZV':
           t = [0, d];            a = [1, K]; break;
+        case 'MZV': {            // Klipper's modified ZV: ¾ period, decay-weighted
+          const Km = Math.exp(-0.75 * zeta * Math.PI / Math.sqrt(1 - zeta * zeta));  // = K^0.75
+          t = [0, 0.75 * d, 1.5 * d];
+          // the Km powers are exactly e^{−ζωₙtᵢ}, so zero vibration at ρ = 1 holds for any ζ
+          a = [1 - Math.SQRT1_2, (Math.SQRT2 - 1) * Km, (1 - Math.SQRT1_2) * Km * Km]; break;
+        }
         case 'ZVD':
           t = [0, d, 2 * d];     a = [1, 2 * K, K * K]; break;
         case 'ZVDD':
@@ -522,6 +519,12 @@
           const A2 = 0.5 - A1;
           t = [0, d, 2 * d, 3 * d];
           a = [A1, A2, A2, A1]; break;
+        }
+        case '3-Hump EI': {      // three-hump EI (undamped amplitudes), tolerance V
+          const A1 = (1 + 3 * V + 2 * Math.sqrt(2 * (V + 1) * V)) / 16;
+          const A2 = (1 - V) / 4;
+          t = [0, d, 2 * d, 3 * d, 4 * d];
+          a = [A1, A2, (1 + V) / 2 - 2 * A1, A2, A1]; break;
         }
         case 'UM-ZV': {          // negative unity-magnitude ZV (damped-exact)
           const r = negShaperImpulses(1, zeta, d); t = r.t; a = r.a; break;
@@ -980,6 +983,63 @@
       ]).join('\n');
     }
 
+    /* Shapers Klipper supports natively in its [input_shaper] section. */
+    const KLIPPER_TYPES = {
+      'ZV': 'zv', 'MZV': 'mzv', 'ZVD': 'zvd',
+      'EI': 'ei', '2-Hump EI': '2hump_ei', '3-Hump EI': '3hump_ei',
+    };
+
+    /* Copy-paste numpy recipe for a classical shaper: the ideal impulses (t, A)
+       plus their projection onto a controller grid Ts — snap or split, matching
+       the discretisation toggle (snap when the analysis runs ideal). fsUsed is
+       the current sample rate when discretisation is on, else null. */
+    function shaperRecipe(imp, type, f, zeta, method, fsUsed, lang) {
+      const de = lang !== 'en';
+      const lines = [
+        'import numpy as np',
+        '# ' + type + '  @  f = ' + (+f.toPrecision(4)) + ' Hz, zeta = ' + (+zeta.toPrecision(3)),
+        't = np.array([',
+        pyArr(imp.t),
+        '])  # s',
+        'A = np.array([',
+        pyArr(imp.a),
+        '])  # ' + (de ? 'Σ = 1' : 'sum = 1'),
+        '',
+        de ? '# FIR-Kern h auf dem Regler-Raster Ts – dann mit beliebiger Referenz falten:'
+           : '# FIR kernel h on the controller grid Ts – convolve with any reference:',
+        fsUsed
+          ? 'Ts = ' + (+(1 / fsUsed).toPrecision(6)) + '  # s  (= 1/fs)'
+          : 'Ts = 0.001  # s  ' + (de ? '(an die eigene Regler-Rate anpassen)' : '(adapt to your controller tick)'),
+      ];
+      if (method === 'split') {
+        lines.push(
+          'x = t / Ts; n = np.floor(x).astype(int); g = x - n',
+          'h = np.zeros(n[-1] + 2)',
+          'np.add.at(h, n, A * (1 - g)); np.add.at(h, n + 1, A * g)  # ' +
+            (de ? 'aufteilen: Zeitschwerpunkt bleibt' : 'split: preserves the time centroid'),
+        );
+      } else {
+        lines.push(
+          'n = np.round(t / Ts).astype(int)',
+          'h = np.zeros(n[-1] + 1)',
+          'np.add.at(h, n, A)  # ' + (de ? 'runden: Impuls aufs nächste Sample' : 'snap: impulse to the nearest sample'),
+        );
+      }
+      lines.push(
+        '',
+        de ? '# cmd = np.convolve(referenz, h)   ·   0→1-Move: u = np.cumsum(h)'
+           : '# cmd = np.convolve(reference, h)   ·   0→1 move: u = np.cumsum(h)',
+      );
+      return lines.join('\n');
+    }
+
+    /* Shared style of the copy-paste <pre> blocks. */
+    const PRE_STYLE = {
+      maxWidth: 680, overflow: 'auto', background: '#0f172a', border: '1px solid #334155',
+      borderRadius: 8, padding: '12px 14px', fontSize: 12, lineHeight: 1.5, color: '#cbd5e1',
+      userSelect: 'text', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    };
+
     /* ── Palette (matches site / subway-sauces hollywood tones) ── */
     const COL_UNSHAPED = '#ff8c42';   // orange
     const COL_SHAPED   = '#0fb5ad';   // teal
@@ -1133,17 +1193,24 @@
       const [detune, setDetune] = useState(20);   // inversion model error [%]
       const [hover, setHover] = useState(null);   // shaper whose tooltip is shown
       const [hoverSM, setHoverSM] = useState(false); // snap/split tooltip
-      // optimize-mode weights / toggles
+      // optimize-mode weights / toggles. The three objective weights step in
+      // powers of two around their default (H∞-style: weights are tuned by
+      // order of magnitude, fine decimals are noise) — the slider state is the
+      // exponent n ∈ [−5, 5]. Only the actuator rate (a datasheet number) and
+      // the ρ-band width stay continuous.
       const [optModel, setOptModel] = useState('steps'); // 'steps' | 'ramps'
       const [optRob,   setOptRob]   = useState(0.3);
-      const [optVibW,  setOptVibW]  = useState(1);    // vibration weight (Wvib)
-      const [optSpeed, setOptSpeed] = useState(0.5);
-      const [optSmooth, setOptSmooth] = useState(0.3);
+      const [optVibWExp,   setOptVibWExp]   = useState(0);  // Wvib = 2^n
+      const [optSpeedExp,  setOptSpeedExp]  = useState(0);  // speed = 0.5·2^n
+      const [optSmoothExp, setOptSmoothExp] = useState(0);  // smooth = 0.3·2^n
+      const optVibW   = Math.pow(2, optVibWExp);
+      const optSpeed  = 0.5 * Math.pow(2, optSpeedExp);
+      const optSmooth = 0.3 * Math.pow(2, optSmoothExp);
       const [optRate,  setOptRate]  = useState(3);    // max actuator rate [1/T]
       const [optNeg,   setOptNeg]   = useState(false);
       const [optMono,  setOptMono]  = useState(false);
 
-      const usesV = type === 'EI' || type === '2-Hump EI' || type === 'UM-EI' || type === 'SNA-EI';
+      const usesV = type === 'EI' || type === '2-Hump EI' || type === '3-Hump EI' || type === 'UM-EI' || type === 'SNA-EI';
       const usesM = type === 'PS';
       const usesA = type === 'SNA-EI';
       const wn = 2 * Math.PI * f;
@@ -1157,7 +1224,7 @@
         const wd = wn * Math.sqrt(1 - zeta * zeta);
         const Tper = 2 * Math.PI / wd;
         // x-range depends only on the system (period), not on the shaper, so the
-        // axis stays put when switching shapers. 8·T covers even 3Δ = 1.5·T shapers.
+        // axis stays put when switching shapers. 8·T covers even the 4Δ = 2·T 3-Hump EI.
         const tMax = 8 * Tper;
         const xMin = -0.045 * tMax;                 // a little room left of 0 to see the step
         const N = 400;
@@ -1249,11 +1316,26 @@
       }, [f, zeta, wn, tmPer, detune]);
 
       /* ── optimisation-based custom shaper ── */
+      /* All optimiser inputs are deferred: dragging a slider re-renders the
+         controls immediately with the old (memoised) result, and the expensive
+         optimizeCommand run happens in a deferred re-render instead of blocking
+         every input event (React 18 useDeferredValue). */
+      const dZeta     = useDeferredValue(zeta);
+      const dF        = useDeferredValue(f);
+      const dOptModel = useDeferredValue(optModel);
+      const dOptRob   = useDeferredValue(optRob);
+      const dOptVibW  = useDeferredValue(optVibW);
+      const dOptSpeed = useDeferredValue(optSpeed);
+      const dOptSmooth = useDeferredValue(optSmooth);
+      const dOptRate  = useDeferredValue(optRate);
+      const dOptNeg   = useDeferredValue(optNeg);
+      const dOptMono  = useDeferredValue(optMono);
       const optPlot = useMemo(() => {
-        if (zeta >= 1 || f <= 0) return null;
-        const r = optimizeCommand(zeta, wn, {
-          model: optModel, rob: optRob, vibW: optVibW, speed: optSpeed, smooth: optSmooth,
-          rateMax: optRate, allowNeg: optNeg, mono: optMono,
+        if (dZeta >= 1 || dF <= 0) return null;
+        const dWn = 2 * Math.PI * dF;
+        const r = optimizeCommand(dZeta, dWn, {
+          model: dOptModel, rob: dOptRob, vibW: dOptVibW, speed: dOptSpeed, smooth: dOptSmooth,
+          rateMax: dOptRate, allowNeg: dOptNeg, mono: dOptMono,
         });
         const tMax = (OPT_HPER + 0.3) * r.Tper;
         const xMin = -0.045 * tMax;
@@ -1262,7 +1344,7 @@
         let settle = 0;
         for (let i = 0; i <= N; i++) {
           const tt = tMax * i / N;
-          const y = optOutput(tt, r, zeta, wn);
+          const y = optOutput(tt, r, dZeta, dWn);
           out.push([tt, y]);
           if (Math.abs(y - 1) > 0.02) settle = tt;
         }
@@ -1278,9 +1360,9 @@
         const setp = [[xMin, 0], [0, 0], [0, 1], [tMax, 1]];
         const sens = [];
         const Ns = 240;
-        for (let i = 0; i <= Ns; i++) { const rho = 2 * i / Ns; sens.push([rho, optResidual(rho, r, zeta, wn)]); }
+        for (let i = 0; i <= Ns; i++) { const rho = 2 * i / Ns; sens.push([rho, optResidual(rho, r, dZeta, dWn)]); }
         return { r, out, cmd, setp, sens, tMax, xMin, settleMs: settle * 1000 };
-      }, [zeta, wn, f, optModel, optRob, optVibW, optSpeed, optSmooth, optRate, optNeg, optMono]);
+      }, [dZeta, dF, dOptModel, dOptRob, dOptVibW, dOptSpeed, dOptSmooth, dOptRate, dOptNeg, dOptMono]);
 
       const residualAt1 = imp ? residualVibration(1, imp, zeta, wn) : null;
       const shaperDurMs = imp ? imp.t[imp.t.length - 1] * 1000 : null;
@@ -1310,19 +1392,22 @@
           </div>
 
           {mode === 'shaping' && (
-            /* shaper type (with hover/focus tooltip) */
+            /* shaper type — hover/focus tooltip on desktop, static info block on touch */
+            <React.Fragment>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
             <span style={slabel}>{t.shaperLabel}</span>
             <div className="shaper-seg" style={{ position: 'relative', display: 'flex', flexWrap: 'wrap' }}>
               {SHAPERS.map(s => (
                 <button key={s} className={'lang-seg' + (type === s ? ' active' : '')}
                         onClick={() => setType(s)} style={{ minWidth: 78 }}
-                        onMouseEnter={() => setHover(s)} onMouseLeave={() => setHover(null)}
-                        onFocus={() => setHover(s)} onBlur={() => setHover(null)}>
+                        {...(HAS_HOVER ? {
+                          onMouseEnter: () => setHover(s), onMouseLeave: () => setHover(null),
+                          onFocus: () => setHover(s), onBlur: () => setHover(null),
+                        } : {})}>
                   {s}
                 </button>
               ))}
-              {hover && (
+              {HAS_HOVER && hover && (
                 <div role="tooltip" style={{
                   position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 30,
                   width: 'min(320px, 80vw)', background: '#0f172a', border: '1px solid #334155',
@@ -1339,6 +1424,15 @@
               )}
             </div>
           </div>
+          {!HAS_HOVER && (
+            <p style={{ margin: '2px 0 10px', color: '#94a3b8', fontSize: 12, lineHeight: 1.5, maxWidth: 680 }}>
+              <strong style={{ color: '#cbd5e1' }}>
+                {type} · {SHAPER_INFO[type].name[LANG] || SHAPER_INFO[type].name.de}
+              </strong>
+              {' — '}{SHAPER_INFO[type].tldr[LANG] || SHAPER_INFO[type].tldr.de}
+            </p>
+          )}
+          </React.Fragment>
           )}
 
           {/* ── Controls: frequency (logarithmic, 0.1–100 Hz) — shared by both modes ── */}
@@ -1407,13 +1501,13 @@
               {fs >= 1000 ? sig3(fs / 1000) + ' kHz' : sig3(fs) + ' Hz'}
             </span>
             <div className="shaper-seg" style={{ position: 'relative', display: 'flex', marginLeft: 4 }}
-                 onMouseEnter={() => setHoverSM(true)} onMouseLeave={() => setHoverSM(false)}>
+                 {...(HAS_HOVER ? { onMouseEnter: () => setHoverSM(true), onMouseLeave: () => setHoverSM(false) } : {})}>
               {[['snap', t.methodSnap], ['split', t.methodSplit]].map(([k, lbl]) => (
                 <button key={k} className={'lang-seg' + (method === k ? ' active' : '')}
                         onClick={() => setMethod(k)} style={{ minWidth: 70 }}
-                        onFocus={() => setHoverSM(true)} onBlur={() => setHoverSM(false)}>{lbl}</button>
+                        {...(HAS_HOVER ? { onFocus: () => setHoverSM(true), onBlur: () => setHoverSM(false) } : {})}>{lbl}</button>
               ))}
-              {hoverSM && (
+              {HAS_HOVER && hoverSM && (
                 <div role="tooltip" style={{
                   position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 30,
                   width: 'min(340px, 80vw)', background: '#0f172a', border: '1px solid #334155',
@@ -1425,6 +1519,11 @@
               )}
             </div>
           </div>
+          {!HAS_HOVER && disc && (
+            <p style={{ margin: '-12px 0 20px', color: '#64748b', fontSize: 11, lineHeight: 1.5, maxWidth: 680 }}>
+              {t.sampleNote}
+            </p>
+          )}
           </React.Fragment>
           )}
 
@@ -1567,6 +1666,16 @@
                   </table>
                 )}
               </div>
+
+              {/* ── Implementation recipe (copy-paste numpy) + Klipper config ── */}
+              <h3 style={{ marginTop: 28, marginBottom: 8 }}>{t.optRecipeTitle}</h3>
+              <pre style={PRE_STYLE}>{shaperRecipe(imp, type, f, zeta, disc ? method : 'snap', disc ? fs : null, LANG)}</pre>
+              {KLIPPER_TYPES[type] && (
+                <React.Fragment>
+                  <p style={{ margin: '12px 0 6px', fontSize: 12, color: '#94a3b8', maxWidth: 680 }}>{t.klipperNote}</p>
+                  <pre style={PRE_STYLE}>{'[input_shaper]\nshaper_freq_x: ' + (+f.toPrecision(4)) + '\nshaper_type_x: ' + KLIPPER_TYPES[type]}</pre>
+                </React.Fragment>
+              )}
             </React.Fragment>
           )}
 
@@ -1644,21 +1753,21 @@
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
               <span style={slabel}>{t.optVibWLabel}</span>
-              <input type="range" min={0} max={4} step={0.05} value={optVibW}
-                     onChange={e => setOptVibW(+e.target.value)} style={{ width: 220, margin: 0 }} />
-              <span style={sval}>{fmt(optVibW, 2)}</span>
+              <input type="range" min={-5} max={5} step={1} value={optVibWExp}
+                     onChange={e => setOptVibWExp(+e.target.value)} style={{ width: 220, margin: 0 }} />
+              <span style={sval}>{sig3(optVibW)}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
               <span style={slabel}>{t.optSpeedLabel}</span>
-              <input type="range" min={0} max={1} step={0.01} value={optSpeed}
-                     onChange={e => setOptSpeed(+e.target.value)} style={{ width: 220, margin: 0 }} />
-              <span style={sval}>{fmt(optSpeed, 2)}</span>
+              <input type="range" min={-5} max={5} step={1} value={optSpeedExp}
+                     onChange={e => setOptSpeedExp(+e.target.value)} style={{ width: 220, margin: 0 }} />
+              <span style={sval}>{sig3(optSpeed)}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
               <span style={slabel}>{t.optSmoothLabel}</span>
-              <input type="range" min={0} max={1} step={0.01} value={optSmooth}
-                     onChange={e => setOptSmooth(+e.target.value)} style={{ width: 220, margin: 0 }} />
-              <span style={sval}>{fmt(optSmooth, 2)}</span>
+              <input type="range" min={-5} max={5} step={1} value={optSmoothExp}
+                     onChange={e => setOptSmoothExp(+e.target.value)} style={{ width: 220, margin: 0 }} />
+              <span style={sval}>{sig3(optSmooth)}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
               <span style={slabel}>{t.optRateLabel}</span>
@@ -1763,21 +1872,20 @@
                 axX={t.axRho} axY={t.axResidual}
               />
 
-              {/* ── Command increments ── */}
-              <h3 style={{ marginTop: 28, marginBottom: 2 }}>{optModel === 'ramps' ? t.optSlopeTitle : t.optImpTitle}</h3>
-              <p style={{ color: '#94a3b8', margin: '0 0 8px', fontSize: 13 }}>{optModel === 'ramps' ? t.optSlopeSub : t.optImpSub}</p>
+              {/* ── Command increments ──
+                   Render from optPlot.r.model, not the optModel state: the result
+                   is deferred, so right after toggling steps↔ramps it still holds
+                   the other model's fields (r.slope vs r.imp) for one frame. */}
+              <h3 style={{ marginTop: 28, marginBottom: 2 }}>{optPlot.r.model === 'ramps' ? t.optSlopeTitle : t.optImpTitle}</h3>
+              <p style={{ color: '#94a3b8', margin: '0 0 8px', fontSize: 13 }}>{optPlot.r.model === 'ramps' ? t.optSlopeSub : t.optImpSub}</p>
               <div style={{ maxWidth: 680 }}>
                 <ImpulsePlot W={680} H={180} dense={true}
-                  imp={optModel === 'ramps' ? { t: optPlot.r.t, a: optPlot.r.slope } : optPlot.r.imp} />
+                  imp={optPlot.r.model === 'ramps' ? { t: optPlot.r.t, a: optPlot.r.slope } : optPlot.r.imp} />
               </div>
 
               {/* ── Implementation recipe (copy-paste numpy) ── */}
               <h3 style={{ marginTop: 28, marginBottom: 8 }}>{t.optRecipeTitle}</h3>
-              <pre style={{
-                maxWidth: 680, overflow: 'auto', background: '#0f172a', border: '1px solid #334155',
-                borderRadius: 8, padding: '12px 14px', fontSize: 12, lineHeight: 1.5, color: '#cbd5e1',
-                userSelect: 'text', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-              }}>{optRecipe(optPlot.r, LANG)}</pre>
+              <pre style={PRE_STYLE}>{optRecipe(optPlot.r, LANG)}</pre>
 
               <p style={{ marginTop: 16, fontSize: 13, color: '#94a3b8', lineHeight: 1.7, maxWidth: 680 }}>
                 {t.optAbout}
