@@ -135,7 +135,7 @@
       const u = new Float32Array(n);
       const v = new Float32Array(n);
       const coreness = new Float32Array(n);
-      const ARMS = 4, WIND = 3.1, R0 = 0.18, RMAX = 1.0;
+      const ARMS = 3, WIND = 3.1, R0 = 0.18, RMAX = 1.0;
       for (let i = 0; i < n; i++) {
         let x, y;
         const kind = rand();
@@ -250,6 +250,19 @@
         p1: wr() * Math.PI * 2, p2: wr() * Math.PI * 2,
         k1: 4.5, k2: 7.5
       };
+      // endogenous events: a handful of local golden ages / dark ages per draw
+      const evs = [];
+      const nev = 3 + Math.floor(wr() * 5);
+      for (let e = 0; e < nev; e++) {
+        const a = wr() * Math.PI * 2, rr = Math.sqrt(wr()) * 0.85;
+        evs.push({
+          step: 15 + Math.floor(wr() * Math.max(1, sim.T - 40)),
+          u: Math.cos(a) * rr, v: Math.sin(a) * rr,
+          r: 0.14 + wr() * 0.22,
+          amp: (wr() < 0.62 ? -1 : 1) * (0.7 + wr() * 0.9)
+        });
+      }
+      sim.events = evs;
       sim.C.fill(0);
     }
 
@@ -329,6 +342,19 @@
         const r = ivRs[a];
         if (!r.fired && r.step === t) { fireIntervention(sim, r); r.fired = true; fired.push(r); }
       }
+      const events = [];
+      if (sim.events) for (let a = 0; a < sim.events.length; a++) {
+        const ev = sim.events[a];
+        if (ev.step === t) {
+          const inv = 1 / (2 * ev.r * ev.r);
+          for (let i = 0; i < n; i++) {
+            const dx = sim.pu[i] - ev.u, dy = sim.pv[i] - ev.v;
+            const kk = Math.exp(-(dx * dx + dy * dy) * inv);
+            if (kk > 0.01) sim.p[i] += ev.amp * kk;
+          }
+          events.push(ev);
+        }
+      }
       // timed modifiers (isolation / shock aftermath)
       let hasTimed = false;
       for (let a = sim.timed.length - 1; a >= 0; a--) {
@@ -343,7 +369,7 @@
       }
       const bias = (params.growth - 0.5) * 1.3;
       const kappa = 3.0 * params.conn;
-      const sigma = (0.10 + 0.70 * params.vol) * Math.sqrt(DT);
+      const sigma = (0.06 + 0.50 * params.vol) * Math.sqrt(DT);
       const gamma = params.centr;
       const memk = 1.2 * params.mem;
       const wv = sim.wave, WAMP = 0.25;
@@ -369,15 +395,18 @@
         pn[i] = x;
         m[i] += (p[i] - m[i]) * DT * 1.2;
         sum += x;
-        // slow positional drift: contraction under centralization + jitter
-        sim.pu[i] = sim.pu[i] * (1 - 0.0015 * gamma) + 0.0035 * gauss();
-        sim.pv[i] = sim.pv[i] * (1 - 0.0015 * gamma) + 0.0035 * gauss();
+        // slow positional drift: thriving regions expand, collapsing ones contract,
+        // centralization pulls everything inward, plus jitter
+        const rr2 = Math.hypot(sim.pu[i], sim.pv[i]) + 1e-4;
+        const rad = 0.0012 * x / rr2;
+        sim.pu[i] = sim.pu[i] * (1 - 0.0015 * gamma + rad) + 0.0035 * gauss();
+        sim.pv[i] = sim.pv[i] * (1 - 0.0015 * gamma + rad) + 0.0035 * gauss();
       }
       sim.p = pn; sim.pn = p;
       const C = Math.max(0, Math.min(1, (sum / n + 1) / 2));
       if (t < sim.T) sim.C[t] = C;
       sim.t = t + 1;
-      return { C: C, fired: fired };
+      return { C: C, fired: fired, events: events };
     }
 
     // Mean prosperity per grid cell (base coordinates), as bytes for a GPU texture.
@@ -427,7 +456,7 @@
       const rand = mulberry32(hash2(seed, 0xE45E));
       const gauss = makeGauss(rand);
       const bias0 = (params.growth - 0.5) * 1.3;
-      const sig0 = (0.10 + 0.70 * params.vol) * 0.55;
+      const sig0 = (0.06 + 0.50 * params.vol) * 0.55;
       // per-step effect timelines from the interventions
       const biasAdd = new Float32Array(T), sigFac = new Float32Array(T).fill(1);
       const impulses = [];
@@ -499,9 +528,9 @@
       CAM_DIST: 3.4, CAM_FOV: 34, CAM_EL: 0.15,
       MOUSE_AZ: 0.10, MOUSE_EL: 0.06, CAM_SMOOTH: 2.6,
       HOLD_SECONDS: 2.0,
-      WIPE_SECONDS: 1.0,
+      FADE_SECONDS: 1.0,
       GRID_N: 48,
-      BLOOM: 0.9, EXPOSURE: 1.35,
+      BLOOM: 0.75, EXPOSURE: 1.15,
       BG: [0.078, 0.094, 0.122]        // #14181f, the page background
     };
 
@@ -568,7 +597,7 @@
       'layout(location=2) in float aB;\n' +
       'uniform mat4 uVP; uniform float uX0, uXStep, uOmega, uSweep;\n' +
       'uniform vec3 uA, uB2, uTint;\n' +
-      'uniform float uFadeK, uHeadK, uHeadAmp, uBaseA, uGhost, uWipe;\n' +
+      'uniform float uFadeK, uHeadK, uHeadAmp, uBaseA, uGhost;\n' +
       'out float vAl; out vec3 vCol;\n' +
       'void main(){\n' +
       '  float ang = uOmega*aT; float c = cos(ang), s = sin(ang);\n' +
@@ -576,7 +605,7 @@
       '  vec3 w = vec3(uX0 + uXStep*aT, 0.0, 0.0) + uA*r.x + uB2*r.y;\n' +
       '  gl_Position = uVP*vec4(w, 1.0);\n' +
       '  float bb = clamp(aB, 0.0, 1.0);\n' +
-      '  float b = 0.10 + 0.90*bb;\n' +
+      '  float b = 0.05 + 0.95*bb*bb;\n' +
       '  float a; vec3 col;\n' +
       '  if (uGhost > 0.5) {\n' +
       '    a = uBaseA*b*smoothstep(0.0, 10.0, aT - uSweep);\n' +
@@ -585,7 +614,6 @@
       '    float age = max(uSweep - aT, 0.0);\n' +
       '    float head = uHeadAmp*exp(-age*uHeadK);\n' +
       '    a = uBaseA*b*(0.58 + 0.42*exp(-age*uFadeK) + head);\n' +
-      '    a *= smoothstep(uWipe, uWipe + 6.0, aT);\n' +
       '    col = mix(vec3(0.70, 0.80, 1.08), vec3(1.06, 0.97, 0.85), bb);\n' +
       '    col = mix(col, vec3(0.72, 1.0, 0.94), min(head*0.30, 0.55));\n' +
       '  }\n' +
@@ -628,7 +656,7 @@
       '  float boost, acc; shockAt(uv, boost, acc);\n' +
       '  gl_Position = uVP*vec4(w, 1.0);\n' +
       '  gl_PointSize = (uPtBase*(0.45 + 1.25*b) + 5.0*min(boost, 1.5))*uDpr;\n' +
-      '  vAl = (0.16 + 0.74*b + 0.55*min(boost, 1.2))*uFade;\n' +
+      '  vAl = (0.08 + 0.82*b*b + 0.55*min(boost, 1.2))*uFade;\n' +
       '  vec3 base = mix(vec3(0.72, 0.82, 1.08), vec3(1.07, 0.97, 0.84), b);\n' +
       '  vCol = mix(base, vec3(1.0, 0.72, 0.38), clamp(acc, 0.0, 0.85));\n' +
       '}\n';
@@ -651,7 +679,7 @@
       '  float boost, acc; shockAt(aUV, boost, acc);\n' +
       '  gl_Position = uVP*vec4(w, 1.0);\n' +
       '  gl_PointSize = max((aSP.x*(0.7 + 0.8*g) + 2.5*min(boost, 1.0))*uDpr, 1.0);\n' +
-      '  vAl = ((0.028 + 0.05*aSP.x)*(0.22 + 1.1*g)*tw + 0.4*min(boost, 1.0))*uFade;\n' +
+      '  vAl = ((0.028 + 0.05*aSP.x)*(0.10 + 1.25*g*g)*tw + 0.4*min(boost, 1.0))*uFade;\n' +
       '  vec3 base = mix(vec3(0.74, 0.83, 1.10), vec3(1.08, 0.98, 0.86), g);\n' +
       '  vCol = mix(base, vec3(1.0, 0.72, 0.38), clamp(acc, 0.0, 0.8));\n' +
       '}\n';
@@ -681,7 +709,7 @@
       'void main(){\n' +
       '  vec3 c = texture(uTex, vUv).rgb + texture(uTex, vUv + vec2(uTexel.x, 0.0)).rgb\n' +
       '         + texture(uTex, vUv + vec2(0.0, uTexel.y)).rgb + texture(uTex, vUv + uTexel).rgb;\n' +
-      '  o = vec4(max(c*0.25 - 0.10, 0.0), 1.0);\n' +
+      '  o = vec4(max(c*0.25 - 0.16, 0.0), 1.0);\n' +
       '}\n';
 
     var BLUR_FS = '#version 300 es\n' +
@@ -1000,6 +1028,12 @@
           flashes.push({ step: r.step, age: 0 });
           if (flashes.length > 4) flashes.shift();
         }
+        if (res.events) for (var e2 = 0; e2 < res.events.length; e2++) {
+          var ev = res.events[e2];
+          shocks.push({ u: ev.u, v: ev.v, age: 0,
+                        amp: Math.min(0.8, 0.45 * Math.abs(ev.amp)), col: 0 });
+          if (shocks.length > 4) shocks.shift();
+        }
         stepsDone = sim.t;
       }
 
@@ -1158,7 +1192,7 @@
 
       function flatColor(r2, g2, b2, a2) { gl.uniform4f(flatU.uColor, r2 * a2, g2 * a2, b2 * a2, a2); }
 
-      function drawLines(vao, vp, isGhost, count, sweepU, wipeU) {
+      function drawLines(vao, vp, isGhost, count, sweepU, fadeMul) {
         gl.useProgram(lineP);
         gl.uniformMatrix4fv(lineU.uVP, false, vp);
         gl.uniform1f(lineU.uX0, X0); gl.uniform1f(lineU.uXStep, XSTEP);
@@ -1172,12 +1206,11 @@
           gl.uniform1f(lineU.uFadeK, 0); gl.uniform1f(lineU.uHeadK, 0); gl.uniform1f(lineU.uHeadAmp, 0);
         } else {
           gl.uniform3f(lineU.uTint, 1, 1, 1);
-          gl.uniform1f(lineU.uBaseA, 0.16);
+          gl.uniform1f(lineU.uBaseA, 0.15 * (fadeMul === undefined ? 1 : fadeMul));
           gl.uniform1f(lineU.uGhost, 0);
           gl.uniform1f(lineU.uFadeK, 0.035);
           gl.uniform1f(lineU.uHeadK, 0.45); gl.uniform1f(lineU.uHeadAmp, 1.5);
         }
-        gl.uniform1f(lineU.uWipe, wipeU === undefined ? -1000 : wipeU);
         gl.bindVertexArray(vao);
         gl.drawElements(gl.LINES, count, gl.UNSIGNED_INT, 0);
         gl.bindVertexArray(null);
@@ -1201,12 +1234,12 @@
         az += (tAz - az) * kk;
         elv += (tEl - elv) * kk;
 
-        // sweep advance: run -> hold (finished image) -> wipe (dissolve left to right) -> next draw
+        // sweep advance: run -> hold (finished image) -> even fade-out -> next draw
         var stepsPerSec = (T - 1) / speedSec;
         if (wiping) {
           wipeT += dt;
           sweep += dt * stepsPerSec;
-          if (wipeT >= CFG.WIPE_SECONDS) {
+          if (wipeT >= CFG.FADE_SECONDS) {
             // current run becomes the ghost
             gl.bindBuffer(gl.ARRAY_BUFFER, ghostBuf);
             gl.bufferData(gl.ARRAY_BUFFER, lineCPU, gl.DYNAMIC_DRAW);
@@ -1222,8 +1255,7 @@
           sweep += dt * stepsPerSec;   // keeps the head glow decaying during the hold
           if (holdT >= CFG.HOLD_SECONDS) { holding = false; wiping = true; wipeT = 0; }
         }
-        var wipeFront = wiping ? (wipeT / CFG.WIPE_SECONDS) * (T + 10) - 4 : -1000;
-        var fadeAll = wiping ? Math.max(0, 1 - wipeT / CFG.WIPE_SECONDS)
+        var fadeAll = wiping ? Math.max(0, 1 - wipeT / CFG.FADE_SECONDS)
                              : Math.min(1, (timeSec - runStart) * 2.5);
         var shownSweep = Math.min(sweep, T - 1);
         var need = Math.min(Math.floor(shownSweep) + 2, T);
@@ -1252,8 +1284,8 @@
         gl.disable(gl.DEPTH_TEST);
 
         var segCount = Math.max(0, Math.min(Math.floor(shownSweep), T - 1)) * N * 2;
-        drawLines(ghostVao, cam.vp, true, N * (T - 1) * 2, (holding || wiping) ? T : shownSweep, -1000);
-        if (segCount > 0) drawLines(lineVao, cam.vp, false, segCount, (holding || wiping) ? sweep : shownSweep, wipeFront);
+        drawLines(ghostVao, cam.vp, true, N * (T - 1) * 2, (holding || wiping) ? T : shownSweep, 1);
+        if (segCount > 0) drawLines(lineVao, cam.vp, false, segCount, (holding || wiping) ? sweep : shownSweep, fadeAll);
 
         // dust
         gl.useProgram(dustP);
@@ -1467,7 +1499,7 @@
     { k: 'growth', g: 'α', label: 'Growth' },
     { k: 'mem',    g: 'λ', label: 'Institutional memory' }
   ];
-  const DEFAULT_PARAMS = { conn: 0.55, vol: 0.35, centr: 0.4, growth: 0.55, mem: 0.5 };
+  const DEFAULT_PARAMS = { conn: 0.55, vol: 0.76, centr: 0.45, growth: 0.28, mem: 0.49 };
 
   const IV_TYPES = [
     { id: 'archive',   label: 'Preserve knowledge', desc: 'archives and education: sustained recovery, lower local volatility' },

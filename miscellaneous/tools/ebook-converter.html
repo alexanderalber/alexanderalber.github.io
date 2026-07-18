@@ -1084,6 +1084,513 @@
       return book;
     }
 
+    // ══ Markdown + HTML readers ══════════════════════════════════════════════
+    // Text inputs, so no container to unzip. Both funnel into buildSections:
+    // Markdown is first spoken as HTML, HTML is parsed as-is, then the same
+    // splitter carves a flat block stream into chapters on its headings.
+
+    const HEAD_LV = { h1: 1, h2: 2, h3: 3, h4: 4, h5: 5, h6: 6 };
+    // Block wrappers that already stand for a chapter each.
+    const SECTION_WRAP = { section: 1, article: 1 };
+    // A sole one of these wrapping the whole body is scenery, not a chapter.
+    const CONTAINER_UNWRAP = { div: 1, main: 1, article: 1, section: 1, center: 1 };
+
+    function headingLevel(n) { return isElement(n) ? (HEAD_LV[localName(n.name)] || 0) : 0; }
+    function elClass(n) { return (n.attrs && n.attrs['class']) || ''; }
+
+    function firstHeadingNode(node) {
+      for (const c of node.children) {
+        if (!isElement(c)) continue;
+        if (HEAD_LV[localName(c.name)]) return c;
+        const d = firstHeadingNode(c);
+        if (d) return d;
+      }
+      return null;
+    }
+    function serializeNodes(nodes) {
+      const out = [];
+      for (const n of nodes) serializeXml(n, out);
+      return out.join('');
+    }
+    function hasContent(html) {
+      return /<img\b/i.test(html) || html.replace(/<[^>]+>/g, '').replace(/\s+/g, '').length > 0;
+    }
+    function pushSection(book, title, html) {
+      const id = 'sec-' + String(book.sections.length + 1).padStart(4, '0');
+      const t = (title || '').trim() || ('Section ' + (book.sections.length + 1));
+      book.sections.push({ id: id, title: t, html: html, css: [] });
+      book.toc.push({ title: t, href: 'text/' + id + '.xhtml', level: 0 });
+    }
+
+    // data: URIs are the only images a lone text file can carry with it, so pull
+    // them into resources and repoint the tag; other srcs stay as external links.
+    function parseDataUri(uri) {
+      const m = /^data:([^;,]*)((?:;[^;,]*)*),([\s\S]*)$/i.exec(uri);
+      if (!m) return null;
+      const mime = (m[1] || 'application/octet-stream').toLowerCase();
+      const isB64 = /;base64/i.test(m[2] || '');
+      try {
+        let bytes;
+        if (isB64) {
+          const bin = atob(m[3].replace(/\s+/g, ''));
+          bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        } else {
+          bytes = encodeUtf8(decodeURIComponent(m[3]));
+        }
+        return { mime: mime, bytes: bytes };
+      } catch (e) { return null; }
+    }
+    function extractDataUris(container, book, log) {
+      let external = 0;
+      walkElements(container, function (el) {
+        if (localName(el.name) !== 'img') return;
+        const src = el.attrs.src || '';
+        if (/^data:/i.test(src)) {
+          const parsed = parseDataUri(src);
+          if (parsed) {
+            const name = addResource(book, 'image', parsed.mime, parsed.bytes);
+            el.attrs.src = '../res/' + name;
+          } else {
+            el.attrs.src = '';
+          }
+        } else if (/^[a-z][a-z0-9+.-]*:/i.test(src)) {
+          external++; // http(s)/other absolute URL: kept as a live link
+        }
+      });
+      if (external) log.warn(external + ' image' + (external > 1 ? 's' : '')
+        + ' point at external URLs and were left as links');
+    }
+
+    // Turn a flat stream of block nodes into chapters. Shared by both readers so
+    // Markdown and HTML split identically.
+    function buildSections(children, book, log) {
+      // Peel off page furniture: a leading <header> gives up its title/author,
+      // a generated table of contents is dropped.
+      const content = [];
+      for (const c of children) {
+        if (isElement(c)) {
+          const ln = localName(c.name);
+          if (ln === 'header') {
+            const h = firstHeadingNode(c);
+            if (h && !book.meta.title) book.meta.title = textOf(h).slice(0, 200);
+            if (!book.meta.author) {
+              const p = kids(c, 'p')[0];
+              const at = p ? textOf(p) : '';
+              if (at && at.length <= 120) book.meta.author = at.replace(/^by\s+/i, '');
+            }
+            continue;
+          }
+          if (ln === 'nav' && /\bec-toc\b/.test(elClass(c))) continue;
+        }
+        content.push(c);
+      }
+
+      // Already carved into <section>/<article> blocks: one chapter each.
+      const wrappers = content.filter(function (c) {
+        return isElement(c) && SECTION_WRAP[localName(c.name)];
+      });
+      if (wrappers.length >= 2) {
+        for (const w of wrappers) {
+          const html = serializeNodes(w.children);
+          if (!hasContent(html)) continue;
+          const h = firstHeadingNode(w);
+          pushSection(book, h ? textOf(h) : '', html);
+        }
+        if (book.sections.length) return;
+      }
+
+      // Otherwise split the flat block stream on its shallowest heading level.
+      let items = content;
+      for (;;) {
+        const els = items.filter(isElement);
+        const strayText = items.some(function (c) { return !isElement(c) && c.value.trim(); });
+        if (els.length === 1 && !strayText && CONTAINER_UNWRAP[localName(els[0].name)]) {
+          items = els[0].children;
+        } else break;
+      }
+
+      let headings = items.filter(function (c) { return headingLevel(c); });
+      let cutLv = headings.length ? Math.min.apply(null, headings.map(headingLevel)) : 0;
+      // A single leading top-level heading is the book's title, not a chapter.
+      const h1s = headings.filter(function (c) { return headingLevel(c) === cutLv; });
+      if (cutLv && h1s.length === 1 && headings[0] === h1s[0]) {
+        if (!book.meta.title) book.meta.title = textOf(h1s[0]).slice(0, 200);
+        items = items.filter(function (c) { return c !== h1s[0]; });
+        const firstEl = items.find(isElement);
+        if (firstEl && localName(firstEl.name) === 'p') {
+          const t = textOf(firstEl);
+          if (/^by\s+/i.test(t) && !book.meta.author) {
+            book.meta.author = t.replace(/^by\s+/i, '');
+            items = items.filter(function (c) { return c !== firstEl; });
+          }
+        }
+        headings = items.filter(function (c) { return headingLevel(c); });
+        cutLv = headings.length ? Math.min.apply(null, headings.map(headingLevel)) : 0;
+      }
+
+      const groups = [];
+      let cur = null;
+      for (const c of items) {
+        if (cutLv && headingLevel(c) === cutLv) {
+          cur = { title: textOf(c), nodes: [c] };
+          groups.push(cur);
+        } else {
+          if (!cur) { cur = { title: '', nodes: [] }; groups.push(cur); }
+          cur.nodes.push(c);
+        }
+      }
+      for (const g of groups) {
+        const html = serializeNodes(g.nodes);
+        if (!hasContent(html)) continue;
+        pushSection(book, g.title, html);
+      }
+    }
+
+    function readHtml(bytes, log) {
+      const dec = decodeText(bytes);
+      const book = emptyBook();
+      const tree = parseXML(dec.text);
+
+      const titleTag = findOne(tree, 'title');
+      if (titleTag) { const t = textOf(titleTag); if (t) book.meta.title = t.slice(0, 200); }
+      walkElements(tree, function (el) {
+        if (localName(el.name) !== 'meta') return;
+        const nm = (el.attrs.name || el.attrs.property || '').toLowerCase();
+        const c = el.attrs.content || '';
+        if (!c) return;
+        if ((nm === 'author' || nm === 'dc.creator') && !book.meta.author) book.meta.author = c;
+        else if ((nm === 'dc.language' || nm === 'language') && !book.meta.language) book.meta.language = c;
+        else if ((nm === 'publisher' || nm === 'dc.publisher') && !book.meta.publisher) book.meta.publisher = c;
+        else if ((nm === 'date' || nm === 'dc.date') && !book.meta.date) book.meta.date = c;
+      });
+      const htmlNode = findOne(tree, 'html');
+      if (htmlNode && htmlNode.attrs.lang) book.meta.language = htmlNode.attrs.lang;
+
+      const body = findOne(tree, 'body');
+      const container = body || tree;
+      extractDataUris(container, book, log);
+      buildSections(container.children, book, log);
+
+      if (!book.sections.length) throw new Error('The HTML file has no readable content.');
+      log.info('HTML: ' + dec.encoding + ', ' + book.sections.length + ' sections'
+        + (book.resources.size ? ', ' + book.resources.size + ' embedded image'
+          + (book.resources.size > 1 ? 's' : '') : ''));
+      return book;
+    }
+
+    function readMarkdown(bytes, log) {
+      const dec = decodeText(bytes);
+      const book = emptyBook();
+      let text = dec.text.replace(/\r\n?/g, '\n');
+      text = stripFrontMatter(text, book);
+      const tree = parseXML(markdownToHtml(text));
+      extractDataUris(tree, book, log);
+      buildSections(tree.children, book, log);
+      if (!book.sections.length) throw new Error('The Markdown file is empty.');
+      log.info('Markdown: ' + dec.encoding + ', ' + book.sections.length + ' sections'
+        + (book.resources.size ? ', ' + book.resources.size + ' embedded image'
+          + (book.resources.size > 1 ? 's' : '') : ''));
+      return book;
+    }
+
+    // A leading YAML block (the Pandoc bundle writes one) carries the metadata.
+    function stripFrontMatter(text, book) {
+      const m = /^---\n([\s\S]*?)\n---[ \t]*\n?/.exec(text);
+      if (!m) return text;
+      for (const ln of m[1].split('\n')) {
+        const kv = /^([A-Za-z_.-]+)\s*:\s*(.*)$/.exec(ln);
+        if (!kv) continue;
+        const key = kv[1].toLowerCase();
+        const val = kv[2].trim().replace(/^["']|["']$/g, '');
+        if (!val) continue;
+        if (key === 'title' && !book.meta.title) book.meta.title = val;
+        else if ((key === 'author' || key === 'creator') && !book.meta.author) book.meta.author = val;
+        else if ((key === 'lang' || key === 'language') && val) book.meta.language = val;
+        else if (key === 'publisher' && !book.meta.publisher) book.meta.publisher = val;
+        else if (key === 'date' && !book.meta.date) book.meta.date = val;
+      }
+      return text.slice(m[0].length);
+    }
+
+    // ── Markdown to HTML (a CommonMark subset) ───────────────────────────────
+    // Enough of CommonMark to invert this tool's own Markdown writer and to read
+    // ordinary hand-written files: ATX headings, fenced and indented code,
+    // blockquotes, ordered/unordered lists, thematic breaks, raw HTML blocks,
+    // and the usual inline run. Not a validator; unknown syntax lands as text.
+
+    const MD_BLOCK_HTML = /^\s{0,3}<\/?(?:address|article|aside|blockquote|details|div|dl|dd|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|main|nav|ol|p|pre|section|table|thead|tbody|tfoot|tr|td|th|ul|li|img|hgroup|iframe)\b/i;
+
+    function escChar(c) {
+      return c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : c;
+    }
+    function mdStripMarkers(s) { return s.replace(/[\\`*_~]/g, ''); }
+
+    function markdownToHtml(src) {
+      const lines = src.replace(/\t/g, '    ').split('\n');
+      const out = [];
+      let i = 0;
+      const blank = function (s) { return !s || !s.trim(); };
+      while (i < lines.length) {
+        const line = lines[i];
+        if (blank(line)) { i++; continue; }
+
+        const fence = /^\s{0,3}(```+|~~~+)(.*)$/.exec(line);
+        if (fence) {
+          const ch = fence[1].charAt(0);
+          const len = fence[1].length;
+          const info = fence[2].trim().split(/\s+/)[0];
+          const closeRe = new RegExp('^\\s{0,3}' + (ch === '`' ? '`' : '~') + '{' + len + ',}\\s*$');
+          i++;
+          const buf = [];
+          while (i < lines.length && !closeRe.test(lines[i])) { buf.push(lines[i]); i++; }
+          if (i < lines.length) i++;
+          const cls = info ? ' class="language-' + escapeAttr(info) + '"' : '';
+          out.push('<pre><code' + cls + '>' + escapeText(buf.join('\n')) + '</code></pre>');
+          continue;
+        }
+
+        const atx = /^\s{0,3}(#{1,6})(\s.*?|)\s*#*\s*$/.exec(line);
+        if (atx) {
+          const level = atx[1].length;
+          out.push('<h' + level + '>' + inlineMd(atx[2].trim()) + '</h' + level + '>');
+          i++;
+          continue;
+        }
+
+        if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) { out.push('<hr/>'); i++; continue; }
+
+        if (/^\s{0,3}>/.test(line)) {
+          const buf = [];
+          while (i < lines.length && !blank(lines[i])) {
+            buf.push(lines[i].replace(/^\s{0,3}>\s?/, ''));
+            i++;
+          }
+          out.push('<blockquote>' + markdownToHtml(buf.join('\n')) + '</blockquote>');
+          continue;
+        }
+
+        if (listMarker(line)) {
+          const res = parseList(lines, i);
+          out.push(res.html);
+          i = res.next;
+          continue;
+        }
+
+        if (/^ {4}/.test(line)) {
+          const buf = [];
+          while (i < lines.length && (/^ {4}/.test(lines[i]) || blank(lines[i]))) {
+            buf.push(lines[i].replace(/^ {4}/, '')); i++;
+          }
+          while (buf.length && blank(buf[buf.length - 1])) buf.pop();
+          out.push('<pre><code>' + escapeText(buf.join('\n')) + '</code></pre>');
+          continue;
+        }
+
+        if (MD_BLOCK_HTML.test(line)) {
+          const buf = [];
+          while (i < lines.length && !blank(lines[i])) { buf.push(lines[i]); i++; }
+          out.push(buf.join('\n')); // raw HTML, re-parsed by parseXML downstream
+          continue;
+        }
+
+        const buf = [];
+        while (i < lines.length && !blank(lines[i])
+          && !/^\s{0,3}(#{1,6}\s|>|```+|~~~+)/.test(lines[i])
+          && !/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(lines[i])
+          && !listMarker(lines[i])
+          && !MD_BLOCK_HTML.test(lines[i])) {
+          buf.push(lines[i]); i++;
+        }
+        out.push('<p>' + inlineMd(buf.join('\n').trim()) + '</p>');
+      }
+      return out.join('\n');
+    }
+
+    function listMarker(line) {
+      const m = /^(\s*)([-*+]|\d{1,9}[.)])(\s+)(.*)$/.exec(line);
+      if (!m) return null;
+      return {
+        indent: m[1].length,
+        ordered: /\d/.test(m[2]),
+        marker: m[2],
+        contentCol: m[1].length + m[2].length + m[3].length,
+        text: m[4],
+      };
+    }
+
+    function parseList(lines, start) {
+      const first = listMarker(lines[start]);
+      const ordered = first.ordered;
+      const baseIndent = first.indent;
+      const items = [];
+      let i = start;
+      let loose = false;
+      while (i < lines.length) {
+        const lm = listMarker(lines[i]);
+        if (!lm || lm.indent !== baseIndent || lm.ordered !== ordered) break;
+        const contentCol = lm.contentCol;
+        const buf = [lm.text];
+        i++;
+        while (i < lines.length) {
+          if (blank(lines[i])) { buf.push(''); i++; continue; }
+          const indent = /^(\s*)/.exec(lines[i])[1].length;
+          const nextM = listMarker(lines[i]);
+          if (nextM && nextM.indent === baseIndent) break;
+          if (indent >= contentCol || (nextM && nextM.indent > baseIndent)) {
+            buf.push(lines[i].slice(Math.min(indent, contentCol)));
+            i++;
+            continue;
+          }
+          break;
+        }
+        while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
+        if (buf.indexOf('') >= 0) loose = true;
+        items.push(buf.join('\n'));
+      }
+      const startAttr = (function () {
+        if (!ordered) return '';
+        const m = /^\d+/.exec(first.marker);
+        return m && m[0] !== '1' ? ' start="' + parseInt(m[0], 10) + '"' : '';
+      })();
+      const tag = ordered ? 'ol' : 'ul';
+      const html = ['<' + tag + startAttr + '>'];
+      for (const it of items) {
+        const inner = markdownToHtml(it);
+        const single = /^<p>([\s\S]*)<\/p>$/.exec(inner.trim());
+        html.push('<li>' + (!loose && single ? single[1] : inner) + '</li>');
+      }
+      html.push('</' + tag + '>');
+      return { html: html.join(''), next: i };
+
+      function blank(s) { return !s || !s.trim(); }
+    }
+
+    function inlineMd(src) {
+      src = src.replace(/(?: {2,}|\\)\n/g, '\u0001').replace(/\n/g, ' ');
+      let out = '';
+      let i = 0;
+      const n = src.length;
+      while (i < n) {
+        const c = src[i];
+        if (c === '\u0001') { out += '<br/>'; i++; continue; }
+        if (c === '\\' && i + 1 < n && /[\\`*_{}\[\]()#+.!><~|"-]/.test(src[i + 1])) {
+          out += escChar(src[i + 1]); i += 2; continue;
+        }
+        if (c === '`') {
+          const ticks = /^`+/.exec(src.slice(i))[0];
+          const close = src.indexOf(ticks, i + ticks.length);
+          if (close >= 0 && src[close - 1] !== '`') {
+            let code = src.slice(i + ticks.length, close);
+            code = code.replace(/^ (?=\S)/, '').replace(/(?<=\S) $/, '');
+            out += '<code>' + escapeText(code) + '</code>';
+            i = close + ticks.length; continue;
+          }
+          out += '`'; i++; continue;
+        }
+        if (c === '<') {
+          const auto = /^<((?:https?|mailto):[^>\s]+)>/i.exec(src.slice(i));
+          if (auto) { out += '<a href="' + escapeAttr(auto[1]) + '">' + escapeText(auto[1]) + '</a>'; i += auto[0].length; continue; }
+          const email = /^<([^\s@<>]+@[^\s@<>]+\.[^\s@<>]+)>/.exec(src.slice(i));
+          if (email) { out += '<a href="mailto:' + escapeAttr(email[1]) + '">' + escapeText(email[1]) + '</a>'; i += email[0].length; continue; }
+          const tag = /^<\/?[a-zA-Z][\w:-]*(?:\s[^<>]*)?\/?>/.exec(src.slice(i));
+          if (tag) { out += tag[0]; i += tag[0].length; continue; }
+          out += '&lt;'; i++; continue;
+        }
+        if (c === '!' && src[i + 1] === '[') {
+          const img = parseLinkAt(src, i + 1, true);
+          if (img) { out += img.html; i = img.end; continue; }
+        }
+        if (c === '[') {
+          const link = parseLinkAt(src, i, false);
+          if (link) { out += link.html; i = link.end; continue; }
+        }
+        if (c === '*') {
+          const em = parseEmphasisAt(src, i);
+          if (em) { out += em.html; i = em.end; continue; }
+          out += '*'; i++; continue;
+        }
+        if (c === '_') {
+          const prev = i > 0 ? src[i - 1] : ' ';
+          if (!/[A-Za-z0-9]/.test(prev)) {
+            const em = parseEmphasisAt(src, i);
+            if (em) { out += em.html; i = em.end; continue; }
+          }
+          out += '_'; i++; continue;
+        }
+        if (c === '~' && src[i + 1] === '~') {
+          const del = parseEmphasisAt(src, i);
+          if (del) { out += del.html; i = del.end; continue; }
+        }
+        out += escChar(c); i++;
+      }
+      return out;
+    }
+
+    // Shared by *, _, ** and ~~: find the matching closing run, emphasise the
+    // inside recursively. Openers need non-space after, closers non-space before.
+    function parseEmphasisAt(src, i) {
+      const c = src[i];
+      const dbl = src[i + 1] === c;
+      const marker = dbl ? c + c : c;
+      const start = i + marker.length;
+      if (c === '~' && !dbl) return null; // a single ~ is not strikethrough
+      if (start >= src.length || /\s/.test(src[start])) return null;
+      let j = start;
+      while (j < src.length) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === c && (!dbl || src[j + 1] === c)) {
+          if (/\s/.test(src[j - 1])) { j++; continue; }
+          if (c === '_') {
+            const after = src[j + marker.length];
+            if (after !== undefined && /[A-Za-z0-9]/.test(after)) { j++; continue; }
+          }
+          const inner = src.slice(start, j);
+          if (inner) {
+            const tag = c === '~' ? 'del' : (dbl ? 'strong' : 'em');
+            return { html: '<' + tag + '>' + inlineMd(inner) + '</' + tag + '>', end: j + marker.length };
+          }
+        }
+        j++;
+      }
+      return null;
+    }
+
+    // [text](url "title") and its image cousin. Bracket and paren nesting are
+    // balanced so links inside link text do not end the match early.
+    function parseLinkAt(src, i, isImage) {
+      let depth = 1;
+      let j = i + 1;
+      while (j < src.length && depth > 0) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '[') depth++;
+        else if (src[j] === ']') { depth--; if (depth === 0) break; }
+        j++;
+      }
+      if (depth !== 0 || src[j + 1] !== '(') return null;
+      const text = src.slice(i + 1, j);
+      let k = j + 2;
+      let pdepth = 1;
+      let raw = '';
+      while (k < src.length && pdepth > 0) {
+        if (src[k] === '\\') { raw += src[k + 1] || ''; k += 2; continue; }
+        if (src[k] === '(') { pdepth++; raw += '('; k++; continue; }
+        if (src[k] === ')') { pdepth--; if (pdepth === 0) { k++; break; } raw += ')'; k++; continue; }
+        raw += src[k]; k++;
+      }
+      if (pdepth !== 0) return null;
+      let href = raw.trim();
+      let title = '';
+      const tm = /^(.*?)\s+["'(]([\s\S]*)["')]\s*$/.exec(href);
+      if (tm) { href = tm[1].trim(); title = tm[2]; }
+      href = href.replace(/^<([\s\S]*)>$/, '$1');
+      const titleAttr = title ? ' title="' + escapeAttr(title) + '"' : '';
+      if (isImage) {
+        return { html: '<img src="' + escapeAttr(href) + '" alt="' + escapeAttr(mdStripMarkers(text)) + '"' + titleAttr + '/>', end: k };
+      }
+      return { html: '<a href="' + escapeAttr(href) + '"' + titleAttr + '>' + inlineMd(text) + '</a>', end: k };
+    }
+
     // ══ PalmDB container ═════════════════════════════════════════════════════
     // A .mobi/.azw3 is a Palm database: a 78-byte header, a record-offset table,
     // then the records. Record 0 holds the PalmDOC + MOBI headers.
@@ -2404,7 +2911,16 @@
 
     // ══ format detection ═════════════════════════════════════════════════════
 
-    function sniff(bytes) {
+    // Block-level tags are the giveaway for HTML masquerading with no extension.
+    function looksLikeHtml(text) {
+      const head = text.slice(0, 4096);
+      if (/^\s*<!doctype\s+html/i.test(head)) return true;
+      if (/<(?:html|head|body)[\s>]/i.test(head)) return true;
+      const tags = head.match(/<\/?(?:p|div|h[1-6]|br|span|a|img|ul|ol|li|table|section|article|header|nav|blockquote)\b/gi);
+      return !!(tags && tags.length >= 3);
+    }
+
+    function sniff(bytes, name) {
       if (bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4B
         && (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07)) return 'epub';
       if (bytes.length > 68) {
@@ -2412,6 +2928,14 @@
         if (type === 'BOOKMOBI') return 'mobi';   // refined to azw3 by the reader
         if (type === 'TEXtREAd') return 'mobi';
       }
+      // The three text formats share no magic, so trust the extension first.
+      const ext = (name && /\.[A-Za-z0-9]+$/.exec(name) || [''])[0].toLowerCase();
+      if (ext === '.html' || ext === '.htm' || ext === '.xhtml') return 'html';
+      if (ext === '.md' || ext === '.markdown' || ext === '.mdown' || ext === '.mkd') return 'md';
+      if (ext === '.txt' || ext === '.text') return 'txt';
+      // No decisive extension: peek at the content. Markdown is too plain-text-like
+      // to tell apart, so the fallback is txt.
+      if (looksLikeHtml(decodeText(bytes.subarray(0, 8192)).text)) return 'html';
       return 'txt';
     }
 
@@ -2426,8 +2950,8 @@
       };
     }
 
-    async function read(bytes, log) {
-      const kind = sniff(bytes);
+    async function read(bytes, log, name) {
+      const kind = sniff(bytes, name);
       if (kind === 'epub') {
         const book = await readEpub(bytes, log);
         book.sourceFormat = 'epub';
@@ -2437,6 +2961,16 @@
         const r = readMobiFile(bytes, log);
         r.book.sourceFormat = r.format; // mobi or azw3, only the reader can tell
         return r.book;
+      }
+      if (kind === 'html') {
+        const book = readHtml(bytes, log);
+        book.sourceFormat = 'html';
+        return book;
+      }
+      if (kind === 'md') {
+        const book = readMarkdown(bytes, log);
+        book.sourceFormat = 'md';
+        return book;
       }
       const book = readTxt(bytes, log);
       book.sourceFormat = 'txt';
@@ -2800,8 +3334,127 @@
       '_': '\\_', '{': '\\{', '}': '\\}',
       '~': '\\textasciitilde{}', '^': '\\textasciicircum{}',
     };
+    // pdflatex with inputenc + fontenc[T1] only knows Latin (ASCII plus the
+    // Latin-1 Supplement and Latin Extended-A, i.e. up to U+017F). Any other
+    // codepoint (Greek, math symbols, arrows, real fractions) aborts the WHOLE
+    // compile with "Unicode character ... not set up for use with LaTeX". Map
+    // the common ones to genuine LaTeX; the leftover long tail is caught by
+    // \newunicodechar in the preamble (see writeLatex) so a stray glyph can
+    // never kill the build. Replacements are pure ASCII, so they are inserted
+    // AFTER the special-character pass and are never re-escaped. Latin-1 chars
+    // (times, division, plus-minus, degree, superscript 1/2/3, 1/4 1/2 3/4)
+    // already work and are deliberately left untouched.
+    const TEX_UNICODE = {
+      // spaces and invisible formatting marks (escapes keep the source legible)
+      '\u00A0': '~', '\u2007': '~', '\u202F': '~',
+      '\u2000': ' ', '\u2001': '\\quad{}', '\u2002': ' ', '\u2003': '\\quad{}',
+      '\u2004': ' ', '\u2005': ' ', '\u2006': ' ', '\u2008': ' ',
+      '\u2009': '\\,', '\u200A': '\\,',
+      '\u200B': '', '\u200C': '', '\u200D': '', '\u200E': '', '\u200F': '', '\uFEFF': '',
+      // typographic punctuation
+      '‐': '-', '‑': '-', '‒': '--', '–': '--',
+      '—': '---', '―': '---', '‘': '`', '’': "'",
+      '‚': ',', '‛': "'", '“': '``', '”': "''",
+      '„': ',,', '‟': '``', '•': '\\textbullet{}',
+      '‣': '\\textbullet{}', '‥': '..', '…': '\\ldots{}',
+      '‰': '\\textperthousand{}', '′': "\\ensuremath{'}",
+      '″': "\\ensuremath{''}", '‴': "\\ensuremath{'''}",
+      '‹': '\\guilsinglleft{}', '›': '\\guilsinglright{}',
+      '†': '\\dag{}', '‡': '\\ddag{}', '⁃': '-',
+      '⁄': '/', '−': '\\ensuremath{-}',
+      // superscripts (Latin-1 covers 1, 2, 3) and subscripts
+      '⁰': '\\ensuremath{^{0}}', '⁴': '\\ensuremath{^{4}}',
+      '⁵': '\\ensuremath{^{5}}', '⁶': '\\ensuremath{^{6}}',
+      '⁷': '\\ensuremath{^{7}}', '⁸': '\\ensuremath{^{8}}',
+      '⁹': '\\ensuremath{^{9}}', '⁺': '\\ensuremath{^{+}}',
+      '⁻': '\\ensuremath{^{-}}', 'ⁿ': '\\ensuremath{^{n}}',
+      '₀': '\\ensuremath{_{0}}', '₁': '\\ensuremath{_{1}}',
+      '₂': '\\ensuremath{_{2}}', '₃': '\\ensuremath{_{3}}',
+      '₄': '\\ensuremath{_{4}}', '₅': '\\ensuremath{_{5}}',
+      '₆': '\\ensuremath{_{6}}', '₇': '\\ensuremath{_{7}}',
+      '₈': '\\ensuremath{_{8}}', '₉': '\\ensuremath{_{9}}',
+      '₊': '\\ensuremath{_{+}}', '₋': '\\ensuremath{_{-}}',
+      // vulgar fractions (Latin-1 covers 1/4, 1/2, 3/4)
+      '⅓': '\\ensuremath{\\frac{1}{3}}', '⅔': '\\ensuremath{\\frac{2}{3}}',
+      '⅕': '\\ensuremath{\\frac{1}{5}}', '⅖': '\\ensuremath{\\frac{2}{5}}',
+      '⅗': '\\ensuremath{\\frac{3}{5}}', '⅘': '\\ensuremath{\\frac{4}{5}}',
+      '⅙': '\\ensuremath{\\frac{1}{6}}', '⅚': '\\ensuremath{\\frac{5}{6}}',
+      '⅛': '\\ensuremath{\\frac{1}{8}}', '⅜': '\\ensuremath{\\frac{3}{8}}',
+      '⅝': '\\ensuremath{\\frac{5}{8}}', '⅞': '\\ensuremath{\\frac{7}{8}}',
+      // Greek lowercase
+      'α': '\\ensuremath{\\alpha}', 'β': '\\ensuremath{\\beta}',
+      'γ': '\\ensuremath{\\gamma}', 'δ': '\\ensuremath{\\delta}',
+      'ε': '\\ensuremath{\\varepsilon}', 'ζ': '\\ensuremath{\\zeta}',
+      'η': '\\ensuremath{\\eta}', 'θ': '\\ensuremath{\\theta}',
+      'ι': '\\ensuremath{\\iota}', 'κ': '\\ensuremath{\\kappa}',
+      'λ': '\\ensuremath{\\lambda}', 'μ': '\\ensuremath{\\mu}',
+      'ν': '\\ensuremath{\\nu}', 'ξ': '\\ensuremath{\\xi}',
+      'ο': 'o', 'π': '\\ensuremath{\\pi}', 'ρ': '\\ensuremath{\\rho}',
+      'ς': '\\ensuremath{\\varsigma}', 'σ': '\\ensuremath{\\sigma}',
+      'τ': '\\ensuremath{\\tau}', 'υ': '\\ensuremath{\\upsilon}',
+      'φ': '\\ensuremath{\\varphi}', 'χ': '\\ensuremath{\\chi}',
+      'ψ': '\\ensuremath{\\psi}', 'ω': '\\ensuremath{\\omega}',
+      'ϑ': '\\ensuremath{\\vartheta}', 'ϕ': '\\ensuremath{\\phi}',
+      'ϖ': '\\ensuremath{\\varpi}', 'ϱ': '\\ensuremath{\\varrho}',
+      'ϵ': '\\ensuremath{\\epsilon}',
+      // Greek uppercase (Latin-lookalikes fall back to their Latin letter)
+      'Α': 'A', 'Β': 'B', 'Γ': '\\ensuremath{\\Gamma}',
+      'Δ': '\\ensuremath{\\Delta}', 'Ε': 'E', 'Ζ': 'Z',
+      'Η': 'H', 'Θ': '\\ensuremath{\\Theta}', 'Ι': 'I',
+      'Κ': 'K', 'Λ': '\\ensuremath{\\Lambda}', 'Μ': 'M',
+      'Ν': 'N', 'Ξ': '\\ensuremath{\\Xi}', 'Ο': 'O',
+      'Π': '\\ensuremath{\\Pi}', 'Ρ': 'P', 'Σ': '\\ensuremath{\\Sigma}',
+      'Τ': 'T', 'Υ': '\\ensuremath{\\Upsilon}', 'Φ': '\\ensuremath{\\Phi}',
+      'Χ': 'X', 'Ψ': '\\ensuremath{\\Psi}', 'Ω': '\\ensuremath{\\Omega}',
+      // math operators, relations and arrows (Latin-1 covers x, div, +-, not)
+      '∗': '\\ensuremath{\\ast}', '∙': '\\ensuremath{\\cdot}',
+      '⋅': '\\ensuremath{\\cdot}', '∂': '\\ensuremath{\\partial}',
+      '∇': '\\ensuremath{\\nabla}', '√': '\\ensuremath{\\surd}',
+      '∝': '\\ensuremath{\\propto}', '∞': '\\ensuremath{\\infty}',
+      '∑': '\\ensuremath{\\sum}', '∏': '\\ensuremath{\\prod}',
+      '∫': '\\ensuremath{\\int}', '≈': '\\ensuremath{\\approx}',
+      '≠': '\\ensuremath{\\neq}', '≡': '\\ensuremath{\\equiv}',
+      '≤': '\\ensuremath{\\leq}', '≥': '\\ensuremath{\\geq}',
+      '≪': '\\ensuremath{\\ll}', '≫': '\\ensuremath{\\gg}',
+      '≅': '\\ensuremath{\\cong}', '∼': '\\ensuremath{\\sim}',
+      '∈': '\\ensuremath{\\in}', '∉': '\\ensuremath{\\notin}',
+      '∋': '\\ensuremath{\\ni}', '⊂': '\\ensuremath{\\subset}',
+      '⊃': '\\ensuremath{\\supset}', '⊆': '\\ensuremath{\\subseteq}',
+      '⊇': '\\ensuremath{\\supseteq}', '∪': '\\ensuremath{\\cup}',
+      '∩': '\\ensuremath{\\cap}', '∅': '\\ensuremath{\\emptyset}',
+      '∀': '\\ensuremath{\\forall}', '∃': '\\ensuremath{\\exists}',
+      '∧': '\\ensuremath{\\wedge}', '∨': '\\ensuremath{\\vee}',
+      '⊕': '\\ensuremath{\\oplus}', '⊗': '\\ensuremath{\\otimes}',
+      '∓': '\\ensuremath{\\mp}', '∣': '\\ensuremath{\\mid}',
+      '∥': '\\ensuremath{\\parallel}', '∘': '\\ensuremath{\\circ}',
+      '∠': '\\ensuremath{\\angle}', '→': '\\ensuremath{\\rightarrow}',
+      '←': '\\ensuremath{\\leftarrow}', '↔': '\\ensuremath{\\leftrightarrow}',
+      '⇒': '\\ensuremath{\\Rightarrow}', '⇐': '\\ensuremath{\\Leftarrow}',
+      '⇔': '\\ensuremath{\\Leftrightarrow}', '↑': '\\ensuremath{\\uparrow}',
+      '↓': '\\ensuremath{\\downarrow}', '↦': '\\ensuremath{\\mapsto}',
+      // letterlike symbols and units
+      'ℓ': '\\ensuremath{\\ell}', '№': 'No.', '™': '\\texttrademark{}',
+      '℃': '\\ensuremath{^{\\circ}}C', '℉': '\\ensuremath{^{\\circ}}F',
+      'Å': '\\AA{}',
+    };
+    const TEX_UNICODE_RE = new RegExp('[' + Object.keys(TEX_UNICODE).join('') + ']', 'g');
     function texEscape(s) {
-      return s.replace(/[\\&%$#_{}~^]/g, function (c) { return TEX_SPECIALS[c]; });
+      return s
+        .replace(/[\u0080-\u009F]/g, '')  // strip C1 controls
+        .replace(/[\\&%$#_{}~^]/g, function (c) { return TEX_SPECIALS[c]; })
+        .replace(TEX_UNICODE_RE, function (c) { return TEX_UNICODE[c]; });
+    }
+    // Codepoints beyond ASCII, the Latin-1 Supplement and Latin Extended-A that
+    // texEscape did not map (astral symbols, CJK, rare marks). pdflatex cannot
+    // render them, so writeLatex declares each with \newunicodechar to a no-op:
+    // the glyph is dropped but the compile survives instead of aborting.
+    function texExotics(str) {
+      const set = new Set();
+      for (const ch of str) {
+        const cp = ch.codePointAt(0);
+        if (cp >= 0x180) set.add(ch);
+      }
+      return Array.from(set);
     }
     // hyperref reads its URL argument nearly verbatim, but %, #, & and braces
     // still need help.
@@ -2974,16 +3627,37 @@
 
     function writeLatex(book) {
       const opts = { imageHref: null, stats: { imagesDropped: 0 } };
+      const title = texFlatten(texEscape(book.meta.title || 'Untitled'));
+      const author = texFlatten(texEscape(book.meta.author || ''));
+      // Build the body first so we can scan the finished document for any
+      // codepoint the curated table missed and declare it safe before use.
+      const body = [];
+      for (const s of book.sections) {
+        const tex = texSection(s, opts);
+        if (!tex) continue;
+        body.push('');
+        // Readers start every spine file on a fresh page. \chapter brings its
+        // own page break; everything else (front matter, the book's own TOC
+        // page) needs an explicit one or it flows into the previous chapter.
+        if (!/^\\chapter/.test(tex)) body.push('\\clearpage');
+        body.push(tex);
+      }
+      const exotics = texExotics(title + '\n' + author + '\n' + body.join('\n'));
+
       const out = [];
       out.push('\\documentclass[11pt]{book}');
       out.push('\\usepackage[utf8]{inputenc}');
       out.push('\\usepackage[T1]{fontenc}');
+      out.push('\\usepackage{textcomp}');
       const lang = TEX_BABEL[(book.meta.language || '').slice(0, 2).toLowerCase()];
       if (lang) out.push('\\usepackage[' + lang + ']{babel}');
       out.push('\\usepackage[normalem]{ulem}');
+      if (exotics.length) out.push('\\usepackage{newunicodechar}');
       out.push('\\usepackage{hyperref}');
-      out.push('\\title{' + texFlatten(texEscape(book.meta.title || 'Untitled')) + '}');
-      out.push('\\author{' + texFlatten(texEscape(book.meta.author || '')) + '}');
+      // Any glyph pdflatex cannot set becomes a no-op instead of a fatal error.
+      for (const ch of exotics) out.push('\\newunicodechar{' + ch + '}{}');
+      out.push('\\title{' + title + '}');
+      out.push('\\author{' + author + '}');
       out.push('\\date{}');
       out.push('');
       out.push('\\begin{document}');
@@ -2991,16 +3665,7 @@
       out.push('\\maketitle');
       out.push('\\tableofcontents');
       out.push('\\mainmatter');
-      for (const s of book.sections) {
-        const tex = texSection(s, opts);
-        if (!tex) continue;
-        out.push('');
-        // Readers start every spine file on a fresh page. \chapter brings its
-        // own page break; everything else (front matter, the book's own TOC
-        // page) needs an explicit one or it flows into the previous chapter.
-        if (!/^\\chapter/.test(tex)) out.push('\\clearpage');
-        out.push(tex);
-      }
+      for (const line of body) out.push(line);
       out.push('');
       out.push('\\end{document}');
       return encodeUtf8(out.join('\n') + '\n');
@@ -3493,8 +4158,8 @@
       mobi:   { label: 'MOBI',          read: true,      write: true,      exts: ['.mobi', '.prc'] },
       azw3:   { label: 'AZW3',          read: true,      write: false,     exts: ['.azw3', '.azw'] },
       txt:    { label: 'Plain text',    read: true,      write: true,      exts: ['.txt'] },
-      md:     { label: 'Markdown',      read: 'planned', write: true,      exts: ['.md', '.markdown'] },
-      html:   { label: 'HTML',          read: 'planned', write: true,      exts: ['.html', '.htm'] },
+      md:     { label: 'Markdown',      read: true,      write: true,      exts: ['.md', '.markdown'] },
+      html:   { label: 'HTML',          read: true,      write: true,      exts: ['.html', '.htm'] },
       latex:  { label: 'LaTeX',         read: false,     write: true,      exts: ['.tex'] },
       docx:   { label: 'DOCX',          read: false,     write: true,      exts: ['.docx'] },
       pandoc: { label: 'Pandoc bundle', read: false,     write: true,      exts: ['.zip'] },
@@ -3512,9 +4177,11 @@
       decodeEntities: decodeEntities, escapeXml: escapeXml,
       resolvePath: resolvePath, htmlToText: htmlToText, decodeText: decodeText,
       readEpub: readEpub, writeEpub: writeEpub, readTxt: readTxt, writeTxt: writeTxt,
+      readHtml: readHtml, readMarkdown: readMarkdown, markdownToHtml: markdownToHtml,
+      inlineMd: inlineMd, buildSections: buildSections,
       writeMd: writeMd, writeHtml: writeHtml, htmlToMarkdown: htmlToMarkdown,
       writeLatex: writeLatex, writePandoc: writePandoc, writeDocx: writeDocx,
-      htmlToLatex: htmlToLatex, texEscape: texEscape, imageDims: imageDims,
+      htmlToLatex: htmlToLatex, texEscape: texEscape, texExotics: texExotics, imageDims: imageDims,
       emptyBook: emptyBook, addResource: addResource, sniffImageMime: sniffImageMime,
       encodeUtf8: encodeUtf8, decodeUtf8: decodeUtf8,
       readPalmDB: readPalmDB, parseMobiHeader: parseMobiHeader,
@@ -3788,7 +4455,7 @@
         setFileSize(file.size);
         const logger = Core.makeLog();
         file.arrayBuffer()
-          .then((buf) => Core.read(new Uint8Array(buf), logger))
+          .then((buf) => Core.read(new Uint8Array(buf), logger, file.name))
           .then((b) => {
             setBook(b);
             setLog(logger.lines.slice());
