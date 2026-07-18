@@ -1096,12 +1096,14 @@
       const rep = repTitle(b);
       // Fixed geometry so cards don't jostle as long/short titles rotate through:
       // title reserves 2 lines, meta lines are single-line ellipsis, controls pinned
-      // bottom. Series cards grow with their volume list (owner-approved).
+      // bottom. minHeight fits the tallest common variant (series with rep line +
+      // 3 collapsed volumes + toggle) so single-book rows are the same height as
+      // series rows; only the explicit "show all" expansion grows a card.
       const clamp2 = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
         overflow: 'hidden', minHeight: '2.7em' };
       const oneLine = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
       return (
-        <div className="rec-card" style={{ display: 'flex', flexDirection: 'column', minHeight: 178 }}>
+        <div className="rec-card" style={{ display: 'flex', flexDirection: 'column', minHeight: 282 }}>
           <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600, lineHeight: 1.35, ...clamp2 }}>{dispTitle(b)}</div>
           <div style={{ fontSize: 12.5, color: C.label, margin: '3px 0 2px', ...oneLine }}>
             {b.a}{b.y ? ` · ${b.y}` : ''}{b.s && !b.vt ? ' · series' : ''}
@@ -1175,7 +1177,7 @@
 
           <h3 style={{ fontSize: 16, color: C.text, margin: '26px 0 8px' }}>Rate a specific book</h3>
           <input type="search" placeholder="Search by title, series, volume or author…" value={query}
-            onChange={e => setQuery(e.target.value)} style={{ maxWidth: 420, marginBottom: 8 }} />
+            onChange={e => setQuery(e.target.value)} style={{ maxWidth: 420, marginBottom: 8, fontSize: 14 }} />
           {query.length >= 2 && results.length === 0 &&
             <p style={{ fontSize: 12.5, color: C.foot }}>No match in the {fmtN(model.prep.n)}-book catalog.</p>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
@@ -1497,7 +1499,10 @@
                 <text x={sx(0) + 6} y={sy(1) + 14} style={qlabel}>BROAD APPEAL</text>
                 <text x={sx(100) - 6} y={sy(0) - 8} textAnchor="end" style={qlabel}>NICHE GAMBLES</text>
                 <text x={sx(0) + 6} y={sy(0) - 8} style={qlabel}>LONG SHOTS</text>
-                {pts.filter(visible).map(p => (
+                {/* All points stay mounted (the clip box hides off-window ones): a zoom
+                    step then only moves attributes instead of mounting/unmounting
+                    hundreds of nodes, which made the zoom drag stutter when cold. */}
+                {pts.map(p => (
                   <circle key={p.j} cx={sx(p.mp)} cy={sy(p.pl)} r={p.r} fill={avgColor(p.mv)} opacity={0.5}
                     stroke={tip && tip.j === p.j ? '#f1f5f9' : 'none'} strokeWidth={1.5} />
                 ))}
@@ -1525,18 +1530,34 @@
       const W = 760, H = 540, P = 10;
       const GW = 60, GH = 40, BW = 0.08;
 
-      const grid = useMemo(() => {
+      // Terrain as a crisp hexbin (no blur): the same kernel-smoothed Δ P(like)
+      // field as before, sampled at pointy-top hex centers by bilinearly
+      // interpolating the 60×40 num/den grids.
+      const hexes = useMemo(() => {
         if (comp.nRated === 0) return null;
         const cur = M.smoothGrid(model.prep, comp.plike, GW, GH, BW);
-        // Delta of P(like) vs. the cold baseline per cell...
+        const base = model.gridBase;
+        const samp = (F, gx, gy) => {
+          const x = Math.min(Math.max(gx, 0), GW - 1), y = Math.min(Math.max(gy, 0), GH - 1);
+          const c0 = Math.floor(x), r0 = Math.floor(y);
+          const c1 = Math.min(c0 + 1, GW - 1), r1 = Math.min(r0 + 1, GH - 1);
+          const fx = x - c0, fy = y - r0;
+          return F[r0 * GW + c0] * (1 - fx) * (1 - fy) + F[r0 * GW + c1] * fx * (1 - fy)
+               + F[r1 * GW + c0] * (1 - fx) * fy + F[r1 * GW + c1] * fx * fy;
+        };
+        // Delta of P(like) vs. the cold baseline per hex center...
+        const R = 8.5, hx = Math.sqrt(3) * R, hy = 1.5 * R;
         const raw = [];
         let sum = 0;
-        for (let r = 0; r < GH; r++) {
-          for (let c = 0; c < GW; c++) {
-            const i = r * GW + c;
-            if (cur.den[i] < 0.15) continue;      // no kernel mass -> stay neutral
-            const delta = cur.num[i] / cur.den[i] - model.gridBase.num[i] / model.gridBase.den[i];
-            raw.push({ c, r, delta });
+        for (let r = 0, y = P + R; y <= H - P - R; r++, y += hy) {
+          for (let x = P + hx / 2 + (r % 2 ? hx / 2 : 0); x <= W - P - hx / 2; x += hx) {
+            const gx = ((x - P) / (W - 2 * P)) * GW - 0.5;
+            const gy = ((y - P) / (H - 2 * P)) * GH - 0.5;
+            const den = samp(cur.den, gx, gy);
+            if (den < 0.15) continue;      // no kernel mass -> stay neutral
+            const delta = samp(cur.num, gx, gy) / den
+                        - samp(base.num, gx, gy) / samp(base.den, gx, gy);
+            raw.push({ x, y, delta });
             sum += delta;
           }
         }
@@ -1545,19 +1566,30 @@
         // information - the interesting signal is which regions are hotter/cooler
         // than your overall taste)...
         const mean = sum / raw.length;
-        const mags = raw.map(x => Math.abs(x.delta - mean)).sort((a, b) => a - b);
+        const mags = raw.map(h => Math.abs(h.delta - mean)).sort((a, b) => a - b);
         // ...and normalized by a robust (90th-pct) scale so the strongest regions
         // saturate to full color instead of washing out to mid-gray.
         const scale = Math.max(0.015, mags[Math.floor(mags.length * 0.9)]);
-        return raw.map(x => {
-          const t = Math.max(-1, Math.min(1, (x.delta - mean) / scale));
-          return { c: x.c, r: x.r, t, op: 0.18 + 0.5 * Math.min(1, Math.abs(t)) };
-        }).filter(cell => Math.abs(cell.t) > 0.05);
+        // Hexes are drawn slightly shrunk so a hairline of background shows
+        // between neighbors — the honeycomb look.
+        const vx = [], vy = [];
+        for (let k = 0; k < 6; k++) {
+          const a = Math.PI / 180 * (60 * k + 30);
+          vx.push((R - 0.7) * Math.cos(a)); vy.push((R - 0.7) * Math.sin(a));
+        }
+        const out = [];
+        for (const h of raw) {
+          const t = Math.max(-1, Math.min(1, (h.delta - mean) / scale));
+          if (Math.abs(t) <= 0.05) continue;
+          let d = '';
+          for (let k = 0; k < 6; k++) d += (k ? 'L' : 'M') + (h.x + vx[k]).toFixed(1) + ' ' + (h.y + vy[k]).toFixed(1);
+          out.push({ d: d + 'Z', t, op: 0.18 + 0.5 * Math.min(1, Math.abs(t)) });
+        }
+        return out;
       }, [comp]);
 
       const sx = mx => P + (mx + 1) / 2 * (W - 2 * P);
       const sy = my => P + (my + 1) / 2 * (H - 2 * P);
-      const cw = (W - 2 * P) / GW, ch = (H - 2 * P) / GH;
 
       // Clamp the pan offset so the (scaled) content always covers the plot box.
       const clampView = (z, ox, oy) => ({
@@ -1663,31 +1695,28 @@
               style={{ cursor: view.z > 1 ? (dragging ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }}>
               <defs>
                 <clipPath id="mapclip"><rect x={0} y={0} width={W} height={H} rx={8} /></clipPath>
-                <filter id="mapsoften" x="-4%" y="-4%" width="108%" height="108%">
-                  <feGaussianBlur stdDeviation={Math.min(cw, ch) * 0.6} />
-                </filter>
               </defs>
               <rect x={0} y={0} width={W} height={H} fill="#0b1220" rx={8} />
               <g clipPath="url(#mapclip)" transform={`translate(${view.ox} ${view.oy}) scale(${view.z})`}>
-                {showTerrain && grid && grid.length > 0 && (
-                  <g filter="url(#mapsoften)">
-                    {/* opaque backdrop so the blur has the bg color to melt into, not transparency */}
-                    <rect x={0} y={0} width={W} height={H} fill="#0b1220" />
-                    {grid.map((cell, i) => (
-                      <rect key={i} x={P + cell.c * cw - 0.5} y={P + cell.r * ch - 0.5} width={cw + 1} height={ch + 1}
-                        fill={cmapOpaque(cell.t, cell.op)} />
-                    ))}
+                {showTerrain && hexes && hexes.length > 0 && (
+                  <g>
+                    {hexes.map((h, i) => <path key={i} d={h.d} fill={cmapOpaque(h.t, h.op)} />)}
                   </g>
                 )}
+                {/* r and strokeWidth counter the group scale so point sizes stay
+                    constant on screen while zooming (only positions spread apart). */}
                 {model.prep.books.map((b, j) => ratings.has(j) ? null : (
-                  <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={passes[j] ? 2.4 : 2.1}
+                  <circle key={j} cx={sx(b.mx)} cy={sy(b.my)} r={(passes[j] ? 2.4 : 2.1) / view.z}
                     fill={passes[j] ? '#a9b7ca' : C.foot} opacity={passes[j] ? 0.85 : 0.32} />
                 ))}
                 {[...ratings.entries()].map(([j, r]) => (
                   <circle key={'r' + j} cx={sx(model.prep.books[j].mx)} cy={sy(model.prep.books[j].my)}
-                    r={5.5} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5} />
+                    r={5.5 / view.z} fill={ratingColor(r)} stroke="#f1f5f9" strokeWidth={1.5 / view.z} />
                 ))}
               </g>
+              {/* Frame on top of the clipped content — same white as the top-pick triangle. */}
+              <rect x={0.6} y={0.6} width={W - 1.2} height={H - 1.2} rx={8} fill="none"
+                stroke="#e2e8f0" strokeWidth={1.1} strokeOpacity={0.82} style={{ pointerEvents: 'none' }} />
             </svg>
             {tip && (
               <div className="rec-tip" style={{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 12, 0)}%` }}>
@@ -1767,16 +1796,44 @@
           const rp = pctMap(filtered, j => M.clip(comp.m[j] + riskAt(r, fr) * zc * Math.sqrt(comp.va[j]), 1, 5));
           for (let c = 0; c < fr; c++) field[r * fr + c] = winnerIn(blendAt(c, fr), rp, pool);
         }
-        // Winners by area (for labels + centroid) and one contour set per winner.
-        const area = new Map(), sumc = new Map(), sumr = new Map();
+        // Winners by area, plus a label anchor per winner: the pole of
+        // inaccessibility (region cell farthest from any border) — the area
+        // centroid can fall OUTSIDE a concave region. Multi-source BFS from all
+        // border cells, propagating only within each region, gives every cell
+        // its grid distance to the region edge in O(fr²).
+        const area = new Map();
+        const dist = new Int32Array(fr * fr).fill(-1);
+        const bfs = new Int32Array(fr * fr);
+        let qt = 0;
         for (let r = 0; r < fr; r++) for (let c = 0; c < fr; c++) {
-          const j = field[r * fr + c];
+          const i = r * fr + c, j = field[i];
           area.set(j, (area.get(j) || 0) + 1);
-          sumc.set(j, (sumc.get(j) || 0) + c);
-          sumr.set(j, (sumr.get(j) || 0) + r);
+          if (r === 0 || r === fr - 1 || c === 0 || c === fr - 1 ||
+              field[i - fr] !== j || field[i + fr] !== j || field[i - 1] !== j || field[i + 1] !== j) {
+            dist[i] = 0; bfs[qt++] = i;
+          }
+        }
+        for (let qh = 0; qh < qt; qh++) {
+          const i = bfs[qh], r = (i / fr) | 0, c = i % fr, j = field[i], d = dist[i] + 1;
+          if (r > 0 && dist[i - fr] < 0 && field[i - fr] === j) { dist[i - fr] = d; bfs[qt++] = i - fr; }
+          if (r < fr - 1 && dist[i + fr] < 0 && field[i + fr] === j) { dist[i + fr] = d; bfs[qt++] = i + fr; }
+          if (c > 0 && dist[i - 1] < 0 && field[i - 1] === j) { dist[i - 1] = d; bfs[qt++] = i - 1; }
+          if (c < fr - 1 && dist[i + 1] < 0 && field[i + 1] === j) { dist[i + 1] = d; bfs[qt++] = i + 1; }
+        }
+        // Pick each winner's best cell by SCREEN clearance, not grid clearance:
+        // one grid step is plotW/(fr-1) px in x but only ~blend·plotH/(fr-1) px
+        // in y, so near the apex a large grid distance is worth little.
+        const best = new Map();   // j -> {score, lx, ly}
+        for (let r = 0; r < fr; r++) for (let c = 0; c < fr; c++) {
+          const i = r * fr + c, j = field[i];
+          const step = Math.min(1, Math.max(c / (fr - 1), 0.02) * (plotH / plotW));
+          const score = dist[i] * step;
+          const b = best.get(j);
+          if (!b || score > b.score) best.set(j, { score, lx: c, ly: r });
         }
         const winners = [...area.entries()]
-          .map(([j, a]) => ({ j, area: a, cx: sumc.get(j) / a, cy: sumr.get(j) / a }))
+          .map(([j, a]) => ({ j, area: a, ...best.get(j),
+            clear: best.get(j).score * (plotW / (fr - 1)) }))   // ≈ px to nearest border
           .sort((p, q) => q.area - p.area);
         const contours = [];
         for (const w of winners) for (const line of regionContours(field, fr, w.j)) contours.push(line);
@@ -1813,7 +1870,11 @@
       const onMove = e => setTip(locate(e));
       const onClick = e => { const h = locate(e); if (h) { setBlend(h.bl); setRisk(h.rk); } };
 
-      const labels = G ? G.winners.filter(w => w.area / G.total > 0.05).slice(0, 5) : [];
+      // Label a region if it is either reasonably large or has a decently clear
+      // anchor spot; a letter or two poking past a border is acceptable.
+      const labels = G ? G.winners
+        .filter(w => w.area / G.total > 0.015 && (w.clear >= 6 || w.area / G.total > 0.05))
+        .slice(0, 9) : [];
       const trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
       const xticks = [0, 0.25, 0.5, 0.75, 1], yticks = [1, 0.5, 0, -0.5, -1];
 
@@ -1871,11 +1932,12 @@
                 <path key={'ct' + i} d={pathD(line)} fill="none" stroke="#e2e8f0" strokeWidth={1.1}
                   opacity={0.82} strokeLinejoin="round" strokeLinecap="round" style={{ pointerEvents: 'none' }} />
               ))}
-              {/* On-map labels for the largest regions; the tooltip covers the small ones. */}
+              {/* On-map labels, anchored at each region's pole of inaccessibility;
+                  the tooltip covers the unlabelled small ones. */}
               {labels.map(w => (
-                <text key={w.j} x={TX(g2b(w.cx))} y={TY(g2b(w.cx), g2r(w.cy))} textAnchor="middle"
-                  dominantBaseline="middle" fontSize={11} fill="#f1f5f9"
-                  stroke="#0b1220" strokeWidth={2.6} style={{ paintOrder: 'stroke', fontWeight: 600, pointerEvents: 'none' }}>
+                <text key={w.j} x={TX(g2b(w.lx))} y={TY(g2b(w.lx), g2r(w.ly))} textAnchor="middle"
+                  dominantBaseline="middle" fontSize={11} fill={C.text}
+                  stroke="#0b1220" strokeWidth={2.6} style={{ paintOrder: 'stroke', pointerEvents: 'none' }}>
                   {trunc(dispTitle(model.prep.books[w.j]), 22)}
                 </text>
               ))}
