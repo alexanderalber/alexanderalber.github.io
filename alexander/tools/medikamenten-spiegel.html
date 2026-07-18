@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="de" data-theme="dark" data-section="alexander">
+<head>
+  <meta charset="utf-8">
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'de');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Medikamentenspiegelvisualisierung - Alexander Alber</title>
+  <meta name="description" content="Interaktives Werkzeug, das den zeitlichen Verlauf der Blutkonzentration von Wirkstoffen darstellt. Einnahmezeitpunkte per Maus verschieben, Dosen und Darreichungsformen (unretardiert/retardiert) kombinieren, Tag-zu-Tag-Akkumulation im Steady State sehen. Pharmakokinetisches Ein-Kompartiment-Modell (Bateman).">
+  <link rel="canonical" href="https://alber.me/alexander/tools/medikamenten-spiegel.html">
+  <link rel="alternate" hreflang="de" href="https://alber.me/alexander/tools/medikamenten-spiegel.html">
+  <link rel="alternate" hreflang="en" href="https://alber.me/alexander/tools/medikamenten-spiegel.html?lang=en">
+  <link rel="alternate" hreflang="x-default" href="https://alber.me/alexander/tools/medikamenten-spiegel.html">
+  <script>if(new URLSearchParams(location.search).get('lang')==='en')document.querySelector('link[rel=canonical]').href+='?lang=en';</script>
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Multi-button segmented control (same pattern as the input-shaper tool). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+    .combo-list { position:absolute; z-index:20; left:0; right:0; margin-top:2px;
+      background:#0f172a; border:1px solid #334155; border-radius:6px; max-height:240px;
+      overflow-y:auto; box-shadow:0 8px 24px rgba(0,0,0,.5); }
+    .combo-item { padding:7px 10px; cursor:pointer; color:#cbd5e1; font-size:14px; }
+    .combo-item:hover, .combo-item.hi { background:#1e293b; }
+    .conc-svg { touch-action:none; }
+    .conc-svg .pin { cursor:ew-resize; }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Medikamentenspiegelvisualisierung",
+    "description": "Interaktives Werkzeug für den zeitlichen Verlauf der Blutkonzentration von Wirkstoffen: Einnahmezeitpunkte per Maus verschieben, Dosen und Darreichungsformen kombinieren, Steady-State-Akkumulation über mehrere Tage sehen. Pharmakokinetisches Ein-Kompartiment-Modell (Bateman-Funktion).",
+    "url": "https://alber.me/alexander/tools/medikamenten-spiegel.html",
+    "applicationCategory": "EducationalApplication",
+    "inLanguage": "de",
+    "author": { "@type": "Person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/alexander/">About</a></li>
+        <li><a href="/alexander/publications.html">Publications</a></li>
+        <li><a href="/alexander/writing.html">Writing</a></li>
+        <li><a href="/alexander/projects.html">Projects &amp; Art</a></li>
+        <li><a href="/alexander/miscellaneous.html" aria-current="page">Miscellaneous</a></li>
+        <li><a href="/alexander/cv.html">CV</a></li>
+        <li class="lang-switcher">
+          <button class="lang-seg" data-lang="en">EN</button><button class="lang-seg" data-lang="de">DE</button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script>
+    (function () {
+      var urlLang = new URLSearchParams(location.search).get('lang');
+      if (urlLang === 'en' || urlLang === 'de') { localStorage.setItem('lang', urlLang); }
+      var l = localStorage.getItem('lang') || 'de';
+      document.querySelectorAll('.lang-seg').forEach(function (btn) {
+        if (btn.getAttribute('data-lang') === l) btn.classList.add('active');
+        btn.onclick = function () { localStorage.setItem('lang', btn.getAttribute('data-lang')); location.reload(); };
+      });
+    })();
+  </script>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/alexander/miscellaneous.html">← Sonstiges</a>
+    </p>
+    <script>if((localStorage.getItem('lang')||'de')==='en')document.currentScript.previousElementSibling.querySelector('a').textContent='← Miscellaneous';</script>
+    <div id="root"></div>
+  </main>
+
+  <script type="text/babel">
+    const { useState, useMemo, useRef, useEffect } = React;
+
+    const LANG = localStorage.getItem('lang') || 'de';
+
+    /* ── UI strings ──────────────────────────────────────────────────────── */
+    const STRINGS = {
+      de: {
+        title: "Medikamentenspiegel-Visualisierung",
+        subtitle: "Wie sich Einnahmezeitpunkte, Dosis und Darreichungsform auf den Blutspiegel über den Tag auswirken",
+        substanceLabel: "Wirkstoff:",
+        searchPlaceholder: "Wirkstoff suchen oder wählen…",
+        formLabel: "Darreichungsform (für neue Einnahmen):",
+        weightLabel: "Körpergewicht:",
+        windowLabel: "Anzeigefenster:",
+        repeatLabel: "Täglich wiederholen (Steady State):",
+        on: "an", off: "aus",
+        intakesTitle: "Einnahmen (Tagesschema)",
+        addIntake: "＋ Einnahme",
+        dose: "Dosis",
+        time: "Zeit",
+        remove: "entfernen",
+        chartTitle: "Konzentration im Blut",
+        chartHint: "Tipp: Die Einnahme-Marker unter der Kurve lassen sich mit der Maus verschieben.",
+        showContribs: "Einzelbeiträge zeigen",
+        axConc: "Konzentration [mg/L]",
+        axTime: "Uhrzeit",
+        total: "Gesamt",
+        night: "Nacht",
+        cmax: "Spitze (Cmax)",
+        cmin: "Tiefstwert (Cmin)",
+        cavg: "Mittel (Cavg)",
+        lastDay: "über den letzten Tag",
+        day: "Tag",
+        noIntakes: "Noch keine Einnahme. Füge oben eine hinzu.",
+        about: "Die meisten Medikamente wirken, solange ihr Blutspiegel in einem bestimmten Bereich liegt. Bei kurzer Halbwertszeit muss man über den Tag verteilt nachdosieren, um den Spiegel halbwegs konstant zu halten – oder die Einnahme so legen, dass er nachts absinkt. Wirken die Dosen länger als der Abstand zwischen ihnen, überlagern sie sich und der Spiegel schaukelt sich über mehrere Tage bis zu einem Fließgleichgewicht (Steady State) auf. Dieses Werkzeug macht genau das sichtbar: Verschiebe die Einnahmezeitpunkte, kombiniere unretardierte und retardierte Formen und beobachte, wie sich Spitzen und Täler verändern.",
+        model: "Modell",
+        modelBody: "Pro Dosis wird ein pharmakokinetisches Ein-Kompartiment-Modell mit Resorption erster Ordnung angesetzt (Bateman-Funktion): C(t) = F·D·kₐ / (V·(kₐ−kₑ)) · (e^(−kₑt) − e^(−kₐt)), mit kₑ = ln2/Halbwertszeit, kₐ = Resorptionsrate, V = Verteilungsvolumen (aus Gewicht × Literatur-V/kg), F = Bioverfügbarkeit. Weil die Kinetik linear ist, addieren sich mehrere Einnahmen (Superposition) – so entstehen Akkumulation und Steady State von selbst. Retardformen sind als langsamere Resorption abgebildet. Dargestellt ist die Plasmakonzentration; die tatsächliche Wirkung folgt ihr nur verzögert und nicht linear.",
+        source: "Parameter (V/kg, Halbwertszeit, kₐ, Bioverfügbarkeit) sind vereinfachte Größenordnungen aus der Standardliteratur, keine patientenindividuellen Werte. Sättigungskinetik, aktive Metaboliten, Mehrkompartiment-Verteilung und interindividuelle Unterschiede sind bewusst weggelassen.",
+        disclaimer: "Vereinfachtes Lehrmodell. Keine medizinische Beratung, keine Dosierungsempfehlung. Für Fragen zur eigenen Medikation die Ärztin, den Arzt oder die Apotheke fragen. Privates Hobbyprojekt, unkommerziell, ohne Gewähr.",
+        loading: "Lade Wirkstoffdaten…",
+        loadError: "Wirkstoffdaten konnten nicht geladen werden.",
+      },
+      en: {
+        title: "Drug Concentration Visualiser",
+        subtitle: "How intake timing, dose and formulation shape the blood level across the day",
+        substanceLabel: "Substance:",
+        searchPlaceholder: "Search or pick a substance…",
+        formLabel: "Formulation (for new intakes):",
+        weightLabel: "Body weight:",
+        windowLabel: "Display window:",
+        repeatLabel: "Repeat daily (steady state):",
+        on: "on", off: "off",
+        intakesTitle: "Intakes (daily schedule)",
+        addIntake: "＋ Intake",
+        dose: "Dose",
+        time: "Time",
+        remove: "remove",
+        chartTitle: "Blood concentration",
+        chartHint: "Tip: drag the intake markers below the curve with the mouse.",
+        showContribs: "show individual contributions",
+        axConc: "Concentration [mg/L]",
+        axTime: "Time of day",
+        total: "Total",
+        night: "Night",
+        cmax: "Peak (Cmax)",
+        cmin: "Trough (Cmin)",
+        cavg: "Mean (Cavg)",
+        lastDay: "over the last day",
+        day: "Day",
+        noIntakes: "No intake yet. Add one above.",
+        about: "Most drugs work while their blood level stays within a certain range. With a short half-life you have to re-dose across the day to keep the level roughly constant — or time the doses so it falls at night. When each dose lasts longer than the gap between doses, they overlap and the level builds up over several days to an equilibrium (steady state). This tool makes exactly that visible: drag the intake times, combine immediate- and extended-release forms, and watch how peaks and troughs change.",
+        model: "Model",
+        modelBody: "Each dose is a pharmacokinetic one-compartment model with first-order absorption (the Bateman function): C(t) = F·D·kₐ / (V·(kₐ−kₑ)) · (e^(−kₑt) − e^(−kₐt)), with kₑ = ln2/half-life, kₐ = absorption rate, V = volume of distribution (weight × literature V/kg), F = bioavailability. Because the kinetics are linear, multiple intakes simply add up (superposition) — so accumulation and steady state emerge on their own. Extended-release forms are modelled as slower absorption. Plasma concentration is shown; the actual effect follows it only with a delay and non-linearly.",
+        source: "Parameters (V/kg, half-life, kₐ, bioavailability) are simplified order-of-magnitude values from standard literature, not patient-specific. Saturable kinetics, active metabolites, multi-compartment distribution and inter-individual variation are deliberately omitted.",
+        disclaimer: "Simplified teaching model. Not medical advice and not a dosing recommendation. For questions about your own medication ask a physician or pharmacist. Personal hobby project, non-commercial, no warranty.",
+        loading: "Loading substance data…",
+        loadError: "Could not load substance data.",
+      },
+    };
+
+    /* ── Colours (site palette) ──────────────────────────────────────────── */
+    const COL_TOTAL = '#0fb5ad';   // teal – total curve
+    const COL_CONTRIB = '#d9a441'; // gold – individual dose contributions
+    const COL_GRID  = '#334155';
+    const COL_AXIS  = '#64748b';
+    const COL_PIN   = '#0fb5ad';
+    const COL_PIN_GHOST = '#475569';
+    const COL_NIGHT = '#1e293b';
+    const LN2 = Math.log(2);
+
+    /* ── Pharmacokinetics ────────────────────────────────────────────────── */
+    /* One-compartment oral model, first-order absorption (Bateman). A form has
+       one or more absorption phases {frac, ka, lag}: immediate-release is a
+       single phase, extended-release is fraction-weighted phases (a slow phase,
+       optionally lagged) added together — the standard way to render a biphasic
+       retard profile. Elimination ke and bioavailability F are shared per form.
+       Returns concentration in mg/L; V is the absolute volume of distribution (L). */
+    function doseCoef(form, doseMg, V) {
+      const ke = LN2 / form.half_life_h;
+      const phases = form.phases.map(ph => {
+        const ka = ph.ka_per_h, dk = ka - ke, lag = ph.lag_h || 0;
+        const amp = form.f * doseMg * ph.frac;
+        // guard against ka ≈ ke (would divide by ~0); fall back to the limiting form
+        if (Math.abs(dk) < 1e-4) return { limiting: true, ke, ka, lag, k: (amp * ke) / V };
+        return { limiting: false, ke, ka, lag, coef: (amp * ka) / (V * dk) };
+      });
+      return { ke, phases };
+    }
+    function concFromDose(c, tau) {
+      if (tau < 0) return 0;
+      let v = 0;
+      for (let i = 0; i < c.phases.length; i++) {
+        const ph = c.phases[i], x = tau - ph.lag;
+        if (x < 0) continue;
+        if (ph.limiting) v += ph.k * x * Math.exp(-ph.ke * x);        // ka→ke limit: k·t·e^(−k t)
+        else v += ph.coef * (Math.exp(-ph.ke * x) - Math.exp(-ph.ka * x));
+      }
+      return v;
+    }
+
+    /* Total concentration (and optional per-intake split) at absolute time T (h).
+       Intakes describe a daily schedule (hour ∈ [0,24)); when `repeat` is on each
+       recurs every 24 h, so past days accumulate into the level. */
+    function concAt(T, intakes, formOf, V, repeat, split) {
+      let total = 0;
+      const parts = split ? [] : null;
+      for (let i = 0; i < intakes.length; i++) {
+        const it = intakes[i];
+        const form = formOf(it.formId);
+        const c = doseCoef(form, it.mg, V);
+        let contrib = 0;
+        if (repeat) {
+          // sum occurrences hour+24k that already happened and still matter
+          let k = Math.floor((T - it.hour) / 24);
+          for (; k >= -60; k--) {
+            const occ = it.hour + 24 * k;
+            if (occ > T) continue;
+            const tau = T - occ;
+            if (tau > 25 * form.half_life_h) break;   // older doses are negligible
+            contrib += concFromDose(c, tau);
+          }
+        } else if (it.hour <= T) {
+          contrib += concFromDose(c, T - it.hour);
+        }
+        total += contrib;
+        if (parts) parts.push(contrib);
+      }
+      return { total, parts };
+    }
+
+    /* ── Small helpers ───────────────────────────────────────────────────── */
+    const pad2 = n => (n < 10 ? '0' : '') + n;
+    function clockLabel(h) {
+      let m = Math.round(h * 60);
+      m = ((m % 1440) + 1440) % 1440;
+      return pad2(Math.floor(m / 60)) + ':' + pad2(m % 60);
+    }
+    const fmt = (x, d) => Number(x).toFixed(d);
+    function niceConc(x) {
+      if (x >= 100) return x.toFixed(0);
+      if (x >= 10) return x.toFixed(1);
+      return x.toFixed(2);
+    }
+    let UID = 1;
+
+    /* ── Substance combobox with search ──────────────────────────────────── */
+    function Combo({ substances, value, onChange, t }) {
+      const [open, setOpen] = useState(false);
+      const [q, setQ] = useState('');
+      const boxRef = useRef(null);
+      const sel = substances.find(s => s.id === value);
+      const nameOf = s => (LANG === 'en' ? s.name_en : s.name_de);
+      const list = substances
+        .filter(s => nameOf(s).toLowerCase().includes(q.toLowerCase()))
+        .sort((a, b) => nameOf(a).localeCompare(nameOf(b), LANG));
+
+      useEffect(() => {
+        const onDoc = e => { if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false); };
+        document.addEventListener('mousedown', onDoc);
+        return () => document.removeEventListener('mousedown', onDoc);
+      }, []);
+
+      return (
+        <div ref={boxRef} style={{ position: 'relative', maxWidth: 340 }}>
+          <input
+            type="text"
+            value={open ? q : (sel ? nameOf(sel) : '')}
+            placeholder={t.searchPlaceholder}
+            onFocus={() => { setOpen(true); setQ(''); }}
+            onChange={e => { setQ(e.target.value); setOpen(true); }}
+            style={{ marginBottom: 0 }}
+          />
+          {open && (
+            <div className="combo-list">
+              {list.map(s => (
+                <div key={s.id} className={'combo-item' + (s.id === value ? ' hi' : '')}
+                     onMouseDown={() => { onChange(s.id); setOpen(false); }}>
+                  {nameOf(s)}
+                </div>
+              ))}
+              {list.length === 0 && <div className="combo-item" style={{ color: '#64748b' }}>—</div>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* Form picker: segmented buttons for ≤3 forms, a dropdown beyond that
+       (e.g. Methylphenidat with five formulations would overflow as buttons). */
+    function FormPicker({ forms, value, onChange, formLabel, small }) {
+      if (forms.length <= 3) {
+        return (
+          <div className="seg-row" role="group" style={{ display: 'inline-flex' }}>
+            {forms.map(f => (
+              <button key={f.id} className={'lang-seg' + (f.id === value ? ' active' : '')}
+                      style={small ? { fontSize: 12, padding: '3px 8px' } : null}
+                      onClick={() => onChange(f.id)}>{formLabel(f)}</button>
+            ))}
+          </div>
+        );
+      }
+      return (
+        <select value={value} onChange={e => onChange(e.target.value)}
+                style={{ width: 'auto', marginBottom: 0, padding: small ? '4px 8px' : '6px 10px' }}>
+          {forms.map(f => <option key={f.id} value={f.id}>{formLabel(f)}</option>)}
+        </select>
+      );
+    }
+
+    /* ── Concentration chart with draggable intake pins ──────────────────── */
+    function ConcChart({ intakes, formOf, V, repeat, windowH, onDragHour, t }) {
+      const W = 760, H = 336, L = 52, R = 16, TP = 14, B = 70;
+      const svgRef = useRef(null);
+      const [drag, setDrag] = useState(null);
+
+      const N = 480;
+      const { series, yMax } = useMemo(() => {
+        const tot = [];
+        let ymax = 1e-6;
+        for (let i = 0; i <= N; i++) {
+          const T = windowH * i / N;
+          const r = concAt(T, intakes, formOf, V, repeat, false);
+          tot.push([T, r.total]);
+          if (r.total > ymax) ymax = r.total;
+        }
+        return { series: tot, yMax: ymax * 1.15 };
+      }, [intakes, V, repeat, windowH]);
+
+      const sx = x => L + (x / windowH) * (W - L - R);
+      const sy = y => TP + (1 - y / yMax) * (H - TP - B);
+      const path = pts => pts.map((p, i) => (i ? 'L' : 'M') + fmt(sx(p[0]), 1) + ' ' + fmt(sy(p[1]), 1)).join(' ');
+
+      // x ticks every 6 h, day dividers every 24 h
+      const xTicks = [];
+      for (let h = 0; h <= windowH; h += 6) xTicks.push(h);
+      const dayDivs = [];
+      for (let d = 24; d < windowH; d += 24) dayDivs.push(d);
+      // night shading 22:00–06:00 for each day in view
+      const nights = [];
+      for (let d = 0; d <= windowH; d += 24) {
+        nights.push([Math.max(0, d - 2), Math.min(windowH, d + 6)]); // 22:00(prev) – 06:00
+      }
+      const yTicks = [];
+      const nY = 4;
+      for (let i = 0; i <= nY; i++) yTicks.push(yMax * i / nY);
+
+      const pinY = H - B + 20;
+
+      function hourFromClientX(clientX) {
+        const rect = svgRef.current.getBoundingClientRect();
+        const px = (clientX - rect.left) / rect.width * W;
+        let h = (px - L) / (W - L - R) * windowH;
+        return h;
+      }
+      function onMove(e) {
+        if (drag == null) return;
+        let h = hourFromClientX(e.clientX);
+        const lo = 0, hi = repeat ? 24 : windowH;
+        h = Math.max(lo, Math.min(hi, h));
+        h = Math.round(h * 4) / 4;   // snap to 15-min grid
+        if (repeat && h >= 24) h = 23.75;
+        onDragHour(drag, h);
+      }
+
+      return (
+        <div>
+          <svg ref={svgRef} className="conc-svg" viewBox={`0 0 ${W} ${H}`}
+               style={{ width: '100%', height: 'auto', fontFamily: 'inherit', display: 'block' }}
+               onPointerMove={onMove}
+               onPointerUp={() => setDrag(null)} onPointerLeave={() => setDrag(null)}>
+            {/* night shading */}
+            {nights.map((n, i) => (
+              <rect key={'n' + i} x={sx(n[0])} y={TP} width={Math.max(0, sx(n[1]) - sx(n[0]))}
+                    height={H - TP - B} fill={COL_NIGHT} opacity={0.5} />
+            ))}
+            {/* y grid + labels */}
+            {yTicks.map((y, i) => (
+              <g key={'y' + i}>
+                <line x1={L} y1={sy(y)} x2={W - R} y2={sy(y)} stroke={COL_GRID} strokeWidth={1} />
+                <text x={L - 6} y={sy(y)} textAnchor="end" dominantBaseline="middle" fontSize={11} fill={COL_AXIS}>{niceConc(y)}</text>
+              </g>
+            ))}
+            {/* x ticks */}
+            {xTicks.map((x, i) => (
+              <g key={'x' + i}>
+                <line x1={sx(x)} y1={TP} x2={sx(x)} y2={H - B} stroke={COL_GRID} strokeWidth={1} opacity={0.4} />
+                <text x={sx(x)} y={H - B + 50} textAnchor="middle" fontSize={10} fill={COL_AXIS}>{clockLabel(x)}</text>
+              </g>
+            ))}
+            {/* day dividers + labels */}
+            {dayDivs.map((x, i) => (
+              <g key={'d' + i}>
+                <line x1={sx(x)} y1={TP} x2={sx(x)} y2={H - B} stroke={COL_AXIS} strokeWidth={1} strokeDasharray="2 3" opacity={0.7} />
+                <text x={sx(x) + 4} y={TP + 11} fontSize={10} fill={COL_AXIS}>{t.day} {x / 24 + 1}</text>
+              </g>
+            ))}
+            {/* total curve */}
+            <path d={path(series)} fill="none" stroke={COL_TOTAL} strokeWidth={2.4} strokeLinejoin="round" />
+            {/* pin rail baseline */}
+            <line x1={L} y1={pinY} x2={W - R} y2={pinY} stroke={COL_GRID} strokeWidth={1} />
+            {/* ghost pins for repeated days */}
+            {repeat && intakes.map(it => {
+              const g = [];
+              for (let dd = it.hour + 24; dd < windowH; dd += 24) g.push(dd);
+              return g.map((gx, j) => (
+                <circle key={'g' + it.id + j} cx={sx(gx)} cy={pinY} r={4} fill={COL_PIN_GHOST} opacity={0.6} />
+              ));
+            })}
+            {/* draggable day-0 pins */}
+            {intakes.map(it => (
+              <g key={'p' + it.id} className="pin" onPointerDown={e => { e.currentTarget.setPointerCapture?.(e.pointerId); setDrag(it.id); }}>
+                <line x1={sx(it.hour)} y1={TP} x2={sx(it.hour)} y2={pinY} stroke={COL_PIN} strokeWidth={1} strokeDasharray="2 3" opacity={0.5} />
+                {/* enlarged transparent hit area for easier grabbing */}
+                <circle cx={sx(it.hour)} cy={pinY} r={18} fill="transparent" />
+                <circle cx={sx(it.hour)} cy={pinY} r={12} fill={drag === it.id ? '#22d3ee' : COL_PIN} stroke="#0f172a" strokeWidth={2} />
+                <text x={sx(it.hour)} y={pinY + 4} textAnchor="middle" fontSize={11} fill="#0f172a" fontWeight="700" style={{ pointerEvents: 'none' }}>{it.mg}</text>
+                <text x={sx(it.hour)} y={pinY - 17} textAnchor="middle" fontSize={10} fill={COL_AXIS} style={{ pointerEvents: 'none' }}>{clockLabel(it.hour)}</text>
+              </g>
+            ))}
+            {/* axis titles */}
+            <text x={(L + W - R) / 2} y={H - 2} textAnchor="middle" fontSize={11} fill={COL_AXIS}>{t.axTime}</text>
+            <text transform={`translate(13,${(TP + H - B) / 2}) rotate(-90)`} textAnchor="middle" fontSize={11} fill={COL_AXIS}>{t.axConc}</text>
+          </svg>
+        </div>
+      );
+    }
+
+    /* ── App ─────────────────────────────────────────────────────────────── */
+    function App() {
+      const t = STRINGS[LANG] || STRINGS.de;
+      const [data, setData] = useState(null);
+      const [err, setErr] = useState(false);
+      const [subId, setSubId] = useState(null);
+      const [formId, setFormId] = useState(null);
+      const [weight, setWeight] = useState(70);
+      const windowH = 24;                 // single-day view
+      const [repeat, setRepeat] = useState(true);
+      const [intakes, setIntakes] = useState([]);
+
+      useEffect(() => {
+        fetch('/assets/files/medications.json')
+          .then(r => r.json())
+          .then(d => {
+            setData(d);
+            const first = d.substances[0];
+            setSubId(first.id);
+            setFormId(first.forms[0].id);
+            setIntakes([
+              { id: UID++, hour: 8, mg: first.default_dose_mg, formId: first.forms[0].id },
+              { id: UID++, hour: 14, mg: first.default_dose_mg, formId: first.forms[0].id },
+            ]);
+          })
+          .catch(() => setErr(true));
+      }, []);
+
+      const sub = data && data.substances.find(s => s.id === subId);
+      const nameOf = s => (LANG === 'en' ? s.name_en : s.name_de);
+      const formLabel = f => (LANG === 'en' ? f.label_en : f.label_de);
+      const formOf = useMemo(() => {
+        return fid => (sub ? (sub.forms.find(f => f.id === fid) || sub.forms[0]) : null);
+      }, [sub]);
+      const V = sub ? sub.vd_l_per_kg * weight : 1;
+
+      function selectSubstance(id) {
+        const s = data.substances.find(x => x.id === id);
+        setSubId(id);
+        setFormId(s.forms[0].id);
+        // reset intakes to a sensible default schedule for the new substance
+        setIntakes([
+          { id: UID++, hour: 8, mg: s.default_dose_mg, formId: s.forms[0].id },
+          { id: UID++, hour: 14, mg: s.default_dose_mg, formId: s.forms[0].id },
+        ]);
+      }
+      function addIntake() {
+        if (!sub) return;
+        // place the new one a few hours after the latest existing intake
+        const last = intakes.length ? Math.max(...intakes.map(i => i.hour)) : 8;
+        const hour = Math.min(23.5, Math.round((last + 4) * 4) / 4) % 24;
+        setIntakes(iv => [...iv, { id: UID++, hour, mg: sub.default_dose_mg, formId }]);
+      }
+      const setIntake = (id, patch) => setIntakes(iv => iv.map(i => i.id === id ? { ...i, ...patch } : i));
+      const removeIntake = id => setIntakes(iv => iv.filter(i => i.id !== id));
+      const onDragHour = (id, hour) => setIntakes(iv => iv.map(i => i.id === id ? { ...i, hour } : i));
+
+      // metrics over the last full day of the window
+      const metrics = useMemo(() => {
+        if (!sub || !intakes.length) return null;
+        const t0 = Math.max(0, windowH - 24), t1 = windowH;
+        let mn = Infinity, mx = -Infinity, sum = 0, n = 0;
+        for (let i = 0; i <= 240; i++) {
+          const T = t0 + (t1 - t0) * i / 240;
+          const c = concAt(T, intakes, formOf, V, repeat, false).total;
+          if (c < mn) mn = c; if (c > mx) mx = c; sum += c; n++;
+        }
+        return { cmin: mn, cmax: mx, cavg: sum / n };
+      }, [sub, intakes, V, repeat, windowH]);
+
+      if (err) return <div className="container"><p style={{ color: '#e05260' }}>{t.loadError}</p></div>;
+      if (!data || !sub) return <div className="container"><p style={{ color: '#94a3b8' }}>{t.loading}</p></div>;
+
+      const multiForm = sub.forms.length > 1;
+      const note = LANG === 'en' ? sub.note_en : sub.note_de;
+
+      const ctrlLabel = { fontSize: 13, color: '#94a3b8', display: 'block', marginBottom: 4 };
+      const card = { border: '1px solid #1e293b', borderRadius: 8, padding: '12px 14px', marginBottom: 14 };
+
+      return (
+        <div className="container" style={{ color: '#cbd5e1', maxWidth: 900 }}>
+          <hgroup style={{ marginBottom: 18 }}>
+            <h1 style={{ marginBottom: 4 }}>{t.title}</h1>
+            <p style={{ color: '#94a3b8', fontSize: 15 }}>{t.subtitle}</p>
+          </hgroup>
+
+          {/* substance + form + globals */}
+          <div style={card}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, alignItems: 'flex-start' }}>
+              <div style={{ minWidth: 260 }}>
+                <label style={ctrlLabel}>{t.substanceLabel}</label>
+                <Combo substances={data.substances} value={subId} onChange={selectSubstance} t={t} />
+              </div>
+              {multiForm && (
+                <div>
+                  <label style={ctrlLabel}>{t.formLabel}</label>
+                  <FormPicker forms={sub.forms} value={formId} onChange={setFormId} formLabel={formLabel} />
+                </div>
+              )}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, marginTop: 14, alignItems: 'flex-end' }}>
+              <div>
+                <label style={ctrlLabel}>{t.weightLabel}</label>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  <input type="range" min={40} max={120} step={1} value={weight}
+                         onChange={e => setWeight(+e.target.value)} style={{ width: 130, marginBottom: 0 }} />
+                  <span style={{ fontVariantNumeric: 'tabular-nums', minWidth: 52 }}>{weight} kg</span>
+                </span>
+              </div>
+              <div>
+                <label style={ctrlLabel}>{t.repeatLabel}</label>
+                <div className="seg-row" role="group" style={{ display: 'inline-flex' }}>
+                  <button className={'lang-seg' + (repeat ? ' active' : '')} onClick={() => setRepeat(true)}>{t.on}</button>
+                  <button className={'lang-seg' + (!repeat ? ' active' : '')} onClick={() => setRepeat(false)}>{t.off}</button>
+                </div>
+              </div>
+            </div>
+            <p style={{ fontSize: 11, color: '#64748b', marginTop: 12, marginBottom: 0, lineHeight: 1.6 }}>{note}</p>
+          </div>
+
+          {/* chart */}
+          <div style={card}>
+            <strong style={{ fontSize: 15 }}>{t.chartTitle}</strong>
+            <ConcChart intakes={intakes} formOf={formOf} V={V} repeat={repeat} windowH={windowH}
+                       onDragHour={onDragHour} t={t} />
+            <p style={{ fontSize: 11, color: '#64748b', margin: '2px 0 10px' }}>{t.chartHint}</p>
+            {metrics && (
+              <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', fontSize: 13 }}>
+                <Metric label={t.cmax} value={niceConc(metrics.cmax)} unit="mg/L" />
+                <Metric label={t.cmin} value={niceConc(metrics.cmin)} unit="mg/L" />
+                <Metric label={t.cavg} value={niceConc(metrics.cavg)} unit="mg/L" />
+                <span style={{ color: '#475569', fontSize: 11, alignSelf: 'center' }}>{t.lastDay}</span>
+              </div>
+            )}
+          </div>
+
+          {/* intakes */}
+          <div style={card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <strong style={{ fontSize: 15 }}>{t.intakesTitle}</strong>
+              <button onClick={addIntake} className="lang-seg" style={{ borderRadius: 6 }}>{t.addIntake}</button>
+            </div>
+            {intakes.length === 0 && <p style={{ color: '#64748b', fontSize: 13 }}>{t.noIntakes}</p>}
+            {intakes.slice().sort((a, b) => a.hour - b.hour).map(it => (
+              <div key={it.id} style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', padding: '7px 0', borderTop: '1px solid #1e293b' }}>
+                <span style={{ fontVariantNumeric: 'tabular-nums', minWidth: 96, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: COL_PIN, display: 'inline-block' }} />
+                  <strong>{clockLabel(it.hour)}</strong>
+                </span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 12, color: '#64748b' }}>{t.time}</span>
+                  <input type="range" min={0} max={repeat ? 24 : windowH} step={0.25} value={it.hour}
+                         onChange={e => setIntake(it.id, { hour: Math.min(repeat ? 23.75 : windowH, +e.target.value) })}
+                         style={{ width: 150, marginBottom: 0 }} />
+                </span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 12, color: '#64748b' }}>{t.dose}</span>
+                  <select value={it.mg} onChange={e => setIntake(it.id, { mg: +e.target.value })} style={{ width: 'auto', marginBottom: 0, padding: '4px 8px' }}>
+                    {sub.doses_mg.map(d => {
+                      const labels = LANG === 'en' ? sub.dose_labels_en : sub.dose_labels_de;
+                      const lbl = labels && labels[d] ? ' – ' + labels[d] : '';
+                      return <option key={d} value={d}>{d} mg{lbl}</option>;
+                    })}
+                  </select>
+                </span>
+                {multiForm && (
+                  <FormPicker forms={sub.forms} value={it.formId} small
+                              onChange={fid => setIntake(it.id, { formId: fid })} formLabel={formLabel} />
+                )}
+                <button onClick={() => removeIntake(it.id)} title={t.remove}
+                        style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#e05260', cursor: 'pointer', fontSize: 18, padding: '0 6px' }}>×</button>
+              </div>
+            ))}
+          </div>
+
+          {/* about + model + footer */}
+          <p style={{ marginTop: 22, fontSize: 13, color: '#94a3b8', lineHeight: 1.7, maxWidth: 720 }}>{t.about}</p>
+          <details style={{ marginTop: 12, maxWidth: 720 }}>
+            <summary style={{ fontSize: 13, color: '#94a3b8', cursor: 'pointer' }}>{t.model}</summary>
+            <p style={{ fontSize: 12.5, color: '#94a3b8', lineHeight: 1.7, marginTop: 8 }}>{t.modelBody}</p>
+          </details>
+          <p style={{ marginTop: 16, fontSize: 11, color: '#64748b', lineHeight: 1.7 }}>{t.source}</p>
+          <p style={{ marginTop: 8, fontSize: 10, color: '#475569', lineHeight: 1.6 }}>{t.disclaimer}</p>
+        </div>
+      );
+    }
+
+    function Metric({ label, value, unit }) {
+      return (
+        <span>
+          <span style={{ color: '#64748b', fontSize: 12 }}>{label}: </span>
+          <strong style={{ color: '#cbd5e1', fontVariantNumeric: 'tabular-nums' }}>{value}</strong>
+          <span style={{ color: '#64748b', fontSize: 11 }}> {unit}</span>
+        </span>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
