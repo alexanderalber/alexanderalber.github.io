@@ -24,9 +24,14 @@
     @media (max-width:900px){.ie-wrap{grid-template-columns:1fr}}
 
     .ie-stage{background:var(--pico-card-background-color);border-radius:var(--pico-border-radius);padding:.6rem;overflow:auto}
+    /* transparency checkerboard: one conic-gradient tiles flush from the corner, so no
+       half-cut cells appear at the edges (the older 4-gradient version needed offsets) */
     .ie-holder{position:relative;display:inline-block;max-width:100%;
-      background-image:linear-gradient(45deg,#2a2f3a 25%,transparent 25%),linear-gradient(-45deg,#2a2f3a 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#2a2f3a 75%),linear-gradient(-45deg,transparent 75%,#2a2f3a 75%);
-      background-size:20px 20px;background-position:0 0,0 10px,10px -10px,-10px 0px;background-color:#20242c}
+      background-image:conic-gradient(#2a2f3a 25%,transparent 0 50%,#2a2f3a 0 75%,transparent 0);
+      background-size:20px 20px;background-color:#20242c}
+    /* The CSS width is pinned inline to the full-res value (see the render effect) so the
+       drag proxy cannot move the layout; max-width scales it down to fit the stage and
+       height:auto keeps the height proportional. */
     .ie-holder canvas{display:block;max-width:100%;height:auto}
     .ie-overlay{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
     .ie-overlay.draw{cursor:crosshair}
@@ -212,6 +217,12 @@
 
     const WORKING_MAX = 4096;          // longest edge; larger uploads are downscaled
     const WARP_GRID = 20;              // subdivisions per axis for the bilinear warp
+    // While a corner is being dragged we redraw on every pointermove, so the full-res
+    // path (a 4096px image through 2*20*20 clipped drawImage calls) is far too slow on
+    // phone GPUs. During a drag we render a downscaled proxy through a coarser grid and
+    // only go back to full quality on pointerup.
+    const DRAG_MAX = 1100;             // longest edge of the proxy used while dragging
+    const DRAG_WARP_GRID = 7;          // warp subdivisions while dragging
     let OP_SEQ = 1;
     const uid = () => 'op' + (OP_SEQ++);
 
@@ -247,9 +258,10 @@
       lines.forEach((line, i) => ctx[method](line, op.x, op.y + i * lh));
     }
 
-    function applyOp(op, inC) {
+    function applyOp(op, inC, draft) {
       if (!op.enabled) return inC;
       const w = inC.width, h = inC.height;
+      const grid = draft ? DRAG_WARP_GRID : WARP_GRID;
       switch (op.type) {
         case 'rotate': {
           const q = (((op.quarter % 4) + 4) % 4);
@@ -284,7 +296,7 @@
         }
         case 'warp': {
           const out = newCanvas(w, h); const ctx = out.getContext('2d');
-          const N = WARP_GRID, c = op.corners;
+          const N = grid, c = op.corners;
           for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
             const u0 = i / N, u1 = (i + 1) / N, v0 = j / N, v1 = (j + 1) / N;
             const s00 = { x: u0 * w, y: v0 * h }, s10 = { x: u1 * w, y: v0 * h },
@@ -299,7 +311,7 @@
         case 'overlay': {
           const out = cloneCanvas(inC); const ctx = out.getContext('2d');
           const img = op.img; if (!img) return out;
-          const iw = img.width, ih = img.height, N = WARP_GRID, c = op.corners;
+          const iw = img.width, ih = img.height, N = grid, c = op.corners;
           // warp the overlay into a transparent temp canvas, then composite it once
           // with the chosen opacity (avoids seam artifacts at low opacity)
           const tmp = newCanvas(w, h); const tctx = tmp.getContext('2d');
@@ -363,11 +375,57 @@
       }
     }
 
-    /* fold ops over source -> array of intermediate canvases (states[i] = after op i) */
-    function computeStates(source, ops) {
+    /* fold ops over source -> array of intermediate canvases (states[i] = after op i)
+       `prefix` (optional) supplies already-computed states for ops[0..prefix.length-1];
+       during a drag only the selected op changes, so its inputs are recomputed once at
+       pointerdown instead of on every pointermove. `draft` selects the fast warp grid. */
+    function computeStates(source, ops, prefix, draft) {
       const states = []; let cur = source.canvas;
-      for (let i = 0; i < ops.length; i++) { cur = applyOp(ops[i], cur); states.push(cur); }
+      const reuse = prefix ? Math.min(prefix.length, ops.length) : 0;
+      for (let i = 0; i < reuse; i++) { cur = prefix[i]; states.push(cur); }
+      for (let i = reuse; i < ops.length; i++) { cur = applyOp(ops[i], cur, draft); states.push(cur); }
       return states;
+    }
+
+    /* Rescale every pixel-space parameter of an op list by q, so the stack can be run
+       against a downscaled proxy image and still land in the same relative places. */
+    function scaleOps(ops, q) {
+      if (q === 1) return ops;
+      return ops.map(op => {
+        const o = { ...op };
+        if (op.corners) o.corners = op.corners.map(p => ({ x: p.x * q, y: p.y * q }));
+        if (op.rect) o.rect = { x: op.rect.x * q, y: op.rect.y * q, w: op.rect.w * q, h: op.rect.h * q };
+        if (op.paths) o.paths = op.paths.map(p => p.map(pt => ({ x: pt.x * q, y: pt.y * q })));
+        if (op.type === 'resize') { o.w = op.w * q; o.h = op.h * q; }
+        if (op.type === 'text') {
+          o.x = op.x * q; o.y = op.y * q; o.size = op.size * q;
+          if (op.outline) o.outline = { ...op.outline, w: op.outline.w * q };
+          if (op.shadow) o.shadow = { ...op.shadow, blur: op.shadow.blur * q, dx: op.shadow.dx * q, dy: op.shadow.dy * q };
+        }
+        if (op.type === 'stroke') o.size = op.size * q;
+        if (op.type === 'pixelate') o.block = Math.max(2, op.block * q);
+        if (op.type === 'overlay' && op.img) {
+          // the overlay bitmap is warped cell by cell too, so shrink it as well; cache
+          // the proxy on the source op so a drag builds it once, not once per frame
+          const want = Math.max(1, Math.round(Math.max(op.img.width, op.img.height) * q));
+          if (!op._proxy || op._proxyFor !== want) {
+            op._proxy = proxyCanvas(op.img, want); op._proxyFor = want;
+          }
+          o.img = op._proxy;
+        }
+        return o;
+      });
+    }
+
+    /* downscale a canvas so its longest edge is at most `max` (returns src if already small) */
+    function proxyCanvas(src, max) {
+      const s = Math.min(1, max / Math.max(src.width, src.height));
+      if (s === 1) return src;
+      const out = newCanvas(Math.round(src.width * s), Math.round(src.height * s));
+      const ctx = out.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(src, 0, 0, out.width, out.height);
+      return out;
     }
 
     /* ---------- op factory / labels ---------- */
@@ -441,6 +499,23 @@
       const canvasRef = useRef(null);
       const svgRef = useRef(null);
       const dragRef = useRef(null);
+      const proxyRef = useRef(null);      // cached downscaled source used during drags
+      // Sliders fire far faster than a full-quality warp can render but are not pointer
+      // drags, so they mark a short "busy" window that puts the renderer on the fast path
+      // and schedules one final full-quality pass once the input goes quiet.
+      const busyRef = useRef({ until: 0, timer: 0, prefix: null });
+      const [drawTick, forceDraw] = useState(0);
+      const markBusy = useCallback(() => {
+        const b = busyRef.current;
+        if (!b.until) b.prefix = null;    // first tick of a burst: drop the stale cache
+        b.until = performance.now() + 180;
+        clearTimeout(b.timer);
+        b.timer = setTimeout(() => {
+          b.until = 0; b.prefix = null;
+          forceDraw(n => n + 1);          // repaint at full quality
+        }, 200);
+      }, []);
+      useEffect(() => () => clearTimeout(busyRef.current.timer), []);
 
       const effOps = liveOps || ops;
       const selIndex = selId ? effOps.findIndex(o => o.id === selId) : -1;
@@ -546,30 +621,61 @@
       const ovBox = (selOp && HANDLE_OPS[selOp.type] && inDims)
         ? (warpVp || { x: 0, y: 0, w: inDims.w, h: inDims.h }) : null;
 
-      /* ---- render to the display canvas (throttled to one draw per frame) ---- */
+      /* ---- render to the display canvas (throttled to one draw per frame) ----
+         While dragging we cut the work three ways: the ops before the selected one come
+         from a cache built at pointerdown, the selected op runs against a downscaled
+         proxy of its input through a coarse warp grid, and the display canvas is sized
+         to the proxy (CSS scales it up). pointerup re-runs this at full quality. */
       useEffect(() => {
         if (!source || !canvasRef.current) return;
         cancelAnimationFrame(rafRef.current);
         rafRef.current = requestAnimationFrame(() => {
-          const states = computeStates(source, effOps);
+          const sess = dragRef.current;
+          // fast path while a handle is dragged OR a slider is being scrubbed
+          const busy = performance.now() < busyRef.current.until;
+          const draft = !!(sess && sess.mode) || busy;
+          const src = draft ? ((sess && sess.proxySource) || dragProxy()) : source;
+          // derive the scale from the proxy actually in use, so the op coordinates and
+          // the image they are drawn onto can never disagree by a rounding step
+          const q = draft ? src.w / source.w : 1;
+          const opsForRender = draft ? scaleOps(effOps, q) : effOps;
+          // the prefix cache lives on the drag session when there is one, otherwise on the
+          // busy window, so slider scrubbing reuses the ops before the selected one too
+          const cache = sess || busyRef.current;
+          const states = computeStates(src, opsForRender, draft ? cache.prefix : null, draft);
+          if (draft && !cache.prefix && selIndex > 0) cache.prefix = states.slice(0, selIndex);
           let display;
           if (selIndex >= 0) {
-            const op = effOps[selIndex];
-            const input = selIndex > 0 ? states[selIndex - 1] : source.canvas;
+            const op = opsForRender[selIndex];
+            const input = selIndex > 0 ? states[selIndex - 1] : src.canvas;
             display = op.type === 'crop' ? input : states[selIndex];
           } else {
-            display = states.length ? states[states.length - 1] : source.canvas;
+            display = states.length ? states[states.length - 1] : src.canvas;
           }
           const cv = canvasRef.current; if (!cv) return;
           const vp = warpVp;
-          const w = vp ? vp.w : display.width, h = vp ? vp.h : display.height;
-          cv.width = w; cv.height = h;
+          // full-res layout size (what the user sees) vs backing-store size (what we paint)
+          const cssW = Math.max(1, Math.round(vp ? vp.w : display.width / q));
+          const cssH = Math.max(1, Math.round(vp ? vp.h : display.height / q));
+          const w = Math.max(1, Math.round(cssW * q)), h = Math.max(1, Math.round(cssH * q));
+          // reassigning width/height reallocates the backing buffer, so only do it on change
+          if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+          // The backing store changes size when the drag proxy swaps in, which would move
+          // the layout, so the CSS width is pinned to the full-res value and height:auto
+          // derives the height from the buffer's ratio. Deriving that width from the
+          // buffer (rather than from cssW) keeps the displayed and buffer ratios exactly
+          // equal: w and h are rounded independently, so cssW/cssH can differ from w/h by
+          // a fraction, and the holder would show a sliver of checkerboard at the edge.
+          // (Do not set aspect-ratio here: it resolves against the unscaled width and
+          // fights max-width:100%.)
+          cv.style.width = (cv.width / q) + 'px';
           const ctx = cv.getContext('2d');
           ctx.clearRect(0, 0, w, h);
-          ctx.drawImage(display, vp ? -vp.x : 0, vp ? -vp.y : 0);
+          ctx.drawImage(display, vp ? -Math.round(vp.x * q) : 0, vp ? -Math.round(vp.y * q) : 0);
+          if (sess) sess.pending = false;   // this move is on screen; accept the next one
         });
         return () => cancelAnimationFrame(rafRef.current);
-      }, [source, effOps, selIndex, warpVp ? warpVp.x : 0, warpVp ? warpVp.y : 0, warpVp ? warpVp.w : 0, warpVp ? warpVp.h : 0]);
+      }, [source, effOps, selIndex, drawTick, warpVp ? warpVp.x : 0, warpVp ? warpVp.y : 0, warpVp ? warpVp.w : 0, warpVp ? warpVp.h : 0]);
 
       /* ---- add / mutate ops ---- */
       function addOp(type) {
@@ -651,36 +757,54 @@
         commit(ops.map(o => o.id === selId ? draftOp : o), selId);
       }
 
+      // proxy of the source image reused for the whole drag; rebuilt when the image changes
+      function dragProxy() {
+        const q = Math.min(1, DRAG_MAX / Math.max(source.w, source.h));
+        if (q === 1) return source;
+        const cache = proxyRef.current;
+        if (cache && cache.for === source.canvas) return cache.proxy;
+        const cv = proxyCanvas(source.canvas, Math.round(Math.max(source.w, source.h) * q));
+        const proxy = { canvas: cv, w: cv.width, h: cv.height, name: source.name };
+        proxyRef.current = { for: source.canvas, proxy };
+        return proxy;
+      }
+
       function onDown(e) {
         if (!selOp) return;
         e.target.setPointerCapture && e.target.setPointerCapture(e.pointerId);
         const p = evtPoint(e);
         const hr = 10 / p.scale; // hit radius in input px
         const draft = beginDraft();
+        // every branch below stores its session through this, so the proxy and the
+        // (initially empty) prefix cache are attached no matter which mode is picked
+        const sess = s => { dragRef.current = s && { ...s, proxySource: dragProxy(), prefix: null }; };
         if (WARP_OPS[selOp.type]) {
           let idx = -1, best = hr;
           draft.corners.forEach((c, i) => { const dd = Math.hypot(c.x - p.x, c.y - p.y); if (dd < best) { best = dd; idx = i; } });
-          if (idx >= 0) dragRef.current = { draft, mode: 'corner', idx };
-          else if (pointInPoly(p, draft.corners)) dragRef.current = { draft, mode: 'moveQuad', start: { x: p.x, y: p.y }, orig: draft.corners.map(c => ({ ...c })) };
-          else dragRef.current = null;
+          if (idx >= 0) sess({ draft, mode: 'corner', idx });
+          else if (pointInPoly(p, draft.corners)) sess({ draft, mode: 'moveQuad', start: { x: p.x, y: p.y }, orig: draft.corners.map(c => ({ ...c })) });
+          else sess(null);
         } else if (selOp.type === 'text') {
-          dragRef.current = { draft, mode: 'move', off: { x: p.x - draft.x, y: p.y - draft.y } };
+          sess({ draft, mode: 'move', off: { x: p.x - draft.x, y: p.y - draft.y } });
         } else if (selOp.type === 'stroke') {
           draft.paths = draft.paths.concat([[{ x: p.x, y: p.y }]]);
-          dragRef.current = { draft, mode: 'draw' };
+          sess({ draft, mode: 'draw' });
           setLive(draft);
         } else if (selOp.type === 'crop' || selOp.type === 'pixelate') {
           const r = draft.rect;
           const corners = [{ x: r.x, y: r.y, cx: 1, cy: 1 }, { x: r.x + r.w, y: r.y, cx: -1, cy: 1 }, { x: r.x + r.w, y: r.y + r.h, cx: -1, cy: -1 }, { x: r.x, y: r.y + r.h, cx: 1, cy: -1 }];
           let hit = null, best = hr;
           corners.forEach(c => { const dd = Math.hypot(c.x - p.x, c.y - p.y); if (dd < best) { best = dd; hit = c; } });
-          if (hit) dragRef.current = { draft, mode: 'resizeRect', anchor: { x: hit.cx > 0 ? r.x + r.w : r.x, y: hit.cy > 0 ? r.y + r.h : r.y } };
-          else if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) dragRef.current = { draft, mode: 'moveRect', off: { x: p.x - r.x, y: p.y - r.y } };
-          else dragRef.current = null;
+          if (hit) sess({ draft, mode: 'resizeRect', anchor: { x: hit.cx > 0 ? r.x + r.w : r.x, y: hit.cy > 0 ? r.y + r.h : r.y } });
+          else if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) sess({ draft, mode: 'moveRect', off: { x: p.x - r.x, y: p.y - r.y } });
+          else sess(null);
         }
       }
       function onMove(e) {
         const dr = dragRef.current; if (!dr || !dr.mode) return;
+        // touchscreens sample faster than they paint; skip a move if the previous one has
+        // not been drawn yet, otherwise React reconciles several times per frame for nothing
+        if (dr.pending && dr.mode !== 'draw') return;
         const p = evtPoint(e); const d = dr.draft;
         if (dr.mode === 'corner') { d.corners[dr.idx] = { x: p.x, y: p.y }; }
         else if (dr.mode === 'moveQuad') {
@@ -697,6 +821,7 @@
           d.rect.x = Math.min(dr.anchor.x, x0); d.rect.y = Math.min(dr.anchor.y, y0);
           d.rect.w = Math.max(4, Math.abs(dr.anchor.x - x0)); d.rect.h = Math.max(4, Math.abs(dr.anchor.y - y0));
         }
+        dr.pending = true;
         setLive(d);
       }
       function onUp() {
@@ -837,8 +962,9 @@
                 ))}
               </ul>
 
-              {selOp && <OpControls op={selOp} inDims={inDims} onChange={patch => updateOp(selOp.id, patch)}
-                warpMargin={warpMargin} onMargin={setWarpMargin} />}
+              {selOp && <OpControls op={selOp} inDims={inDims}
+                onChange={patch => { markBusy(); updateOp(selOp.id, patch); }}
+                warpMargin={warpMargin} onMargin={v => { markBusy(); setWarpMargin(v); }} />}
 
               <h3>Export</h3>
               <div className="ie-export">

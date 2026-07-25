@@ -1,0 +1,975 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Color Extractor – Dominant Colors from an Image – Alexander Alber</title>
+  <meta name="description" content="Drop an image and read off its dominant colors: k-means clustering in OKLab, exact or averaged representatives, real pixel shares. Runs entirely in your browser, nothing is uploaded.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/color-extractor.html">
+  <meta property="og:title" content="Color Extractor – dominant colors from an image">
+  <meta property="og:description" content="Drop an image and read off its dominant colors: k-means in OKLab, exact or averaged representatives, real pixel shares. Runs entirely in your browser.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/color-extractor.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+
+  <style>
+    /* Scoped class names (cx-*), never ids: this page carries site chrome and
+       the prototype's #drop/#list selectors would be a collision risk. */
+    .cx-wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1.5rem;align-items:start}
+    @media (max-width:820px){.cx-wrap{grid-template-columns:1fr}}
+
+    /* role="button" is needed for keyboard users, but Pico paints anything with
+       that role as a filled primary button. Reset its variables, do not drop the role. */
+    .cx-drop{position:relative;border:2px dashed var(--pico-muted-border-color);border-radius:var(--pico-border-radius);
+      min-height:260px;display:grid;place-items:center;padding:2.5rem 1rem;text-align:center;cursor:pointer;
+      background:transparent;color:var(--pico-color);font-weight:inherit;font-size:inherit;line-height:inherit;
+      transition:border-color .15s,background .15s}
+    .cx-drop:hover,.cx-drop.drag{border-color:var(--pico-primary);background:var(--pico-card-background-color)}
+    .cx-drop p{margin:0}
+    .cx-hint{color:var(--pico-muted-color);font-size:.85em;margin-top:.4rem}
+    .cx-hint kbd{font-size:.8em;padding:.05em .35em}
+    /* With an image loaded the box turns into a plain frame with a checkerboard,
+       so transparent PNGs do not read as a white area. */
+    .cx-drop.has-image{padding:.4rem;border-style:solid;min-height:0;display:block;
+      background-image:linear-gradient(45deg,#2a2f3a 25%,transparent 25%),linear-gradient(-45deg,#2a2f3a 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#2a2f3a 75%),linear-gradient(-45deg,transparent 75%,#2a2f3a 75%);
+      background-size:20px 20px;background-position:0 0,0 10px,10px -10px,-10px 0px;background-color:#20242c}
+    /* The preview is a canvas drawn from the decoded ImageBitmap, not <img src=objectURL>:
+       what you see is guaranteed to be what was analysed, and no object URL to clean up. */
+    .cx-drop canvas{display:block;width:100%;height:auto;max-height:58vh;object-fit:contain;margin:0 auto}
+    .cx-drop input[type=file]{display:none}
+
+    .cx-viewbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem}
+    .cx-dl{width:auto;margin:0 0 0 auto;font-size:.78rem;padding:.25rem .55rem;
+      background:var(--pico-card-background-color);border-color:var(--pico-muted-border-color);color:var(--pico-color)}
+    .cx-dl:hover{border-color:var(--pico-primary)}
+
+    .cx-controls{display:flex;gap:.9rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem}
+    .cx-field label{font-size:.72rem;color:var(--pico-muted-color);display:block;margin-bottom:.25rem;
+      letter-spacing:.06em;text-transform:uppercase}
+    .cx-field select{margin-bottom:0;padding:.3rem .5rem;font-size:.85rem;height:auto;width:auto}
+    .cx-seg{display:flex;gap:0}
+    .cx-seg .lang-seg{white-space:nowrap}
+
+    /* Proportional band: real cluster shares, not decoration. */
+    .cx-band{display:flex;height:46px;width:100%;border-radius:var(--pico-border-radius);overflow:hidden;margin-bottom:1rem}
+    .cx-band span{height:100%;min-width:2px}
+
+    .cx-list{list-style:none;margin:0;padding:0;border:1px solid var(--pico-muted-border-color);
+      border-radius:var(--pico-border-radius);overflow:hidden}
+    .cx-list li+li{border-top:1px solid var(--pico-muted-border-color)}
+    .cx-row{display:flex;align-items:center;gap:.8rem;width:100%;margin:0;padding:.6rem .7rem;
+      background:none;border:0;border-radius:0;text-align:left;color:var(--pico-color);font-size:.9rem}
+    .cx-row:hover{background:var(--pico-card-background-color)}
+    .cx-chip{width:28px;height:28px;border-radius:50%;flex:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}
+    .cx-hex{font-family:var(--pico-font-family-monospace);letter-spacing:.02em}
+    .cx-share{margin-left:auto;font-family:var(--pico-font-family-monospace);font-size:.82em;color:var(--pico-muted-color)}
+    .cx-row:hover .cx-share::after{content:" · copy"}
+    .cx-row.copied .cx-share::after{content:" · copied"}
+
+    .cx-empty{color:var(--pico-muted-color);font-size:.85em;padding:.9rem .7rem;margin:0}
+    .cx-note{color:#64748b;font-size:11px;margin-top:1rem}
+    .cx-err{color:#f0a0a0;font-size:.85em;margin:.6rem 0 0}
+    .cx-export{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.8rem}
+    .cx-export button{width:auto;margin:0;font-size:.8rem;padding:.3rem .6rem;
+      background:var(--pico-card-background-color);border-color:var(--pico-muted-border-color);color:var(--pico-color)}
+    .cx-export button:hover{border-color:var(--pico-primary)}
+  </style>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Color Extractor",
+    "description": "Extract the dominant colors of an image: k-means clustering in the perceptually uniform OKLab space, exact or averaged cluster representatives, and the real pixel share per color. Runs entirely in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/color-extractor.html",
+    "applicationCategory": "MultimediaApplication",
+    "inLanguage": "en",
+    "author": {
+      "@type": "Person",
+      "@id": "https://alber.me/alexander/#person",
+      "name": "Alexander Alber",
+      "url": "https://alber.me/alexander/"
+    },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">← Miscellaneous</a>
+    </p>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Color Extractor</h1>
+        <p style="color:#94a3b8;max-width:70ch">Drop an image and read off the colors it is actually made of. The pixels are clustered in OKLab, a perceptually uniform color space, so the result matches what your eye groups together &ndash; and every color comes with the share of the image it covers. Everything runs in your browser; your image never leaves your device.</p>
+      </div>
+    </div>
+  </main>
+
+  <script id="colorcore">
+  /* COLOR-CORE-START -- pure pipeline, no DOM except one canvas read; also runnable
+     under Node for tests (samplePixels takes an ImageData-like {data,width,height}). */
+  var ColorCore = (function () {
+    'use strict';
+
+    /* ---------- tunables -------------------------------------------------- */
+    var MAX_PX = 60000;           // ~245x245; enough for stable clusters, 50x cheaper than full res
+    var AUTO_K = 12;              // starting k in auto mode, reduced by refine()
+    var MERGE_THRESHOLD = 0.12;   // OKLab distance below which two clusters are the same color
+    var MIN_SHARE = 0.02;         // pixel share below which a cluster is not a palette color
+    var KMEANS_ITERS = 24;
+
+    /* ---------- sRGB <-> OKLab (Ottosson 2020) ---------------------------- */
+    /* Euclidean distance in sRGB is perceptually useless: green dominates the
+       metric and dark tones collapse into each other. OKLab is closed-form,
+       ~15 flops per pixel, and roughly perceptually uniform. The matrices are
+       exact - do not retype them from memory. */
+    var SRGB_LIN = new Float32Array(256);
+    for (var i = 0; i < 256; i++) {
+      var c = i / 255;
+      SRGB_LIN[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    function rgbToOklab(r, g, b, out, o) {
+      var R = SRGB_LIN[r], G = SRGB_LIN[g], B = SRGB_LIN[b];
+      var l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+      var m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+      var s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+      out[o]     = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+      out[o + 1] = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+      out[o + 2] = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+    }
+
+    /* Clamping is required, not optional: the sRGB gamut is not convex in OKLab,
+       so a centroid of valid colors can land just outside it. */
+    function oklabToRgb(L, a, b) {
+      var l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+      var m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+      var s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+      var l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+      var lin = [
+         4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+      ];
+      return lin.map(function (v) {
+        var g = v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(Math.max(v, 0), 1 / 2.4) - 0.055;
+        return Math.min(255, Math.max(0, Math.round(g * 255)));
+      });
+    }
+
+    function hex(r, g, b) {
+      return '#' + [r, g, b].map(function (v) {
+        return Math.round(v).toString(16).padStart(2, '0');
+      }).join('');
+    }
+
+    /* ---------- seeded PRNG ----------------------------------------------- */
+    /* k-means++ picks its seeds at random. With Math.random two runs on the same
+       image give slightly different hex values and orderings, which reads as a
+       bug in a public tool. mulberry32 seeded from the image makes it repeatable. */
+    function mulberry32(seed) {
+      var a = seed >>> 0;
+      return function () {
+        a = (a + 0x6D2B79F5) >>> 0;
+        var t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /* ---------- sampling --------------------------------------------------- */
+    function scaleFor(w, h) {
+      return Math.min(1, Math.sqrt(MAX_PX / (w * h)));
+    }
+
+    /* img: {data: Uint8ClampedArray RGBA, width, height} - an ImageData or any
+       stand-in. Pixels with alpha < 128 are dropped: a transparent logo would
+       otherwise be reported as mostly "the color of nothing". */
+    function samplePixels(img) {
+      var n = img.width * img.height;
+      var data = img.data;
+      var lab = new Float32Array(n * 3);
+      var rgb = new Uint8Array(n * 3);
+      var k = 0;
+      for (var i = 0; i < n; i++) {
+        var p = i * 4;
+        if (data[p + 3] < 128) continue;
+        var r = data[p], g = data[p + 1], b = data[p + 2];
+        rgb[k * 3] = r; rgb[k * 3 + 1] = g; rgb[k * 3 + 2] = b;
+        rgbToOklab(r, g, b, lab, k * 3);
+        k++;
+      }
+      return { lab: lab.subarray(0, k * 3), rgb: rgb.subarray(0, k * 3), count: k };
+    }
+
+    /* ---------- k-means, k-means++ init. O(n*k*i) -------------------------- */
+    function kmeans(lab, n, k, rnd, iters) {
+      iters = iters == null ? KMEANS_ITERS : iters;
+      var cent = new Float32Array(k * 3);
+      var d2 = new Float32Array(n);
+
+      var first = Math.min(n - 1, (rnd() * n) | 0);
+      cent[0] = lab[first * 3]; cent[1] = lab[first * 3 + 1]; cent[2] = lab[first * 3 + 2];
+      d2.fill(Infinity);
+
+      for (var c = 1; c < k; c++) {
+        var sum = 0;
+        for (var i = 0; i < n; i++) {
+          var dl = lab[i * 3] - cent[(c - 1) * 3];
+          var da = lab[i * 3 + 1] - cent[(c - 1) * 3 + 1];
+          var db = lab[i * 3 + 2] - cent[(c - 1) * 3 + 2];
+          var d = dl * dl + da * da + db * db;
+          if (d < d2[i]) d2[i] = d;
+          sum += d2[i];
+        }
+        var target = rnd() * sum, pick = n - 1;
+        for (var j = 0, acc = 0; j < n; j++) {
+          acc += d2[j];
+          if (acc >= target) { pick = j; break; }
+        }
+        cent[c * 3] = lab[pick * 3]; cent[c * 3 + 1] = lab[pick * 3 + 1]; cent[c * 3 + 2] = lab[pick * 3 + 2];
+      }
+
+      var assign = new Int32Array(n);
+      var sums = new Float64Array(k * 3), counts = new Int32Array(k);
+
+      for (var it = 0; it < iters; it++) {
+        var moved = 0;
+        sums.fill(0); counts.fill(0);
+        for (var q = 0; q < n; q++) {
+          var best = 0, bd = Infinity;
+          for (var cc = 0; cc < k; cc++) {
+            var el = lab[q * 3] - cent[cc * 3];
+            var ea = lab[q * 3 + 1] - cent[cc * 3 + 1];
+            var eb = lab[q * 3 + 2] - cent[cc * 3 + 2];
+            var e = el * el + ea * ea + eb * eb;
+            if (e < bd) { bd = e; best = cc; }
+          }
+          if (assign[q] !== best) { assign[q] = best; moved++; }
+          sums[best * 3] += lab[q * 3];
+          sums[best * 3 + 1] += lab[q * 3 + 1];
+          sums[best * 3 + 2] += lab[q * 3 + 2];
+          counts[best]++;
+        }
+        for (var z = 0; z < k; z++) {
+          if (!counts[z]) continue;
+          cent[z * 3] = sums[z * 3] / counts[z];
+          cent[z * 3 + 1] = sums[z * 3 + 1] / counts[z];
+          cent[z * 3 + 2] = sums[z * 3 + 2] / counts[z];
+        }
+        if (moved === 0) break;
+      }
+      return { assign: assign, cent: cent, counts: counts };
+    }
+
+    /* ---------- cluster -> representative ---------------------------------- */
+    /* Two legitimate answers, see MODE below. The histogram over 5-bit-per-channel
+       bins folds JPEG noise together; the winning bin reports the exact mean of
+       the real pixels inside it. */
+    function buildClusters(rgb, n, k, assign, cent, counts) {
+      var bins = [];
+      for (var b0 = 0; b0 < k; b0++) bins.push(new Map());
+      for (var i = 0; i < n; i++) {
+        var c = assign[i];
+        var r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+        var key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        var e = bins[c].get(key);
+        if (!e) { e = { n: 0, r: 0, g: 0, b: 0 }; bins[c].set(key, e); }
+        e.n++; e.r += r; e.g += g; e.b += b;
+      }
+      var out = [];
+      for (var z = 0; z < k; z++) {
+        if (!counts[z]) continue;
+        out.push({
+          lab: [cent[z * 3], cent[z * 3 + 1], cent[z * 3 + 2]],
+          count: counts[z],
+          bins: bins[z]
+        });
+      }
+      return out;
+    }
+
+    function representative(bins) {
+      var best = null;
+      bins.forEach(function (e) { if (!best || e.n > best.n) best = e; });
+      return [best.r / best.n, best.g / best.n, best.b / best.n];
+    }
+
+    function labDist(a, b) {
+      var dl = a.lab[0] - b.lab[0], da = a.lab[1] - b.lab[1], db = a.lab[2] - b.lab[2];
+      return Math.sqrt(dl * dl + da * da + db * db);
+    }
+
+    /* B is absorbed into A. Bins are added up, so A's representative (its most
+       frequent bin) survives as long as A is the heavier cluster. */
+    function absorb(cs, keepIdx, dropIdx) {
+      var A = cs[keepIdx], B = cs[dropIdx], t = A.count + B.count;
+      B.bins.forEach(function (e, key) {
+        var x = A.bins.get(key);
+        if (x) { x.n += e.n; x.r += e.r; x.g += e.g; x.b += e.b; }
+        else A.bins.set(key, e);
+      });
+      A.lab = A.lab.map(function (v, i) { return (v * A.count + B.lab[i] * B.count) / t; });
+      A.count = t;
+      cs.splice(dropIdx, 1);
+    }
+
+    /* Auto mode, two independent criteria alternating to a fixed point:
+       (1) similarity - centroids closer than thr are the same color.
+       (2) salience - clusters below minShare are not a palette color and get
+           swallowed by their perceptually nearest neighbour. Absorbed, not
+           deleted, so the percentages still add up to 100.
+       Similarity alone is not enough: white, red, yellow, pink and black all sit
+       far apart, nothing merges, and you get eight "dominant" colors of which
+       five are below 1 %. */
+    function refine(clusters, total, thr, minShare) {
+      var cs = clusters.slice();
+      for (;;) {
+        var bi = -1, bj = -1, bd = thr;
+        for (var i = 0; i < cs.length; i++) {
+          for (var j = i + 1; j < cs.length; j++) {
+            var d = labDist(cs[i], cs[j]);
+            if (d < bd) { bd = d; bi = i; bj = j; }
+          }
+        }
+        if (bi >= 0) {
+          // the heavier cluster survives and determines the hex value
+          if (cs[bi].count >= cs[bj].count) absorb(cs, bi, bj);
+          else absorb(cs, bj, bi);
+          continue;
+        }
+
+        if (cs.length > 1) {
+          var weak = -1, weakest = minShare;
+          for (var w = 0; w < cs.length; w++) {
+            var s = cs[w].count / total;
+            if (s < weakest) { weakest = s; weak = w; }
+          }
+          if (weak >= 0) {
+            /* Prefer a neighbour that is itself still below minShare. A color can
+               arrive split across two clusters that are each too small - two halves
+               of the same yellow, say. Handing each half to whatever large cluster
+               happens to be nearest destroys the color twice over, and can even
+               rename the absorber, because the merged histogram changes which bin
+               wins. Letting the siblings coalesce first gives them one shared
+               chance to clear the threshold on their own. */
+            var near = -1, nd = Infinity, nearWeak = -1, ndWeak = Infinity;
+            for (var q = 0; q < cs.length; q++) {
+              if (q === weak) continue;
+              var dq = labDist(cs[weak], cs[q]);
+              if (dq < nd) { nd = dq; near = q; }
+              if (cs[q].count / total < minShare && dq < ndWeak) { ndWeak = dq; nearWeak = q; }
+            }
+            var target = nearWeak >= 0 ? nearWeak : near;
+            // the heavier of the two survives, so the hex value follows the mass
+            if (cs[target].count >= cs[weak].count) absorb(cs, target, weak);
+            else absorb(cs, weak, target);
+            continue;
+          }
+        }
+        return cs;
+      }
+    }
+
+    /* After refine(), a cluster's centroid is a weighted average of the centroids
+       it absorbed, while its displayed color comes from the winning histogram bin.
+       Those two can drift apart far enough that a swatch sits closer to a
+       neighbour's centroid than to its own - the palette then labels two adjacent
+       colors the wrong way round. Fixing it at the source: take the final colors
+       as the answer, assign every pixel to the nearest one, and recompute the
+       shares from that. One extra pass over the sample, and afterwards the
+       percentages describe exactly the colors on screen. */
+    function reconcile(lab, rgb, n, clusters) {
+      var k = clusters.length;
+      if (k < 2) return clusters;
+      var reps = clusters.map(function (c) { return representative(c.bins); });
+      var plab = new Float32Array(k * 3);
+      for (var i = 0; i < k; i++) {
+        rgbToOklab(Math.round(reps[i][0]), Math.round(reps[i][1]), Math.round(reps[i][2]), plab, i * 3);
+      }
+      var bins = [], counts = new Int32Array(k);
+      for (var b0 = 0; b0 < k; b0++) bins.push(new Map());
+      for (var p = 0; p < n; p++) {
+        var c = nearestIndex(lab[p * 3], lab[p * 3 + 1], lab[p * 3 + 2], plab, k);
+        counts[c]++;
+        var r = rgb[p * 3], g = rgb[p * 3 + 1], b = rgb[p * 3 + 2];
+        var key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        var e = bins[c].get(key);
+        if (!e) { e = { n: 0, r: 0, g: 0, b: 0 }; bins[c].set(key, e); }
+        e.n++; e.r += r; e.g += g; e.b += b;
+      }
+      var out = [];
+      for (var z = 0; z < k; z++) {
+        if (!counts[z]) continue;   // a color nothing is nearest to has no share
+        out.push({ lab: [plab[z * 3], plab[z * 3 + 1], plab[z * 3 + 2]], count: counts[z], bins: bins[z] });
+      }
+      return out;
+    }
+
+    /* How concentrated is the image histogram? If the 8 most frequent 5-bit bins
+       cover most of the pixels it is almost certainly flat artwork rather than a
+       photograph. Used only to suggest a mode, never to override the choice. */
+    function flatness(rgb, n) {
+      if (!n) return 0;
+      var counts = new Map();
+      for (var i = 0; i < n; i++) {
+        var key = ((rgb[i * 3] >> 3) << 10) | ((rgb[i * 3 + 1] >> 3) << 5) | (rgb[i * 3 + 2] >> 3);
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      var top = [];
+      counts.forEach(function (v) { top.push(v); });
+      top.sort(function (a, b) { return b - a; });
+      var sum = 0;
+      for (var t = 0; t < Math.min(8, top.length); t++) sum += top[t];
+      return sum / n;
+    }
+
+    /* ---------- pipeline --------------------------------------------------- */
+    /* opts: {k: "auto" | 2..8, mode: "exact" | "average", seed, minShare}
+       Returns {palette, n, ms, flatness, clusters}. `clusters` keeps the per-pixel
+       assignment around: a vectorizer would otherwise re-guess the same palette. */
+    function extract(img, opts) {
+      opts = opts || {};
+      var t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      var mode = opts.mode === 'average' ? 'average' : 'exact';
+      var minShare = opts.minShare == null ? MIN_SHARE : opts.minShare;
+      var sampled = samplePixels(img);
+      var lab = sampled.lab, rgb = sampled.rgb, n = sampled.count;
+      if (!n) return { palette: [], n: 0, ms: 0, flatness: 0, clusters: [], assign: null };
+
+      // seed from the image dimensions: same picture -> same palette, every time
+      var seed = opts.seed == null ? (img.width * 73856093) ^ (img.height * 19349663) ^ n : opts.seed;
+      var rnd = mulberry32(seed);
+
+      var kSetting = opts.k == null ? 'auto' : opts.k;
+      var kRun = Math.min(kSetting === 'auto' ? AUTO_K : +kSetting, n);
+      var km = kmeans(lab, n, kRun, rnd);
+      var clusters = buildClusters(rgb, n, kRun, km.assign, km.cent, km.counts);
+      if (kSetting === 'auto') {
+        clusters = refine(clusters, n, MERGE_THRESHOLD, minShare);
+        clusters = reconcile(lab, rgb, n, clusters);
+      }
+
+      clusters.sort(function (a, b) { return b.count - a.count; });
+      var palette = clusters.map(function (c) {
+        var col = mode === 'average'
+          ? oklabToRgb(c.lab[0], c.lab[1], c.lab[2])
+          : representative(c.bins);
+        return { hex: hex(col[0], col[1], col[2]), share: c.count / n, lab: c.lab.slice() };
+      });
+      return {
+        palette: palette,
+        n: n,
+        ms: (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0,
+        flatness: flatness(rgb, n),
+        clusters: clusters,
+        assign: km.assign
+      };
+    }
+
+    /* ---------- quantization ----------------------------------------------- */
+    /* Map every pixel to its nearest palette entry. Done in OKLab, like the
+       clustering itself: nearest-in-sRGB would pick visibly wrong entries in
+       exactly the cases the OKLab clustering was chosen to get right.
+       Not reusing the `assign` array on purpose - that one refers to the
+       downsampled, alpha-filtered sample, so it cannot address a full-size image. */
+    function paletteLab(palette) {
+      var out = new Float32Array(palette.length * 3);
+      for (var i = 0; i < palette.length; i++) {
+        var h = palette[i].hex;
+        rgbToOklab(
+          parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16),
+          out, i * 3
+        );
+      }
+      return out;
+    }
+
+    function paletteRgb(palette) {
+      return palette.map(function (p) {
+        return [parseInt(p.hex.slice(1, 3), 16), parseInt(p.hex.slice(3, 5), 16), parseInt(p.hex.slice(5, 7), 16)];
+      });
+    }
+
+    function nearestIndex(L, a, b, plab, k) {
+      var best = 0, bd = Infinity;
+      for (var i = 0; i < k; i++) {
+        var dl = L - plab[i * 3], da = a - plab[i * 3 + 1], db = b - plab[i * 3 + 2];
+        var d = dl * dl + da * da + db * db;
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+
+    /* Rewrites img.data in place. dither: false = hard edges (honest about how
+       coarse the palette is), true = Floyd-Steinberg (prettier on photos).
+       Alpha is preserved untouched; fully transparent pixels are left alone so
+       a transparent PNG does not gain a colored fringe. */
+    function quantize(img, palette, dither) {
+      var k = palette.length;
+      if (!k) return img;
+      var plab = paletteLab(palette), prgb = paletteRgb(palette);
+      var data = img.data, w = img.width, h = img.height;
+      var lab = new Float32Array(3);
+
+      if (!dither) {
+        for (var p = 0; p < data.length; p += 4) {
+          if (data[p + 3] === 0) continue;
+          rgbToOklab(data[p], data[p + 1], data[p + 2], lab, 0);
+          var c = prgb[nearestIndex(lab[0], lab[1], lab[2], plab, k)];
+          data[p] = c[0]; data[p + 1] = c[1]; data[p + 2] = c[2];
+        }
+        return img;
+      }
+
+      /* Floyd-Steinberg. The error is carried in sRGB, not OKLab: the diffusion
+         weights assume a linear-ish additive error, and accumulating in OKLab
+         drifts out of gamut. Errors live in a float buffer so they do not get
+         clipped to bytes between pixels. */
+      var err = new Float32Array(w * h * 3);
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var idx = (y * w + x), q = idx * 4, e = idx * 3;
+          if (data[q + 3] === 0) continue;
+          var r = Math.min(255, Math.max(0, data[q] + err[e]));
+          var g = Math.min(255, Math.max(0, data[q + 1] + err[e + 1]));
+          var b = Math.min(255, Math.max(0, data[q + 2] + err[e + 2]));
+          rgbToOklab(Math.round(r), Math.round(g), Math.round(b), lab, 0);
+          var col = prgb[nearestIndex(lab[0], lab[1], lab[2], plab, k)];
+          data[q] = col[0]; data[q + 1] = col[1]; data[q + 2] = col[2];
+          var er = r - col[0], eg = g - col[1], eb = b - col[2];
+          // 7/16 right, 3/16 below-left, 5/16 below, 1/16 below-right
+          spread(err, w, h, x + 1, y,     er, eg, eb, 7 / 16);
+          spread(err, w, h, x - 1, y + 1, er, eg, eb, 3 / 16);
+          spread(err, w, h, x,     y + 1, er, eg, eb, 5 / 16);
+          spread(err, w, h, x + 1, y + 1, er, eg, eb, 1 / 16);
+        }
+      }
+      return img;
+    }
+
+    function spread(err, w, h, x, y, er, eg, eb, f) {
+      if (x < 0 || x >= w || y < 0 || y >= h) return;
+      var e = (y * w + x) * 3;
+      err[e] += er * f; err[e + 1] += eg * f; err[e + 2] += eb * f;
+    }
+
+    /* ---------- export formats --------------------------------------------- */
+    function toCss(palette) {
+      return palette.map(function (c, i) {
+        return '  --color-' + (i + 1) + ': ' + c.hex + '; /* ' + (c.share * 100).toFixed(1) + '% */';
+      }).join('\n');
+    }
+
+    function toJson(palette) {
+      return JSON.stringify(palette.map(function (c) {
+        return { hex: c.hex, share: +c.share.toFixed(4) };
+      }), null, 2);
+    }
+
+    return {
+      MAX_PX: MAX_PX, AUTO_K: AUTO_K, MERGE_THRESHOLD: MERGE_THRESHOLD, MIN_SHARE: MIN_SHARE,
+      rgbToOklab: rgbToOklab, oklabToRgb: oklabToRgb, hex: hex, mulberry32: mulberry32,
+      scaleFor: scaleFor, samplePixels: samplePixels, kmeans: kmeans,
+      buildClusters: buildClusters, representative: representative, labDist: labDist,
+      refine: refine, reconcile: reconcile, flatness: flatness, extract: extract,
+      toCss: toCss, toJson: toJson,
+      paletteLab: paletteLab, paletteRgb: paletteRgb, nearestIndex: nearestIndex, quantize: quantize
+    };
+  })();
+  if (typeof window !== 'undefined') window.ColorCore = ColorCore;
+  /* COLOR-CORE-END */
+  </script>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+    const C = window.ColorCore;
+
+    const K_OPTIONS = ['auto', '2', '3', '4', '5', '6', '7', '8'];
+    // "Mode" and "centroid" are implementation vocabulary. Name the modes after
+    // what you can see in the result instead.
+    const MODES = [
+      { id: 'exact', label: 'Exact', hint: 'Most frequent real pixel color. Best for logos, flat design, screenshots, illustrations.' },
+      { id: 'average', label: 'Averaged', hint: 'Cluster average, converted back from OKLab. Best for photos, gradients, textures, film stills.' }
+    ];
+    const FLAT_HINT = 0.7; // above this the histogram looks like flat artwork
+    const VIEWS = [
+      { id: 'original', label: 'Original', hint: 'The image as loaded.' },
+      { id: 'quantized', label: 'Quantized', hint: 'Every pixel replaced by its nearest palette color. Gradients break into visible bands - that is what the palette really covers.' },
+      { id: 'dithered', label: 'Dithered', hint: 'Same palette, Floyd-Steinberg error diffusion. Looks smoother, but hides how coarse the palette is.' }
+    ];
+    /* Quantizing runs per pixel on the main thread: measured on a 12 MP image
+       that is ~0.8 s hard and ~1.6 s dithered, which is a visible freeze. Above
+       this many pixels the preview is computed on a downscaled copy - it is
+       displayed scaled anyway, so nothing visible is lost. */
+    const QUANT_MAX_PX = 4000000;
+    const DITHER_MAX_PX = 2200000;
+
+    /* Downsample to <= MAX_PX and read the pixels back. willReadFrequently keeps
+       Chrome from warning and from putting getImageData on the slow path. */
+    function imageDataFrom(bitmap) {
+      const scale = C.scaleFor(bitmap.width, bitmap.height);
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      return ctx.getImageData(0, 0, w, h);
+    }
+
+    function App() {
+      const [bitmap, setBitmap] = useState(null);
+      const [result, setResult] = useState(null);
+      const [k, setK] = useState('auto');
+      const [mode, setMode] = useState('exact');
+      const [error, setError] = useState('');
+      const [dragging, setDragging] = useState(false);
+      const [copied, setCopied] = useState(null);
+      const [view, setView] = useState('original');
+      const [rendering, setRendering] = useState(false);
+
+      const dropRef = useRef(null);
+      const fileRef = useRef(null);
+      const canvasRef = useRef(null);
+      const dataRef = useRef(null);   // the downsampled ImageData, reused on re-run
+
+      /* Preview: draw the decoded ImageBitmap into a canvas rather than pointing
+         an <img> at an object URL. Guarantees the preview shows what was analysed
+         and removes the object-URL lifecycle entirely. */
+      const drawPreview = useCallback((bm, mode, pal) => {
+        const cv = canvasRef.current;
+        if (!cv || !bm) return;
+
+        // Dithering is O(pixels) with a serial dependency, so cap the working
+        // size; the canvas is displayed scaled anyway.
+        let w = bm.width, h = bm.height;
+        const cap = mode === 'dithered' ? DITHER_MAX_PX : mode === 'quantized' ? QUANT_MAX_PX : Infinity;
+        if (w * h > cap) {
+          const s = Math.sqrt(cap / (w * h));
+          w = Math.max(1, Math.round(w * s));
+          h = Math.max(1, Math.round(h * s));
+        }
+        cv.width = w;
+        cv.height = h;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.clearRect(0, 0, w, h);
+        ctx.drawImage(bm, 0, 0, w, h);
+        if (mode === 'original' || !pal || !pal.length) return;
+
+        const img = ctx.getImageData(0, 0, w, h);
+        C.quantize(img, pal, mode === 'dithered');
+        ctx.putImageData(img, 0, 0);
+      }, []);
+
+      /* Repaint whenever the image, the view or the palette changes. Kept out of
+         the render pass: quantizing a large photo takes long enough to drop a
+         frame, so yield first and show a "rendering" note. */
+      useEffect(() => {
+        if (!bitmap) return;
+        if (view === 'original' || !result || !result.palette.length) {
+          drawPreview(bitmap, 'original', null);
+          return;
+        }
+        let cancelled = false;
+        setRendering(true);
+        const id = setTimeout(() => {
+          if (cancelled) return;
+          drawPreview(bitmap, view, result.palette);
+          setRendering(false);
+        }, 0);
+        return () => { cancelled = true; clearTimeout(id); setRendering(false); };
+      }, [bitmap, view, result, drawPreview]);
+
+      const load = useCallback(async (source) => {
+        setError('');
+        let bm;
+        try {
+          bm = await createImageBitmap(source);
+        } catch (err) {
+          const name = source && source.name ? source.name : 'The file';
+          const heic = /\.(heic|heif)$/i.test(name || '');
+          setError(heic
+            ? name + ' is a HEIC/HEIF file, which only Safari can decode. Export it as JPEG or PNG first.'
+            : name + ' could not be decoded as an image. Supported: PNG, JPEG, GIF, WebP, AVIF, BMP, SVG (animated files give the first frame).');
+          return;
+        }
+        try {
+          dataRef.current = imageDataFrom(bm);
+        } catch (err) {
+          setError('The image could not be read back from the canvas.');
+          return;
+        }
+        setView('original');
+        setBitmap(bm);
+      }, []);
+
+      // Re-run whenever the image or a setting changes. 10-40 ms, so no debounce
+      // needed; if this ever grows a live slider it belongs in a Worker.
+      useEffect(() => {
+        if (!dataRef.current) return;
+        setResult(C.extract(dataRef.current, { k, mode }));
+      }, [bitmap, k, mode]);
+
+      /* The paste listener has to be global to catch a paste that is not aimed at
+         any particular element, but it must not hijack typing in a real field, and
+         must only preventDefault when the clipboard actually held an image. */
+      useEffect(() => {
+        function onPaste(e) {
+          const t = e.target;
+          if (t && (t.isContentEditable ||
+                    /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return;
+          if (!e.clipboardData) return;
+          const item = [...e.clipboardData.items].find(i => i.type.startsWith('image/'));
+          if (!item) return;
+          const file = item.getAsFile();
+          if (!file) return;
+          e.preventDefault();
+          load(file);
+        }
+        document.addEventListener('paste', onPaste);
+        return () => document.removeEventListener('paste', onPaste);
+      }, [load]);
+
+      function onDrop(e) {
+        e.preventDefault();
+        setDragging(false);
+        const f = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
+        if (f) load(f);
+        else setError('That drop contained no image file.');
+      }
+
+      /* navigator.clipboard needs a secure context; keep a plain-HTTP/file:// path
+         working too, otherwise copying fails silently. */
+      function copy(text, id) {
+        const done = () => {
+          setCopied(id);
+          setTimeout(() => setCopied(c => (c === id ? null : c)), 1200);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+        } else {
+          fallbackCopy(text, done);
+        }
+      }
+
+      /* The canvas already holds exactly what is on screen, so export it straight
+         from there instead of quantizing a second time. */
+      function downloadPreview() {
+        const cv = canvasRef.current;
+        if (!cv) return;
+        cv.toBlob(blob => {
+          if (!blob) return;
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'palette-' + view + '-' + palette.length + '-colors.png';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }, 'image/png');
+      }
+
+      function fallbackCopy(text, done) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); done(); } catch (err) { window.prompt('Palette:', text); }
+        document.body.removeChild(ta);
+      }
+
+      const palette = result ? result.palette : [];
+      const suggestAveraged = result && result.flatness < FLAT_HINT && mode === 'exact';
+
+      return (
+        <div className="container">
+          <div className="cx-wrap">
+
+            <div>
+              {bitmap && palette.length > 0 &&
+                <div className="cx-viewbar">
+                  <div className="cx-seg">
+                    {VIEWS.map(v =>
+                      <button
+                        key={v.id}
+                        type="button"
+                        className={'lang-seg' + (view === v.id ? ' active' : '')}
+                        title={v.hint}
+                        onClick={() => setView(v.id)}
+                      >{v.label}</button>
+                    )}
+                  </div>
+                  {view !== 'original' &&
+                    <button type="button" className="cx-dl" onClick={downloadPreview}>Download PNG</button>}
+                </div>}
+
+              <div
+                ref={dropRef}
+                className={'cx-drop' + (dragging ? ' drag' : '') + (bitmap ? ' has-image' : '')}
+                tabIndex="0"
+                role="button"
+                aria-label="Choose or drop an image"
+                onClick={() => fileRef.current.click()}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileRef.current.click(); }
+                }}
+                onDragEnter={e => { e.preventDefault(); setDragging(true); }}
+                onDragOver={e => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={e => { e.preventDefault(); setDragging(false); }}
+                onDrop={onDrop}
+              >
+                {!bitmap && <div>
+                  <p><strong>Drop an image here</strong></p>
+                  <p className="cx-hint">or click to choose a file, or press <kbd>Ctrl</kbd>+<kbd>V</kbd> to paste one</p>
+                </div>}
+                <canvas ref={canvasRef} style={{ display: bitmap ? 'block' : 'none' }} aria-label="Loaded image" />
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={e => { const f = e.target.files[0]; if (f) load(f); e.target.value = ''; }}
+                />
+              </div>
+              {error && <p className="cx-err">{error}</p>}
+              {bitmap && !error &&
+                <p className="cx-note">
+                  {bitmap.width} × {bitmap.height} px · analysed on {result ? result.n.toLocaleString('en-US') : '0'} sampled pixels{result ? ' · ' + result.ms.toFixed(0) + ' ms' : ''}
+                  {rendering && ' · rendering preview…'}
+                  {view !== 'original' &&
+                   bitmap.width * bitmap.height > (view === 'dithered' ? DITHER_MAX_PX : QUANT_MAX_PX) &&
+                    ' · preview downscaled for speed'}
+                </p>}
+            </div>
+
+            <div>
+              <div className="cx-controls">
+                <div className="cx-field">
+                  <label htmlFor="cx-k">Colors</label>
+                  <select id="cx-k" value={k} onChange={e => setK(e.target.value)}>
+                    {K_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                </div>
+                <div className="cx-field">
+                  <label>Representative</label>
+                  <div className="cx-seg">
+                    {MODES.map(m =>
+                      <button
+                        key={m.id}
+                        type="button"
+                        className={'lang-seg' + (mode === m.id ? ' active' : '')}
+                        title={m.hint}
+                        onClick={() => setMode(m.id)}
+                      >{m.label}</button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {palette.length > 0 &&
+                <div className="cx-band">
+                  {palette.map((c, i) =>
+                    <span key={i} style={{ background: c.hex, flex: c.share }} />
+                  )}
+                </div>}
+
+              <ul className="cx-list">
+                {palette.length === 0 &&
+                  <li><p className="cx-empty">{
+                    !bitmap ? 'No image loaded yet.'
+                      : 'No opaque pixels found in this image.'
+                  }</p></li>}
+                {palette.map((c, i) =>
+                  <li key={i}>
+                    <button
+                      type="button"
+                      className={'cx-row' + (copied === c.hex + i ? ' copied' : '')}
+                      onClick={() => copy(c.hex, c.hex + i)}
+                      title={'Copy ' + c.hex}
+                    >
+                      <span className="cx-chip" style={{ background: c.hex }} />
+                      <span className="cx-hex">{c.hex}</span>
+                      <span className="cx-share">{(c.share * 100).toFixed(1)} %</span>
+                    </button>
+                  </li>
+                )}
+              </ul>
+
+              {palette.length > 0 &&
+                <div className="cx-export">
+                  <button type="button" onClick={() => copy(palette.map(c => c.hex).join('\n'), 'all')}>
+                    {copied === 'all' ? 'Copied' : 'Copy all hex'}
+                  </button>
+                  <button type="button" onClick={() => copy(C.toCss(palette), 'css')}>
+                    {copied === 'css' ? 'Copied' : 'Copy as CSS'}
+                  </button>
+                  <button type="button" onClick={() => copy(C.toJson(palette), 'json')}>
+                    {copied === 'json' ? 'Copied' : 'Copy as JSON'}
+                  </button>
+                </div>}
+
+              {suggestAveraged &&
+                <p className="cx-note">This looks like a photograph or a gradient. <b>Averaged</b> often reads truer there, because the most frequent single pixel value is close to arbitrary.</p>}
+
+              <p className="cx-note">
+                The percentage is the share of sampled pixels a color stands for, and the only
+                indication of how load-bearing it is. In <b>auto</b> mode two rules run in turn:
+                clusters that are perceptually the same color get merged - regardless of how
+                big they are - and only then is anything under 2 % folded into its nearest
+                neighbour. Merged clusters are absorbed rather than dropped, so the shares always
+                add up to 100 %. A color can therefore disappear despite a healthy percentage,
+                simply because it was a shade of one above it; set <b>Colors</b> to a fixed number
+                to switch both rules off and see every cluster.
+              </p>
+            </div>
+
+          </div>
+
+          <p style={{ fontSize: 11, color: '#64748b', marginTop: '1.5rem' }}>
+            k-means clustering in OKLab (Ottosson 2020) on up to 60,000 sampled pixels; seeded, so the
+            same image always yields the same palette. Transparent pixels are ignored. Nothing is
+            uploaded - the image is decoded and analysed in this browser tab.
+          </p>
+        </div>
+      );
+    }
+
+    const rootEl = document.getElementById('root');
+    const intro = rootEl.firstElementChild;
+    ReactDOM.createRoot(rootEl).render(
+      <div>
+        <div dangerouslySetInnerHTML={{ __html: intro.outerHTML }}></div>
+        <App />
+      </div>
+    );
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
