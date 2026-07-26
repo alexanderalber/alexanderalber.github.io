@@ -38,10 +38,23 @@
     .ec-snips li::before { content: "· "; color: #475569; }
     .ec-snips mark { background: rgba(15,181,173,.22); color: #e2e8f0;
       padding: 0 1px; border-radius: 2px; }
-    .ec-edit { border: 1px solid #334155; border-radius: 8px; background: rgba(15,23,42,.35);
-      padding: 10px 14px; margin-bottom: 14px; }
-    .ec-edit summary { cursor: pointer; color: #94a3b8; font-size: 14px; }
-    .ec-edit[open] summary { margin-bottom: 12px; }
+    /* One panel per editing tool, stacked into a single bordered group so the
+       four of them read as one section rather than four loose boxes. */
+    .ec-edits { border: 1px solid #334155; border-radius: 8px; background: rgba(15,23,42,.35);
+      margin-bottom: 14px; }
+    .ec-edit { border-top: 1px solid #334155; padding: 0 14px; }
+    .ec-edit:first-child { border-top: 0; }
+    .ec-edit summary { cursor: pointer; color: #94a3b8; font-size: 14px; padding: 10px 0;
+      list-style: none; display: flex; align-items: baseline; gap: 8px; }
+    .ec-edit summary::-webkit-details-marker { display: none; }
+    /* A rotating caret, so the open panel is obvious without relying on the
+       platform's own triangle, which Pico hides. */
+    .ec-edit summary::before { content: '▸'; color: #64748b; font-size: 11px;
+      transition: transform .12s ease; display: inline-block; }
+    .ec-edit[open] summary::before { transform: rotate(90deg); }
+    .ec-edit summary:hover { color: #cbd5e1; }
+    .ec-edit .ec-editnote { color: #64748b; font-size: 12px; font-weight: normal; }
+    .ec-edit[open] { padding-bottom: 14px; }
     .ec-err { border: 1px solid #7f1d1d; background: rgba(127,29,29,.15); border-radius: 8px;
       padding: 12px 14px; color: #fca5a5; font-size: 14px; }
     .ec-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13.5px; }
@@ -57,6 +70,38 @@
     .ec-preview h1, .ec-preview h2, .ec-preview h3, .ec-preview h4 { color: #e2e8f0; }
     .ec-preview a { color: #0fb5ad; cursor: default; }
     .ec-preview table { font-size: 14px; }
+    .ec-toclist { list-style: none; margin: 0 0 4px; padding: 0;
+      max-height: 320px; overflow-y: auto; }
+    .ec-toclist li { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+    .ec-toclist input { margin-bottom: 0; font-size: 13px; padding: 4px 8px;
+      flex: 1 1 auto; min-width: 8ch; }
+    .ec-toclist .lang-seg { margin: 0; padding: 3px 7px; font-size: 12px; line-height: 1.1; }
+    .ec-toclist .lang-seg:disabled { opacity: .35; cursor: not-allowed; }
+    .ec-tocsec { color: #64748b; font-size: 11px; flex: 0 0 auto;
+      width: 11ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Position column. It sits before the indent so the bars stay on one axis:
+       reading straight down them shows how the chapters are spaced, which is
+       the whole point of showing a position at all. */
+    .ec-tocpos { flex: 0 0 auto; display: flex; align-items: center; gap: 5px;
+      cursor: default; }
+    .ec-tocbar { width: 46px; height: 4px; border-radius: 2px;
+      background: #1e293b; overflow: hidden; flex: 0 0 auto; }
+    .ec-tocbarfill { display: block; height: 100%; background: #475569; }
+    .ec-tocpct { color: #64748b; font-size: 11px; font-variant-numeric: tabular-nums;
+      width: 4.5ch; text-align: right; flex: 0 0 auto; }
+    /* The row carries a lot now. On a narrow screen the bar goes first and the
+       section name second; the percentage and the buttons are what you act on. */
+    @media (max-width: 720px) {
+      .ec-tocbar { display: none; }
+      .ec-tocsec { width: 7ch; }
+    }
+    @media (max-width: 560px) {
+      .ec-tocsec { display: none; }
+    }
+    .ec-coverprev { display: block; width: 150px; height: auto; border: 1px solid #334155;
+      border-radius: 4px; margin-top: 4px; }
+    .ec-cover { text-align: center; margin: 0; }
+    .ec-cover img { max-width: 100%; height: auto; }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -95,7 +140,7 @@
     <div id="root">
       <div class="container">
         <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">E-Book Converter</h1>
-        <p style="color:#94a3b8;max-width:70ch">Convert EPUB, MOBI, AZW3, Markdown, HTML and plain text. Everything runs in your browser: the file is never uploaded.</p>
+        <p style="color:#94a3b8;max-width:70ch">Convert EPUB, MOBI, AZW3, Markdown, HTML and plain text to EPUB, MOBI, Markdown, HTML, LaTeX, DOCX, a Pandoc bundle or plain text. Everything runs in your browser: the file is never uploaded. A free, private alternative to upload-based converter sites, with no account and no tracking; DRM-protected books are detected and rejected.</p>
       </div>
     </div>
   </main>
@@ -933,9 +978,34 @@
         return { title: s.title || ('Section ' + (i + 1)), href: 'text/' + s.id + '.xhtml', level: 0 };
       });
 
-      const navItems = toc.map(function (t) {
-        return '      <li><a href="' + escapeXml(t.href) + '">' + escapeXml(t.title) + '</a></li>';
-      }).join('\n');
+      // Both the nav and the NCX carry the nesting in book.toc, so a level of 2
+      // has to become a list inside a list. Levels never jump by more than one
+      // (normalizeToc guarantees it), so a running depth is enough.
+      const navItems = (function () {
+        const out = [];
+        let depth = 0;
+        const pad = function (n) { return '      ' + '    '.repeat(n); };
+        const closeTo = function (target) {
+          while (depth > target) {
+            out.push(pad(depth - 1) + '  </ol>');
+            depth--;
+            out.push(pad(depth) + '</li>');
+          }
+        };
+        toc.forEach(function (t) {
+          while (depth < t.level) {
+            // Open a nested list inside the still-unclosed <li> above.
+            out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, '');
+            depth++;
+            out.push(pad(depth - 1) + '  <ol>');
+          }
+          closeTo(t.level);
+          out.push(pad(depth) + '<li><a href="' + escapeXml(t.href) + '">'
+            + escapeXml(t.title) + '</a></li>');
+        });
+        closeTo(0);
+        return out.join('\n');
+      })();
       const nav = '<?xml version="1.0" encoding="utf-8"?>\n'
         + '<!DOCTYPE html>\n'
         + '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="'
@@ -944,16 +1014,32 @@
         + '<body>\n  <nav epub:type="toc" id="toc">\n    <h1>Contents</h1>\n    <ol>\n'
         + navItems + '\n    </ol>\n  </nav>\n</body>\n</html>\n';
 
-      const ncxItems = toc.map(function (t, i) {
-        return '    <navPoint id="np-' + (i + 1) + '" playOrder="' + (i + 1) + '">\n'
-          + '      <navLabel><text>' + escapeXml(t.title) + '</text></navLabel>\n'
-          + '      <content src="' + escapeXml(t.href) + '"/>\n'
-          + '    </navPoint>';
-      }).join('\n');
+      // navPoints nest the same way: a deeper entry lives inside the previous
+      // navPoint rather than beside it.
+      let ncxDepth = 1;
+      const ncxItems = (function () {
+        const out = [];
+        let depth = 0;
+        const pad = function (n) { return '  '.repeat(n + 2); };
+        toc.forEach(function (t, i) {
+          while (depth > t.level) { depth--; out.push(pad(depth) + '</navPoint>'); }
+          if (t.level > depth) depth = t.level; // only ever by one, see above
+          if (depth + 1 > ncxDepth) ncxDepth = depth + 1;
+          // Left open, so the next deeper entry lands inside it.
+          out.push(pad(depth) + '<navPoint id="np-' + (i + 1) + '" playOrder="' + (i + 1) + '">');
+          out.push(pad(depth) + '  <navLabel><text>' + escapeXml(t.title) + '</text></navLabel>');
+          out.push(pad(depth) + '  <content src="' + escapeXml(t.href) + '"/>');
+          if (i + 1 >= toc.length || toc[i + 1].level <= depth) {
+            out.push(pad(depth) + '</navPoint>');
+          }
+        });
+        while (depth > 0) { depth--; out.push(pad(depth) + '</navPoint>'); }
+        return out.join('\n');
+      })();
       const ncx = '<?xml version="1.0" encoding="utf-8"?>\n'
         + '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
         + '  <head>\n    <meta name="dtb:uid" content="' + escapeXml(uid) + '"/>\n'
-        + '    <meta name="dtb:depth" content="1"/>\n'
+        + '    <meta name="dtb:depth" content="' + ncxDepth + '"/>\n'
         + '    <meta name="dtb:totalPageCount" content="0"/>\n'
         + '    <meta name="dtb:maxPageNumber" content="0"/>\n  </head>\n'
         + '  <docTitle><text>' + escapeXml(title) + '</text></docTitle>\n'
@@ -1785,7 +1871,12 @@
         if (!entry) break;
         let bytes = entry.bytes;
         if (!entry.terminal) {
-          if (depth > 4) break; // malformed: phrases must bottom out
+          // A non-terminal phrase is itself a bit stream of other phrases, so
+          // decoding recurses. The limit only exists to stop a malformed file
+          // from recursing forever; it is not a format limit. Wool nests eight
+          // deep in four places, and a limit of 4 silently dropped 160 bytes
+          // of markup there, which shifted every later skeleton offset.
+          if (depth > 32) break;
           bytes = huffDecompress(bytes, t, depth + 1);
         }
         chunks.push(bytes);
@@ -1937,7 +2028,15 @@
       let text = new Uint8Array(total);
       let o = 0;
       for (const p of parts) { text.set(p, o); o += p.length; }
-      if (h.textLength && h.textLength < text.length) text = text.subarray(0, h.textLength);
+      // In a plain MOBI, textLength is the length of the text, and the records
+      // are padded past it. In KF8/AZW3 it describes flow 0 (the markup) only,
+      // while the records carry every flow, so cutting there throws away the
+      // stylesheets and, when the last markup record straddles the boundary,
+      // part of the markup itself. The FDST table is the authority there.
+      const isKF8 = h.fileVersion >= 8;
+      if (h.textLength && h.textLength < text.length && !isKF8) {
+        text = text.subarray(0, h.textLength);
+      }
       log.info('Compression: ' + decoders[h.compression] + ', '
         + h.textRecordCount + ' text records, ' + text.length + ' bytes of markup');
       return text;
@@ -4322,16 +4421,42 @@
       return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
+    // What counts as being "inside a word". \b is no use here: it is defined on
+    // [A-Za-z0-9_], so it would put a boundary in the middle of "Grüße" and find
+    // "uber" inside "Übermut". Letters, marks and digits of any script count,
+    // and so does the apostrophe, so "cant" does not match inside "can't".
+    const WORD_CHAR = '[\\p{L}\\p{M}\\p{N}_’\']';
+
+    // Wrap a pattern so it only matches where a word starts and ends. Done with
+    // lookarounds rather than \b so it also works for terms that begin or end
+    // with punctuation, where a \b would sit on the wrong side of the character.
+    function wholeWordRx(source) {
+      return '(?<!' + WORD_CHAR + ')(?:' + source + ')(?!' + WORD_CHAR + ')';
+    }
+
     function buildSearchRx(query, opts) {
       if (!query) return { error: 'Enter a search term first.' };
+      const o = opts || {};
       let rx;
       try {
-        rx = new RegExp(
-          opts && opts.regex ? query : escapeRegExp(query),
-          'g' + (opts && opts.matchCase ? '' : 'i')
-        );
+        const body = o.regex ? query : escapeRegExp(query);
+        // The 'u' flag is required for \p{...} and is only safe to add once the
+        // pattern is known to parse under it, so a user regex is tried both ways.
+        rx = new RegExp(o.wholeWord ? wholeWordRx(body) : body,
+          'gu' + (o.matchCase ? '' : 'i'));
       } catch (e) {
-        return { error: 'Invalid regular expression: ' + (e && e.message ? e.message : e) };
+        if (o.wholeWord) {
+          return { error: 'This pattern cannot be limited to whole words: '
+            + (e && e.message ? e.message : e) };
+        }
+        try {
+          // Without 'u' some older-style patterns are legal again, e.g. \d{2,}
+          // written with a stray escape. Fall back rather than reject them.
+          rx = new RegExp(o.regex ? query : escapeRegExp(query),
+            'g' + (o.matchCase ? '' : 'i'));
+        } catch (e2) {
+          return { error: 'Invalid regular expression: ' + (e2 && e2.message ? e2.message : e2) };
+        }
       }
       if (rx.test('')) return { error: 'This pattern would match the empty string.' };
       rx.lastIndex = 0;
@@ -4398,6 +4523,340 @@
       return { book: Object.assign({}, book, { sections: sections }), total: total };
     }
 
+    // ══ table of contents ════════════════════════════════════════════════════
+    // A TOC entry points at "text/<section-id>.xhtml" plus an optional fragment.
+    // Everything here keeps that shape, so the writers need no special case.
+
+    function tocHref(sectionId, frag) {
+      return 'text/' + sectionId + '.xhtml' + (frag ? '#' + frag : '');
+    }
+
+    // Which section does this entry belong to? -1 when it points nowhere.
+    function tocSectionIndex(book, entry) {
+      if (!entry || !entry.href) return -1;
+      const path = String(entry.href).split('#')[0];
+      const m = /(?:^|\/)([^\/]+)\.xhtml$/.exec(path);
+      const id = m ? m[1] : null;
+      if (id === null) return -1;
+      for (let i = 0; i < book.sections.length; i++) {
+        if (book.sections[i].id === id) return i;
+      }
+      return -1;
+    }
+
+    // Roughly how much visible text a chunk of markup carries. Tags, and the
+    // whole of script/style, do not count; entities collapse to one character
+    // so "&amp;" does not weigh five times what "&" does.
+    function textWeight(html) {
+      return String(html || '')
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&[#a-z0-9]+;/gi, 'x')
+        .replace(/\s+/g, ' ')
+        .trim().length;
+    }
+
+    // Where each TOC entry sits in the book, measured in characters of text
+    // rather than sections: chapters differ wildly in length, so "entry 30 of
+    // 60" says much less about how far in you are than "at 48%".
+    //
+    // An entry with a fragment is placed inside its section by looking up where
+    // that anchor occurs, so several entries in one section do not collapse
+    // onto the same number. Returns one record per entry, plus the total.
+    //
+    // Weighing every section means walking the whole book, so that half is split
+    // into tocWeights: editing a TOC title changes no section, and the UI hands
+    // the same weights back in across keystrokes.
+    function tocWeights(book) {
+      const weights = book.sections.map(function (s) { return textWeight(s.html); });
+      const starts = [];
+      let running = 0;
+      for (let i = 0; i < weights.length; i++) {
+        starts.push(running);
+        running += weights[i];
+      }
+      return { sectionChars: weights, sectionStarts: starts, total: running };
+    }
+
+    function tocPositions(book, toc, weights) {
+      const list = toc || book.toc || [];
+      const w = weights || tocWeights(book);
+      const starts = w.sectionStarts;
+      const total = w.total;
+      const entries = list.map(function (e) {
+        const si = tocSectionIndex(book, e);
+        if (si < 0) return { section: -1, chars: -1, percent: -1 };
+        let at = starts[si];
+        const hash = String(e.href || '').indexOf('#');
+        const frag = hash < 0 ? '' : String(e.href).slice(hash + 1);
+        if (frag) {
+          // Find the element carrying the anchor and weigh only what precedes it.
+          const html = book.sections[si].html || '';
+          const esc = frag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const m = new RegExp('<[^<>]*\\sid\\s*=\\s*["\']?' + esc + '["\'\\s>]').exec(html);
+          if (m) at += textWeight(html.slice(0, m.index));
+        }
+        return {
+          section: si,
+          chars: at,
+          percent: total > 0 ? (at / total) * 100 : 0,
+        };
+      });
+      return {
+        entries: entries, total: total,
+        sectionStarts: starts, sectionChars: w.sectionChars,
+      };
+    }
+
+    // Strip entries whose section is gone, clamp levels so the list never jumps
+    // more than one level deeper than its parent (EPUB nav is a nested <ol>,
+    // and a jump from 0 straight to 2 has no list to nest into).
+    function normalizeToc(book, toc) {
+      const out = [];
+      let prev = -1;
+      for (const e of toc) {
+        if (tocSectionIndex(book, e) < 0) continue;
+        const title = String(e.title || '').replace(/\s+/g, ' ').trim();
+        if (!title) continue;
+        const want = Math.max(0, Math.min(6, Math.round(Number(e.level) || 0)));
+        const level = Math.min(want, prev + 1);
+        out.push({ title: title, href: e.href, level: level });
+        prev = level;
+      }
+      return out;
+    }
+
+    const HEADING_TAG_RE = /<h([1-6])\b([^>]*)>([\s\S]*?)<\/h\1\s*>/gi;
+
+    function attrValue(attrs, name) {
+      const m = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(attrs || '');
+      return m ? (m[1] !== undefined ? m[1] : m[2]) : '';
+    }
+
+    // Build a TOC from the headings in the markup. Levels come from the heading
+    // ranks actually used, mapped onto 0, 1, 2 in order, so a book whose
+    // chapters are <h2> does not start one level deep. A heading with an id
+    // becomes a fragment link; the first heading of a section links to the
+    // section itself, so the entry works even where fragments are lossy.
+    //
+    // Real e-books often have no <h*> at all: MOBI and AZW3 chapter titles are
+    // usually bold text in a div or blockquote. tocRebuild falls back to the
+    // section titles the readers worked out, so the button is never a no-op.
+    function buildTocFromHeadings(book, maxLevel) {
+      const limit = Math.max(1, Math.min(6, maxLevel || 3));
+      const raw = [];
+      book.sections.forEach(function (sec, si) {
+        let m;
+        HEADING_TAG_RE.lastIndex = 0;
+        let first = true;
+        while ((m = HEADING_TAG_RE.exec(sec.html || ''))) {
+          const rank = Number(m[1]);
+          const title = decodeEntities(m[3].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+          if (!title) continue;
+          const id = attrValue(m[2], 'id');
+          raw.push({
+            title: title.slice(0, 200),
+            rank: rank,
+            href: tocHref(sec.id, first ? '' : id),
+            section: si,
+          });
+          first = false;
+        }
+      });
+      // Map the ranks that occur onto consecutive levels.
+      const ranks = [];
+      for (const r of raw) if (ranks.indexOf(r.rank) < 0) ranks.push(r.rank);
+      ranks.sort(function (a, b) { return a - b; });
+      const entries = [];
+      for (const r of raw) {
+        const level = ranks.indexOf(r.rank);
+        if (level >= limit) continue;
+        entries.push({ title: r.title, href: r.href, level: level });
+      }
+      return normalizeToc(book, entries);
+    }
+
+    // One entry per section, titled from the section itself. The fallback when
+    // a book has no headings at all.
+    function tocFromSections(book) {
+      return book.sections.map(function (s, i) {
+        return {
+          title: String(s.title || '').trim() || ('Section ' + (i + 1)),
+          href: tocHref(s.id, ''),
+          level: 0,
+        };
+      });
+    }
+
+    // Does a section title say anything, or is it just a placeholder?
+    function hasRealTitle(sec, i) {
+      const t = String(sec.title || '').trim();
+      return !!t && t !== 'Section ' + (i + 1);
+    }
+
+    // What the "rebuild" button runs. Headings win when the markup has them;
+    // otherwise the section titles do, which is the common case for MOBI and
+    // AZW3. Returns the source so the UI can say what it did.
+    function tocRebuild(book, maxLevel) {
+      const fromHeadings = buildTocFromHeadings(book, maxLevel);
+      const named = book.sections.filter(hasRealTitle).length;
+      // Headings only count as the better source if they cover the book at
+      // least as well as the section titles do.
+      if (fromHeadings.length && fromHeadings.length >= named) {
+        return { toc: fromHeadings, source: 'headings' };
+      }
+      if (named > 0) {
+        const toc = normalizeToc(book, book.sections.map(function (s, i) {
+          return hasRealTitle(s, i)
+            ? { title: String(s.title).trim(), href: tocHref(s.id, ''), level: 0 }
+            : null;
+        }).filter(Boolean));
+        if (toc.length) return { toc: toc, source: 'titles' };
+      }
+      if (fromHeadings.length) return { toc: fromHeadings, source: 'headings' };
+      return { toc: normalizeToc(book, tocFromSections(book)), source: 'sections' };
+    }
+
+    // How many heading levels a rebuild could actually use, so the UI can say
+    // so before the user clicks. 0 means the depth setting changes nothing:
+    // either there are no headings, or the section titles win anyway, and both
+    // of those paths produce a flat list. Deliberately mirrors tocRebuild's
+    // precedence by asking it, rather than restating the rule and drifting.
+    function tocDepthChoices(book) {
+      const ranks = [];
+      book.sections.forEach(function (sec) {
+        HEADING_TAG_RE.lastIndex = 0;
+        let m;
+        while ((m = HEADING_TAG_RE.exec(sec.html || ''))) {
+          const title = decodeEntities(m[3].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+          if (title && ranks.indexOf(Number(m[1])) < 0) ranks.push(Number(m[1]));
+        }
+      });
+      // Ask at the deepest setting: if headings do not win there, they never do.
+      if (ranks.length === 0) return 0;
+      return tocRebuild(book, 3).source === 'headings' ? Math.min(ranks.length, 3) : 0;
+    }
+
+    // ══ cover generator ══════════════════════════════════════════════════════
+    // Draws a plain typographic cover. The caller supplies the 2D context
+    // (the DOM lives in the UI), this decides the layout. 1600x2400 is the
+    // 2:3 that every store wants.
+
+    const COVER_W = 1600, COVER_H = 2400;
+
+    const COVER_THEMES = {
+      slate:   { bg: '#1e293b', fg: '#f1f5f9', accent: '#64748b' },
+      paper:   { bg: '#f5f1e8', fg: '#1f2937', accent: '#9a8c78' },
+      ink:     { bg: '#111827', fg: '#e5e7eb', accent: '#4b5563' },
+      crimson: { bg: '#4c1d1d', fg: '#fdf2f2', accent: '#b45454' },
+      forest:  { bg: '#14342b', fg: '#eafaf1', accent: '#4d8a72' },
+    };
+
+    // Greedy wrap: the longest run of words that still measures under width.
+    function wrapLines(ctx, text, maxWidth) {
+      const words = String(text).split(/\s+/).filter(Boolean);
+      if (!words.length) return [];
+      const lines = [];
+      let line = words[0];
+      for (let i = 1; i < words.length; i++) {
+        const test = line + ' ' + words[i];
+        if (ctx.measureText(test).width <= maxWidth) line = test;
+        else { lines.push(line); line = words[i]; }
+      }
+      lines.push(line);
+      return lines;
+    }
+
+    // Shrink the type until the wrapped block fits the box in both directions.
+    function fitLines(ctx, text, maxWidth, maxHeight, startSize, minSize, font) {
+      let size = startSize;
+      for (;;) {
+        ctx.font = font(size);
+        const lines = wrapLines(ctx, text, maxWidth);
+        const height = lines.length * size * 1.18;
+        if (height <= maxHeight || size <= minSize) return { lines: lines, size: size };
+        size -= Math.max(2, Math.round(size * 0.06));
+      }
+    }
+
+    function drawCover(ctx, opts) {
+      const theme = COVER_THEMES[opts.theme] || COVER_THEMES.slate;
+      const title = String(opts.title || '').trim() || 'Untitled';
+      const author = String(opts.author || '').trim();
+      const serif = function (s) { return '600 ' + s + 'px Georgia, "Times New Roman", serif'; };
+      const sans = function (s) { return '400 ' + s + 'px Helvetica, Arial, sans-serif'; };
+      const margin = 150;
+      const inner = COVER_W - margin * 2;
+
+      ctx.fillStyle = theme.bg;
+      ctx.fillRect(0, 0, COVER_W, COVER_H);
+
+      // A hairline frame, inset from the margin.
+      ctx.strokeStyle = theme.accent;
+      ctx.lineWidth = 4;
+      ctx.strokeRect(margin * 0.62, margin * 0.62, COVER_W - margin * 1.24, COVER_H - margin * 1.24);
+
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+
+      const t = fitLines(ctx, title, inner, COVER_H * 0.42, 170, 54, serif);
+      ctx.font = serif(t.size);
+      ctx.fillStyle = theme.fg;
+      const lineH = t.size * 1.18;
+      let y = COVER_H * 0.30 - (t.lines.length * lineH) / 2;
+      for (const line of t.lines) {
+        ctx.fillText(line, COVER_W / 2, y);
+        y += lineH;
+      }
+
+      // Rule between title and author.
+      const ruleY = Math.min(COVER_H * 0.62, y + 110);
+      ctx.strokeStyle = theme.accent;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(COVER_W / 2 - 170, ruleY);
+      ctx.lineTo(COVER_W / 2 + 170, ruleY);
+      ctx.stroke();
+
+      if (author) {
+        const a = fitLines(ctx, author, inner, COVER_H * 0.16, 76, 34, sans);
+        ctx.font = sans(a.size);
+        ctx.fillStyle = theme.fg;
+        let ay = ruleY + 90;
+        for (const line of a.lines) {
+          ctx.fillText(line, COVER_W / 2, ay);
+          ay += a.size * 1.3;
+        }
+      }
+      return { width: COVER_W, height: COVER_H };
+    }
+
+    // Install a generated cover: it becomes coverRes and, so that every writer
+    // shows it (not all of them use coverRes), a first section holding just the
+    // image. An earlier generated cover section is replaced, never stacked.
+    const COVER_SECTION_ID = 'sec-cover';
+
+    function setGeneratedCover(book, bytes, mime) {
+      const sections = book.sections.filter(function (s) { return s.id !== COVER_SECTION_ID; });
+      const resources = new Map(book.resources);
+      const next = Object.assign({}, book, { resources: resources });
+      // Drop the previous generated cover image so repeated runs do not pile up.
+      if (book.meta.coverRes && /^cover-generated/.test(book.meta.coverRes)) {
+        resources.delete(book.meta.coverRes);
+      }
+      const name = addResource(next, 'cover-generated.png', mime, bytes);
+      sections.unshift({
+        id: COVER_SECTION_ID,
+        title: 'Cover',
+        html: '<div class="ec-cover"><img src="../res/' + name + '" alt="Cover"/></div>',
+        css: [],
+      });
+      next.sections = sections;
+      next.meta = Object.assign({}, book.meta, { coverRes: name });
+      next.toc = normalizeToc(next, book.toc);
+      return next;
+    }
+
     return {
       formats: FORMATS,
       // pipeline
@@ -4425,6 +4884,14 @@
       mapTextNodes: mapTextNodes, smartenHtml: smartenHtml,
       cleanTypography: cleanTypography, bookFind: bookFind, bookReplace: bookReplace,
       escapeRegExp: escapeRegExp,
+      tocHref: tocHref, tocSectionIndex: tocSectionIndex, normalizeToc: normalizeToc,
+      tocPositions: tocPositions, tocWeights: tocWeights, textWeight: textWeight,
+      tocDepthChoices: tocDepthChoices,
+      buildTocFromHeadings: buildTocFromHeadings, tocFromSections: tocFromSections,
+      tocRebuild: tocRebuild,
+      drawCover: drawCover, setGeneratedCover: setGeneratedCover,
+      coverThemes: COVER_THEMES, coverSize: { width: COVER_W, height: COVER_H },
+      wrapLines: wrapLines, coverSectionId: COVER_SECTION_ID,
     };
   })();
   </script>
@@ -4532,9 +4999,8 @@
 
     function sectionTitles(book) {
       return book.sections.map((s, i) => {
-        const t = book.toc.find(
-          (e) => e.href && s.href && e.href.split('#')[0] === s.href
-        );
+        // TOC hrefs are "text/<section-id>.xhtml"; match on the id.
+        const t = book.toc.find((e) => Core.tocSectionIndex(book, e) === i);
         if (t && t.title) return t.title;
         const m = /<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/i.exec(s.html || '');
         if (m) {
@@ -4659,9 +5125,33 @@
       const [replacement, setReplacement] = useState('');
       const [useRegex, setUseRegex] = useState(false);
       const [matchCase, setMatchCase] = useState(false);
+      // On by default: replacing "the" and silently hitting "they" surprises
+      // everyone who does not write regular expressions for a living.
+      const [wholeWord, setWholeWord] = useState(true);
       const [found, setFound] = useState(null);
       const [srMsg, setSrMsg] = useState(null);
+      const [tocDepth, setTocDepth] = useState(3);
+      const [tocMsg, setTocMsg] = useState('');
+      const [coverTheme, setCoverTheme] = useState('slate');
+      const [coverMsg, setCoverMsg] = useState('');
+      const [coverPreview, setCoverPreview] = useState('');
       const titles = useMemo(() => sectionTitles(book), [book]);
+      // Weighing the sections walks the whole book (about 30 ms on a long one),
+      // and renaming a TOC entry re-renders on every keystroke. The weights only
+      // depend on the section markup, so they are memoised on that alone and the
+      // cheap half re-runs per keystroke.
+      // Keyed on the sections array itself: every edit builds a new array (the
+      // book is treated as immutable), while a TOC-only change reuses it. A
+      // length-based key would miss an equal-length replace such as cat -> dog.
+      const weights = useMemo(() => Core.tocWeights(book), [book.sections]);
+      // 0 when a rebuild would fall back to the chapter titles, which is the
+      // normal case for MOBI/AZW3: they set chapter headings as bold divs.
+      const depthChoices = useMemo(() => Core.tocDepthChoices(book), [book.sections]);
+      // The default is 3, so on a book with fewer levels the selected button
+      // would be one of the disabled ones and the control would look unset.
+      const effDepth = depthChoices > 0 ? Math.min(tocDepth, depthChoices) : tocDepth;
+      const tocPos = useMemo(
+        () => Core.tocPositions(book, book.toc, weights), [book.toc, weights]);
 
       // Any change to the book makes an old match preview stale.
       useEffect(() => { setFound(null); }, [book]);
@@ -4669,8 +5159,14 @@
       const autoLang = String(book.meta.language || 'en').toLowerCase().indexOf('de') === 0
         ? 'German' : 'English';
 
+      // Only the most recent action should be reporting; otherwise the panel
+      // fills up with messages from things the user did minutes ago.
+      const clearMessages = () => {
+        setTypoMsg(''); setSrMsg(null); setTocMsg(''); setCoverMsg('');
+      };
+
       const runTypo = () => {
-        setSrMsg(null);
+        clearMessages();
         const r = Core.cleanTypography(book, typoLang === 'auto' ? undefined : typoLang);
         const c = r.counts;
         const total = c.quotes + c.apostrophes + c.ellipses + c.dashes;
@@ -4682,15 +5178,20 @@
           : 'Nothing to change: no straight quotes, triple dots or hyphen runs found.');
       };
 
+      const srOpts = () => ({ regex: useRegex, matchCase: matchCase, wholeWord: wholeWord });
+
+      // The preview belongs to the options it was made with, so changing one
+      // has to drop it rather than leave a stale count on screen.
+      useEffect(() => { setFound(null); }, [useRegex, matchCase, wholeWord, query]);
+
       const runFind = () => {
-        setTypoMsg('');
-        setSrMsg(null);
-        setFound(Core.bookFind(book, query, { regex: useRegex, matchCase: matchCase }));
+        clearMessages();
+        setFound(Core.bookFind(book, query, srOpts()));
       };
 
       const runReplace = () => {
-        setTypoMsg('');
-        const r = Core.bookReplace(book, query, replacement, { regex: useRegex, matchCase: matchCase });
+        clearMessages();
+        const r = Core.bookReplace(book, query, replacement, srOpts());
         if (r.error) { setFound(null); setSrMsg({ text: r.error, warn: true }); return; }
         if (r.total > 0) onBook(r.book);
         setSrMsg({
@@ -4702,33 +5203,251 @@
       };
 
       const clip = (s) => (s || '').replace(/\s+/g, ' ');
+      // Thin spaces as thousands separators: readable without picking a locale
+      // convention (1,234 vs 1.234) that would be wrong for half the readers.
+      const fmtChars = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+
+      // normalizeToc is the gatekeeper: it drops dead entries and clamps a level
+      // that has no parent to nest into. When it changes what was asked for,
+      // say so, otherwise the buttons look broken.
+      const setToc = (toc, msg) => {
+        const clean = Core.normalizeToc(book, toc);
+        clearMessages();
+        onBook(Object.assign({}, book, { toc: clean }));
+        if (msg) { setTocMsg(msg); return; }
+        const sameLength = clean.length === toc.length;
+        const sameLevels = sameLength && clean.every((e, i) => e.level === toc[i].level);
+        setTocMsg(sameLevels
+          ? ''
+          : 'Adjusted: an entry cannot sit deeper than one level below the one above it.');
+      };
+
+      const moveEntry = (i, delta) => {
+        const j = i + delta;
+        if (j < 0 || j >= book.toc.length) return;
+        const next = book.toc.slice();
+        const tmp = next[i];
+        next[i] = next[j];
+        next[j] = tmp;
+        setToc(next, '');
+      };
+
+      const editEntry = (i, patch) => {
+        const next = book.toc.slice();
+        next[i] = Object.assign({}, next[i], patch);
+        setToc(next, '');
+      };
+
+      const removeEntry = (i) => {
+        const next = book.toc.slice();
+        next.splice(i, 1);
+        setToc(next, '');
+      };
+
+      const generateToc = () => {
+        const r = Core.tocRebuild(book, effDepth);
+        const from = {
+          headings: 'from the headings in the text',
+          titles: 'from the chapter titles, because the text has no headings',
+          sections: 'one per section, because there are no headings or titles to go on',
+        }[r.source];
+        setToc(r.toc, 'Built ' + r.toc.length
+          + (r.toc.length === 1 ? ' entry ' : ' entries ') + from + '.');
+      };
+
+      const addForSection = (si) => {
+        const sec = book.sections[si];
+        if (!sec) return;
+        const next = book.toc.concat([{
+          title: titles[si] || ('Section ' + (si + 1)),
+          href: Core.tocHref(sec.id, ''),
+          level: 0,
+        }]);
+        setToc(next, '');
+      };
+
+      // Canvas lives only for the moment it takes to paint and encode.
+      const makeCover = () => {
+        clearMessages();
+        const canvas = document.createElement('canvas');
+        canvas.width = Core.coverSize.width;
+        canvas.height = Core.coverSize.height;
+        const ctx = canvas.getContext('2d');
+        Core.drawCover(ctx, {
+          title: book.meta.title,
+          author: book.meta.author,
+          theme: coverTheme,
+        });
+        setCoverPreview(canvas.toDataURL('image/png'));
+        canvas.toBlob((blob) => {
+          if (!blob) { setCoverMsg('The browser could not encode the cover image.'); return; }
+          blob.arrayBuffer().then((buf) => {
+            const next = Core.setGeneratedCover(book, new Uint8Array(buf), 'image/png');
+            onBook(next);
+            setCoverMsg('Cover generated and put in front of the book ('
+              + Math.round(buf.byteLength / 1024) + ' KB).');
+          });
+        }, 'image/png');
+      };
+
+      const hasCover = !!book.meta.coverRes;
 
       return (
+        <div className="ec-edits">
         <details className="ec-edit">
-          <summary>Edit the loaded book</summary>
+          <summary>
+            Cover
+            <span className="ec-editnote">
+              {hasCover ? 'has one, can be replaced' : 'none yet'}
+            </span>
+          </summary>
 
           <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
-            Typography: straight quotes become typographic ones, three dots an ellipsis,
-            hyphen runs proper dashes. Code blocks are left alone. Applies to the loaded
-            book; convert afterwards.
+            Draws a plain typographic cover from the title and author above and puts it at
+            the front of the book. {hasCover
+              ? 'This book already has a cover; generating one replaces it.'
+              : 'This book has no cover.'}
           </label>
           <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
             <div className="seg-row" style={{ display: 'flex' }}>
-              {[['auto', 'Auto: ' + autoLang], ['de', 'German'], ['en', 'English']].map((o) => (
-                <button key={o[0]}
-                  className={'lang-seg' + (typoLang === o[0] ? ' active' : '')}
-                  onClick={() => setTypoLang(o[0])}>{o[1]}</button>
+              {Object.keys(Core.coverThemes).map((k) => (
+                <button key={k}
+                  className={'lang-seg' + (coverTheme === k ? ' active' : '')}
+                  onClick={() => setCoverTheme(k)}>{k.charAt(0).toUpperCase() + k.slice(1)}</button>
               ))}
             </div>
-            <button onClick={runTypo} style={{ width: 'auto', marginBottom: 0 }}>
-              Clean up typography
+            <button onClick={makeCover} style={{ width: 'auto', marginBottom: 0 }}>
+              Generate cover
             </button>
           </div>
-          {typoMsg && (
-            <p style={{ fontSize: 13, color: '#0fb5ad', marginBottom: 6 }}>{typoMsg}</p>
+          {coverMsg && (
+            <p style={{ fontSize: 13, color: '#0fb5ad', margin: '0 0 6px' }}>{coverMsg}</p>
+          )}
+          {coverPreview && (
+            <img src={coverPreview} alt="Generated cover preview" className="ec-coverprev" />
+          )}
+        </details>
+
+        <details className="ec-edit">
+          <summary>
+            Table of contents
+            <span className="ec-editnote">
+              {book.toc.length === 0
+                ? 'none'
+                : book.toc.length + (book.toc.length === 1 ? ' entry' : ' entries')}
+            </span>
+          </summary>
+
+          <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
+            Rename entries, change their nesting, reorder or remove them, or
+            build a fresh one. Rebuilding prefers the headings in the text and falls back to the
+            chapter titles. The bar on the left is how far into the book each entry sits, measured
+            in text rather than in chapters; hover it for the exact count.
+            {tocPos.total > 0 && ' This book has ' + fmtChars(tocPos.total) + ' characters of text.'}
+          </label>
+          {depthChoices === 0 && (
+            <p style={{ fontSize: 12, color: '#64748b', margin: '0 0 6px' }}>
+              Heading levels are off because this book has no usable headings: a rebuild would
+              go by the chapter titles and give one flat level. MOBI and AZW3 files usually set
+              their chapter headings as bold text rather than as real headings.
+            </p>
+          )}
+          {depthChoices === 1 && (
+            <p style={{ fontSize: 12, color: '#64748b', margin: '0 0 6px' }}>
+              This book uses only one heading level, so a rebuild gives a flat list either way.
+            </p>
+          )}
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 }}>
+            <span style={{ fontSize: 13, color: depthChoices > 0 ? '#94a3b8' : '#475569' }}>
+              Heading levels
+            </span>
+            <div className="seg-row" style={{ display: 'flex' }}
+              title={depthChoices > 0
+                ? 'How deep the rebuilt table of contents should go.'
+                : 'This book has no headings a rebuild could use, so every setting '
+                  + 'gives the same flat list.'}>
+              {[1, 2, 3].map((d) => (
+                <button key={d}
+                  className={'lang-seg' + (effDepth === d ? ' active' : '')}
+                  disabled={d > depthChoices}
+                  onClick={() => setTocDepth(d)}>{d}</button>
+              ))}
+            </div>
+            <button className="lang-seg" onClick={generateToc}>Rebuild</button>
+            {book.toc.length > 0 && (
+              <button className="lang-seg" onClick={() => setToc([], 'Table of contents cleared.')}>
+                Clear
+              </button>
+            )}
+          </div>
+          {tocMsg && (
+            <p style={{ fontSize: 13, color: '#0fb5ad', margin: '0 0 8px' }}>{tocMsg}</p>
           )}
 
-          <hr style={{ borderColor: '#334155', margin: '14px 0' }} />
+          {book.toc.length === 0 ? (
+            <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 8px' }}>
+              No table of contents. The EPUB and MOBI writers will fall back to one entry per
+              section; rebuild to get something better.
+            </p>
+          ) : (
+            <ul className="ec-toclist">
+              {book.toc.map((e, i) => {
+                const si = Core.tocSectionIndex(book, e);
+                const pos = tocPos.entries[i];
+                const pct = pos && pos.percent >= 0 ? pos.percent : null;
+                return (
+                  <li key={i}>
+                    <span className="ec-tocpos"
+                      title={pct === null ? 'Position unknown: the section is gone.'
+                        : fmtChars(pos.chars) + ' of ' + fmtChars(tocPos.total)
+                          + ' characters into the book'}>
+                      <span className="ec-tocbar">
+                        <span className="ec-tocbarfill"
+                          style={{ width: (pct === null ? 0 : pct) + '%' }} />
+                      </span>
+                      <span className="ec-tocpct">
+                        {pct === null ? '–' : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + '%'}
+                      </span>
+                    </span>
+                    <input type="text" value={e.title} aria-label={'TOC entry ' + (i + 1)}
+                      style={{ marginLeft: e.level * 22 }}
+                      onChange={(ev) => editEntry(i, { title: ev.target.value })} />
+                    <span className="ec-tocsec">
+                      {si >= 0 ? clip(titles[si]).slice(0, 24) : 'missing section'}
+                    </span>
+                    <button className="lang-seg" title="Move up"
+                      disabled={i === 0} onClick={() => moveEntry(i, -1)}>↑</button>
+                    <button className="lang-seg" title="Move down"
+                      disabled={i === book.toc.length - 1} onClick={() => moveEntry(i, 1)}>↓</button>
+                    <button className="lang-seg" title="Outdent"
+                      disabled={e.level === 0}
+                      onClick={() => editEntry(i, { level: e.level - 1 })}>←</button>
+                    <button className="lang-seg" title="Indent"
+                      onClick={() => editEntry(i, { level: e.level + 1 })}>→</button>
+                    <button className="lang-seg" title="Remove"
+                      onClick={() => removeEntry(i)}>×</button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          <div className="ec-field" style={{ marginTop: 8, marginBottom: 0 }}>
+            <label htmlFor="ec-tocadd" style={{ fontSize: 13 }}>Add an entry for a section</label>
+            <select id="ec-tocadd" value=""
+              onChange={(ev) => { if (ev.target.value !== '') addForSection(Number(ev.target.value)); }}>
+              <option value="">Choose a section…</option>
+              {book.sections.map((s, i) => (
+                <option key={s.id} value={i}>{(i + 1) + '. ' + clip(titles[i]).slice(0, 60)}</option>
+              ))}
+            </select>
+          </div>
+        </details>
+
+        <details className="ec-edit">
+          <summary>
+            Search and replace
+            <span className="ec-editnote">text only, never the markup</span>
+          </summary>
 
           <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
             Search and replace across the whole book, on the text only, never on the markup.
@@ -4747,14 +5466,20 @@
             </div>
           </div>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
+            <label style={{ fontSize: 13, color: '#94a3b8', marginBottom: 0 }}
+              title="Off, replacing &quot;the&quot; also hits the &quot;the&quot; inside &quot;they&quot;.">
+              <input type="checkbox" checked={wholeWord}
+                onChange={(e) => { setWholeWord(e.target.checked); setSrMsg(null); }} />
+              {' '}Whole words only
+            </label>
             <label style={{ fontSize: 13, color: '#94a3b8', marginBottom: 0 }}>
               <input type="checkbox" checked={useRegex}
-                onChange={(e) => { setUseRegex(e.target.checked); setFound(null); setSrMsg(null); }} />
+                onChange={(e) => { setUseRegex(e.target.checked); setSrMsg(null); }} />
               {' '}Regular expression
             </label>
             <label style={{ fontSize: 13, color: '#94a3b8', marginBottom: 0 }}>
               <input type="checkbox" checked={matchCase}
-                onChange={(e) => { setMatchCase(e.target.checked); setFound(null); setSrMsg(null); }} />
+                onChange={(e) => { setMatchCase(e.target.checked); setSrMsg(null); }} />
               {' '}Match case
             </label>
             <button className="lang-seg" onClick={runFind}>Find</button>
@@ -4795,7 +5520,37 @@
               )}
             </div>
           )}
+
         </details>
+
+        <details className="ec-edit">
+          <summary>
+            Typography
+            <span className="ec-editnote">quotes, ellipses, dashes</span>
+          </summary>
+
+          <label style={{ color: '#94a3b8', fontSize: 13, marginBottom: 6, display: 'block' }}>
+            Straight quotes become typographic ones, three dots an ellipsis,
+            hyphen runs proper dashes. Code blocks are left alone. Applies to the loaded
+            book; convert afterwards.
+          </label>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+            <div className="seg-row" style={{ display: 'flex' }}>
+              {[['auto', 'Auto: ' + autoLang], ['de', 'German'], ['en', 'English']].map((o) => (
+                <button key={o[0]}
+                  className={'lang-seg' + (typoLang === o[0] ? ' active' : '')}
+                  onClick={() => setTypoLang(o[0])}>{o[1]}</button>
+              ))}
+            </div>
+            <button onClick={runTypo} style={{ width: 'auto', marginBottom: 0 }}>
+              Clean up typography
+            </button>
+          </div>
+          {typoMsg && (
+            <p style={{ fontSize: 13, color: '#0fb5ad', marginBottom: 6 }}>{typoMsg}</p>
+          )}
+        </details>
+        </div>
       );
     }
 
@@ -4896,17 +5651,6 @@
             comes out. Your file is never uploaded, and it stays on your device.
           </p>
 
-          <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 18 }}>
-            {TABS.map((t) => (
-              <button key={t.id}
-                className={'lang-seg' + (tab === t.id ? ' active' : '')}
-                onClick={() => pickTab(t.id)}>{t.label}</button>
-            ))}
-          </div>
-
-          {tab === 'preview' && <PreviewTab book={book} />}
-
-          {isConvert && <React.Fragment>
           <Machine detected={book ? book.sourceFormat : null} target={target} />
 
           <div
@@ -4942,6 +5686,18 @@
               <div style={{ marginTop: 4 }}>{error}</div>
             </div>
           )}
+
+          <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 18 }}>
+            {TABS.map((t) => (
+              <button key={t.id}
+                className={'lang-seg' + (tab === t.id ? ' active' : '')}
+                onClick={() => pickTab(t.id)}>{t.label}</button>
+            ))}
+          </div>
+
+          {tab === 'preview' && <PreviewTab book={book} />}
+
+          {isConvert && <React.Fragment>
 
           {book && (
             <div className="ec-card" style={{ marginBottom: 18 }}>
