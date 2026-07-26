@@ -1,0 +1,1998 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Language Zipper - Alexander Alber</title>
+  <meta name="description" content="Paste a few words in any language and watch a compression model guess which one it is. Ranked candidates, a family tree of 87 languages built from the same measurements, and a map of how close they sit to each other.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/language-zipper.html">
+  <meta property="og:title" content="Language Zipper - identifying languages by compression">
+  <meta property="og:description" content="A character model trained on 87 languages. Paste text, see which language explains it in the fewest bits, and where your sample lands in a tree built from nothing but compressibility.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/language-zipper.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Multi-button segmented control (same pattern as the input-shaper tool). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active):not(:disabled),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+
+    .lz-card { border: 1px solid #334155; border-radius: 8px; padding: 14px 16px;
+      background: rgba(15,23,42,.55); }
+    .lz-ta { font-size: 15px; line-height: 1.6; min-height: 128px; resize: vertical;
+      margin-bottom: 6px; }
+    .lz-bar { height: 100%; border-radius: 3px; transition: width .18s ease; }
+    .lz-track { background: rgba(148,163,184,.13); border-radius: 3px; height: 16px;
+      overflow: hidden; }
+    .lz-row { display: grid; grid-template-columns: 148px 1fr 92px; gap: 10px;
+      align-items: center; padding: 3px 0; font-size: 13.5px; }
+    .lz-row .num { text-align: right; font-variant-numeric: tabular-nums; color: #94a3b8; }
+    .lz-load { height: 6px; background: rgba(148,163,184,.15); border-radius: 3px;
+      overflow: hidden; }
+    .lz-load > div { height: 100%; background: #38bdf8; border-radius: 3px;
+      transition: width .25s ease; }
+    .lz-chip { display: inline-block; border: 1px solid #334155; border-radius: 999px;
+      padding: 1px 9px; font-size: 11.5px; color: #94a3b8; margin: 2px 4px 2px 0; }
+    .lz-note { border: 1px solid #78350f; background: rgba(120,53,15,.15); border-radius: 8px;
+      padding: 10px 14px; color: #d9a05b; font-size: 13px; }
+    .lz-scroll { overflow-x: auto; }
+    /* The map is a bounded plane, not a drawing that bleeds into the page.
+       The frame also tells the reader where the wheel-zoom surface ends. */
+    .lz-mapwrap { border: 1px solid #334155; border-radius: 8px;
+      background: rgba(15,23,42,.55); overflow: hidden; }
+    .lz-mapwrap svg { border-radius: 8px; }
+    .lz-ex { background: none; border: none; padding: 0; margin: 0 12px 0 0;
+      font-size: 12.5px; color: #64748b; cursor: pointer; text-decoration: underline;
+      text-underline-offset: 2px; width: auto; display: inline; }
+    .lz-ex:hover { color: #cbd5e1; background: none; }
+    @media (max-width: 560px) { .lz-row { grid-template-columns: 104px 1fr 74px; } }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Language Zipper",
+    "description": "Language identification by compression. An order-3 byte-level character model with Witten-Bell interpolation, trained on 87 languages from the Tatoeba corpus, scores a pasted text by how many bits each language's model needs to encode it. Includes a UPGMA dendrogram and a multidimensional scaling map built from the same cross-entropy measurements.",
+    "url": "https://alber.me/miscellaneous/tools/language-zipper.html",
+    "applicationCategory": "EducationalApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+        <li class="lang-switcher">
+          <button class="lang-seg" data-lang="en">EN</button><button class="lang-seg" data-lang="de">DE</button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script>
+    (function () {
+      var urlLang = new URLSearchParams(location.search).get('lang');
+      if (urlLang === 'en' || urlLang === 'de') { try { localStorage.setItem('lang', urlLang); } catch (e) {} }
+      var l = urlLang;
+      if (l !== 'en' && l !== 'de') { try { l = localStorage.getItem('lang') || 'en'; } catch (e) { l = 'en'; } }
+      document.documentElement.lang = l;
+      document.querySelectorAll('.lang-seg').forEach(function (btn) {
+        if (btn.getAttribute('data-lang') === l) btn.classList.add('active');
+        btn.onclick = function () {
+          var lang = btn.getAttribute('data-lang');
+          try { localStorage.setItem('lang', lang); } catch (e) {}
+          var url = new URL(location.href);
+          if (lang === 'en') url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
+          location.replace(url.href);
+        };
+      });
+    })();
+  </script>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">← Miscellaneous</a>
+    </p>
+    <script>if((localStorage.getItem('lang')||'en')==='de')document.currentScript.previousElementSibling.querySelector('a').textContent='← Sonstiges';</script>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Language Zipper</h1>
+        <p style="color:#94a3b8;max-width:70ch">Paste a sentence in any language. A small character model trained separately on each of 87 languages measures how many bits it needs to encode your text, and the language that needs the fewest is the guess. The same measurement, applied between the languages themselves, builds a family tree and a map without anyone telling it what a language family is.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Model core: plain JS (no JSX, no DOM) so it can be extracted and
+       unit-tested in Node (notes/dev/langzip.test.mjs). Generated from
+       notes/dev/ncdcore.draft.js by notes/dev/embed-core.mjs. Edit the draft,
+       not this block.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="ncdcore">
+  /* NCD-CORE-START -- pure logic, no DOM. Runs in the browser and, byte for byte
+     identically, in the Node build script and test suite.
+
+     Language identification by character-level context modelling. The classic
+     version of this trick (Benedetto, Caglioti & Loreto 2002) appends the query
+     to a reference text and measures how much a general compressor such as gzip
+     grows. We model the reference directly instead: an order-3 byte model with
+     Witten-Bell interpolation, scored as a code length. No arithmetic coder is
+     needed because only the ranking across models matters, never the encoded
+     bytes.
+
+     Byte level, not codepoint level, on purpose. It caps the alphabet at 256 so
+     CJK cannot blow up the tables, and it removes the zero-frequency problem
+     structurally: every possible UTF-8 byte is already in the alphabet, so no
+     escape mechanism is required. */
+  var NCDCore = (function () {
+    'use strict';
+
+    /* ---------- tunables -------------------------------------------------- */
+    var ORDER = 3;            // order 3 is the knee; order 4 costs 2.2x the table for <=0.3pp
+    var ALPHABET = 256;
+    var PRUNE_MIN = 3;        // drop contexts seen fewer times than this
+    var COUNT_BITS = 4;       // logarithmic count buckets; 4 bits is lossless for accuracy, 3 is not
+    var TEMP_PER_BYTE = 0.12; // softmax temperature per byte, calibrated against measured accuracy
+    var MIN_CHARS = 20;       // below this the answer is noise and the UI says so
+    var RELIABLE_CHARS = 100; // at and above this, measured accuracy is 99.6%
+
+    /* ---------- small helpers --------------------------------------------- */
+
+    function encodeUtf8(str) {
+      if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+      var out = [], i, c;
+      for (i = 0; i < str.length; i++) {
+        c = str.charCodeAt(i);
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+        else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+      return new Uint8Array(out);
+    }
+
+    /* Indentation style is a formatting habit, not a language. Left alone it
+       dominates: because gofmt forces tabs and almost every other snippet uses
+       spaces, the model learned "tab means Go" and read tab-indented Python as Go
+       with 83% confidence, while space-indented Go came out as TypeScript.
+
+       Normalising leading whitespace to a single tab per level removes the style
+       and keeps the structure, which is the part that actually differs between
+       languages (Python's block indentation is real syntax; C's is decoration).
+       Applied identically at training and query time. Two spaces per level is
+       assumed for space indentation; getting that wrong merely changes the depth,
+       not the shape, and the depth is not what identifies a language.
+
+       Only leading whitespace is touched. Alignment inside a line and every other
+       byte pass through untouched. */
+    function normalizeIndent(str) {
+      return str.replace(/^[ \t]+/gm, function (ws) {
+        var spaces = 0, tabs = 0, i;
+        for (i = 0; i < ws.length; i++) {
+          if (ws.charCodeAt(i) === 9) tabs++; else spaces++;
+        }
+        var levels = tabs + Math.floor(spaces / 2);
+        return new Array(levels + 1).join('\t');
+      });
+    }
+
+    /* Deterministic PRNG so every build and every test run agrees. */
+    function mulberry32(seed) {
+      var a = seed >>> 0;
+      return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        var t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /* ---------- training (build time only) --------------------------------
+
+       A model is one Map per order. The key packs the preceding bytes into an
+       integer (order 1 -> b0, order 2 -> b0<<8|b1, order 3 -> b0<<16|b1<<8|b2),
+       the value holds the 256 symbol counts plus the running total and the
+       number of distinct symbols seen. Order 0 is a single unconditional node. */
+
+    function newNode() {
+      return { c: new Uint32Array(ALPHABET), t: 0, d: 0 };
+    }
+
+    function train(bytes, order) {
+      if (order === undefined) order = ORDER;
+      var levels = [], k;
+      for (k = 0; k <= order; k++) levels.push(new Map());
+      levels[0].set(0, newNode());
+
+      for (var i = 0; i < bytes.length; i++) {
+        var sym = bytes[i];
+        for (k = 0; k <= order; k++) {
+          if (i < k) break;                       // not enough history for this order yet
+          var key = 0;
+          for (var j = k; j >= 1; j--) key = (key << 8) | bytes[i - j];
+          var lvl = levels[k];
+          var node = lvl.get(key);
+          if (node === undefined) { node = newNode(); lvl.set(key, node); }
+          if (node.c[sym] === 0) node.d++;
+          node.c[sym]++;
+          node.t++;
+        }
+      }
+      return { maxOrder: order, levels: levels };
+    }
+
+    /* Contexts seen only once or twice are mostly accidents of the training
+       sample. Dropping them costs little accuracy and shrinks the payload.
+       Order 0 is never pruned; it is the backoff floor. */
+    function prune(model, minTotal) {
+      if (minTotal === undefined) minTotal = PRUNE_MIN;
+      for (var k = 1; k <= model.maxOrder; k++) {
+        var lvl = model.levels[k], dead = [];
+        lvl.forEach(function (node, key) { if (node.t < minTotal) dead.push(key); });
+        for (var i = 0; i < dead.length; i++) lvl.delete(dead[i]);
+      }
+      return model;
+    }
+
+    /* Counts are stored in logarithmic buckets so each fits in COUNT_BITS.
+       Measured: 4 bits leaves identification accuracy unchanged, and the
+       recomputed totals keep the model self-consistent. */
+    function bucketOf(count, bits) {
+      if (count <= 0) return 0;
+      var maxB = (1 << bits) - 1;
+      var b = Math.round(Math.log2(count) * 2) + 1;
+      return b > maxB ? maxB : b;
+    }
+    function valueOf(bucket) {
+      if (bucket <= 0) return 0;
+      return Math.max(1, Math.round(Math.pow(2, (bucket - 1) / 2)));
+    }
+
+    function quantizeCounts(model, bits) {
+      if (bits === undefined) bits = COUNT_BITS;
+      for (var k = 0; k <= model.maxOrder; k++) {
+        model.levels[k].forEach(function (node) {
+          var t = 0, d = 0;
+          for (var s = 0; s < ALPHABET; s++) {
+            if (node.c[s] === 0) continue;
+            var v = valueOf(bucketOf(node.c[s], bits));
+            node.c[s] = v; t += v; d++;
+          }
+          node.t = t; node.d = d;
+        });
+      }
+      return model;
+    }
+
+    /* ---------- serialization ---------------------------------------------
+
+       Varint everywhere, context keys delta coded against the previous key at
+       the same order. Symbols within a node are also delta coded. The result is
+       about 40% smaller than the same data as JSON. */
+
+    function VarintWriter() { this.buf = []; }
+    VarintWriter.prototype.u = function (n) {
+      n = n >>> 0;
+      while (n >= 0x80) { this.buf.push((n & 0x7f) | 0x80); n >>>= 7; }
+      this.buf.push(n);
+    };
+    VarintWriter.prototype.bytes = function () { return new Uint8Array(this.buf); };
+
+    function VarintReader(u8) { this.a = u8; this.p = 0; }
+    VarintReader.prototype.u = function () {
+      var shift = 0, res = 0, b;
+      do { b = this.a[this.p++]; res |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+      return res >>> 0;
+    };
+    VarintReader.prototype.done = function () { return this.p >= this.a.length; };
+
+    function serialize(model) {
+      var w = new VarintWriter();
+      w.u(model.maxOrder);
+      for (var k = 0; k <= model.maxOrder; k++) {
+        var lvl = model.levels[k];
+        var keys = Array.from(lvl.keys()).sort(function (a, b) { return a - b; });
+        w.u(keys.length);
+        var prevKey = 0;
+        for (var i = 0; i < keys.length; i++) {
+          var key = keys[i], node = lvl.get(key);
+          w.u(key - prevKey); prevKey = key;
+          var syms = [];
+          for (var s = 0; s < ALPHABET; s++) if (node.c[s] > 0) syms.push(s);
+          w.u(syms.length);
+          var prevSym = 0;
+          for (var j = 0; j < syms.length; j++) {
+            w.u(syms[j] - prevSym); prevSym = syms[j];
+            w.u(node.c[syms[j]]);
+          }
+        }
+      }
+      return w.bytes();
+    }
+
+    /* ---------- flat model (load time) ------------------------------------
+
+       The obvious Map-of-objects representation measured 259 MB of heap for 100
+       models, which would kill mobile Safari. This open-addressed flat form
+       measured 24 MB and produces bit-identical code lengths. It is a
+       requirement, not an optimization.
+
+       Layout per order: a power-of-two hash table of keys (Int32Array, -1 empty)
+       pointing at a slot index. Per slot we store the total, the distinct count,
+       and an offset/length into shared symbol and count arrays. */
+
+    function nextPow2(n) { var p = 1; while (p < n) p <<= 1; return p; }
+
+    function buildFlatLevel(entries) {
+      // entries: [{key, syms:[], cnts:[], t, d}]
+      var n = entries.length;
+      var cap = nextPow2(Math.max(4, Math.ceil(n / 0.6)));
+      var mask = cap - 1;
+      var hkey = new Int32Array(cap).fill(-1);
+      var hslot = new Int32Array(cap).fill(-1);
+      var total = new Float32Array(n);
+      var distinct = new Float32Array(n);
+      var off = new Uint32Array(n + 1);
+      var symTotal = 0, i;
+      for (i = 0; i < n; i++) symTotal += entries[i].syms.length;
+      var syms = new Uint8Array(symTotal);
+      var cnts = new Float32Array(symTotal);
+      var cursor = 0;
+      for (i = 0; i < n; i++) {
+        var e = entries[i];
+        off[i] = cursor;
+        for (var j = 0; j < e.syms.length; j++) { syms[cursor] = e.syms[j]; cnts[cursor] = e.cnts[j]; cursor++; }
+        total[i] = e.t; distinct[i] = e.d;
+        // open addressing, linear probing
+        var h = (Math.imul(e.key ^ (e.key >>> 15), 0x2545F491) >>> 0) & mask;
+        while (hkey[h] !== -1) h = (h + 1) & mask;
+        hkey[h] = e.key; hslot[h] = i;
+      }
+      off[n] = cursor;
+      return { mask: mask, hkey: hkey, hslot: hslot, total: total, distinct: distinct, off: off, syms: syms, cnts: cnts };
+    }
+
+    function deserialize(u8) {
+      var r = new VarintReader(u8);
+      var maxOrder = r.u();
+      var levels = [];
+      for (var k = 0; k <= maxOrder; k++) {
+        var count = r.u();
+        var entries = [];
+        var prevKey = 0;
+        for (var i = 0; i < count; i++) {
+          var key = prevKey + r.u(); prevKey = key;
+          var ns = r.u();
+          var symsArr = new Array(ns), cntsArr = new Array(ns);
+          var prevSym = 0, t = 0;
+          for (var j = 0; j < ns; j++) {
+            var sym = prevSym + r.u(); prevSym = sym;
+            var c = r.u();
+            symsArr[j] = sym; cntsArr[j] = c; t += c;
+          }
+          entries.push({ key: key, syms: symsArr, cnts: cntsArr, t: t, d: ns });
+        }
+        levels.push(buildFlatLevel(entries));
+      }
+      return { maxOrder: maxOrder, levels: levels };
+    }
+
+    /* Look up a context key, returning the slot index or -1. */
+    function findSlot(lvl, key) {
+      var h = (Math.imul(key ^ (key >>> 15), 0x2545F491) >>> 0) & lvl.mask;
+      var hkey = lvl.hkey;
+      while (true) {
+        var k = hkey[h];
+        if (k === -1) return -1;
+        if (k === key) return lvl.hslot[h];
+        h = (h + 1) & lvl.mask;
+      }
+    }
+
+    function countIn(lvl, slot, sym) {
+      var a = lvl.off[slot], b = lvl.off[slot + 1], syms = lvl.syms;
+      for (var i = a; i < b; i++) if (syms[i] === sym) return lvl.cnts[i];
+      return 0;
+    }
+
+    /* ---------- code length ------------------------------------------------
+
+       Recursive Witten-Bell interpolation:
+
+         p_k = (c_k(s) + d_k * p_{k-1}) / (t_k + d_k),  p_{-1} = 1/256
+
+       where c_k is the count of s in the order-k context, t_k the context total
+       and d_k the number of distinct symbols seen there. The descent stops at a
+       context that was never seen. No escapes, no exclusion: measured against
+       PPM-C and PPM-D this is as accurate and about five times faster, because
+       only the argmin over models matters, never a real encodable code. */
+
+    function codeLen(flat, bytes) {
+      var bits = 0, maxOrder = flat.maxOrder, levels = flat.levels;
+      var uniform = 1 / ALPHABET;
+      for (var i = 0; i < bytes.length; i++) {
+        var sym = bytes[i];
+        var p = uniform;
+        var hi = maxOrder < i ? maxOrder : i;
+        for (var k = 0; k <= hi; k++) {
+          var key = 0;
+          for (var j = k; j >= 1; j--) key = (key << 8) | bytes[i - j];
+          var lvl = levels[k];
+          var slot = findSlot(lvl, key);
+          if (slot === -1) break;
+          var t = lvl.total[slot], d = lvl.distinct[slot];
+          p = (countIn(lvl, slot, sym) + d * p) / (t + d);
+        }
+        bits -= Math.log2(p);
+      }
+      return bits;
+    }
+
+    /* ---------- scoring ---------------------------------------------------- */
+
+    /* models: [{code, flat}]. Returns per-model bits/byte plus a calibrated
+       posterior. The relative value (bits/byte minus the mean over all models)
+       is what the bars show: subtracting the mean cancels how intrinsically
+       complex the pasted text is, so a simple sentence and a dense one produce
+       comparably scaled bars. */
+    function scoreAll(models, text) {
+      var bytes = encodeUtf8(text);
+      var n = models.length;
+      var bits = new Float64Array(n), bpb = new Float64Array(n);
+      var i;
+      for (i = 0; i < n; i++) {
+        bits[i] = codeLen(models[i].flat, bytes);
+        bpb[i] = bytes.length ? bits[i] / bytes.length : 0;
+      }
+      var mean = 0;
+      for (i = 0; i < n; i++) mean += bpb[i];
+      mean = n ? mean / n : 0;
+      var relative = new Float64Array(n);
+      for (i = 0; i < n; i++) relative[i] = bpb[i] - mean;
+
+      // Raw softmax saturates to 100/0 and would overstate certainty. This
+      // temperature was calibrated so mean top-1 probability tracks measured
+      // accuracy across query lengths.
+      var T = TEMP_PER_BYTE * Math.max(1, bytes.length);
+      var best = Infinity;
+      for (i = 0; i < n; i++) if (bits[i] < best) best = bits[i];
+      var post = new Float64Array(n), sum = 0;
+      for (i = 0; i < n; i++) { post[i] = Math.exp(-(bits[i] - best) / T); sum += post[i]; }
+      for (i = 0; i < n; i++) post[i] /= sum;
+
+      var ranked = [];
+      for (i = 0; i < n; i++) ranked.push({ i: i, code: models[i].code, bits: bits[i], bpb: bpb[i], relative: relative[i], posterior: post[i] });
+      ranked.sort(function (a, b) { return a.bits - b.bits; });
+      return { nbytes: bytes.length, bits: bits, bitsPerByte: bpb, relative: relative, posterior: post, ranked: ranked };
+    }
+
+    /* ---------- language geometry ------------------------------------------ */
+
+    /* Cross-entropy of each language's probe text under every model. */
+    function crossEntropyMatrix(models, probes) {
+      var n = models.length, H = [];
+      for (var i = 0; i < n; i++) {
+        H.push(new Float64Array(n));
+        var pb = encodeUtf8(probes[i]);
+        for (var j = 0; j < n; j++) H[i][j] = codeLen(models[j].flat, pb) / pb.length;
+      }
+      return H;
+    }
+
+    /* Cross-entropy is strongly asymmetric. Of four symmetrizations tested, the
+       plain average recovered the most same-family nearest neighbours (82%), so
+       that is what the tree uses. */
+    function symmetrize(H, mode) {
+      var n = H.length, D = [], i, j;
+      for (i = 0; i < n; i++) D.push(new Float64Array(n));
+      for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++) {
+          if (i === j) { D[i][j] = 0; continue; }
+          if (mode === 'excess') {
+            D[i][j] = ((H[i][j] - H[i][i]) + (H[j][i] - H[j][j])) / 2;
+          } else {
+            D[i][j] = (H[i][j] + H[j][i]) / 2;
+          }
+        }
+      }
+      // The average form leaves the diagonal at the self-entropy level, which
+      // would make a language look distant from itself. Shift so the smallest
+      // off-diagonal sits above zero and the diagonal is exactly zero.
+      if (mode !== 'excess') {
+        for (i = 0; i < n; i++) {
+          for (j = 0; j < n; j++) {
+            if (i !== j) D[i][j] = D[i][j] - (H[i][i] + H[j][j]) / 2;
+          }
+        }
+        var mn = Infinity;
+        for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j && D[i][j] < mn) mn = D[i][j];
+        if (mn < 0) {
+          for (i = 0; i < n; i++) for (j = 0; j < n; j++) if (i !== j) D[i][j] -= mn;
+        }
+      }
+      return D;
+    }
+
+    /* UPGMA, average linkage. Chosen over neighbour joining because NJ produced
+       long unbalanced ladders on this data; UPGMA's rooted balanced output is
+       what a dendrogram wants. Heights are half the merge distance so they read
+       as an ultrametric axis. */
+    function upgma(D, labels) {
+      var n = D.length;
+      if (n === 0) return null;
+      var active = [], i, j;
+      for (i = 0; i < n; i++) active.push({ node: { leaf: true, code: labels[i], height: 0, size: 1 }, members: [i] });
+      // working copy of the distance matrix over cluster indices
+      var d = [];
+      for (i = 0; i < n; i++) { d.push(new Float64Array(n)); for (j = 0; j < n; j++) d[i][j] = D[i][j]; }
+      var idx = [];
+      for (i = 0; i < n; i++) idx.push(i);
+
+      while (active.length > 1) {
+        var bi = -1, bj = -1, bd = Infinity;
+        for (i = 0; i < active.length; i++) {
+          for (j = i + 1; j < active.length; j++) {
+            var v = d[idx[i]][idx[j]];
+            if (v < bd) { bd = v; bi = i; bj = j; }
+          }
+        }
+        var A = active[bi], B = active[bj];
+        var merged = {
+          leaf: false,
+          left: A.node, right: B.node,
+          height: bd / 2,
+          size: A.node.size + B.node.size
+        };
+        // average linkage update, weighted by cluster size
+        var ni = A.members.length, nj = B.members.length;
+        var ai = idx[bi], aj = idx[bj];
+        for (var k = 0; k < active.length; k++) {
+          if (k === bi || k === bj) continue;
+          var ak = idx[k];
+          var nd = (ni * d[ai][ak] + nj * d[aj][ak]) / (ni + nj);
+          d[ai][ak] = nd; d[ak][ai] = nd;
+        }
+        A.node = merged;
+        A.members = A.members.concat(B.members);
+        active.splice(bj, 1);
+        idx.splice(bj, 1);
+      }
+      return active[0].node;
+    }
+
+    /* Leaf order and coordinates for a rectangular dendrogram. x is the height,
+       y is the in-order position of the leaves. */
+    function layoutTree(tree) {
+      var leaves = [], links = [], nodes = [];
+      var counter = { y: 0 };
+      function walk(node) {
+        if (node.leaf) {
+          node._y = counter.y++;
+          node._x = 0;
+          leaves.push(node);
+          nodes.push(node);
+          return node;
+        }
+        var L = walk(node.left), R = walk(node.right);
+        node._y = (L._y + R._y) / 2;
+        node._x = node.height;
+        nodes.push(node);
+        links.push({ from: node, to: L });
+        links.push({ from: node, to: R });
+        return node;
+      }
+      walk(tree);
+      var maxHeight = 0;
+      for (var i = 0; i < nodes.length; i++) if (nodes[i]._x > maxHeight) maxHeight = nodes[i]._x;
+      return { nodes: nodes, links: links, leaves: leaves, maxHeight: maxHeight };
+    }
+
+    /* Insert the user's sample as an extra leaf without rebuilding the tree.
+       Rebuilding would make the corpus tree jump around on every keystroke; the
+       point is that the sample lands in a stable tree.
+
+       `distByCode` must be on the same scale as the tree's heights, which means
+       the caller has to subtract self-entropy the way symmetrize() does. Raw
+       cross-entropy runs roughly three times larger and lands every sample at the
+       root.
+
+       The descent follows the *minimum* distance, not the mean. Mean linkage was
+       the obvious choice and is wrong here: averaging over a large clade drowns
+       the one language that actually matches, so a Finnish sample went to a clade
+       of 52 languages instead of next to Finnish. The nearest corpus language is
+       exactly what a reader expects the sample to hang beside.
+
+       Having found that leaf, walk back up while the sample is closer to the
+       clade than the clade's own spread, so a sample that fits a whole family
+       attaches to the family rather than being jammed against one member. */
+    function graftLeaf(tree, distByCode, label) {
+      function minTo(node) {
+        var best = Infinity;
+        (function walk(x) {
+          if (x.leaf) { var v = distByCode[x.code]; if (v !== undefined && v < best) best = v; return; }
+          walk(x.left); walk(x.right);
+        })(node);
+        return best;
+      }
+      var sampleNode = { leaf: true, code: label, height: 0, size: 1, isSample: true };
+
+      // Path from the root down to the nearest leaf.
+      var path = [];
+      (function descend(node) {
+        path.push(node);
+        if (node.leaf) return;
+        var dl = minTo(node.left), dr = minTo(node.right);
+        descend(dl <= dr ? node.left : node.right);
+      })(tree);
+
+      var d = minTo(path[path.length - 1]);   // distance to the nearest language
+      // Climb only as long as the clade below is tighter than the sample's own
+      // distance: the sample belongs to that clade as a whole rather than to one
+      // member. Comparing against the child's height, not the parent's, is what
+      // stops the walk. (Against the parent's it never stops, because the root is
+      // taller than any single distance, and everything lands at the root.)
+      var attachAt = path.length - 1;
+      for (var k = path.length - 2; k >= 0; k--) {
+        var child = path[k + 1];
+        var spread = child.leaf ? 0 : child.height;
+        // Strictly greater. With >= a sample that matches one language exactly
+        // (d = 0, the common case, since the nearest distance is clamped at zero)
+        // satisfies the test at every level and climbs all the way to the root.
+        if (spread > d / 2) attachAt = k; else break;
+      }
+      var target = path[attachAt];
+
+      function rebuild(node) {
+        if (node === target) {
+          return {
+            leaf: false, left: node, right: sampleNode,
+            height: Math.max(node.leaf ? 0 : node.height, d / 2),
+            size: node.size + 1, hasSample: true
+          };
+        }
+        if (node.leaf) return node;
+        var inLeft = contains(node.left, target);
+        var copy = {
+          leaf: false, left: node.left, right: node.right,
+          height: node.height, size: node.size + 1, hasSample: true
+        };
+        if (inLeft) copy.left = rebuild(node.left); else copy.right = rebuild(node.right);
+        return copy;
+      }
+      function contains(node, needle) {
+        if (node === needle) return true;
+        if (node.leaf) return false;
+        return contains(node.left, needle) || contains(node.right, needle);
+      }
+      return rebuild(tree);
+    }
+
+    /* Feeding the raw distance to the map lets script differences dominate: a
+       Cyrillic and a Latin text share almost no byte patterns, so those pairs sit
+       far outside the range that separates, say, German from Dutch, and every
+       Latin-script language collapses into one blob.
+
+       Compressing the scale fixes that. A logarithm is the natural choice here
+       because cross-entropy is already a log quantity, so this stays in units the
+       measure is defined in rather than introducing an arbitrary exponent.
+
+       Measured on an earlier 47-language corpus with 5 random starts, before
+       smacofBest began selecting on neighbour trust. What matters here is the
+       comparison between transforms, which that change does not affect. The
+       fraction of languages whose nearest neighbour on the map is also their
+       true nearest neighbour:
+       rank transform 26%, raw distance 47%, log with s between 3 and 12 all
+       46-48%. The log form additionally gives the Latin-script languages 61% of
+       the map instead of 47%, which is the whole point. The plateau is flat, so
+       s = 4 is a choice within a broad safe range, not a tuned optimum. */
+    var MDS_SCALE = 4;
+    /* Restarts for the map layout. Build-time only, so this costs the visitor
+       nothing; ~50 s for the 87-language corpus. See smacofBest for why the
+       count is this high and why the winner is chosen on neighbour trust. */
+    var SMACOF_TRIES = 1200;
+
+    function logTransform(D, scale) {
+      if (scale === undefined) scale = MDS_SCALE;
+      var n = D.length, out = [], i, j, mx = 0;
+      for (i = 0; i < n; i++) out.push(new Float64Array(n));
+      for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++) {
+          if (i === j) continue;
+          out[i][j] = Math.log1p(D[i][j] / scale);
+          if (out[i][j] > mx) mx = out[i][j];
+        }
+      }
+      if (mx > 0) for (i = 0; i < n; i++) for (j = 0; j < n; j++) out[i][j] /= mx;
+      return out;
+    }
+
+    /* Kept for comparison in the test suite; not what the map uses. */
+    function rankTransform(D) {
+      var n = D.length, pairs = [], i, j;
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) pairs.push({ i: i, j: j, v: D[i][j] });
+      pairs.sort(function (a, b) { return a.v - b.v; });
+      var out = [];
+      for (i = 0; i < n; i++) out.push(new Float64Array(n));
+      for (var r = 0; r < pairs.length; r++) {
+        var p = pairs[r];
+        var v = pairs.length > 1 ? r / (pairs.length - 1) : 0;
+        out[p.i][p.j] = v; out[p.j][p.i] = v;
+      }
+      return out;
+    }
+
+    /* SMACOF stress majorization. */
+    function smacof(D, iters, seed) {
+      if (iters === undefined) iters = 600;
+      var n = D.length;
+      var rnd = mulberry32(seed === undefined ? 12345 : seed);
+      var X = [];
+      for (var i = 0; i < n; i++) X.push([rnd() * 2 - 1, rnd() * 2 - 1]);
+      if (n < 2) return { X: X, stress: 0 };
+
+      var stress = 0;
+      for (var it = 0; it < iters; it++) {
+        var Y = [];
+        for (i = 0; i < n; i++) Y.push([0, 0]);
+        for (i = 0; i < n; i++) {
+          var sx = 0, sy = 0, wsum = 0;
+          for (var j = 0; j < n; j++) {
+            if (i === j) continue;
+            var dx = X[i][0] - X[j][0], dy = X[i][1] - X[j][1];
+            var dist = Math.sqrt(dx * dx + dy * dy);
+            var ratio = dist > 1e-9 ? D[i][j] / dist : 0;
+            sx += X[j][0] + ratio * dx;
+            sy += X[j][1] + ratio * dy;
+            wsum++;
+          }
+          Y[i][0] = sx / wsum; Y[i][1] = sy / wsum;
+        }
+        X = Y;
+      }
+      // final normalized stress
+      var num = 0, den = 0;
+      for (i = 0; i < n; i++) {
+        for (var j2 = i + 1; j2 < n; j2++) {
+          var ddx = X[i][0] - X[j2][0], ddy = X[i][1] - X[j2][1];
+          var dd = Math.sqrt(ddx * ddx + ddy * ddy);
+          num += (dd - D[i][j2]) * (dd - D[i][j2]);
+          den += D[i][j2] * D[i][j2];
+        }
+      }
+      stress = den > 0 ? Math.sqrt(num / den) : 0;
+      return { X: X, stress: stress };
+    }
+
+    /* Neighbourhood preservation: of each point's k true nearest, how many are
+       still among its k nearest in the layout. Unlike stress, which averages
+       every pair and is dominated by the large distances, this measures the
+       one thing a reader takes off the map, namely who sits next to whom. */
+    function neighbourTrust(D, X, k) {
+      var n = D.length, hit = 0, tot = 0, i, j;
+      if (k === undefined) k = 5;
+      var idx = [];
+      for (i = 0; i < n; i++) idx.push(i);
+      for (i = 0; i < n; i++) {
+        var others = [];
+        for (j = 0; j < n; j++) if (j !== i) others.push(j);
+        var byTrue = others.slice().sort(function (a, b) { return D[i][a] - D[i][b]; });
+        var byMap = others.slice().sort(function (a, b) {
+          var da = (X[a][0] - X[i][0]) * (X[a][0] - X[i][0]) + (X[a][1] - X[i][1]) * (X[a][1] - X[i][1]);
+          var db = (X[b][0] - X[i][0]) * (X[b][0] - X[i][0]) + (X[b][1] - X[i][1]) * (X[b][1] - X[i][1]);
+          return da - db;
+        });
+        var near = {};
+        for (j = 0; j < k && j < byMap.length; j++) near[byMap[j]] = 1;
+        for (j = 0; j < k && j < byTrue.length; j++) { tot++; if (near[byTrue[j]]) hit++; }
+      }
+      return tot ? hit / tot : 0;
+    }
+
+    /* Majorization only finds a local optimum, and the starting configuration
+       decides which one. Run many fixed seeds and keep the best.
+
+       Selection is by neighbourhood trust, not by stress. Measured over 1665
+       seeds on the 87-language corpus: stress spans only 0.2869 to 0.2985
+       while trust@5 spans 36.8% to 52.2%, and the two barely correlate (a run
+       at 0.2981, near the worst stress, tied for the best trust). Picking the
+       lowest stress therefore picks close to arbitrarily among layouts that
+       differ a lot in the neighbourhoods a reader actually reads. Selecting on
+       trust gives 52.2% where lowest-stress gives 49.9% over the same runs.
+
+       k=5 and k=10 are averaged so the choice is not tuned to one radius.
+       The seed list is generated from a fixed formula, so the build stays
+       reproducible; iterations past ~600 change neither measure. */
+    function smacofBest(D, iters, seeds) {
+      if (seeds === undefined) {
+        seeds = [];
+        for (var s = 0; s < SMACOF_TRIES; s++) seeds.push(s * 7919 + 1);
+      }
+      var best = null, bestScore = -1;
+      for (var i = 0; i < seeds.length; i++) {
+        var r = smacof(D, iters, seeds[i]);
+        var score = (neighbourTrust(D, r.X, 5) + neighbourTrust(D, r.X, 10)) / 2;
+        if (score > bestScore) { bestScore = score; best = r; best.seed = seeds[i]; best.trust = score; }
+      }
+      return best;
+    }
+
+    /* Place one extra point into an existing configuration without moving it,
+       by the same majorization step applied to the sample alone. */
+    function projectPoint(X, dists, iters) {
+      if (iters === undefined) iters = 200;
+      var n = X.length;
+      if (!n) return [0, 0];
+      var p = [0, 0], i;
+      for (i = 0; i < n; i++) { p[0] += X[i][0]; p[1] += X[i][1]; }
+      p[0] /= n; p[1] /= n;
+      for (var it = 0; it < iters; it++) {
+        var sx = 0, sy = 0;
+        for (i = 0; i < n; i++) {
+          var dx = p[0] - X[i][0], dy = p[1] - X[i][1];
+          var dist = Math.sqrt(dx * dx + dy * dy);
+          var ratio = dist > 1e-9 ? dists[i] / dist : 0;
+          sx += X[i][0] + ratio * dx;
+          sy += X[i][1] + ratio * dy;
+        }
+        p = [sx / n, sy / n];
+      }
+      return p;
+    }
+
+    /* ---------- seam for the planned world map ----------------------------
+       scoreAll already yields a per-language affinity vector; the map is then a
+       dot product against a country-by-language speaker-share table. Kept here
+       so that view needs no change to the core. */
+    function affinityVector(scoreResult) {
+      return scoreResult.posterior;
+    }
+
+    /* ---------- base64 for the packed distance matrix ---------------------- */
+
+    function b64ToBytes(b64) {
+      if (typeof atob === 'function') {
+        var bin = atob(b64), out = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      }
+      return new Uint8Array(Buffer.from(b64, 'base64'));
+    }
+    function bytesToB64(u8) {
+      if (typeof btoa === 'function') {
+        var s = '';
+        for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+      }
+      return Buffer.from(u8).toString('base64');
+    }
+
+    /* Upper triangle of a symmetric matrix as Float32, row major. */
+    function packMatrix(D) {
+      var n = D.length, m = (n * (n - 1)) / 2;
+      var f = new Float32Array(m), p = 0;
+      for (var i = 0; i < n; i++) for (var j = i + 1; j < n; j++) f[p++] = D[i][j];
+      return bytesToB64(new Uint8Array(f.buffer));
+    }
+    function unpackMatrix(b64, n) {
+      var u8 = b64ToBytes(b64);
+      var f = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+      var D = [], i, j;
+      for (i = 0; i < n; i++) D.push(new Float64Array(n));
+      var p = 0;
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) { D[i][j] = f[p]; D[j][i] = f[p]; p++; }
+      return D;
+    }
+
+    return {
+      ORDER: ORDER, ALPHABET: ALPHABET, PRUNE_MIN: PRUNE_MIN, COUNT_BITS: COUNT_BITS,
+      TEMP_PER_BYTE: TEMP_PER_BYTE, MIN_CHARS: MIN_CHARS, RELIABLE_CHARS: RELIABLE_CHARS,
+      encodeUtf8: encodeUtf8, mulberry32: mulberry32, normalizeIndent: normalizeIndent,
+      train: train, prune: prune, quantizeCounts: quantizeCounts,
+      serialize: serialize, deserialize: deserialize,
+      codeLen: codeLen, scoreAll: scoreAll,
+      crossEntropyMatrix: crossEntropyMatrix, symmetrize: symmetrize,
+      upgma: upgma, layoutTree: layoutTree, graftLeaf: graftLeaf,
+      MDS_SCALE: MDS_SCALE,
+      rankTransform: rankTransform, logTransform: logTransform,
+      smacof: smacof, smacofBest: smacofBest, projectPoint: projectPoint,
+      neighbourTrust: neighbourTrust, SMACOF_TRIES: SMACOF_TRIES,
+      affinityVector: affinityVector,
+      packMatrix: packMatrix, unpackMatrix: unpackMatrix,
+      bytesToB64: bytesToB64, b64ToBytes: b64ToBytes
+    };
+  })();
+  if (typeof window !== 'undefined') window.NCDCore = NCDCore;
+  if (typeof module !== 'undefined' && module.exports) module.exports = NCDCore;
+  /* NCD-CORE-END */
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+    const C = window.NCDCore;
+
+    const LANG = (function () {
+      try { return localStorage.getItem('lang') || 'en'; } catch (e) { return 'en'; }
+    })();
+
+    const INDEX_URL = '/assets/files/langzip/index-2026-07.json';
+    const CODE_URL = '/assets/files/langzip/code-2026-07.json';
+
+    const STRINGS = {
+      en: {
+        title: 'Language Zipper',
+        corpusNatural: 'Natural languages',
+        corpusCode: 'Programming languages',
+        placeholder: 'Paste text in any language…',
+        placeholderCode: 'Paste some source code…',
+        loading: 'Loading language models',
+        loadingHint: 'About 2.4 MB of trained models, once per visit.',
+        loadFailed: 'The language models could not be loaded. Reload the page to try again.',
+        chars: 'characters',
+        bytes: 'bytes',
+        clear: 'Clear',
+        examples: 'Try:',
+        tooShort: n => `${n} characters is too little to say anything. Below 20 characters the answer is mostly noise; from about 100 characters on it is reliable.`,
+        shortWarn: 'Short sample. The ranking below is a guess, not a result.',
+        scopeLabel: 'Show',
+        scopeCommon: 'Common',
+        scopeExtended: 'Extended',
+        scopeExotic: 'All',
+        scopeHint: 'The scope only filters what is drawn. The tree and the map are always computed over all languages, so they do not rearrange themselves when you switch.',
+        viewRanking: 'Ranking',
+        viewTree: 'Family tree',
+        viewMap: 'Map',
+        viewMethod: 'How it works',
+        rankHeadline: 'Best explained by',
+        rankNoText: 'Type or paste something above and the ranking appears here.',
+        bitsPerByte: 'bits per byte',
+        confidence: 'confidence',
+        relativeAxis: 'bits per byte, relative to the average across all languages',
+        rankExpand: n => `Show all ${n}`,
+        rankCollapse: 'Show fewer',
+        confusableWith: c => `hard to tell apart from ${c} at this length`,
+        tooClose: 'Too close to call',
+        tooCloseBody: 'These candidates are within a hair of each other. On short input a character model cannot separate them, and no amount of extra modelling would: they are nearly the same written language.',
+        treeTitle: 'The corpus as a tree',
+        treeBody: 'Built by average linkage over the same cross-entropy measurements the ranking uses. Nothing here knows about language families; the grouping is a result, not an input.',
+        treeYours: 'your text',
+        treeGrafted: 'Your sample is grafted in without rebuilding the tree, so the corpus structure stays put as you type.',
+        mapTitle: 'The corpus as a map',
+        mapBody: 'The same distances, squeezed into two dimensions by stress majorization. Close together means mutually cheap to encode.',
+        mapStress: (s, n) => `Stress ${s}. Two dimensions cannot hold ${n} languages faithfully, so read neighbourhoods, not exact positions. Of many restarts the layout kept is the one that preserves the most true neighbours, which is not the same as the one with the lowest stress.`,
+        mapYours: 'Your text',
+        mapZoomHint: 'Scroll to zoom, drag to pan.',
+        mapReset: 'Reset view',
+        mapLinksOn: 'Show links',
+        mapLinksOff: 'Hide links',
+        mapLinksNote: (n, k, iso) => `Lines join each language to its ${k} nearest among those shown (${n} links), brighter the closer the pair. They come from the cross-entropies, not from the positions, so a line running far across the map marks a pair the projection could not keep together.` + (iso ? ` A dashed ring means nothing came close enough to link: ${iso === 1 ? 'one language has' : `${iso} languages have`} no near relative in this selection.` : ''),
+        methodTitle: 'How it works',
+        legendFamily: 'Colour marks the language family.',
+        selfEntropy: 'own entropy',
+        family: 'Family',
+        script: 'Script',
+        srcNote: 'Training text from Tatoeba (tatoeba.org), CC BY 2.0. 50 KB per language, held-out probe text of equal length for the distances. Nothing is uploaded: the models are downloaded once and everything runs in this browser tab.',
+        srcNoteCode: 'Training snippets written by hand for this tool rather than taken from a corpus, which keeps the licensing simple. That also makes them small, so the models here are weaker than the natural-language ones: measured on held-out halves, 76.5% correct at 40 characters, 89.1% at 100, 97.3% at 300.',
+        autoSwitched: 'That looks like source code, so the programming-language tab is showing.',
+        disclaimer: 'Private hobby project, non-commercial.'
+      },
+      de: {
+        title: 'Language Zipper',
+        corpusNatural: 'Natürliche Sprachen',
+        corpusCode: 'Programmiersprachen',
+        placeholder: 'Text in einer beliebigen Sprache einfügen…',
+        placeholderCode: 'Quelltext einfügen…',
+        loading: 'Sprachmodelle werden geladen',
+        loadingHint: 'Etwa 2,4 MB trainierte Modelle, einmal pro Besuch.',
+        loadFailed: 'Die Sprachmodelle konnten nicht geladen werden. Seite neu laden, um es erneut zu versuchen.',
+        chars: 'Zeichen',
+        bytes: 'Bytes',
+        clear: 'Leeren',
+        examples: 'Beispiele:',
+        tooShort: n => `${n} Zeichen sind zu wenig für eine Aussage. Unter 20 Zeichen ist die Antwort im Wesentlichen Rauschen, ab etwa 100 Zeichen wird sie verlässlich.`,
+        shortWarn: 'Kurze Probe. Das Ranking unten ist geraten, kein Ergebnis.',
+        scopeLabel: 'Zeigen',
+        scopeCommon: 'Häufige',
+        scopeExtended: 'Erweitert',
+        scopeExotic: 'Alle',
+        scopeHint: 'Der Umfang filtert nur die Darstellung. Baum und Karte werden immer über alle Sprachen gerechnet und bauen sich beim Umschalten deshalb nicht um.',
+        viewRanking: 'Ranking',
+        viewTree: 'Stammbaum',
+        viewMap: 'Karte',
+        viewMethod: 'Methode',
+        rankHeadline: 'Am besten erklärt durch',
+        rankNoText: 'Oben etwas eintippen oder einfügen, dann erscheint hier das Ranking.',
+        bitsPerByte: 'Bit pro Byte',
+        confidence: 'Sicherheit',
+        relativeAxis: 'Bit pro Byte, relativ zum Mittel über alle Sprachen',
+        rankExpand: n => `Alle ${n} anzeigen`,
+        rankCollapse: 'Weniger anzeigen',
+        confusableWith: c => `bei dieser Länge kaum von ${c} zu trennen`,
+        tooClose: 'Zu knapp',
+        tooCloseBody: 'Diese Kandidaten liegen praktisch gleichauf. Bei kurzer Eingabe kann ein Zeichenmodell sie nicht trennen, und mehr Modellierung würde daran nichts ändern: es sind fast dieselben Schriftsprachen.',
+        treeTitle: 'Der Korpus als Baum',
+        treeBody: 'Gebaut per Average Linkage über dieselben Kreuzentropien, die auch das Ranking benutzt. Nichts daran kennt Sprachfamilien; die Gruppierung ist Ergebnis, nicht Eingabe.',
+        treeYours: 'dein Text',
+        treeGrafted: 'Deine Probe wird eingehängt, ohne den Baum neu zu bauen. Die Korpusstruktur bleibt beim Tippen also stehen.',
+        mapTitle: 'Der Korpus als Karte',
+        mapBody: 'Dieselben Abstände, per Stress-Majorisierung in zwei Dimensionen gepresst. Nah beieinander heißt: gegenseitig günstig zu kodieren.',
+        mapStress: (s, n) => `Stress ${s}. Zwei Dimensionen können ${n} Sprachen nicht treu abbilden, also Nachbarschaften lesen, keine exakten Positionen. Aus vielen Durchläufen bleibt der, der die meisten echten Nachbarschaften erhält, und das ist nicht der mit dem niedrigsten Stress.`,
+        mapYours: 'Dein Text',
+        mapZoomHint: 'Mausrad zum Zoomen, ziehen zum Verschieben.',
+        mapReset: 'Ansicht zurücksetzen',
+        mapLinksOn: 'Verbindungen zeigen',
+        mapLinksOff: 'Verbindungen ausblenden',
+        mapLinksNote: (n, k, iso) => `Linien verbinden jede Sprache mit ihren ${k} nächsten unter den gezeigten (${n} Linien), je näher das Paar, desto heller. Sie stammen aus den Kreuzentropien, nicht aus den Positionen: eine quer über die Karte laufende Linie markiert also ein Paar, das die Projektion nicht zusammenhalten konnte.` + (iso ? ` Ein gestrichelter Ring heißt: nichts kam nah genug heran. ${iso === 1 ? 'Eine Sprache hat' : `${iso} Sprachen haben`} in dieser Auswahl keine nahen Verwandten.` : ''),
+        methodTitle: 'Wie das funktioniert',
+        legendFamily: 'Die Farbe markiert die Sprachfamilie.',
+        selfEntropy: 'Eigenentropie',
+        family: 'Familie',
+        script: 'Schrift',
+        srcNote: 'Trainingstext von Tatoeba (tatoeba.org), CC BY 2.0. 50 KB je Sprache, für die Abstände ein gleich langer zurückgehaltener Probetext. Nichts wird hochgeladen: die Modelle werden einmal geladen, alles Weitere läuft in diesem Browser-Tab.',
+        srcNoteCode: 'Die Trainings-Snippets sind für dieses Tool von Hand geschrieben statt aus einem Korpus genommen, das hält die Lizenzfrage einfach. Sie sind dadurch aber klein, und die Modelle hier entsprechend schwächer als die für natürliche Sprachen: an zurückgehaltenen Hälften gemessen 76,5 % bei 40 Zeichen, 89,1 % bei 100, 97,3 % bei 300.',
+        autoSwitched: 'Das sieht nach Quelltext aus, deshalb ist der Programmiersprachen-Tab aktiv.',
+        disclaimer: 'Privates Hobbyprojekt, unkommerziell.'
+      }
+    };
+    const T = STRINGS[LANG] || STRINGS.en;
+
+    /* Example texts. Written here rather than drawn from the training corpus, so
+       clicking one is a real test and not a lookup. */
+    const EXAMPLES = [
+      { label: 'Deutsch', text: 'Am Samstagmorgen fahren wir mit dem Zug in die Berge und wandern den ganzen Tag, bis die Sonne hinter den Gipfeln verschwindet.' },
+      { label: 'Português', text: 'No sábado de manhã apanhamos o comboio para as montanhas e caminhamos o dia inteiro até o sol desaparecer.' },
+      { label: '日本語', text: '土曜日の朝、私たちは電車で山に行き、太陽が山の向こうに沈むまで一日中歩きます。' },
+      { label: 'Suomi', text: 'Lauantaiaamuna menemme junalla vuorille ja kävelemme koko päivän, kunnes aurinko katoaa huippujen taakse.' },
+      { label: 'Esperanto', text: 'Sabate matene ni veturas per trajno al la montoj kaj promenas la tutan tagon ĝis la suno malaperas malantaŭ la pintoj.' }
+    ];
+
+    const CODE_EXAMPLES = [
+      { label: 'Python', text: 'def summarise(rows):\n    totals = {}\n    for row in rows:\n        key = row.get("category", "unknown")\n        totals[key] = totals.get(key, 0) + int(row["quantity"])\n    return sorted(totals.items(), key=lambda kv: -kv[1])\n' },
+      { label: 'Rust', text: 'pub fn totals(items: &[Item]) -> HashMap<&str, u32> {\n    let mut totals = HashMap::new();\n    for item in items {\n        let key = item.category.as_deref().unwrap_or("unknown");\n        *totals.entry(key).or_insert(0) += item.quantity;\n    }\n    totals\n}\n' },
+      { label: 'SQL', text: 'SELECT c.name AS category, COUNT(*) AS items, SUM(i.quantity) AS total\nFROM items AS i\nINNER JOIN categories AS c ON c.id = i.category_id\nWHERE i.active = TRUE AND i.quantity > 0\nGROUP BY c.name\nORDER BY total DESC;\n' },
+      { label: 'Haskell', text: 'totals :: [Item] -> Map String Int\ntotals items =\n  Map.fromListWith (+) [ (categoryOf item, itemQuantity item) | item <- items ]\n  where\n    categoryOf = fromMaybe "unknown" . itemCategory\n' }
+    ];
+
+    /* Family colours. Chosen to stay legible on the dark background and to keep
+       the big families visually distinct; everything rare falls back to grey. */
+    const FAMILY_COLOR = {
+      Germanic: '#60a5fa', Romance: '#f472b6', Slavic: '#facc15', Baltic: '#fb923c',
+      Celtic: '#4ade80', Uralic: '#2dd4bf', Turkic: '#c084fc', Semitic: '#f87171',
+      Iranian: '#fbbf24', Indic: '#a3e635', Dravidian: '#34d399', Japonic: '#38bdf8',
+      Sinitic: '#e879f9', Koreanic: '#22d3ee', Vietic: '#a78bfa', Tai: '#fda4af',
+      Austronesian: '#86efac', Khmer: '#93c5fd', Burmese: '#fca5a5', Hellenic: '#67e8f9',
+      Kartvelian: '#d8b4fe', Armenian: '#f9a8d4', Isolate: '#cbd5e1', Caucasian: '#fcd34d',
+      Bantu: '#7dd3fc', Berber: '#bef264', Chadic: '#fdba74', Constructed: '#94a3b8',
+      // programming-language families
+      Curly: '#60a5fa', Systems: '#f87171', Scripting: '#4ade80', Functional: '#c084fc',
+      Markup: '#facc15', Query: '#fb923c', Shell: '#2dd4bf', Numeric: '#f472b6'
+    };
+    const famColor = f => FAMILY_COLOR[f] || '#64748b';
+
+    /* Which tab does this text belong to? Deliberately crude: a few markers
+       that essentially never appear in prose but are everywhere in source code.
+       It only switches tabs, so a false positive costs one click. */
+    function looksLikeCode(text) {
+      if (text.length < 40) return false;
+      const t = text.slice(0, 4000);
+      let score = 0;
+      if (/[;{}]\s*\n/.test(t)) score += 2;
+      if (/^\s*(def|function|class|public|private|const|let|var|import|package|using|fn|func)\b/mi.test(t)) score += 2;
+      if (/\w+\s*\([^)]*\)\s*[{:;]/.test(t)) score += 2;
+      if (/^\s*(#|\/\/|--|;;)/m.test(t)) score += 1;
+      if (/[=!<>]=|=>|->|::|\+\+|&&|\|\|/.test(t)) score += 1;
+      if (/^[ \t]+\S/m.test(t)) score += 1;
+      // SQL and markup are the hard cases: prose-like word order, few of the
+      // brackets and operators that give everything else away.
+      if (/^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/mi.test(t) &&
+          /\b(FROM|WHERE|GROUP\s+BY|ORDER\s+BY|JOIN|VALUES|SET)\b/i.test(t)) score += 4;
+      if (/<\/[a-z][\w-]*>|<[a-z][\w-]*(\s+[\w-]+\s*=\s*"[^"]*")+\s*\/?>/i.test(t)) score += 4;
+      if (/^[.#]?[\w-]+\s*\{[^}]*:[^}]*(;|\})/m.test(t)) score += 3;
+      // A type signature. The ML family writes whole modules with no braces and
+      // no semicolons, so without this Haskell reads as prose.
+      if (/^\s*\w+\s*(::|:)\s*[\w[(].*(->|=>)/m.test(t)) score += 3;
+      return score >= 4;
+    }
+
+    const TIER_RANK = { common: 0, extended: 1, exotic: 2 };
+    const fmt = (v, d) => v.toFixed(d === undefined ? 2 : d);
+
+    /* ---------- data loading ---------------------------------------------
+       Two stages on purpose: the index is small and carries the tree and the
+       map, so those views can render while the models are still arriving. */
+
+    function useCorpus(corpus) {
+      const [state, setState] = useState({ phase: 'idle', progress: 0 });
+
+      useEffect(() => {
+        let alive = true;
+        setState({ phase: 'index', progress: 0 });
+        const url = corpus === 'code' ? CODE_URL : INDEX_URL;
+
+        fetch(url)
+          .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+          .then(ix => {
+            if (!alive) return;
+            setState({ phase: 'models', progress: 0.08, index: ix });
+            // Programming-language models are small enough to sit in the index.
+            if (ix.models) {
+              const bin = C.b64ToBytes(ix.models);
+              return finish(ix, bin);
+            }
+            return fetch(ix.modelsUrl).then(r => {
+              if (!r.ok) throw new Error('http ' + r.status);
+              const total = Number(r.headers.get('content-length')) || 0;
+              // Progress needs the body reader; without content-length we still
+              // show motion, just without a meaningful fraction.
+              if (!r.body || !total) return r.arrayBuffer().then(b => finish(ix, new Uint8Array(b)));
+              const reader = r.body.getReader();
+              const chunks = [];
+              let got = 0;
+              const pump = () => reader.read().then(({ done, value }) => {
+                if (done) {
+                  const bin = new Uint8Array(got);
+                  let o = 0;
+                  for (const c of chunks) { bin.set(c, o); o += c.length; }
+                  return finish(ix, bin);
+                }
+                chunks.push(value); got += value.length;
+                if (alive) setState(s => ({ ...s, progress: 0.08 + 0.84 * (got / total) }));
+                return pump();
+              });
+              return pump();
+            });
+          })
+          .catch(() => { if (alive) setState({ phase: 'error', progress: 0 }); });
+
+        function finish(ix, bin) {
+          if (!alive) return;
+          setState(s => ({ ...s, progress: 0.94 }));
+          const models = ix.langs.map((l, i) => {
+            const [a, b] = ix.modelOffsets[i];
+            return { code: l.code, flat: C.deserialize(bin.subarray(a, b), ix.order) };
+          });
+          const D = C.unpackMatrix(ix.matrix.data, ix.langs.length);
+          if (alive) setState({ phase: 'ready', progress: 1, index: ix, models, D });
+        }
+
+        return () => { alive = false; };
+      }, [corpus]);
+
+      return state;
+    }
+
+    /* ---------- shared chrome --------------------------------------------- */
+
+    function Seg({ options, value, onChange, label }) {
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {label && <span style={{ fontSize: 12.5, color: '#94a3b8' }}>{label}</span>}
+          <div className="seg-row" style={{ display: 'inline-flex' }}>
+            {options.map(o => (
+              <button key={o.v}
+                className={'lang-seg' + (o.v === value ? ' active' : '')}
+                onClick={() => onChange(o.v)}
+                disabled={o.disabled}>{o.label}</button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // Both charts are SVG with a fixed internal coordinate system. Measuring the
+    // container lets them use the whole width on a wide screen instead of
+    // stopping at a hardcoded 720, and lets them scale down on a narrow one
+    // instead of being cut off. Returns null until the first measurement, so a
+    // caller can render at its natural size for one frame rather than at zero.
+    function useWidth(ref) {
+      const [w, setW] = useState(null);
+      useEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const measure = () => setW(el.clientWidth);
+        measure();
+        // ResizeObserver catches container changes that no window event
+        // reports, such as the sidebar-free layout shift when a view swaps.
+        if (typeof ResizeObserver === 'undefined') {
+          window.addEventListener('resize', measure);
+          return () => window.removeEventListener('resize', measure);
+        }
+        const ro = new ResizeObserver(measure);
+        ro.observe(el);
+        return () => ro.disconnect();
+      }, [ref]);
+      return w;
+    }
+
+    function LoadingBar({ progress, failed }) {
+      if (failed) return <div className="lz-note" style={{ marginBottom: 16 }}>{T.loadFailed}</div>;
+      return (
+        <div className="lz-card" style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 13.5, color: '#cbd5e1', marginBottom: 8 }}>
+            {T.loading} <span style={{ color: '#64748b' }}>{Math.round(progress * 100)}%</span>
+          </div>
+          <div className="lz-load"><div style={{ width: (progress * 100).toFixed(1) + '%' }}></div></div>
+          <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 8 }}>{T.loadingHint}</div>
+        </div>
+      );
+    }
+
+    /* ---------- ranking ---------------------------------------------------- */
+
+    const RANK_COLLAPSED = 14;
+
+    function RankingView({ index, result, scope }) {
+      const [expanded, setExpanded] = useState(false);
+      // Collapse again when the scope changes, so switching to "All" does not
+      // silently leave 87 rows open.
+      useEffect(() => { setExpanded(false); }, [scope]);
+
+      if (!result) {
+        return <div style={{ color: '#64748b', fontSize: 13.5, padding: '18px 2px' }}>{T.rankNoText}</div>;
+      }
+      const byCode = {};
+      index.langs.forEach(l => { byCode[l.code] = l; });
+      const shown = result.ranked.filter(r => TIER_RANK[byCode[r.code].tier] <= TIER_RANK[scope]);
+      const top = expanded ? shown : shown.slice(0, RANK_COLLAPSED);
+      if (!top.length) return null;
+
+      // Bars are drawn on the relative scale (bits per byte minus the mean).
+      // Normalised over every language in scope, not just the visible rows:
+      // otherwise the scale jumps when the list is expanded, and the last
+      // visible bar always collapses to a stub because it happens to be the
+      // worst of the fourteen shown.
+      const worst = Math.max(...shown.map(r => r.relative));
+      const best = Math.min(...shown.map(r => r.relative));
+      const span = Math.max(1e-6, worst - best);
+      const winner = shown[0];
+      const wl = byCode[winner.code];
+
+      // Group anything the model genuinely cannot separate from the winner:
+      // either within a whisker on the bit scale, or a known confusable pair.
+      const named = new Set(wl.confusable || []);
+      const close = shown.slice(1).filter(r =>
+        named.has(r.code) || (r.bits - winner.bits) / Math.max(1, result.nbytes) < 0.06
+      ).slice(0, 4);
+
+      return (
+        <div>
+          <div style={{ fontSize: 12.5, color: '#94a3b8', marginBottom: 2 }}>{T.rankHeadline}</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 4 }}>
+            <div style={{ fontSize: 26, color: famColor(wl.family), fontWeight: 600 }}>
+              {wl.name[LANG] || wl.name.en}
+            </div>
+            <div style={{ fontSize: 13, color: '#64748b' }}>
+              {(winner.posterior * 100).toFixed(1)}% {T.confidence} · {fmt(winner.bpb)} {T.bitsPerByte}
+            </div>
+          </div>
+
+          {close.length > 0 && (
+            <div className="lz-card" style={{ margin: '10px 0 14px', borderColor: '#3f3f46' }}>
+              <div style={{ fontSize: 13, color: '#cbd5e1', marginBottom: 4 }}>
+                {T.tooClose}: {close.map(r => (byCode[r.code].name[LANG] || byCode[r.code].name.en)).join(', ')}
+              </div>
+              <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.55 }}>{T.tooCloseBody}</div>
+            </div>
+          )}
+
+          {/* Repeat the toggle above the list: expanded, the one below it sits
+              past 87 rows, which is exactly where nobody looks to collapse. */}
+          {shown.length > RANK_COLLAPSED && expanded && (
+            <div style={{ marginTop: 12, marginBottom: -4 }}>
+              <button className="lz-ex" onClick={() => setExpanded(false)}>{T.rankCollapse}</button>
+            </div>
+          )}
+
+          {/* No inner scroll container: nesting one inside a scrolling page
+              means the wheel moves whichever the pointer happens to be over.
+              Expanded simply grows, and the page scrolls as usual. */}
+          <div className="lz-mapwrap" style={{ marginTop: 12, padding: '10px 14px' }}>
+            {top.map(r => {
+              const l = byCode[r.code];
+              // Cheapest gets the full bar; the scale is inverted because fewer
+              // bits is a better fit.
+              const w = 100 * (worst - r.relative) / span;
+              return (
+                <div className="lz-row" key={r.code}>
+                  <div style={{ color: r === shown[0] ? '#cbd5e1' : '#94a3b8', overflow: 'hidden',
+                    textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={l.name[LANG] || l.name.en}>
+                    {l.name[LANG] || l.name.en}
+                  </div>
+                  <div className="lz-track">
+                    {/* Fade with rank as well as length. On a scale that has to
+                        reach from German at 2.5 to Bengali at 13.9 bits, the
+                        near field is necessarily compressed, so opacity carries
+                        the part the length cannot. */}
+                    <div className="lz-bar" style={{ width: Math.max(1.5, w) + '%', background: famColor(l.family),
+                      opacity: r === shown[0] ? 1 : Math.max(0.3, 0.78 - 0.12 * Math.log2(1 + (r.bits - winner.bits) / Math.max(1, result.nbytes))) }}></div>
+                  </div>
+                  <div className="num">{fmt(r.bpb)}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', gap: 14, alignItems: 'baseline', flexWrap: 'wrap', marginTop: 8 }}>
+            {shown.length > RANK_COLLAPSED && (
+              <button className="lz-ex" onClick={() => setExpanded(v => !v)}>
+                {expanded ? T.rankCollapse : T.rankExpand(shown.length)}
+              </button>
+            )}
+            <span style={{ fontSize: 11, color: '#64748b' }}>{T.relativeAxis}</span>
+          </div>
+        </div>
+      );
+    }
+
+    /* ---------- dendrogram -------------------------------------------------
+       Hand-rolled SVG. Leaves are laid out on a fixed vertical pitch and each
+       internal node sits at the mean of its children, which is the standard
+       dendrogram layout and keeps edges from crossing. */
+
+    function TreeView({ index, scope, result, D }) {
+      // Declared before the early return below, so the hook order stays fixed.
+      const wrapRef = useRef(null);
+      const avail = useWidth(wrapRef);
+
+      const byCode = {};
+      index.langs.forEach((l, i) => { byCode[l.code] = { ...l, i }; });
+
+      const tree = useMemo(() => {
+        const inScope = c => TIER_RANK[byCode[c].tier] <= TIER_RANK[scope];
+        // Prune to the scope. This drops leaves; it never re-clusters, so the
+        // remaining structure is identical to the full tree's.
+        const prune = n => {
+          if (n.code) return inScope(n.code) ? { code: n.code } : null;
+          const a = prune(n.c[0]), b = prune(n.c[1]);
+          if (a && b) return { h: n.h, c: [a, b] };
+          return a || b;
+        };
+        let t = prune(index.tree);
+        if (!t) return null;
+
+        if (result && D) {
+          // Graft the sample using its distance to every corpus language, on
+          // the same scale the tree heights live on. Raw cross-entropy is not
+          // that scale: symmetrize() subtracts both languages' own entropy, so
+          // feeding raw bits/byte here (1.5 to 14) against heights (0.2 to 5.5)
+          // pushed every sample out to the root.
+          //
+          // One of the two self-entropies is unknown, since the sample has no
+          // model of its own. The minimum over all languages is the best
+          // available stand-in: for the closest language it is exactly right,
+          // and it is what makes the nearest distance go to zero.
+          const dist = {};
+          const own = Math.min.apply(null, Array.from(result.bitsPerByte));
+          index.langs.forEach((l, i) => {
+            dist[l.code] = Math.max(0, result.bitsPerByte[i] - (l.selfEntropy + own) / 2);
+          });
+          const conv = n => n.code
+            ? { leaf: true, code: n.code, height: 0, size: 1 }
+            : (() => { const l = conv(n.c[0]), r = conv(n.c[1]);
+                return { leaf: false, left: l, right: r, height: n.h, size: l.size + r.size }; })();
+          t = C.graftLeaf(conv(t), dist, '__sample__');
+        } else {
+          const conv = n => n.code
+            ? { leaf: true, code: n.code, height: 0, size: 1 }
+            : (() => { const l = conv(n.c[0]), r = conv(n.c[1]);
+                return { leaf: false, left: l, right: r, height: n.h, size: l.size + r.size }; })();
+          t = conv(t);
+        }
+        return t;
+      }, [index, scope, result, D]);
+
+      if (!tree) return null;
+
+      const PITCH = 17, M = { l: 12, r: 168, t: 14, b: 14 };
+      const leaves = [];
+      (function walk(n) { if (n.leaf) { leaves.push(n); return; } walk(n.left); walk(n.right); })(tree);
+      const H = leaves.length * PITCH + M.t + M.b;
+      const maxH = (function mx(n) { return n.leaf ? 0 : Math.max(n.height, mx(n.left), mx(n.right)); })(tree);
+      // Only the branch area stretches. The right margin is the label gutter and
+      // stays at 168px, so wider windows buy resolution in the branch lengths
+      // rather than pushing the names off to the side.
+      const TREE_MIN_W = 480, TREE_MAX_W = 1100;
+      const W = Math.round(Math.min(TREE_MAX_W, Math.max(TREE_MIN_W, avail || 720)));
+      const plotW = W - M.l - M.r;
+      // Height maps to horizontal position: root at the left, leaves at the right.
+      const X = h => M.l + plotW * (1 - (maxH > 0 ? h / maxH : 0));
+
+      const yOf = new Map();
+      leaves.forEach((n, i) => { yOf.set(n, M.t + PITCH * (i + 0.5)); });
+
+      const edges = [], dots = [], labels = [];
+      (function walk(n) {
+        if (n.leaf) {
+          const y = yOf.get(n), x = X(0);
+          const isSample = n.code === '__sample__';
+          const l = isSample ? null : byCode[n.code];
+          labels.push(
+            <text key={'t' + n.code + y} x={x + 7} y={y + 4} fontSize={isSample ? 12 : 11.5}
+              fill={isSample ? '#38bdf8' : '#94a3b8'} fontWeight={isSample ? 600 : 400}>
+              {isSample ? T.treeYours : (l.name[LANG] || l.name.en)}
+            </text>
+          );
+          if (!isSample) dots.push(<circle key={'d' + n.code} cx={x} cy={y} r={2.6} fill={famColor(l.family)} />);
+          else dots.push(<circle key="dsample" cx={x} cy={y} r={3.6} fill="#38bdf8" />);
+          return y;
+        }
+        const yl = walk(n.left), yr = walk(n.right);
+        const y = (yl + yr) / 2;
+        yOf.set(n, y);
+        const x = X(n.height), xl = X(n.left.leaf ? 0 : n.left.height), xr = X(n.right.leaf ? 0 : n.right.height);
+        // Highlight the path to the sample branch by branch, not node by node.
+        // `hasSample` is set on every node from the root down, so colouring all
+        // three of a node's edges by it lit up half the tree: the root's own
+        // flag made the branches to every distant language blue too.
+        const sampleLeft = n.left.hasSample || n.left.code === '__sample__';
+        const sampleRight = n.right.hasSample || n.right.code === '__sample__';
+        const lit = e => (e ? '#38bdf8' : '#475569');
+        const wide = e => (e ? 1.4 : 1);
+        // The crossbar carries the sample only on the half that leads to it, so
+        // draw it as two segments meeting at this node's own y.
+        edges.push(<path key={'eu' + x + '-' + y} d={`M${x},${yl} L${x},${y}`} stroke={lit(sampleLeft)} strokeWidth={wide(sampleLeft)} fill="none" />);
+        edges.push(<path key={'ed' + x + '-' + y} d={`M${x},${y} L${x},${yr}`} stroke={lit(sampleRight)} strokeWidth={wide(sampleRight)} fill="none" />);
+        edges.push(<path key={'l' + x + '-' + yl} d={`M${x},${yl} L${xl},${yl}`} stroke={lit(sampleLeft)} strokeWidth={wide(sampleLeft)} fill="none" />);
+        edges.push(<path key={'r' + x + '-' + yr} d={`M${x},${yr} L${xr},${yr}`} stroke={lit(sampleRight)} strokeWidth={wide(sampleRight)} fill="none" />);
+        return y;
+      })(tree);
+
+      return (
+        <div>
+          <div style={{ fontSize: 13.5, color: '#cbd5e1', marginBottom: 4 }}>{T.treeTitle}</div>
+          <p style={{ fontSize: 12.5, color: '#94a3b8', maxWidth: '70ch', marginBottom: 10 }}>{T.treeBody}</p>
+          {/* Unlike the map, the tree keeps a scrollbar as its fallback: its
+              labels are already at 11.5px, so scaling below TREE_MIN_W would
+              trade a clipped chart for an unreadable one. */}
+          <div className="lz-mapwrap lz-scroll" ref={wrapRef} style={{ padding: '4px 0' }}>
+            <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+              {edges}{dots}{labels}
+            </svg>
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
+            {result ? T.treeGrafted + ' ' : ''}{T.legendFamily}
+          </div>
+        </div>
+      );
+    }
+
+    /* ---------- map --------------------------------------------------------
+       Positions are precomputed at build time and shipped in the index, so the
+       map is identical on every visit and does not depend on a local optimum
+       found in the browser. The sample is projected into the fixed layout. */
+
+    function MapView({ index, scope, result, D }) {
+      // The map has no intrinsic width: it is a plane of points, so it takes
+      // whatever the container gives it and keeps a 1.44 aspect ratio. Below
+      // MAP_MIN_W the SVG scales down as a whole (labels shrink with it)
+      // rather than being clipped by the frame.
+      const MAP_MIN_W = 560, MAP_MAX_W = 1100, MAP_ASPECT = 1.44;
+      const wrapRef = useRef(null);
+      const avail = useWidth(wrapRef);
+      const W = Math.round(Math.min(MAP_MAX_W, Math.max(MAP_MIN_W, avail || 720)));
+      const H = Math.round(W / MAP_ASPECT);
+      const M = { l: 24, r: 24, t: 18, b: 18 };
+      const pts = index.langs.map((l, i) => ({ l, i, x: l.mds[0], y: l.mds[1] }));
+
+      // Zoom and pan through the viewBox rather than a transform, so dots and
+      // labels keep their size while the layout stretches. `view` is the
+      // visible rectangle in the SVG's own coordinates.
+      // The view rectangle is kept in fractions of the plane, not in pixels, so
+      // a resize does not throw away the zoom the reader chose. Pixel-space
+      // rectangles are derived from it below.
+      const [view, setView] = useState({ x: 0, y: 0, w: 1, h: 1 });
+      const [dragging, setDragging] = useState(false);
+      const [showLinks, setShowLinks] = useState(true);
+      const svgRef = useRef(null);
+      const drag = useRef(null);
+      const zoom = 1 / view.w;
+      const MIN_ZOOM = 1, MAX_ZOOM = 12;
+
+      // Nearest-neighbour links, drawn from the distance matrix rather than
+      // from the map coordinates: they show what the projection had to leave
+      // out. A link that stretches across the map is a pair MDS could not
+      // place, which is the honest way to display stress 0.29.
+      //
+      // Two cuts, because either alone misbehaves. Per-language k-nearest
+      // keeps the count linear and is scale-free, but on its own it forces an
+      // edge onto isolates too, which produced "Cantonese - Greek" at 9.68:
+      // not a relationship, just Cantonese having no neighbour. The ceiling
+      // drops those.
+      //
+      // The ceiling sits at 6.0 because the corpus has a real gap there.
+      // Sorting every language by the distance to its single nearest
+      // neighbour: the field runs continuously up to Vietnamese at 5.43, then
+      // jumps to Korean at 8.67 and keeps going to Armenian at 9.78. Below the
+      // gap are relationships (Japanese-Chinese 4.23, Javanese-Malay 5.05),
+      // above it is only "nothing else was close either". Raising the ceiling
+      // past 6 adds no edge at all, which is what a real gap looks like.
+      const LINK_K = 2, LINK_CEIL = 6.0;
+      // Neighbours are taken among the languages actually on screen, not over
+      // the whole corpus and then filtered. Filtering afterwards made k mean
+      // something different per scope: at "common" Python lost both its links
+      // because Kotlin and Scala are hidden there, and then got drawn with an
+      // isolate ring, which claims something false. Computing within the
+      // visible set keeps "its 2 nearest of the ones shown" true everywhere.
+      const links = useMemo(() => {
+        const vis = [];
+        index.langs.forEach((l, i) => {
+          if (TIER_RANK[l.tier] <= TIER_RANK[scope]) vis.push(i);
+        });
+        const seen = new Set(), out = [];
+        for (const i of vis) {
+          const order = vis.filter(j => j !== i).sort((a, b) => D[i][a] - D[i][b]);
+          for (let t = 0; t < LINK_K && t < order.length; t++) {
+            const j = order[t];
+            // Sorted ascending, so the first one over the ceiling ends it.
+            if (D[i][j] > LINK_CEIL) break;
+            const key = i < j ? i + ':' + j : j + ':' + i;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({ a: Math.min(i, j), b: Math.max(i, j), d: D[i][j] });
+          }
+        }
+        return out;
+      }, [index, D, scope]);
+
+      const resetView = useCallback(() => setView({ x: 0, y: 0, w: 1, h: 1 }), []);
+      // A new corpus has a different layout, so start over rather than leaving
+      // the reader parked on coordinates that no longer mean anything.
+      useEffect(resetView, [index, resetView]);
+
+      // Non-passive listener: React's onWheel is passive, so preventDefault
+      // there does nothing and the page scrolls away under the cursor.
+      useEffect(() => {
+        const svg = svgRef.current;
+        if (!svg) return;
+        const onWheel = e => {
+          e.preventDefault();
+          const rect = svg.getBoundingClientRect();
+          // Keep the point under the cursor fixed while scaling around it.
+          const px = (e.clientX - rect.left) / rect.width;
+          const py = (e.clientY - rect.top) / rect.height;
+          setView(v => {
+            const factor = Math.exp(-e.deltaY * 0.0015);
+            const current = 1 / v.w;
+            const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, current * factor));
+            const w = 1 / next, h = 1 / next;
+            let x = v.x + (v.w - w) * px;
+            let y = v.y + (v.h - h) * py;
+            x = Math.min(Math.max(0, x), 1 - w);
+            y = Math.min(Math.max(0, y), 1 - h);
+            return { x, y, w, h };
+          });
+        };
+        svg.addEventListener('wheel', onWheel, { passive: false });
+        return () => svg.removeEventListener('wheel', onWheel);
+      }, []);
+
+      const onPointerDown = e => {
+        if (zoom <= 1) return;
+        drag.current = { cx: e.clientX, cy: e.clientY, vx: view.x, vy: view.y };
+        setDragging(true);
+        e.currentTarget.setPointerCapture(e.pointerId);
+      };
+      const onPointerMove = e => {
+        const d = drag.current;
+        if (!d) return;
+        const rect = svgRef.current.getBoundingClientRect();
+        const dx = ((e.clientX - d.cx) / rect.width) * view.w;
+        const dy = ((e.clientY - d.cy) / rect.height) * view.h;
+        setView(v => ({
+          ...v,
+          x: Math.min(Math.max(0, d.vx - dx), 1 - v.w),
+          y: Math.min(Math.max(0, d.vy - dy), 1 - v.h)
+        }));
+      };
+      const endDrag = e => {
+        if (!drag.current) return;
+        drag.current = null;
+        setDragging(false);
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+      };
+
+      const sample = useMemo(() => {
+        if (!result) return null;
+        // Distances from the sample to every language, on the same transformed
+        // scale the map was laid out in.
+        const raw = Array.from(result.bitsPerByte);
+        const self = index.langs.map(l => l.selfEntropy);
+        const d = raw.map((v, i) => Math.max(0, v - self[i]));
+        const mxCorpus = Math.max(...index.langs.map((_, i) =>
+          Math.max(...index.langs.map((_, j) => (i === j ? 0 : D[i][j])))));
+        const tr = d.map(v => Math.log1p(v / C.MDS_SCALE) / Math.log1p(mxCorpus / C.MDS_SCALE));
+        return C.projectPoint(index.langs.map(l => l.mds), tr);
+      }, [index, result, D]);
+
+      const all = pts.map(p => [p.x, p.y]).concat(sample ? [sample] : []);
+      const xs = all.map(p => p[0]), ys = all.map(p => p[1]);
+      const x0 = Math.min(...xs), x1 = Math.max(...xs);
+      const y0 = Math.min(...ys), y1 = Math.max(...ys);
+      const sx = v => M.l + (W - M.l - M.r) * (x1 > x0 ? (v - x0) / (x1 - x0) : 0.5);
+      const sy = v => M.t + (H - M.t - M.b) * (y1 > y0 ? (v - y0) / (y1 - y0) : 0.5);
+
+      const shown = pts.filter(p => TIER_RANK[p.l.tier] <= TIER_RANK[scope]);
+
+      // Only links whose both ends are visible at this scope. Nearer pairs are
+      // drawn brighter and thicker, so the eye reads strength without needing
+      // the numbers; the floor keeps the weakest ones visible but quiet.
+      // Already restricted to the visible set by the memo above.
+      const vlinks = links;
+      // Fade over the range the links actually occupy, not over the ceiling:
+      // almost every link is under 4, so scaling by 6 would wash them all out.
+      const linkAlpha = d => Math.max(0.1, 0.55 * (1 - d / 4.5) + 0.1);
+
+      // A language with no link gets a hollow ring. Without it a bare dot reads
+      // as a gap in the data, when it is really a result: these are the ones
+      // that are the only member of their script in the corpus, so the model
+      // has nothing to relate them to.
+      const linked = new Set();
+      vlinks.forEach(e => { linked.add(e.a); linked.add(e.b); });
+      const isolates = shown.filter(p => !linked.has(p.i));
+
+      return (
+        <div>
+          <div style={{ fontSize: 13.5, color: '#cbd5e1', marginBottom: 4 }}>{T.mapTitle}</div>
+          <p style={{ fontSize: 12.5, color: '#94a3b8', maxWidth: '70ch', marginBottom: 10 }}>{T.mapBody}</p>
+          <div className="lz-mapwrap" ref={wrapRef}>
+            {/* Width 100% with a viewBox: below MAP_MIN_W the whole drawing
+                scales down instead of overflowing the frame. */}
+            <svg ref={svgRef} width="100%"
+              height={Math.round(Math.min(W, avail || W) / MAP_ASPECT)}
+              preserveAspectRatio="xMidYMid meet"
+              viewBox={`${view.x * W} ${view.y * H} ${view.w * W} ${view.h * H}`}
+              onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+              onPointerUp={endDrag} onPointerCancel={endDrag}
+              style={{ display: 'block', touchAction: 'none',
+                cursor: zoom > 1 ? (dragging ? 'grabbing' : 'grab') : 'default' }}>
+              {/* Links first, so dots and labels stay on top of them. */}
+              {showLinks && vlinks.map(e => (
+                <line key={'k' + e.a + '-' + e.b}
+                  x1={sx(pts[e.a].x)} y1={sy(pts[e.a].y)}
+                  x2={sx(pts[e.b].x)} y2={sy(pts[e.b].y)}
+                  stroke="#7dd3fc" strokeOpacity={linkAlpha(e.d)}
+                  strokeWidth={(e.d < 1.5 ? 1.5 : 1) / zoom} />
+              ))}
+              {showLinks && isolates.map(p => (
+                <circle key={'iso' + p.l.code} cx={sx(p.x)} cy={sy(p.y)} r={6 / zoom}
+                  fill="none" stroke={famColor(p.l.family)} strokeOpacity={0.4}
+                  strokeWidth={1 / zoom} strokeDasharray={`${2 / zoom} ${2 / zoom}`} />
+              ))}
+              {/* Radii and font sizes are divided by the zoom so they stay put
+                  visually while the layout spreads out. */}
+              {shown.map(p => (
+                <g key={p.l.code}>
+                  <circle cx={sx(p.x)} cy={sy(p.y)} r={3 / zoom} fill={famColor(p.l.family)} opacity={0.85} />
+                  <text x={sx(p.x) + 5 / zoom} y={sy(p.y) + 3.5 / zoom} fontSize={10.5 / zoom} fill="#94a3b8">
+                    {p.l.name[LANG] || p.l.name.en}
+                  </text>
+                </g>
+              ))}
+              {sample && (
+                <g>
+                  <circle cx={sx(sample[0])} cy={sy(sample[1])} r={6 / zoom} fill="none" stroke="#38bdf8" strokeWidth={2 / zoom} />
+                  <circle cx={sx(sample[0])} cy={sy(sample[1])} r={2.5 / zoom} fill="#38bdf8" />
+                  <text x={sx(sample[0]) + 9 / zoom} y={sy(sample[1]) + 4 / zoom} fontSize={12 / zoom} fill="#38bdf8" fontWeight={600}>
+                    {T.mapYours}
+                  </text>
+                </g>
+              )}
+            </svg>
+          </div>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 6 }}>
+            <span style={{ fontSize: 11, color: '#64748b' }}>{T.mapZoomHint}</span>
+            <button className="lz-ex" onClick={() => setShowLinks(v => !v)}>
+              {showLinks ? T.mapLinksOff : T.mapLinksOn}
+            </button>
+            {zoom > 1.01 && (
+              <button className="lz-ex" onClick={resetView}>{T.mapReset} ({zoom.toFixed(1)}&times;)</button>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+            {showLinks ? T.mapLinksNote(vlinks.length, LINK_K, isolates.length) + ' ' : ''}
+            {T.mapStress(fmt(index.mdsStress), index.langs.length)} {T.legendFamily}
+          </div>
+        </div>
+      );
+    }
+
+    /* ---------- methodology ------------------------------------------------ */
+
+    function Methodology({ index }) {
+      const n = index ? index.langs.length : 87;
+      const de = LANG === 'de';
+      return (
+        <div style={{ maxWidth: '74ch' }}>
+          <div style={{ fontSize: 13.5, color: '#cbd5e1', marginBottom: 8 }}>{T.methodTitle}</div>
+          {de ? (
+            <div style={{ fontSize: 13, color: '#94a3b8', lineHeight: 1.7 }}>
+              <p>Die Idee stammt aus einem Paper von <b>Benedetto, Caglioti und Loreto (2002)</b>. Man
+              nimmt einen Referenztext, hängt den fraglichen Text an und komprimiert. Ist der Anhang in
+              derselben Sprache, wächst das Archiv weniger, weil der Kompressor die Muster schon kennt.
+              Aus dem Wachstum je Referenzsprache fällt eine Rangfolge heraus, und aus den paarweisen
+              Werten sogar ein Stammbaum.</p>
+
+              <p>Hier läuft es etwas anders, an zwei Stellen bewusst. Erstens <b>kein gzip</b>. Deflate
+              hat ein 32-KB-Fenster, das die Referenztexte künstlich klein hielte; es rundet auf ganze
+              Bytes, was bei kurzen Proben das Signal verrauscht; seine Huffman-Blockgrenzen erzeugen
+              Sprünge, die nichts mit Sprache zu tun haben; und die Browser-Implementierung ist eine
+              Black Box ohne Determinismus-Garantie. Stattdessen wird je Sprache <b>ein Modell trainiert
+              und eingefroren</b>: ein Zeichenkontextmodell der Ordnung 3 auf Byte-Ebene mit
+              <b> Witten-Bell-Interpolation</b> (Witten &amp; Bell 1991). Gemessen wird nur die Codelänge,
+              also die Summe von −log₂ p über alle Bytes. Ein arithmetischer Kodierer wäre überflüssig,
+              weil nur der Vergleich zwischen den Modellen zählt, nie die kodierten Bytes.</p>
+
+              <p>Zweitens <b>kein PPM</b>, obwohl das der naheliegende Kandidat wäre. An 50 echten
+              Sprachen gemessen liefert Witten-Bell dieselbe Trefferquote (96,1 % bei 30 Zeichen,
+              99,6 % bei 100, 100 % bei 300) und ist dabei rund fünfmal schneller. Ordnung 4 kostet die
+              2,2-fache Tabellengröße für höchstens 0,3 Prozentpunkte, Ordnung 5 bringt nichts. Das
+              deckt sich mit <b>Goodman (2002)</b>, der dem Originalpaper entgegenhielt, dass ein
+              schlichtes n-Gramm-Modell das Kompressionsverfahren schlägt. Er hatte recht.</p>
+
+              <p>Modelliert werden <b>Bytes, nicht Zeichen</b>. Das hält das Alphabet bei 256, sodass
+              CJK-Schriften die Tabellen nicht sprengen, und beseitigt das Zero-Frequency-Problem
+              strukturell: jedes mögliche Byte ist schon im Alphabet. Der Preis ist, dass die Anzeige in
+              <b> Bit pro Byte</b> erfolgt und Chinesisch oder Japanisch dort systematisch anders
+              aussehen, weil ein Zeichen dort drei Bytes braucht. Romanisiert wird bewusst nicht: das
+              zerstörte Töne und die japanische Kana-Kanji-Mischung, bräuchte ein Dutzend
+              Transliterationstabellen, und deren Fehler gingen direkt ins Ergebnis ein.</p>
+
+              <p>Die Abstände zwischen den {n} Sprachen sind Kreuzentropien: wie teuer der
+              zurückgehaltene Probetext der einen Sprache unter dem Modell der anderen ist. Das ist
+              asymmetrisch, deshalb wird gemittelt und die Eigenentropie abgezogen. Der Baum entsteht
+              per <b>UPGMA</b> daraus, die Karte per <b>SMACOF</b>. Beide bekommen ausschließlich die
+              Zahlenmatrix zu sehen: dass Spanisch und Galicisch nebeneinander landen, ist Ergebnis.</p>
+
+              <p>Zwei ehrliche Einschränkungen. Die Karte zeigt <b>Schriftverwandtschaft mindestens so
+              stark wie Sprachverwandtschaft</b>, weil zwei Schriftsysteme auf Byte-Ebene fast keine
+              Muster teilen; Jiddisch landet neben Hebräisch. Und der Baum ist <b>keine Phylogenie</b>:
+              er misst Oberflächenähnlichkeit heutiger Schriftsprachen, nicht gemeinsame Abstammung.
+              Nah verwandte Schriftsprachen wie Serbisch und Kroatisch oder Dänisch und Norwegisch
+              lassen sich bei kurzer Eingabe grundsätzlich nicht trennen; das Tool nennt sie deshalb als
+              Gruppe statt einen Sieger zu behaupten.</p>
+
+              <p>Der Trainingstext stammt aus <b>Tatoeba</b>, also aus kurzen Alltagssätzen. Juristische
+              Prosa, Fachtexte oder URL-lastige Eingaben liegen außerhalb dieser Domäne.</p>
+
+              <p style={{ marginTop: 18 }}><b>Der Programmiersprachen-Tab.</b> Dieselbe Mechanik, aber
+              die Snippets sind für dieses Tool von Hand geschrieben statt aus einem Korpus genommen,
+              damit sich die Lizenzfrage gar nicht erst stellt. Sie sind dadurch klein, rund ein
+              Kilobyte je Sprache, und die Modelle entsprechend schwächer: an zurückgehaltenen Hälften
+              76,5 % bei 40 Zeichen, 89,1 % bei 100, 97,3 % bei 300. Vierzig Zeichen Quelltext sind auch
+              ehrlich mehrdeutig, eine Zeile wie <code>    return result;</code> gehört einem Dutzend
+              Sprachen. Die verbleibenden Fehler sind fast alle die erwarteten Paare: Java gegen C#,
+              Kotlin gegen Swift, Rust gegen C++.</p>
+
+              <p>Eine Falle ist dabei aufgefallen, die das Byte-Modell besonders trifft: <b>Einrückung
+              schlug anfangs die Sprache</b>. Weil gofmt Tabs erzwingt und fast alle anderen Snippets
+              Leerzeichen benutzen, hatte das Modell gelernt, dass Tabs Go bedeuten, und las
+              tab-eingerücktes Python mit 83 % Sicherheit als Go, während Go mit Leerzeichen zu
+              TypeScript wurde. Deshalb wird führender Whitespace vor dem Training <b>und</b> vor jeder
+              Abfrage auf eine Form normalisiert. Das entfernt die Gewohnheit und behält die Struktur,
+              also genau den Teil, der bei Python wirklich Syntax ist. Nebenbei wurde die Erkennung
+              dadurch besser, nicht schlechter.</p>
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, color: '#94a3b8', lineHeight: 1.7 }}>
+              <p>The idea comes from a paper by <b>Benedetto, Caglioti and Loreto (2002)</b>. Take a
+              reference text, append the text in question, compress. If the appended part is in the same
+              language, the archive grows less, because the compressor already knows the patterns. The
+              growth per reference language gives you a ranking, and the pairwise values give you a
+              family tree.</p>
+
+              <p>This tool departs from that in two places, both deliberately. First, <b>no gzip</b>.
+              Deflate has a 32 KB window, which would force the reference texts to stay artificially
+              small; it rounds to whole bytes, which drowns the signal on short samples; its Huffman
+              block boundaries introduce jumps that have nothing to do with language; and the browser
+              implementation is a black box with no determinism guarantee. Instead each language gets
+              <b> one model, trained once and frozen</b>: an order-3 byte-level character model with
+              <b> Witten-Bell interpolation</b> (Witten &amp; Bell 1991). All that is measured is code
+              length, the sum of −log₂ p over the bytes. No arithmetic coder is needed, because only the
+              comparison between models matters, never the encoded bytes.</p>
+
+              <p>Second, <b>no PPM</b>, even though it is the obvious candidate. Measured across 50 real
+              languages, Witten-Bell reaches the same accuracy (96.1% at 30 characters, 99.6% at 100,
+              100% at 300) while running about five times faster. Order 4 costs 2.2 times the table size
+              for at most 0.3 percentage points, and order 5 buys nothing. This agrees with
+              <b> Goodman (2002)</b>, who objected to the original paper that a plain n-gram model beats
+              the compression approach. He was right.</p>
+
+              <p>The model works on <b>bytes, not characters</b>. That caps the alphabet at 256, so CJK
+              scripts cannot blow up the tables, and it removes the zero-frequency problem structurally:
+              every possible byte is already in the alphabet. The price is that everything is reported in
+              <b> bits per byte</b>, so Chinese and Japanese systematically look different, because one
+              character there costs three bytes. Romanising first would be worse: it destroys tone marks
+              and the Japanese kana/kanji mixture, needs a dozen transliteration tables, and their errors
+              would feed straight into the result.</p>
+
+              <p>The distances between the {n} languages are cross-entropies: how expensive one
+              language's held-out probe text is under another language's model. That is asymmetric, so
+              the values are averaged and each language's own entropy subtracted. The tree comes from
+              <b> UPGMA</b> on that matrix, the map from <b>SMACOF</b>. Neither sees anything but the
+              numbers: Spanish and Galician landing next to each other is a result, not a setting.</p>
+
+              <p>Two honest limitations. The map shows <b>script relatedness at least as strongly as
+              language relatedness</b>, because two writing systems share almost no byte patterns;
+              Yiddish sits next to Hebrew. And the tree is <b>not a phylogeny</b>: it measures surface
+              similarity between today's written languages, not common descent. Closely related written
+              languages such as Serbian and Croatian, or Danish and Norwegian, cannot be separated on
+              short input at all, so the tool names them as a group rather than claiming a winner.</p>
+
+              <p>The training text comes from <b>Tatoeba</b>, which means short everyday sentences.
+              Legal prose, technical writing or URL-heavy input sit outside that domain.</p>
+
+              <p style={{ marginTop: 18 }}><b>The programming-language tab.</b> Same machinery, but the
+              snippets were written by hand for this tool rather than taken from a corpus, so the
+              licensing question never arises. That also makes them small, roughly a kilobyte per
+              language, and the models correspondingly weaker: on held-out halves, 76.5% correct at 40
+              characters, 89.1% at 100, 97.3% at 300. Forty characters of source code is genuinely
+              ambiguous anyway, since a line like <code>    return result;</code> belongs to a dozen
+              languages. Almost all the remaining errors are the pairs you would expect: Java against
+              C#, Kotlin against Swift, Rust against C++.</p>
+
+              <p>One trap showed up that hits a byte model particularly hard: <b>indentation initially
+              beat the language</b>. Because gofmt forces tabs while almost every other snippet uses
+              spaces, the model had learned that tabs mean Go, and read tab-indented Python as Go with
+              83% confidence while space-indented Go came out as TypeScript. Leading whitespace is
+              therefore normalised to one form before training <b>and</b> before every query. That
+              removes the habit and keeps the structure, which is the part that is real syntax in
+              Python. As a side effect identification got better, not worse.</p>
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 14, lineHeight: 1.6 }}>
+            Benedetto, Caglioti &amp; Loreto (2002), <i>Language Trees and Zipping</i>, Phys. Rev. Lett. 88, 048702 ·
+            Goodman (2002), <i>Extended Comment on Language Trees and Zipping</i> ·
+            Cilibrasi &amp; Vitányi (2005), <i>Clustering by Compression</i>, IEEE Trans. Inf. Theory 51(4) ·
+            Witten &amp; Bell (1991), <i>The Zero-Frequency Problem</i>, IEEE Trans. Inf. Theory 37(4)
+          </div>
+        </div>
+      );
+    }
+
+    /* ---------- app -------------------------------------------------------- */
+
+    function App() {
+      const [corpus, setCorpus] = useState('natural');
+      const [text, setText] = useState('');
+      const [scope, setScope] = useState('extended');
+      const [view, setView] = useState('ranking');
+      const [autoSwitched, setAutoSwitched] = useState(false);
+      // Once the user picks a tab by hand, stop second-guessing them.
+      const pinned = useRef(false);
+      const st = useCorpus(corpus);
+      const ready = st.phase === 'ready';
+      const isCode = corpus === 'code';
+
+      const chooseCorpus = useCallback(v => {
+        pinned.current = true;
+        setAutoSwitched(false);
+        setCorpus(v);
+      }, []);
+
+      useEffect(() => {
+        if (pinned.current) return;
+        const wants = looksLikeCode(text) ? 'code' : 'natural';
+        if (wants !== corpus) {
+          setCorpus(wants);
+          setAutoSwitched(wants === 'code');
+        }
+      }, [text, corpus]);
+
+      const nbytes = useMemo(() => (text ? C.encodeUtf8(text).length : 0), [text]);
+      const enough = text.trim().length >= C.MIN_CHARS;
+
+      const result = useMemo(() => {
+        if (!ready || !enough) return null;
+        // Source code gets its indentation normalised first, exactly as the
+        // training snippets did. Without it the model keys on tabs-versus-spaces
+        // and reads tab-indented Python as Go.
+        return C.scoreAll(st.models, isCode ? C.normalizeIndent(text) : text);
+      }, [ready, enough, text, st.models, isCode]);
+
+      const views = [
+        { v: 'ranking', label: T.viewRanking },
+        { v: 'tree', label: T.viewTree },
+        { v: 'map', label: T.viewMap },
+        { v: 'method', label: T.viewMethod }
+      ];
+      const scopes = [
+        { v: 'common', label: T.scopeCommon },
+        { v: 'extended', label: T.scopeExtended },
+        { v: 'exotic', label: T.scopeExotic }
+      ];
+
+      return (
+        <div className="container" style={{ paddingTop: 6 }}>
+          <div style={{ marginBottom: 14 }}>
+            <Seg options={[
+              { v: 'natural', label: T.corpusNatural },
+              { v: 'code', label: T.corpusCode }
+            ]} value={corpus} onChange={chooseCorpus} />
+          </div>
+
+          {st.phase !== 'ready' && st.phase !== 'idle' &&
+            <LoadingBar progress={st.progress} failed={st.phase === 'error'} />}
+
+          <textarea className="lz-ta" value={text} spellCheck={false}
+            onChange={e => setText(e.target.value)}
+            disabled={!ready}
+            style={isCode ? { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 13 } : null}
+            placeholder={ready ? (isCode ? T.placeholderCode : T.placeholder) : T.loading + '…'}></textarea>
+
+          {autoSwitched && (
+            <div style={{ fontSize: 12, color: '#38bdf8', marginBottom: 6 }}>{T.autoSwitched}</div>
+          )}
+
+          <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap',
+            fontSize: 12, color: '#64748b', marginBottom: 4 }}>
+            <span>{text.length} {T.chars} · {nbytes} {T.bytes}</span>
+            {text && <button className="lz-ex" onClick={() => setText('')}>{T.clear}</button>}
+          </div>
+
+          <div style={{ marginBottom: 14, fontSize: 12.5, color: '#64748b' }}>
+            <span style={{ marginRight: 8 }}>{T.examples}</span>
+            {(isCode ? CODE_EXAMPLES : EXAMPLES).map(e => (
+              <button key={e.label} className="lz-ex" onClick={() => setText(e.text)} disabled={!ready}>{e.label}</button>
+            ))}
+          </div>
+
+          {ready && text.trim().length > 0 && !enough && (
+            <div className="lz-note" style={{ marginBottom: 14 }}>{T.tooShort(text.trim().length)}</div>
+          )}
+          {result && text.trim().length < C.RELIABLE_CHARS && (
+            <div style={{ fontSize: 12, color: '#d9a05b', marginBottom: 12 }}>{T.shortWarn}</div>
+          )}
+
+          <div style={{ display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap',
+            margin: '18px 0 14px' }}>
+            <Seg options={views} value={view} onChange={setView} />
+            {view !== 'method' && <Seg options={scopes} value={scope} onChange={setScope} label={T.scopeLabel} />}
+          </div>
+
+          {ready && view === 'ranking' && <RankingView index={st.index} result={result} scope={scope} />}
+          {ready && view === 'tree' && <TreeView index={st.index} scope={scope} result={result} D={st.D} />}
+          {ready && view === 'map' && <MapView index={st.index} scope={scope} result={result} D={st.D} />}
+          {view === 'method' && <Methodology index={st.index} />}
+
+          {ready && view !== 'method' && view !== 'ranking' && (
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 10 }}>{T.scopeHint}</div>
+          )}
+
+          <div style={{ marginTop: 28, borderTop: '1px solid #1e293b', paddingTop: 12 }}>
+            <div style={{ fontSize: 11, color: '#64748b', maxWidth: '76ch', lineHeight: 1.6 }}>
+              {isCode ? T.srcNoteCode : T.srcNote}
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 6 }}>{T.disclaimer}</div>
+          </div>
+        </div>
+      );
+    }
+
+    const rootEl = document.getElementById('root');
+    const intro = rootEl.firstElementChild;
+    ReactDOM.createRoot(rootEl).render(
+      <div>
+        <div dangerouslySetInnerHTML={{ __html: intro.outerHTML }}></div>
+        <App />
+      </div>
+    );
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
