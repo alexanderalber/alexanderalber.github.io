@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ruler Title Finder - Alexander Alber</title>
+  <meta name="description" content="You are newly in power and need a title. A short consultation scores 29 historical ruler titles (emperor, caliph, shogun, tsar, doge and more) and recommends the best fit, with real history: etymology, notable holders, and how each title ended.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/title-finder.html">
+  <meta property="og:title" content="Ruler Title Finder - which historical title fits your regime?">
+  <meta property="og:description" content="A deadpan consultation for the newly enthroned: seven questions, a transparent fit score, and 29 real historical ruler titles with etymology, notable holders and occupational statistics.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/title-finder.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    .tf-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      max-width: 980px;
+    }
+    .tf-card {
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 16px 18px;
+      background: rgba(15,23,42,.55);
+    }
+    /* Dossier layout: facts column left, prose column right; wraps to a
+       single column on narrow screens. */
+    .tf-card-inner { display: flex; flex-wrap: wrap; gap: 4px 32px; margin-top: 4px; }
+    .tf-card-side { flex: 1 1 240px; min-width: 220px; }
+    .tf-card-main { flex: 2 1 340px; min-width: 280px; }
+    .tf-pill {
+      cursor: pointer;
+      border-radius: 20px;
+      margin: 0;          /* Pico gives buttons a margin-bottom; wrapped pill rows must stay tight */
+      width: auto;
+      padding: 4px 12px;
+      font-size: 0.8rem;
+      border: 1.5px solid #475569;
+      background: transparent;
+      color: #94a3b8;
+      line-height: 1.4;
+      white-space: nowrap;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+    }
+    .tf-pill:hover { border-color: #94a3b8; color: #cbd5e1; }
+    .tf-pill.active { background: #cbd5e1; border-color: #cbd5e1; color: #0f172a; font-weight: 600; }
+    .tf-badge {
+      display: inline-block;
+      font-size: 0.66rem;
+      padding: 2px 7px;
+      border-radius: 9px;
+      margin: 1px 3px 1px 0;
+      border: 1px solid #334155;
+      color: #94a3b8;
+      white-space: nowrap;
+    }
+    /* Multi-button segmented control (house pattern). */
+    .seg-row .lang-seg { margin-right: -1px; position: relative; }
+    .seg-row .lang-seg:last-child { margin-right: 0; }
+    .seg-row .lang-seg:hover:not(.active):not(:disabled),
+    .seg-row .lang-seg:focus-visible,
+    .seg-row .lang-seg.active { z-index: 2; }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Ruler Title Finder",
+    "description": "Interactive questionnaire that recommends historical ruler titles (emperor, caliph, shogun, tsar, doge and more) with a transparent fit score, plus a filterable reference catalogue with etymology, notable holders and honest statistics.",
+    "url": "https://alber.me/miscellaneous/tools/title-finder.html",
+    "applicationCategory": "EducationalApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><a href="/"><span class="site-logo" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li><a href="/miscellaneous/" aria-current="page">Miscellaneous</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <p class="container" style="margin-bottom:0;padding-top:var(--pico-spacing);">
+      <a href="/miscellaneous/">&larr; Miscellaneous</a>
+    </p>
+    <div id="root">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">Ruler Title Finder</h1>
+        <p style="color:#94a3b8;max-width:70ch">You are newly in power and need a title. Seven questions, a transparent fit score, and 29 historical ruler titles with real history: etymology, notable holders, occupational statistics, and how each title ended.</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Scoring core: plain JS (no JSX, no DOM) so it can be extracted and
+       unit-tested in Node (notes/dev/titlefinder.test.mjs). The score is a
+       transparent additive heuristic in points; no probabilities anywhere.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="titlecore">
+  window.TitleCore = (function () {
+    'use strict';
+
+    var AXES = {
+      legitimacy: ['hereditary', 'elective', 'military', 'religious', 'self_proclaimed', 'bureaucratic'],
+      divine: ['none', 'favored', 'mandate', 'living_god', 'posthumous_god'],
+      facade: ['none', 'partial', 'full'],
+      scope: ['city', 'realm', 'empire', 'universal'],
+      vibe: ['understated', 'standard', 'maximalist'],
+      domain: ['civil', 'military', 'religious', 'mixed'],
+      still_in_use: ['no', 'ceremonial'],
+      region_group: ['Europe & Byzantium', 'Islamic world', 'Persia & the Steppe',
+                     'East Asia', 'South & Southeast Asia', 'Africa & Egypt', 'Americas']
+    };
+
+    // Weight kinds:
+    //   {axis, value, pts, why}          axis match (legitimacy matches if included)
+    //   {special: 'violent', pts, why}   applies if stats.violent_end_share >= 0.4
+    var QUESTIONS = [
+      {
+        id: 'power',
+        prompt: 'How did you come to power?',
+        options: [
+          { id: 'inherited', label: 'I inherited it, as is proper', weights: [
+            { axis: 'legitimacy', value: 'hereditary', pts: 2, why: 'a hereditary title' },
+            { axis: 'legitimacy', value: 'self_proclaimed', pts: -1, why: 'self-proclamation sits oddly with an inheritance' } ] },
+          { id: 'elected', label: 'I was genuinely elected', weights: [
+            { axis: 'legitimacy', value: 'elective', pts: 2, why: 'an elective office' },
+            { axis: 'legitimacy', value: 'self_proclaimed', pts: -2, why: 'self-proclaimed titles undercut a real mandate' } ] },
+          { id: 'elected_quotes', label: 'I was “elected”', weights: [
+            { axis: 'legitimacy', value: 'elective', pts: 1, why: 'formally elective' },
+            { axis: 'legitimacy', value: 'self_proclaimed', pts: 1, why: 'a certain flexibility about mandates' },
+            { axis: 'facade', value: 'partial', pts: 1, why: 'institutions kept partly in place' } ] },
+          { id: 'coup', label: 'Coup. Possibly conquest', weights: [
+            { axis: 'legitimacy', value: 'military', pts: 2, why: 'a title with military legitimacy' },
+            { axis: 'legitimacy', value: 'bureaucratic', pts: -1, why: 'an appointed office rarely survives its appointer' } ] },
+          { id: 'divine_appt', label: 'The divine appointed me', weights: [
+            { axis: 'legitimacy', value: 'religious', pts: 2, why: 'religiously legitimated' },
+            { axis: 'divine', value: 'favored', pts: 1, why: 'divine favor attached' },
+            { axis: 'divine', value: 'mandate', pts: 1, why: 'a formal heavenly mandate' } ] },
+          { id: 'paperwork', label: 'There was paperwork involved', weights: [
+            { axis: 'legitimacy', value: 'bureaucratic', pts: 3, why: 'an office one is appointed to' } ] }
+        ]
+      },
+      {
+        id: 'facade',
+        prompt: 'Does the republic officially continue?',
+        options: [
+          { id: 'full', label: 'Obviously. Nothing has changed', weights: [
+            { axis: 'facade', value: 'full', pts: 2, why: 'maintains the fiction that the old order continues' },
+            { axis: 'vibe', value: 'understated', pts: 1, why: 'a modest style keeps the fiction plausible' } ] },
+          { id: 'partial', label: 'A tasteful transition period', weights: [
+            { axis: 'facade', value: 'partial', pts: 2, why: 'keeps some of the old institutions around' } ] },
+          { id: 'none', label: 'Crown me', weights: [
+            { axis: 'facade', value: 'none', pts: 2, why: 'no pretense about who rules' } ] }
+        ]
+      },
+      {
+        id: 'divine',
+        prompt: 'Your relationship with the divine?',
+        options: [
+          { id: 'none', label: 'Strictly professional', weights: [
+            { axis: 'divine', value: 'none', pts: 2, why: 'a secular office' } ] },
+          { id: 'favored', label: 'The gods favor me, informally', weights: [
+            { axis: 'divine', value: 'favored', pts: 2, why: 'divinely favored, nothing in writing' } ] },
+          { id: 'mandate', label: 'I hold a formal mandate', weights: [
+            { axis: 'divine', value: 'mandate', pts: 2, why: 'rules under an explicit heavenly mandate' } ] },
+          { id: 'living_god', label: 'I am a god, effective immediately', weights: [
+            { axis: 'divine', value: 'living_god', pts: 2, why: 'the holder was a living god' },
+            { axis: 'vibe', value: 'maximalist', pts: 1, why: 'divinity rarely pairs with understatement' } ] },
+          { id: 'posthumous', label: 'Deification can wait until I am dead', weights: [
+            { axis: 'divine', value: 'posthumous_god', pts: 2, why: 'deification arrives posthumously' } ] }
+        ]
+      },
+      {
+        id: 'scope',
+        prompt: 'The extent of your ambition?',
+        options: [
+          { id: 'city', label: 'This city', weights: [
+            { axis: 'scope', value: 'city', pts: 2, why: 'a city-state office' },
+            { axis: 'scope', value: 'realm', pts: 1, why: 'a single realm is close enough' } ] },
+          { id: 'realm', label: 'This realm', weights: [
+            { axis: 'scope', value: 'realm', pts: 2, why: 'made for a single realm' },
+            { axis: 'scope', value: 'city', pts: 1, why: 'a city is a compact realm' },
+            { axis: 'scope', value: 'empire', pts: 1, why: 'an empire is an ambitious realm' } ] },
+          { id: 'empire', label: 'An empire', weights: [
+            { axis: 'scope', value: 'empire', pts: 2, why: 'an imperial title' },
+            { axis: 'scope', value: 'realm', pts: 1, why: 'a realm with room to grow' },
+            { axis: 'scope', value: 'universal', pts: 1, why: 'claims even more than you asked for' } ] },
+          { id: 'universal', label: 'All known lands, ideally more', weights: [
+            { axis: 'scope', value: 'universal', pts: 2, why: 'claims universal dominion' },
+            { axis: 'scope', value: 'empire', pts: 1, why: 'imperial, nearly sufficient' },
+            { axis: 'vibe', value: 'maximalist', pts: 1, why: 'ambition of this kind wants a matching register' } ] }
+        ]
+      },
+      {
+        id: 'vibe',
+        prompt: 'Your preferred style?',
+        options: [
+          { id: 'understated', label: 'Understatement. Power needs no costume', weights: [
+            { axis: 'vibe', value: 'understated', pts: 2, why: 'deliberately modest wording' },
+            { axis: 'vibe', value: 'maximalist', pts: -2, why: 'king-of-kings wording, the opposite of understatement' } ] },
+          { id: 'standard', label: 'Classic. A crown is a crown', weights: [
+            { axis: 'vibe', value: 'standard', pts: 2, why: 'a classic, unembarrassed sovereign title' } ] },
+          { id: 'maximalist', label: 'King-of-kings energy', weights: [
+            { axis: 'vibe', value: 'maximalist', pts: 2, why: 'maximalist wording' },
+            { axis: 'vibe', value: 'understated', pts: -2, why: 'pointedly modest, not what you ordered' } ] }
+        ]
+      },
+      {
+        id: 'domain',
+        prompt: 'Your actual day job?',
+        options: [
+          { id: 'civil', label: 'Administration', weights: [
+            { axis: 'domain', value: 'civil', pts: 2, why: 'a civil office' },
+            { axis: 'domain', value: 'mixed', pts: 1, why: 'administration included in the portfolio' } ] },
+          { id: 'military', label: 'Warlord', weights: [
+            { axis: 'domain', value: 'military', pts: 2, why: 'a military office' },
+            { axis: 'domain', value: 'mixed', pts: 1, why: 'command included in the portfolio' } ] },
+          { id: 'religious', label: 'High priest', weights: [
+            { axis: 'domain', value: 'religious', pts: 2, why: 'a religious office' },
+            { axis: 'domain', value: 'mixed', pts: 1, why: 'ritual duties included in the portfolio' } ] },
+          { id: 'mixed', label: 'All of it', weights: [
+            { axis: 'domain', value: 'mixed', pts: 2, why: 'the full portfolio in one office' } ] }
+        ]
+      },
+      {
+        id: 'succession',
+        prompt: 'Succession plan?',
+        options: [
+          { id: 'children', label: 'My children, obviously', weights: [
+            { axis: 'legitimacy', value: 'hereditary', pts: 1, why: 'built for dynastic succession' } ] },
+          { id: 'electors', label: 'The electors will decide', weights: [
+            { axis: 'legitimacy', value: 'elective', pts: 1, why: 'succession by election' } ] },
+          { id: 'strongest', label: 'The strongest will emerge', weights: [
+            { axis: 'legitimacy', value: 'military', pts: 1, why: 'succession settled in the field' },
+            { axis: 'legitimacy', value: 'self_proclaimed', pts: 1, why: 'the strongest tend to proclaim themselves' } ] },
+          { id: 'chaos', label: 'Unclear. Chaos, probably', weights: [
+            { axis: 'legitimacy', value: 'self_proclaimed', pts: 1, why: 'thrives without a succession rule' },
+            { special: 'violent', pts: 1, why: 'a documented occupational-hazard profile to match' } ] }
+        ]
+      }
+    ];
+
+    // Hard contradictions between an answer and a title get a marked penalty.
+    var CONFLICTS = [
+      { q: 'facade', a: 'full', axis: 'vibe', value: 'maximalist', pts: -3,
+        why: 'a full republican facade cannot be reconciled with king-of-kings styling' },
+      { q: 'divine', a: 'none', axis: 'divine', value: 'living_god', pts: -2,
+        why: 'you asked for a professional distance from the divine; this title IS the divine' },
+      { q: 'vibe', a: 'understated', axis: 'scope', value: 'universal', pts: -2,
+        why: 'a claim to universal dominion is difficult to understate' }
+    ];
+
+    function optionOf(qid, aid) {
+      for (var i = 0; i < QUESTIONS.length; i++) {
+        if (QUESTIONS[i].id !== qid) continue;
+        for (var j = 0; j < QUESTIONS[i].options.length; j++) {
+          if (QUESTIONS[i].options[j].id === aid) return QUESTIONS[i].options[j];
+        }
+      }
+      return null;
+    }
+
+    function weightApplies(w, title) {
+      if (w.special === 'violent') {
+        return !!(title.stats && title.stats.violent_end_share != null &&
+                  title.stats.violent_end_share >= 0.4);
+      }
+      var v = title[w.axis];
+      if (Array.isArray(v)) return v.indexOf(w.value) >= 0;
+      return v === w.value;
+    }
+
+    // answers: {questionId: optionId}, only answered questions count.
+    // Returns {score, contributions: [{pts, why}]}, contributions sorted by
+    // |pts| descending; deterministic for identical inputs.
+    function scoreTitle(answers, title) {
+      var score = 0, contributions = [];
+      QUESTIONS.forEach(function (q) {
+        var opt = answers[q.id] != null ? optionOf(q.id, answers[q.id]) : null;
+        if (!opt) return;
+        opt.weights.forEach(function (w) {
+          if (weightApplies(w, title)) {
+            score += w.pts;
+            contributions.push({ pts: w.pts, why: w.why });
+          }
+        });
+      });
+      CONFLICTS.forEach(function (c) {
+        if (answers[c.q] === c.a && weightApplies(c, title)) {
+          score += c.pts;
+          contributions.push({ pts: c.pts, why: c.why });
+        }
+      });
+      contributions.sort(function (a, b) {
+        return Math.abs(b.pts) - Math.abs(a.pts) || (a.why < b.why ? -1 : 1);
+      });
+      return { score: score, contributions: contributions };
+    }
+
+    // Sorted list of {title, score, contributions}; ties broken by id so the
+    // ranking is fully deterministic.
+    function rankTitles(answers, titles) {
+      var rows = titles.map(function (t) {
+        var s = scoreTitle(answers, t);
+        return { title: t, score: s.score, contributions: s.contributions };
+      });
+      rows.sort(function (a, b) {
+        return b.score - a.score || (a.title.id < b.title.id ? -1 : 1);
+      });
+      return rows;
+    }
+
+    // filters: {axis: [selected values]}; empty/missing array = no filter on
+    // that axis. OR within an axis, AND across axes.
+    function filterTitles(titles, filters) {
+      return titles.filter(function (t) {
+        for (var axis in filters) {
+          var sel = filters[axis];
+          if (!sel || !sel.length) continue;
+          var v = t[axis];
+          var hit = Array.isArray(v)
+            ? v.some(function (x) { return sel.indexOf(x) >= 0; })
+            : sel.indexOf(v) >= 0;
+          if (!hit) return false;
+        }
+        return true;
+      });
+    }
+
+    // Returns a list of problem strings; an empty list means the dataset is valid.
+    function validateDataset(data) {
+      var problems = [];
+      if (!data || !Array.isArray(data.titles)) return ['no titles array'];
+      var seen = {};
+      data.titles.forEach(function (t) {
+        var id = t.id || '(missing id)';
+        if (seen[id]) problems.push(id + ': duplicate id');
+        seen[id] = true;
+        ['id', 'title', 'origin', 'meaning', 'region', 'region_group',
+         'how_it_ended', 'blurb', 'fun_fact'].forEach(function (f) {
+          if (typeof t[f] !== 'string' || !t[f]) problems.push(id + ': missing ' + f);
+        });
+        if (!Array.isArray(t.legitimacy) || !t.legitimacy.length) {
+          problems.push(id + ': legitimacy must be a non-empty array');
+        } else {
+          t.legitimacy.forEach(function (v) {
+            if (AXES.legitimacy.indexOf(v) < 0) problems.push(id + ': bad legitimacy "' + v + '"');
+          });
+        }
+        ['divine', 'facade', 'scope', 'vibe', 'domain', 'still_in_use', 'region_group']
+          .forEach(function (axis) {
+            if (AXES[axis].indexOf(t[axis]) < 0) problems.push(id + ': bad ' + axis + ' "' + t[axis] + '"');
+          });
+        if (!t.era || typeof t.era.label !== 'string' || typeof t.era.from !== 'number') {
+          problems.push(id + ': era needs {label, from}');
+        } else if (t.era.to != null && t.era.to < t.era.from) {
+          problems.push(id + ': era ends before it starts');
+        }
+        if (!Array.isArray(t.holders) || !t.holders.length) {
+          problems.push(id + ': holders must be a non-empty array');
+        } else {
+          t.holders.forEach(function (h) {
+            if (!h || typeof h.name !== 'string' || typeof h.note !== 'string') {
+              problems.push(id + ': holder needs {name, note}');
+            }
+          });
+        }
+        if (t.stats != null) {
+          if (typeof t.stats.n_holders !== 'number' || typeof t.stats.method !== 'string') {
+            problems.push(id + ': stats needs n_holders and method');
+          }
+          if (t.stats.violent_end_share != null &&
+              (t.stats.violent_end_share < 0 || t.stats.violent_end_share > 1)) {
+            problems.push(id + ': violent_end_share out of [0,1]');
+          }
+        }
+        if (!Array.isArray(t.sources) || !t.sources.length) problems.push(id + ': missing sources');
+      });
+      return problems;
+    }
+
+    return {
+      AXES: AXES,
+      QUESTIONS: QUESTIONS,
+      CONFLICTS: CONFLICTS,
+      scoreTitle: scoreTitle,
+      rankTitles: rankTitles,
+      filterTitles: filterTitles,
+      validateDataset: validateDataset
+    };
+  })();
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+    const C = window.TitleCore;
+
+    const DATA_URL = '/assets/files/regnal-titles-2026-07.json';
+    const TOP_N = 5;
+
+    const AXIS_LABELS = {
+      legitimacy: 'Legitimacy',
+      divine: 'Divine status',
+      facade: 'Republican facade',
+      scope: 'Scope',
+      vibe: 'Style',
+      domain: 'Domain',
+      still_in_use: 'Still in use',
+      region_group: 'Region',
+    };
+    const VALUE_LABELS = {
+      hereditary: 'hereditary', elective: 'elective', military: 'military',
+      religious: 'religious', self_proclaimed: 'self-proclaimed', bureaucratic: 'appointed',
+      none: 'none', favored: 'divinely favored', mandate: 'heavenly mandate',
+      living_god: 'living god', posthumous_god: 'god after death',
+      partial: 'partial', full: 'full',
+      city: 'city', realm: 'realm', empire: 'empire', universal: 'universal',
+      understated: 'understated', standard: 'standard', maximalist: 'maximalist',
+      civil: 'civil', mixed: 'mixed',
+      no: 'defunct', ceremonial: 'still in use today',
+    };
+    const vl = v => VALUE_LABELS[v] || v;
+
+    function eraSort(a, b) { return a.era.from - b.era.from || (a.id < b.id ? -1 : 1); }
+
+    function fmtPct(x) { return Math.round(x * 100) + '%'; }
+
+    // ── Small building blocks ────────────────────────────────────────────────
+    function Pill({ label, active, onClick }) {
+      return (
+        <button type="button" className={'tf-pill' + (active ? ' active' : '')} onClick={onClick}>
+          {label}
+        </button>
+      );
+    }
+
+    function AxisBadges({ t }) {
+      const items = [];
+      t.legitimacy.forEach(v => items.push(['legitimacy', vl(v)]));
+      if (t.divine !== 'none') items.push(['divine', vl(t.divine)]);
+      if (t.facade !== 'none') items.push(['facade', 'facade: ' + vl(t.facade)]);
+      items.push(['scope', vl(t.scope)]);
+      items.push(['vibe', vl(t.vibe)]);
+      items.push(['domain', vl(t.domain) + ' office']);
+      if (t.still_in_use === 'ceremonial') items.push(['still', vl('ceremonial')]);
+      return (
+        <div style={{ margin: '8px 0 2px' }}>
+          {items.map(([k, label], i) => <span key={k + i} className="tf-badge">{label}</span>)}
+        </div>
+      );
+    }
+
+    function StatsLine({ stats }) {
+      if (!stats) return null;
+      const bits = [`${stats.n_holders} recorded holders`];
+      if (stats.mean_tenure_years != null) bits.push(`mean tenure ${stats.mean_tenure_years} years`);
+      if (stats.violent_end_share != null) bits.push(`${fmtPct(stats.violent_end_share)} ended violently`);
+      return (
+        <div style={{ marginTop: 10, fontSize: 12.5, color: '#94a3b8' }} title={stats.method}>
+          <span style={{ color: '#64748b', textTransform: 'uppercase', fontSize: 10.5, letterSpacing: '0.05em' }}>Occupational statistics </span>
+          {bits.join(' · ')}
+          <span style={{ color: '#64748b' }}> (hover for method)</span>
+        </div>
+      );
+    }
+
+    function FitBreakdown({ contributions }) {
+      if (!contributions.length) return null;
+      return (
+        <div style={{ marginTop: 10, padding: '8px 12px', border: '1px solid #1e293b',
+          borderRadius: 8, background: 'rgba(30,41,59,.4)', fontSize: 12.5, lineHeight: 1.6 }}>
+          <div style={{ color: '#64748b', textTransform: 'uppercase', fontSize: 10.5, letterSpacing: '0.05em', marginBottom: 2 }}>Why this fits</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', columnGap: 20 }}>
+            {contributions.map((c, i) => (
+              <div key={i} style={{ color: '#94a3b8' }}>
+                <span style={{ color: c.pts > 0 ? '#4ade80' : '#f87171', fontVariantNumeric: 'tabular-nums' }}>
+                  {c.pts > 0 ? '+' + c.pts : c.pts}
+                </span> {c.why}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // With onToggle the card behaves as an accordion item: the header stays
+    // clickable, the body renders only when not collapsed.
+    function TitleCard({ t, rank, score, contributions, collapsed, onToggle }) {
+      return (
+        <article className="tf-card" style={{ margin: 0 }}>
+          <div onClick={onToggle}
+            role={onToggle ? 'button' : undefined}
+            tabIndex={onToggle ? 0 : undefined}
+            aria-expanded={onToggle ? !collapsed : undefined}
+            onKeyDown={onToggle ? (e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); } }) : undefined}
+            style={{ display: 'flex', justifyContent: 'space-between',
+            alignItems: 'baseline', gap: 8, cursor: onToggle ? 'pointer' : 'default' }}>
+            <div>
+              {onToggle && (
+                <span aria-hidden="true" style={{ color: '#64748b', fontSize: '0.8rem', marginRight: 8,
+                  display: 'inline-block', width: 12 }}>{collapsed ? '▸' : '▾'}</span>
+              )}
+              <span style={{ fontSize: '1.25rem', fontWeight: 700, color: '#e2e8f0' }}>{t.title}</span>
+              {t.original_script && (
+                <span style={{ marginLeft: 8, color: '#64748b', fontSize: '0.9rem' }}>{t.original_script}</span>
+              )}
+            </div>
+            {rank != null && (
+              <span style={{ color: '#94a3b8', fontSize: 12.5, whiteSpace: 'nowrap' }}>
+                #{rank} · fit {score} pts
+              </span>
+            )}
+          </div>
+          {collapsed && (
+            <div style={{ fontSize: 12.5, color: '#64748b', fontStyle: 'italic', marginTop: 2,
+              paddingLeft: 20, cursor: 'pointer' }} onClick={onToggle}>
+              {t.origin}: {t.meaning}
+            </div>
+          )}
+          {!collapsed && t.female_form && (
+            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>female form: {t.female_form}</div>
+          )}
+          {!collapsed && <div className="tf-card-inner">
+            <div className="tf-card-side">
+              <div style={{ fontSize: 12.5, color: '#94a3b8', marginTop: 6 }}>
+                {t.region} · {t.era.label}
+              </div>
+              <div style={{ fontSize: 13, color: '#94a3b8', fontStyle: 'italic', marginTop: 6, lineHeight: 1.5 }}>
+                {t.origin}: {t.meaning}
+              </div>
+              <AxisBadges t={t} />
+              <StatsLine stats={t.stats} />
+              <div style={{ marginTop: 10, fontSize: 10.5, color: '#475569' }}>
+                Sources: {t.sources.join('; ')}
+              </div>
+            </div>
+            <div className="tf-card-main">
+              <p style={{ fontSize: 13.5, color: '#cbd5e1', lineHeight: 1.6, margin: '8px 0 0' }}>{t.blurb}</p>
+              <div style={{ marginTop: 10, fontSize: 12.5, color: '#94a3b8', lineHeight: 1.6 }}>
+                <span style={{ color: '#64748b', textTransform: 'uppercase', fontSize: 10.5, letterSpacing: '0.05em' }}>Notable holders </span>
+                {t.holders.map((h, i) => (
+                  <span key={h.name}>{i > 0 && '; '}<span style={{ color: '#cbd5e1' }}>{h.name}</span> ({h.note})</span>
+                ))}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 12.5, color: '#94a3b8', lineHeight: 1.6 }}>
+                <span style={{ color: '#64748b', textTransform: 'uppercase', fontSize: 10.5, letterSpacing: '0.05em' }}>How it ended </span>
+                {t.how_it_ended}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 12.5, color: '#94a3b8', lineHeight: 1.6,
+                borderLeft: '2px solid #334155', paddingLeft: 10 }}>
+                {t.fun_fact}
+              </div>
+              {contributions && <FitBreakdown contributions={contributions} />}
+            </div>
+          </div>}
+        </article>
+      );
+    }
+
+    // ── Consultation view ────────────────────────────────────────────────────
+    function Consultation({ titles }) {
+      const [answers, setAnswers] = useState({});
+      // Accordion state: null = follow the ranking (top pick open),
+      // '' = everything closed by hand, otherwise the open title's id.
+      const [openId, setOpenId] = useState(null);
+      const answered = Object.keys(answers).length;
+
+      const ranking = useMemo(() => {
+        if (!answered) return [];
+        return C.rankTitles(answers, titles).slice(0, TOP_N);
+      }, [answers, titles]);
+
+      const effectiveOpen = openId === '' ? null
+        : (openId && ranking.some(r => r.title.id === openId)) ? openId
+        : (ranking.length ? ranking[0].title.id : null);
+
+      const setAnswer = (qid, oid) => {
+        setAnswers(prev => {
+          const next = { ...prev };
+          if (next[qid] === oid) delete next[qid]; else next[qid] = oid;
+          return next;
+        });
+      };
+
+      return (
+        <div>
+          <p style={{ fontSize: 14, color: '#94a3b8', maxWidth: '70ch', lineHeight: 1.6 }}>
+            Congratulations on your recent accession. Before the coronation, the
+            paperwork: seven questions about your situation. Recommendations update
+            as you answer; the scoring is additive and disclosed in full on each card.
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, margin: '18px 0' }}>
+            {C.QUESTIONS.map((q, qi) => (
+              <div key={q.id}>
+                <div style={{ fontSize: 13, color: '#cbd5e1', fontWeight: 600, marginBottom: 6 }}>
+                  <span style={{ color: '#64748b', fontVariantNumeric: 'tabular-nums' }}>{qi + 1}. </span>
+                  {q.prompt}
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {q.options.map(o => (
+                    <Pill key={o.id} label={o.label} active={answers[q.id] === o.id}
+                      onClick={() => setAnswer(q.id, o.id)} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          {answered > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', margin: '24px 0 12px' }}>
+              <h2 style={{ fontSize: '1.1rem', color: '#cbd5e1', margin: 0 }}>
+                Recommended titles
+                {answered < C.QUESTIONS.length && (
+                  <span style={{ fontSize: 12.5, color: '#64748b', fontWeight: 400, marginLeft: 10 }}>
+                    based on {answered} of {C.QUESTIONS.length} answers; more answers, firmer advice
+                  </span>
+                )}
+              </h2>
+              <button type="button" onClick={() => { setAnswers({}); setOpenId(null); }} style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: '#64748b', fontSize: 12.5, padding: '2px 4px', width: 'auto' }}>
+                &#10005; start over
+              </button>
+            </div>
+          )}
+          {answered > 0 && (
+            <div className="tf-grid">
+              {ranking.map((r, i) => (
+                <TitleCard key={r.title.id} t={r.title} rank={i + 1}
+                  score={r.score} contributions={r.contributions}
+                  collapsed={r.title.id !== effectiveOpen}
+                  onToggle={() => setOpenId(r.title.id === effectiveOpen ? '' : r.title.id)} />
+              ))}
+            </div>
+          )}
+          {answered === 0 && (
+            <p style={{ color: '#64748b', fontSize: 13 }}>
+              Answer at least one question and the consultation begins.
+            </p>
+          )}
+        </div>
+      );
+    }
+
+    // ── Catalogue view ───────────────────────────────────────────────────────
+    const FILTER_AXES = ['region_group', 'legitimacy', 'divine', 'facade', 'scope', 'vibe', 'domain', 'still_in_use'];
+
+    function Catalogue({ titles }) {
+      const [filters, setFilters] = useState({});
+      const [sortBy, setSortBy] = useState('era');
+
+      const toggle = (axis, value) => {
+        setFilters(prev => {
+          const cur = prev[axis] || [];
+          const next = cur.includes(value) ? cur.filter(v => v !== value) : [...cur, value];
+          return { ...prev, [axis]: next };
+        });
+      };
+      const hasFilters = Object.values(filters).some(a => a && a.length);
+
+      const rows = useMemo(() => {
+        const r = C.filterTitles(titles, filters);
+        const s = [...r];
+        if (sortBy === 'era') s.sort(eraSort);
+        else if (sortBy === 'alpha') s.sort((a, b) => a.title.localeCompare(b.title, 'en'));
+        return s;
+      }, [titles, filters, sortBy]);
+
+      const lbl = { fontSize: 11, color: '#64748b', fontWeight: 600, textTransform: 'uppercase',
+        letterSpacing: '0.05em', whiteSpace: 'nowrap', minWidth: 118 };
+
+      return (
+        <div>
+          <div className="tf-card" style={{ display: 'flex', flexDirection: 'column', gap: 9, marginBottom: 16 }}>
+            {FILTER_AXES.map(axis => (
+              <div key={axis} style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                <span style={lbl}>{AXIS_LABELS[axis]}</span>
+                {C.AXES[axis].map(v => (
+                  <Pill key={v} label={axis === 'region_group' ? v : vl(v)}
+                    active={(filters[axis] || []).includes(v)}
+                    onClick={() => toggle(axis, v)} />
+                ))}
+              </div>
+            ))}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center',
+              borderTop: '1px solid #1e293b', paddingTop: 9, justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <span style={lbl}>Sort</span>
+                <Pill label="chronological" active={sortBy === 'era'} onClick={() => setSortBy('era')} />
+                <Pill label="A to Z" active={sortBy === 'alpha'} onClick={() => setSortBy('alpha')} />
+              </div>
+              {hasFilters && (
+                <button type="button" onClick={() => setFilters({})} style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: '#64748b', fontSize: 12.5, padding: '2px 4px', width: 'auto' }}>
+                  &#10005; reset filters
+                </button>
+              )}
+            </div>
+          </div>
+          <p style={{ fontSize: 12.5, color: '#64748b', margin: '0 0 12px' }}>
+            {rows.length} of {titles.length} titles
+          </p>
+          <div className="tf-grid">
+            {rows.map(t => <TitleCard key={t.id} t={t} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ── App ──────────────────────────────────────────────────────────────────
+    function App() {
+      const [titles, setTitles] = useState(null);
+      const [error, setError] = useState(false);
+      const [view, setView] = useState('consult');
+
+      useEffect(() => {
+        fetch(DATA_URL)
+          .then(r => r.json())
+          .then(data => {
+            const problems = C.validateDataset(data);
+            if (problems.length) { console.error('dataset problems:', problems); }
+            setTitles(data.titles);
+          })
+          .catch(() => setError(true));
+      }, []);
+
+      if (error) return (
+        <div className="container" style={{ padding: '48px 0', color: '#94a3b8' }}>
+          Could not load the title database. If you opened this file directly
+          (file://), it needs to be served over HTTP.
+        </div>
+      );
+      if (!titles) return (
+        <div className="container" style={{ padding: '48px 0', color: '#64748b' }}>Loading the archive&hellip;</div>
+      );
+
+      return (
+        <div className="container" style={{ paddingBottom: 48 }}>
+          <h1 style={{ fontSize: '1.5rem', color: '#cbd5e1', marginBottom: 8 }}>Ruler Title Finder</h1>
+          <p style={{ color: '#94a3b8', maxWidth: '70ch', fontSize: 14.5, lineHeight: 1.6 }}>
+            You are newly in power and need a title. This happens. The archive
+            holds {titles.length} historical options, each with its etymology, notable
+            holders, and an honest account of how it ended.
+          </p>
+          <div className="seg-row" style={{ margin: '16px 0 22px' }}>
+            <button type="button" className={'lang-seg' + (view === 'consult' ? ' active' : '')}
+              onClick={() => setView('consult')}>Consultation</button>
+            <button type="button" className={'lang-seg' + (view === 'catalogue' ? ' active' : '')}
+              onClick={() => setView('catalogue')}>The full catalogue</button>
+          </div>
+          {view === 'consult' ? <Consultation titles={titles} /> : <Catalogue titles={titles} />}
+          <div style={{ marginTop: 40, borderTop: '1px solid #1e293b', paddingTop: 14 }}>
+            <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.6, maxWidth: '90ch' }}>
+              Historical content compiled from standard references (Britannica, Encyclopaedia
+              Iranica, Dumbarton Oaks, and the works cited on each card); era years are
+              approximate. Statistics appear only where a conventional numbered list of
+              holders exists; the method is disclosed on hover. The fit score is a plain
+              additive heuristic, fully disclosed per recommendation, and not a probability
+              of anything.
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 8 }}>
+              A private, non-commercial hobby project. Historical accuracy attempted;
+              consult a historian before actually seizing power.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · <a href="/">alber.me</a> · Feedback welcome: feedback@alber.me · <a href="/datenschutz.html">Datenschutz</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+  <script>/* privacy-label-i18n */if(document.documentElement.lang==='en'){var _pl=document.querySelector('footer a[href="/datenschutz.html"]');if(_pl)_pl.textContent='Privacy';}</script>
+</body>
+</html>
