@@ -1,0 +1,1750 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Reaction Diffusion, Live - Alexander Alber</title>
+  <meta name="description" content="A Gray-Scott reaction-diffusion system running live on your GPU, filling the whole screen. Drag a cursor through the feed/kill parameter space and watch the pattern turn from solitons into worms into mitosis, paint new seeds with the mouse, and change the lighting of the field.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/reaction-diffusion.html">
+  <meta property="og:title" content="Reaction Diffusion, Live">
+  <meta property="og:description" content="Gray-Scott reaction-diffusion on the GPU, full screen. Drag through the feed/kill parameter space, paint seeds, watch the pattern change class under your cursor.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/reaction-diffusion.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* This tool is a full-screen canvas, so it deliberately drops the Pico
+       container, the site header and the site footer. Everything that would
+       normally live in those goes into the panel, including the footer line. */
+    html, body { height: 100%; }
+    body { margin: 0; overflow: hidden; background: #0b1017; }
+    #root { position: fixed; inset: 0; }
+
+    .rd-stage { position: absolute; inset: 0; touch-action: none; cursor: crosshair; }
+    .rd-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+    .rd-back { position: absolute; top: 12px; left: 12px; z-index: 3;
+      font-size: 12.5px; color: #94a3b8; text-decoration: none;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: rgba(15,23,42,.6); backdrop-filter: blur(6px); }
+    .rd-back:hover { color: #cbd5e1; border-color: #475569; }
+
+    .rd-hud { position: absolute; bottom: 12px; left: 12px; z-index: 3;
+      display: flex; align-items: baseline; gap: 10px;
+      font-size: 11.5px; color: #94a3b8; font-variant-numeric: tabular-nums;
+      pointer-events: none; letter-spacing: .02em;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: rgba(15,23,42,.6); backdrop-filter: blur(6px); }
+    .rd-hud b { color: #cbd5e1; font-weight: 600; }
+    .rd-hud span { color: #64748b; }
+
+    .rd-panel { position: absolute; top: 12px; right: 12px; z-index: 4;
+      width: min(330px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+      overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid #334155; border-radius: 10px; padding: 12px 14px 14px;
+      background: rgba(15,23,42,.82); backdrop-filter: blur(10px);
+      box-shadow: 0 18px 40px rgba(0,0,0,.5); }
+    .rd-panel::-webkit-scrollbar { width: 8px; }
+    .rd-panel::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+
+    .rd-toggle { position: absolute; top: 12px; right: 12px; z-index: 4;
+      font-size: 12.5px; color: #cbd5e1; cursor: pointer;
+      padding: 6px 13px; border-radius: 999px; border: 1px solid #334155;
+      background: rgba(15,23,42,.75); backdrop-filter: blur(8px); }
+    .rd-toggle:hover { border-color: #475569; }
+
+    .rd-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .rd-head h1 { font-size: 14px; color: #cbd5e1; margin: 0; font-weight: 600;
+      letter-spacing: .01em; flex: 1; }
+    .rd-x { background: none; border: none; color: #64748b; cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 4px; margin: 0; width: auto; }
+    .rd-x:hover { color: #cbd5e1; }
+
+    /* Accordion. Only one section is open at a time, because the whole point is
+       that the panel has to fit next to a full-screen canvas on a laptop. */
+    .rd-acc { border-top: 1px solid #1e293b; }
+    .rd-acc-h { display: flex; align-items: baseline; gap: 8px; width: 100%;
+      margin: 0; padding: 9px 2px; background: none; border: none; cursor: pointer;
+      font-size: 11px; color: #64748b; letter-spacing: .06em; text-transform: uppercase;
+      text-align: left; }
+    .rd-acc-h:hover { color: #cbd5e1; }
+    .rd-acc-h.open { color: #94a3b8; }
+    .rd-acc-s { margin-left: auto; font-size: 11px; color: #475569;
+      text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+    .rd-acc-c { margin-left: auto; font-size: 13px; line-height: 1; color: #475569; flex: none; }
+    .rd-acc-s + .rd-acc-c { margin-left: 6px; }
+    .rd-acc-b { padding: 0 2px 12px; }
+
+    /* Multi-button segmented control, same pattern as the triplet-loss tool. */
+    .rd-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .rd-seg { display: flex; }
+    .rd-seg .lang-seg { margin-right: -1px; position: relative; }
+    .rd-seg .lang-seg:first-child { border-right: 1px solid var(--pico-muted-border-color); }
+    .rd-seg .lang-seg:last-child { margin-right: 0; }
+    .rd-seg .lang-seg:hover:not(.active), .rd-seg .lang-seg:focus-visible,
+    .rd-seg .lang-seg.active { z-index: 2; }
+    .lang-seg { width: auto; }
+
+    .rd-run.lang-seg { background: #38bdf8; border-color: #38bdf8; color: #06212f;
+      font-weight: 600; padding-left: 14px; padding-right: 14px; border-radius: 4px; }
+    .rd-run.lang-seg:hover { background: #7dd3fc; border-color: #7dd3fc; color: #06212f; }
+    .rd-run.lang-seg.paused { background: none; color: #38bdf8; border-color: #38bdf8; }
+    .rd-run.lang-seg.paused:hover { background: rgba(56,189,248,.12); color: #7dd3fc; }
+    .rd-btn.lang-seg { border-radius: 4px; }
+
+    .rd-param label { display: flex; align-items: baseline; gap: 6px;
+      font-size: 12px; color: #94a3b8; margin-bottom: 1px; }
+    .rd-param .rd-val { color: #cbd5e1; font-variant-numeric: tabular-nums;
+      flex: none; margin-left: auto; }
+    .rd-param input[type=range] { margin: 0 0 7px; height: 16px; }
+
+    .rd-map { display: block; width: 100%; height: auto; border-radius: 6px;
+      border: 1px solid #334155; touch-action: none; cursor: crosshair; }
+    .rd-maplabel { font-size: 12px; color: #cbd5e1; margin: 6px 0 0;
+      display: flex; gap: 6px; align-items: baseline; }
+    .rd-maplabel small { color: #64748b; font-size: 11px; }
+
+    .rd-legend { display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+      font-size: 10.5px; color: #64748b; margin: 7px 0 0; }
+    .rd-key { display: inline-block; width: 14px; height: 0; flex: none; margin-left: 6px; }
+    .rd-key:first-child { margin-left: 0; }
+    .rd-key-dash { border-top: 1px dashed rgba(203,213,225,.6); }
+    .rd-key-red { border-top: 2px solid #f87171; }
+    .rd-key-hatch { height: 9px; border: none; border-radius: 2px;
+      background-image: repeating-linear-gradient(45deg,
+        rgba(251,191,36,.55) 0 1px, transparent 1px 4px);
+      background-color: rgba(8,12,19,.5); }
+
+    .rd-chip { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; margin: 0;
+      width: auto; background: transparent; border: 1px solid #334155; color: #94a3b8;
+      cursor: pointer; line-height: 1.7; }
+    .rd-chip:hover { border-color: #475569; color: #cbd5e1; }
+    .rd-chip.active { background: rgba(56,189,248,.14); border-color: #38bdf8; color: #7dd3fc; }
+
+    .rd-about { font-size: 11.5px; color: #64748b; line-height: 1.7; }
+    .rd-about p { margin: 0 0 7px; }
+    .rd-about a { color: #94a3b8; }
+    .rd-about summary { cursor: pointer; color: #94a3b8; font-size: 11px;
+      letter-spacing: .06em; text-transform: uppercase; }
+    .rd-foot { font-size: 10px; color: #475569; line-height: 1.6; margin-top: 8px; }
+    .rd-foot a { color: #475569; }
+
+    .rd-fallback { position: absolute; inset: 0; display: flex; align-items: center;
+      justify-content: center; padding: 24px; text-align: center; color: #94a3b8;
+      font-size: 14px; line-height: 1.7; }
+  </style>
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/babel.min.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Reaction Diffusion, Live",
+    "description": "A Gray-Scott reaction-diffusion system simulated on the GPU in WebGL2 and rendered full screen as a lit height field. The feed and kill rates are navigated on a two-dimensional map of catalogued pattern regimes, seeds can be painted with the pointer, and the shading, palette, grid resolution and step rate are adjustable.",
+    "url": "https://alber.me/miscellaneous/tools/reaction-diffusion.html",
+    "applicationCategory": "EducationalApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript and WebGL2 with floating point render targets"
+  }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Core: plain JS, no JSX and no DOM and no GL, so the Node test suite can
+       pull this block out and eval it (notes/dev/rd.test.mjs). Everything the
+       GPU does not have to do lives here.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="rdcore">
+  /* RD-CORE-START -- pure logic, also runs in the Node test suite */
+  window.RDCore = (function () {
+    'use strict';
+
+    /* ---------- seeded randomness (same generator as the other tools) ---------- */
+
+    function mulberry32(seed) {
+      var a = seed >>> 0;
+      return function () {
+        a = (a + 0x6D2B79F5) | 0;
+        var t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /* ---------- the parameter space ----------
+
+       Gray-Scott has two chemicals. U is fed in at rate F and V is removed at
+       rate F+k, and the reaction U + 2V -> 3V converts one into the other. Only
+       F and k decide what the pattern looks like; everything else is scenery.
+
+       One line in the plane is exact rather than surveyed: the saddle-node line
+       k = sqrt(F)/2 - F, where the two non-trivial UNIFORM steady states meet
+       and vanish. It is worth drawing because it is analytic, but it is not a
+       boundary for patterns: patterns are not uniform states, and the
+       self-replicating regimes sit above the line precisely because the uniform
+       state they would otherwise relax into is no longer there.                 */
+
+    function saddleK(F) {
+      return F <= 0 ? -1 : Math.sqrt(F) / 2 - F;
+    }
+
+    /* NORM is the plane the classification measures distances in. It is wider
+       than what the map shows and never changes, so cropping the view cannot
+       silently restretch the metric and reassign points to other regimes. */
+    var NORM = { F: [0.005, 0.11], k: [0.030, 0.075] };
+
+    /* RANGES is the part worth showing, and it is a measured crop rather than a
+       taste decision. Above k = 0.068 nothing survives at all.
+
+       The lower cut had a wrong reason at first: an early scan called everything
+       below k = 0.045 uniform, but that scan used the single horizon that cannot
+       tell a transient from a uniform field. Re-measured, the band does form
+       patterns, and they collapse completely before step 1000 (at F=0.03,
+       k=0.040 the standard deviation is 0.174 at step 500 and exactly 0 from
+       step 1000 on). So the cut stands, for the honest reason: down there the
+       show is over in a couple of seconds, while the transients inside the crop
+       last thousands of steps.
+
+       Cropping both ends roughly doubles the vertical resolution of the map
+       where it counts. F is not cropped: patterns reach both ends of it.        */
+    var RANGES = {
+      F: [0.005, 0.11],
+      k: [0.045, 0.068],
+      Du: [0.20, 1.20],
+      Dv: [0.05, 0.80],
+      steps: [1, 30],
+      height: [0, 30],
+      glow: [0, 3],
+      light: [0, 6.2832],
+      brush: [0.004, 0.09]
+    };
+
+    function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+
+    function clampTo(key, x) {
+      var r = RANGES[key];
+      if (!r || !isFinite(x)) return r ? r[0] : 0;
+      return clamp(x, r[0], r[1]);
+    }
+
+    /* Pad coordinates are (u, v) in [0,1]^2 with F to the right and k upward,
+       so the map reads the way the published diagrams do. */
+    function padToParams(u, v) {
+      return {
+        F: RANGES.F[0] + clamp(u, 0, 1) * (RANGES.F[1] - RANGES.F[0]),
+        k: RANGES.k[0] + clamp(v, 0, 1) * (RANGES.k[1] - RANGES.k[0])
+      };
+    }
+
+    function paramsToPad(F, k) {
+      return {
+        u: clamp((F - RANGES.F[0]) / (RANGES.F[1] - RANGES.F[0]), 0, 1),
+        v: clamp((k - RANGES.k[0]) / (RANGES.k[1] - RANGES.k[0]), 0, 1)
+      };
+    }
+
+    /* ---------- catalogued regimes ----------
+
+       These are parameter points that are named in the literature and in the
+       usual reproductions of Pearson's survey. The map shades the plane by
+       nearest catalogued point, which is an honest partition of a set of known
+       examples and NOT a rigorous phase diagram: the real boundaries are
+       curved, some regimes are bistable, and which one you land in also depends
+       on how the field was seeded.                                            */
+
+    /* "Waves" (F=0.014, k=0.045) used to be in here and was removed: measured on
+       a 128 grid over 3000 steps it dies with every seed variant tried, which
+       matches the survival mask below. Whatever it looks like in a still image,
+       under this scheme it is a transient. */
+    var PRESETS = [
+      { id: 'chaos',     name: 'Chaos',        F: 0.026,  k: 0.051,  color: '#3b2f63',
+        note: 'Never settles. Blobs merge, split and drift forever.' },
+      { id: 'loops',     name: 'Spots & loops', F: 0.018, k: 0.051,  color: '#2c3f6b',
+        note: 'Spots that grow tails and close into rings.' },
+      { id: 'moving',    name: 'Moving spots', F: 0.034,  k: 0.056,  color: '#4a2c56',
+        note: 'Spots that wander and punch holes in each other.' },
+      { id: 'maze',      name: 'Mazes',        F: 0.029,  k: 0.057,  color: '#2f4858',
+        note: 'Labyrinth of even-width corridors. Grows until it fills.' },
+      { id: 'holes',     name: 'Holes',        F: 0.039,  k: 0.058,  color: '#523a2c',
+        note: 'Inverted: a filled field eaten away from inside.' },
+      { id: 'worms',     name: 'Worms',        F: 0.078,  k: 0.061,  color: '#1f4d47',
+        note: 'Long fingers that extend and branch. Barely spreads from a single square: give it the blobs or noise seed.' },
+      { id: 'uskate',    name: 'U-Skate',      F: 0.062,  k: 0.0609, color: '#5c4a1f',
+        note: 'Gliders. Small structures that travel across the field.' },
+      { id: 'solitons',  name: 'Solitons',     F: 0.030,  k: 0.062,  color: '#26456e',
+        note: 'Isolated spots that hold their shape indefinitely.' },
+      { id: 'pulsing',   name: 'Pulsing solitons', F: 0.025, k: 0.060, color: '#334f7a',
+        note: 'The same spots, breathing in and out.' },
+      { id: 'coral',     name: 'Coral',        F: 0.0545, k: 0.062,  color: '#3d5230',
+        note: 'Branching growth from the seed outward, tips only.' },
+      { id: 'mitosis',   name: 'Mitosis',      F: 0.0367, k: 0.0649, color: '#6b2f3f',
+        note: 'Each spot grows until it splits in two, and so on. Slow to start: the first division takes a while.' }
+    ];
+
+    /* Far from every catalogued point the honest answer is that nobody put a
+       name here, so the map says so instead of extrapolating one. */
+    var UNCHARTED = { id: 'uncharted', name: 'Uncharted', color: '#141a23',
+      note: 'No catalogued regime nearby. Often nothing survives here, but that is worth checking rather than assuming.' };
+    var UNCHARTED_DIST = 0.17;
+
+    var PRESET_BY_ID = {};
+    for (var pi = 0; pi < PRESETS.length; pi++) PRESET_BY_ID[PRESETS[pi].id] = PRESETS[pi];
+
+    /* Classification uses the measured plane rather than the visible one, so
+       that cropping the view does not silently restretch the metric and change
+       which regime a point belongs to. */
+    function normPad(F, k) {
+      return {
+        u: clamp((F - NORM.F[0]) / (NORM.F[1] - NORM.F[0]), 0, 1),
+        v: clamp((k - NORM.k[0]) / (NORM.k[1] - NORM.k[0]), 0, 1)
+      };
+    }
+
+    /* Nearest catalogued regime, measured in normalised coordinates so that the
+       two axes count equally despite their different units. */
+    function classify(F, k) {
+      var here = normPad(F, k), best = null, bestD = Infinity;
+      for (var i = 0; i < PRESETS.length; i++) {
+        var p = PRESETS[i], q = normPad(p.F, p.k);
+        var d = (q.u - here.u) * (q.u - here.u) + (q.v - here.v) * (q.v - here.v);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      return bestD > UNCHARTED_DIST * UNCHARTED_DIST ? UNCHARTED : best;
+    }
+
+    /* ---------- what actually happens where ----------
+
+       The owner's first report was that whole regions go blank within a second,
+       which the catalogued points said nothing about. So it was measured rather
+       than reasoned about: notes/dev/rd-survival.mjs runs the same update the
+       shader runs, on the standard centre seed, over a 30 x 21 sample of the
+       visible crop, 128 x 128 cells, 3200 steps.
+
+       Survival alone turned out to be the wrong question. A field flooded to a
+       single uniform value passes any "is V still there" test and is exactly as
+       interesting to look at as an empty one, so the spatial standard deviation
+       of V decides between the two.
+
+       A fixed step count was the second wrong question. At F=0.093, k=0.053 the
+       field builds a clean pattern by step 1500 and then collapses to a perfectly
+       uniform V=0.410 at around step 2900, forever. Measured at 3200 steps that
+       cell counts as patterned, and the visitor who parks there watches the
+       screen go blank inside the marked region. So both horizons are measured
+       and both are shown:
+
+         0  dead        V decayed away, the field is blank
+         1  flat        uniform from the start, never had structure
+         2  transient   patterned early, uniform once it settles
+         3  patterned   still has structure when settled
+
+       Two further things had to be measured rather than assumed. The domain
+       matters: chaotic regimes collapse on a 128 grid and persist on 160 and
+       192, so the scan uses 160 and the tool's own grids are larger still. And
+       an instantaneous standard deviation is useless for those regimes, because
+       it wanders between 0.007 and 0.113; both windows take the maximum over
+       several samples instead, while a genuinely flooded field sits at exactly
+       zero for all of them.
+
+       rows[0] is the highest k. This describes the tool with its own seed, not
+       Gray-Scott in general: a different seed moves the boundary, which is why
+       the seed values above are fixed and tested.                              */
+
+    var STATE_DEAD = 0, STATE_FLAT = 1, STATE_TRANSIENT = 2, STATE_PATTERN = 3;
+
+    var STATE_MASK = {
+      cols: 80, rows: 54,
+      rect: { F: [0.005, 0.11], k: [0.045, 0.068] },
+      // 4320 samples, 160 x 160 cells, up to 9000 steps each, about 100 minutes.
+      // Of those: 1163 dead, 1884 transient, 1272 patterned, and exactly ONE
+      // uniform from the start. That last number is the whole argument for
+      // measuring two horizons: what a single late snapshot would have written
+      // off as a boring flooded half of the plane is almost entirely made of
+      // patterns that form first and flatten afterwards.
+      bits: [
+        '00000000000000000000000000000000000000000000000000000000000000000000000000000000',
+        '00000000000000000000000000000000000000000000000000000000000000000000000000000000',
+        '00000000000000000000000000000000000000000000000000000000000000000000000000000000',
+        '00000000000000000000000000000003333333333000000000000000000000000000000000000000',
+        '00000000000000000000000000033333333333333333330000000000000000000000000000000000',
+        '00000000000000000000000003333333333333333333333330000000000000000000000000000000',
+        '00000000000000000000000333333333333333333333333333300000000000000000000000000000',
+        '00000000000000000000033333333333333333333333333333333300000000000000000000000000',
+        '00000000000000000000333333333333333333333333333333333333000000000000000000000000',
+        '00000000000000000003333333333333333333333333333333333333330000000000000000000000',
+        '00000000000000000033333333333333333333333333333333333333333000000000000000000000',
+        '00000000000000000333333333333333333333333333333333333333333330000000000000000000',
+        '00000000000000003333333333333333333333333333333333333333333333300000000000000000',
+        '00000000000000033333333333333333333333333333333333333333333333330000000000000000',
+        '00000000000000033333333333333333333333333333333333333333333233333000000000000000',
+        '00000000000000333333333333333333333333333333333333333333333332333330000000000000',
+        '00000000000000333333333333333333333333333333333333333333333333223333000000000000',
+        '00000000000003333333333333333333333333333333333333333333333333322333300000000000',
+        '00000000000003333333333333333333333322222222222333333333333333333223333000000000',
+        '00000000000033333333333333333333322222222222222222333333333333333322233300000000',
+        '00000000000333333333333333333332222222222222222222222333333333333332223330000000',
+        '00000000000333333333333333333322222222222222222222222223333333333333222333000000',
+        '00000000000333333333333333332222222222222222222222222222233333333333322223300000',
+        '00000000003333333333333333322222222222222222222222222222223333333333332222330000',
+        '00000000003333333333333333222222222222222222222222222222222233333333333222230000',
+        '00000000003333333333333332222222222222222222222222222222222223333333333322222000',
+        '00000000333333333333333322222222222222222222222222222222222222233333333333222200',
+        '00000000033333333333333222222222222222222222222222222222222222223333333333322220',
+        '00000000033333333333333222222222222222222222222222222222222222222333333333332222',
+        '00000000333333333333332222222222222222222222222222222222222222222223333333333221',
+        '00000000333333333333332222222222222222222222222222222222222222222222333333333322',
+        '00000003333333333333322222222222222222222222222222222222222222222222233333333322',
+        '00000003333333333333222222222222222222222222222222222222222222222222223333333332',
+        '00000033333333333330222222222222222222222222222222222222222222222222222333333333',
+        '00000033333333333332222222222222222222222222222222222222222222222222222223333333',
+        '00000333333333333332222222222222222222222222222222222222222222222222222222333333',
+        '00000033333333333332222222222222222222222222222222222222222222222222222222233333',
+        '00000033333333333322222222222222222222222222222222222222222222222222222222223333',
+        '00000333333333333322222222222222222222222222222222222222222222222222222222222333',
+        '00000033333333333222222222222222222222222222222222222222222222222222222222222233',
+        '00000333333333333222222222222222222222222222222222222222222222222222222222222223',
+        '00000033333333332222222222222222222222222222222222222222222222222222222222222222',
+        '00003033333333332222222222222222222222222222222222222222222222222222222222222222',
+        '00033333333333322222222222222222222222222222222222222222222222222222222222222222',
+        '00033333333333322222222222222222222222222222222222222222222222222222222222222222',
+        '00000333333333322222222222222222222222222222222222222222222222222222222222222222',
+        '00303333333333222222222222222222222222222222222222222222222222222222222222222222',
+        '00303333333333222222222222222222222222222222222222222222222222222222222222222222',
+        '00003333333333222222222222222222222222222222222222222222222222222222222222222222',
+        '00030030333332222222222222222222222222222222222222222222222222222222222222222222',
+        '00000300333332222222222222222222222222222222222222222222222222222222222222222222',
+        '00000000333322222222222222222222222222222222222222222222222222222222222222222222',
+        '00003000333322222222222222222222222222222222222222222222222222222222222222222222',
+        '03000000333322222222222222222222222222222222222222222222222222222222222222222222'
+      ]
+    };
+
+    function stateAtCell(i, j) {
+      if (i < 0 || i >= STATE_MASK.cols) return STATE_DEAD;
+      // Outside the sampled band the coarse first pass is the authority: above it
+      // nothing survived, below it everything flooded.
+      if (j < 0) return STATE_DEAD;
+      if (j >= STATE_MASK.rows) return STATE_FLAT;
+      return STATE_MASK.bits[j].charCodeAt(i) - 48;
+    }
+
+    function cellOf(F, k) {
+      var r = STATE_MASK.rect;
+      var u = clamp((F - r.F[0]) / (r.F[1] - r.F[0]), 0, 1);
+      var v = (k - r.k[0]) / (r.k[1] - r.k[0]);
+      return {
+        i: Math.round(u * (STATE_MASK.cols - 1)),
+        j: Math.round((1 - v) * (STATE_MASK.rows - 1))
+      };
+    }
+
+    function stateAt(F, k) {
+      var c = cellOf(F, k);
+      return stateAtCell(c.i, c.j);
+    }
+
+    /* ---------- the boundary as a curve ----------
+
+       The mask is a grid, but the boundary it approximates is not axis-aligned,
+       so drawing cell edges gives a staircase that says more about the sampling
+       than about the system. Marching squares on the patterned indicator draws
+       the same data as a curve instead.
+
+       The indicator is 0 or 1, and a contour through a binary field would still
+       be a staircase cut at 45 degrees, so it is box-blurred by one cell first.
+       The blur cannot invent a boundary where the samples agree, and it has one
+       deliberate side effect: a lone patterned sample in a non-patterned
+       neighbourhood blurs to 1/9 and drops below the level, so single-cell
+       speckle does not become a tiny ring of its own.                           */
+
+    function patternField(minState) {
+      var W = STATE_MASK.cols, H = STATE_MASK.rows;
+      var raw = new Float32Array(W * H), out = new Float32Array(W * H);
+      var i, j;
+      for (j = 0; j < H; j++) {
+        for (i = 0; i < W; i++) {
+          raw[j * W + i] = stateAtCell(i, j) >= minState ? 1 : 0;
+        }
+      }
+      for (j = 0; j < H; j++) {
+        for (i = 0; i < W; i++) {
+          var s = 0, n = 0;
+          for (var dj = -1; dj <= 1; dj++) {
+            for (var di = -1; di <= 1; di++) {
+              var jj = j + dj, ii = i + di;
+              n++;
+              // outside the grid counts as not patterned, which is what the
+              // coarse pass found in every direction
+              if (jj < 0 || jj >= H || ii < 0 || ii >= W) continue;
+              s += raw[jj * W + ii];
+            }
+          }
+          out[j * W + i] = s / n;
+        }
+      }
+      return out;
+    }
+
+    /* Fractional grid coordinates to parameters. Row 0 is the highest k. */
+    function gridToParams(gi, gj) {
+      var r = STATE_MASK.rect;
+      return {
+        F: r.F[0] + (r.F[1] - r.F[0]) * (gi / (STATE_MASK.cols - 1)),
+        k: r.k[1] - (r.k[1] - r.k[0]) * (gj / (STATE_MASK.rows - 1))
+      };
+    }
+
+    function patternContour(minState) {
+      var W = STATE_MASK.cols, H = STATE_MASK.rows;
+      var f = patternField(minState), L = 0.5, segs = [];
+
+      function at(i, j) { return f[j * W + i]; }
+      function mix(x0, y0, x1, y1, v0, v1) {
+        var d = v1 - v0;
+        var t = Math.abs(d) < 1e-9 ? 0.5 : (L - v0) / d;
+        t = clamp(t, 0, 1);
+        return [x0 + (x1 - x0) * t, y0 + (y1 - y0) * t];
+      }
+      function push(a, b) {
+        var pa = gridToParams(a[0], a[1]), pb = gridToParams(b[0], b[1]);
+        segs.push([[pa.F, pa.k], [pb.F, pb.k]]);
+      }
+
+      for (var j = 0; j < H - 1; j++) {
+        for (var i = 0; i < W - 1; i++) {
+          var v0 = at(i, j), v1 = at(i + 1, j), v2 = at(i + 1, j + 1), v3 = at(i, j + 1);
+          var idx = (v0 > L ? 8 : 0) | (v1 > L ? 4 : 0) | (v2 > L ? 2 : 0) | (v3 > L ? 1 : 0);
+          if (idx === 0 || idx === 15) continue;
+
+          var top = mix(i, j, i + 1, j, v0, v1);
+          var right = mix(i + 1, j, i + 1, j + 1, v1, v2);
+          var bottom = mix(i, j + 1, i + 1, j + 1, v3, v2);
+          var left = mix(i, j, i, j + 1, v0, v3);
+          var center = (v0 + v1 + v2 + v3) / 4;
+
+          switch (idx) {
+            case 1: case 14: push(left, bottom); break;
+            case 2: case 13: push(bottom, right); break;
+            case 3: case 12: push(left, right); break;
+            case 4: case 11: push(top, right); break;
+            case 6: case 9: push(top, bottom); break;
+            case 7: case 8: push(left, top); break;
+            // saddles: the centre value decides which way the two arms connect
+            case 5:
+              if (center > L) { push(left, top); push(bottom, right); }
+              else { push(left, bottom); push(top, right); }
+              break;
+            case 10:
+              if (center > L) { push(top, right); push(left, bottom); }
+              else { push(left, top); push(bottom, right); }
+              break;
+          }
+        }
+      }
+      return segs;
+    }
+
+    /* An earlier version promoted the cell under every catalogued point to
+       patterned, because two of them landed on the wrong side of a coarse grid.
+       That is gone. With both horizons measured there is nothing to paper over:
+       if a catalogued regime turns out to be transient, the honest thing is to
+       say so, and the map now has a way to. */
+
+    /* ---------- palettes ----------
+       lo/hi are the base colour ramp over V, glow is the rim colour that gives
+       the pattern edges their light. RGB in 0..1, straight into the shader. */
+
+    var PALETTES = [
+      { id: 'abyss', name: 'Abyss', lo: [0.15, 0.19, 0.25], hi: [0.44, 0.52, 0.60], glow: [0.35, 0.95, 1.00] },
+      { id: 'mono',  name: 'Mono',  lo: [0.12, 0.12, 0.13], hi: [0.72, 0.73, 0.75], glow: [1.00, 1.00, 1.00] },
+      { id: 'ember', name: 'Ember', lo: [0.11, 0.07, 0.06], hi: [0.56, 0.33, 0.19], glow: [1.00, 0.55, 0.18] },
+      { id: 'bio',   name: 'Bio',   lo: [0.05, 0.11, 0.09], hi: [0.34, 0.60, 0.42], glow: [0.55, 1.00, 0.65] }
+    ];
+
+    var PALETTE_BY_ID = {};
+    for (var qi = 0; qi < PALETTES.length; qi++) PALETTE_BY_ID[PALETTES[qi].id] = PALETTES[qi];
+
+    /* ---------- seeding ----------
+
+       Returns U and V interleaved, ready for a two-channel float texture. U is
+       1 in the resting state and V is 0; a pattern only starts where V is
+       seeded, which is also what painting does later.
+
+       Two things here were measured rather than chosen (notes/dev/rd-survival.mjs):
+
+       SEED_U/SEED_V. A seed only ignites if the reaction outruns the removal,
+       roughly u*v > F+k. The first version seeded u=0.5, v=0.25, so uv=0.125,
+       which is below the removal rate of every high-feed regime: in the worms
+       corner the seed died on the spot. Halving the conversion instead of
+       quartering it ignites 11 of the 12 catalogued regimes rather than 10.
+       The brush shader stamps the same pair and a test keeps the two in sync.
+
+       Sizes are in texels, not fractions of the grid. Pattern features are
+       texel-sized because the diffusion constants are, so a seed that scaled
+       with the resolution would behave differently on every grid, and a
+       measurement made on one grid would not transfer to the others.           */
+
+    var SEED_U = 0.5, SEED_V = 0.5;
+    var SEED_SQUARE = 12;    // half-width of the centre square, in texels
+    var SEED_BLOB_R = 8;     // blob radius, in texels
+    var SEED_RING_BAND = 6;  // ring thickness, in texels
+
+    var SEEDS = [
+      { id: 'center', name: 'Square' },
+      { id: 'blobs',  name: 'Blobs' },
+      { id: 'noise',  name: 'Noise' },
+      { id: 'rings',  name: 'Rings' },
+      { id: 'empty',  name: 'Empty' }
+    ];
+
+    function seedField(kind, w, h, seed) {
+      var rnd = mulberry32((seed >>> 0) || 1);
+      var out = new Float32Array(w * h * 2);
+      var i, x, y, idx;
+      for (i = 0; i < w * h; i++) { out[i * 2] = 1; out[i * 2 + 1] = 0; }
+      if (kind === 'empty') return out;
+
+      function disc(cx, cy, r) {
+        var x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(w - 1, Math.ceil(cx + r));
+        var y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(h - 1, Math.ceil(cy + r));
+        for (var yy = y0; yy <= y1; yy++) {
+          for (var xx = x0; xx <= x1; xx++) {
+            var dx = xx - cx, dy = yy - cy;
+            if (dx * dx + dy * dy <= r * r) {
+              var j = (yy * w + xx) * 2;
+              out[j] = SEED_U; out[j + 1] = SEED_V;
+            }
+          }
+        }
+      }
+
+      if (kind === 'center') {
+        var s = Math.min(SEED_SQUARE, Math.floor(Math.min(w, h) / 3));
+        var cx0 = Math.floor(w / 2), cy0 = Math.floor(h / 2);
+        for (y = cy0 - s; y <= cy0 + s; y++) {
+          for (x = cx0 - s; x <= cx0 + s; x++) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            idx = (y * w + x) * 2;
+            out[idx] = SEED_U;
+            out[idx + 1] = clamp(SEED_V + 0.02 * (rnd() - 0.5), 0, 1);
+          }
+        }
+      } else if (kind === 'blobs') {
+        // count follows the area, so a 2048 grid is not left nearly empty
+        var n = Math.round(clamp(18 * (w * h) / (512 * 512), 6, 400));
+        for (i = 0; i < n; i++) disc(rnd() * w, rnd() * h, SEED_BLOB_R * (0.6 + rnd()));
+      } else if (kind === 'noise') {
+        for (i = 0; i < w * h; i++) {
+          if (rnd() < 0.004) { out[i * 2] = SEED_U; out[i * 2 + 1] = SEED_V; }
+        }
+      } else if (kind === 'rings') {
+        var cx = w / 2, cy = h / 2, maxR = Math.min(w, h) * 0.46;
+        var band = Math.min(SEED_RING_BAND, Math.max(2, Math.round(Math.min(w, h) / 12)));
+        for (y = 0; y < h; y++) {
+          for (x = 0; x < w; x++) {
+            var d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+            if (d > maxR) continue;
+            if (Math.floor(d / band) % 4 === 0) {
+              idx = (y * w + x) * 2;
+              out[idx] = SEED_U; out[idx + 1] = SEED_V;
+            }
+          }
+        }
+      }
+      return out;
+    }
+
+    /* ---------- shareable state ----------
+       A flat, human-readable string in the URL hash. Anything malformed falls
+       back to the defaults rather than throwing, because a hand-edited hash is
+       a normal thing for a visitor to try.                                     */
+
+    /* The default is coral, and it was picked from the measured time course
+       rather than by taste. From the standard seed, mean V over the first 2400
+       steps runs 0.021 -> 0.032 -> 0.047 -> 0.062 -> 0.107: visible growth from
+       the first second onward. Mitosis, the previous default, instead shrinks
+       the seed to half its size and then sits flat for over a thousand steps
+       before the first division, which at one step per frame reads as the seed
+       disappearing. Worms is worse still from a point seed: it holds at 0.017
+       for the whole run and needs the blobs or noise seed to go anywhere.       */
+    var DEFAULTS = {
+      F: 0.0545, k: 0.0620, Du: 1.0, Dv: 0.5,
+      // Three steps per frame: fast enough that a pattern forms while you watch,
+      // slow enough that you can see it happen.
+      steps: 3, res: 512, palette: 'abyss', seed: 'center',
+      height: 14, glow: 1.0, light: 2.2, brush: 0.02, seedNum: 1
+    };
+
+    var STATE_KEYS = ['F', 'k', 'Du', 'Dv', 'steps', 'res', 'height', 'glow', 'light', 'brush'];
+    var RES_STEPS = [256, 512, 1024, 2048];
+
+    function encodeState(s) {
+      var out = ['v1'];
+      for (var i = 0; i < STATE_KEYS.length; i++) {
+        var key = STATE_KEYS[i];
+        var val = (s && isFinite(s[key])) ? s[key] : DEFAULTS[key];
+        out.push(key === 'res' || key === 'steps' ? String(Math.round(val)) : (+val).toFixed(4));
+      }
+      out.push(PALETTE_BY_ID[s && s.palette] ? s.palette : DEFAULTS.palette);
+      out.push((s && s.seed && SEEDS.some(function (x) { return x.id === s.seed; })) ? s.seed : DEFAULTS.seed);
+      out.push(String((s && s.seedNum) ? (s.seedNum >>> 0) : DEFAULTS.seedNum));
+      return out.join('_');
+    }
+
+    function decodeState(str) {
+      var s = {};
+      for (var key in DEFAULTS) if (DEFAULTS.hasOwnProperty(key)) s[key] = DEFAULTS[key];
+      if (typeof str !== 'string') return s;
+      var parts = str.replace(/^#/, '').split('_');
+      if (parts[0] !== 'v1' || parts.length < STATE_KEYS.length + 4) return s;
+      for (var i = 0; i < STATE_KEYS.length; i++) {
+        var k2 = STATE_KEYS[i], v = parseFloat(parts[i + 1]);
+        if (!isFinite(v)) continue;
+        if (k2 === 'res') {
+          s.res = RES_STEPS.indexOf(Math.round(v)) >= 0 ? Math.round(v) : DEFAULTS.res;
+        } else if (k2 === 'steps') {
+          s.steps = Math.round(clampTo('steps', v));
+        } else {
+          s[k2] = clampTo(k2, v);
+        }
+      }
+      var pal = parts[STATE_KEYS.length + 1];
+      if (PALETTE_BY_ID[pal]) s.palette = pal;
+      var sd = parts[STATE_KEYS.length + 2];
+      if (SEEDS.some(function (x) { return x.id === sd; })) s.seed = sd;
+      var sn = parseInt(parts[STATE_KEYS.length + 3], 10);
+      if (isFinite(sn) && sn > 0) s.seedNum = sn >>> 0;
+      return s;
+    }
+
+    /* Grid dimensions for a viewport: the long side gets the chosen resolution
+       and the short side follows the aspect, so nothing is ever stretched.
+
+       Reallocating wipes the pattern, so an existing grid is kept whenever the
+       aspect has only wobbled. Rounding alone is not enough for that: a mobile
+       URL bar sliding away moves the aspect by several percent and would step
+       over any grid boundary it happened to be sitting near. Hence hysteresis
+       against the grid actually in use.                                        */
+    var ASPECT_TOLERANCE = 0.08;   // in log ratio, so roughly 8 percent either way
+
+    function gridFor(res, vw, vh, prev) {
+      var longSide = Math.max(1, Math.max(vw, vh));
+      var shortSide = Math.max(1, Math.min(vw, vh));
+      var other = Math.max(64, Math.min(res, Math.round(res * shortSide / longSide / 8) * 8));
+      var next = (vw >= vh) ? { w: res, h: other } : { w: other, h: res };
+      if (prev && prev.w > 0 && prev.h > 0 && Math.max(prev.w, prev.h) === res) {
+        var want = Math.max(1, vw) / Math.max(1, vh);
+        var have = prev.w / prev.h;
+        if (Math.abs(Math.log(want / have)) < ASPECT_TOLERANCE) return { w: prev.w, h: prev.h };
+      }
+      return next;
+    }
+
+    return {
+      mulberry32: mulberry32,
+      saddleK: saddleK,
+      RANGES: RANGES, RES_STEPS: RES_STEPS, DEFAULTS: DEFAULTS, STATE_KEYS: STATE_KEYS,
+      clamp: clamp, clampTo: clampTo,
+      padToParams: padToParams, paramsToPad: paramsToPad,
+      PRESETS: PRESETS, PRESET_BY_ID: PRESET_BY_ID,
+      UNCHARTED: UNCHARTED, UNCHARTED_DIST: UNCHARTED_DIST, classify: classify,
+      NORM: NORM, normPad: normPad,
+      STATE_MASK: STATE_MASK, stateAt: stateAt, stateAtCell: stateAtCell, cellOf: cellOf,
+      patternField: patternField, patternContour: patternContour, gridToParams: gridToParams,
+      STATE_DEAD: STATE_DEAD, STATE_FLAT: STATE_FLAT,
+      STATE_TRANSIENT: STATE_TRANSIENT, STATE_PATTERN: STATE_PATTERN,
+      PALETTES: PALETTES, PALETTE_BY_ID: PALETTE_BY_ID,
+      SEEDS: SEEDS, seedField: seedField, SEED_U: SEED_U, SEED_V: SEED_V,
+      encodeState: encodeState, decodeState: decodeState,
+      gridFor: gridFor
+    };
+  })();
+  /* RD-CORE-END */
+  </script>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       WebGL2 engine. Plain JS, owns the canvas and nothing else. Same shape as
+       the psychohistory tool's psygl block: create() returns an engine object
+       or null, and the caller renders the fallback.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="rdgl">
+  window.RDGL = (function () {
+    'use strict';
+
+    var VERT = [
+      '#version 300 es',
+      'layout(location=0) in vec2 aPos;',
+      'out vec2 vUv;',
+      'void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }'
+    ].join('\n');
+
+    /* One Euler step of Gray-Scott with the standard nine-point Laplacian.
+       Reads with texelFetch, which ignores both the sampler filter and the wrap
+       mode, so the torus has to be closed by hand with a modulo. */
+    var SIM = [
+      '#version 300 es',
+      'precision highp float;',
+      'uniform sampler2D uState;',
+      'uniform ivec2 uSize;',
+      'uniform float uF, uK, uDu, uDv, uDt;',
+      'out vec4 frag;',
+      'vec2 at(ivec2 p, ivec2 o){',
+      '  ivec2 q = p + o;',
+      '  q = ((q % uSize) + uSize) % uSize;',
+      '  return texelFetch(uState, q, 0).rg;',
+      '}',
+      'void main(){',
+      '  ivec2 p = ivec2(gl_FragCoord.xy);',
+      '  vec2 c  = at(p, ivec2(0,0));',
+      '  vec2 lap = -1.0 * c',
+      '    + 0.20 * (at(p,ivec2(1,0)) + at(p,ivec2(-1,0)) + at(p,ivec2(0,1)) + at(p,ivec2(0,-1)))',
+      '    + 0.05 * (at(p,ivec2(1,1)) + at(p,ivec2(-1,1)) + at(p,ivec2(1,-1)) + at(p,ivec2(-1,-1)));',
+      '  float u = c.r, v = c.g;',
+      '  float uvv = u * v * v;',
+      '  float du = uDu * lap.r - uvv + uF * (1.0 - u);',
+      '  float dv = uDv * lap.g + uvv - (uF + uK) * v;',
+      '  u += du * uDt;',
+      '  v += dv * uDt;',
+      '  frag = vec4(clamp(u, 0.0, 1.0), clamp(v, 0.0, 1.0), 0.0, 1.0);',
+      '}'
+    ].join('\n');
+
+    /* Brush pass: copy the field and stamp V along the segment the pointer
+       travelled since the last event, so a fast drag has no gaps. */
+    var BRUSH = [
+      '#version 300 es',
+      'precision highp float;',
+      'in vec2 vUv;',
+      'uniform sampler2D uState;',
+      'uniform vec2 uA, uB, uSeed;',
+      'uniform float uRadius, uAspect, uErase;',
+      'out vec4 frag;',
+      'float sdSeg(vec2 p, vec2 a, vec2 b){',
+      '  vec2 pa = p - a, ba = b - a;',
+      '  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0.0, 1.0);',
+      '  return length(pa - ba * h);',
+      '}',
+      'void main(){',
+      '  vec2 st = texture(uState, vUv).rg;',
+      '  vec2 p = vec2(vUv.x * uAspect, vUv.y);',
+      '  float d = sdSeg(p, vec2(uA.x * uAspect, uA.y), vec2(uB.x * uAspect, uB.y));',
+      '  float m = 1.0 - smoothstep(uRadius * 0.6, uRadius, d);',
+      // uSeed comes straight from RDCore, so the brush cannot drift away from
+      // the seeds whose ignition was measured.
+      '  vec2 target = uErase > 0.5 ? vec2(1.0, 0.0) : uSeed;',
+      '  st = mix(st, target, m);',
+      '  frag = vec4(st, 0.0, 1.0);',
+      '}'
+    ].join('\n');
+
+    /* Display: treat V as a height field, light it, and put a rim term on the
+       slopes. That rim is what makes the edges glow. */
+    var SHOW = [
+      '#version 300 es',
+      'precision highp float;',
+      'in vec2 vUv;',
+      'uniform sampler2D uState;',
+      'uniform vec2 uTexel;',
+      'uniform vec3 uLo, uHi, uGlow;',
+      'uniform float uHeight, uGlowAmt, uLight;',
+      'out vec4 frag;',
+      // The palettes are written down the way a person picks colours, so they
+      // are sRGB. Lighting has to happen in linear light or the whole image
+      // washes out, hence in here and back out again at the end.
+      'vec3 toLin(vec3 c){ return pow(c, vec3(2.2)); }',
+      'void main(){',
+      '  float v  = texture(uState, vUv).g;',
+      '  float vl = texture(uState, vUv - vec2(uTexel.x, 0.0)).g;',
+      '  float vr = texture(uState, vUv + vec2(uTexel.x, 0.0)).g;',
+      '  float vd = texture(uState, vUv - vec2(0.0, uTexel.y)).g;',
+      '  float vu = texture(uState, vUv + vec2(0.0, uTexel.y)).g;',
+      '  vec2 g = vec2(vr - vl, vu - vd) * 0.5 * uHeight;',
+      '  vec3 n = normalize(vec3(-g, 1.0));',
+      '  vec3 L = normalize(vec3(cos(uLight), sin(uLight), 0.55));',
+      '  vec3 V = vec3(0.0, 0.0, 1.0);',
+      '  vec3 H = normalize(L + V);',
+      '  float diff = max(dot(n, L), 0.0);',
+      '  float spec = pow(max(dot(n, H), 0.0), 46.0) * 0.55;',
+      '  float rim  = pow(1.0 - clamp(n.z, 0.0, 1.0), 2.6);',
+      '  vec3 base = mix(toLin(uLo), toLin(uHi), smoothstep(0.0, 0.55, v));',
+      '  vec3 col = base * (0.34 + 0.90 * diff) + vec3(spec) + toLin(uGlow) * rim * uGlowAmt;',
+      '  col = col / (1.0 + col * 0.28);',                 // gentle roll-off, no clipping
+      '  frag = vec4(pow(clamp(col, 0.0, 1.0), vec3(0.4545)), 1.0);',
+      '}'
+    ].join('\n');
+
+    function compile(gl, type, src) {
+      var s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+        throw new Error('shader: ' + gl.getShaderInfoLog(s));
+      return s;
+    }
+    function makeProg(gl, vs, fs) {
+      var p = gl.createProgram();
+      gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs));
+      gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+        throw new Error('link: ' + gl.getProgramInfoLog(p));
+      return p;
+    }
+    function uni(gl, p) {
+      var out = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+      for (var i = 0; i < n; i++) {
+        var info = gl.getActiveUniform(p, i);
+        out[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, info.name);
+      }
+      return out;
+    }
+
+    function create(container, opts) {
+      var core = window.RDCore;
+      opts = opts || {};
+
+      var canvas = document.createElement('canvas');
+      var gl = canvas.getContext('webgl2', {
+        antialias: false, alpha: false, depth: false, stencil: false,
+        preserveDrawingBuffer: false, powerPreference: 'high-performance'
+      });
+      if (!gl) return null;
+      if (!gl.getExtension('EXT_color_buffer_float')) return null;   // no float FBO, no simulation
+      container.innerHTML = '';
+      container.appendChild(canvas);
+
+      var simP, brushP, showP, simU, brushU, showU;
+      try {
+        simP = makeProg(gl, VERT, SIM); simU = uni(gl, simP);
+        brushP = makeProg(gl, VERT, BRUSH); brushU = uni(gl, brushP);
+        showP = makeProg(gl, VERT, SHOW); showU = uni(gl, showP);
+      } catch (e) {
+        container.innerHTML = '';
+        return null;
+      }
+
+      // fullscreen triangle
+      var quad = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      var vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+
+      var params = Object.assign({}, core.DEFAULTS, opts.params || {});
+      var running = opts.running !== false;
+      var brushRadius = params.brush;
+      var res = params.res;
+      var seedKind = params.seed;
+      var seedNum = params.seedNum || 1;
+      var palette = core.PALETTE_BY_ID[params.palette] || core.PALETTES[0];
+
+      var GW = 0, GH = 0;
+      var tex = [null, null], fbo = [null, null], cur = 0;
+      var disposed = false, ctxLost = false, rafId = 0;
+
+      function makeTarget(w, h) {
+        var t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RG16F, w, h);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+        var f = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+        var ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return { tex: t, fbo: f, ok: ok };
+      }
+
+      function freeTargets() {
+        for (var i = 0; i < 2; i++) {
+          if (tex[i]) gl.deleteTexture(tex[i]);
+          if (fbo[i]) gl.deleteFramebuffer(fbo[i]);
+          tex[i] = null; fbo[i] = null;
+        }
+      }
+
+      var allocOk = true;
+      function allocate(w, h) {
+        freeTargets();
+        GW = w; GH = h;
+        allocOk = true;
+        for (var i = 0; i < 2; i++) {
+          var t = makeTarget(w, h);
+          tex[i] = t.tex; fbo[i] = t.fbo;
+          if (!t.ok) allocOk = false;
+        }
+        cur = 0;
+        return allocOk;
+      }
+
+      function upload(data) {
+        gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, GW, GH, gl.RG, gl.FLOAT, data);
+      }
+
+      function reseed(kind, num) {
+        if (kind) seedKind = kind;
+        if (num !== undefined) seedNum = num >>> 0;
+        upload(core.seedField(seedKind, GW, GH, seedNum));
+      }
+
+      function drawInto(target) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, target === null ? null : fbo[target]);
+        if (target === null) gl.viewport(0, 0, canvas.width, canvas.height);
+        else gl.viewport(0, 0, GW, GH);
+        gl.bindVertexArray(vao);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.bindVertexArray(null);
+      }
+
+      function simStep() {
+        var src = cur, dst = 1 - cur;
+        gl.useProgram(simP);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex[src]);
+        gl.uniform1i(simU.uState, 0);
+        gl.uniform2i(simU.uSize, GW, GH);
+        gl.uniform1f(simU.uF, params.F);
+        gl.uniform1f(simU.uK, params.k);
+        gl.uniform1f(simU.uDu, params.Du);
+        gl.uniform1f(simU.uDv, params.Dv);
+        gl.uniform1f(simU.uDt, 1.0);
+        drawInto(dst);
+        cur = dst;
+      }
+
+      function brushStroke(ax, ay, bx, by, erase) {
+        var src = cur, dst = 1 - cur;
+        gl.useProgram(brushP);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex[src]);
+        gl.uniform1i(brushU.uState, 0);
+        gl.uniform2f(brushU.uA, ax, ay);
+        gl.uniform2f(brushU.uB, bx, by);
+        gl.uniform2f(brushU.uSeed, core.SEED_U, core.SEED_V);
+        gl.uniform1f(brushU.uRadius, brushRadius);
+        gl.uniform1f(brushU.uAspect, GH > 0 ? GW / GH : 1);
+        gl.uniform1f(brushU.uErase, erase ? 1 : 0);
+        drawInto(dst);
+        cur = dst;
+      }
+
+      function display() {
+        gl.useProgram(showP);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+        gl.uniform1i(showU.uState, 0);
+        gl.uniform2f(showU.uTexel, 1 / GW, 1 / GH);
+        gl.uniform3fv(showU.uLo, palette.lo);
+        gl.uniform3fv(showU.uHi, palette.hi);
+        gl.uniform3fv(showU.uGlow, palette.glow);
+        gl.uniform1f(showU.uHeight, params.height);
+        gl.uniform1f(showU.uGlowAmt, params.glow);
+        gl.uniform1f(showU.uLight, params.light);
+        drawInto(null);
+      }
+
+      // ---- sizing. The grid follows the viewport aspect, so nothing is
+      // stretched; it is only reallocated when the quantised dims really change.
+      var cssW = 0, cssH = 0;
+      function resize(force) {
+        var w = container.clientWidth || window.innerWidth;
+        var h = container.clientHeight || window.innerHeight;
+        var dpr = Math.min(window.devicePixelRatio || 1, 2);
+        var pw = Math.max(1, Math.round(w * dpr)), ph = Math.max(1, Math.round(h * dpr));
+        if (canvas.width !== pw || canvas.height !== ph) {
+          canvas.width = pw; canvas.height = ph;
+        }
+        cssW = w; cssH = h;
+        var g = core.gridFor(res, w, h, force ? null : { w: GW, h: GH });
+        if (force || g.w !== GW || g.h !== GH) {
+          allocate(g.w, g.h);
+          reseed(seedKind, seedNum);
+        }
+      }
+
+      var ro = null;
+      if (window.ResizeObserver) {
+        ro = new ResizeObserver(function () { if (!disposed) resize(false); });
+        ro.observe(container);
+      } else {
+        window.addEventListener('resize', function () { resize(false); });
+      }
+
+      resize(true);
+      if (!allocOk) { container.innerHTML = ''; return null; }
+
+      // ---- pointer painting
+      var painting = false, lastU = 0, lastV = 0, pid = -1;
+      function toUv(ev) {
+        var r = canvas.getBoundingClientRect();
+        return {
+          u: (ev.clientX - r.left) / Math.max(1, r.width),
+          v: 1 - (ev.clientY - r.top) / Math.max(1, r.height)   // GL origin is bottom left
+        };
+      }
+      function onDown(ev) {
+        if (ev.button !== undefined && ev.button !== 0) return;
+        var p = toUv(ev);
+        painting = true; pid = ev.pointerId;
+        lastU = p.u; lastV = p.v;
+        if (canvas.setPointerCapture) { try { canvas.setPointerCapture(pid); } catch (e) {} }
+        brushStroke(p.u, p.v, p.u, p.v, ev.shiftKey);
+        if (!running) display();
+        ev.preventDefault();
+      }
+      function onMove(ev) {
+        if (!painting || ev.pointerId !== pid) return;
+        var p = toUv(ev);
+        brushStroke(lastU, lastV, p.u, p.v, ev.shiftKey);
+        lastU = p.u; lastV = p.v;
+        if (!running) display();
+        ev.preventDefault();
+      }
+      function onUp(ev) {
+        if (ev.pointerId !== pid) return;
+        painting = false; pid = -1;
+        if (canvas.releasePointerCapture) { try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} }
+      }
+      canvas.addEventListener('pointerdown', onDown);
+      canvas.addEventListener('pointermove', onMove);
+      canvas.addEventListener('pointerup', onUp);
+      canvas.addEventListener('pointercancel', onUp);
+
+      function onLost(ev) { ev.preventDefault(); ctxLost = true; if (opts.onLost) opts.onLost(); }
+      canvas.addEventListener('webglcontextlost', onLost);
+
+      // ---- main loop
+      var lastTs = -1, fpsAccum = 0, fpsFrames = 0, totalSteps = 0;
+      function frame(ts) {
+        if (disposed || ctxLost) return;
+        rafId = requestAnimationFrame(frame);
+        var dt = lastTs < 0 ? 0.016 : Math.min(0.25, (ts - lastTs) / 1000);
+        lastTs = ts;
+
+        if (running) {
+          var n = Math.max(1, Math.round(params.steps));
+          for (var i = 0; i < n; i++) simStep();
+          totalSteps += n;
+        }
+        display();
+
+        fpsAccum += dt; fpsFrames++;
+        if (fpsAccum > 0.5) {
+          if (opts.onTick) opts.onTick({
+            fps: fpsFrames / fpsAccum, grid: GW + '×' + GH, steps: totalSteps
+          });
+          fpsAccum = 0; fpsFrames = 0;
+        }
+      }
+      rafId = requestAnimationFrame(frame);
+
+      return {
+        setParams: function (p) {
+          for (var key in p) if (p.hasOwnProperty(key)) params[key] = p[key];
+          if (p.brush !== undefined) brushRadius = p.brush;
+          if (p.palette !== undefined) palette = core.PALETTE_BY_ID[p.palette] || palette;
+        },
+        setRunning: function (on) { running = !!on; },
+        stepOnce: function () { simStep(); display(); },
+        reseed: function (kind, num) { reseed(kind, num); if (!running) display(); },
+        clear: function () { reseed('empty', seedNum); if (!running) display(); },
+        setResolution: function (n) {
+          if (n === res) return;
+          res = n;
+          resize(true);
+          if (!running) display();
+        },
+        snapshot: function () {
+          display();                        // re-render, then read before the compositor runs
+          try { return canvas.toDataURL('image/png'); } catch (e) { return null; }
+        },
+        dispose: function () {
+          disposed = true;
+          if (rafId) cancelAnimationFrame(rafId);
+          if (ro) ro.disconnect();
+          canvas.removeEventListener('pointerdown', onDown);
+          canvas.removeEventListener('pointermove', onMove);
+          canvas.removeEventListener('pointerup', onUp);
+          canvas.removeEventListener('pointercancel', onUp);
+          canvas.removeEventListener('webglcontextlost', onLost);
+          freeTargets();
+          gl.deleteBuffer(quad);
+          gl.deleteVertexArray(vao);
+          gl.deleteProgram(simP); gl.deleteProgram(brushP); gl.deleteProgram(showP);
+          if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+        }
+      };
+    }
+
+    return { create: create };
+  })();
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+    const C = window.RDCore;
+
+    const COL = { text: '#cbd5e1', label: '#94a3b8', foot: '#64748b', faint: '#475569' };
+
+    function Slider({ label, value, min, max, step, fmt, onChange }) {
+      return (
+        <div className="rd-param">
+          <label>
+            <span>{label}</span>
+            <span className="rd-val">{fmt ? fmt(value) : value}</span>
+          </label>
+          <input type="range" min={min} max={max} step={step} value={value}
+                 onChange={e => onChange(parseFloat(e.target.value))} />
+        </div>
+      );
+    }
+
+    function Seg({ items, value, onChange }) {
+      return (
+        <div className="rd-seg">
+          {items.map(it => (
+            <button key={it.id} type="button"
+                    className={'lang-seg' + (value === it.id ? ' active' : '')}
+                    onClick={() => onChange(it.id)}>{it.name}</button>
+          ))}
+        </div>
+      );
+    }
+
+    /* One section open at a time. The collapsed header carries a summary of what
+       is inside it, so folding a section away does not hide its current value. */
+    function Section({ id, title, summary, open, onToggle, children }) {
+      return (
+        <div className="rd-acc">
+          <button type="button" className={'rd-acc-h' + (open ? ' open' : '')}
+                  aria-expanded={open} onClick={() => onToggle(id)}>
+            <span>{title}</span>
+            {!open && summary ? <span className="rd-acc-s">{summary}</span> : null}
+            <span className="rd-acc-c">{open ? '−' : '+'}</span>
+          </button>
+          {open ? <div className="rd-acc-b">{children}</div> : null}
+        </div>
+      );
+    }
+
+    /* The regime map. The tint is a nearest-neighbour partition of the
+       catalogued points and is expensive enough to be worth caching in an
+       offscreen canvas; only the cursor is redrawn while dragging. */
+    const MAP_W = 300, MAP_H = 190;
+
+    /* Diagonal hatch for the transient region. Two nested contours turned out to
+       be unreadable: the transient area is a lake inside the patterned region
+       rather than a ring around it, so its outer edge coincides with the settled
+       one almost everywhere and the amber line hides underneath the red. A fill
+       says "temporary" where a line cannot. */
+    function hatchPattern(ctx) {
+      const tile = document.createElement('canvas');
+      tile.width = tile.height = 6;
+      const t = tile.getContext('2d');
+      t.strokeStyle = 'rgba(251,191,36,.30)';
+      t.lineWidth = 1;
+      t.beginPath();
+      t.moveTo(-1, 5); t.lineTo(5, -1);
+      t.moveTo(1, 7); t.lineTo(7, 1);
+      t.stroke();
+      return ctx.createPattern(tile, 'repeat');
+    }
+
+    function buildTint() {
+      const off = document.createElement('canvas');
+      off.width = MAP_W; off.height = MAP_H;
+      const ctx = off.getContext('2d');
+      const hatch = hatchPattern(ctx);
+      const cell = 2;
+      for (let py = 0; py < MAP_H; py += cell) {
+        for (let px = 0; px < MAP_W; px += cell) {
+          const u = (px + cell / 2) / MAP_W;
+          const v = 1 - (py + cell / 2) / MAP_H;
+          const p = C.padToParams(u, v);
+          ctx.fillStyle = C.classify(p.F, p.k).color;
+          ctx.fillRect(px, py, cell, cell);
+          // knock back everything that is not patterned, in four steps, so the
+          // region worth visiting is the one that reads as the map
+          const s = C.stateAt(p.F, p.k);
+          if (s !== C.STATE_PATTERN) {
+            ctx.fillStyle = s === C.STATE_DEAD ? 'rgba(8,12,19,.76)'
+              : s === C.STATE_FLAT ? 'rgba(8,12,19,.62)'
+              : 'rgba(8,12,19,.42)';
+            ctx.fillRect(px, py, cell, cell);
+            if (s === C.STATE_TRANSIENT) {
+              // the pattern is in canvas space, so neighbouring cells line up
+              ctx.fillStyle = hatch;
+              ctx.fillRect(px, py, cell, cell);
+            }
+          }
+        }
+      }
+
+      // Two measured boundaries, as marching-squares contours. The outer one is
+      // where a pattern forms at all, the inner one where it is still there once
+      // the field has settled. Between them the show is real but temporary,
+      // which is worth visiting and worth being warned about.
+      // Segments come back in F/k, so neither the crop nor the mask grid has to
+      // line up with the canvas.
+      const contour = (minState, color, dash, width) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.setLineDash(dash);
+        ctx.beginPath();
+        C.patternContour(minState).forEach(([a, b]) => {
+          const pa = C.paramsToPad(a[0], a[1]), pb = C.paramsToPad(b[0], b[1]);
+          ctx.moveTo(pa.u * MAP_W, (1 - pa.v) * MAP_H);
+          ctx.lineTo(pb.u * MAP_W, (1 - pb.v) * MAP_H);
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+      };
+      contour(C.STATE_TRANSIENT, '#fbbf24', [4, 3], 1.2);
+      contour(C.STATE_PATTERN, '#f87171', [], 1.5);
+      // the saddle-node line k = sqrt(F)/2 - F, the one exact curve in here
+      ctx.strokeStyle = 'rgba(203,213,225,.40)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      let started = false;
+      for (let px = 0; px <= MAP_W; px++) {
+        const u = px / MAP_W;
+        const F = C.padToParams(u, 0).F;
+        const kb = C.saddleK(F);
+        if (kb < C.RANGES.k[0] || kb > C.RANGES.k[1]) { started = false; continue; }
+        const py = (1 - C.paramsToPad(F, kb).v) * MAP_H;
+        if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Labels, placed by trial: the catalogued points sit close together in the
+      // middle of the plane, so a fixed offset overlaps three ways at once.
+      ctx.font = '9px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      const placed = [];
+      const hits = (r) => placed.some(q =>
+        !(r.x1 < q.x0 || r.x0 > q.x1 || r.y1 < q.y0 || r.y0 > q.y1));
+      C.PRESETS.forEach(p => {
+        const q = C.paramsToPad(p.F, p.k);
+        const cx = q.u * MAP_W, cy = (1 - q.v) * MAP_H;
+        const tw = ctx.measureText(p.name).width;
+        const x = Math.min(MAP_W - tw / 2 - 2, Math.max(tw / 2 + 2, cx));
+        for (const dy of [-6, 12, -16, 22, -26, 32]) {
+          const r = { x0: x - tw / 2 - 2, x1: x + tw / 2 + 2, y0: cy + dy - 8, y1: cy + dy + 2 };
+          if (r.y0 < 0 || r.y1 > MAP_H || hits(r)) continue;
+          placed.push(r);
+          ctx.lineWidth = 2.5;
+          ctx.strokeStyle = 'rgba(2,6,23,.8)';
+          ctx.strokeText(p.name, x, cy + dy);
+          ctx.fillStyle = 'rgba(226,232,240,.8)';
+          ctx.fillText(p.name, x, cy + dy);
+          break;
+        }
+        ctx.fillStyle = 'rgba(226,232,240,.35)';
+        ctx.fillRect(cx - 0.5, cy - 0.5, 1, 1);
+      });
+      return off;
+    }
+
+    function RegimeMap({ F, k, onPick }) {
+      const ref = useRef(null);
+      const tintRef = useRef(null);
+      const dragRef = useRef(false);
+
+      if (!tintRef.current) tintRef.current = buildTint();
+
+      useEffect(() => {
+        const cv = ref.current;
+        if (!cv) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        cv.width = MAP_W * dpr; cv.height = MAP_H * dpr;
+        const ctx = cv.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, MAP_W, MAP_H);
+        ctx.drawImage(tintRef.current, 0, 0);
+        const q = C.paramsToPad(F, k);
+        const x = q.u * MAP_W, y = (1 - q.v) * MAP_H;
+        ctx.strokeStyle = 'rgba(2,6,23,.85)'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+        ctx.strokeStyle = '#f1f5f9'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x - 10, y); ctx.lineTo(x - 7, y);
+        ctx.moveTo(x + 7, y); ctx.lineTo(x + 10, y);
+        ctx.moveTo(x, y - 10); ctx.lineTo(x, y - 7);
+        ctx.moveTo(x, y + 7); ctx.lineTo(x, y + 10);
+        ctx.stroke();
+      }, [F, k]);
+
+      const pick = (ev) => {
+        const r = ref.current.getBoundingClientRect();
+        const u = (ev.clientX - r.left) / r.width;
+        const v = 1 - (ev.clientY - r.top) / r.height;
+        const p = C.padToParams(u, v);
+        onPick(p.F, p.k);
+      };
+
+      return (
+        <canvas ref={ref} className="rd-map"
+                style={{ aspectRatio: MAP_W + ' / ' + MAP_H }}
+                onPointerDown={e => {
+                  dragRef.current = true;
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  pick(e);
+                }}
+                onPointerMove={e => { if (dragRef.current) pick(e); }}
+                onPointerUp={e => {
+                  dragRef.current = false;
+                  try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {}
+                }}
+                onPointerCancel={() => { dragRef.current = false; }} />
+      );
+    }
+
+    function App() {
+      const [st, setSt] = useState(() => C.decodeState(location.hash));
+      const [running, setRunning] = useState(true);
+      const [view, setView] = useState('map');
+      const [open, setOpen] = useState(() => localStorage.getItem('rd.panel') !== '0');
+      const [sec, setSec] = useState(() => localStorage.getItem('rd.sec') || 'space');
+      const [webgl, setWebgl] = useState(true);
+      const [hud, setHud] = useState(null);
+      const [copied, setCopied] = useState(false);
+
+      const stageRef = useRef(null);
+      const engineRef = useRef(null);
+
+      const set = useCallback((patch) => setSt(s => Object.assign({}, s, patch)), []);
+
+      useEffect(() => { localStorage.setItem('rd.panel', open ? '1' : '0'); }, [open]);
+      useEffect(() => { localStorage.setItem('rd.sec', sec); }, [sec]);
+
+      const toggleSec = useCallback((id) => setSec(s => (s === id ? '' : id)), []);
+
+      // The engine is built once. Everything else is pushed in through setters,
+      // because rebuilding it would throw the pattern away.
+      useEffect(() => {
+        if (!stageRef.current || !window.RDGL) { setWebgl(false); return; }
+        let eng = null;
+        try {
+          eng = window.RDGL.create(stageRef.current, {
+            params: st,
+            running: true,
+            onTick: s => setHud(s),
+            onLost: () => setWebgl(false)
+          });
+        } catch (e) { eng = null; }
+        if (!eng) { setWebgl(false); return; }
+        engineRef.current = eng;
+        return () => { eng.dispose(); engineRef.current = null; };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      useEffect(() => {
+        const e = engineRef.current;
+        if (e) e.setParams(st);
+      }, [st]);
+
+      useEffect(() => {
+        const e = engineRef.current;
+        if (e) e.setResolution(st.res);
+      }, [st.res]);
+
+      useEffect(() => {
+        const e = engineRef.current;
+        if (e) e.setRunning(running);
+      }, [running]);
+
+      const regime = C.classify(st.F, st.k);
+      const mState = C.stateAt(st.F, st.k);
+      const alive = mState === C.STATE_PATTERN;
+      const transient = mState === C.STATE_TRANSIENT;
+      const stateLabel = alive ? regime.name
+        : transient ? regime.name + ', briefly'
+        : (mState === C.STATE_FLAT ? 'Floods over' : 'Nothing takes hold');
+      const stateColor = alive ? COL.text : transient ? '#fbbf24' : '#f87171';
+      const stateNote = alive ? regime.note
+        : transient
+          ? 'Measured transient: a pattern forms and then flattens out to one uniform value. Worth watching, but it will not stay.'
+          : mState === C.STATE_FLAT
+            ? 'Measured uniform: V survives but fills the field evenly, so there is no structure to light.'
+            : 'Measured dead: a seed dropped here decays instead of growing. Paint all you like, nothing will hold.';
+      const paletteName = (C.PALETTE_BY_ID[st.palette] || C.PALETTES[0]).name;
+      const seedEntry = C.SEEDS.filter(s => s.id === st.seed)[0];
+      const seedName = seedEntry ? seedEntry.name : st.seed;
+
+      const reseed = (kind) => {
+        const num = (Math.random() * 4294967295) >>> 0;
+        set({ seed: kind || st.seed, seedNum: num });
+        if (engineRef.current) engineRef.current.reseed(kind || st.seed, num);
+      };
+
+      const savePng = () => {
+        const e = engineRef.current;
+        if (!e) return;
+        const url = e.snapshot();
+        if (!url) return;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'reaction-diffusion-' + regime.id + '.png';
+        a.click();
+      };
+
+      const copyLink = () => {
+        const hash = '#' + C.encodeState(st);
+        history.replaceState(null, '', location.pathname + hash);
+        const url = location.href;
+        const done = () => { setCopied(true); setTimeout(() => setCopied(false), 1400); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(url).then(done, done);
+        } else done();
+      };
+
+      if (!webgl) {
+        return (
+          <div className="rd-fallback">
+            <div>
+              <p style={{ color: COL.text }}>This one needs WebGL2 with floating point render targets.</p>
+              <p style={{ fontSize: 13, color: COL.foot }}>
+                Your browser did not provide them, so there is nothing to simulate on.
+                Everything else on <a href="/miscellaneous/">the tools page</a> works without a GPU.
+              </p>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <React.Fragment>
+          <div className="rd-stage" ref={stageRef}></div>
+          <a className="rd-back" href="/miscellaneous/">&larr; Miscellaneous</a>
+          {hud && (
+            <div className="rd-hud">
+              <b>{hud.fps.toFixed(0)} fps</b>
+              <span>{hud.grid}</span>
+              <span>{hud.steps.toLocaleString('en-US')} steps</span>
+              <span>drag to paint, shift-drag to erase</span>
+            </div>
+          )}
+
+          {!open && (
+            <button type="button" className="rd-toggle" onClick={() => setOpen(true)}>
+              &#8801; Parameters
+            </button>
+          )}
+
+          {open && (
+            <div className="rd-panel">
+              <div className="rd-head">
+                <h1>Reaction Diffusion</h1>
+                <button type="button" className="rd-x" onClick={() => setOpen(false)}
+                        aria-label="Collapse panel">&#10005;</button>
+              </div>
+
+              <div className="rd-row">
+                {/* Emoji plus label, the same transport pattern the lambda
+                    diagram tool uses, but only on the two buttons that are
+                    reached for mid-run. Four emoji wrap the row onto a second
+                    line, and the row fitting on one is worth more here than the
+                    last two icons. */}
+                <button type="button" className={'rd-run lang-seg' + (running ? '' : ' paused')}
+                        onClick={() => setRunning(r => !r)}>
+                  {running ? '⏸️ Pause' : '▶️ Run'}
+                </button>
+                <button type="button" className="rd-btn lang-seg"
+                        onClick={() => engineRef.current && engineRef.current.stepOnce()}>👣 Step</button>
+                <button type="button" className="rd-btn lang-seg" onClick={() => reseed()}>Reseed</button>
+                <button type="button" className="rd-btn lang-seg"
+                        onClick={() => engineRef.current && engineRef.current.clear()}>Clear</button>
+              </div>
+
+              <Section id="space" title="Parameter space"
+                       summary={stateLabel}
+                       open={sec === 'space'} onToggle={toggleSec}>
+                <div className="rd-row" style={{ justifyContent: 'flex-end', marginBottom: 8 }}>
+                  <Seg items={[{ id: 'map', name: 'Map' }, { id: 'sliders', name: 'Sliders' }]}
+                       value={view} onChange={setView} />
+                </div>
+
+                {view === 'map' ? (
+                  <React.Fragment>
+                    <RegimeMap F={st.F} k={st.k} onPick={(F, k) => set({ F, k })} />
+                    <p className="rd-maplabel">
+                      <b style={{ color: stateColor }}>{stateLabel}</b>
+                      <small>F {st.F.toFixed(4)} &middot; k {st.k.toFixed(4)}</small>
+                    </p>
+                    <p style={{ fontSize: 11, color: COL.foot, margin: '2px 0 0', lineHeight: 1.6 }}>
+                      {stateNote}
+                    </p>
+                    <p className="rd-legend">
+                      <span className="rd-key rd-key-red"></span> stays patterned
+                      <span className="rd-key rd-key-hatch"></span> patterns, then flattens
+                      <span className="rd-key rd-key-dash"></span> saddle-node line
+                    </p>
+                  </React.Fragment>
+                ) : (
+                  <React.Fragment>
+                    <Slider label="Feed F" value={st.F} min={C.RANGES.F[0]} max={C.RANGES.F[1]}
+                            step={0.0005} fmt={v => v.toFixed(4)} onChange={v => set({ F: v })} />
+                    <Slider label="Kill k" value={st.k} min={C.RANGES.k[0]} max={C.RANGES.k[1]}
+                            step={0.0005} fmt={v => v.toFixed(4)} onChange={v => set({ k: v })} />
+                    <Slider label="Diffusion U" value={st.Du} min={C.RANGES.Du[0]} max={C.RANGES.Du[1]}
+                            step={0.01} fmt={v => v.toFixed(2)} onChange={v => set({ Du: v })} />
+                    <Slider label="Diffusion V" value={st.Dv} min={C.RANGES.Dv[0]} max={C.RANGES.Dv[1]}
+                            step={0.01} fmt={v => v.toFixed(2)} onChange={v => set({ Dv: v })} />
+                    <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px' }}>
+                      {alive
+                        ? <React.Fragment>Nearest catalogued regime: <b style={{ color: COL.label }}>{regime.name}</b></React.Fragment>
+                        : <b style={{ color: stateColor }}>{stateLabel}. Measured, not guessed.</b>}
+                    </p>
+                  </React.Fragment>
+                )}
+
+                <div className="rd-row" style={{ marginTop: 9 }}>
+                  {C.PRESETS.map(p => (
+                    <button key={p.id} type="button"
+                            className={'rd-chip' + (regime.id === p.id ? ' active' : '')}
+                            title={p.note}
+                            onClick={() => set({ F: p.F, k: p.k })}>{p.name}</button>
+                  ))}
+                </div>
+              </Section>
+
+              <Section id="look" title="Look" summary={paletteName}
+                       open={sec === 'look'} onToggle={toggleSec}>
+                <Seg items={C.PALETTES} value={st.palette} onChange={v => set({ palette: v })} />
+                <div style={{ height: 9 }} />
+                <Slider label="Relief" value={st.height} min={C.RANGES.height[0]} max={C.RANGES.height[1]}
+                        step={0.5} fmt={v => v.toFixed(1)} onChange={v => set({ height: v })} />
+                <Slider label="Edge glow" value={st.glow} min={C.RANGES.glow[0]} max={C.RANGES.glow[1]}
+                        step={0.05} fmt={v => v.toFixed(2)} onChange={v => set({ glow: v })} />
+                <Slider label="Light angle" value={st.light} min={C.RANGES.light[0]} max={C.RANGES.light[1]}
+                        step={0.05} fmt={v => (v * 180 / Math.PI).toFixed(0) + '°'}
+                        onChange={v => set({ light: v })} />
+              </Section>
+
+              <Section id="seed" title="Seed &amp; brush" summary={seedName}
+                       open={sec === 'seed'} onToggle={toggleSec}>
+                <div className="rd-row">
+                  {C.SEEDS.map(s => (
+                    <button key={s.id} type="button"
+                            className={'rd-chip' + (st.seed === s.id ? ' active' : '')}
+                            onClick={() => reseed(s.id)}>{s.name}</button>
+                  ))}
+                </div>
+                <div style={{ height: 9 }} />
+                <Slider label="Brush size" value={st.brush} min={C.RANGES.brush[0]} max={C.RANGES.brush[1]}
+                        step={0.002} fmt={v => (v * 100).toFixed(1) + '%'} onChange={v => set({ brush: v })} />
+                <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
+                  Drag on the canvas to paint, hold shift to erase.
+                </p>
+              </Section>
+
+              <Section id="perf" title="Speed &amp; grid" summary={st.steps + '/frame · ' + st.res}
+                       open={sec === 'perf'} onToggle={toggleSec}>
+                <Slider label="Steps per frame" value={st.steps} min={C.RANGES.steps[0]}
+                        max={C.RANGES.steps[1]} step={1} onChange={v => set({ steps: v })} />
+                <div className="rd-row">
+                  <Seg items={C.RES_STEPS.map(n => ({ id: n, name: String(n) }))}
+                       value={st.res} onChange={v => set({ res: v })} />
+                </div>
+                <p style={{ fontSize: 11, color: COL.foot, margin: '7px 0 0', lineHeight: 1.6 }}>
+                  Cells on the long edge. Changing it restarts the field.
+                </p>
+              </Section>
+
+              <Section id="share" title="Export" open={sec === 'share'} onToggle={toggleSec}>
+                <div className="rd-row">
+                  <button type="button" className="rd-btn lang-seg" onClick={savePng}>Save PNG</button>
+                  <button type="button" className="rd-btn lang-seg" onClick={copyLink}>
+                    {copied ? 'Copied' : 'Copy link'}
+                  </button>
+                </div>
+              </Section>
+
+              <Section id="about" title="About" open={sec === 'about'} onToggle={toggleSec}>
+                <div className="rd-about">
+                    <p>
+                      Two chemicals on a periodic grid. U is fed in everywhere at rate F, V is
+                      removed at rate F+k, and wherever they meet the reaction U + 2V &rarr; 3V turns
+                      one into the other. U diffuses faster than V. That is the whole model, and it
+                      is enough for spots, mazes, gliders and cell division.
+                    </p>
+                    <p>
+                      The field is drawn as a height map of V: the surface is lit from one side and
+                      the slopes carry a rim term, which is where the glow on the edges comes from.
+                      Drag on the canvas to paint V, hold shift to erase back to the resting state.
+                    </p>
+                    <p>
+                      The map shades the plane by nearest catalogued point, which is a partition of
+                      known examples and not a phase diagram: the real boundaries are curved, several
+                      regimes are bistable, and where you land also depends on how the field was
+                      seeded. Where nothing has been catalogued nearby it says so.
+                    </p>
+                    <p>
+                      The two outlines are measured, not derived. The same update this page runs was
+                      run offline across the plane, seeded the way this tool seeds, and each sample
+                      was watched over two horizons. The dashed amber line encloses everything that
+                      forms a pattern at all. The solid red line encloses what still has structure
+                      once the field has settled. In the band between them the pattern is real and
+                      temporary: it builds, and then it flattens to a single uniform value and stays
+                      there. Outside both, either the seed decays and the field goes blank, or it
+                      floods evenly from the start.
+                    </p>
+                    <p>
+                      Move the seed and the boundaries move, so they describe this tool rather than
+                      the equations. So does the grid: chaotic regimes collapse on a small torus and
+                      persist on a larger one, and the offline scan necessarily ran smaller than what
+                      your screen is running.
+                    </p>
+                    <p>
+                      The map is cropped for the same kind of reason. Above k = 0.068 nothing
+                      survives at all. Below k = 0.045 a pattern does form, but it is gone before
+                      step 1000, a couple of seconds at this speed, where the hatched transients
+                      inside the crop last thousands of steps. Neither end is worth the pixels.
+                    </p>
+                    <p>
+                      The dashed curve is the one exact line here, k = &radic;F/2 &minus; F, where the
+                      two non-trivial uniform steady states meet and disappear. It is not a boundary
+                      for patterns. Solitons and mitosis live above it, and that is the point: the
+                      uniform state they would otherwise settle into is no longer available, so the
+                      structures have to keep doing something instead.
+                    </p>
+                    <p style={{ color: COL.foot }}>
+                      The model is Gray and Scott's; the survey of what it does across the F/k plane
+                      is Pearson, <em>Complex Patterns in a Simple System</em> (Science, 1993), and the
+                      named parameter points come from the usual reproductions of it. Everything here
+                      runs on your GPU, nothing is uploaded anywhere.
+                    </p>
+                    <p className="rd-foot">
+                      &copy; 2026 Franziska and Alexander Alber &middot; <a href="/">alber.me</a> &middot;{' '}
+                      <a href="/datenschutz.html">Privacy</a> &middot;{' '}
+                      <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a>
+                    </p>
+                </div>
+              </Section>
+            </div>
+          )}
+        </React.Fragment>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
