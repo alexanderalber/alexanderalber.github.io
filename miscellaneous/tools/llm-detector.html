@@ -62,6 +62,15 @@
     .ld-input::placeholder { color: var(--pico-muted-color); -webkit-text-fill-color: var(--pico-muted-color); opacity: 1; }
     .ld-input::selection { background: rgba(148,163,184,.35); }
 
+    /* Drag-and-Drop einer .docx/.txt auf den Eingabebereich */
+    .ld-editor.ld-drag .ld-input { border-color: var(--pico-primary); }
+    .ld-drop {
+      position: absolute; inset: 0; z-index: 5; pointer-events: none;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 11px; border: 2px dashed var(--pico-primary);
+      background: rgba(56,189,248,.10); color: #cbd5e1; font-size: .9rem;
+    }
+
     .ld-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 0; }
     .ld-toolbar .spacer { flex: 1 1 auto; }
     .ld-btn {
@@ -252,11 +261,101 @@
     <div id="root">
       <div class="container">
         <h1 style="font-size:1.5rem;color:#cbd5e1;margin-bottom:8px">LLM Detector</h1>
-        <p style="color:#94a3b8;max-width:70ch">Paste English or German text and get an estimate of how likely it was written by a language model. The detector checks stylometric signals and phrases typical of AI assistants such as ChatGPT or Claude, highlights them directly in your text and reports a calibrated probability together with a Bayes factor. The full methodology is documented on the page; the analysis runs locally in your browser and no text is ever uploaded.</p>
+        <p style="color:#94a3b8;max-width:70ch">Paste English or German text and get an estimate of how likely it was written by a language model. The detector checks stylometric signals and phrases typical of AI assistants such as ChatGPT or Claude, highlights them directly in your text and reports a calibrated probability together with a Bayes factor. The full methodology is documented on the page; the analysis runs locally in your browser and no text ever leaves your machine.</p>
       </div>
     </div>
-    <script>(function(){if((localStorage.getItem('lang')||'en')!=='de')return;var r=document.getElementById('root');r.querySelector('h1').textContent='LLM-Detektor';r.querySelector('p').textContent='Englischen oder deutschen Text einfügen und schätzen lassen, wie wahrscheinlich er von einem Sprachmodell stammt. Der Detektor prüft stilometrische Signale und Formulierungen, die für KI-Assistenten wie ChatGPT oder Claude typisch sind, markiert sie direkt im Text und liefert eine kalibrierte Wahrscheinlichkeit samt Bayesfaktor. Die Methodik ist auf der Seite offengelegt; die Analyse läuft lokal im Browser, kein Text wird hochgeladen.';})()</script>
+    <script>(function(){if((localStorage.getItem('lang')||'en')!=='de')return;var r=document.getElementById('root');r.querySelector('h1').textContent='LLM-Detektor';r.querySelector('p').textContent='Englischen oder deutschen Text einfügen und schätzen lassen, wie wahrscheinlich er von einem Sprachmodell stammt. Der Detektor prüft stilometrische Signale und Formulierungen, die für KI-Assistenten wie ChatGPT oder Claude typisch sind, markiert sie direkt im Text und liefert eine kalibrierte Wahrscheinlichkeit samt Bayesfaktor. Die Methodik ist auf der Seite offengelegt; die Analyse läuft lokal im Browser, kein Text verlässt deinen Rechner.';})()</script>
   </main>
+
+  <script id="docxcore">
+  /* DOCX/TXT-Textextraktion für den LLM-Detektor. Eigenständig (nicht aus dem
+     E-Book-Konverter importiert, aber dessen zipRead-Logik gespiegelt). Liefert
+     reinen Klartext, weil das Modell ohnehin nur Text sieht. docxXmlToText ist
+     rein und Node-testbar; readDocx ist async (browser-natives DecompressionStream). */
+  var docxcore = (function () {
+    'use strict';
+
+    var u16 = (b, o) => b[o] | (b[o + 1] << 8);
+    var u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+    var utf8 = (b, o, n) => new TextDecoder('utf-8').decode(b.subarray(o, o + n));
+
+    // Einen einzelnen Eintrag aus einem ZIP holen. Sucht die End-of-Central-
+    // Directory vom Ende her, läuft das Central Directory ab und liest für den
+    // Treffer den Local Header nach (dort steht der wahre Daten-Offset).
+    // Rückgabe { method, bytes } oder null, wenn der Name fehlt.
+    function zipEntry(bytes, name) {
+      var n = bytes.length;
+      var eocd = -1, min = Math.max(0, n - 22 - 65535);
+      for (var i = n - 22; i >= min; i--) {
+        if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
+      }
+      if (eocd < 0) throw new Error('kein EOCD (keine ZIP-Datei)');
+      var count = u16(bytes, eocd + 10), p = u32(bytes, eocd + 16);
+      for (var k = 0; k < count; k++) {
+        if (u32(bytes, p) !== 0x02014b50) break;
+        var flags = u16(bytes, p + 8), method = u16(bytes, p + 10), csize = u32(bytes, p + 20);
+        var nameLen = u16(bytes, p + 28), extraLen = u16(bytes, p + 30), commentLen = u16(bytes, p + 32);
+        var lho = u32(bytes, p + 42);
+        if (utf8(bytes, p + 46, nameLen) === name) {
+          if (flags & 0x0001) throw new Error('verschlüsselter ZIP-Eintrag');
+          if (u32(bytes, lho) !== 0x04034b50) throw new Error('defekter Local Header');
+          var dataStart = lho + 30 + u16(bytes, lho + 26) + u16(bytes, lho + 28);
+          return { method: method, bytes: bytes.subarray(dataStart, dataStart + csize) };
+        }
+        p += 46 + nameLen + extraLen + commentLen;
+      }
+      return null;
+    }
+
+    // Rohe DEFLATE-Daten über die Compression Streams API auspacken (async).
+    function inflateRaw(bytes) {
+      var stream = new Response(bytes).body.pipeThrough(new DecompressionStream('deflate-raw'));
+      return new Response(stream).arrayBuffer().then(buf => new Uint8Array(buf));
+    }
+
+    var NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+    function decodeEntities(s) {
+      return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, e) => {
+        if (e[0] === '#') {
+          var cp = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+          return isFinite(cp) ? String.fromCodePoint(cp) : m;
+        }
+        return NAMED.hasOwnProperty(e) ? NAMED[e] : m;
+      });
+    }
+
+    // OOXML (word/document.xml) zu Klartext. Jeder Absatz <w:p> wird zu einer
+    // Zeile; die <w:t>-Runs eines Absatzes werden zusammenhängend konkateniert
+    // (KEINE Umbrüche innerhalb eines Absatzes, damit die Engine Sätze nicht
+    // zerstückelt). <w:tab/> wird zu Tab, <w:br/>/<w:cr/> zu Newline.
+    function docxXmlToText(xml) {
+      var bm = xml.match(/<w:body[\s\S]*<\/w:body>/);
+      var body = bm ? bm[0] : xml;
+      var paras = [], re = /<w:p(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g, m;
+      while ((m = re.exec(body)) !== null) {
+        var seg = m[1]
+          .replace(/<w:tab\b[^>]*\/?>/g, '\t')
+          .replace(/<w:(?:br|cr)\b[^>]*\/?>/g, '\n')
+          .replace(/<[^>]+>/g, '');           // übrige Tags weg, Run-Text bleibt
+        paras.push(decodeEntities(seg));
+      }
+      return paras.join('\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    function readDocx(bytes) {
+      var entry;
+      try { entry = zipEntry(bytes, 'word/document.xml'); }
+      catch (e) { return Promise.reject(e); }
+      if (!entry) return Promise.reject(new Error('kein word/document.xml (keine .docx?)'));
+      var xmlP = entry.method === 0 ? Promise.resolve(entry.bytes)
+        : entry.method === 8 ? inflateRaw(entry.bytes)
+        : Promise.reject(new Error('nicht unterstützte Kompressionsmethode ' + entry.method));
+      return xmlP.then(xb => docxXmlToText(new TextDecoder('utf-8').decode(xb)));
+    }
+
+    return { zipEntry: zipEntry, readDocx: readDocx, docxXmlToText: docxXmlToText, decodeEntities: decodeEntities };
+  })();
+  </script>
 
   <script type="text/babel">
     const { useState, useMemo, useEffect, useRef } = React;
@@ -265,6 +364,8 @@
     const MODEL_URL = "/assets/files/llm-detector-model.json";
     const DEBOUNCE_MS = 220;        // gegen Flackern, nicht wegen Laufzeit
     const HL_CAP = 20000;           // ab hier keine Einfärbung mehr (Backdrop-Kosten)
+    const ANALYZE_HINT_CHARS = 4000; // ab hier den "Analysiere…"-Hinweis zeigen
+    const LONG_TEXT_WORDS = 2000;    // ab hier die Durchschnitts-Notiz zeigen
     const ENGINE = typeof window !== 'undefined' ? window.llmDetector : null;
 
     // Breite des Unsicherheitsbands: reine UI-Darstellung, kein Modell-Output.
@@ -276,17 +377,24 @@
         subtitle: "Englischen oder deutschen Text einfügen - das Modell schätzt, wie wahrscheinlich er von einem Sprachmodell geschrieben wurde.",
         prehint: "Das Modell kann Englisch und Deutsch und erkennt die Sprache selbst. Bei anderen Sprachen enthält es sich einer Aussage.",
         placeholder: "Text hier einfügen …",
-        clear: "Leeren",
-        sampleAi: "Beispiel: KI",
-        sampleHuman: "Beispiel: Mensch",
-        hlOn: "Markierung: an",
-        hlOff: "Markierung: aus",
+        clear: "🗑️ Leeren",
+        sampleAi: "🤖 Beispiel: KI",
+        sampleHuman: "✍️ Beispiel: Mensch",
+        uploadBtn: "📄 Datei…",
+        dropHint: ".docx oder .txt hier ablegen",
+        fileUnsupported: "Nur .docx und .txt werden unterstützt. (.doc, PDF und andere Formate nicht.)",
+        fileError: "Die Datei konnte nicht gelesen werden - ist es eine gültige .docx?",
+        fileEmpty: "Aus der Datei ließ sich kein Text extrahieren.",
+        hlOn: "🖍️ Markierung: an",
+        hlOff: "🖍️ Markierung: aus",
         legendAi: "typische KI-Phrasen",
         legendConn: "Verbindungswörter",
         loading: "Modell wird geladen …",
         loadError: "Das Modell konnte nicht geladen werden - ohne die Modelldatei ist keine Schätzung möglich.",
         noEngine: "Die Detektor-Engine konnte nicht geladen werden.",
         idle: "Noch kein Text. Ab etwa 25 Wörtern gibt das Modell eine Schätzung ab.",
+        analyzing: "Analysiere …",
+        longTextNote: "Langer Text - die Schätzung ist ein Durchschnitt über das gesamte Dokument, nicht pro Abschnitt.",
         probLabel: "geschätzte Wahrscheinlichkeit, dass der Text von einem LLM stammt",
         detected: "Erkannt",
         langName: { en: "Englisch", de: "Deutsch" },
@@ -338,17 +446,24 @@
         subtitle: "Paste English or German text - the model estimates how likely it was written by a language model.",
         prehint: "The model handles English and German and detects the language itself. For other languages it abstains instead of guessing.",
         placeholder: "Paste text here …",
-        clear: "Clear",
-        sampleAi: "Sample: AI",
-        sampleHuman: "Sample: human",
-        hlOn: "Highlighting: on",
-        hlOff: "Highlighting: off",
+        clear: "🗑️ Clear",
+        sampleAi: "🤖 Sample: AI",
+        sampleHuman: "✍️ Sample: human",
+        uploadBtn: "📄 Upload file…",
+        dropHint: "Drop a .docx or .txt here",
+        fileUnsupported: "Only .docx and .txt are supported. (Not .doc, PDF or other formats.)",
+        fileError: "The file could not be read - is it a valid .docx?",
+        fileEmpty: "No text could be extracted from the file.",
+        hlOn: "🖍️ Highlighting: on",
+        hlOff: "🖍️ Highlighting: off",
         legendAi: "typical AI phrases",
         legendConn: "connector words",
         loading: "Loading model …",
         loadError: "The model could not be loaded - without the model file no estimate is possible.",
         noEngine: "The detector engine could not be loaded.",
         idle: "No text yet. From about 25 words on, the model will give an estimate.",
+        analyzing: "Analysing …",
+        longTextNote: "Long text - the estimate is an average over the whole document, not per section.",
         probLabel: "estimated probability that this text came from an LLM",
         detected: "Detected",
         langName: { en: "English", de: "German" },
@@ -500,8 +615,13 @@
       const [model, setModel] = useState(null);
       const [modelError, setModelError] = useState(false);
       const [highlight, setHighlight] = useState(true);
+      const [result, setResult] = useState(null);
+      const [analyzing, setAnalyzing] = useState(false);
+      const [dragOver, setDragOver] = useState(false);
+      const [fileMsg, setFileMsg] = useState(null);
       const taRef = useRef(null);
       const backdropRef = useRef(null);
+      const fileRef = useRef(null);
 
       const t = stringsFor(lang);
 
@@ -526,13 +646,19 @@
         return () => clearTimeout(id);
       }, [text]);
 
-      const result = useMemo(() => {
-        if (!ENGINE || !model || !debounced.trim()) return null;
-        try {
-          return ENGINE.detect(debounced, model);
-        } catch (e) {
-          return { error: true };
-        }
+      // detect() läuft synchron im Hauptthread. Bei großen Texten (Uploads)
+      // würde er die UI blockieren, bevor der "Analysiere…"-Hinweis gezeichnet
+      // ist. Deshalb: Hinweis setzen, einen Tick yield-en (setTimeout 0), dann
+      // rechnen. Kleine Texte laufen praktisch sofort durch.
+      useEffect(() => {
+        if (!ENGINE || !model || !debounced.trim()) { setResult(null); setAnalyzing(false); return; }
+        setAnalyzing(true);
+        const id = setTimeout(() => {
+          try { setResult(ENGINE.detect(debounced, model)); }
+          catch (e) { setResult({ error: true }); }
+          setAnalyzing(false);
+        }, 0);
+        return () => clearTimeout(id);
       }, [debounced, model]);
 
       const normText = useMemo(() => normalizeText(text), [text]);
@@ -556,6 +682,25 @@
 
       const confWord = c => c === 'high' ? t.confHigh : c === 'low' ? t.confLow : t.confMedium;
 
+      // Datei einlesen und den extrahierten Text ins Textfeld schreiben, damit
+      // der Mensch ihn gegenlesen kann. Kein async/await (preset-env), nur .then().
+      const onFile = file => {
+        if (!file) return;
+        setFileMsg(null);
+        const name = (file.name || '').toLowerCase();
+        const done = txt => { if (txt && txt.trim()) setText(txt); else setFileMsg('fileEmpty'); };
+        if (name.endsWith('.txt') || file.type === 'text/plain') {
+          file.text().then(done).catch(() => setFileMsg('fileError'));
+        } else if (name.endsWith('.docx')) {
+          file.arrayBuffer()
+            .then(b => docxcore.readDocx(new Uint8Array(b)))
+            .then(done)
+            .catch(() => setFileMsg('fileError'));
+        } else {
+          setFileMsg('fileUnsupported');
+        }
+      };
+
       // Die Base-Rate hängt am Sprachkopf des Modells (EN ~53 %, DE ~38 %).
       const baseRatePct = (result && !result.abstain && model && result.language &&
         model.languages && model.languages[result.language])
@@ -569,7 +714,13 @@
 
           <p className="ld-prehint">{t.prehint}</p>
 
-          <div className="ld-editor">
+          <div
+            className={'ld-editor' + (dragOver ? ' ld-drag' : '')}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={e => { e.preventDefault(); if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false); }}
+            onDrop={e => { e.preventDefault(); setDragOver(false); onFile(e.dataTransfer.files && e.dataTransfer.files[0]); }}
+          >
+            {dragOver && <div className="ld-drop">{t.dropHint}</div>}
             <div className="ld-backdrop" ref={backdropRef} aria-hidden="true">
               {segments
                 ? segments.map((s, i) => (
@@ -596,6 +747,14 @@
             <button className="ld-btn" onClick={() => setText('')}>{t.clear}</button>
             <button className="ld-btn" onClick={() => setText(t.sampleAiText)}>{t.sampleAi}</button>
             <button className="ld-btn" onClick={() => setText(t.sampleHumanText)}>{t.sampleHuman}</button>
+            <button className="ld-btn" onClick={() => fileRef.current && fileRef.current.click()}>{t.uploadBtn}</button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".docx,.txt"
+              style={{ display: 'none' }}
+              onChange={e => { onFile(e.target.files && e.target.files[0]); e.target.value = ''; }}
+            />
             <span className="spacer"></span>
             <button className="ld-btn" onClick={() => setHighlight(v => !v)}>
               {highlight ? t.hlOn : t.hlOff}
@@ -609,12 +768,14 @@
             </div>
           )}
           {tooLongForHl && <p className="ld-privacy" style={{ marginTop: 8 }}>{t.hlCap}</p>}
+          {fileMsg && <p className="ld-warn">{t[fileMsg]}</p>}
 
           {!ENGINE && <p className="ld-warn">{t.noEngine}</p>}
           {ENGINE && modelError && <p className="ld-warn">{t.loadError}</p>}
           {ENGINE && !model && !modelError && <p className="ld-idle">{t.loading}</p>}
 
-          {ENGINE && model && !result && <p className="ld-idle">{t.idle}</p>}
+          {ENGINE && model && analyzing && normText.length > ANALYZE_HINT_CHARS && <p className="ld-idle">{t.analyzing}</p>}
+          {ENGINE && model && !result && !analyzing && <p className="ld-idle">{t.idle}</p>}
 
           {result && result.error && <p className="ld-warn">{t.loadError}</p>}
 
@@ -656,6 +817,9 @@
                 <div className="ld-band-label">{t.bandLabel(confWord(result.confidence))}</div>
                 {result.confidence === 'low' && (
                   <div className="ld-band-label" style={{ color: '#94a3b8' }}>{t.lowConfHint}</div>
+                )}
+                {result.word_count > LONG_TEXT_WORDS && (
+                  <div className="ld-band-label" style={{ color: '#94a3b8' }}>{t.longTextNote}</div>
                 )}
               </div>
 
