@@ -1,7 +1,8 @@
 <!doctype html>
-<html lang="en" data-theme="dark" data-section="miscellaneous">
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
 <head>
   <meta charset="utf-8">
+  <script>(function(){var d='dark',e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(t==='light'||t==='dark'){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(t!=='light'&&t!=='dark')t=d;e.dataset.theme=t;e.dataset.themeDefault=d;e.style.colorScheme=t;})();</script>
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Race Time Predictor – Alexander Alber</title>
@@ -49,28 +50,14 @@
         <li class="lang-switcher">
           <button class="lang-seg" data-lang="en">EN</button><button class="lang-seg" data-lang="de">DE</button>
         </li>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
       </ul>
     </nav>
   </header>
 
-  <script>
-    (function () {
-      var urlLang = new URLSearchParams(location.search).get('lang');
-      if (urlLang === 'en' || urlLang === 'de') { try { localStorage.setItem('lang', urlLang); } catch (e) {} }
-      var l = urlLang;
-      if (l !== 'en' && l !== 'de') { try { l = localStorage.getItem('lang') || 'en'; } catch (e) { l = 'en'; } }
-      document.querySelectorAll('.lang-seg').forEach(function (btn) {
-        if (btn.getAttribute('data-lang') === l) btn.classList.add('active');
-        btn.onclick = function () {
-          var lang = btn.getAttribute('data-lang');
-          try { localStorage.setItem('lang', lang); } catch (e) {}
-          var url = new URL(location.href);
-          if (lang === 'en') url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
-          location.replace(url.href);
-        };
-      });
-    })();
-  </script>
+  <script src="/assets/js/site-nav.js"></script>
 
   <main>
     <script>if((localStorage.getItem('lang')||'en')==='de')document.getElementById('nav-misc').textContent='Sonstiges';</script>
@@ -84,8 +71,10 @@
   </main>
 
   <script type="text/babel">
-    const { useState, useMemo, useRef } = React;
+    const { useState, useMemo, useRef, useEffect } = React;
 
+    /* Startsprache; ab dann lebt die Sprache als React-State (Live-Wechsel
+       über window.__setLang, aufgerufen von /assets/js/site-nav.js) */
     const LANG = localStorage.getItem('lang') || 'en';
 
     /* ── Farben: Prognosekurve teal, Eingabepunkte gold (validiert gegen #14181f:
@@ -151,6 +140,7 @@
         invalidTime: 'Zeit nicht lesbar – Format m:ss oder h:mm:ss',
         invalidKm: 'Distanz in km angeben (0–500)',
         implausibleTime: 'Unplausibel für diese Distanz – wird ignoriert',
+        readAs: 'So wurde die Eingabe gelesen',
         custom: 'Andere …',
         exponentHead: 'Ermüdungsexponent b',
         expFitted: n => `Aus deinen ${n} Zeiten geschätzt:`,
@@ -199,6 +189,7 @@
         invalidTime: 'Cannot read time – use m:ss or h:mm:ss',
         invalidKm: 'Enter distance in km (0–500)',
         implausibleTime: 'Implausible for this distance – ignored',
+        readAs: 'How your entry was read',
         custom: 'Other …',
         exponentHead: 'Fatigue exponent b',
         expFitted: n => `Estimated from your ${n} times:`,
@@ -234,11 +225,28 @@
     };
 
     /* ── Parsing & Formatierung ── */
+
+    /* Trenner ist primär der Doppelpunkt. Ohne Doppelpunkt zählen Punkt und
+       Komma als Trenner, sobald es zwei davon sind (2.05.00 = 2:05:00): eine
+       Dezimalzahl kann das nicht mehr sein. Bei genau einem Trenner bleibt es
+       mehrdeutig, deshalb die Zwei-Ziffern-Regel: 47.30 sind Sekunden (47:30),
+       47.5 bleiben Dezimalminuten (ebenfalls 47:30). Die Restambiguität (47.25:
+       47:25 oder 47:15?) liegt mit 10 s weit unter dem Rauschen, das das Modell
+       für eine Einzelzeit ohnehin annimmt. Was verstanden wurde, zeigt die
+       Zeile daneben an. */
+    function splitTime(s) {
+      if (s.indexOf(':') >= 0) return s.split(':').map(p => p.trim());
+      const p = s.split('.');
+      if (p.length === 3) return p;
+      if (p.length === 2 && /^\d{2}$/.test(p[1]) && Number(p[1]) < 60) return p;
+      return [s];
+    }
+
     function parseTime(str) {
       if (!str) return null;
-      const s = str.trim().replace(',', '.');
+      const s = str.trim().replace(/,/g, '.');
       if (!s) return null;
-      const parts = s.split(':').map(p => p.trim());
+      const parts = splitTime(s);
       if (parts.length > 3 || parts.some(p => p === '' || !/^\d+(\.\d+)?$/.test(p))) return null;
       const n = parts.map(Number);
       let sec;
@@ -268,8 +276,8 @@
       return m + ':' + String(s).padStart(2, '0');
     }
 
-    function fmtNum(v, digits) {
-      return v.toLocaleString(LANG === 'de' ? 'de-DE' : 'en-US',
+    function fmtNum(v, digits, lang) {
+      return v.toLocaleString(lang === 'de' ? 'de-DE' : 'en-US',
         { minimumFractionDigits: digits, maximumFractionDigits: digits });
     }
 
@@ -337,7 +345,7 @@
     const CW = 680, CHH = 340, L = 60, R = 20, T = 14, B = 42;
     const KM_MIN = 1, KM_MAX = 50;
 
-    function PaceChart({ fit, points, t }) {
+    function PaceChart({ fit, points, t, lang }) {
       const [hover, setHover] = useState(null);
       const svgRef = useRef(null);
 
@@ -390,7 +398,7 @@
       // dieselben Distanzen wie Dropdown und Tabelle; 10 Meilen (16,1) liegt
       // im Log-Raum zu dicht an 15 km, das Label rückt in eine zweite Zeile
       const xTicks = DISTANCES.map(d => d.km);
-      const xTickLabel = km => km % 1 ? fmtNum(km, 1) : String(km);
+      const xTickLabel = km => km % 1 ? fmtNum(km, 1, lang) : String(km);
       const xTickRow2 = km => km === 16.09344;
 
       // Snap-Ziele: Eingabepunkte und Standarddistanzen
@@ -415,7 +423,7 @@
       const hoverPace = hover ? pace(hover.km) : 0;
       const hoverDist = hover ? DISTANCES.find(d => Math.abs(d.km - hover.km) < 1e-6) : null;
       const hoverLabel = hover
-        ? (hoverDist ? (LANG === 'de' ? hoverDist.de : hoverDist.en) : fmtNum(hover.km, hover.km < 10 ? 1 : 0) + ' km')
+        ? (hoverDist ? (lang === 'de' ? hoverDist.de : hoverDist.en) : fmtNum(hover.km, hover.km < 10 ? 1 : 0, lang) + ' km')
         : '';
 
       return (
@@ -427,7 +435,7 @@
               width={CW}
               style={{ display: 'block', maxWidth: '100%', fontFamily: 'inherit', touchAction: 'pan-y',
                 background: 'color-mix(in srgb, var(--tool-ink) 55%, transparent)', border: '1px solid var(--tool-border)', borderRadius: 8,
-                boxShadow: '0 12px 28px rgba(0,0,0,.45)' }}
+                boxShadow: 'var(--tool-panel-shadow)' }}
               onPointerMove={onMove}
               onPointerLeave={() => setHover(null)}
             >
@@ -517,7 +525,15 @@
     }
 
     function RacePredictor() {
-      const t = STRINGS[LANG] || STRINGS.de;
+      const [lang, setLang] = useState(LANG);
+      const t = STRINGS[lang] || STRINGS.en;
+
+      /* Der Sprachumschalter sitzt im Header, außerhalb der React-Wurzel;
+         site-nav.js ruft diesen Hook auf, statt die Seite neu zu laden. */
+      useEffect(() => {
+        window.__setLang = setLang;
+        return () => { delete window.__setLang; };
+      }, []);
 
       const [rows, setRows] = useState(initialRows);
 
@@ -547,8 +563,8 @@
           const km = r.distKey === 'custom' ? parseKm(r.customKm) : distByKey(r.distKey).km;
           const sec = parseTime(r.time);
           if (!km || !sec || !paceOk(km, sec)) return null;
-          const d = r.distKey === 'custom' ? r.customKm.trim().replace(',', '.') : r.distKey;
-          return d + ':' + r.time.trim().replace(',', '.');
+          const d = r.distKey === 'custom' ? r.customKm.trim().replace(/,/g, '.') : r.distKey;
+          return d + ':' + r.time.trim().replace(/,/g, '.');
         }).filter(Boolean);
         if (!toks.length) return;
         const url = location.origin + location.pathname + '?t=' + toks.join(',');
@@ -590,7 +606,10 @@
         const km = r.distKey === 'custom' ? parseKm(r.customKm) : distByKey(r.distKey).km;
         const sec = parseTime(r.time);
         const implausible = !!(km && sec) && !paceOk(km, sec);
-        return { kmBad, timeBad, implausible };
+        /* Rückmeldung nur, wenn die Eingabe anders gelesen wurde als getippt:
+           "47.30" wird zu "47:30", "47:30" bleibt kommentarlos stehen. */
+        const shown = sec != null ? fmtTime(sec) : null;
+        return { kmBad, timeBad, implausible, echo: shown !== r.time.trim() ? shown : null };
       });
 
       const anyExtrap = fit && DISTANCES.some(d => isExtrap(d.km));
@@ -622,7 +641,7 @@
                 style={selStyle}
               >
                 {DISTANCES.map(d => (
-                  <option key={d.key} value={d.key}>{LANG === 'de' ? d.de : d.en}</option>
+                  <option key={d.key} value={d.key}>{lang === 'de' ? d.de : d.en}</option>
                 ))}
                 <option value="custom">{t.custom}</option>
               </select>
@@ -649,9 +668,13 @@
               {rows.length > 1 && (
                 <button className="lang-seg" onClick={() => removeRow(r.id)} aria-label={t.removeRow} style={{ fontSize: 16, lineHeight: '1' }}>×</button>
               )}
-              {(rowErrors[i].timeBad || rowErrors[i].kmBad || rowErrors[i].implausible) && (
+              {(rowErrors[i].timeBad || rowErrors[i].kmBad || rowErrors[i].implausible) ? (
                 <span style={{ color: '#e05260', fontSize: 12, alignSelf: 'center' }}>
                   {rowErrors[i].timeBad ? t.invalidTime : rowErrors[i].kmBad ? t.invalidKm : t.implausibleTime}
+                </span>
+              ) : rowErrors[i].echo && (
+                <span title={t.readAs} style={{ color: 'var(--tool-note)', fontSize: 12, alignSelf: 'center', fontVariantNumeric: 'tabular-nums' }}>
+                  = {rowErrors[i].echo}
                 </span>
               )}
             </div>
@@ -668,7 +691,7 @@
           {fit && (
             <p style={{ color: 'var(--tool-label)', fontSize: 13, margin: '0 0 8px' }}>
               {fit.fitted ? t.expFitted(points.length) : t.expDefault}{' '}
-              <strong style={{ color: 'var(--tool-text)', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(b, 3)}</strong>
+              <strong style={{ color: 'var(--tool-text)', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(b, 3, lang)}</strong>
             </p>
           )}
           {fit && fit.fitted && (
@@ -705,7 +728,7 @@
                       return (
                         <tr key={d.key}>
                           <td style={{ fontSize: 13, color: ink }}>
-                            {LANG === 'de' ? d.de : d.en}
+                            {lang === 'de' ? d.de : d.en}
                             {dim && ' *'}
                             {inp && (
                               <span title={t.inputMarker} aria-label={t.inputMarker} style={{
@@ -719,7 +742,7 @@
                             {fmtTime(fit.lo(d.km))}–{fmtTime(fit.hi(d.km))}
                           </td>
                           <td style={{ fontSize: 13, color: ink, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtPace(sec / d.km)}</td>
-                          <td style={{ fontSize: 13, color: ink, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(d.km / (sec / 3600), 1)}</td>
+                          <td style={{ fontSize: 13, color: ink, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(d.km / (sec / 3600), 1, lang)}</td>
                         </tr>
                       );
                     })}
@@ -749,7 +772,7 @@
                   </span>
                 )}
               </div>
-              <PaceChart fit={fit} points={points} t={t} />
+              <PaceChart fit={fit} points={points} t={t} lang={lang} />
             </React.Fragment>
           )}
 
