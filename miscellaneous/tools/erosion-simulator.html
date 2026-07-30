@@ -680,6 +680,23 @@
         URL.revokeObjectURL(EROApp._job.url);
         EROApp._job = null;
       }
+    },
+
+    /* Stores the exported PNG in IndexedDB so heightmap-to-stl.html (opened
+       with ?from=erosion) can pick it up; the reader deletes the entry. */
+    handoffToStl: function (blob, name) {
+      return new Promise(function (resolve, reject) {
+        var req = indexedDB.open('alber-handoff', 1);
+        req.onupgradeneeded = function () { req.result.createObjectStore('files'); };
+        req.onerror = function () { reject(req.error); };
+        req.onsuccess = function () {
+          var db = req.result;
+          var tx = db.transaction('files', 'readwrite');
+          tx.objectStore('files').put({ blob: blob, name: name }, 'eroded-heightmap');
+          tx.oncomplete = function () { db.close(); resolve(); };
+          tx.onerror = function () { db.close(); reject(tx.error); };
+        };
+      });
     }
   };
   </script>
@@ -731,7 +748,7 @@
         previewNoWebGL: '3D preview is not available (WebGL disabled), but the simulation and PNG export work regardless.',
         download: (size) => `Download heightmap PNG (16 bit, ${size})`,
         toStl: 'Open Heightmap to STL',
-        doneNote: 'The exported PNG is normalized to the full 16 bit range, with the same orientation as the input. Feed it into the Heightmap to STL tool to 3D print your eroded terrain.',
+        doneNote: 'The exported PNG is normalized to the full 16 bit range, with the same orientation as the input. "Open Heightmap to STL" carries the eroded terrain over directly, ready to 3D print.',
         errFlat: 'This image is completely flat (all pixels have the same value), so there is nothing to erode.',
         errHuge: 'Too many cells for the simulation. Choose a coarser working resolution.',
         warnSlow: 'That is a lot of cells; the simulation may take a while. A coarser working resolution is much faster and erosion features scale with it anyway.',
@@ -787,7 +804,7 @@
         previewNoWebGL: 'Die 3D-Vorschau ist nicht verfügbar (WebGL deaktiviert), Simulation und PNG-Export funktionieren trotzdem.',
         download: (size) => `Heightmap-PNG herunterladen (16 bit, ${size})`,
         toStl: 'Heightmap zu STL öffnen',
-        doneNote: 'Das exportierte PNG ist auf den vollen 16-bit-Bereich normalisiert, mit derselben Orientierung wie die Eingabe. Füttere es ins Heightmap-zu-STL-Tool, um dein erodiertes Gelände zu drucken.',
+        doneNote: 'Das exportierte PNG ist auf den vollen 16-bit-Bereich normalisiert, mit derselben Orientierung wie die Eingabe. "Heightmap zu STL öffnen" übernimmt das erodierte Gelände direkt, bereit zum 3D-Druck.',
         errFlat: 'Dieses Bild ist komplett flach (alle Pixel haben denselben Wert), da gibt es nichts zu erodieren.',
         errHuge: 'Zu viele Zellen für die Simulation. Wähle eine gröbere Arbeitsauflösung.',
         warnSlow: 'Das sind sehr viele Zellen; die Simulation kann dauern. Eine gröbere Arbeitsauflösung ist deutlich schneller, und die Erosionsformen skalieren ohnehin mit.',
@@ -1046,7 +1063,7 @@
           const mm = ERO.minMax(m.map);
           const png = ERO.encodePNG16(m.map, m.W, m.H, mm.min, mm.max);
           const blob = new Blob([png], { type: 'image/png' });
-          setResult({ data: m.map, W: m.W, H: m.H, blobUrl: URL.createObjectURL(blob), size: blob.size });
+          setResult({ data: m.map, W: m.W, H: m.H, blob: blob, blobUrl: URL.createObjectURL(blob), size: blob.size });
           setLive(null);
           setJob({ phase: 'done' });
         }).catch(e => {
@@ -1215,7 +1232,18 @@
             {job.phase === 'done' && result && (
               <div style={{ marginTop: '1.2rem' }}>
                 <a href={result.blobUrl} download={fname} role="button">{T.download(ERO.formatBytes(result.size))}</a>{' '}
-                <a href={'/miscellaneous/tools/heightmap-to-stl.html' + (LANG === 'de' ? '?lang=de' : '')} role="button" className="outline">{T.toStl}</a>
+                <a href={'/miscellaneous/tools/heightmap-to-stl.html?from=erosion' + (LANG === 'de' ? '&lang=de' : '')}
+                   role="button" className="outline"
+                   onClick={e => {
+                     e.preventDefault();
+                     const dest = e.currentTarget.href;
+                     /* store first, navigate after; on failure navigate anyway
+                        (the STL tool then simply starts empty, as before) */
+                     EROApp.handoffToStl(result.blob, fname).then(
+                       () => { location.href = dest; },
+                       () => { location.href = dest; }
+                     );
+                   }}>{T.toStl}</a>
                 <p className="ero-sub" style={{ marginTop: '.4rem' }}>{T.doneNote}</p>
               </div>
             )}

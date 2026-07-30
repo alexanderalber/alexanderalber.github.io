@@ -145,25 +145,54 @@
       return meta.quants.filter(function (q) { return q.id !== 'mxfp4'; });
     }
 
+    function quantCfg(model, quant, penPct, opts) {
+      var need = vramNeeded(model, quant.bpw, opts.context, opts.bytesPerElem);
+      return { quant: quant, need: need, score: adjScore(model.score, penPct),
+               fits: need.total <= opts.budgetGiB * FIT_MARGIN };
+    }
+
+    // One model at every precision, ascending bits per weight: quantization
+    // moves a model down (quality) and left (VRAM), and this is that path.
+    // The top rung is the unquantized fp16 reference the published score was
+    // measured at, so the drop is visible instead of implied. Omitted for
+    // models whose score IS a native low-precision number (MXFP4), where an
+    // fp16 variant does not exist and the penalty is zero by definition.
+    var FP16 = { id: 'fp16', label: 'fp16 (unquantized)', bpw: 16 };
+    var NO_PEN = { mid: 0, lo: 0, hi: 0 };
+    function quantLadder(model, meta, opts) {
+      var rungs = modelQuants(model, meta).map(function (q) {
+        return quantCfg(model, q, meta.quant_penalties_pct[q.id] || NO_PEN, opts);
+      });
+      if (!(model.quants && model.quants.indexOf('mxfp4') >= 0)) {
+        rungs.push(quantCfg(model, FP16, NO_PEN, opts));
+      }
+      return rungs.sort(function (a, b) { return a.quant.bpw - b.quant.bpw; });
+    }
+
     // Per model: the highest-quality quant that fits the budget at the given
     // context; if none fits, fall back to the smallest config (marked !fits).
+    // The fp16 rung is a drawing reference only and never recommended.
     function evaluate(data, opts) {
       return data.models.map(function (m) {
+        var ladder = quantLadder(m, data.meta, opts);
         var best = null, min = null;
-        modelQuants(m, data.meta).forEach(function (q) {
-          var need = vramNeeded(m, q.bpw, opts.context, opts.bytesPerElem);
-          var pen = data.meta.quant_penalties_pct[q.id] || { mid: 0, lo: 0, hi: 0 };
-          var cfg = { quant: q, need: need, score: adjScore(m.score, pen),
-                      fits: need.total <= opts.budgetGiB * FIT_MARGIN };
-          if (!min || need.total < min.need.total) min = cfg;
+        ladder.forEach(function (cfg) {
+          if (cfg.quant.id === FP16.id) return;
+          if (!min || cfg.need.total < min.need.total) min = cfg;
           if (cfg.fits && (!best || cfg.score.mid > best.score.mid)) best = cfg;
         });
         var chosen = best || min;
         return {
-          model: m, fits: !!best, cfg: chosen, minNeed: min.need.total,
+          model: m, fits: !!best, cfg: chosen, minNeed: min.need.total, ladder: ladder,
           speed: speedRange(m.active_params_b, chosen.quant.bpw, opts.bwGBps)
         };
       });
+    }
+
+    // Reference rung of a ladder, or null when the model has none (MXFP4).
+    function quantReference(row) {
+      var top = row.ladder && row.ladder[row.ladder.length - 1];
+      return top && top.quant.id === FP16.id ? top : null;
     }
 
     function bestPick(rows) {
@@ -274,6 +303,7 @@
       EFF_LO: EFF_LO, EFF_HI: EFF_HI,
       weightsGiB: weightsGiB, kvGiB: kvGiB, vramNeeded: vramNeeded,
       adjScore: adjScore, speedRange: speedRange, modelQuants: modelQuants,
+      quantCfg: quantCfg, quantLadder: quantLadder, quantReference: quantReference, FP16: FP16,
       evaluate: evaluate, bestPick: bestPick, pareto: pareto, equivalence: equivalence,
       ymToNum: ymToNum, numToYm: numToYm, logitC: logitC, invLogitC: invLogitC,
       trendEvents: trendEvents, trendCeiling: trendCeiling, fitTrend: fitTrend,
@@ -385,6 +415,10 @@
     const pts = rows.map(r => ({ r, x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
     const frontier = C.pareto(rows).map(r => ({ x: X(r.cfg.need.total), y: Y(r.cfg.score.mid) }));
 
+    const ladders = [];
+    if (best) ladders.push({ r: best, col: COL.pick });
+    if (hover && (!best || hover.p.r.model.id !== best.model.id)) ladders.push({ r: hover.p.r, col: COL.label });
+
     const xticks = [2, 4, 8, 16, 32, 64, 96, 128, 192, 256].filter(v => v >= xmin && v <= xmax);
     const yticks = [];
     for (let v = 0; v <= ymax; v += 10) yticks.push(v);
@@ -429,12 +463,35 @@
           })()}
 
           {/* VRAM budget line */}
-          <line x1={X(budget)} x2={X(budget)} y1={M.t} y2={H - M.b} stroke={COL.fit} strokeWidth="1.5" opacity="0.75" />
-          <text x={X(budget) + 5} y={M.t + 11} fontSize="11" fill={COL.fit}>{fmt0(budget)} GB budget</text>
+          <line x1={X(budget)} x2={X(budget)} y1={M.t} y2={H - M.b} stroke={COL.label} strokeWidth="1.5" strokeDasharray="7 5" opacity="0.8" />
+          <text x={X(budget) + 5} y={M.t + 11} fontSize="11" fill={COL.label}>{fmt0(budget)} GB budget</text>
 
           {/* Pareto frontier through fitting configs */}
           {frontier.length > 1 &&
             <polyline points={frontier.map(p => p.x + ',' + p.y).join(' ')} fill="none" stroke={COL.fit} strokeWidth="2" opacity="0.55" strokeLinejoin="round" strokeLinecap="round" />}
+
+          {/* Quantization ladders: where the same model sits at other precisions.
+              Only for the best pick and whatever is hovered, since 45 ladders at
+              once is a hairball. */}
+          {ladders.map(({ r, col }) => {
+            const rungs = r.ladder.map(c => ({ c, x: X(c.need.total), y: Y(c.score.mid) }))
+              .filter(p => p.x <= W - M.r);
+            if (rungs.length < 2) return null;
+            const top = rungs[rungs.length - 1];
+            const flip = top.x > W - M.r - 34;
+            return (
+              <g key={'lad' + r.model.id}>
+                <polyline points={rungs.map(p => p.x + ',' + p.y).join(' ')} fill="none"
+                  stroke={col} strokeWidth="1" strokeDasharray="3 3" opacity="0.65" />
+                {rungs.map(p => p.c.quant.id === r.cfg.quant.id ? null :
+                  <circle key={p.c.quant.id} cx={p.x} cy={p.y} r="3" fill={COL.surface}
+                    stroke={col} strokeWidth="1.2" opacity="0.9" />)}
+                {top.c.quant.id === C.FP16.id &&
+                  <text x={flip ? top.x - 6 : top.x + 6} y={top.y + 3.5} fontSize="10"
+                    fill={COL.foot} textAnchor={flip ? 'end' : 'start'}>fp16</text>}
+              </g>
+            );
+          })}
 
           {/* uncertainty bands + dots */}
           {pts.map(({ r, x, y }) => {
@@ -463,6 +520,13 @@
               : <>does not fit ({hover.p.r.cfg.quant.label} needs {fmt1(hover.p.r.minNeed)} GB)<br /></>}
             VRAM: {fmt1(hover.p.r.cfg.need.total)} GB ({fmt1(hover.p.r.cfg.need.weights)} weights + {fmt1(hover.p.r.cfg.need.kv)} KV)<br />
             index: {fmt0(hover.p.r.cfg.score.mid)} (band {band(hover.p.r.cfg.score)}){hover.p.r.model.score_estimated ? ' · estimated' : ''}<br />
+            {(() => {
+              const ref = C.quantReference(hover.p.r);
+              if (!ref) return <>native low precision, no quantization loss modeled<br /></>;
+              const dScore = ref.score.mid - hover.p.r.cfg.score.mid;
+              const dVram = ref.need.total - hover.p.r.cfg.need.total;
+              return <>vs fp16: {dScore < 0.05 ? 'no modeled quality cost' : '−' + fmt1(dScore) + ' index points'}, {fmt1(dVram)} GB saved<br /></>;
+            })()}
             speed: {spd(hover.p.r.speed)} · released {hover.p.r.model.released}
           </div>
         )}
@@ -782,7 +846,7 @@
             <span style={{ '--dot': COL.fit }}>fits your GPU</span>
             <span style={{ '--dot': COL.pick }}>best pick</span>
             <span style={{ '--dot': COL.miss }}>too big</span>
-            <span className="lf-legendnote" style={{ color: COL.foot }}>dashed lines: closed reference models &middot; vertical bars: uncertainty band</span>
+            <span className="lf-legendnote" style={{ color: COL.foot }}>dashed horizontal lines: closed reference models &middot; grey dashed vertical: your VRAM budget &middot; vertical bars: uncertainty band &middot; hollow rungs: the same model at other precisions, up to the unquantized fp16 point (shown for the best pick and whatever you hover)</span>
           </div>
           <Chart rows={rows} anchors={data.anchors} budget={budget} best={best} />
 
@@ -800,7 +864,9 @@
               runtime overhead; a config "fits" when it needs at most {Math.round(C.FIT_MARGIN * 100)}% of nominal VRAM.</li>
             <li>Quality: composite intelligence index ({data.meta.scale.name}), reasoning mode where available. Quantization
               degradation is applied as a relative penalty with wide uncertainty, since public evidence is thin. The bands are the honest
-              part of this tool: differences within overlapping bands are not meaningful.</li>
+              part of this tool: differences within overlapping bands are not meaningful. The published score is the fp16 number, and the
+              chart draws the shift quantization causes: every hollow rung is the same model at another precision, moving left (less VRAM)
+              and down (lower index) as bits per weight drop. Models evaluated natively in low precision (MXFP4) have no fp16 rung.</li>
             <li>Speed: decode is memory-bound, so tok/s &asymp; bandwidth &times; {C.EFF_LO}&ndash;{C.EFF_HI} / bytes-per-token
               (active parameters &times; bits / 8). Prompt processing and multi-GPU splits are not modeled; reasoning modes spend many
               tokens thinking before answering.</li>

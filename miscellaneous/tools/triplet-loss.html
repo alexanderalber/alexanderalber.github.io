@@ -72,6 +72,19 @@
       border: 1px solid #334155; border-radius: 6px; }
     .tl-sparkwrap { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
     .tl-sparkwrap h5 { font-size: 11.5px; color: #64748b; font-weight: 500; margin: 0 0 3px; }
+    /* Stage on the left, controls on the right. Both tracks get a zero minimum,
+       otherwise the control column keeps its intrinsic width and pushes the whole
+       grid past the viewport on a phone. */
+    .tl-split { display: grid; gap: 16px; align-items: start;
+      grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); }
+    @media (max-width: 760px) {
+      .tl-split { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 520px) {
+      .tl-card { padding: 12px; }
+      .tl-formula { font-size: 12px; }
+      .tl-stat b { font-size: 17px; }
+    }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -777,7 +790,7 @@
 
     // World half-width of the stage. The scale follows the canvas width, so the
     // panel stays usable at any column width.
-    const VIEW_X = 2.7, STAGE_H = 420;
+    const VIEW_X = 2.7, VIEW_X_NARROW = 2.0, STAGE_H = 420, STAGE_H_NARROW = 340;
 
     function norm2(v) { return Math.sqrt(v[0] * v[0] + v[1] * v[1]); }
     function unit(v) { const r = norm2(v); return r < 1e-9 ? [1, 0] : [v[0] / r, v[1] / r]; }
@@ -803,6 +816,13 @@
     // Text with a dark outline, so labels stay readable over the hatching.
     function label(ctx, text, x, y, color, font) {
       ctx.font = font || '12px system-ui, sans-serif';
+      // Keep the text inside the canvas. On a phone the stage is narrow enough
+      // that a label next to a point would otherwise be cut off at the edge.
+      const dpr = window.devicePixelRatio || 1;
+      const cw = ctx.canvas.width / dpr, ch = ctx.canvas.height / dpr;
+      const tw = ctx.measureText(text).width;
+      x = Math.max(4, Math.min(x, cw - tw - 4));
+      y = Math.max(12, Math.min(y, ch - 4));
       ctx.lineWidth = 3.5;
       ctx.strokeStyle = '#0b1220';
       ctx.lineJoin = 'round';
@@ -924,12 +944,15 @@
       const kindColor = kind === 'hard' ? COL.neg : (kind === 'semi-hard' ? COL.warn : COL.pos);
       const kindText = { hard: 'hard', 'semi-hard': 'semi-hard', easy: 'easy' }[kind];
       const dSym = squared ? 'd²' : 'd';
+      const narrow = useNarrow(520);
 
       // The whole stage is drawn on a canvas, cleared and repainted every frame.
       // The first version was SVG and left repaint smears behind the gradient
       // arrows while a point was being dragged; canvas has no such state.
       const stageRef = useCanvas((ctx, w, h) => {
-        const scale = w / (2 * VIEW_X);
+        // A narrow stage zooms in, otherwise the three points sit on top of each
+        // other and there is nothing left to drag.
+        const scale = w / (2 * (w < 480 ? VIEW_X_NARROW : VIEW_X));
         const cx = w / 2, cy = h / 2;
         viewRef.current = { s: scale, cx, cy };
         const X = (x) => cx + x * scale, Y = (y) => cy - y * scale;
@@ -993,9 +1016,11 @@
             label(ctx, name, X(v[0]) + 12, Y(v[1]) - 10, color, '600 13px system-ui, sans-serif');
           });
 
-        label(ctx, 'anywhere in the hatched disc, the negative still produces a gradient',
+        label(ctx, w < 480
+          ? 'in the hatched disc the negative still has a gradient'
+          : 'anywhere in the hatched disc, the negative still produces a gradient',
           14, h - 14, COL.foot, '11.5px system-ui, sans-serif');
-      }, [pts, margin, squared, normalize, showGrad, g.dap, g.dan, g.active, rIn, rOut]);
+      }, [pts, margin, squared, normalize, showGrad, g.dap, g.dan, g.active, rIn, rOut, narrow]);
 
       return (
         <div>
@@ -1004,9 +1029,9 @@
             something else. All three move, because a triplet constrains a configuration, not a sample.
           </p>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.55fr) minmax(240px, 1fr)', gap: 16, alignItems: 'start' }}>
+          <div className="tl-split">
             <div>
-              <canvas ref={stageRef} className="tl-stage" data-h={STAGE_H}
+              <canvas ref={stageRef} className="tl-stage" data-h={narrow ? STAGE_H_NARROW : STAGE_H}
                 style={{ cursor: 'grab' }}
                 onPointerDown={onDown} onPointerMove={onMove}
                 onPointerUp={endDrag} onPointerCancel={endDrag} />
@@ -1103,6 +1128,18 @@
         draw(ctx, w, h);
       }, deps.concat(resizeTick));
       return ref;
+    }
+
+    // Phone-sized viewport. Used where a CSS media query cannot reach, namely the
+    // pixel height of the canvas element.
+    function useNarrow(bp) {
+      const [narrow, setNarrow] = useState(() => window.innerWidth < bp);
+      useEffect(() => {
+        const on = () => setNarrow(window.innerWidth < bp);
+        window.addEventListener('resize', on);
+        return () => window.removeEventListener('resize', on);
+      }, [bp]);
+      return narrow;
     }
 
     function ScatterPanel({ title, points, labels, n, view, highlight, onPick, footer }) {
