@@ -15,6 +15,11 @@
   <link rel="stylesheet" href="/assets/css/pico.min.css">
   <link rel="stylesheet" href="/assets/css/custom.css">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Pico hängt an jedes Formularelement ein margin-bottom; in der Bedienleiste macht das
+       die Umschalter zu hoch und alles gegeneinander schief. */
+    .ctl-bar button, .ctl-bar input { margin-bottom: 0; }
+  </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/babel.min.js"></script>
@@ -69,6 +74,119 @@
     <script>(function(){if((localStorage.getItem('lang')||'de')!=='en')return;var r=document.getElementById('root');r.querySelector('h1').textContent='Baby Sleep, Feeding & Crying in the First Year';r.querySelector('p').textContent='Interactive distribution curves for sleep, feeding frequency and crying in the first year of life – with percentile bands instead of plain averages, showing how wide the normal range between babies really is.';})()</script>
   </main>
 
+  <script id="bbcore">
+    // ─── Fütterungsdaten und Zwiefütterungsschätzung ──────────────────────────
+    // Reines JS, kein JSX, keine Seiteneffekte: dieser Block ist die Naht, an der
+    // die Node-Tests unter notes/dev/ die Rechnung prüfen.
+    // Alle Perzentilzeilen: [Woche, P10, P25, P50, P75, P90].
+
+    // Stillfrequenz Mahlzeiten/Tag — Kent 2006 (1–6 Mo) + AAP/WHO für spätere Monate.
+    // Rechtsschiefe Verteilung; P90 nach oben angepasst.
+    const FEED_BF = [
+      [ 0, 7.0, 8.5, 10.5, 13.0, 15.0],
+      [ 4, 7.0, 9.0, 11.0, 13.0, 15.5],
+      [ 8, 6.5, 8.3, 10.0, 11.7, 13.5],
+      [13, 5.5, 7.0,  8.5, 10.0, 11.5],
+      [22, 4.5, 6.0,  7.5,  9.0, 10.5],
+      [26, 3.8, 5.0,  6.0,  7.2,  8.5], // Beikosteinführung
+      [39, 2.5, 3.5,  4.5,  5.5,  6.5],
+      [52, 2.0, 3.0,  4.0,  5.0,  6.0],
+    ];
+
+    // Flaschenfrequenz Mahlzeiten/Tag — AAP HealthyChildren + DARLING (Heinig 1993)
+    const FEED_FF = [
+      [ 0, 5.0, 6.0, 7.5, 9.0, 10.5],
+      [ 4, 5.0, 6.0, 7.5, 9.0, 10.5],
+      [ 8, 4.5, 5.5, 6.5, 7.5,  8.5],
+      [13, 4.0, 5.0, 6.0, 7.0,  8.0],
+      [22, 3.5, 4.3, 5.0, 5.7,  6.5],
+      [26, 3.5, 4.3, 5.0, 5.7,  6.5],
+      [39, 2.5, 3.3, 4.0, 4.7,  5.5],
+      [52, 2.0, 2.5, 3.0, 3.5,  4.2],
+    ];
+
+    // Zwiefütterung, gemessen. Die Recherche (notes/tools/baby-basics/) fand genau eine
+    // Studie, die Brust- und Flaschenmahlzeiten IM SELBEN Kind zählt und eine Streuung
+    // angibt: Moral 2010 (BMC Pediatrics 10:6), Spanien, Elternangabe für die Vorwoche,
+    // n=110 (3.–4. Woche) und n=125 (3.–5. Monat). Zwei Alter, keine Perzentile, keine
+    // Staffelung nach Zufütterungsgrad.
+    // [Woche, Brust M, Brust SD, Flasche M, Flasche SD, n]
+    const FEED_MIXED = [
+      [ 3.5, 5.83, 1.93, 5.0, 2.2, 110],  // 21–28 Tage
+      [17,   4.42, 1.67, 3.7, 1.6, 125],  // 3–5 Monate, Mitte
+    ];
+
+    // z-Werte zu P10/P25/P50/P75/P90 unter Normalverteilungsannahme, dieselbe Näherung,
+    // mit der auch die übrigen Bänder dieses Tools aus Mittel ± SD entstanden sind.
+    const BB_Z = [-1.2816, -0.6745, 0, 0.6745, 1.2816];
+
+    function bbLerp(data, wk, col) {
+      if (wk <= data[0][0]) return data[0][col];
+      const n = data.length;
+      if (wk >= data[n-1][0]) return data[n-1][col];
+      let i = 1;
+      while (i < n && data[i][0] < wk) i++;
+      const a = data[i-1], b = data[i];
+      return a[col] + (wk - a[0]) / (b[0] - a[0]) * (b[col] - a[col]);
+    }
+
+    // Partial Pooling, so weit zwei Messpunkte es zulassen: die Altersform wird
+    // vollständig aus der Exklusivkurve geliehen, geschätzt wird nur ein Niveaufaktor
+    // je Komponente. Die einzelnen Verhältnisse kommen mit zurück, weil ihre Spanne
+    // die eigentliche Prüfgröße ist: streuen sie, ist die Annahme "konstanter Faktor"
+    // widerlegt und die Kurve darf nicht gezeichnet werden.
+    function bbFactor(exclusive, obs) {
+      const ratios = obs.map(o => o[1] / bbLerp(exclusive, o[0], 3));
+      const factor = ratios.reduce((s, r) => s + r, 0) / ratios.length;
+      const spread = Math.max.apply(null, ratios) - Math.min.apply(null, ratios);
+      return { ratios: ratios, factor: factor, spread: spread, relSpread: spread / factor };
+    }
+
+    // Variationskoeffizient aus den gemessenen SD, ausdrücklich NICHT aus der
+    // Exklusivkurve: zwiegefütterte Kinder streuen relativ breiter, weil bei ihnen
+    // auch der Zufütterungsgrad variiert. Ein herunterskaliertes Exklusivband wäre zu eng.
+    function bbCV(obs) {
+      const cvs = obs.map(o => o[2] / o[1]);
+      return cvs.reduce((s, c) => s + c, 0) / cvs.length;
+    }
+
+    function bbMixCurve(exclusive, factor, cv, weeks) {
+      return weeks.map(function (wk) {
+        const m = factor * bbLerp(exclusive, wk, 3);
+        return [wk].concat(BB_Z.map(function (z) { return Math.max(0, m * (1 + z * cv)); }));
+      });
+    }
+
+    // Wochenraster inklusive der beiden Messalter, damit die durchgezogene Strecke
+    // genau dort endet, wo gemessen wurde, und nicht am nächsten ganzen Wochenwert.
+    const MIX_OBS_BF = FEED_MIXED.map(function (r) { return [r[0], r[1], r[2]]; });
+    const MIX_OBS_FF = FEED_MIXED.map(function (r) { return [r[0], r[3], r[4]]; });
+    const MIX_WEEKS = (function () {
+      const w = [];
+      for (let i = 0; i <= 52; i++) w.push(i);
+      FEED_MIXED.forEach(function (r) { if (w.indexOf(r[0]) < 0) w.push(r[0]); });
+      return w.sort(function (a, b) { return a - b; });
+    })();
+    const MIX_FIT = {
+      bf: bbFactor(FEED_BF, MIX_OBS_BF),
+      ff: bbFactor(FEED_FF, MIX_OBS_FF),
+      cvBf: bbCV(MIX_OBS_BF),
+      cvFf: bbCV(MIX_OBS_FF),
+      wkFrom: FEED_MIXED[0][0],
+      wkTo: FEED_MIXED[FEED_MIXED.length - 1][0],
+    };
+    const MIX_BF = bbMixCurve(FEED_BF, MIX_FIT.bf.factor, MIX_FIT.cvBf, MIX_WEEKS);
+    const MIX_FF = bbMixCurve(FEED_FF, MIX_FIT.ff.factor, MIX_FIT.cvFf, MIX_WEEKS);
+
+    // Der Browser sieht die Namen ohnehin (klassisches Skript, globaler Skop); dieses
+    // Bündel ist für die Node-Tests da, die den Block per eval laden.
+    globalThis.BabyCore = {
+      FEED_BF: FEED_BF, FEED_FF: FEED_FF, FEED_MIXED: FEED_MIXED, BB_Z: BB_Z,
+      bbLerp: bbLerp, bbFactor: bbFactor, bbCV: bbCV, bbMixCurve: bbMixCurve,
+      MIX_FIT: MIX_FIT, MIX_BF: MIX_BF, MIX_FF: MIX_FF, MIX_WEEKS: MIX_WEEKS,
+    };
+  </script>
+
   <script type="text/babel">
     const { useState, useMemo, useRef, useEffect } = React;
 
@@ -80,14 +198,16 @@
     const STRINGS = {
       de: {
         h1: 'Babyschlaf, Stillen\u00a0& Schreien\u00a0– Verteilungen',
-        source: 'Quellen: Iglowstein\u00a02003\u00a0(Schlaf gesamt, n=493, direkte Perzentile) · Henderson\u00a02010\u00a0(Nachtsequenz, n=75) · Kent\u00a02006\u00a0(Stillfrequenz, n=71) · AAP/ESPGHAN\u00a0(Flasche) · Wolke\u00a02017\u00a0(Schreien, n=8.690) · Vermillet\u00a02022\u00a0(Schreien 3–12\u00a0Mo, n=7.580). Bänder außer Schlaf gesamt aus Mittel\u00a0± SD rekonstruiert (Normalverteilungsannahme, approximativ).',
+        source: 'Quellen: Iglowstein\u00a02003\u00a0(Schlaf gesamt, n=493, direkte Perzentile) · Henderson\u00a02010\u00a0(Nachtsequenz, n=75) · Kent\u00a02006\u00a0(Stillfrequenz, n=71) · AAP/ESPGHAN\u00a0(Flasche) · Moral 2010 (Zwiefütterung, n=110/125) · Wolke\u00a02017\u00a0(Schreien, n=8.690) · Vermillet\u00a02022\u00a0(Schreien 3–12\u00a0Mo, n=7.580). Bänder außer Schlaf gesamt aus Mittel\u00a0± SD rekonstruiert (Normalverteilungsannahme, approximativ).',
         notice: 'Diese Tools sind private Hobbyprojekte - nicht kommerziell, nicht ausgiebig getestet und ohne Gewähr. Nutzung gerne, auf eigene Verantwortung.',
         bday: 'Geburtsdatum', today: 'Heute',
+        todayLineLabel: 'Heute-Linie',
         age: (wk, mo) => `Alter: ${Math.round(wk)} Wo\u00a0·\u00a0${mo} Mo`,
-        feedingLabel: 'ERNÄHRUNG',
+        feedingLabel: 'Ernährung',
         btnBrust: 'Brust', btnFlasche: 'Flasche', btnBeides: 'Beides',
-        overlayLabel: 'EINBLENDUNGEN',
+        overlayLabel: 'Einblendungen',
         btnStretch: 'Längste Nachtsequenz',
+        notesSummary: 'Hinweise',
         panelSleep: 'Schlaf gesamt (h\u00a0/ 24\u00a0h)',
         panelFeed: 'Mahlzeiten pro Tag',
         panelCry: 'Schreien\u00a0& Quengeln (h\u00a0/ Tag)',
@@ -95,6 +215,15 @@
         stretchLabel: 'P50 Nacht',
         stretchLegend: 'Längste Nachtsequenz',
         colLabelBreast: 'Brust', colLabelFormula: 'Flasche',
+        refSuffix: ' (Ref.)',
+        estSuffix: ' (gesch.)',
+        mixedNote: (fb, ff) => `Zwiefütterung, geschätzt: Brust × ${fb} + Flasche × ${ff} der jeweiligen Exklusivkurve; Niveau aus Moral 2010, Punkte mit ±1 SD`,
+        mixedNote2: 'Durchgezogen zwischen den beiden gemessenen Altern, gestrichelt extrapoliert; dünn gepunktet die Exklusivkurven als Bezug.',
+        methodTitle: 'Zwiefütterung, wie geschätzt wird:',
+        methodText: (rb, rf, fb, ff, cb, cf) => `Für zwiegefütterte Kinder gibt es keine veröffentlichte Verteilung, nur eine Studie mit zwei Altern (Moral 2010, n=110 und n=125). Die Altersform wird deshalb vollständig aus den Kurven für ausschließliche Fütterung geliehen, geschätzt wird nur das Niveau: ein Faktor je Komponente. Die Verhältnisse Messung zu Exklusivkurve sind ${rb} (Brust) und ${rf} (Flasche), über beide Alter also praktisch konstant; verwendet wird ihr Mittel, × ${fb} und × ${ff}. Die Bänder entstehen aus den gemessenen Streuungen (Variationskoeffizient ${cb} und ${cf}) unter Normalverteilungsannahme, nicht aus einem herunterskalierten Exklusivband: zwiegefütterte Kinder streuen relativ breiter, weil bei ihnen auch der Zufütterungsgrad variiert.`,
+        methodLimits: 'Grenzen: beide Messpunkte stammen aus derselben Kohorte, demselben Land und derselben Erhebungsart (Elternangabe), und die Studie schnitt über ihre Einschlusskriterien die Ränder der Verteilung ab. Gedeckt ist Woche 3 bis Monat 5; außerhalb ist die Kurve gestrichelt, weil dort nur noch die geliehene Form trägt, gerade wenn ab etwa Monat 6 die Beikost dazukommt. Die Summe beider geschätzter Kurven liegt auf Höhe der Stillkurve und über der Flaschenkurve, was zu Ongprasert 2025 passt, einer Studie, die in die Schätzung nicht eingegangen ist.',
+        mixedAges: ['3.–4. Woche', '3.–5. Monat'],
+        tipMixed: (age, bf, ff) => `👶 Zwiefütterung ${age}: Brust ${bf}×, Flasche ${ff}×/Tag (Mittel)`,
         koliklinie: 'Kolik-Grenze (Wessel\u00a0> 3\u00a0h)',
         geb: 'Geb.',
         tipMoveMouse: 'Maus über das Diagramm bewegen für Details\u00a0…',
@@ -118,14 +247,16 @@
       },
       en: {
         h1: 'Baby Sleep, Feeding\u00a0& Crying\u00a0– Distributions',
-        source: 'Sources: Iglowstein\u00a02003\u00a0(total sleep, n=493, direct percentiles) · Henderson\u00a02010\u00a0(night stretch, n=75) · Kent\u00a02006\u00a0(breastfeeding freq., n=71) · AAP/ESPGHAN\u00a0(formula) · Wolke\u00a02017\u00a0(crying, n=8,690) · Vermillet\u00a02022\u00a0(crying 3–12\u00a0mo, n=7,580). Bands (except total sleep) reconstructed from mean\u00a0± SD (normal distribution assumption, approximate).',
+        source: 'Sources: Iglowstein\u00a02003\u00a0(total sleep, n=493, direct percentiles) · Henderson\u00a02010\u00a0(night stretch, n=75) · Kent\u00a02006\u00a0(breastfeeding freq., n=71) · AAP/ESPGHAN\u00a0(formula) · Moral 2010 (combination feeding, n=110/125) · Wolke\u00a02017\u00a0(crying, n=8,690) · Vermillet\u00a02022\u00a0(crying 3–12\u00a0mo, n=7,580). Bands (except total sleep) reconstructed from mean\u00a0± SD (normal distribution assumption, approximate).',
         notice: 'These are personal hobby projects - non-commercial, not extensively tested, and provided without any warranty. Feel free to use them, at your own risk.',
         bday: 'Birth Date', today: 'Today',
+        todayLineLabel: 'Today line',
         age: (wk, mo) => `Age: ${Math.round(wk)} wks\u00a0·\u00a0${mo}\u00a0mo`,
-        feedingLabel: 'FEEDING',
+        feedingLabel: 'Feeding',
         btnBrust: 'Breast', btnFlasche: 'Formula', btnBeides: 'Both',
-        overlayLabel: 'OVERLAYS',
+        overlayLabel: 'Overlays',
         btnStretch: 'Longest Night Stretch',
+        notesSummary: 'Notes',
         panelSleep: 'Total Sleep (h\u00a0/ 24\u00a0h)',
         panelFeed: 'Meals per Day',
         panelCry: 'Crying\u00a0& Fussing (h\u00a0/ Day)',
@@ -133,6 +264,15 @@
         stretchLabel: 'P50 Night',
         stretchLegend: 'Longest Night Stretch',
         colLabelBreast: 'Breast', colLabelFormula: 'Formula',
+        refSuffix: ' (ref.)',
+        estSuffix: ' (est.)',
+        mixedNote: (fb, ff) => `Combination feeding, estimated: breast × ${fb} + formula × ${ff} of the respective exclusive curve; level from Moral 2010, points with ±1 SD`,
+        mixedNote2: 'Solid between the two measured ages, dashed where extrapolated; finely dotted are the exclusive curves for reference.',
+        methodTitle: 'Combination feeding, how it is estimated:',
+        methodText: (rb, rf, fb, ff, cb, cf) => `There is no published distribution for combination-fed infants, only one study with two ages (Moral 2010, n=110 and 125). The age shape is therefore borrowed entirely from the exclusive-feeding curves, and only the level is estimated: one factor per component. The measured-to-exclusive ratios are ${rb} (breast) and ${rf} (formula), essentially constant across both ages; their mean is used, × ${fb} and × ${ff}. The bands come from the measured spread (coefficient of variation ${cb} and ${cf}) under a normal assumption, not from a scaled-down exclusive band: combination-fed infants vary relatively more, because the degree of supplementation varies too.`,
+        methodLimits: 'Limits: both measurements come from the same cohort, country and method (parental report), and the study truncated the tails through its inclusion criteria. Covered is week 3 to month 5; outside that the curve is dashed, because only the borrowed shape carries it there, precisely where solids enter from about month 6. The sum of both estimated curves sits at the level of the breastfeeding curve and above the formula curve, consistent with Ongprasert 2025, a study that did not enter the estimate.',
+        mixedAges: ['week 3–4', 'month 3–5'],
+        tipMixed: (age, bf, ff) => `👶 Combination feeding, ${age}: breast ${bf}×, formula ${ff}×/day (mean)`,
         koliklinie: 'Colic Threshold (Wessel\u00a0> 3\u00a0h)',
         geb: 'Birth',
         tipMoveMouse: 'Move mouse over chart for details\u00a0…',
@@ -186,30 +326,8 @@
       [52, 8.2, 9.1, 10.1, 11.1, 11.9],
     ];
 
-    // Breastfeeding frequency meals/day — Kent 2006 (1–6 Mo) + AAP/WHO for later months
-    // Note: right-skewed distribution; P90 adjusted upward
-    const FEED_BF = [
-      [ 0, 7.0, 8.5, 10.5, 13.0, 15.0],
-      [ 4, 7.0, 9.0, 11.0, 13.0, 15.5],
-      [ 8, 6.5, 8.3, 10.0, 11.7, 13.5],
-      [13, 5.5, 7.0,  8.5, 10.0, 11.5],
-      [22, 4.5, 6.0,  7.5,  9.0, 10.5],
-      [26, 3.8, 5.0,  6.0,  7.2,  8.5], // Beikosteinführung
-      [39, 2.5, 3.5,  4.5,  5.5,  6.5],
-      [52, 2.0, 3.0,  4.0,  5.0,  6.0],
-    ];
-
-    // Formula frequency meals/day — AAP HealthyChildren + DARLING (Heinig 1993)
-    const FEED_FF = [
-      [ 0, 5.0, 6.0, 7.5, 9.0, 10.5],
-      [ 4, 5.0, 6.0, 7.5, 9.0, 10.5],
-      [ 8, 4.5, 5.5, 6.5, 7.5,  8.5],
-      [13, 4.0, 5.0, 6.0, 7.0,  8.0],
-      [22, 3.5, 4.3, 5.0, 5.7,  6.5],
-      [26, 3.5, 4.3, 5.0, 5.7,  6.5],
-      [39, 2.5, 3.3, 4.0, 4.7,  5.5],
-      [52, 2.0, 2.5, 3.0, 3.5,  4.2],
-    ];
+    // Die drei Fütterungsdatensätze und die Zwiefütterungsschätzung stehen im
+    // bbcore-Block oben, damit die Node-Tests sie erreichen.
 
     // Crying+fussing h/day
     // Wolke 2017 (weeks 1–12, meta-analysis n=8,690); Vermillet 2022 (3–12 Mo, n=7,580)
@@ -254,6 +372,27 @@
     }
 
     // ─── COMPONENT ───────────────────────────────────────────────────────────
+    const Calendar = ({style}) => <svg style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>;
+    // Dasselbe Zeichen, das dieses Tool auf der Übersichtsseite trägt
+    // (/assets/img/icons/moon.svg, lucide).
+    const Moon = ({style}) => <svg style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg>;
+
+    // Ein Eingabefeld der Bedienleiste: kleine Überschrift, darunter das Bedienelement.
+    // Bewusst ein <div> und kein <label>, weil manche Felder selbst ein <label> enthalten.
+    function Field({ label, icon, children }) {
+      return (
+        <div style={{display:"flex",flexDirection:"column",gap:5,
+          background:"var(--tool-subtle)",borderRadius:10,padding:"7px 11px 9px"}}>
+          <span style={{display:"flex",alignItems:"center",gap:5,fontSize:11,fontWeight:600,
+            letterSpacing:".04em",textTransform:"uppercase",color:"var(--tool-faint)",whiteSpace:"nowrap"}}>
+            {icon}{label}
+          </span>
+          <span style={{display:"flex",alignItems:"center",gap:8,minHeight:30,
+            fontSize:13,color:"var(--tool-note)"}}>{children}</span>
+        </div>
+      );
+    }
+
     function DateInput({ value, onChange }) {
       const hiddenRef = React.useRef(null);
       const [parts, setParts] = React.useState(() => value ? value.split('-') : ['','','']);
@@ -301,6 +440,15 @@
       const [curLang, setLang] = useState(lang);
       lang = curLang;
       t = STRINGS[lang] || STRINGS.de;
+      // Volltonflächen leuchten im Dunkeln unangenehm. Die aktiven Umschalter werden
+      // dort deshalb zurückgenommen und über Kontur und Schriftfarbe definiert;
+      // das Theme kommt aus dem Attribut, das der zentrale Umschalter live setzt.
+      const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
+      useEffect(() => {
+        const onTheme = () => setDark(document.documentElement.dataset.theme === "dark");
+        window.addEventListener("themechange", onTheme);
+        return () => window.removeEventListener("themechange", onTheme);
+      }, []);
       useEffect(() => {
         window.__setLang = setLang;
         return () => { delete window.__setLang; };
@@ -312,17 +460,32 @@
       const [todayStr, setTodayStr] = useState(new Date().toISOString().slice(0,10));
       const [feeding,  setFeeding]  = useState("bf");        // "bf"|"ff"|"both"
       const [showStretch, setShowStretch] = useState(true);
+      const [showTodayLine, setShowTodayLine] = useState(true);
+      const [showNotes, setShowNotes] = useState(false);
       const [tip, setTip] = useState(null);
       const svgRef = useRef(null);
 
       const bday  = useMemo(() => new Date(bdayStr  + "T12:00:00"), [bdayStr]);
       const today = useMemo(() => new Date(todayStr + "T12:00:00"), [todayStr]);
       const ageWk = useMemo(() => (today - bday) / (7 * 86400000), [bday, today]);
-      const showToday = ageWk >= 0 && ageWk <= 52;
+      // Im Alter liegt sie überhaupt nur innerhalb des ersten Jahres; das Häkchen
+      // entscheidet darüber hinaus, ob sie gezeigt wird.
+      const inRange   = ageWk >= 0 && ageWk <= 52;
+      const showToday = inRange && showTodayLine;
 
       // ── SVG layout ─────────────────────────────────────────────────────────
       const W  = 1180;
-      const ML = 54, MR = 52;
+      // Rechts steht die Kurvenbeschriftung außerhalb der Felder. Im
+      // Zwiefütterungsmodus heißt sie "Flasche (gesch.)" statt "Flasche" und
+      // braucht mehr Rand, sonst schneidet die SVG-Kante sie ab. Der Bedarf hängt
+      // an der Sprache ("Formula (est.)" ist kürzer), deshalb aus der längsten
+      // Beschriftung geschätzt statt fest gesetzt: rund 4.4px pro Zeichen bei 10px fett.
+      const ML = 54;
+      const MR = feeding === "both"
+        ? Math.round(Math.max(
+            (t.colLabelBreast  + t.estSuffix).length,
+            (t.colLabelFormula + t.estSuffix).length) * 4.4) + 8
+        : 52;
       const pw = W - ML - MR;
       const PH0 = 338;  // sleep panel (+30%)
       const PH1 = 208;  // feeding panel (−20%)
@@ -343,38 +506,53 @@
       const X_TICKS = [0,4,8,13,17,22,26,30,35,39,43,48,52];
       const MO_LABELS = {0:t.geb,4:"1M",8:"2M",13:"3M",17:"4M",22:"5M",26:"6M",30:"7M",35:"8M",39:"9M",43:"10M",48:"11M",52:"12M"};
 
+      const tipAt = wk => ({
+        wk,
+        wkR: Math.round(wk),
+        sleep:   lerp(SLEEP_TOTAL,   wk, 3),
+        p25s:    lerp(SLEEP_TOTAL,   wk, 2), p75s: lerp(SLEEP_TOTAL, wk, 4),
+        stretch: lerp(SLEEP_STRETCH, wk, 3),
+        feedBf:  lerp(FEED_BF,       wk, 3),
+        feedFf:  lerp(FEED_FF,       wk, 3),
+        mixBf:   lerp(MIX_BF,        wk, 3),
+        mixFf:   lerp(MIX_FF,        wk, 3),
+        cry:     lerp(CRYING,        wk, 3),
+        p25c:    lerp(CRYING,        wk, 2), p75c: lerp(CRYING, wk, 4),
+      });
+
       const handleMove = e => {
         if (!svgRef.current) return;
         const rect = svgRef.current.getBoundingClientRect();
         const svgX = (e.clientX - rect.left) * (W / rect.width);
-        const wk = Math.max(0, Math.min(52, (svgX - ML) / pw * 52));
-        setTip({
-          wk,
-          wkR: Math.round(wk),
-          sleep:   lerp(SLEEP_TOTAL,   wk, 3),
-          p25s:    lerp(SLEEP_TOTAL,   wk, 2), p75s: lerp(SLEEP_TOTAL, wk, 4),
-          stretch: lerp(SLEEP_STRETCH, wk, 3),
-          feedBf:  lerp(FEED_BF,       wk, 3),
-          feedFf:  lerp(FEED_FF,       wk, 3),
-          cry:     lerp(CRYING,        wk, 3),
-          p25c:    lerp(CRYING,        wk, 2), p75c: lerp(CRYING, wk, 4),
-        });
+        setTip(tipAt(Math.max(0, Math.min(52, (svgX - ML) / pw * 52))));
       };
 
-      const inp = {border:"1px solid var(--tool-hairline)",borderRadius:8,padding:"5px 10px",
-        fontSize:13,color:"var(--tool-emph)",background:"var(--tool-surface)",fontFamily:"inherit"};
+      // Ohne Mauszeiger bleibt dieselbe Zeile stehen, nur unsichtbar. Sonst fällt die
+      // Leiste beim Verlassen des Diagramms von zwei Zeilen auf eine zusammen, die Seite
+      // springt, und an der Kante entsteht ein Flackern aus Verlassen und Wiedereintritt.
+      // Die Platzhalterwerte sind mittige Zahlen, damit die Zeile realistisch breit ist.
+      const tipShown = tip || tipAt(26);
 
-      const btnStyle = (active, col) => ({
-        padding:"5px 14px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",
-        border:`1.5px solid ${active ? col : "var(--tool-hairline)"}`,
-        background: active ? col : "var(--tool-surface)",
-        color: active ? "white" : "var(--tool-note)",
-        transition:"all .15s",
+      // Die Knöpfe sitzen in einem gerahmten Kasten, der die Segmentierung trägt.
+      // Hell: Vollton mit weißer Schrift. Dunkel: getönte Fläche, Rand und Schrift
+      // tragen die Farbe, sonst leuchtet das Segment aus der Karte heraus.
+      const segStyle = (active, col) => ({
+        padding:"4px 12px",borderRadius:6,fontSize:13,fontWeight:600,cursor:"pointer",
+        border:`1px solid ${active && dark ? col : "transparent"}`,transition:"all .15s",
+        background: active
+          ? (dark ? `color-mix(in srgb, ${col} 20%, var(--tool-surface))` : col)
+          : "transparent",
+        color: active ? (dark ? col : "white") : "var(--tool-note)",
       });
 
       const showBf = feeding === "bf" || feeding === "both";
       const showFf = feeding === "ff" || feeding === "both";
-      const colBf = "#10b981", colFf = "#f97316", colSleep = "#3b82f6", colStretch = "#8b5cf6", colCry = "#f43f5e";
+      // "Beides" ist kein Übereinanderlegen zweier Kurven: die beiden Kurven gelten je für
+      // ausschließliche Fütterung und sind nicht addierbar. Im Zwiefütterungsmodus treten
+      // sie deshalb als Referenz zurück, und die gemessenen Punkte stehen vorn.
+      const mixed = feeding === "both";
+      const colBf = "#10b981", colFf = "#f97316", colSleep = "#3b82f6", colStretch = "#8b5cf6",
+            colCry = "#f43f5e", colMix = "#6366f1";
 
       return (
         <div style={{fontFamily:"system-ui,sans-serif",background:"var(--pico-background-color)",minHeight:"100vh",padding:16}}>
@@ -382,46 +560,95 @@
 
           {/* ── HEADER CARD ── */}
           <div style={{background:"var(--tool-surface)",borderRadius:12,border:"1px solid var(--tool-hairline)",
-            padding:"18px 24px",marginBottom:12,
-            display:"flex",alignItems:"flex-start",justifyContent:"space-between",flexWrap:"wrap",gap:16}}>
-            <div style={{flex:1,minWidth:320}}>
-              <h1 style={{fontSize:21,fontWeight:700,color:"var(--tool-emph)",margin:"0 0 4px"}}>
-                {t.h1}
-              </h1>
-              <p style={{fontSize:11,color:"var(--tool-faint)",margin:"0 0 14px",lineHeight:1.5}}>
-                {t.source}
-                <span style={{display:"block",marginTop:8,color:"var(--tool-note)"}}>{t.notice}</span>
-              </p>
-              <div style={{display:"flex",flexWrap:"wrap",gap:12,alignItems:"center"}}>
-                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"var(--tool-note)"}}>
-                  {t.bday}
-                  <DateInput value={bdayStr} onChange={e=>setBdayStr(e.target.value)} />
+            padding:"18px 24px",marginBottom:12}}>
+            <h1 style={{fontSize:22,fontWeight:700,color:"var(--tool-emph)",margin:"0 0 14px",
+              display:"flex",alignItems:"center",gap:8}}>
+              <Moon style={{width:22,height:22,color:"#3b82f6"}}/>
+              {t.h1}
+            </h1>
+
+            <div className="ctl-bar" style={{display:"flex",flexWrap:"wrap",alignItems:"flex-start",
+              columnGap:12,rowGap:12}}>
+              <Field label={t.bday} icon={<Calendar style={{width:12,height:12}}/>}>
+                <DateInput value={bdayStr} onChange={e=>setBdayStr(e.target.value)} />
+              </Field>
+              <Field label={t.today} icon={<Calendar style={{width:12,height:12}}/>}>
+                <DateInput value={todayStr} onChange={e=>setTodayStr(e.target.value)} />
+                <label style={{display:"flex",alignItems:"center",gap:5,
+                  marginLeft:4,cursor:"pointer",whiteSpace:"nowrap"}}>
+                  <input type="checkbox" checked={showTodayLine}
+                    onChange={e=>setShowTodayLine(e.target.checked)}
+                    style={{cursor:"pointer"}}/>
+                  <span>{t.todayLineLabel}</span>
                 </label>
-                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"var(--tool-note)"}}>
-                  {t.today}
-                  <DateInput value={todayStr} onChange={e=>setTodayStr(e.target.value)} />
-                </label>
-                {showToday && <span style={{fontSize:13,color:"var(--tool-faint)"}}>
-                  <strong style={{color:"#dc2626"}}>{t.age(ageWk, (ageWk/4.33).toFixed(1))}</strong>
-                </span>}
-              </div>
-            </div>
-            <div style={{display:"flex",flexDirection:"column",gap:10,minWidth:220}}>
-              <div>
-                <div style={{fontSize:11,color:"var(--tool-faint)",fontWeight:700,marginBottom:5,letterSpacing:.5}}>{t.feedingLabel}</div>
-                <div style={{display:"flex",gap:6}}>
-                  {[["bf",t.btnBrust,colBf],["ff",t.btnFlasche,colFf],["both",t.btnBeides,"#6366f1"]].map(([k,lbl,col])=>(
-                    <button key={k} onClick={()=>setFeeding(k)} style={btnStyle(feeding===k,col)}>{lbl}</button>
+              </Field>
+              <Field label={t.feedingLabel}>
+                {/* Fläche statt Tönung, weil die Tönung jetzt das Feld selbst trägt */}
+                <div style={{display:"flex",padding:3,background:"var(--tool-surface)",
+                  border:"1px solid var(--tool-hairline)",borderRadius:8,gap:3}}>
+                  {[["bf",t.btnBrust,colBf],["ff",t.btnFlasche,colFf],["both",t.btnBeides,colMix]].map(([k,lbl,col])=>(
+                    <button key={k} onClick={()=>setFeeding(k)} style={segStyle(feeding===k,col)}>{lbl}</button>
                   ))}
                 </div>
-              </div>
-              <div>
-                <div style={{fontSize:11,color:"var(--tool-faint)",fontWeight:700,marginBottom:5,letterSpacing:.5}}>{t.overlayLabel}</div>
-                <button onClick={()=>setShowStretch(s=>!s)} style={btnStyle(showStretch,colStretch)}>
-                  {t.btnStretch}
-                </button>
-              </div>
+              </Field>
+              <Field label={t.overlayLabel}>
+                <div style={{display:"flex",padding:3,background:"var(--tool-surface)",
+                  border:"1px solid var(--tool-hairline)",borderRadius:8}}>
+                  <button onClick={()=>setShowStretch(s=>!s)} style={segStyle(showStretch,colStretch)}>
+                    {t.btnStretch}
+                  </button>
+                </div>
+              </Field>
             </div>
+
+            <div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:12,marginTop:14,
+              paddingTop:12,borderTop:"1px solid var(--tool-hairline)"}}>
+              {inRange && <span style={{fontSize:13,color:"var(--tool-faint)"}}>
+                <strong style={{color:"#dc2626"}}>{t.age(ageWk, (ageWk/4.33).toFixed(1))}</strong>
+              </span>}
+              <button type="button" onClick={()=>setShowNotes(v=>!v)}
+                style={{marginLeft:"auto",marginBottom:0,fontSize:11,padding:"3px 9px",borderRadius:6,
+                  background:"var(--tool-subtle)",border:"none",cursor:"pointer",color:"var(--tool-label)",
+                  display:"inline-flex",alignItems:"center",gap:5,whiteSpace:"nowrap"}}>
+                <span style={{fontSize:9}}>{showNotes ? "▾" : "▸"}</span>{t.notesSummary}
+              </button>
+            </div>
+
+            {showNotes && (
+              <div style={{fontSize:11,color:"var(--tool-faint)",margin:"10px 0 0",lineHeight:1.5,maxWidth:680}}>
+                {/* Die Legende stand früher als eigene Karte unter dem Diagramm. Sie ist
+                    Nachschlagestoff wie die Quellen und sitzt deshalb hier. */}
+                <div style={{display:"flex",gap:"8px 20px",flexWrap:"wrap",alignItems:"center",
+                  marginBottom:10}}>
+                  <span style={{fontSize:11,fontWeight:700,color:"var(--tool-faint)",letterSpacing:.5}}>{t.legendTitle}</span>
+                  {[
+                    {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="var(--tool-note)" opacity={0.15}/>, label:t.leg1},
+                    {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="var(--tool-label)" opacity={0.35}/>, label:t.leg2},
+                    {render:<line x1={2} y1={8} x2={30} y2={8} stroke="var(--tool-emph)" strokeWidth={2.5}/>, label:t.leg3},
+                    {render:<line x1={2} y1={8} x2={30} y2={8} stroke={colStretch} strokeWidth={2} strokeDasharray="6,3"/>, label:t.leg4},
+                  ].map(({render,label},i)=>(
+                    <span key={i} style={{display:"flex",alignItems:"center",gap:7,fontSize:12,color:"var(--tool-note)"}}>
+                      <svg width={32} height={16}>{render}</svg>{label}
+                    </span>
+                  ))}
+                </div>
+                <p style={{margin:"0 0 10px"}}>{t.legNote}</p>
+                {t.source}
+                {/* Die Zahlen kommen aus der Rechnung, nicht aus dem Fließtext: sonst
+                    driftet die Beschreibung irgendwann von der gezeichneten Kurve weg. */}
+                <p style={{margin:"10px 0 0"}}>
+                  <strong style={{color:"var(--tool-note)"}}>{t.methodTitle}</strong>{" "}
+                  {t.methodText(
+                    MIX_FIT.bf.ratios.map(r=>r.toFixed(2)).join(" / "),
+                    MIX_FIT.ff.ratios.map(r=>r.toFixed(2)).join(" / "),
+                    MIX_FIT.bf.factor.toFixed(2), MIX_FIT.ff.factor.toFixed(2),
+                    MIX_FIT.cvBf.toFixed(2), MIX_FIT.cvFf.toFixed(2)
+                  )}
+                </p>
+                <p style={{margin:"8px 0 0"}}>{t.methodLimits}</p>
+                <p style={{margin:"10px 0 0",color:"var(--tool-note)"}}>{t.notice}</p>
+              </div>
+            )}
           </div>
 
           {/* ── CHART ── */}
@@ -435,7 +662,9 @@
               {/* Panel backgrounds + y-grids */}
               {panels.map((p,pi) => (
                 <g key={pi}>
-                  <rect x={ML} y={p.y} width={pw} height={p.h} fill="var(--tool-surface)" stroke="var(--tool-hairline)"/>
+                  {/* Nur die Fläche; die Kontur kommt am Ende über allem, sonst
+                      überdecken die Bänder sie an den Rändern. */}
+                  <rect x={ML} y={p.y} width={pw} height={p.h} fill="var(--tool-surface)"/>
                   {p.yticks.map(v => (
                     <g key={v}>
                       <line x1={ML} y1={yOf(v,p)} x2={ML+pw} y2={yOf(v,p)}
@@ -450,13 +679,14 @@
                 </g>
               ))}
 
-              {/* X-axis ticks across all panels */}
+              {/* X-axis ticks across all panels. Die beiden Ränder zeichnet der
+                  Panelrahmen, hier laufen nur die gestrichelten Hilfslinien. */}
               {X_TICKS.map(wk => (
                 <g key={wk}>
-                  <line x1={xOf(wk)} y1={panels[0].y} x2={xOf(wk)} y2={panels[2].y+panels[2].h}
-                    stroke={wk===0||wk===52?"var(--tool-border)":"var(--tool-hairline)"}
-                    strokeWidth={wk===0||wk===52?1.5:1}
-                    strokeDasharray={wk===0||wk===52?undefined:"2,4"}/>
+                  {wk!==0 && wk!==52 && panels.map((p,pi) => (
+                    <line key={pi} x1={xOf(wk)} y1={p.y} x2={xOf(wk)} y2={p.y+p.h}
+                      stroke="var(--tool-hairline)" strokeWidth={1} strokeDasharray="2,4"/>
+                  ))}
                   <text x={xOf(wk)} y={panels[2].y+panels[2].h+16}
                     textAnchor="middle" fill="var(--tool-faint)" fontSize={10}>
                     {MO_LABELS[wk]}
@@ -522,33 +752,109 @@
               {(() => {
                 const p = panels[1];
                 const yf = v => yOf(v, p);
+                // Volle Kurve mit Bändern: der Normalfall, und im Zwiefütterungsmodus
+                // die geschätzte Kurve. Zwischen den beiden Messaltern durchgezogen,
+                // außerhalb gestrichelt und mit blasserem Band, weil dort nur noch die
+                // geliehene Altersform trägt.
+                // Die Beschriftungen am rechten Rand werden gesammelt und erst am Schluss
+                // gesetzt: im Zwiefütterungsmodus enden vier Kurven im untersten Viertel
+                // des Felds, und ohne Entzerrung liegen ihre Namen übereinander.
+                const edge = [];
+                const full = (rows, col, label, from, to) => {
+                  const seg = (a, b) => rows.filter(r => r[0] >= a && r[0] <= b);
+                  const parts = from == null
+                    ? [[rows, true]]
+                    : [[seg(from, to), true], [seg(0, from), false], [seg(to, 52), false]];
+                  const last = rows[rows.length-1];
+                  // P10/P90 nur, wo die Kurve allein steht. Im Zwiefütterungsmodus wären
+                  // es sechs Zahlen auf engstem Raum, und am extrapolierten Ende sagen sie
+                  // ohnehin am wenigsten.
+                  if (from == null) {
+                    edge.push({y: yf(last[5])+4, col, text: "P90", size: 9, weight: 400, op: 0.6});
+                    edge.push({y: yf(last[1])+4, col, text: "P10", size: 9, weight: 400, op: 0.6});
+                  }
+                  edge.push({y: yf(last[3])+4, col, text: label, size: 10, weight: 700, op: 1});
+                  return <g key={label}>
+                    {parts.map(([rs, solid], i) => rs.length > 1 && <g key={i}>
+                      <path d={band(rs,1,5,xOf,yf)} fill={col} opacity={solid?0.09:0.05}/>
+                      <path d={band(rs,2,4,xOf,yf)} fill={col} opacity={solid?0.19:0.10}/>
+                      <path d={line(rs,3,xOf,yf)} fill="none" stroke={col}
+                        strokeWidth={solid?2.5:2} opacity={solid?1:0.7}
+                        strokeDasharray={solid?undefined:"6,4"}/>
+                    </g>)}
+                  </g>;
+                };
+                // Im Zwiefütterungsmodus sind die Exklusivkurven nur noch Bezug: dünn
+                // gepunktet, ohne Band, damit sie nicht mit der Schätzung konkurrieren.
+                const ref = (rows, col, label) => {
+                  edge.push({y: yf(rows[rows.length-1][3])+4, col,
+                    text: label+t.refSuffix, size: 9, weight: 400, op: 0.55});
+                  return <g key={label+"ref"}>
+                    <path d={line(rows,3,xOf,yf)} fill="none" stroke={col}
+                      strokeWidth={1} strokeDasharray="2,3" opacity={0.45}/>
+                  </g>;
+                };
+                // Dieselbe Entzerrung wie beim Heute-Marker: der Reihe nach nach unten
+                // schieben, danach die ganze Spalte zurück ins Feld ziehen.
+                const edgeLabels = () => {
+                  const GAP = 11;
+                  const ms = edge.slice().sort((a,b) => a.y - b.y);
+                  let prev = -Infinity;
+                  ms.forEach(m => { m.ly = Math.max(m.y, prev + GAP); prev = m.ly; });
+                  const over = ms.length ? ms[ms.length-1].ly - (p.y + p.h - 3) : 0;
+                  if (over > 0) ms.forEach(m => { m.ly = Math.max(m.ly - over, p.y + 9); });
+                  return ms.map((m,i) => <g key={i}>
+                    {Math.abs(m.ly - m.y) > 2 && (
+                      <line x1={xOf(52)} y1={m.y-4} x2={xOf(52)+3} y2={m.ly-3}
+                        stroke={m.col} strokeWidth={0.75} opacity={0.35}/>
+                    )}
+                    <text x={xOf(52)+4} y={m.ly} fill={m.col} fontSize={m.size}
+                      fontWeight={m.weight} opacity={m.op}>{m.text}</text>
+                  </g>);
+                };
+                const { wkFrom, wkTo } = MIX_FIT;
+                const curves = [];
+                if (showBf && !mixed) curves.push(full(FEED_BF, colBf, t.colLabelBreast));
+                if (showFf && !mixed) curves.push(full(FEED_FF, colFf, t.colLabelFormula));
+                if (mixed) {
+                  curves.push(ref(FEED_BF, colBf, t.colLabelBreast));
+                  curves.push(ref(FEED_FF, colFf, t.colLabelFormula));
+                  curves.push(full(MIX_BF, colBf, t.colLabelBreast+t.estSuffix, wkFrom, wkTo));
+                  curves.push(full(MIX_FF, colFf, t.colLabelFormula+t.estSuffix, wkFrom, wkTo));
+                }
                 return <>
-                  {showBf && <>
-                    <path d={band(FEED_BF,1,5,xOf,yf)} fill={colBf} opacity={0.09}/>
-                    <path d={band(FEED_BF,2,4,xOf,yf)} fill={colBf} opacity={0.19}/>
-                    <path d={line(FEED_BF,3,xOf,yf)} fill="none" stroke={colBf} strokeWidth={2.5}/>
-                    {(() => {
-                      const last = FEED_BF[FEED_BF.length-1];
-                      return <>
-                        <text x={xOf(last[0])+4} y={yf(last[5])+4} fill={colBf} fontSize={9} opacity={0.6}>P90</text>
-                        <text x={xOf(last[0])+4} y={yf(last[3])+4} fill={colBf} fontSize={10} fontWeight={700}>{t.colLabelBreast}</text>
-                        <text x={xOf(last[0])+4} y={yf(last[1])+4} fill={colBf} fontSize={9} opacity={0.6}>P10</text>
-                      </>;
-                    })()}
+                  {curves}
+                  {mixed && <>
+                    {/* Die zwei gemessenen Alter als Anker: Mittel mit ±1 SD, vor allem
+                        anderen, damit sichtbar bleibt, woran die Schätzung hängt. */}
+                    {FEED_MIXED.map(([wk, bfM, bfSD, ffM, ffSD], i) => {
+                      const bar = (x, m, sd, col) => (
+                        <g>
+                          <line x1={x} y1={yf(m-sd)} x2={x} y2={yf(m+sd)} stroke={col} strokeWidth={1.5}/>
+                          <line x1={x-4} y1={yf(m-sd)} x2={x+4} y2={yf(m-sd)} stroke={col} strokeWidth={1.5}/>
+                          <line x1={x-4} y1={yf(m+sd)} x2={x+4} y2={yf(m+sd)} stroke={col} strokeWidth={1.5}/>
+                          <circle cx={x} cy={yf(m)} r={4} fill={col}
+                            stroke="var(--tool-surface)" strokeWidth={1.5}/>
+                        </g>
+                      );
+                      // Beide Werte gehören zum selben Alter und würden sich decken,
+                      // deshalb je 5px zur Seite.
+                      return <g key={i}>
+                        {bar(xOf(wk)-5, bfM, bfSD, colBf)}
+                        {bar(xOf(wk)+5, ffM, ffSD, colFf)}
+                      </g>;
+                    })}
+                    {/* Halo, weil die Zeilen über Gitterlinien und der Heute-Linie liegen */}
+                    <text x={ML+10} y={p.y+34} fill={colMix} fontSize={10} fontWeight={600}
+                      stroke="var(--tool-surface)" strokeWidth={3} paintOrder="stroke" strokeLinejoin="round">
+                      {t.mixedNote(MIX_FIT.bf.factor.toFixed(2), MIX_FIT.ff.factor.toFixed(2))}
+                    </text>
+                    <text x={ML+10} y={p.y+47} fill="var(--tool-faint)" fontSize={10}
+                      stroke="var(--tool-surface)" strokeWidth={3} paintOrder="stroke" strokeLinejoin="round">
+                      {t.mixedNote2}
+                    </text>
                   </>}
-                  {showFf && <>
-                    <path d={band(FEED_FF,1,5,xOf,yf)} fill={colFf} opacity={0.09}/>
-                    <path d={band(FEED_FF,2,4,xOf,yf)} fill={colFf} opacity={0.19}/>
-                    <path d={line(FEED_FF,3,xOf,yf)} fill="none" stroke={colFf} strokeWidth={2.5}/>
-                    {(() => {
-                      const last = FEED_FF[FEED_FF.length-1];
-                      return <>
-                        <text x={xOf(last[0])+4} y={yf(last[5])+4} fill={colFf} fontSize={9} opacity={0.6}>P90</text>
-                        <text x={xOf(last[0])+4} y={yf(last[3])+4} fill={colFf} fontSize={10} fontWeight={700}>{t.colLabelFormula}</text>
-                        <text x={xOf(last[0])+4} y={yf(last[1])+4} fill={colFf} fontSize={9} opacity={0.6}>P10</text>
-                      </>;
-                    })()}
-                  </>}
+                  {edgeLabels()}
                 </>;
               })()}
 
@@ -583,106 +889,151 @@
                 const toLeft = ageWk > 36;
                 const lx = toLeft ? tx - 7 : tx + 7;
                 const anchor = toLeft ? "end" : "start";
+                // Erst sammeln, dann setzen. Die Punkte selbst sitzen auf ihrem Wert, die
+                // Beschriftungen werden danach auseinandergeschoben: im Zwiefütterungsmodus
+                // liegen die geschätzten Kurven so dicht, dass Brust- und Flaschenzahl sonst
+                // auf denselben Pixeln landen.
+                const marks = [];
                 const dot = (dataset, p, col, label, color, fmt, bold) => {
                   const v = lerp(dataset, ageWk, col);
-                  const cy = yOf(v, p);
-                  return <g key={`${label}`}>
-                    <circle cx={tx} cy={cy} r={bold ? 4 : 2.5}
-                      fill="var(--tool-surface)" stroke={color} strokeWidth={bold ? 2 : 1.5}/>
-                    <text x={lx} y={cy + 4} textAnchor={anchor}
-                      fill={color} fontSize={bold ? 11 : 9} fontWeight={bold ? 700 : 400}>
-                      {label}: {fmt(v)}
-                    </text>
-                  </g>;
+                  marks.push({p, cy: yOf(v, p), color, bold, text: `${label}: ${fmt(v)}`});
+                  return null;
+                };
+                const layout = () => {
+                  const GAP = 12;
+                  panels.forEach(p => {
+                    const ms = marks.filter(m => m.p === p).sort((a,b) => a.cy - b.cy);
+                    let prev = -Infinity;
+                    ms.forEach(m => { m.ly = Math.max(m.cy + 4, prev + GAP); prev = m.ly; });
+                    // Wer dabei unten aus dem Feld geschoben wurde, zieht die ganze
+                    // Spalte wieder hinein, statt über den Rand zu stehen.
+                    const over = ms.length ? ms[ms.length-1].ly - (p.y + p.h - 3) : 0;
+                    if (over > 0) ms.forEach(m => { m.ly = Math.max(m.ly - over, p.y + 9); });
+                  });
                 };
                 const hfmt = v => `${v.toFixed(1)} h`;
                 const mfmt = v => `${Math.round(v * 60)} min`;
                 const ffmt = v => `${v.toFixed(1)}×`;
+
+                const PCT = ["P10","P25","P50","P75","P90"];
+                [1,2,3,4,5].forEach((col,i) =>
+                  dot(SLEEP_TOTAL, panels[0], col, PCT[i], colSleep, hfmt, col===3));
+                if (showStretch) dot(SLEEP_STRETCH, panels[0], 3, t.nightMarker, colStretch, hfmt, true);
+                // Im Zwiefütterungsmodus liest der Marker die geschätzte Kurve ab, nicht die
+                // Referenz: sonst stünde am Punkt eine Zahl, die für dieses Kind nicht gilt.
+                if (showBf) {
+                  dot(mixed?MIX_BF:FEED_BF, panels[1], 3, t.breastMarker, colBf, ffmt, true);
+                  dot(mixed?MIX_BF:FEED_BF, panels[1], 1, "P10", colBf, ffmt, false);
+                  dot(mixed?MIX_BF:FEED_BF, panels[1], 5, "P90", colBf, ffmt, false);
+                }
+                if (showFf) {
+                  dot(mixed?MIX_FF:FEED_FF, panels[1], 3, t.formulaMarker, colFf, ffmt, true);
+                  dot(mixed?MIX_FF:FEED_FF, panels[1], 1, "P10 ", colFf, ffmt, false);
+                  dot(mixed?MIX_FF:FEED_FF, panels[1], 5, "P90 ", colFf, ffmt, false);
+                }
+                [1,2,3,4,5].forEach((col,i) =>
+                  dot(CRYING, panels[2], col, PCT[i], colCry, mfmt, col===3));
+                layout();
+
                 return <>
-                  <line x1={tx} y1={panels[0].y} x2={tx} y2={panels[2].y + panels[2].h}
-                    stroke="#dc2626" strokeWidth={1.5} strokeDasharray="4,3"/>
+                  {/* Pro Feld, damit die Linie die weißen Lücken freilässt wie die Beikost-Marke */}
+                  {panels.map((p,pi) => (
+                    <line key={pi} x1={tx} y1={p.y} x2={tx} y2={p.y+p.h}
+                      stroke="#dc2626" strokeWidth={1.5} strokeDasharray="4,3"/>
+                  ))}
                   <text x={tx} y={panels[0].y - 8} textAnchor="middle"
                     fill="#dc2626" fontSize={10} fontWeight={600}>{fmtDE(today)}</text>
 
-                  {/* Sleep panel intersections */}
-                  {[1,2,3,4,5].map((col,i) =>
-                    dot(SLEEP_TOTAL, panels[0], col, ["P10","P25","P50","P75","P90"][i], colSleep, hfmt, col===3)
-                  )}
-                  {showStretch && dot(SLEEP_STRETCH, panels[0], 3, t.nightMarker, colStretch, hfmt, true)}
-
-                  {/* Feeding panel intersections */}
-                  {showBf && dot(FEED_BF, panels[1], 3, t.breastMarker, colBf, ffmt, true)}
-                  {showBf && dot(FEED_BF, panels[1], 1, "P10", colBf, ffmt, false)}
-                  {showBf && dot(FEED_BF, panels[1], 5, "P90", colBf, ffmt, false)}
-                  {showFf && dot(FEED_FF, panels[1], 3, t.formulaMarker, colFf, ffmt, true)}
-                  {showFf && dot(FEED_FF, panels[1], 1, "P10 ", colFf, ffmt, false)}
-                  {showFf && dot(FEED_FF, panels[1], 5, "P90 ", colFf, ffmt, false)}
-
-                  {/* Crying panel intersections */}
-                  {[1,2,3,4,5].map((col,i) =>
-                    dot(CRYING, panels[2], col, ["P10","P25","P50","P75","P90"][i], colCry, mfmt, col===3)
-                  )}
+                  {/* Punkte auf ihrem Wert, Beschriftungen auf der entzerrten Höhe.
+                      Weicht die Beschriftung ab, führt ein Haarstrich zu ihrem Punkt. */}
+                  {marks.map((m,i) => (
+                    <g key={i}>
+                      {Math.abs(m.ly - m.cy - 4) > 2 && (
+                        <line x1={tx + (toLeft?-5:5)} y1={m.cy} x2={lx} y2={m.ly-3}
+                          stroke={m.color} strokeWidth={0.75} opacity={0.35}/>
+                      )}
+                      <circle cx={tx} cy={m.cy} r={m.bold ? 4 : 2.5}
+                        fill="var(--tool-surface)" stroke={m.color} strokeWidth={m.bold ? 2 : 1.5}/>
+                      {/* Halo, damit die Zahl auch über Bändern und Gitterlinien lesbar bleibt */}
+                      <text x={lx} y={m.ly} textAnchor={anchor} fill={m.color}
+                        fontSize={m.bold ? 11 : 9} fontWeight={m.bold ? 700 : 400}
+                        stroke="var(--tool-surface)" strokeWidth={3} paintOrder="stroke"
+                        strokeLinejoin="round">
+                        {m.text}
+                      </text>
+                    </g>
+                  ))}
                 </>;
               })()}
 
               {/* ── TOOLTIP CROSSHAIR ── */}
-              {tip && (
-                <line x1={xOf(tip.wk)} y1={panels[0].y}
-                  x2={xOf(tip.wk)} y2={panels[2].y+panels[2].h}
+              {tip && panels.map((p,pi) => (
+                <line key={pi} x1={xOf(tip.wk)} y1={p.y} x2={xOf(tip.wk)} y2={p.y+p.h}
                   stroke="var(--tool-faint)" strokeWidth={1} strokeDasharray="2,3" opacity={0.6}/>
-              )}
+              ))}
+
+              {/* ── PANEL FRAMES ── zuletzt, damit die Bänder die Kontur nicht anfressen */}
+              {panels.map((p,pi) => (
+                <rect key={pi} x={ML} y={p.y} width={pw} height={p.h}
+                  fill="none" stroke="var(--tool-border)" strokeWidth={1.5}/>
+              ))}
 
             </svg>
 
             {/* ── TOOLTIP BAR ── */}
+            {/* Die Zeile wird nur unsichtbar geschaltet, nicht entfernt: sie belegt sonst
+                mal zwei, mal null Zeilen, und die Seite springt beim Verlassen. Der
+                Platzhalter liegt darüber, damit er selbst keine Höhe beisteuert. */}
             <div style={{
-              minHeight:44,padding:"10px 16px",borderTop:"1px solid var(--tool-subtle)",
-              display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:12,color:"var(--tool-note)"
+              position:"relative",minHeight:44,padding:"10px 16px",
+              borderTop:"1px solid var(--tool-subtle)"
             }}>
-              {tip ? <>
+              <div style={{
+                display:"flex",gap:24,flexWrap:"wrap",alignItems:"center",fontSize:12,
+                color:"var(--tool-note)",visibility:tip?"visible":"hidden"
+              }}>
                 <strong style={{color:"var(--tool-emph)"}}>
-                  {t.tipWeek(tip.wkR, (tip.wkR/4.33).toFixed(1))}
+                  {t.tipWeek(tipShown.wkR, (tipShown.wkR/4.33).toFixed(1))}
                 </strong>
                 <span>
-                  <strong style={{color:colSleep}}>{t.tipSleep(tip.sleep.toFixed(1), tip.p25s.toFixed(1), tip.p75s.toFixed(1))}</strong>
+                  <strong style={{color:colSleep}}>{t.tipSleep(tipShown.sleep.toFixed(1), tipShown.p25s.toFixed(1), tipShown.p75s.toFixed(1))}</strong>
                 </span>
                 {showStretch && <span>
-                  <strong style={{color:colStretch}}>{t.tipStretch(tip.stretch.toFixed(1))}</strong>
+                  <strong style={{color:colStretch}}>{t.tipStretch(tipShown.stretch.toFixed(1))}</strong>
                 </span>}
                 {showBf && <span>
-                  <strong style={{color:colBf}}>{t.tipBreast(tip.feedBf.toFixed(1))}</strong>
+                  <strong style={{color:colBf}}>
+                    {t.tipBreast((mixed?tipShown.mixBf:tipShown.feedBf).toFixed(1))}{mixed?t.estSuffix:""}
+                  </strong>
                 </span>}
                 {showFf && <span>
-                  <strong style={{color:colFf}}>{t.tipFormula(tip.feedFf.toFixed(1))}</strong>
+                  <strong style={{color:colFf}}>
+                    {t.tipFormula((mixed?tipShown.mixFf:tipShown.feedFf).toFixed(1))}{mixed?t.estSuffix:""}
+                  </strong>
                 </span>}
+                {/* In der Nähe eines gemessenen Alters die tatsächlichen Zahlen. Ohne
+                    Mauszeiger bleibt der Platz reserviert, damit auch dieser Zusatz die
+                    Höhe nicht verändert. */}
+                {mixed && (() => {
+                  const i = FEED_MIXED.findIndex(m => Math.abs(m[0] - tipShown.wk) <= 3);
+                  const m = FEED_MIXED[i < 0 ? 0 : i];
+                  return <span style={{visibility: !tip || i >= 0 ? "visible" : "hidden"}}>
+                    <strong style={{color:colMix}}>{t.tipMixed(t.mixedAges[i < 0 ? 0 : i], m[1].toFixed(1), m[3].toFixed(1))}</strong>
+                  </span>;
+                })()}
                 <span>
-                  <strong style={{color:colCry}}>{t.tipCry(Math.round(tip.cry*60), Math.round(tip.p25c*60), Math.round(tip.p75c*60))}</strong>
+                  <strong style={{color:colCry}}>{t.tipCry(Math.round(tipShown.cry*60), Math.round(tipShown.p25c*60), Math.round(tipShown.p75c*60))}</strong>
                 </span>
-              </> : (
-                <span style={{color:"var(--tool-border)"}}>{t.tipMoveMouse}</span>
+              </div>
+              {!tip && (
+                <span style={{position:"absolute",left:16,top:10,fontSize:12,color:"var(--tool-border)"}}>
+                  {t.tipMoveMouse}
+                </span>
               )}
             </div>
           </div>
 
           {/* ── LEGEND ── */}
-          <div style={{background:"var(--tool-surface)",borderRadius:12,border:"1px solid var(--tool-hairline)",
-            padding:"12px 20px",marginTop:12,display:"flex",gap:20,flexWrap:"wrap",alignItems:"center"}}>
-            <span style={{fontSize:11,fontWeight:700,color:"var(--tool-faint)",letterSpacing:.5}}>{t.legendTitle}</span>
-            {[
-              {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="var(--tool-note)" opacity={0.15}/>, label:t.leg1},
-              {render:<rect x={0} y={4} width={32} height={8} rx={3} fill="var(--tool-label)" opacity={0.35}/>, label:t.leg2},
-              {render:<line x1={2} y1={8} x2={30} y2={8} stroke="var(--tool-emph)" strokeWidth={2.5}/>, label:t.leg3},
-              {render:<><line x1={2} y1={8} x2={30} y2={8} stroke={colStretch} strokeWidth={2} strokeDasharray="6,3"/></>, label:t.leg4},
-            ].map(({render,label},i)=>(
-              <span key={i} style={{display:"flex",alignItems:"center",gap:7,fontSize:12,color:"var(--tool-note)"}}>
-                <svg width={32} height={16}>{render}</svg>{label}
-              </span>
-            ))}
-            <span style={{fontSize:11,color:"var(--tool-faint)",marginLeft:"auto",maxWidth:340,textAlign:"right",lineHeight:1.4}}>
-              {t.legNote}
-            </span>
-          </div>
-
         </div>
         </div>
       );
