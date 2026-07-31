@@ -34,6 +34,9 @@
       transition: border-color .15s, background .15s; }
     .ec-drop:hover, .ec-drop.over { border-color: #0fb5ad; background: rgba(15,181,173,.07); }
     .ec-drop.over { border-style: solid; }
+    /* Once a book is loaded the zone only exists for "load another": one slim
+       line instead of the big landing target. */
+    .ec-drop.small { padding: 9px 18px; }
     .ec-log { font-family: var(--pico-font-family-monospace, monospace); font-size: 12px;
       line-height: 1.75; color: var(--tool-label); margin: 0; padding: 0; list-style: none; }
     .ec-log li::before { content: "› "; color: var(--tool-faint); }
@@ -68,6 +71,21 @@
       background: color-mix(in srgb, var(--tool-hairline) 75%, transparent); }
     .ec-edit .ec-editnote { color: var(--tool-note); font-size: 12px; font-weight: normal; }
     .ec-edit[open] { padding-bottom: 14px; }
+    /* Action buttons in the edit panels: same size as the lang-seg chips the
+       segmented pickers use, but tinted with the section accent, so "does
+       something" and "selects something" stop looking identical. */
+    .ec-act { font-size: 0.72rem; padding: 2px 10px; margin: 0; cursor: pointer;
+      line-height: 1.6; white-space: nowrap; border-radius: 4px;
+      border: 1px solid color-mix(in srgb, var(--pico-primary) 55%, transparent);
+      background: color-mix(in srgb, var(--pico-primary) 14%, transparent);
+      color: var(--pico-primary); width: auto;
+      transition: background .12s, color .12s, border-color .12s; }
+    .ec-act:hover:not(:disabled), .ec-act:focus:not(:disabled) {
+      background: var(--pico-primary); border-color: var(--pico-primary);
+      color: var(--pico-background-color); }
+    html[data-theme="light"] .ec-act:hover:not(:disabled),
+    html[data-theme="light"] .ec-act:focus:not(:disabled) {
+      color: var(--pico-primary-inverse); }
     .ec-err { border: 1px solid #7f1d1d; background: rgba(127,29,29,.15); border-radius: 8px;
       padding: 12px 14px; color: #fca5a5; font-size: 14px; }
     .ec-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13.5px; }
@@ -4859,7 +4877,8 @@
       if (book.meta.coverRes && /^cover-generated/.test(book.meta.coverRes)) {
         resources.delete(book.meta.coverRes);
       }
-      const name = addResource(next, 'cover-generated.png', mime, bytes);
+      const name = addResource(next,
+        mime === 'image/jpeg' ? 'cover-generated.jpg' : 'cover-generated.png', mime, bytes);
       sections.unshift({
         id: COVER_SECTION_ID,
         title: 'Cover',
@@ -4868,6 +4887,20 @@
       });
       next.sections = sections;
       next.meta = Object.assign({}, book.meta, { coverRes: name });
+      next.toc = normalizeToc(next, book.toc);
+      return next;
+    }
+
+    // Undo for setGeneratedCover: drop the synthetic section and image and hand
+    // coverRes back to whatever the caller remembered from before the install.
+    function removeGeneratedCover(book, prevCoverRes) {
+      const resources = new Map(book.resources);
+      if (book.meta.coverRes && /^cover-generated/.test(book.meta.coverRes)) {
+        resources.delete(book.meta.coverRes);
+      }
+      const next = Object.assign({}, book, { resources: resources });
+      next.sections = book.sections.filter(function (s) { return s.id !== COVER_SECTION_ID; });
+      next.meta = Object.assign({}, book.meta, { coverRes: prevCoverRes || '' });
       next.toc = normalizeToc(next, book.toc);
       return next;
     }
@@ -4905,6 +4938,7 @@
       buildTocFromHeadings: buildTocFromHeadings, tocFromSections: tocFromSections,
       tocRebuild: tocRebuild,
       drawCover: drawCover, setGeneratedCover: setGeneratedCover,
+      removeGeneratedCover: removeGeneratedCover,
       coverThemes: COVER_THEMES, coverSize: { width: COVER_W, height: COVER_H },
       wrapLines: wrapLines, coverSectionId: COVER_SECTION_ID,
     };
@@ -5151,6 +5185,14 @@
       const [coverTheme, setCoverTheme] = useState('slate');
       const [coverMsg, setCoverMsg] = useState('');
       const [coverPreview, setCoverPreview] = useState('');
+      // Snapshot of meta.coverRes from before the first cover install, so one
+      // click can put things back the way the book arrived.
+      const [coverUndo, setCoverUndo] = useState(null);
+      // { img, url, min, scale, x, y } while an uploaded image is being framed.
+      const [crop, setCrop] = useState(null);
+      const cropCanvas = useRef(null);
+      const cropDrag = useRef(null);
+      const coverFile = useRef(null);
       const titles = useMemo(() => sectionTitles(book), [book]);
       // Weighing the sections walks the whole book (about 30 ms on a long one),
       // and renaming a TOC entry re-renders on every keystroke. The weights only
@@ -5298,12 +5340,116 @@
         canvas.toBlob((blob) => {
           if (!blob) { setCoverMsg('The browser could not encode the cover image.'); return; }
           blob.arrayBuffer().then((buf) => {
-            const next = Core.setGeneratedCover(book, new Uint8Array(buf), 'image/png');
-            onBook(next);
-            setCoverMsg('Cover generated and put in front of the book ('
+            installCover(new Uint8Array(buf), 'image/png',
+              'Cover generated and put in front of the book ('
               + Math.round(buf.byteLength / 1024) + ' KB).');
           });
         }, 'image/png');
+      };
+
+      // Both cover sources (drawn and uploaded) install through here, so one
+      // undo snapshot covers either. Only the first install takes it: after
+      // replacing a generated cover twice, undo still restores the original.
+      const installCover = (bytes, mime, msg) => {
+        if (!coverUndo) setCoverUndo({ coverRes: book.meta.coverRes || '' });
+        onBook(Core.setGeneratedCover(book, bytes, mime));
+        setCoverMsg(msg);
+      };
+
+      const undoCover = () => {
+        clearMessages();
+        onBook(Core.removeGeneratedCover(book, coverUndo.coverRes));
+        setCoverUndo(null);
+        setCoverPreview('');
+        setCoverMsg(coverUndo.coverRes ? 'Previous cover restored.' : 'Cover removed.');
+      };
+
+      // ---- own image as cover: pan/zoom framing in a fixed 2:3 viewport ----
+      const CROP_W = 200, CROP_H = 300;
+
+      const clampPan = (img, scale, x, y) => ({
+        x: Math.min(0, Math.max(CROP_W - img.naturalWidth * scale, x)),
+        y: Math.min(0, Math.max(CROP_H - img.naturalHeight * scale, y)),
+      });
+
+      const pickCoverImage = (file) => {
+        if (!file) return;
+        clearMessages();
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          const min = Math.max(CROP_W / img.naturalWidth, CROP_H / img.naturalHeight);
+          setCrop((old) => {
+            if (old) URL.revokeObjectURL(old.url);
+            return {
+              img: img, url: url, min: min, scale: min,
+              x: (CROP_W - img.naturalWidth * min) / 2,
+              y: (CROP_H - img.naturalHeight * min) / 2,
+            };
+          });
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          setCoverMsg('The browser could not read that file as an image.');
+        };
+        img.src = url;
+      };
+
+      useEffect(() => {
+        if (!crop || !cropCanvas.current) return;
+        const ctx = cropCanvas.current.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, CROP_W, CROP_H);
+        ctx.setTransform(crop.scale, 0, 0, crop.scale, crop.x, crop.y);
+        ctx.drawImage(crop.img, 0, 0);
+      }, [crop]);
+
+      const cropDown = (e) => {
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        cropDrag.current = { sx: e.clientX, sy: e.clientY, x: crop.x, y: crop.y };
+      };
+      const cropMove = (e) => {
+        const d = cropDrag.current;
+        if (!d) return;
+        const nx = d.x + e.clientX - d.sx, ny = d.y + e.clientY - d.sy;
+        setCrop((c) => Object.assign({}, c, clampPan(c.img, c.scale, nx, ny)));
+      };
+      const cropEnd = () => { cropDrag.current = null; };
+
+      // Zooming keeps the point under the middle of the frame where it is.
+      const cropZoom = (v) => {
+        setCrop((c) => {
+          const s = c.min * Math.pow(4, v);
+          const nx = CROP_W / 2 - (CROP_W / 2 - c.x) * (s / c.scale);
+          const ny = CROP_H / 2 - (CROP_H / 2 - c.y) * (s / c.scale);
+          return Object.assign({}, c, { scale: s }, clampPan(c.img, s, nx, ny));
+        });
+      };
+
+      const cancelCrop = () => {
+        setCrop((old) => { if (old) URL.revokeObjectURL(old.url); return null; });
+      };
+
+      // The same pan/zoom transform, scaled up from the 200px viewport to the
+      // full cover resolution. Photos go out as JPEG; PNG would balloon them.
+      const applyCrop = () => {
+        const out = document.createElement('canvas');
+        out.width = Core.coverSize.width;
+        out.height = Core.coverSize.height;
+        const ctx = out.getContext('2d');
+        const r = out.width / CROP_W;
+        ctx.setTransform(crop.scale * r, 0, 0, crop.scale * r, crop.x * r, crop.y * r);
+        ctx.drawImage(crop.img, 0, 0);
+        setCoverPreview(out.toDataURL('image/jpeg', 0.9));
+        out.toBlob((blob) => {
+          if (!blob) { setCoverMsg('The browser could not encode the cover image.'); return; }
+          blob.arrayBuffer().then((buf) => {
+            installCover(new Uint8Array(buf), 'image/jpeg',
+              'Cover cut from your image (' + Math.round(buf.byteLength / 1024) + ' KB).');
+            cancelCrop();
+          });
+        }, 'image/jpeg', 0.9);
       };
 
       const hasCover = !!book.meta.coverRes;
@@ -5319,9 +5465,9 @@
           </summary>
 
           <label style={{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
-            Draws a plain typographic cover from the title and author above and puts it at
-            the front of the book. {hasCover
-              ? 'This book already has a cover; generating one replaces it.'
+            Draws a plain typographic cover from the title and author above, or cuts one
+            from an image you upload, and puts it at the front of the book. {hasCover
+              ? 'This book already has a cover; a new one replaces it.'
               : 'This book has no cover.'}
           </label>
           <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
@@ -5332,10 +5478,50 @@
                   onClick={() => setCoverTheme(k)}>{k.charAt(0).toUpperCase() + k.slice(1)}</button>
               ))}
             </div>
-            <button onClick={makeCover} style={{ width: 'auto', marginBottom: 0 }}>
-              Generate cover
+            <button className="ec-act" onClick={makeCover}>Generate cover</button>
+            <button className="ec-act"
+              onClick={() => coverFile.current && coverFile.current.click()}>
+              Upload an image…
             </button>
+            {coverUndo && (
+              <button className="ec-act" onClick={undoCover}>
+                {coverUndo.coverRes ? 'Restore previous cover' : 'Remove cover again'}
+              </button>
+            )}
+            <input ref={coverFile} type="file" accept="image/*" style={{ display: 'none' }}
+              onChange={(e) => {
+                pickCoverImage(e.target.files && e.target.files[0]);
+                e.target.value = '';
+              }} />
           </div>
+          {crop && (
+            <div style={{ margin: '4px 0 8px' }}>
+              <p style={{ fontSize: 12, color: 'var(--tool-note)', margin: '0 0 6px' }}>
+                The frame is the cover. Drag the image to position it, zoom with the slider.
+              </p>
+              <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                <canvas ref={cropCanvas} width={200} height={300}
+                  style={{ border: '1px solid var(--tool-border)', borderRadius: 4,
+                    touchAction: 'none', cursor: 'grab', flex: '0 0 auto' }}
+                  onPointerDown={cropDown} onPointerMove={cropMove}
+                  onPointerUp={cropEnd} onPointerCancel={cropEnd} />
+                <div style={{ flex: '1 1 200px', minWidth: 180 }}>
+                  <label style={{ fontSize: 12, color: 'var(--tool-label)', display: 'block',
+                      marginBottom: 8 }}>
+                    Zoom
+                    <input type="range" min={0} max={1} step={0.01}
+                      value={Math.log(crop.scale / crop.min) / Math.log(4)}
+                      onChange={(e) => cropZoom(Number(e.target.value))}
+                      style={{ marginBottom: 0 }} />
+                  </label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="ec-act" onClick={applyCrop}>Use as cover</button>
+                    <button className="lang-seg" onClick={cancelCrop}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
           {coverMsg && (
             <p style={{ fontSize: 13, color: '#0fb5ad', margin: '0 0 6px' }}>{coverMsg}</p>
           )}
@@ -5389,9 +5575,9 @@
                   onClick={() => setTocDepth(d)}>{d}</button>
               ))}
             </div>
-            <button className="lang-seg" onClick={generateToc}>Rebuild</button>
+            <button className="ec-act" onClick={generateToc}>Rebuild</button>
             {book.toc.length > 0 && (
-              <button className="lang-seg" onClick={() => setToc([], 'Table of contents cleared.')}>
+              <button className="ec-act" onClick={() => setToc([], 'Table of contents cleared.')}>
                 Clear
               </button>
             )}
@@ -5498,8 +5684,8 @@
                 onChange={(e) => { setMatchCase(e.target.checked); setSrMsg(null); }} />
               {' '}Match case
             </label>
-            <button className="lang-seg" onClick={runFind}>Find</button>
-            <button className="lang-seg" onClick={runReplace}>Replace all</button>
+            <button className="ec-act" onClick={runFind}>Find</button>
+            <button className="ec-act" onClick={runReplace}>Replace all</button>
           </div>
 
           {found && found.error && (
@@ -5558,9 +5744,7 @@
                   onClick={() => setTypoLang(o[0])}>{o[1]}</button>
               ))}
             </div>
-            <button onClick={runTypo} style={{ width: 'auto', marginBottom: 0 }}>
-              Clean up typography
-            </button>
+            <button className="ec-act" onClick={runTypo}>Clean up typography</button>
           </div>
           {typoMsg && (
             <p style={{ fontSize: 13, color: '#0fb5ad', marginBottom: 6 }}>{typoMsg}</p>
@@ -5592,6 +5776,9 @@
       const reset = () => {
         setBook(null); setLog([]); setError(''); setResult(null);
         setFileName(''); setFileSize(0);
+        // The tab row is only rendered once a book is loaded; whoever drops a
+        // new file while on Preview must land on a tab that shows it.
+        setTab('convert');
       };
 
       const loadFile = useCallback((file) => {
@@ -5670,7 +5857,7 @@
           </p>
 
           <div
-            className={'ec-drop' + (over ? ' over' : '')}
+            className={'ec-drop' + (book ? ' small' : '') + (over ? ' over' : '')}
             onClick={() => inputRef.current && inputRef.current.click()}
             onDragOver={(e) => { e.preventDefault(); setOver(true); }}
             onDragLeave={() => setOver(false)}
@@ -5681,10 +5868,18 @@
             }}
             style={{ marginBottom: 18 }}
           >
-            <div style={{ color: 'var(--tool-text)', fontSize: 15, marginBottom: 4 }}>
-              Drop an e-book here, or click to choose one
-            </div>
-            <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>EPUB, MOBI, AZW3, TXT, Markdown or HTML</div>
+            {book ? (
+              <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>
+                Drop another e-book here, or click to choose one
+              </div>
+            ) : (
+              <React.Fragment>
+                <div style={{ color: 'var(--tool-text)', fontSize: 15, marginBottom: 4 }}>
+                  Drop an e-book here, or click to choose one
+                </div>
+                <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>EPUB, MOBI, AZW3, TXT, Markdown or HTML</div>
+              </React.Fragment>
+            )}
             <input
               ref={inputRef}
               type="file"
@@ -5703,13 +5898,15 @@
             </div>
           )}
 
-          <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 18 }}>
-            {TABS.map((t) => (
-              <button key={t.id}
-                className={'lang-seg' + (tab === t.id ? ' active' : '')}
-                onClick={() => setTab(t.id)}>{t.label}</button>
-            ))}
-          </div>
+          {book && (
+            <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 18 }}>
+              {TABS.map((t) => (
+                <button key={t.id}
+                  className={'lang-seg' + (tab === t.id ? ' active' : '')}
+                  onClick={() => setTab(t.id)}>{t.label}</button>
+              ))}
+            </div>
+          )}
 
           {tab === 'preview' && <PreviewTab book={book} />}
 
@@ -5766,11 +5963,14 @@
               </button>
 
               {result && (
-                <p style={{ marginTop: 14, marginBottom: 0 }}>
-                  <a href={result.url} download={result.name} style={{ fontWeight: 600 }}>
+                <p style={{ marginTop: 14, marginBottom: 0, display: 'flex',
+                    alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <a href={result.url} download={result.name} role="button"
+                    style={{ width: 'auto', marginBottom: 0, background: '#0fb5ad',
+                      borderColor: '#0fb5ad', color: '#1e293b', fontWeight: 600 }}>
                     Download {result.name}
                   </a>
-                  <span style={{ color: 'var(--tool-note)', fontSize: 13 }}> ({fmtSize(result.size)})</span>
+                  <span style={{ color: 'var(--tool-note)', fontSize: 13 }}>({fmtSize(result.size)})</span>
                 </p>
               )}
             </div>
