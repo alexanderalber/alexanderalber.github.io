@@ -197,10 +197,10 @@
 
      Injected once, on first use, into a zero-sized inert svg. */
   var LANG_SPLIT_PX = 10;    // px of channel offset inside the band
-  var LANG_BAND = 0.10;      // half height of the band, in viewport heights,
+  var LANG_BAND = 0.1;      // half height of the band, in viewport heights,
                              // before the blur widens it further
-  var LANG_BLUR = 40;        // px of blur on the band's edges
-  var LANG_STEPS = 24;       // positions the band is stepped through
+  var LANG_BLUR = 100;        // px of blur on the band's edges
+  var LANG_STEPS = 20;       // positions the band is stepped through
   var LANG_TRAVEL = [-0.12, 1.12];  // where the band starts and ends, in the
                                     // same units as the wipe's mask-position
 
