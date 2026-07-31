@@ -316,13 +316,25 @@
     var mark = function (v) {
       segs.forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-lang') === v); });
     };
+    /* Everything outside the app that carries both wordings inline: the
+       breadcrumb crumbs (site-wide "Miscellaneous"/"Sonstiges" plus the tool's
+       category) and anything else a page tags with data-en/data-de. The crumb
+       is relabelled at init too, not just on a click: this script is loaded
+       synchronously right after </header>, so the crumbs are parsed and the
+       swap lands before the first paint. Only the header exists at that point,
+       which is the intended scope; page content brings its own strings. */
     var relabel = function (v) {
+      document.querySelectorAll('[data-en][data-de]').forEach(function (e) {
+        e.textContent = v === 'en' ? e.dataset.en : e.dataset.de;
+      });
       var back = document.getElementById('nav-misc');
-      if (back) back.textContent = v === 'en' ? 'Miscellaneous' : 'Sonstiges';
+      // fallback for a page that has not been given the data attributes yet
+      if (back && !back.dataset.en) back.textContent = v === 'en' ? 'Miscellaneous' : 'Sonstiges';
       var pl = document.querySelector('footer a[href="/datenschutz.html"]');
       if (pl) pl.textContent = v === 'en' ? 'Privacy' : 'Datenschutz';
     };
     mark(l);
+    relabel(l);
     segs.forEach(function (btn) {
       btn.onclick = function () {
         var lang = btn.getAttribute('data-lang');
