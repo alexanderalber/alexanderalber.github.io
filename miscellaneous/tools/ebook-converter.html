@@ -129,6 +129,32 @@
     @media (max-width: 560px) {
       .ec-tocsec { display: none; }
     }
+    /* Image grid. The thumbnail box has a fixed height so the tiles line up
+       whatever the aspect ratios in the book are. */
+    .ec-imgs { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); }
+    .ec-imgcell { border: 1px solid var(--tool-border); border-radius: 8px; padding: 8px;
+      background: color-mix(in srgb, var(--tool-ink) 45%, transparent);
+      display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--tool-note); }
+    .ec-thumb { height: 116px; display: flex; align-items: center; justify-content: center;
+      border-radius: 4px; overflow: hidden;
+      background: color-mix(in srgb, var(--tool-hairline) 40%, transparent); }
+    .ec-thumb img { max-width: 100%; max-height: 116px; height: auto; }
+    .ec-imgname { color: var(--tool-text); overflow-wrap: anywhere; line-height: 1.35; }
+    .ec-imgcell .ec-act { align-self: flex-start; }
+    .ec-imgcover { color: #0fb5ad; }
+    /* Batch file list: one row per file, status on the right. */
+    .ec-files { list-style: none; margin: 0 0 14px; padding: 0; font-size: 13px;
+      max-height: 320px; overflow-y: auto; }
+    .ec-files li { display: flex; align-items: baseline; gap: 10px; padding: 3px 0;
+      border-top: 1px solid var(--tool-hairline); }
+    .ec-files li:first-child { border-top: 0; }
+    .ec-fname { color: var(--tool-text); flex: 1 1 auto; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; }
+    .ec-fstat { flex: 0 0 auto; color: var(--tool-note); font-size: 12px; }
+    .ec-fstat.done { color: #0fb5ad; }
+    .ec-fstat.failed { color: #fca5a5; }
+    .ec-fstat.working { color: var(--tool-text); }
+    .ec-ferr { flex: 0 0 100%; color: #fca5a5; font-size: 12px; padding-left: 2px; }
     .ec-coverprev { display: block; width: 150px; height: auto; border: 1px solid var(--tool-border);
       border-radius: 4px; margin-top: 4px; }
     .ec-cover { text-align: center; margin: 0; }
@@ -3368,7 +3394,12 @@
       return { sec: m[1], frag: frag };
     }
 
-    function writeHtml(book) {
+    // Everything both HTML writers need: images as data URIs, section markup
+    // scrubbed and made unique, internal links turned into in-page anchors, and
+    // a table of contents whose entries already know their anchor. The plain
+    // export and the reader export differ in their chrome, not in any of this.
+    function buildHtmlParts(book, opts) {
+      const stripType = !!(opts && opts.stripType);
       const title = book.meta.title || 'Untitled';
       const secIndex = {};
       book.sections.forEach(function (s, i) { secIndex[s.id] = i; });
@@ -3408,10 +3439,21 @@
           delete el.attrs.color;
           delete el.attrs.bgcolor;
           delete el.attrs.text;
+          // The reader owns the typography, so anything the book says about
+          // type size or family has to go too. Plenty of EPUBs put font-size
+          // straight on the paragraph; left in place it silently overrides the
+          // size control and makes it look broken. Weight and style stay: bold
+          // and italic are meaning, not decoration.
+          if (stripType) {
+            delete el.attrs.size;
+            delete el.attrs.face;
+          }
           if (el.attrs.style) {
             const kept = el.attrs.style.split(';').filter(function (d) {
               const prop = (d.split(':')[0] || '').trim();
-              return d.trim() && !/color|background/i.test(prop);
+              if (!d.trim()) return false;
+              if (/color|background/i.test(prop)) return false;
+              return !(stripType && /^(font|font-size|font-family|line-height)$/i.test(prop));
             });
             if (kept.length) el.attrs.style = kept.join(';');
             else delete el.attrs.style;
@@ -3447,11 +3489,32 @@
         return s.html.indexOf(book.meta.coverRes) >= 0;
       });
 
+      // The anchor is resolved once, here, so the two writers can never disagree
+      // about where an entry points.
+      const tocItems = toc.map(function (t) {
+        const r = resolveSectionHref(t.href, '', secIndex);
+        return {
+          label: escapeText(t.title || ''),
+          anchor: r ? escapeAttr(anchorFor(r)) : null,
+          level: t.level || 0,
+        };
+      });
+
+      return {
+        title: title, lang: book.meta.language || 'en', author: book.meta.author || '',
+        secIndex: secIndex, dataUris: dataUris, anchorFor: anchorFor,
+        bodies: bodies, toc: toc, tocItems: tocItems,
+        coverUri: coverUri, coverShown: coverShown,
+      };
+    }
+
+    function writeHtml(book) {
+      const P = buildHtmlParts(book);
       const out = [];
       out.push('<!doctype html>');
-      out.push('<html lang="' + escapeAttr(book.meta.language || 'en') + '">');
+      out.push('<html lang="' + escapeAttr(P.lang) + '">');
       out.push('<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">');
-      out.push('<title>' + escapeText(title) + '</title>');
+      out.push('<title>' + escapeText(P.title) + '</title>');
       out.push('<style>');
       out.push('body{font-family:Georgia,"Times New Roman",serif;line-height:1.6;max-width:42em;margin:0 auto;padding:2rem 1rem 4rem;background:#fff;color:#1c1c1c}');
       out.push('img{max-width:100%;height:auto}');
@@ -3460,25 +3523,604 @@
       out.push('@media (prefers-color-scheme:dark){body{background:#141414;color:#d6d6d6}a{color:#6ecfca}}');
       out.push('</style></head><body>');
       out.push('<header>');
-      if (coverUri && !coverShown) out.push('<p><img src="' + coverUri + '" alt="Cover"/></p>');
-      out.push('<h1>' + escapeText(title) + '</h1>');
-      if (book.meta.author) out.push('<p>' + escapeText(book.meta.author) + '</p>');
+      if (P.coverUri && !P.coverShown) out.push('<p><img src="' + P.coverUri + '" alt="Cover"/></p>');
+      out.push('<h1>' + escapeText(P.title) + '</h1>');
+      if (P.author) out.push('<p>' + escapeText(P.author) + '</p>');
       out.push('</header>');
-      if (toc.length > 1) {
+      if (P.tocItems.length > 1) {
         out.push('<nav class="ec-toc"><h2>Contents</h2><ol>');
-        for (const t of toc) {
-          const r = resolveSectionHref(t.href, '', secIndex);
+        for (const t of P.tocItems) {
           const pad = t.level ? ' style="margin-left:' + (t.level * 1.2).toFixed(1) + 'em"' : '';
-          const label = escapeText(t.title || '');
-          out.push(r
-            ? '<li' + pad + '><a href="#' + escapeAttr(anchorFor(r)) + '">' + label + '</a></li>'
-            : '<li' + pad + '>' + label + '</li>');
+          out.push(t.anchor
+            ? '<li' + pad + '><a href="#' + t.anchor + '">' + t.label + '</a></li>'
+            : '<li' + pad + '>' + t.label + '</li>');
         }
         out.push('</ol></nav>');
       }
       book.sections.forEach(function (s, i) {
         out.push('<section class="ec-section" id="' + escapeAttr(s.id) + '">');
-        out.push(bodies[i]);
+        out.push(P.bodies[i]);
+        out.push('</section>');
+      });
+      out.push('</body></html>');
+      return encodeUtf8(out.join('\n'));
+    }
+
+    // ══ HTML reader writer ═══════════════════════════════════════════════════
+    // The same book as the plain HTML export, wrapped in the furniture a web
+    // serial site gives you: a contents drawer on the left, reading settings on
+    // the right, both collapsible. Still one file, still no request to anyone.
+    //
+    // Three constraints shape the output and none of them are obvious:
+    //
+    // 1. The chapters stay DIRECT children of <body>, with no <main> around
+    //    them. buildSections only recognises <section> chapters at the top
+    //    level, so a wrapper would turn this file into one undifferentiated
+    //    lump when read back in. The panels are position:fixed instead.
+    // 2. The inline script must not contain a single "<". Our own parseXML has
+    //    no raw-text mode for <script>, so "if (a<b)" would be read as an open
+    //    tag on re-import. Every comparison below is written with ">".
+    // 3. Collapsing is done by a hidden checkbox and sibling selectors, not by
+    //    JavaScript, so the panels still open with scripting turned off. The
+    //    script only adds the settings (which stay hidden without it) and the
+    //    docked-sidebar layout on wide screens.
+
+    const READER_SERIF = 'Georgia,"Iowan Old Style","Times New Roman",serif';
+    const READER_SANS = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif';
+
+    // Themes. Each one is a full set, and the buttons that pick them are drawn
+    // in their own colours, so the control shows what it does instead of
+    // naming it. 'auto' has no entry: it is :root plus the dark media query.
+    const READER_THEMES = [
+      { id: 'paper', label: 'Paper', bg: '#faf9f7', fg: '#22201d', dim: '#6f6a63',
+        line: '#e3ded6', panel: '#fffdfa', acc: '#0e766f', btn: '#f1ece4', mark: '#ffe066' },
+      { id: 'sepia', label: 'Sepia', bg: '#f4ecd8', fg: '#463a29', dim: '#8a7856',
+        line: '#e0d3b4', panel: '#fbf5e6', acc: '#8a5320', btn: '#ebdfc4', mark: '#e5c164' },
+      { id: 'grey', label: 'Grey', bg: '#d8d6d2', fg: '#2a2926', dim: '#6b6862',
+        line: '#c2bfb9', panel: '#e2e0dc', acc: '#0f6660', btn: '#cdcac5', mark: '#f0d970' },
+      // The one deliberately mid-tone theme, sitting between Grey and Dusk in
+      // brightness. Dark text on a middling background cannot reach the
+      // contrast of the others; that is the point of it, not an oversight.
+      { id: 'slate', label: 'Slate', bg: '#7f8489', fg: '#15181b', dim: '#2f353b',
+        line: '#6d7276', panel: '#8b9095', acc: '#04352d', btn: '#757a7f', mark: '#dcc75f' },
+      { id: 'dusk', label: 'Dusk', bg: '#182029', fg: '#c8d2dd', dim: '#8a97a6',
+        line: '#2b3642', panel: '#1e2731', acc: '#7fc9cf', btn: '#26313d', mark: '#6a5a25' },
+      { id: 'dark', label: 'Dark', bg: '#141414', fg: '#d6d6d6', dim: '#8d8d8d',
+        line: '#2e2e2e', panel: '#1b1b1b', acc: '#6ecfca', btn: '#262626', mark: '#7a6320' },
+      { id: 'black', label: 'Black', bg: '#000000', fg: '#a8a8a8', dim: '#6e6e6e',
+        line: '#232323', panel: '#0a0a0a', acc: '#58bdb8', btn: '#171717', mark: '#5d4a18' },
+    ];
+    // Looked up by name, not by index: these two are what 'auto' resolves to,
+    // and inserting a theme in the middle of the list must not silently move them.
+    function readerTheme(id) {
+      return READER_THEMES.filter(function (t) { return t.id === id; })[0];
+    }
+    const READER_LIGHT = readerTheme('paper');
+    const READER_DARK = readerTheme('dark');
+
+    // Font stacks only, never an embedded font file: a webfont would add a few
+    // hundred kilobytes to every exported book and drag a licence along with
+    // it. Everything here is either a system face or degrades to one. Computer
+    // Modern shows up for people who have TeX installed and looks like Georgia
+    // for everybody else, which is the honest version of offering it.
+    const READER_FONTS = [
+      { id: 'serif', label: 'Serif (Georgia)', stack: READER_SERIF },
+      { id: 'book', label: 'Old style (Palatino)',
+        stack: 'Palatino,"Palatino Linotype","Book Antiqua","URW Palladio L",Georgia,serif' },
+      { id: 'times', label: 'Times', stack: '"Times New Roman",Times,Tinos,"Liberation Serif",serif' },
+      { id: 'cm', label: 'Computer Modern',
+        stack: '"Latin Modern Roman","CMU Serif","Computer Modern Roman","Latin Modern Roman 10",Georgia,serif' },
+      { id: 'sans', label: 'Sans', stack: READER_SANS },
+      { id: 'mono', label: 'Monospace',
+        stack: 'ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace' },
+    ];
+
+    function readerThemeVars(t) {
+      return '--ecr-bg:' + t.bg + ';--ecr-fg:' + t.fg + ';--ecr-dim:' + t.dim
+        + ';--ecr-line:' + t.line + ';--ecr-panel:' + t.panel + ';--ecr-acc:' + t.acc
+        + ';--ecr-btn:' + t.btn + ';--ecr-mark:' + t.mark;
+    }
+
+    // A flat list of {label, anchor, level} becomes a nested <ol>. Levels that
+    // jump by more than one are pulled back to one, because a book's own TOC is
+    // not obliged to be well nested and the markup is.
+    function readerTocHtml(items) {
+      const out = ['<ol>'];
+      let depth = 0;
+      let any = false;
+      for (const it of items) {
+        // A nested list has to hang off an item, so a book that opens on level
+        // 2 starts at the top anyway.
+        const want = any ? Math.min(it.level || 0, depth + 1) : 0;
+        any = true;
+        while (depth > want) { out.push('</ol></li>'); depth--; }
+        if (want > depth) { out.push('<ol>'); depth++; }
+        const inner = it.anchor
+          ? '<a href="#' + it.anchor + '">' + it.label + '</a>'
+          : '<span>' + it.label + '</span>';
+        out.push('<li>' + inner + '</li>');
+      }
+      while (depth > 0) { out.push('</ol></li>'); depth--; }
+      out.push('</ol>');
+      // Every nested list has to live inside the preceding <li>, so glue the
+      // opening of a child list onto the item that owns it.
+      return out.join('').replace(/<\/li><ol>/g, '<ol>');
+    }
+
+    function readerCss() {
+      const themes = READER_THEMES.map(function (t) {
+        return 'html[data-ecr-theme="' + t.id + '"]{' + readerThemeVars(t) + '}';
+      }).join('');
+      return [
+        // --ecr-w is a bare number, the "reader width" percentage, turned into a
+        // length below. It used to be in em, which tied the column to the type
+        // size: making the text bigger widened the column by the same factor,
+        // the line breaks never moved, and the size control looked inert.
+        ':root{--ecr-fs:19px;--ecr-lh:1.62;--ecr-w:80;--ecr-ff:' + READER_SERIF + ';',
+        readerThemeVars(READER_LIGHT) + '}',
+        '@media (prefers-color-scheme:dark){:root{' + readerThemeVars(READER_DARK) + '}}',
+        themes,
+        '*{box-sizing:border-box}',
+        'body{margin:0;background:var(--ecr-bg);color:var(--ecr-fg);font-family:var(--ecr-ff);',
+        'font-size:var(--ecr-fs);line-height:var(--ecr-lh);',
+        'transition:padding-left .22s ease}',
+        'img{max-width:100%;height:auto}',
+        'a{color:var(--ecr-acc)}',
+        // Fixed, not absolute: activating a label focuses its checkbox, and a
+        // browser scrolls a focused element into view. Parked at the top of the
+        // document it therefore threw you back to page one on every toggle.
+        '.ecr-t{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none}',
+        // The checkbox is invisible, so its focus ring has to show on the label.
+        '#ecr-nav:focus-visible~.ecr-bar label[for="ecr-nav"],',
+        '#ecr-set:focus-visible~.ecr-bar label[for="ecr-set"]{outline:2px solid var(--ecr-acc);',
+        'outline-offset:2px}',
+        /* top bar */
+        '.ecr-bar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;',
+        'justify-content:space-between;padding:7px 12px;background:var(--ecr-panel);',
+        'border-bottom:1px solid var(--ecr-line);font-family:' + READER_SANS + ';font-size:14px}',
+        '.ecr-name{color:var(--ecr-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+        '.ecr-btn{cursor:pointer;border:1px solid var(--ecr-line);border-radius:6px;',
+        'padding:4px 11px;background:var(--ecr-btn);color:var(--ecr-fg);flex:0 0 auto;',
+        'font:inherit;line-height:1.5}',
+        '.ecr-btn:hover{border-color:var(--ecr-acc);color:var(--ecr-acc)}',
+        /* the two panels */
+        '.ecr-side{position:fixed;top:0;bottom:0;z-index:30;width:20em;max-width:84vw;',
+        'overflow:auto;padding:1.1rem 1.2rem 2rem;background:var(--ecr-panel);',
+        'font-family:' + READER_SANS + ';font-size:14px;line-height:1.5;',
+        'transition:transform .22s ease}',
+        'nav.ec-toc{left:0;border-right:1px solid var(--ecr-line);transform:translateX(-102%)}',
+        '.ecr-opts{right:0;border-left:1px solid var(--ecr-line);transform:translateX(102%);display:none}',
+        'html.ecr-js .ecr-opts{display:block}',
+        '#ecr-nav:checked~nav.ec-toc{transform:none}',
+        '#ecr-set:checked~.ecr-opts{transform:none}',
+        '.ecr-side h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;',
+        'color:var(--ecr-dim);margin:0 0 .8rem}',
+        'nav.ec-toc ol{list-style:none;margin:0;padding:0 0 0 .9rem}',
+        'nav.ec-toc>ol{padding-left:0}',
+        'nav.ec-toc li{margin:.15rem 0}',
+        'nav.ec-toc a,nav.ec-toc span{display:block;padding:.25rem .4rem;border-radius:5px;',
+        'color:var(--ecr-fg);text-decoration:none}',
+        'nav.ec-toc a:hover{background:var(--ecr-btn);color:var(--ecr-acc)}',
+        'nav.ec-toc a.ecr-here{background:var(--ecr-btn);color:var(--ecr-acc);font-weight:600}',
+        /* settings rows */
+        '.ecr-row{display:flex;align-items:center;justify-content:space-between;gap:10px;',
+        'margin-bottom:.9rem}',
+        '.ecr-lab{color:var(--ecr-dim)}',
+        '.ecr-grp{display:flex;gap:4px;flex:0 0 auto}',
+        '.ecr-grp .ecr-btn{padding:3px 9px;font-size:13px}',
+        '.ecr-grp .ecr-btn[aria-pressed="true"]{border-color:var(--ecr-acc);color:var(--ecr-acc)}',
+        '.ecr-val{min-width:3.4em;text-align:right;color:var(--ecr-fg);',
+        'font-variant-numeric:tabular-nums}',
+        '.ecr-blk{margin-bottom:.9rem}',
+        '.ecr-sel{width:100%;margin-top:.35rem;font:inherit;padding:5px 8px;border-radius:6px;',
+        'border:1px solid var(--ecr-line);background:var(--ecr-bg);color:var(--ecr-fg)}',
+        /* Each theme button is painted in its own theme, so the control shows
+           the answer instead of spelling it out. */
+        '.ecr-sw{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:.4rem}',
+        '.ecr-swb{cursor:pointer;font:inherit;font-size:12px;padding:8px 6px;border-radius:6px;',
+        'border:1px solid var(--ecr-line);background:var(--ecr-btn);color:var(--ecr-fg);',
+        'text-align:center;line-height:1.3}',
+        '.ecr-swb[aria-pressed="true"]{box-shadow:0 0 0 2px var(--ecr-acc)}',
+        '.ecr-swb:focus-visible{outline:2px solid var(--ecr-acc);outline-offset:2px}',
+        '.ecr-note{color:var(--ecr-dim);font-size:12px;line-height:1.5;margin:1.4rem 0 0;',
+        'border-top:1px solid var(--ecr-line);padding-top:.8rem}',
+        /* search: hidden without script, since it is the one thing here that
+           cannot work without one */
+        '.ecr-find{display:none;margin-bottom:1rem}',
+        'html.ecr-js .ecr-find{display:block}',
+        '.ecr-find input{width:100%;font:inherit;padding:6px 9px;border-radius:6px;',
+        'border:1px solid var(--ecr-line);background:var(--ecr-bg);color:var(--ecr-fg)}',
+        '.ecr-find input:focus{outline:2px solid var(--ecr-acc);outline-offset:1px}',
+        '.ecr-res{display:none}',
+        '.ecr-rescount{color:var(--ecr-dim);font-size:12px;margin:0 0 .6rem}',
+        '.ecr-resitem{display:block;width:100%;text-align:left;cursor:pointer;font:inherit;',
+        'background:none;border:0;border-radius:6px;padding:.4rem .45rem;margin-bottom:.15rem;',
+        'color:var(--ecr-fg);line-height:1.45}',
+        '.ecr-resitem:hover,.ecr-resitem:focus-visible{background:var(--ecr-btn)}',
+        '.ecr-restitle{display:block;color:var(--ecr-dim);font-size:11px;',
+        'text-transform:uppercase;letter-spacing:.05em;margin-bottom:.15rem}',
+        '.ecr-ressnip{display:block;font-size:13px}',
+        '.ecr-ressnip b{color:var(--ecr-acc)}',
+        'mark#ecr-hit{background:var(--ecr-mark);color:inherit;border-radius:2px;padding:0 1px}',
+        /* the click-away layer, which is a label so it works without script */
+        '.ecr-scrim{position:fixed;top:0;right:0;bottom:0;left:0;z-index:20;display:none;',
+        'margin:0;background:rgba(0,0,0,.38)}',
+        '#ecr-nav:checked~.ecr-scrim-n,#ecr-set:checked~.ecr-scrim-s{display:block}',
+        /* the text itself */
+        '.ecr-head,.ec-section{max-width:calc(var(--ecr-w) * 8.5px);margin:0 auto;',
+        'padding:0 1.2rem}',
+        '.ecr-head{padding-top:2.4rem;text-align:center}',
+        '.ecr-head h1{font-size:1.7em;line-height:1.25;margin:0 0 .3rem}',
+        '.ecr-head p{color:var(--ecr-dim);margin:0}',
+        '.ecr-head img{max-height:70vh;width:auto;margin-bottom:1.4rem}',
+        '.ec-section{margin-top:3.2rem;padding-bottom:1rem}',
+        '.ec-section:last-of-type{padding-bottom:5rem}',
+        'blockquote{border-left:3px solid var(--ecr-line);margin-left:0;padding-left:1rem;',
+        'color:var(--ecr-dim)}',
+        'pre,code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.88em}',
+        'pre{overflow-x:auto}',
+        'hr{border:0;border-top:1px solid var(--ecr-line);margin:2rem auto;width:40%}',
+        /* wide screens: the contents dock instead of covering the text. Needs
+           the class the script sets, because a checkbox cannot style its own
+           parent and the padding has to land on <body>. */
+        '@media (min-width:1100px){',
+        'html[data-ecr-dock="1"] body{padding-left:20em}',
+        'html[data-ecr-dock="1"] .ecr-scrim-n{display:none}',
+        '}',
+        '@media print{.ecr-bar,.ecr-side,.ecr-scrim{display:none}body{padding-left:0}}',
+      ].join('');
+    }
+
+    // Written as one string on purpose: it is the only script in the exported
+    // file. Read the header comment above before adding a "<" to it.
+    function readerJs() {
+      return [
+        '(function(){',
+        'var D=document,H=D.documentElement,KEY="ecReader";',
+        'var FONTS=' + JSON.stringify(READER_FONTS.reduce(function (m, f) {
+          m[f.id] = f.stack; return m;
+        }, {})) + ';',
+        'var THEMES=' + JSON.stringify(READER_THEMES.reduce(function (m, t) {
+          m[t.id] = 1; return m;
+        }, { auto: 1 })) + ';',
+        'var DEF={fs:19,lh:1.62,w:80,ff:"serif",th:"auto",nav:1},P={},k;',
+        'for(k in DEF){P[k]=DEF[k];}',
+        'try{var raw=localStorage.getItem(KEY);if(raw){var o=JSON.parse(raw);',
+        'for(k in DEF){if(o[k]!==undefined&&o[k]!==null)P[k]=o[k];}}}catch(e){}',
+        // Whatever was in storage, the three numbers have to be numbers again.
+        'P.fs=+P.fs||DEF.fs;P.lh=+P.lh||DEF.lh;P.w=+P.w||DEF.w;',
+        // Settings saved by an older version of this file named two themes that
+        // no longer exist, and could name a font this one does not have.
+        'if(P.th==="light")P.th="paper";',
+        'if(!THEMES[P.th])P.th=DEF.th;',
+        'if(!FONTS[P.ff])P.ff=DEF.ff;',
+        // The width used to be a number of em, so an old setting would land far
+        // outside the percentage range it means now.
+        'if(P.w>100||!(P.w>39))P.w=DEF.w;',
+        'function save(){try{localStorage.setItem(KEY,JSON.stringify(P));}catch(e){}}',
+        'function clamp(v,lo,hi){if(v>hi)return hi;if(lo>v)return lo;return v;}',
+        'function vars(){',
+        'H.style.setProperty("--ecr-fs",P.fs+"px");',
+        'H.style.setProperty("--ecr-lh",String(P.lh));',
+        'H.style.setProperty("--ecr-w",String(P.w));',
+        'H.style.setProperty("--ecr-ff",FONTS[P.ff]||FONTS[DEF.ff]);',
+        'H.setAttribute("data-ecr-theme",P.th);',
+        '}',
+        'H.className=H.className?H.className+" ecr-js":"ecr-js";',
+        'vars();',
+        'function ready(){',
+        'var nav=D.getElementById("ecr-nav"),set=D.getElementById("ecr-set");',
+        'var mq=window.matchMedia?window.matchMedia("(min-width:1100px)"):null;',
+        'var btns=D.querySelectorAll("[data-k]"),i;',
+        'var secs=D.querySelectorAll("section.ec-section");',
+        'var ffsel=D.getElementById("ecr-ff");',
+        'function paint(){',
+        'vars();',
+        'var f=D.getElementById("ecr-vfs"),l=D.getElementById("ecr-vlh"),w=D.getElementById("ecr-vw");',
+        'if(f)f.textContent=P.fs+"px";',
+        'if(l)l.textContent=P.lh.toFixed(2);',
+        'if(w)w.textContent=P.w+"%";',
+        'if(ffsel)ffsel.value=P.ff;',
+        'for(var j=0;j!==btns.length;j++){',
+        'var b=btns[j],kk=b.getAttribute("data-k"),vv=b.getAttribute("data-v");',
+        'if(kk==="th")b.setAttribute("aria-pressed",P.th===vv?"true":"false");',
+        '}',
+        '}',
+        // Changing the type size reflows the whole book, and the line you were
+        // reading slides away under the change. So: find whatever sits at the
+        // middle of the screen, remember how far into it that point is, and put
+        // that same point back in the middle afterwards.
+        //
+        // "Whatever sits there" has to be the innermost element, not the first
+        // block in document order: chapters are often one big <div>, and
+        // holding a container that starts far above the screen holds nothing at
+        // all, because its contents grow underneath the anchor. Hence
+        // elementsFromPoint, which also returns the whole stack, so the settings
+        // panel and its full-screen backdrop can be looked straight through.
+        'var BLOCK={P:1,H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,LI:1,BLOCKQUOTE:1,IMG:1,PRE:1,TD:1};',
+        'function scanAnchor(){',
+        'var bar=D.querySelector(".ecr-bar");',
+        'var edge=bar?bar.getBoundingClientRect().bottom:0;',
+        'for(var j=0;j!==secs.length;j++){',
+        'var sr=secs[j].getBoundingClientRect();',
+        'if(!(sr.bottom>edge+1))continue;',
+        'var els=secs[j].querySelectorAll("*");',
+        'for(var q=0;q!==els.length;q++){',
+        'if(!BLOCK[els[q].tagName])continue;',
+        'var r=els[q].getBoundingClientRect();',
+        'if(r.height>0&&r.bottom>edge+1)return {el:els[q],top:r.top};',
+        '}',
+        'return {el:secs[j],top:sr.top};',
+        '}',
+        'return null;',
+        '}',
+        // Several x positions, because a drawer may cover the first one and the
+        // text column does not always start at the same place.
+        'var XS=[0.32,0.5,0.2,0.68];',
+        'function anchor(){',
+        'var h=window.innerHeight||600,w=window.innerWidth||800;',
+        'var y=Math.round(h/2),el=null,j,m,st;',
+        'if(D.elementsFromPoint){',
+        'for(j=0;j!==XS.length&&!el;j++){',
+        'st=D.elementsFromPoint(Math.round(w*XS[j]),y);',
+        'for(m=0;m!==st.length;m++){',
+        'if(st[m].closest&&st[m].closest("section.ec-section")){el=st[m];break;}',
+        '}',
+        '}',
+        '}',
+        'if(!el)return scanAnchor();',
+        'var r=el.getBoundingClientRect();',
+        'if(!(r.height>0))return scanAnchor();',
+        'return {el:el,y:y,ratio:(y-r.top)/r.height};',
+        '}',
+        'function keepPlace(fn){',
+        'var a=anchor();',
+        'fn();',
+        'if(!a)return;',
+        // Reading the rectangle forces the reflow, so the delta is the real one.
+        'var r=a.el.getBoundingClientRect();',
+        'var to=a.ratio===undefined?r.top:r.top+a.ratio*r.height;',
+        'var from=a.ratio===undefined?a.top:a.y;',
+        'if(to!==from)window.scrollBy(0,to-from);',
+        '}',
+        'function dock(){H.setAttribute("data-ecr-dock",nav.checked&&mq&&mq.matches?"1":"0");}',
+        'for(i=0;i!==btns.length;i++){',
+        'btns[i].addEventListener("click",function(){',
+        'var kk=this.getAttribute("data-k"),vv=this.getAttribute("data-v");',
+        'keepPlace(function(){',
+        'if(kk==="fs")P.fs=clamp(P.fs+ +vv,14,30);',
+        'else if(kk==="lh")P.lh=Math.round((P.lh+ +vv)*100)/100,P.lh=clamp(P.lh,1.2,2.4);',
+        'else if(kk==="w")P.w=clamp(P.w+ +vv,40,100);',
+        'else P[kk]=vv;',
+        'save();paint();',
+        '});',
+        '});',
+        '}',
+        'if(ffsel)ffsel.addEventListener("change",function(){',
+        'var v=ffsel.value;',
+        'keepPlace(function(){if(FONTS[v]){P.ff=v;save();paint();}});',
+        '});',
+        'var rst=D.getElementById("ecr-reset");',
+        'if(rst)rst.addEventListener("click",function(){',
+        'keepPlace(function(){',
+        'for(var q in DEF){if(q!=="nav")P[q]=DEF[q];}save();paint();',
+        '});',
+        '});',
+        'nav.addEventListener("change",function(){P.nav=nav.checked?1:0;save();dock();});',
+        'if(mq){nav.checked=mq.matches&&!!P.nav;',
+        'if(mq.addEventListener)mq.addEventListener("change",dock);}',
+        'dock();paint();',
+        'D.addEventListener("keydown",function(e){',
+        'if(e.key==="Escape"){nav.checked=false;set.checked=false;dock();}',
+        '});',
+        // Search. No index is kept: walking the text nodes of a whole book takes
+        // a few milliseconds, and an index would have to be rebuilt every time a
+        // hit is wrapped in a mark anyway. Matches are found inside single text
+        // nodes, so a phrase broken up by formatting does not match - the same
+        // limit the converter's own search and replace has.
+        'var box=D.getElementById("ecr-res"),list=D.getElementById("ecr-toclist");',
+        'var qbox=D.getElementById("ecr-q");',
+        'var timer=null,hits=[];',
+        'function docked(){return mq&&mq.matches&&nav.checked;}',
+        'function unmark(){',
+        'var m=D.getElementById("ecr-hit");',
+        'if(!m)return;',
+        'var p=m.parentNode;',
+        'while(m.firstChild)p.insertBefore(m.firstChild,m);',
+        'p.removeChild(m);p.normalize();',
+        '}',
+        'function secTitle(sec,i){',
+        'var h=sec.querySelector("h1,h2,h3,h4");',
+        'var t=h?h.textContent.replace(/\\s+/g," ").trim():"";',
+        'return t?t:"Section "+(i+1);',
+        '}',
+        // Text nodes are counted per section, so a hit survives the document
+        // being changed and changed back by the marking.
+        'function nodeAt(sec,want){',
+        'var w=D.createTreeWalker(sec,NodeFilter.SHOW_TEXT,null,false),node,k=0;',
+        'while((node=w.nextNode())){if(k===want)return node;k++;}',
+        'return null;',
+        '}',
+        'function goTo(r){',
+        'unmark();',
+        'var node=nodeAt(secs[r.s],r.n);',
+        'if(!node)return;',
+        'var rg=D.createRange();',
+        'try{rg.setStart(node,r.o);rg.setEnd(node,r.o+r.len);}catch(e){return;}',
+        'var mk=D.createElement("mark");mk.id="ecr-hit";',
+        'try{rg.surroundContents(mk);}catch(e){return;}',
+        'if(!docked()){nav.checked=false;dock();}',
+        'if(mk.scrollIntoView)mk.scrollIntoView({block:"center"});',
+        '}',
+        'function draw(q){',
+        'if(!box)return;',
+        'box.textContent="";',
+        'if(!q){box.style.display="none";if(list)list.style.display="";return;}',
+        'box.style.display="block";if(list)list.style.display="none";',
+        'var head=D.createElement("p");head.className="ecr-rescount";',
+        'head.textContent=hits.length?(hits.length+(hits.length===1?" match":" matches")',
+        '+(hits.capped?", showing the first 200":"")):"Nothing found.";',
+        'box.appendChild(head);',
+        'for(var i=0;i!==hits.length;i++){',
+        'box.appendChild(item(hits[i]));',
+        '}',
+        '}',
+        'function item(r){',
+        'var b=D.createElement("button");b.type="button";b.className="ecr-resitem";',
+        'var t=D.createElement("span");t.className="ecr-restitle";t.textContent=r.title;',
+        'var s=D.createElement("span");s.className="ecr-ressnip";',
+        'var pre=r.txt.slice(0,r.o),post=r.txt.slice(r.o+r.len);',
+        'if(pre.length>44)pre="…"+pre.slice(pre.length-44);',
+        'if(post.length>44)post=post.slice(0,44)+"…";',
+        's.appendChild(D.createTextNode(pre));',
+        'var m=D.createElement("b");m.textContent=r.txt.slice(r.o,r.o+r.len);',
+        's.appendChild(m);s.appendChild(D.createTextNode(post));',
+        'b.appendChild(t);b.appendChild(s);',
+        'b.addEventListener("click",function(){goTo(r);});',
+        'return b;',
+        '}',
+        'function find(q){',
+        'unmark();',
+        'hits=[];',
+        'var needle=q.toLowerCase();',
+        'if(needle.length>0){',
+        'for(var i=0;i!==secs.length;i++){',
+        'var title=secTitle(secs[i],i);',
+        'var w=D.createTreeWalker(secs[i],NodeFilter.SHOW_TEXT,null,false),node,k=0;',
+        'while((node=w.nextNode())){',
+        'var txt=node.nodeValue,low=txt.toLowerCase(),p=0,at;',
+        'while((at=low.indexOf(needle,p))!==-1){',
+        'hits.push({s:i,n:k,o:at,len:needle.length,txt:txt,title:title});',
+        'p=at+needle.length;',
+        'if(hits.length>199){hits.capped=true;break;}',
+        '}',
+        'k++;',
+        'if(hits.capped)break;',
+        '}',
+        'if(hits.capped)break;',
+        '}',
+        '}',
+        'draw(q);',
+        '}',
+        'if(qbox){',
+        'qbox.addEventListener("input",function(){',
+        'var q=qbox.value.trim();',
+        'if(timer)clearTimeout(timer);',
+        'timer=setTimeout(function(){find(q);},180);',
+        '});',
+        'qbox.addEventListener("keydown",function(e){',
+        'if(e.key==="Enter"&&hits.length)goTo(hits[0]);',
+        'if(e.key==="Escape"){qbox.value="";find("");}',
+        '});',
+        '}',
+        // Following a chapter link should get the drawer out of the way, unless
+        // it is docked beside the text anyway.
+        'var tocLinks=D.querySelectorAll("nav.ec-toc a");',
+        'for(i=0;i!==tocLinks.length;i++){',
+        'tocLinks[i].addEventListener("click",function(){',
+        'if(!docked())nav.checked=false;',
+        'dock();',
+        '});',
+        '}',
+        // The contents entry for the chapter you are reading lights up. Anchors
+        // may point inside a chapter, so map them back to the section id first.
+        'if(window.IntersectionObserver){',
+        'var links=tocLinks,ids=[],seen={},cur="";',
+        'for(i=0;i!==secs.length;i++)ids.push(secs[i].id);',
+        'var io=new IntersectionObserver(function(es){',
+        'for(var j=0;j!==es.length;j++)seen[es[j].target.id]=es[j].isIntersecting;',
+        'var now="";',
+        'for(var m=0;m!==ids.length;m++){if(seen[ids[m]]){now=ids[m];break;}}',
+        'if(!now||now===cur)return;',
+        'cur=now;',
+        'for(var n=0;n!==links.length;n++){',
+        'var t=(links[n].getAttribute("href")||"").slice(1).replace(/^(sec-[0-9]+).*$/,"$1");',
+        'if(t===cur)links[n].className="ecr-here";',
+        'else links[n].className="";',
+        '}',
+        '},{rootMargin:"0px 0px -72% 0px"});',
+        'for(i=0;i!==secs.length;i++)io.observe(secs[i]);',
+        '}',
+        '}',
+        'if(D.readyState==="loading")D.addEventListener("DOMContentLoaded",ready);',
+        'else ready();',
+        '})();',
+      ].join('');
+    }
+
+    function writeHtmlReader(book) {
+      // stripType: the reading settings are only honest if the book's own
+      // inline font sizes are gone. The plain HTML export keeps them.
+      const P = buildHtmlParts(book, { stripType: true });
+      const out = [];
+      out.push('<!doctype html>');
+      out.push('<html lang="' + escapeAttr(P.lang) + '">');
+      out.push('<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">');
+      out.push('<title>' + escapeText(P.title) + '</title>');
+      out.push('<style>' + readerCss() + '</style>');
+      out.push('<script>' + readerJs() + '</' + 'script>');
+      out.push('</head><body>');
+      // The toggles come first: everything they open is a later sibling.
+      out.push('<input class="ecr-t" type="checkbox" id="ecr-nav">');
+      out.push('<input class="ecr-t" type="checkbox" id="ecr-set">');
+      out.push('<header class="ecr-bar">');
+      out.push('<label class="ecr-btn" for="ecr-nav">Contents</label>');
+      out.push('<span class="ecr-name">' + escapeText(P.title) + '</span>');
+      out.push('<label class="ecr-btn" for="ecr-set">Aa</label>');
+      out.push('</header>');
+      out.push('<nav class="ec-toc ecr-side" id="ecr-toc">');
+      out.push('<div class="ecr-find"><input type="search" id="ecr-q" autocomplete="off"'
+        + ' placeholder="Find in this book" aria-label="Find in this book"></div>');
+      out.push('<div class="ecr-res" id="ecr-res"></div>');
+      out.push('<div id="ecr-toclist"><h2>Contents</h2>');
+      out.push(readerTocHtml(P.tocItems));
+      out.push('</div>');
+      out.push('</nav>');
+      out.push('<aside class="ecr-opts ecr-side"><h2>Reading</h2>');
+      out.push('<div class="ecr-row"><span class="ecr-lab">Font Size</span>'
+        + '<span class="ecr-val" id="ecr-vfs">19px</span><span class="ecr-grp">'
+        + '<button class="ecr-btn" type="button" data-k="fs" data-v="-1">&#8722;</button>'
+        + '<button class="ecr-btn" type="button" data-k="fs" data-v="1">+</button></span></div>');
+      out.push('<div class="ecr-row"><span class="ecr-lab">Line Height</span>'
+        + '<span class="ecr-val" id="ecr-vlh">1.62</span><span class="ecr-grp">'
+        + '<button class="ecr-btn" type="button" data-k="lh" data-v="-0.1">&#8722;</button>'
+        + '<button class="ecr-btn" type="button" data-k="lh" data-v="0.1">+</button></span></div>');
+      out.push('<div class="ecr-row"><span class="ecr-lab">Reader Width</span>'
+        + '<span class="ecr-val" id="ecr-vw">80%</span><span class="ecr-grp">'
+        + '<button class="ecr-btn" type="button" data-k="w" data-v="-5">&#8722;</button>'
+        + '<button class="ecr-btn" type="button" data-k="w" data-v="5">+</button></span></div>');
+      out.push('<div class="ecr-blk"><span class="ecr-lab">Font Family</span>'
+        + '<select class="ecr-sel" id="ecr-ff" aria-label="Font Family">'
+        + READER_FONTS.map(function (f) {
+          return '<option value="' + f.id + '">' + escapeText(f.label) + '</option>';
+        }).join('')
+        + '</select></div>');
+      out.push('<div class="ecr-blk"><span class="ecr-lab">Color Scheme</span><div class="ecr-sw">'
+        + '<button class="ecr-swb" type="button" data-k="th" data-v="auto">Auto</button>'
+        + READER_THEMES.map(function (t) {
+          return '<button class="ecr-swb" type="button" data-k="th" data-v="' + t.id + '"'
+            + ' style="background:' + t.bg + ';color:' + t.fg + ';border-color:' + t.fg + '">'
+            + escapeText(t.label) + '</button>';
+        }).join('')
+        + '</div></div>');
+      out.push('<div class="ecr-row"><span class="ecr-lab">Everything back to normal</span>'
+        + '<span class="ecr-grp"><button class="ecr-btn" type="button" id="ecr-reset">Reset'
+        + '</button></span></div>');
+      out.push('<p class="ecr-note">Typefaces are the ones installed on this device; no font is '
+        + 'downloaded, so an unavailable one quietly falls back to the next in line. Settings are '
+        + 'kept in this browser. The whole book is inside this one file: it opens offline and '
+        + 'loads nothing from the network.</p>');
+      out.push('</aside>');
+      out.push('<label class="ecr-scrim ecr-scrim-n" for="ecr-nav" aria-hidden="true"></label>');
+      out.push('<label class="ecr-scrim ecr-scrim-s" for="ecr-set" aria-hidden="true"></label>');
+      out.push('<header class="ecr-head">');
+      if (P.coverUri && !P.coverShown) out.push('<img src="' + P.coverUri + '" alt="Cover"/>');
+      out.push('<h1>' + escapeText(P.title) + '</h1>');
+      if (P.author) out.push('<p>' + escapeText(P.author) + '</p>');
+      out.push('</header>');
+      book.sections.forEach(function (s, i) {
+        out.push('<section class="ec-section" id="' + escapeAttr(s.id) + '">');
+        out.push(P.bodies[i]);
         out.push('</section>');
       });
       out.push('</body></html>');
@@ -3845,17 +4487,7 @@
     }
 
     async function writePandoc(book) {
-      const media = new Map(); // resource key -> zip path
-      const used = new Set();
-      for (const entry of book.resources) {
-        if (!/^image\//.test(entry[1].mime)) continue;
-        const base = entry[0].replace(/[\\/:*?"<>|\s]/g, '_') || 'image';
-        let path = 'media/' + base;
-        let i = 2;
-        while (used.has(path)) { path = 'media/' + i + '_' + base; i++; }
-        used.add(path);
-        media.set(entry[0], path);
-      }
+      const media = imageZipNames(book, 'media/');
       const opts = {
         stats: { imagesDropped: 0 },
         imageHref: function (name) { return media.get(name) || null; },
@@ -3874,6 +4506,59 @@
       const entries = [{ name: 'book.md', bytes: encodeUtf8(md) }];
       for (const entry of media) {
         entries.push({ name: entry[1], bytes: book.resources.get(entry[0]).bytes });
+      }
+      return zipWrite(entries);
+    }
+
+    // ══ image bundle ═════════════════════════════════════════════════════════
+    // The images are already sitting in book.resources as raw bytes; nothing
+    // here re-encodes them. Two consumers share the naming: the Pandoc bundle
+    // (media/) and the plain "give me the pictures" archive (flat).
+
+    // Resource keys are already flat basenames, but they came out of somebody
+    // else's file and may still carry characters a zip entry should not.
+    function imageZipNames(book, prefix) {
+      const map = new Map(); // resource key -> zip path
+      const used = new Set();
+      for (const entry of book.resources) {
+        if (!/^image\//.test(entry[1].mime)) continue;
+        const base = entry[0].replace(/[\\/:*?"<>|\s]/g, '_') || 'image';
+        let path = prefix + base;
+        let i = 2;
+        while (used.has(path)) { path = prefix + i + '_' + base; i++; }
+        used.add(path);
+        map.set(entry[0], path);
+      }
+      return map;
+    }
+
+    // The cover comes first: it is the one image somebody looks for by name.
+    function imageResources(book) {
+      const out = [];
+      for (const entry of book.resources) {
+        if (!/^image\//.test(entry[1].mime)) continue;
+        out.push({
+          name: entry[0], mime: entry[1].mime, bytes: entry[1].bytes,
+          isCover: entry[0] === book.meta.coverRes,
+        });
+      }
+      out.sort(function (a, b) { return (b.isCover ? 1 : 0) - (a.isCover ? 1 : 0); });
+      return out;
+    }
+
+    // JPEG, PNG, GIF and WEBP are already compressed containers. zipWrite would
+    // deflate them, notice it gained nothing and fall back to stored anyway, so
+    // asking for stored up front skips one CompressionStream round-trip per
+    // image for the same bytes. SVG is text and does compress.
+    const PRECOMPRESSED = { 'image/jpeg': 1, 'image/png': 1, 'image/gif': 1, 'image/webp': 1 };
+
+    async function writeImagesZip(book) {
+      const names = imageZipNames(book, '');
+      if (!names.size) throw new Error('This book has no images.');
+      const entries = [];
+      for (const entry of names) {
+        const res = book.resources.get(entry[0]);
+        entries.push({ name: entry[1], bytes: res.bytes, store: !!PRECOMPRESSED[res.mime] });
       }
       return zipWrite(entries);
     }
@@ -4300,6 +4985,7 @@
       txt: { write: writeTxt, ext: 'txt', mime: 'text/plain;charset=utf-8' },
       md: { write: writeMd, ext: 'md', mime: 'text/markdown;charset=utf-8' },
       html: { write: writeHtml, ext: 'html', mime: 'text/html;charset=utf-8' },
+      htmlreader: { write: writeHtmlReader, ext: 'reader.html', mime: 'text/html;charset=utf-8' },
       latex: { write: writeLatex, ext: 'tex', mime: 'text/x-tex;charset=utf-8' },
       docx: { write: writeDocx, ext: 'docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
       pandoc: { write: writePandoc, ext: 'pandoc.zip', mime: 'application/zip' },
@@ -4322,6 +5008,9 @@
       txt:    { label: 'Plain text',    read: true,      write: true,      exts: ['.txt'] },
       md:     { label: 'Markdown',      read: true,      write: true,      exts: ['.md', '.markdown'] },
       html:   { label: 'HTML',          read: true,      write: true,      exts: ['.html', '.htm'] },
+      // Reads back in through the plain HTML reader; it is a target only, so it
+      // never widens the file picker.
+      htmlreader: { label: 'HTML (Reader)', read: false, write: true,      exts: ['.html'] },
       latex:  { label: 'LaTeX',         read: false,     write: true,      exts: ['.tex'] },
       docx:   { label: 'DOCX',          read: false,     write: true,      exts: ['.docx'] },
       pandoc: { label: 'Pandoc bundle', read: false,     write: true,      exts: ['.zip'] },
@@ -4926,6 +5615,79 @@
       return next;
     }
 
+    // ══ batch ════════════════════════════════════════════════════════════════
+    // Many files in, one zip out. Sequential on purpose: running the readers in
+    // parallel would multiply peak memory by the number of files and win
+    // nothing, since they are CPU-bound and there is one thread. Each file is
+    // fetched only when its turn comes (hence getBytes rather than bytes), and
+    // its book is dropped before the next one starts, so the only thing that
+    // grows is the pile of finished outputs the zip needs anyway.
+    //
+    // This lives in the core block because the UI block cannot use await.
+
+    // Already-compressed containers: deflating a zip inside a zip is pure heat.
+    const STORED_OUT = { epub: 1, docx: 1, zip: 1, 'pandoc.zip': 1 };
+
+    async function convertMany(items, target, opts, onProgress) {
+      opts = opts || {};
+      const results = [];
+      const entries = [];
+      const used = new Set();
+      const report = (i, entry) => { if (onProgress) onProgress(i, items.length, entry); };
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        report(i, { name: item.name, status: 'working' });
+        const log = makeLog();
+        const entry = { name: item.name, ok: false, error: '', outName: '', outSize: 0, notes: [] };
+        try {
+          let bytes = new Uint8Array(await item.getBytes());
+          let book = await read(bytes, log, item.name);
+          bytes = null;
+          if (opts.typography) {
+            const lang = opts.typography === 'auto' ? null : opts.typography;
+            book = cleanTypography(book, lang).book;
+          }
+          const rep = opts.replace;
+          if (rep && rep.query) {
+            const r = bookReplace(book, rep.query, rep.replacement || '', rep);
+            if (r.error) entry.notes.push('Search and replace skipped: ' + r.error);
+            else { book = r.book; entry.notes.push(r.total + ' replacement' + (r.total === 1 ? '' : 's')); }
+          }
+          const out = await write(book, target);
+          book = null;
+          let name = (item.name.replace(/\.[A-Za-z0-9]+$/, '') || 'book') + '.' + out.ext;
+          let n = 2;
+          while (used.has(name.toLowerCase())) {
+            name = (item.name.replace(/\.[A-Za-z0-9]+$/, '') || 'book') + ' (' + n + ').' + out.ext;
+            n++;
+          }
+          used.add(name.toLowerCase());
+          entries.push({ name: name, bytes: out.bytes, store: !!STORED_OUT[out.ext] });
+          entry.ok = true;
+          entry.outName = name;
+          entry.outSize = out.bytes.length;
+        } catch (e) {
+          entry.error = (e && e.message) ? e.message : String(e);
+        }
+        entry.status = entry.ok ? 'done' : 'failed';
+        entry.log = log.lines.slice();
+        results.push(entry);
+        report(i, entry);
+      }
+
+      const okCount = results.filter(function (r) { return r.ok; }).length;
+      const lines = ['E-book converter batch', 'Target format: ' + target,
+        okCount + ' of ' + results.length + ' converted', ''];
+      for (const r of results) {
+        lines.push((r.ok ? 'OK   ' : 'FAIL ') + r.name + (r.ok ? '  ->  ' + r.outName : ''));
+        if (r.error) lines.push('       ' + r.error);
+        for (const n of r.notes) lines.push('       ' + n);
+      }
+      entries.push({ name: 'conversion-log.txt', bytes: encodeUtf8(lines.join('\n') + '\n') });
+      return { bytes: await zipWrite(entries), results: results, converted: okCount };
+    }
+
     return {
       formats: FORMATS,
       // pipeline
@@ -4963,6 +5725,13 @@
       removeGeneratedCover: removeGeneratedCover,
       coverThemes: COVER_THEMES, coverSize: { width: COVER_W, height: COVER_H },
       wrapLines: wrapLines, coverSectionId: COVER_SECTION_ID,
+      // image bundle, reader export, batch
+      imageResources: imageResources, imageZipNames: imageZipNames,
+      writeImagesZip: writeImagesZip,
+      buildHtmlParts: buildHtmlParts, writeHtmlReader: writeHtmlReader,
+      readerTocHtml: readerTocHtml, readerJs: readerJs,
+      readerThemes: READER_THEMES, readerFonts: READER_FONTS,
+      convertMany: convertMany,
     };
   })();
   </script>
@@ -5183,6 +5952,125 @@
           <p style={{ fontSize: 11, color: 'var(--tool-note)', marginTop: 8 }}>
             Rendered from the parsed book, exactly what a writer would receive. Publisher
             styles are stripped, links are disabled, and nothing is fetched from the network.
+          </p>
+        </div>
+      );
+    }
+
+    // ---- images tab ------------------------------------------------------
+
+    // One object URL per image, created when the tile is about to scroll into
+    // view and revoked when the book changes or the tab goes away. A picture
+    // book can hold hundreds of images; materialising every blob at once is how
+    // a preview grid quietly eats a few hundred megabytes.
+    function ImagesTab({ book, baseName }) {
+      const items = useMemo(() => (book ? Core.imageResources(book) : []), [book]);
+      const urls = useRef(new Map());
+      const cells = useRef([]);
+      const [, bump] = useState(0);
+      const [zip, makeZip, clearZip] = useDownload();
+      const [busy, setBusy] = useState(false);
+      const [err, setErr] = useState('');
+
+      useEffect(() => {
+        const map = urls.current;
+        return () => {
+          map.forEach((u) => URL.revokeObjectURL(u));
+          map.clear();
+        };
+      }, [book]);
+
+      useEffect(() => { clearZip(); setErr(''); }, [book, clearZip]);
+
+      const show = useCallback((i) => {
+        if (urls.current.has(i)) return;
+        const it = items[i];
+        if (!it) return;
+        urls.current.set(i, URL.createObjectURL(new Blob([it.bytes], { type: it.mime })));
+        bump((n) => n + 1);
+      }, [items]);
+
+      useEffect(() => {
+        cells.current = cells.current.slice(0, items.length);
+        if (!window.IntersectionObserver) {
+          items.forEach((it, i) => show(i));
+          return undefined;
+        }
+        const io = new IntersectionObserver((entries) => {
+          entries.forEach((e) => {
+            if (!e.isIntersecting) return;
+            show(Number(e.target.getAttribute('data-i')));
+            io.unobserve(e.target);
+          });
+        }, { rootMargin: '400px' });
+        cells.current.forEach((el) => { if (el) io.observe(el); });
+        return () => io.disconnect();
+      }, [items, show]);
+
+      if (!book) {
+        return <p style={{ color: 'var(--tool-note)' }}>Load a book on the Convert tab first.</p>;
+      }
+      if (!items.length) {
+        return (
+          <p style={{ color: 'var(--tool-note)' }}>
+            This book has no images. Plain text and Markdown files usually do not carry any,
+            and neither do some EPUBs.
+          </p>
+        );
+      }
+
+      const total = items.reduce((n, it) => n + it.bytes.length, 0);
+      const grabAll = () => {
+        setBusy(true);
+        setErr('');
+        Core.writeImagesZip(book)
+          .then((bytes) => { makeZip(bytes, 'application/zip', baseName + '-images.zip'); setBusy(false); })
+          .catch((e) => { setErr(e && e.message ? e.message : String(e)); setBusy(false); });
+      };
+
+      return (
+        <div>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 14 }}>
+            <span style={{ color: 'var(--tool-label)', fontSize: 13 }}>
+              {items.length + (items.length === 1 ? ' image · ' : ' images · ') + fmtSize(total)}
+            </span>
+            <button className="ec-act" onClick={grabAll} disabled={busy}>Download all as ZIP</button>
+            {zip && (
+              <a href={zip.url} download={zip.name} role="button"
+                style={{ width: 'auto', marginBottom: 0, padding: '4px 12px', fontSize: 13,
+                  background: '#0fb5ad', borderColor: '#0fb5ad', color: '#1e293b', fontWeight: 600 }}>
+                Save {zip.name} ({fmtSize(zip.size)})
+              </a>
+            )}
+          </div>
+          {err && <p style={{ color: '#d97706', fontSize: 13 }}>{err}</p>}
+          <div className="ec-imgs">
+            {items.map((it, i) => {
+              const url = urls.current.get(i);
+              const dims = Core.imageDims(it.bytes, it.mime);
+              return (
+                <div className="ec-imgcell" key={it.name} data-i={i}
+                  ref={(el) => { cells.current[i] = el; }}>
+                  <div className="ec-thumb">
+                    {url
+                      ? <img src={url} alt={it.name} loading="lazy" />
+                      : <span style={{ color: 'var(--tool-faint)', fontSize: 11 }}>…</span>}
+                  </div>
+                  <div className="ec-imgname">{it.name}</div>
+                  <div>
+                    {it.mime.replace('image/', '')}
+                    {dims ? ' · ' + dims.w + '×' + dims.h : ''}
+                    {' · ' + fmtSize(it.bytes.length)}
+                    {it.isCover && <span className="ec-imgcover"> · cover</span>}
+                  </div>
+                  {url && <a className="ec-act" href={url} download={it.name}>Download</a>}
+                </div>
+              );
+            })}
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--tool-note)', marginTop: 12 }}>
+            The images come straight out of the book, byte for byte. Nothing is resized or
+            re-encoded, and the archive stores them as they are.
           </p>
         </div>
       );
@@ -5776,6 +6664,102 @@
       );
     }
 
+    // ---- batch mode ------------------------------------------------------
+
+    // The same two panels as in EditTools, minus the buttons: with a stack of
+    // files there is no single book to search, so these are settings that run
+    // during the conversion rather than actions with a visible result. Cover
+    // and table of contents have no batch meaning at all and are left out.
+    function BatchEdits({ opts, onOpts }) {
+      const set = (k, v) => onOpts(Object.assign({}, opts, { [k]: v }));
+      return (
+        <div className="ec-edits">
+          <details className="ec-edit">
+            <summary>
+              Search and replace
+              <span className="ec-editnote">
+                {opts.query ? 'runs on every file' : 'off'}
+              </span>
+            </summary>
+            <label style={{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
+              Applied to every file after it is read, on the text only, never on the markup.
+              Leave the search field empty to skip it.
+            </label>
+            <div className="ec-field" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 14px' }}>
+              <div>
+                <label htmlFor="ec-bfind">Search for</label>
+                <input id="ec-bfind" type="text" value={opts.query}
+                  onChange={(e) => set('query', e.target.value)} />
+              </div>
+              <div>
+                <label htmlFor="ec-brepl">Replace with</label>
+                <input id="ec-brepl" type="text" value={opts.replacement}
+                  onChange={(e) => set('replacement', e.target.value)} />
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ fontSize: 13, color: 'var(--tool-label)', marginBottom: 0 }}>
+                <input type="checkbox" checked={opts.wholeWord}
+                  onChange={(e) => set('wholeWord', e.target.checked)} />
+                {' '}Whole words only
+              </label>
+              <label style={{ fontSize: 13, color: 'var(--tool-label)', marginBottom: 0 }}>
+                <input type="checkbox" checked={opts.regex}
+                  onChange={(e) => set('regex', e.target.checked)} />
+                {' '}Regular expression
+              </label>
+              <label style={{ fontSize: 13, color: 'var(--tool-label)', marginBottom: 0 }}>
+                <input type="checkbox" checked={opts.matchCase}
+                  onChange={(e) => set('matchCase', e.target.checked)} />
+                {' '}Match case
+              </label>
+            </div>
+          </details>
+
+          <details className="ec-edit">
+            <summary>
+              Typography
+              <span className="ec-editnote">{opts.typo ? 'runs on every file' : 'off'}</span>
+            </summary>
+            <label style={{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
+              Straight quotes become typographic ones, three dots an ellipsis, hyphen runs
+              proper dashes. Code blocks are left alone.
+            </label>
+            <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap' }}>
+              {[['', 'Off'], ['auto', 'Auto: per file'], ['de', 'German'], ['en', 'English']].map((o) => (
+                <button key={o[0] || 'off'}
+                  className={'lang-seg' + (opts.typo === o[0] ? ' active' : '')}
+                  onClick={() => set('typo', o[0])}>{o[1]}</button>
+              ))}
+            </div>
+          </details>
+        </div>
+      );
+    }
+
+    // One place where a finished byte array becomes a download link. Every
+    // caller used to build its own object URL and none of them ever revoked it,
+    // which leaks the whole file on every conversion. Handing out the URL from
+    // here means the previous one dies when the next is made, and the last one
+    // dies on unmount.
+    function useDownload() {
+      const ref = useRef(null);
+      const [dl, setDl] = useState(null);
+      const clear = useCallback(() => {
+        if (ref.current) URL.revokeObjectURL(ref.current.url);
+        ref.current = null;
+        setDl(null);
+      }, []);
+      const make = useCallback((bytes, mime, name) => {
+        if (ref.current) URL.revokeObjectURL(ref.current.url);
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        ref.current = { url: url, name: name, size: bytes.length };
+        setDl(ref.current);
+      }, []);
+      useEffect(() => clear, [clear]);
+      return [dl, make, clear];
+    }
+
     function App() {
       const [book, setBook] = useState(null);
       const [fileName, setFileName] = useState('');
@@ -5785,23 +6769,49 @@
       const [busy, setBusy] = useState(false);
       const [over, setOver] = useState(false);
       const [target, setTarget] = useState('epub');
-      const [result, setResult] = useState(null);
+      const [result, makeResult, clearResult] = useDownload();
       const [tab, setTab] = useState('convert');
+      // Batch mode: set as soon as more than one file arrives. `book` stays
+      // null then, which is the whole memory strategy - only the file being
+      // converted is ever parsed.
+      const [batch, setBatch] = useState(null);
+      const [bopts, setBopts] = useState({
+        query: '', replacement: '', regex: false, matchCase: false, wholeWord: true, typo: '',
+      });
       const inputRef = useRef(null);
+
+      const imageCount = book
+        ? Array.from(book.resources.values()).filter((r) => /^image\//.test(r.mime)).length
+        : 0;
 
       const TABS = [
         { id: 'convert', label: 'Convert' },
         { id: 'preview', label: 'Preview' },
+        { id: 'images', label: 'Images (' + imageCount + ')' },
       ];
       const isConvert = tab === 'convert';
+      const base = fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book';
 
       const reset = () => {
-        setBook(null); setLog([]); setError(''); setResult(null);
-        setFileName(''); setFileSize(0);
+        setBook(null); setLog([]); setError(''); clearResult();
+        setFileName(''); setFileSize(0); setBatch(null);
         // The tab row is only rendered once a book is loaded; whoever drops a
         // new file while on Preview must land on a tab that shows it.
         setTab('convert');
       };
+
+      // One file behaves exactly as before; two or more open the batch.
+      const loadFiles = useCallback((list) => {
+        if (!list || !list.length) return;
+        if (list.length === 1) { loadFile(list[0]); return; }
+        reset();
+        setBatch({
+          files: Array.from(list).map((f) => ({
+            file: f, name: f.name, size: f.size, status: 'queued', error: '', outName: '', outSize: 0,
+          })),
+          running: false, done: 0, current: '',
+        });
+      }, []);
 
       const loadFile = useCallback((file) => {
         if (!file) return;
@@ -5829,12 +6839,11 @@
         if (!book) return;
         setBusy(true);
         setError('');
-        setResult(null);
+        clearResult();
         Core.write(book, target)
           .then((out) => {
             const base = fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book';
-            const blob = new Blob([out.bytes], { type: out.mime });
-            setResult({ url: URL.createObjectURL(blob), name: base + '.' + out.ext, size: out.bytes.length });
+            makeResult(out.bytes, out.mime, base + '.' + out.ext);
             setBusy(false);
           })
           .catch((e) => {
@@ -5843,9 +6852,47 @@
           });
       };
 
-      const imageCount = book
-        ? Array.from(book.resources.values()).filter((r) => /^image\//.test(r.mime)).length
-        : 0;
+      const runBatch = () => {
+        if (!batch || batch.running) return;
+        setError('');
+        clearResult();
+        setBatch((b) => b && Object.assign({}, b, { running: true, done: 0, current: '',
+          files: b.files.map((f) => Object.assign({}, f, { status: 'queued', error: '' })) }));
+        const items = batch.files.map((f) => ({
+          name: f.name,
+          getBytes: () => f.file.arrayBuffer().then((buf) => new Uint8Array(buf)),
+        }));
+        const opts = {
+          typography: bopts.typo || null,
+          replace: bopts.query ? {
+            query: bopts.query, replacement: bopts.replacement,
+            regex: bopts.regex, matchCase: bopts.matchCase, wholeWord: bopts.wholeWord,
+          } : null,
+        };
+        Core.convertMany(items, target, opts, (i, n, entry) => {
+          setBatch((b) => {
+            if (!b) return b;
+            const files = b.files.slice();
+            files[i] = Object.assign({}, files[i], {
+              status: entry.status, error: entry.error || '',
+              outName: entry.outName || '', outSize: entry.outSize || 0,
+            });
+            return Object.assign({}, b, {
+              files: files,
+              current: entry.name,
+              done: entry.status === 'working' ? b.done : i + 1,
+            });
+          });
+        })
+          .then((out) => {
+            makeResult(out.bytes, 'application/zip', 'converted-' + target + '.zip');
+            setBatch((b) => b && Object.assign({}, b, { running: false, current: '' }));
+          })
+          .catch((e) => {
+            setError(e && e.message ? e.message : String(e));
+            setBatch((b) => b && Object.assign({}, b, { running: false, current: '' }));
+          });
+      };
 
       const setMeta = (key, value) => {
         setBook((b) => {
@@ -5855,7 +6902,7 @@
           next.meta[key] = value;
           return next;
         });
-        setResult(null);
+        clearResult();
       };
 
       return (
@@ -5879,35 +6926,38 @@
           </p>
 
           <div
-            className={'ec-drop' + (book ? ' small' : '') + (over ? ' over' : '')}
+            className={'ec-drop' + (book || batch ? ' small' : '') + (over ? ' over' : '')}
             onClick={() => inputRef.current && inputRef.current.click()}
             onDragOver={(e) => { e.preventDefault(); setOver(true); }}
             onDragLeave={() => setOver(false)}
             onDrop={(e) => {
               e.preventDefault();
               setOver(false);
-              if (e.dataTransfer.files && e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+              loadFiles(e.dataTransfer.files);
             }}
             style={{ marginBottom: 18 }}
           >
-            {book ? (
+            {book || batch ? (
               <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>
-                Drop another e-book here, or click to choose one
+                Drop other e-books here, or click to choose them
               </div>
             ) : (
               <React.Fragment>
                 <div style={{ color: 'var(--tool-text)', fontSize: 15, marginBottom: 4 }}>
                   Drop an e-book here, or click to choose one
                 </div>
-                <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>EPUB, MOBI, AZW3, TXT, Markdown or HTML</div>
+                <div style={{ color: 'var(--tool-note)', fontSize: 13 }}>
+                  EPUB, MOBI, AZW3, TXT, Markdown or HTML · several at once for batch mode
+                </div>
               </React.Fragment>
             )}
             <input
               ref={inputRef}
               type="file"
               accept={ACCEPT}
+              multiple
               style={{ display: 'none' }}
-              onChange={(e) => loadFile(e.target.files && e.target.files[0])}
+              onChange={(e) => loadFiles(e.target.files)}
             />
           </div>
 
@@ -5930,7 +6980,83 @@
             </div>
           )}
 
-          {tab === 'preview' && <PreviewTab book={book} />}
+          {book && tab === 'preview' && <PreviewTab book={book} />}
+          {book && tab === 'images' && <ImagesTab book={book} baseName={base} />}
+
+          {batch && (
+            <div className="ec-card" style={{ marginBottom: 18 }}>
+              <dl className="ec-kv" style={{ marginBottom: 14 }}>
+                <dt>Batch</dt>
+                <dd>
+                  {batch.files.length} files ·{' '}
+                  {fmtSize(batch.files.reduce((n, f) => n + f.size, 0))}
+                </dd>
+              </dl>
+
+              <ul className="ec-files">
+                {batch.files.map((f, i) => (
+                  <li key={i}>
+                    <span className="ec-fname">{f.name}</span>
+                    <span className={'ec-fstat ' + f.status}>
+                      {f.status === 'done'
+                        ? f.outName + ' · ' + fmtSize(f.outSize)
+                        : f.status === 'working' ? 'converting…'
+                          : f.status === 'failed' ? 'failed' : fmtSize(f.size)}
+                    </span>
+                    {f.error && <span className="ec-ferr">{f.error}</span>}
+                  </li>
+                ))}
+              </ul>
+
+              <label style={{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
+                Convert all to
+              </label>
+              <div className="seg-row" style={{ display: 'flex', flexWrap: 'wrap', marginBottom: 14 }}>
+                {TARGETS.map((t) => (
+                  <button
+                    key={t.id}
+                    className={'lang-seg' + (target === t.id ? ' active' : '')}
+                    onClick={() => { setTarget(t.id); clearResult(); }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+
+              <BatchEdits opts={bopts} onOpts={setBopts} />
+
+              <p style={{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
+                Cover and table of contents are single-book tools: drop one file on its own to
+                use them, and to get the preview and the images.
+              </p>
+
+              <button onClick={runBatch} disabled={batch.running} style={{ width: 'auto' }}>
+                Convert all
+              </button>
+
+              {batch.running && (
+                <p style={{ color: 'var(--tool-label)', fontSize: 13, marginTop: 12, marginBottom: 0 }}>
+                  {batch.done} of {batch.files.length} done
+                  {batch.current ? ' · ' + batch.current : ''}
+                </p>
+              )}
+
+              {result && !batch.running && (
+                <p style={{ marginTop: 14, marginBottom: 0, display: 'flex',
+                    alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <a href={result.url} download={result.name} role="button"
+                    style={{ width: 'auto', marginBottom: 0, background: '#0fb5ad',
+                      borderColor: '#0fb5ad', color: '#1e293b', fontWeight: 600 }}>
+                    Download {result.name}
+                  </a>
+                  <span style={{ color: 'var(--tool-note)', fontSize: 13 }}>
+                    ({fmtSize(result.size)} · {batch.files.filter((f) => f.status === 'done').length} of{' '}
+                    {batch.files.length} converted, log included)
+                  </span>
+                </p>
+              )}
+            </div>
+          )}
 
           {isConvert && <React.Fragment>
 
@@ -5965,7 +7091,7 @@
                   <button
                     key={t.id}
                     className={'lang-seg' + (target === t.id ? ' active' : '')}
-                    onClick={() => { setTarget(t.id); setResult(null); }}
+                    onClick={() => { setTarget(t.id); clearResult(); }}
                   >
                     {t.label}
                   </button>
@@ -5978,7 +7104,14 @@
                   Unpack it and run: pandoc book.md -o book.docx
                 </p>
               )}
-              <EditTools book={book} onBook={(b) => { setBook(b); setResult(null); }} />
+              {target === 'htmlreader' && (
+                <p style={{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
+                  One file to read in, rather than to keep: a contents drawer on the left,
+                  text size, line height, width and light/dark on the right. Everything is
+                  inside the file, so it opens offline and requests nothing.
+                </p>
+              )}
+              <EditTools book={book} onBook={(b) => { setBook(b); clearResult(); }} />
 
               <button onClick={convert} disabled={busy} style={{ width: 'auto' }}>
                 Convert
@@ -6008,8 +7141,9 @@
           </React.Fragment>}
 
           <p style={{ fontSize: 11, color: 'var(--tool-note)', marginBottom: 4 }}>
-            Reads EPUB, MOBI, AZW3, Markdown, HTML and plain text; writes EPUB, MOBI, Markdown, HTML, LaTeX,
-            DOCX, Pandoc bundle and plain text. Encrypted files cannot be opened. Formats
+            Reads EPUB, MOBI, AZW3, Markdown, HTML and plain text; writes EPUB, MOBI, Markdown, HTML,
+            HTML (Reader), LaTeX, DOCX, Pandoc bundle and plain text. Drop several files at once to
+            convert them in one go and get them back as a zip. Encrypted files cannot be opened. Formats
             implemented from their public descriptions. A single Markdown or LaTeX file cannot
             carry images; they are left out there. The Pandoc bundle keeps them: a zip with
             book.md and media/.
