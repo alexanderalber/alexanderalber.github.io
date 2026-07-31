@@ -1,7 +1,8 @@
 <!doctype html>
-<html lang="en" data-theme="dark" data-section="miscellaneous">
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
 <head>
   <meta charset="utf-8">
+  <script>(function(){var d='dark',e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(t==='light'||t==='dark'){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(t!=='light'&&t!=='dark')t=d;e.dataset.theme=t;e.dataset.themeDefault=d;e.style.colorScheme=t;})();</script>
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Token & Character Counter - Alexander Alber</title>
@@ -157,28 +158,14 @@
         <li class="lang-switcher">
           <button class="lang-seg" data-lang="en">EN</button><button class="lang-seg" data-lang="de">DE</button>
         </li>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
       </ul>
     </nav>
   </header>
 
-  <script>
-    (function () {
-      var urlLang = new URLSearchParams(location.search).get('lang');
-      if (urlLang === 'en' || urlLang === 'de') { try { localStorage.setItem('lang', urlLang); } catch (e) {} }
-      var l = urlLang;
-      if (l !== 'en' && l !== 'de') { try { l = localStorage.getItem('lang') || 'en'; } catch (e) { l = 'en'; } }
-      document.querySelectorAll('.lang-seg').forEach(function (btn) {
-        if (btn.getAttribute('data-lang') === l) btn.classList.add('active');
-        btn.onclick = function () {
-          var lang = btn.getAttribute('data-lang');
-          try { localStorage.setItem('lang', lang); } catch (e) {}
-          var url = new URL(location.href);
-          if (lang === 'en') url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
-          location.replace(url.href);
-        };
-      });
-    })();
-  </script>
+  <script src="/assets/js/site-nav.js"></script>
 
   <main>
     <script>if((localStorage.getItem('lang')||'en')==='de')document.getElementById('nav-misc').textContent='Sonstiges';</script>
@@ -191,14 +178,168 @@
     <script>(function(){if((localStorage.getItem('lang')||'en')!=='de')return;var r=document.getElementById('root');r.querySelector('h1').textContent='Token- & Zeichenzähler';r.querySelector('p').textContent='Text einfügen und live Tokens, Zeichen, Wörter, Sätze, Zeilen und Bytes zählen. Die Token-Zählung nutzt die echten Tokenizer o200k_base (GPT-4o, GPT-4.1, o-Serie) und cl100k_base (GPT-3.5, GPT-4), jedes Token wird direkt im Text farblich markiert. Praktisch zum Abschätzen von LLM-API-Kosten und Kontextfenster-Auslastung; alles läuft lokal im Browser, nichts wird hochgeladen.';})()</script>
   </main>
 
+  <!-- Core: Zählungen und die beiden Entropie-Schätzer. Reines JS, kein JSX,
+       kein DOM, damit notes/dev den Block extrahieren und testen kann. -->
+  <script id="tccore">
+  (function (global) {
+    'use strict';
+
+    /* ---------- Zählungen ---------------------------------------------------
+       Zeichen = Unicode-Codepoints, konsistent über alle Kacheln hinweg. */
+    var hasSeg = typeof Intl !== 'undefined' && Intl.Segmenter;
+    var wordSeg = hasSeg ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+    var sentSeg = hasSeg ? new Intl.Segmenter(undefined, { granularity: 'sentence' }) : null;
+
+    function countChars(t) { return Array.from(t).length; }
+    function countCharsNoSpace(t) { return Array.from(t.replace(/\s+/g, '')).length; }
+    function countWords(t) {
+      if (!t.trim()) return 0;
+      if (wordSeg) {
+        var n = 0, it = wordSeg.segment(t);
+        for (var s of it) if (s.isWordLike) n++;
+        return n;
+      }
+      return t.trim().split(/\s+/).length;
+    }
+    function countSentences(t) {
+      if (!t.trim()) return 0;
+      if (sentSeg) {
+        var n = 0;
+        for (var s of sentSeg.segment(t)) if (s.segment.trim()) n++;
+        return n;
+      }
+      var m = t.match(/[^.!?…]+[.!?…]+/g);
+      return m ? m.length : 1;
+    }
+    function countLines(t) { return t.length === 0 ? 0 : t.split(/\r\n|\r|\n/).length; }
+    function countBytes(t) { return new TextEncoder().encode(t).length; }
+
+    /* ---------- Schätzer 1: Häufigkeit -------------------------------------
+       Shannon-Entropie 0. Ordnung über die Zeichenhäufigkeit (Bits/Zeichen).
+       Eine Statistik über die Verteilung, keine Codelänge: die Verteilung
+       selbst wird nicht mitgezählt. Sieht keine Muster zwischen Zeichen. */
+    function entropyBits(t) {
+      if (!t) return 0;
+      var cps = Array.from(t), freq = new Map(), i;
+      for (i = 0; i < cps.length; i++) freq.set(cps[i], (freq.get(cps[i]) || 0) + 1);
+      var n = cps.length, h = 0;
+      freq.forEach(function (count) { var p = count / n; h -= p * Math.log2(p); });
+      return h;
+    }
+
+    /* ---------- Schätzer 2: adaptives Kontextmodell ------------------------
+       PPM-D über UTF-8-Bytes: für jedes Byte wird die Wahrscheinlichkeit aus
+       den bis zu ORDER vorangegangenen Bytes geschätzt und -log2(p) aufaddiert.
+       Findet der längste Kontext das Byte nicht, kostet ein Escape den Weg zur
+       nächstkürzeren Ordnung; ganz unten liegt eine Gleichverteilung über die
+       256 Bytewerte. Es wird nur gezählt, nicht kodiert, weil ein
+       arithmetischer Coder die Summe nur um Bruchteile eines Bits verfehlt.
+
+       Damit die Zahl eine echte Codelänge bleibt (ein Dekoder könnte den Text
+       daraus rekonstruieren), gelten drei Regeln: das Modell startet leer, es
+       kennt das Alphabet nicht vorab, und jedes erstmals gesehene Byte wird
+       voll bezahlt.
+
+       Exclusion: Symbole, die eine höhere Ordnung schon ausgeschlossen hat,
+       fallen aus der Verteilung der niedrigeren heraus. Update-Exclusion:
+       aktualisiert werden nur die Ordnungen ab der, die kodiert hat. Beides
+       gemessen an Prosa und Markdown, zusammen etwa 0,1 Bit/Zeichen. */
+    var ORDER = 4;              // Ordnung 5 liegt gleichauf, 3 kostet ~0,14 Bit, 6 wird wieder schlechter
+    var MAX_BYTES = 262144;     // darüber auf dem Präfix schätzen; 200k Zeichen lagen bei ~74 ms
+
+    function ppmBits(bytes, maxOrder) {
+      if (maxOrder === undefined) maxOrder = ORDER;
+      if (bytes.length > MAX_BYTES) bytes = bytes.subarray(0, MAX_BYTES);
+      var levels = [], k;
+      for (k = 0; k <= maxOrder; k++) levels.push(new Map());
+      var excluded = new Uint8Array(256), exList = [], bits = 0, i, j;
+
+      function key(at, order) {
+        if (order === 0) return '';
+        var s = '';
+        for (var q = at - order; q < at; q++) s += String.fromCharCode(bytes[q]);
+        return s;
+      }
+
+      for (i = 0; i < bytes.length; i++) {
+        var sym = bytes[i];
+        for (j = 0; j < exList.length; j++) excluded[exList[j]] = 0;
+        exList.length = 0;
+
+        var coded = false, codedAt = -1;
+        var top = Math.min(maxOrder, i);
+        for (k = top; k >= 0 && !coded; k--) {
+          var node = levels[k].get(key(i, k));
+          if (!node) continue;
+          var t = node.t, d = node.d;
+          if (exList.length) {            // langsamer Pfad nur nach einem Escape
+            t = 0; d = 0;
+            node.c.forEach(function (c, s) { if (!excluded[s]) { t += c; d++; } });
+            if (d === 0) continue;
+          }
+          var cs = node.c.get(sym);
+          if (cs !== undefined && !excluded[sym]) {
+            bits += -Math.log2((2 * cs - 1) / (2 * t));
+            coded = true; codedAt = k;
+          } else {
+            bits += -Math.log2(d / (2 * t));
+            node.c.forEach(function (_, s) {
+              if (!excluded[s]) { excluded[s] = 1; exList.push(s); }
+            });
+          }
+        }
+        if (!coded) bits += Math.log2(256 - exList.length);
+
+        var from = codedAt >= 0 ? codedAt : 0;
+        for (k = from; k <= maxOrder; k++) {
+          if (i < k) break;
+          var kk = key(i, k), nd = levels[k].get(kk);
+          if (!nd) { nd = { c: new Map(), t: 0, d: 0 }; levels[k].set(kk, nd); }
+          var prev = nd.c.get(sym);
+          if (prev === undefined) { nd.c.set(sym, 1); nd.d++; } else nd.c.set(sym, prev + 1);
+          nd.t++;
+        }
+      }
+      return bits;
+    }
+
+    /* Bits pro Zeichen, gemessen an Codepoints wie alle anderen Kacheln.
+       Bei überlangem Text ist es die Rate des Präfixes. */
+    function modelBitsPerChar(text) {
+      var n = Array.from(text).length;
+      if (!n) return 0;
+      var bytes = new TextEncoder().encode(text);
+      if (bytes.length > MAX_BYTES) {
+        var cut = new TextDecoder().decode(bytes.subarray(0, MAX_BYTES));
+        return ppmBits(bytes) / Array.from(cut).length;
+      }
+      return ppmBits(bytes) / n;
+    }
+
+    global.TCCore = {
+      ORDER: ORDER,
+      MAX_BYTES: MAX_BYTES,
+      countChars: countChars,
+      countCharsNoSpace: countCharsNoSpace,
+      countWords: countWords,
+      countSentences: countSentences,
+      countLines: countLines,
+      countBytes: countBytes,
+      entropyBits: entropyBits,
+      ppmBits: ppmBits,
+      modelBitsPerChar: modelBitsPerChar,
+    };
+  })(typeof window !== 'undefined' ? window : globalThis);
+  </script>
+
   <script type="text/babel">
     const { useState, useMemo, useEffect, useRef } = React;
-    const LANG = localStorage.getItem('lang') || 'en';
+    const C = window.TCCore;
+    const LANG = document.documentElement.lang === 'de' ? 'de' : 'en';
 
     const VIZ_CAP = 2500;               // max. Tokens in der Visualisierung
     const DEBOUNCE_MS = 140;            // Verzögerung für Token-Berechnung
-    const COMP_MIN_CHARS = 200;         // ab hier ist die Kompressions-Schätzung aussagekräftig
-    const HAS_CS = typeof CompressionStream !== 'undefined';
+    const MODEL_MIN_CHARS = 100;        // darunter dominiert der Anlauf des Modells die Rate
     const TOK = typeof window !== 'undefined' ? window.GPTTokenizer_o200k_base : null;
     const TOK2 = typeof window !== 'undefined' ? window.GPTTokenizer_cl100k_base : null;
 
@@ -232,8 +373,8 @@
         entropy: "Entropie",
         entropySub: "Bits/Zeichen · Häufigkeit",
         entropy2: "Entropie ≈",
-        entropySub2: "Bits/Zeichen · Kompression",
-        entropyNote: "Entropie schätzt den mittleren Informationsgehalt pro Zeichen (Bits). „Häufigkeit“ ist die Shannon-Entropie 0. Ordnung aus der Zeichenverteilung - eine grobe Obergrenze, die keine Muster zwischen Zeichen sieht. „Kompression“ packt den Text mit deflate und kommt der echten Entropie meist näher, weil sie Wiederholungen und Kontext erfasst; sie braucht aber etwas Text (ab ~200 Zeichen) und bleibt ebenfalls eine Obergrenze. Die echte Entropie liegt unter dem kleineren der beiden Werte.",
+        entropySub2: "Bits/Zeichen · Kontextmodell",
+        entropyNote: "Entropie schätzt den mittleren Informationsgehalt pro Zeichen (Bits). Beide Zahlen sind Obergrenzen, die echte Entropie liegt unter der kleineren. „Häufigkeit“ ist die Shannon-Entropie 0. Ordnung aus der Zeichenverteilung des Textes: sie sieht keine Muster zwischen Zeichen, und sie bekommt diese Verteilung geschenkt, statt sie mitzuzählen. „Kontextmodell“ ist dagegen eine echte Codelänge: ein adaptives PPM-Modell 4. Ordnung liest den Text einmal von links nach rechts, sagt jedes Byte aus den bis zu vier vorangegangenen voraus und summiert die Überraschung auf. Es startet ohne jedes Vorwissen und bezahlt auch jedes erstmals gesehene Zeichen mit, ein Dekoder könnte den Text also allein aus dieser Bitzahl zurückgewinnen.",
         vizTrunc: n => `Ab ${n.toLocaleString('de-DE')} Tokens wird nicht mehr eingefärbt (die Zählung bleibt exakt).`,
         noTokenizer: "Tokenizer konnte nicht geladen werden - Token-Zählung nicht verfügbar.",
         note1: "Beide Zahlen nutzen OpenAI-Tokenizer: o200k_base (GPT-4o, GPT-4.1, o-Serie) und cl100k_base (GPT-3.5, GPT-4, ältere Modelle). Schon zwischen diesen beiden weicht die Tokenzahl für denselben Text ab.",
@@ -266,8 +407,8 @@
         entropy: "Entropy",
         entropySub: "bits/char · frequency",
         entropy2: "Entropy ≈",
-        entropySub2: "bits/char · compression",
-        entropyNote: "Entropy estimates the average information content per character (bits). “Frequency” is the order-0 Shannon entropy from the character distribution - a loose upper bound that sees no patterns between characters. “Compression” packs the text with deflate and usually gets closer to the true entropy because it captures repetition and context; it needs some text (from ~200 characters) and is still an upper bound. The true entropy is below the smaller of the two.",
+        entropySub2: "bits/char · context model",
+        entropyNote: "Entropy estimates the average information content per character (bits). Both numbers are upper bounds; the true entropy is below the smaller one. “Frequency” is the order-0 Shannon entropy from the text's own character distribution: it sees no patterns between characters, and it gets that distribution for free rather than counting it. “Context model” is a genuine code length: an adaptive order-4 PPM model reads the text once from left to right, predicts each byte from up to four preceding ones and adds up the surprise. It starts with no prior knowledge and pays for every character it sees for the first time, so a decoder could recover the text from this bit count alone.",
         vizTrunc: n => `Above ${n.toLocaleString('en-US')} tokens highlighting is off (the count stays exact).`,
         noTokenizer: "Tokenizer failed to load - token counting unavailable.",
         note1: "Both numbers use OpenAI tokenizers: o200k_base (GPT-4o, GPT-4.1, o-series) and cl100k_base (GPT-3.5, GPT-4, older models). Even between these two the token count for the same text differs.",
@@ -278,58 +419,7 @@
       },
     };
 
-    const LOCALE = LANG === 'de' ? 'de-DE' : 'en-US';
-    const fmt = n => n.toLocaleString(LOCALE);
-    const fmt2 = n => n.toLocaleString(LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
-    // Segmenter einmalig anlegen (Wort-/Satzgrenzen)
-    const hasSeg = typeof Intl !== 'undefined' && Intl.Segmenter;
-    const wordSeg = hasSeg ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
-    const sentSeg = hasSeg ? new Intl.Segmenter(undefined, { granularity: 'sentence' }) : null;
-
-    function countChars(t) { return [...t].length; }
-    function countCharsNoSpace(t) { return [...t.replace(/\s+/g, '')].length; }
-    function countWords(t) {
-      if (!t.trim()) return 0;
-      if (wordSeg) { let n = 0; for (const s of wordSeg.segment(t)) if (s.isWordLike) n++; return n; }
-      return t.trim().split(/\s+/).length;
-    }
-    function countSentences(t) {
-      if (!t.trim()) return 0;
-      if (sentSeg) { let n = 0; for (const s of sentSeg.segment(t)) if (s.segment.trim()) n++; return n; }
-      const m = t.match(/[^.!?…]+[.!?…]+/g); return m ? m.length : 1;
-    }
-    function countLines(t) { return t.length === 0 ? 0 : t.split(/\r\n|\r|\n/).length; }
-    function countBytes(t) { return new TextEncoder().encode(t).length; }
-
-    // Kompressions-basierte Entropie-Schätzung: Text mit deflate packen und die
-    // Größe messen. deflate-raw = minimaler Overhead (kein Header/Prüfsumme).
-    // Erfasst Wiederholungen/Muster zwischen Zeichen, also eine engere (aber immer
-    // noch obere) Schranke der echten Entropie als die reine Häufigkeit.
-    async function deflateRawSize(text) {
-      const bytes = new TextEncoder().encode(text);
-      const cs = new CompressionStream('deflate-raw');
-      const writer = cs.writable.getWriter();
-      writer.write(bytes); writer.close();
-      let size = 0;
-      const reader = cs.readable.getReader();
-      for (;;) { const { done, value } = await reader.read(); if (done) break; size += value.length; }
-      return size;
-    }
-
-    // Shannon-Entropie 0. Ordnung über die Zeichenhäufigkeit (Bits/Zeichen).
-    // Zeichen = Unicode-Codepoints, konsistent mit countChars. Ignoriert Muster
-    // zwischen Zeichen und ist daher eine Obergrenze des echten Informationsgehalts.
-    function entropyBits(t) {
-      if (!t) return 0;
-      const cps = [...t];
-      const freq = new Map();
-      for (const c of cps) freq.set(c, (freq.get(c) || 0) + 1);
-      const n = cps.length;
-      let h = 0;
-      for (const count of freq.values()) { const p = count / n; h -= p * Math.log2(p); }
-      return h;
-    }
+    const localeOf = l => (l === 'de' ? 'de-DE' : 'en-US');
 
     // Sichtbare Token-Stücke bauen und pro Stück zählen, wie viele Token-IDs es
     // gekostet hat. decodeGenerator führt Byte-Tokens (z. B. bei Emojis) zu einem
@@ -348,7 +438,18 @@
     }
 
     function TokenCounter() {
-      const t = STRINGS[LANG] || STRINGS.de;
+      // Der Sprachumschalter sitzt im Header, außerhalb der React-Wurzel, und ruft
+      // diesen Hook auf, statt die Seite neu zu laden (siehe assets/js/site-nav.js).
+      const [lang, setLang] = useState(LANG);
+      useEffect(() => {
+        window.__setLang = setLang;
+        return () => { delete window.__setLang; };
+      }, []);
+
+      const t = STRINGS[lang] || STRINGS.en;
+      const locale = localeOf(lang);
+      const fmt = n => n.toLocaleString(locale);
+      const fmt2 = n => n.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const [text, setText] = useState('');
       const [debounced, setDebounced] = useState('');
       const [highlight, setHighlight] = useState(true);
@@ -362,26 +463,20 @@
       }, [text]);
 
       const basic = useMemo(() => ({
-        chars: countChars(text),
-        charsNoSpace: countCharsNoSpace(text),
-        words: countWords(text),
-        sentences: countSentences(text),
-        lines: countLines(text),
-        bytes: countBytes(text),
-        entropy: entropyBits(text),
+        chars: C.countChars(text),
+        charsNoSpace: C.countCharsNoSpace(text),
+        words: C.countWords(text),
+        sentences: C.countSentences(text),
+        lines: C.countLines(text),
+        bytes: C.countBytes(text),
+        entropy: C.entropyBits(text),
       }), [text]);
 
-      // Kompressions-Schätzung (async) auf dem entprellten Text; null = zu kurz / n/a
-      const [compBits, setCompBits] = useState(null);
-      useEffect(() => {
-        if (!HAS_CS) return;
-        const n = [...debounced].length;
-        if (n < COMP_MIN_CHARS) { setCompBits(null); return; }
-        let cancelled = false;
-        deflateRawSize(debounced)
-          .then(size => { if (!cancelled) setCompBits(size * 8 / n); })
-          .catch(() => { if (!cancelled) setCompBits(null); });
-        return () => { cancelled = true; };
+      // Kontextmodell auf dem entprellten Text; null = zu kurz.
+      // Synchron, läuft aber erst nach der Tipppause: gemessen 74 ms bei 200000 Zeichen.
+      const modelBits = useMemo(() => {
+        if (C.countChars(debounced) < MODEL_MIN_CHARS) return null;
+        return C.modelBitsPerChar(debounced);
       }, [debounced]);
 
       const encodeWith = (engine) => {
@@ -517,7 +612,7 @@
             <div className="tc-tile"><div className="num">{fmt(basic.lines)}</div><div className="lbl">{t.lines}</div></div>
             <div className="tc-tile"><div className="num">{fmt(basic.bytes)}</div><div className="lbl">{t.bytes}</div></div>
             <div className="tc-tile"><div className="num">{fmt2(basic.entropy)}</div><div className="lbl">{t.entropy}</div><div className="sub">{t.entropySub}</div></div>
-            {HAS_CS && <div className="tc-tile"><div className="num">{compBits == null ? '-' : fmt2(compBits)}</div><div className="lbl">{t.entropy2}</div><div className="sub">{t.entropySub2}</div></div>}
+            <div className="tc-tile"><div className="num">{modelBits == null ? '-' : fmt2(modelBits)}</div><div className="lbl">{t.entropy2}</div><div className="sub">{t.entropySub2}</div></div>
           </div>
 
           {canToggle && <p className="tc-privacy" style={{ marginTop: 8 }}>{t.heroHint}</p>}
