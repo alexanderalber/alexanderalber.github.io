@@ -78,7 +78,23 @@
   var LANG_SPREAD = 420;     // ms between the first element and the last
   var LANG_TROUGH = 130;     // ms from an element's start to its text swap;
                              // must match the 0% -> 40% leg of @keyframes lang-swap
-  var langGen = 0, langTimers = [];
+  var langGen = 0, langTimers = [], langSweepEl = null;
+
+  /* The sweeping edge. An element's delay depends on its y alone, so everything
+     switching at the same moment lies on a horizontal line and the overlay is a
+     plain top-to-bottom gradient whose bright band sits on that line. Letting x
+     weigh in too would tilt the band, which the theme sweep does but which
+     reads worse on running text: a line of prose would then change from one end
+     to the other. */
+  function langSweep() {
+    var d = document.createElement('div');
+    d.className = 'lang-sweep';
+    document.body.appendChild(d);
+    langSweepEl = d;
+    var gone = function () { if (d.parentNode) d.parentNode.removeChild(d); if (langSweepEl === d) langSweepEl = null; };
+    d.addEventListener('animationend', gone);
+    setTimeout(gone, 1400);  // in case the animation never runs at all
+  }
 
   function langLeaves() {
     var out = [], all = document.body.getElementsByTagName('*');
@@ -114,6 +130,8 @@
       e.classList.remove('lang-swap');
       e.style.animationDelay = '';
     });
+    if (langSweepEl && langSweepEl.parentNode) langSweepEl.parentNode.removeChild(langSweepEl);
+    langSweepEl = null;
   }
   /* When the DOM is ready to diff depends on the tool: React usually commits a
      click-triggered setState in a microtask, but a tool that defers its own
@@ -145,15 +163,14 @@
 
     /* Read all geometry before writing anything back, so this costs one layout
        rather than one per element. */
-    var h = window.innerHeight || 800, w = window.innerWidth || 1200;
+    var h = window.innerHeight || 800;
     var delays = top.map(function (p) {
       var r = p.el.getBoundingClientRect();
-      var y = Math.min(1, Math.max(0, r.top / h));
-      var x = Math.min(1, Math.max(0, r.left / w));
-      return Math.round((y * 0.82 + x * 0.18) * LANG_SPREAD);
+      return Math.round(Math.min(1, Math.max(0, r.top / h)) * LANG_SPREAD);
     });
 
     var gen = ++langGen;
+    langSweep();
     top.forEach(function (p, i) {
       var old = before.get(p.el);
       for (var k = 0; k < p.nodes.length; k++) p.nodes[k].nodeValue = old.vals[k];
