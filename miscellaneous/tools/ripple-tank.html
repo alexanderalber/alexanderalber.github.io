@@ -165,15 +165,25 @@
        C is the Courant number c0*dt/dx; the 2D stability bound is 1/sqrt(2)
        and glass only ever makes c_rel smaller, so 0.5 is safe everywhere.
 
-       The sponge is a band of SPONGE texels along each edge in which both time
-       levels are multiplied by 1 - SPONGE_K * (1 - d/SPONGE)^2 per step. The
-       quadratic ramp matters: a step in damping reflects, a smooth ramp
-       absorbs. The GL sim shader takes all four numbers as uniforms straight
-       from here, so the CPU reference below and the GPU run the same scheme. */
+       The sponge is a band along each edge in which both time levels are
+       multiplied by 1 - SPONGE_K * (1 - d/S)^2 per step. The quadratic ramp
+       matters: a step in damping reflects, a smooth ramp absorbs. Its width
+       has to scale with the wavelength (spongeFor): a fixed 56-texel band
+       reflected ~15% of a default wave on a 2048 grid, which built visible
+       standing stripes within a minute. With a plane source the LEFT edge is
+       exempt, because the source columns sit inside that band and the wave
+       was otherwise eaten on its way out. The GL sim shader takes all these
+       numbers as uniforms straight from here, so the CPU reference below and
+       the GPU run the same scheme. */
 
     var COURANT = 0.5;
-    var SPONGE = 56;         // texels
-    var SPONGE_K = 0.05;     // damping strength at the outermost texel
+    var SPONGE = 56;             // minimum width, texels
+    var SPONGE_PER_LAMBDA = 1.2; // width as a multiple of the wavelength
+    var SPONGE_K = 0.05;         // damping strength at the outermost texel
+
+    function spongeFor(lambdaCells) {
+      return Math.max(SPONGE, Math.round(SPONGE_PER_LAMBDA * Math.max(4, lambdaCells)));
+    }
     var SRC_COLS = 3;        // driven columns of the plane source, texels
     var SRC_RADIUS = 2.5;    // point source radius, texels (scaled up on big grids)
 
@@ -478,7 +488,8 @@
        field: { w, h, u, up } with Float32Arrays of length w*h.
        medium: { wall, glass } same length, or null for free space; glass
        stores slowness 1 - 1/n per cell, exactly like the texture channel.
-       opt: { sponge, srcType ('plane'|'point'|'off'), drive, srcX, srcY } */
+       opt: { sponge, noLeft (exempt the left edge from the sponge),
+              srcType ('plane'|'point'|'off'), drive, srcX, srcY } */
 
     function createField(w, h) {
       return { w: w, h: h, u: new Float32Array(w * h), up: new Float32Array(w * h) };
@@ -501,7 +512,8 @@
           var un = 2 * u[i] - up[i] + C2 * crel * crel * lap;
           var damp = 1;
           if (S > 0) {
-            var d = Math.min(Math.min(x, w - 1 - x), Math.min(y, h - 1 - y));
+            var dl = opt.noLeft ? Infinity : x;
+            var d = Math.min(Math.min(dl, w - 1 - x), Math.min(y, h - 1 - y));
             damp = spongeDamp(d, S);
           }
           un *= damp;
@@ -530,6 +542,7 @@
 
     return {
       COURANT: COURANT, SPONGE: SPONGE, SPONGE_K: SPONGE_K,
+      SPONGE_PER_LAMBDA: SPONGE_PER_LAMBDA, spongeFor: spongeFor,
       SRC_COLS: SRC_COLS, SRC_RADIUS: SRC_RADIUS,
       omegaFor: omegaFor, spongeDamp: spongeDamp, slowness: slowness,
       RANGES: RANGES, RES_STEPS: RES_STEPS, DEFAULTS: DEFAULTS, STATE_KEYS: STATE_KEYS,
@@ -592,7 +605,10 @@
       '  float crel = 1.0 - m.g;',   // glass channel stores slowness 1 - 1/n
       '  float un = 2.0*c.r - c.g + uC2*crel*crel*lap;',
       '  vec2 pf = vec2(p);',
-      '  float d = min(min(pf.x, float(uSize.x-1)-pf.x), min(pf.y, float(uSize.y-1)-pf.y));',
+      // with a plane source the left edge is exempt from the sponge: the
+      // driven columns live there and the wave must leave at full amplitude
+      '  float dl = (uSrcType == 1) ? 1e9 : pf.x;',
+      '  float d = min(min(dl, float(uSize.x-1)-pf.x), min(pf.y, float(uSize.y-1)-pf.y));',
       '  float s = clamp(d / uSponge, 0.0, 1.0);',
       '  float damp = 1.0 - uSpongeK * (1.0-s)*(1.0-s);',
       '  un *= damp;',
@@ -692,11 +708,12 @@
     ].join('\n');
 
     /* Display: diverging colour over u (troughs neg, crests pos, rest mid),
-       optional relief lighting of u as a height field, then the medium drawn
-       on top: glass as a tint the wave stays visible through, walls opaque.
-       The state texture is NEAREST (32F filtering needs an extra extension),
-       so the upsampling bilinear is done by hand. sRGB palettes are mixed in
-       linear light and gamma-encoded at the end. */
+       then the medium drawn on top: glass as a tint the wave stays visible
+       through, walls opaque. Deliberately flat, no lighting: the relief pass
+       of the first version muddied the refraction pictures and washed the
+       light palette grey. The state texture is NEAREST (32F filtering needs
+       an extra extension), so the upsampling bilinear is done by hand. sRGB
+       palettes are mixed in linear light and gamma-encoded at the end. */
     var SHOW = [
       '#version 300 es',
       'precision highp float;',
@@ -723,30 +740,30 @@
       '}',
       'vec3 toLin(vec3 c){ return pow(c, vec3(2.2)); }',
       'void main(){',
-      '  vec2 tx = 1.0 / uGrid;',
-      '  float u  = bilinU(vUv);',
-      '  float ul = bilinU(vUv - vec2(tx.x, 0.0));',
-      '  float ur = bilinU(vUv + vec2(tx.x, 0.0));',
-      '  float ud = bilinU(vUv - vec2(0.0, tx.y));',
-      '  float uu = bilinU(vUv + vec2(0.0, tx.y));',
-      // relief and light direction are baked: they were sliders once and
-      // nobody ever wanted anything but these values
-      '  float t = clamp(u, -1.0, 1.0);',
-      '  vec3 base = t < 0.0 ? mix(toLin(uMid), toLin(uNeg), -t) : mix(toLin(uMid), toLin(uPos), t);',
-      '  vec2 grd = vec2(ur - ul, uu - ud) * 5.0;',
-      '  vec3 n = normalize(vec3(-grd, 1.0));',
-      '  vec3 L = normalize(vec3(-0.5885, 0.8085, 0.6));',
-      '  float diff = max(dot(n, L), 0.0);',
-      '  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));',
-      '  float spec = pow(max(dot(n, H), 0.0), 60.0) * 0.35;',
-      '  vec3 col = base * (0.45 + 0.75 * diff) + vec3(spec);',
+      '  float u = bilinU(vUv);',
+      // mild gain: the far field never reaches the source amplitude, and
+      // without it the light palette reads as pale pastel
+      '  float t = clamp(u * 1.4, -1.0, 1.0);',
+      '  vec3 col = t < 0.0 ? mix(toLin(uMid), toLin(uNeg), -t) : mix(toLin(uMid), toLin(uPos), t);',
       '  vec2 m = texture(uMedium, vUv).rg;',
       // the glass channel is slowness, so rescale it before using it as a tint
       '  col = mix(col, toLin(uGlass), clamp(m.g * 3.0, 0.0, 1.0) * 0.35);',
       '  col = mix(col, toLin(uWall), clamp(m.r * 1.15, 0.0, 1.0));',
-      '  col = col / (1.0 + col * 0.15);',
       '  frag = vec4(pow(clamp(col, 0.0, 1.0), vec3(0.4545)), 1.0);',
       '}'
+    ].join('\n');
+
+    /* Stretch-copy pass, used when the grid is reallocated on resize so the
+       running field and the paint survive instead of restarting. Browser
+       chrome (download bars, moving between monitors) fires ResizeObserver
+       more often than one would think. */
+    var COPY = [
+      '#version 300 es',
+      'precision highp float;',
+      'in vec2 vUv;',
+      'uniform sampler2D uSrc;',
+      'out vec4 frag;',
+      'void main(){ frag = texture(uSrc, vUv); }'
     ].join('\n');
 
     function compile(gl, type, src) {
@@ -788,12 +805,13 @@
       container.innerHTML = '';
       container.appendChild(canvas);
 
-      var simP, brushP, compP, showP, simU, brushU, compU, showU;
+      var simP, brushP, compP, showP, copyP, simU, brushU, compU, showU, copyU;
       try {
         simP = makeProg(gl, VERT, SIM); simU = uni(gl, simP);
         brushP = makeProg(gl, VERT, BRUSH); brushU = uni(gl, brushP);
         compP = makeProg(gl, VERT, COMPOSE); compU = uni(gl, compP);
         showP = makeProg(gl, VERT, SHOW); showU = uni(gl, showP);
+        copyP = makeProg(gl, VERT, COPY); copyU = uni(gl, copyP);
       } catch (e) {
         container.innerHTML = '';
         return null;
@@ -870,9 +888,23 @@
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       }
 
+      function copyInto(fbo, tex) {
+        gl.useProgram(copyP);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.uniform1i(copyU.uSrc, 0);
+        drawInto(fbo);
+      }
+
+      /* Reallocate for a new grid. If a field already exists it is
+         stretch-copied into the new textures instead of being wiped, so a
+         viewport change (download bar, window move) does not restart the
+         simulation. */
       var allocOk = true;
       function allocate(w, h) {
-        freeTargets();
+        var oldState = stateTex[cur], oldPaint = paintTex[pcur];
+        var oldTexs = [stateTex[0], stateTex[1], paintTex[0], paintTex[1], medTex];
+        var oldFbos = [stateFbo[0], stateFbo[1], paintFbo[0], paintFbo[1], medFbo];
         GW = w; GH = h;
         allocOk = true;
         for (var i = 0; i < 2; i++) {
@@ -888,10 +920,19 @@
         if (!m.ok) allocOk = false;
         cur = 0; pcur = 0;
         if (allocOk) {
-          for (var j = 0; j < 2; j++) { clearFbo(stateFbo[j]); clearFbo(paintFbo[j]); }
-          clearFbo(medFbo);
+          clearFbo(stateFbo[1]); clearFbo(paintFbo[1]); clearFbo(medFbo);
+          if (oldState) {
+            copyInto(stateFbo[0], oldState);
+            copyInto(paintFbo[0], oldPaint);
+          } else {
+            clearFbo(stateFbo[0]); clearFbo(paintFbo[0]);
+            stepsSinceClear = 0;
+          }
         }
-        stepsSinceClear = 0;
+        for (var k = 0; k < oldTexs.length; k++) {
+          if (oldTexs[k]) gl.deleteTexture(oldTexs[k]);
+          if (oldFbos[k]) gl.deleteFramebuffer(oldFbos[k]);
+        }
         mediumDirty = true;
         return allocOk;
       }
@@ -946,7 +987,11 @@
         gl.uniform1i(simU.uMedium, 1);
         gl.uniform2i(simU.uSize, GW, GH);
         gl.uniform1f(simU.uC2, core.COURANT * core.COURANT);
-        gl.uniform1f(simU.uSponge, core.SPONGE);
+        // sponge width follows the wavelength, capped so it cannot swallow
+        // more than a quarter of the short grid side
+        var spongeTex = Math.min(core.spongeFor(params.lambda * GH),
+                                 Math.floor(Math.min(GW, GH) * 0.25));
+        gl.uniform1f(simU.uSponge, spongeTex);
         gl.uniform1f(simU.uSpongeK, core.SPONGE_K);
         gl.uniform1f(simU.uDrive, drive);
         gl.uniform1i(simU.uSrcType, srcType);
@@ -1071,7 +1116,7 @@
       canvas.addEventListener('webglcontextlost', onLost);
 
       // ---- main loop
-      var recorder = null, recChunks = [];
+      var recorder = null, recChunks = [], recLoopLeft = 0;
 
       var lastTs = -1, fpsAccum = 0, fpsFrames = 0;
       function frame(ts) {
@@ -1084,6 +1129,13 @@
         if (running) {
           var n = Math.max(1, Math.round(params.steps));
           for (var i = 0; i < n; i++) simStep();
+          if (recorder && recLoopLeft > 0) {
+            recLoopLeft -= n;
+            if (recLoopLeft <= 0) {
+              recLoopLeft = 0;
+              if (recorder.state !== 'inactive') recorder.stop();
+            }
+          }
         }
         display();
 
@@ -1097,7 +1149,7 @@
       }
       rafId = requestAnimationFrame(frame);
 
-      return {
+      var api = {
         setParams: function (p) {
           for (var key in p) if (p.hasOwnProperty(key)) params[key] = p[key];
           if (p.palette !== undefined) palette = core.PALETTE_BY_ID[p.palette] || palette;
@@ -1143,7 +1195,7 @@
         /* WebM capture via MediaRecorder: zero dependencies, and the canvas
            stream captures on present, so preserveDrawingBuffer can stay off.
            Returns false when the browser lacks the machinery. */
-        startRecord: function (onDone) {
+        startRecord: function (onDone, loopSteps) {
           if (recorder || !canvas.captureStream || typeof MediaRecorder === 'undefined') return false;
           var stream = canvas.captureStream(60);
           var mime = MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
@@ -1158,10 +1210,20 @@
             recChunks = []; recorder = null;
             if (onDone) onDone(blob);
           };
+          recLoopLeft = (loopSteps > 0) ? loopSteps : 0;
           recorder.start();
           return true;
         },
+        /* Record exactly one source period (rounded to whole frames), so the
+           file loops seamlessly once the field has settled. */
+        startRecordLoop: function (onDone) {
+          var n = Math.max(1, Math.round(params.steps));
+          var P = 2 * Math.PI / omega();
+          var N = Math.max(n, Math.round(P / n) * n);
+          return api.startRecord(onDone, N);
+        },
         stopRecord: function () {
+          recLoopLeft = 0;
           if (recorder && recorder.state !== 'inactive') recorder.stop();
         },
         snapshot: function () {
@@ -1184,9 +1246,11 @@
           gl.deleteVertexArray(vao);
           gl.deleteProgram(simP); gl.deleteProgram(brushP);
           gl.deleteProgram(compP); gl.deleteProgram(showP);
+          gl.deleteProgram(copyP);
           if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
         }
       };
+      return api;
     }
 
     return { create: create };
@@ -1409,20 +1473,28 @@
         a.click();
       };
 
+      const saveBlob = (blob) => {
+        setRec(false);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'ripple-tank.webm';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      };
+
       const toggleRec = () => {
         const e = engineRef.current;
         if (!e) return;
-        if (rec) { e.stopRecord(); return; }   // onDone below flips the state back
-        const ok = e.startRecord(blob => {
-          setRec(false);
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'ripple-tank.webm';
-          a.click();
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
-        });
-        if (ok) setRec(true);
+        if (rec) { e.stopRecord(); return; }   // saveBlob flips the state back
+        if (e.startRecord(saveBlob)) setRec(true);
+      };
+
+      const recordLoop = () => {
+        const e = engineRef.current;
+        if (!e || rec) return;
+        if (!running) setRunning(true);        // a paused loop would never end
+        if (e.startRecordLoop(saveBlob)) setRec(true);
       };
 
       const copyLink = () => {
@@ -1491,8 +1563,8 @@
                 <button type="button" className="rt-btn lang-seg"
                         onClick={() => engineRef.current && engineRef.current.stepOnce()}>👣 Step</button>
                 <button type="button" className="rt-btn lang-seg"
-                        onClick={() => engineRef.current && engineRef.current.clearWaves()}>Still water</button>
-                <button type="button" className="rt-btn lang-seg" onClick={clearAll}>Clear all</button>
+                        onClick={() => engineRef.current && engineRef.current.clearWaves()}>Still</button>
+                <button type="button" className="rt-btn lang-seg" onClick={clearAll}>Reset</button>
               </div>
 
               <div className="rt-row" style={{ marginBottom: 8 }}>
@@ -1613,9 +1685,8 @@
                        value={st.res} onChange={v => set({ res: v })} />
                 </div>
                 <p style={{ fontSize: 11, color: COL.foot, margin: '7px 0 0', lineHeight: 1.6 }}>
-                  Cells on the long edge. Changing it stills the water and clears paint;
-                  shapes stay. The wavelength is a fraction of the screen, so the picture
-                  survives the change.
+                  Cells on the long edge. The wavelength is a fraction of the screen and
+                  the field is carried over, so the picture survives the change.
                 </p>
               </Section>
 
@@ -1626,13 +1697,18 @@
                           style={rec ? { color: '#f87171', borderColor: '#f87171' } : null}>
                     {rec ? '⏹ Stop recording' : '⏺ Record video'}
                   </button>
+                  <button type="button" className="rt-btn lang-seg" onClick={recordLoop} disabled={rec}>
+                    ⟳ Record loop
+                  </button>
                   <button type="button" className="rt-btn lang-seg" onClick={copyLink}>
                     {copied ? 'Copied' : 'Copy link'}
                   </button>
                 </div>
                 <p style={{ fontSize: 11, color: COL.foot, margin: '7px 0 0', lineHeight: 1.6 }}>
                   Recording captures the canvas as WebM until you stop it, then downloads.
-                  The link carries the settings and the shapes, not the paint.
+                  Record loop stops itself after exactly one source period, so the file
+                  loops seamlessly once the field has settled. The link carries the
+                  settings and the shapes, not the paint.
                 </p>
               </Section>
 
@@ -1662,11 +1738,11 @@
                   </p>
                   <p>
                     The colours are a diverging map over the wave height: one hue for
-                    crests, one for troughs, still water sits at the midpoint. A touch
-                    of relief lighting draws the field as a surface, which is closest
-                    to what an actual ripple tank projects onto its floor. Every piece
-                    of glass carries its own n; painted glass bakes in the n it was
-                    painted with.
+                    crests, one for troughs, still water sits at the midpoint. Every
+                    piece of glass carries its own n; painted glass bakes in the n it
+                    was painted with. The absorbing band at the edges is about one
+                    wavelength deep, so long waves dim visibly towards the border;
+                    that is the sponge doing its job, not a rendering bug.
                   </p>
                   <p style={{ color: COL.foot }}>
                     Everything runs on your GPU, nothing is uploaded anywhere. The
