@@ -76,25 +76,10 @@
      thousands of nodes. */
   var LANG_FADE_MAX = 500;   // above this the stagger is skipped entirely
   var LANG_SPREAD = 420;     // ms between the first element and the last
-  var LANG_TROUGH = 130;     // ms from an element's start to its text swap;
+  var LANG_TROUGH = 168;     // ms from an element's start to its text swap;
                              // must match the 0% -> 40% leg of @keyframes lang-swap
-  var langGen = 0, langTimers = [], langSweepEl = null;
-
-  /* The sweeping edge. An element's delay depends on its y alone, so everything
-     switching at the same moment lies on a horizontal line and the overlay is a
-     plain top-to-bottom gradient whose bright band sits on that line. Letting x
-     weigh in too would tilt the band, which the theme sweep does but which
-     reads worse on running text: a line of prose would then change from one end
-     to the other. */
-  function langSweep() {
-    var d = document.createElement('div');
-    d.className = 'lang-sweep';
-    document.body.appendChild(d);
-    langSweepEl = d;
-    var gone = function () { if (d.parentNode) d.parentNode.removeChild(d); if (langSweepEl === d) langSweepEl = null; };
-    d.addEventListener('animationend', gone);
-    setTimeout(gone, 1400);  // in case the animation never runs at all
-  }
+                             // (40% of its 0.42s), where the element is blank
+  var langGen = 0, langTimers = [];
 
   function langLeaves() {
     var out = [], all = document.body.getElementsByTagName('*');
@@ -130,8 +115,6 @@
       e.classList.remove('lang-swap');
       e.style.animationDelay = '';
     });
-    if (langSweepEl && langSweepEl.parentNode) langSweepEl.parentNode.removeChild(langSweepEl);
-    langSweepEl = null;
   }
   /* When the DOM is ready to diff depends on the tool: React usually commits a
      click-triggered setState in a microtask, but a tool that defers its own
@@ -170,7 +153,6 @@
     });
 
     var gen = ++langGen;
-    langSweep();
     top.forEach(function (p, i) {
       var old = before.get(p.el);
       for (var k = 0; k < p.nodes.length; k++) p.nodes[k].nodeValue = old.vals[k];
@@ -189,6 +171,132 @@
       top.forEach(function (p) { p.el.classList.remove('lang-swap'); p.el.style.animationDelay = ''; });
     }, LANG_SPREAD + 500);
     return true;
+  }
+
+  /* The channel split, as a post effect on the finished page rather than on the
+     text. A view transition hands us the old and the new page as two textures;
+     the old one is put through an SVG filter that shifts its red channel one
+     way and its green and blue the other, and the new one wipes down over it.
+     Everything on the page comes apart, not just the glyphs: rules, cards,
+     charts, images.
+
+     The displacement is not applied to the whole snapshot but to a band, and
+     the band travels with the wipe. A filter has no notion of where the wipe
+     currently is, so the position has to live inside the filter: each one
+     carries its own band, and the keyframes step through them. Splitting the
+     entire page uniformly, which is what a single filter does, reads as three
+     separate events instead of one wave: everything comes apart, the edge
+     crosses, everything closes up.
+
+     `filter` interpolates discretely between two url()s, so a step is all a
+     keyframe can do anyway. Enough steps and a band soft enough to overlap
+     between them, and it passes for a moving band. Driving one filter's
+     parameters per frame would be truly continuous, but it would also re-filter
+     a full-page texture sixty times a second, which is the one thing here that
+     could actually stutter.
+
+     Injected once, on first use, into a zero-sized inert svg. */
+  var LANG_SPLIT_PX = 10;    // px of channel offset inside the band
+  var LANG_BAND = 0.10;      // half height of the band, in viewport heights,
+                             // before the blur widens it further
+  var LANG_BLUR = 40;        // px of blur on the band's edges
+  var LANG_STEPS = 24;       // positions the band is stepped through
+  var LANG_TRAVEL = [-0.12, 1.12];  // where the band starts and ends, in the
+                                    // same units as the wipe's mask-position
+
+  /* The band is a flooded rectangle in its own subregion, blurred soft. The
+     obvious way to draw it, feImage with a generated gradient, is the way not
+     to: feImage fetches its image asynchronously, and until it arrives the
+     filtered element does not render at all. With two dozen of them the whole
+     transition sat there showing nothing and then snapped. feFlood needs
+     nothing from outside and is there on the first frame.
+
+     The blur's own subregion has to be stated. A primitive's default subregion
+     is the union of its inputs', which for the blur is the band rectangle: the
+     softness would be clipped away at exactly the edges it is meant to soften. */
+  function langBandDefs(c, pad) {
+    var top = c - LANG_BAND, bot = c + LANG_BAND;
+    var y = Math.min(1, Math.max(0, top)), h = Math.min(1, Math.max(0, bot)) - y;
+    if (h <= 0) return '<feFlood flood-opacity="0" result="band"/>';
+    // The blur only needs the band plus the reach of the blur itself, not the
+    // whole page. Everything outside is transparent and blurs to transparent,
+    // and a gaussian costs its area: on a large screen this is most of the work
+    // of the whole chain, and most of it would be spent on nothing.
+    var by = Math.max(0, y - pad), bh = Math.min(1 - by, h + 2 * pad);
+    return '<feFlood flood-color="#fff" flood-opacity="1" x="-5%" width="110%"' +
+      ' y="' + (y * 100).toFixed(2) + '%" height="' + (h * 100).toFixed(2) + '%" result="raw"/>' +
+      '<feGaussianBlur in="raw" stdDeviation="' + LANG_BLUR + '"' +
+      ' x="-5%" width="110%" y="' + (by * 100).toFixed(2) + '%"' +
+      ' height="' + (bh * 100).toFixed(2) + '%" result="band"/>';
+  }
+
+  function langFilters() {
+    if (document.getElementById('lang-split-defs')) return;
+    var i, svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.id = 'lang-split-defs';
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('width', '0');
+    svg.setAttribute('height', '0');
+    svg.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden';
+
+    /* How much of the chain a machine has to do is set here, not by the machine.
+       Each step is one full-page evaluation of the filter per snapshot, so the
+       work scales with steps times device pixels. A 3090 at 1440p does not care;
+       an integrated chip on a dense laptop screen, or a browser that puts SVG
+       reference filters on the CPU, very much does. So the step count is bought
+       against the pixel count: full detail up to about 1440p, down to a floor of
+       ten on a 5K screen, where each step costs seven times as much. Ten steps
+       through a band this soft still overlap, they just march a little more
+       visibly. */
+    var dpr = window.devicePixelRatio || 1;
+    var area = (window.innerWidth || 1200) * (window.innerHeight || 800) * dpr * dpr;
+    var steps = Math.max(10, Math.min(LANG_STEPS, Math.round(LANG_STEPS * 4.2e6 / area)));
+    var pad = Math.min(0.4, 3 * LANG_BLUR / (window.innerHeight || 800));
+
+    var defs = '', d = LANG_SPLIT_PX;
+    for (i = 0; i < steps; i++) {
+      var c = LANG_TRAVEL[0] + (LANG_TRAVEL[1] - LANG_TRAVEL[0]) * (i + 0.5) / steps;
+      // Two copies with disjoint channels, screened back together: where one
+      // operand is 0 in a channel, screen returns the other unchanged, so this
+      // recombines rather than brightens. sRGB, or the detour through linear
+      // light would shift every colour on the page. Then the split is composited
+      // into the band and the untouched page into everything else, so an empty
+      // band leaves the page whole rather than blank.
+      // The region is widened sideways to give the offset copies room, but not
+      // vertically: the band's subregion is in percentages of this region, so
+      // slack at the top and bottom would shift it away from the wipe's edge.
+      defs += '<filter id="lang-wave-' + i + '" x="-5%" y="0%" width="110%" height="100%"' +
+        ' color-interpolation-filters="sRGB">' +
+        langBandDefs(c, pad) +
+        '<feOffset in="SourceGraphic" dx="' + d + '" dy="0" result="a"/>' +
+        '<feOffset in="SourceGraphic" dx="' + (-d) + '" dy="0" result="b"/>' +
+        '<feColorMatrix in="a" type="matrix" result="ar" values="' +
+          '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0"/>' +
+        '<feColorMatrix in="b" type="matrix" result="bgb" values="' +
+          '0 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"/>' +
+        '<feBlend in="ar" in2="bgb" mode="screen" result="split"/>' +
+        '<feComposite in="split" in2="band" operator="in" result="inband"/>' +
+        '<feComposite in="SourceGraphic" in2="band" operator="out" result="whole"/>' +
+        '<feMerge><feMergeNode in="whole"/><feMergeNode in="inband"/></feMerge>' +
+        '</filter>';
+    }
+    svg.innerHTML = defs;
+    document.body.appendChild(svg);
+
+    /* The matching walk. One keyframe per band position, evenly spaced, so the
+       band moves at the same steady rate as the wipe and stays with it. Kept
+       next to the filters rather than in custom.css, where it would have to be
+       rewritten by hand every time LANG_STEPS changes. */
+    var kf = '';
+    for (i = 0; i < steps; i++) {
+      kf += (100 * i / steps).toFixed(2) + '%{filter:url(#lang-wave-' + i + ')}';
+    }
+    kf += '100%{filter:none}';   // the band has left the screen by then anyway,
+                                 // but this way the run ends on an unfiltered
+                                 // frame rather than on the last step's
+    var st = document.createElement('style');
+    st.textContent = '@keyframes lang-vt-wave{' + kf + '}';
+    document.head.appendChild(st);
   }
 
   /* Language switcher, bilingual pages only (they carry data-lang-default on
@@ -224,13 +332,38 @@
         if (lang === def) url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
         if (window.__setLang) {
           history.replaceState(null, '', url.href);
-          langFlush();
-          var before = langSnapshot();
-          el.lang = lang;
-          mark(lang);
-          relabel(lang);
-          window.__setLang(lang);
-          langFadeSoon(before);
+          var swap = function () {
+            el.lang = lang;
+            mark(lang);
+            relabel(lang);
+            window.__setLang(lang);
+          };
+          var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+          if (!still && document.startViewTransition) {
+            langFilters();
+            el.classList.add('lang-vt');   // scopes the transition CSS, so the
+                                           // theme sweep's rules do not apply
+            var vt = document.startViewTransition(function () {
+              swap();
+              // React commits the re-render off the click, not during it, and
+              // the transition captures the new page as soon as this resolves.
+              // A short timer is the one wait that is guaranteed to fire while
+              // the transition holds the frame.
+              return new Promise(function (res) { setTimeout(res, 30); });
+            });
+            var clear = function () { el.classList.remove('lang-vt'); };
+            if (vt && vt.finished && vt.finished.then) vt.finished.then(clear, clear);
+            else setTimeout(clear, 1200);
+          } else if (still) {
+            swap();
+          } else {
+            // No view transitions: the per-element wave does the same job by
+            // hand, holding each element's old wording until its turn.
+            langFlush();
+            var before = langSnapshot();
+            swap();
+            langFadeSoon(before);
+          }
         } else {
           location.replace(url.href);
         }
