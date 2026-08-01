@@ -48,6 +48,36 @@
       max-width: 110px; display: inline-block; margin: 0; font-size: 14px; }
     .lf-note { border: 1px solid #78350f; background: rgba(120,53,15,.15); border-radius: 8px;
       padding: 10px 14px; color: #d9a05b; font-size: 13px; }
+    /* Family pills: freestanding buttons with gaps, like the category pills in
+       child-dev-timeline. They cannot reuse .lang-seg, which is built for a
+       joined bar: its first/last-child rules square off the inner corners and
+       drop one border, which only reads correctly when the buttons touch.
+       Everything else (size, colours, active fill) follows .lang-seg so the row
+       still belongs to this page. */
+    .lf-fampills { display: flex; flex-wrap: wrap; gap: 8px; }
+    .lf-fam { font-size: 0.72rem; padding: 3px 10px; margin: 0; width: auto;
+      background: transparent; border: 1px solid var(--pico-muted-border-color);
+      border-radius: 8px; cursor: pointer; color: var(--pico-muted-color);
+      line-height: 1.6; white-space: nowrap;
+      transition: background .12s, color .12s, border-color .12s; }
+    /* Text on the filled pill is --tool-ink, not --pico-background-color as in
+       .lang-seg.active. Pico redefines --pico-background-color to
+       --pico-primary-background on every button, so inside one it resolves to
+       Pico's saturated default blue instead of the page colour, and the label
+       ends up blue on blue. --tool-ink is the site's variable for exactly this
+       ("dark text on light chips" in dark, light text on dark chips in light)
+       and it tracks the theme on its own. */
+    .lf-fam.active { background: var(--pico-primary); color: var(--tool-ink);
+      border-color: var(--pico-primary); }
+    .lf-fam:hover:not(.active), .lf-fam:focus:not(.active) {
+      background: transparent; border-color: var(--pico-primary); color: var(--pico-primary); }
+
+    /* Bulk actions next to the family pills: quieter than a segment, so the
+       pills stay the thing you look at. */
+    .lf-linkbtn { background: none; border: none; padding: 2px 4px; margin: 0; width: auto;
+      font-size: 12px; color: var(--tool-note); text-decoration: underline; cursor: pointer; }
+    .lf-linkbtn:hover:not(:disabled) { color: var(--tool-emph); }
+    .lf-linkbtn:disabled { opacity: .4; cursor: default; text-decoration: none; }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -328,6 +358,10 @@
     { id: '2026-07', label: 'July 2026', file: '/assets/files/llm-landscape-2026-07.json' }
   ];
 
+  // `reserve` is memory the box needs for something other than the model. It is
+  // 0 for a discrete GPU (the OS lives in system RAM) and non-zero only for
+  // unified-memory machines, where weights and operating system share the same
+  // pool and the nominal capacity is not the budget.
   const GPUS = [
     { id: '3060',    label: 'RTX 3060 12GB',      vram: 12, bw: 360 },
     { id: '4070tis', label: 'RTX 4070 Ti S 16GB', vram: 16, bw: 672 },
@@ -335,6 +369,10 @@
     { id: '5090',    label: 'RTX 5090 32GB',      vram: 32, bw: 1792 },
     { id: '2x3090',  label: '2× RTX 3090 48GB', vram: 48, bw: 936 },
     { id: 'pro6000', label: 'RTX Pro 6000 96GB', vram: 96, bw: 1792 },
+    { id: 'spark',   label: 'DGX Spark 128GB',   vram: 128, bw: 273, reserve: 8,
+      note: 'GB10 Grace Blackwell: 128 GB unified LPDDR5X shared with the OS, so about 120 GB is left for a model. ' +
+            'Bandwidth is 273 GB/s, roughly a seventh of an RTX 5090, and decode speed follows bandwidth: this box buys ' +
+            'you size, not tokens per second.' },
     { id: 'custom',  label: 'Custom', vram: null, bw: null }
   ];
 
@@ -371,6 +409,38 @@
             onClick={() => onChange(o.value)}>{o.label}</button>
         ))}
       </div>
+    );
+  }
+
+  // Model families for the visibility filter. Grouping is by creator, with two
+  // aliases: the Mistral/NVIDIA collaboration (Mistral NeMo) belongs with the
+  // rest of Mistral rather than opening a family of one, and Zhipu's double
+  // name does not fit on a pill.
+  const FAMILY_ALIAS = { 'Mistral / NVIDIA': 'Mistral', 'Zhipu / Z.AI': 'Zhipu' };
+  const familyOf = m => FAMILY_ALIAS[m.creator] || m.creator;
+
+  // Deliberately NOT colour-coded per family, unlike the category pills in
+  // child-dev-timeline: in this chart colour already means fits / best pick /
+  // too big, and a second colour meaning would collide with the legend. The
+  // pills only switch models on and off; the dots keep their fit colours.
+  function FamilyFilter({ families, hidden, onToggle, onSet }) {
+    const visible = families.filter(f => !hidden.has(f.name)).length;
+    return (
+      <>
+        <div className="lf-fampills">
+          {families.map(f => (
+            <button key={f.name} className={'lf-fam' + (hidden.has(f.name) ? '' : ' active')}
+              aria-pressed={!hidden.has(f.name)} onClick={() => onToggle(f.name)}
+              title={hidden.has(f.name) ? 'Show ' + f.name : 'Hide ' + f.name}>
+              {f.name}<span style={{ fontSize: 11, opacity: 0.65, marginLeft: 5 }}>{f.n}</span>
+            </button>
+          ))}
+        </div>
+        <button className="lf-linkbtn" onClick={() => onSet(new Set())}
+          disabled={visible === families.length}>all</button>
+        <button className="lf-linkbtn" onClick={() => onSet(new Set(families.map(f => f.name)))}
+          disabled={visible === 0}>none</button>
+      </>
     );
   }
 
@@ -475,7 +545,7 @@
             <polyline points={frontier.map(p => p.x + ',' + p.y).join(' ')} fill="none" stroke={COL.fit} strokeWidth="2" opacity="0.55" strokeLinejoin="round" strokeLinecap="round" />}
 
           {/* Quantization ladders: where the same model sits at other precisions.
-              Only for the best pick and whatever is hovered, since 45 ladders at
+              Only for the best pick and whatever is hovered, since 46 ladders at
               once is a hairball. */}
           {ladders.map(({ r, col }) => {
             const rungs = r.ladder.map(c => ({ c, x: X(c.need.total), y: Y(c.score.mid) }))
@@ -699,10 +769,15 @@
   }
 
   // ── Best pick card ──────────────────────────────────────────────────────
-  function BestCard({ best, rows, anchors, budget }) {
+  function BestCard({ best, rows, anchors, budget, allHidden }) {
+    // Two different nothings: an empty budget and an empty filter. Saying
+    // "nothing fits" when the user just switched every family off would send
+    // them hunting for a hardware problem they do not have.
     if (!best) return (
       <div className="lf-card" style={{ marginBottom: 18 }}>
-        <p style={{ margin: 0, color: COL.label }}>Nothing in the dataset fits this budget at the chosen context. Try a shorter context or 8-bit KV cache.</p>
+        <p style={{ margin: 0, color: COL.label }}>{allHidden
+          ? 'Every model family is switched off. Turn one back on above.'
+          : 'Nothing in the dataset fits this budget at the chosen context. Try a shorter context or 8-bit KV cache.'}</p>
       </div>
     );
     const eq = eqSentence(C.equivalence(best.cfg.score, anchors));
@@ -788,6 +863,9 @@
     const [customBw, setCustomBw] = useState('');
     const [context, setContext] = useState(16384);
     const [kv, setKv] = useState(2); // bytes per element: 2 = FP16, 1 = Q8
+    // Hidden rather than visible families, so a family that appears in a later
+    // snapshot shows up by default instead of being invisible until noticed.
+    const [hidden, setHidden] = useState(() => new Set());
 
     useEffect(() => {
       fetch(DATA_FILES[0].file)
@@ -796,13 +874,34 @@
     }, []);
 
     const preset = GPUS.find(g => g.id === gpu);
-    const budget = preset.vram != null ? preset.vram : (parseFloat(customVram) || 0);
+    const budget = preset.vram != null ? preset.vram - (preset.reserve || 0) : (parseFloat(customVram) || 0);
     const bw = preset.vram != null ? preset.bw : (parseFloat(customBw) || null);
 
-    const rows = useMemo(() => data
+    const allRows = useMemo(() => data
       ? C.evaluate(data, { context, bytesPerElem: kv, budgetGiB: budget, bwGBps: bw })
       : [], [data, context, kv, budget, bw]);
+
+    // Families in descending model count, so the big catalogues sit at the
+    // front of the row where they are easiest to hit.
+    const families = useMemo(() => {
+      const n = new Map();
+      (data ? data.models : []).forEach(m => { const f = familyOf(m); n.set(f, (n.get(f) || 0) + 1); });
+      return [...n].map(([name, count]) => ({ name, n: count }))
+        .sort((a, b) => b.n - a.n || a.name.localeCompare(b.name));
+    }, [data]);
+
+    // The filter runs after evaluate, so hiding a family really removes it from
+    // every downstream reading: best pick, Pareto frontier and the trend fit.
+    // That is the point, it lets you ask what the local frontier looks like
+    // without a given lab.
+    const rows = useMemo(() => allRows.filter(r => !hidden.has(familyOf(r.model))), [allRows, hidden]);
     const best = useMemo(() => C.bestPick(rows), [rows]);
+    const allHidden = allRows.length > 0 && rows.length === 0;
+    const toggleFamily = name => setHidden(prev => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
 
     return (
       <div className="container">
@@ -827,6 +926,8 @@
             <Row label="GPU:">
               <Seg options={GPUS.map(g => ({ value: g.id, label: g.label }))} value={gpu} onChange={setGpu} />
             </Row>
+            {preset.note &&
+              <p style={{ margin: '2px 0 8px', fontSize: 12, color: COL.foot, maxWidth: '70ch' }}>{preset.note}</p>}
             {gpu === 'custom' &&
               <Row label="Custom:">
                 <input className="lf-input" type="number" min="1" max="512" step="1" value={customVram}
@@ -842,9 +943,12 @@
             <Row label="KV cache:">
               <Seg options={[{ value: 2, label: 'FP16' }, { value: 1, label: 'Q8' }]} value={kv} onChange={setKv} />
             </Row>
+            <Row label="Families:">
+              <FamilyFilter families={families} hidden={hidden} onToggle={toggleFamily} onSet={setHidden} />
+            </Row>
           </div>
 
-          <BestCard best={best} rows={rows} anchors={data.anchors} budget={budget} />
+          <BestCard best={best} rows={rows} anchors={data.anchors} budget={budget} allHidden={allHidden} />
 
           <div className="lf-legend" aria-hidden="true">
             <span style={{ '--dot': COL.fit }}>fits your GPU</span>
@@ -856,7 +960,11 @@
 
           <TrendSection rows={rows} anchors={data.anchors} snapshot={data.meta.snapshot} />
 
-          <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>All models</h2>
+          <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>
+            {rows.length === allRows.length ? 'All models' : 'Models shown'}
+            {rows.length !== allRows.length &&
+              <span style={{ fontSize: '0.8rem', color: COL.foot, fontWeight: 400 }}> {rows.length} of {allRows.length}</span>}
+          </h2>
           <Table rows={rows} budget={budget} />
 
           <h2 style={{ fontSize: '1.1rem', color: COL.text, marginTop: 26 }}>Assumptions</h2>
@@ -865,7 +973,9 @@
               ({data.meta.quants.map(q => q.label.replace(/ \(.*/, '') + ' ' + q.bpw).join(', ')} bits per weight). GB means GiB, matching how VRAM is marketed.</li>
             <li>KV cache: 2 &times; layers &times; KV heads &times; head dim &times; context &times; bytes per element, per attention type
               (sliding-window layers cap at their window; linear-attention layers hold no per-token cache). Plus a flat {C.OVERHEAD_GIB} GB
-              runtime overhead; a config "fits" when it needs at most {Math.round(C.FIT_MARGIN * 100)}% of nominal VRAM.</li>
+              runtime overhead; a config "fits" when it needs at most {Math.round(C.FIT_MARGIN * 100)}% of the budget. On unified-memory
+              machines the budget is the nominal capacity minus what the operating system keeps for itself, because there weights and OS
+              share one pool.</li>
             <li>Quality: composite intelligence index ({data.meta.scale.name}), reasoning mode where available. Quantization
               degradation is applied as a relative penalty with wide uncertainty, since public evidence is thin. The bands are the honest
               part of this tool: differences within overlapping bands are not meaningful. The published score is the fp16 number, and the
