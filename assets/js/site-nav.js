@@ -56,6 +56,124 @@
     });
   })();
 
+  /* Staggered swap for a live language switch. React updates the text nodes in
+     place, so the elements survive the re-render and we can diff them: snapshot
+     every leaf element's own text before the switch, compare afterwards, and
+     touch only what actually changed.
+
+     React swaps all of it in one commit, which is exactly what we do not want,
+     so the new text is taken away again right after the diff and each element
+     is put back to its old wording. Every element then gets its own timer, its
+     delay taken from its position on screen: it fades out, its text is set at
+     the trough of the fade, it fades back in. The new wording therefore washes
+     down the page over roughly a second instead of appearing at once. The
+     mutation is invisible to React: its own vdom already holds the new text,
+     so it will not fight us for the nodes, and our timers converge on the same
+     state a beat later.
+
+     Nested matches are dropped (the outermost animated ancestor covers them),
+     and a very large changed set is left to switch hard rather than animating
+     thousands of nodes. */
+  var LANG_FADE_MAX = 500;   // above this the stagger is skipped entirely
+  var LANG_SPREAD = 420;     // ms between the first element and the last
+  var LANG_TROUGH = 130;     // ms from an element's start to its text swap;
+                             // must match the 0% -> 40% leg of @keyframes lang-swap
+  var langGen = 0, langTimers = [];
+
+  function langLeaves() {
+    var out = [], all = document.body.getElementsByTagName('*');
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i], t = e.tagName;
+      if (t === 'SCRIPT' || t === 'STYLE' || t === 'CANVAS' || t === 'OPTION') continue;
+      var nodes = [], vals = [], any = false;
+      for (var n = e.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType !== 3) continue;
+        nodes.push(n); vals.push(n.nodeValue);
+        if (!any && n.nodeValue.trim()) any = true;
+      }
+      if (any) out.push({ el: e, nodes: nodes, vals: vals, key: vals.join('\u0000') });
+    }
+    return out;
+  }
+  function langSnapshot() {
+    var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (still) return null;
+    var leaves = langLeaves();
+    if (leaves.length > 4000) return null;
+    var m = new Map();
+    leaves.forEach(function (p) { m.set(p.el, p); });
+    return m;
+  }
+  /* A second click while the wave is still running: run every pending swap now,
+     so nothing is left holding text from the language before last. */
+  function langFlush() {
+    langGen++;
+    langTimers.forEach(function (t) { clearTimeout(t.id); t.done(); });
+    langTimers = [];
+    document.querySelectorAll('.lang-swap').forEach(function (e) {
+      e.classList.remove('lang-swap');
+      e.style.animationDelay = '';
+    });
+  }
+  /* When the DOM is ready to diff depends on the tool: React usually commits a
+     click-triggered setState in a microtask, but a tool that defers its own
+     work needs one more beat. Retry until something changed, then stop. */
+  function langFadeSoon(before) {
+    if (!before) return;
+    var tries = 0;
+    var attempt = function () {
+      if (langFade(before)) return;
+      if (++tries === 1) requestAnimationFrame(attempt);
+      else if (tries < 4) setTimeout(attempt, 40);
+    };
+    Promise.resolve().then(attempt);
+  }
+  function langFade(before) {
+    if (!before) return false;
+    var changed = langLeaves().filter(function (p) {
+      var old = before.get(p.el);
+      return old && old.key !== p.key && old.nodes.length === p.nodes.length;
+    });
+    if (!changed.length) return false;
+    if (changed.length > LANG_FADE_MAX) return true;
+
+    var set = new Set(changed.map(function (p) { return p.el; }));
+    var top = changed.filter(function (p) {
+      for (var a = p.el.parentElement; a; a = a.parentElement) { if (set.has(a)) return false; }
+      return true;
+    });
+
+    /* Read all geometry before writing anything back, so this costs one layout
+       rather than one per element. */
+    var h = window.innerHeight || 800, w = window.innerWidth || 1200;
+    var delays = top.map(function (p) {
+      var r = p.el.getBoundingClientRect();
+      var y = Math.min(1, Math.max(0, r.top / h));
+      var x = Math.min(1, Math.max(0, r.left / w));
+      return Math.round((y * 0.82 + x * 0.18) * LANG_SPREAD);
+    });
+
+    var gen = ++langGen;
+    top.forEach(function (p, i) {
+      var old = before.get(p.el);
+      for (var k = 0; k < p.nodes.length; k++) p.nodes[k].nodeValue = old.vals[k];
+      p.el.style.animationDelay = delays[i] + 'ms';
+      p.el.classList.add('lang-swap');
+      var done = function () {
+        for (var k = 0; k < p.nodes.length; k++) p.nodes[k].nodeValue = p.vals[k];
+      };
+      langTimers.push({ id: setTimeout(function () {
+        if (gen === langGen) done();
+      }, delays[i] + LANG_TROUGH), done: done });
+    });
+    setTimeout(function () {
+      if (gen !== langGen) return;
+      langTimers = [];
+      top.forEach(function (p) { p.el.classList.remove('lang-swap'); p.el.style.animationDelay = ''; });
+    }, LANG_SPREAD + 500);
+    return true;
+  }
+
   /* Language switcher, bilingual pages only (they carry data-lang-default on
      <html>). By default a click reloads with the new lang. A page that wants to
      switch live registers window.__setLang(lang) — the React app re-renders from
@@ -89,10 +207,13 @@
         if (lang === def) url.searchParams.delete('lang'); else url.searchParams.set('lang', lang);
         if (window.__setLang) {
           history.replaceState(null, '', url.href);
+          langFlush();
+          var before = langSnapshot();
           el.lang = lang;
           mark(lang);
           relabel(lang);
           window.__setLang(lang);
+          langFadeSoon(before);
         } else {
           location.replace(url.href);
         }
