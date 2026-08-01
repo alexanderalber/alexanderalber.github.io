@@ -207,8 +207,14 @@
       lambda: [0.02, 0.30],
       n: [1.1, 3.0],
       steps: [1, 8],
-      brush: [0.006, 0.08]
+      brush: [0.006, 0.08],
+      gain: [0.3, 3.0]
     };
+
+    /* Time constant of the intensity view's moving average of u^2, in source
+       periods. Long enough to hold the pattern steady, short enough to follow
+       a dragged lens within a second or two. */
+    var ACC_PERIODS = 2.5;
 
     /* The medium texture's glass channel stores slowness 1 - 1/n directly
        (0 = free space, 0.67 = n of 3), so every piece of glass can carry its
@@ -371,10 +377,10 @@
       lambda: 0.08, n: 1.5,
       steps: 1, res: 1024, palette: 'hollywood',
       source: 'plane', srcX: 0.22, srcY: 0.5,
-      brush: 0.02
+      brush: 0.02, gain: 1.0, view: 'waves'
     };
 
-    var STATE_KEYS = ['lambda', 'n', 'steps', 'res', 'brush', 'srcX', 'srcY'];
+    var STATE_KEYS = ['lambda', 'n', 'steps', 'res', 'brush', 'srcX', 'srcY', 'gain'];
     var RES_STEPS = [256, 512, 1024, 2048];
 
     /* One shape: "t!x!y!p1!p2!rot!m!n" with t in c/b/l/p and m in w/g; shapes
@@ -543,6 +549,7 @@
     return {
       COURANT: COURANT, SPONGE: SPONGE, SPONGE_K: SPONGE_K,
       SPONGE_PER_LAMBDA: SPONGE_PER_LAMBDA, spongeFor: spongeFor,
+      ACC_PERIODS: ACC_PERIODS,
       SRC_COLS: SRC_COLS, SRC_RADIUS: SRC_RADIUS,
       omegaFor: omegaFor, spongeDamp: spongeDamp, slowness: slowness,
       RANGES: RANGES, RES_STEPS: RES_STEPS, DEFAULTS: DEFAULTS, STATE_KEYS: STATE_KEYS,
@@ -578,17 +585,18 @@
       'void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }'
     ].join('\n');
 
-    /* One leapfrog step. State texture is RG32F with r = u and g = u_prev;
-       reads use texelFetch with clamped coordinates, which is the reflecting
-       open boundary the sponge then eats. The medium texture is sampled at
-       the same texel: r = wall coverage, g = glass coverage. */
+    /* One leapfrog step. State texture is RGBA32F with r = u, g = u_prev and
+       b = a running average of u^2 (the intensity view; uAccK is the per-step
+       blend factor). Reads use texelFetch with clamped coordinates, which is
+       the reflecting open boundary the sponge then eats. The medium texture
+       is sampled at the same texel: r = wall coverage, g = glass slowness. */
     var SIM = [
       '#version 300 es',
       'precision highp float;',
       'uniform sampler2D uState;',
       'uniform sampler2D uMedium;',
       'uniform ivec2 uSize;',
-      'uniform float uC2, uSponge, uSpongeK;',
+      'uniform float uC2, uSponge, uSpongeK, uAccK;',
       'uniform float uDrive, uSrcR;',
       'uniform int uSrcType;',
       'uniform vec2 uSrcPos;',
@@ -599,7 +607,7 @@
       '}',
       'void main(){',
       '  ivec2 p = ivec2(gl_FragCoord.xy);',
-      '  vec2 c = texelFetch(uState, p, 0).rg;',
+      '  vec4 c = texelFetch(uState, p, 0);',
       '  vec2 m = texelFetch(uMedium, p, 0).rg;',
       '  float lap = at(p+ivec2(1,0)) + at(p+ivec2(-1,0)) + at(p+ivec2(0,1)) + at(p+ivec2(0,-1)) - 4.0*c.r;',
       '  float crel = 1.0 - m.g;',   // glass channel stores slowness 1 - 1/n
@@ -615,8 +623,9 @@
       '  float uc = c.r * damp;',
       '  if (uSrcType == 1 && pf.x < 3.0) { un = uDrive; }',
       '  else if (uSrcType == 2 && distance(pf, uSrcPos) <= uSrcR) { un = uDrive; }',
-      '  if (m.r > 0.5) { un = 0.0; uc = 0.0; }',
-      '  frag = vec4(un, uc, 0.0, 1.0);',
+      '  float acc = c.b + uAccK * (c.r * c.r - c.b);',
+      '  if (m.r > 0.5) { un = 0.0; uc = 0.0; acc = 0.0; }',
+      '  frag = vec4(un, uc, acc, 1.0);',
       '}'
     ].join('\n');
 
@@ -722,8 +731,10 @@
       'uniform sampler2D uMedium;',
       'uniform vec2 uGrid;',
       'uniform vec3 uNeg, uMid, uPos, uWall, uGlass;',
+      'uniform float uGain, uView;',
       'out vec4 frag;',
-      'float bilinU(vec2 uv){',
+      // r = u (the wave view), b = mean of u^2 (the intensity view)
+      'vec2 bilinRB(vec2 uv){',
       '  vec2 g = uv * uGrid - 0.5;',
       '  vec2 f = fract(g);',
       '  ivec2 i0 = ivec2(floor(g));',
@@ -732,19 +743,25 @@
       '  ivec2 b = clamp(i0 + ivec2(1,0), ivec2(0), hi);',
       '  ivec2 c = clamp(i0 + ivec2(0,1), ivec2(0), hi);',
       '  ivec2 d = clamp(i0 + ivec2(1,1), ivec2(0), hi);',
-      '  float u00 = texelFetch(uState, a, 0).r;',
-      '  float u10 = texelFetch(uState, b, 0).r;',
-      '  float u01 = texelFetch(uState, c, 0).r;',
-      '  float u11 = texelFetch(uState, d, 0).r;',
+      '  vec2 u00 = texelFetch(uState, a, 0).rb;',
+      '  vec2 u10 = texelFetch(uState, b, 0).rb;',
+      '  vec2 u01 = texelFetch(uState, c, 0).rb;',
+      '  vec2 u11 = texelFetch(uState, d, 0).rb;',
       '  return mix(mix(u00, u10, f.x), mix(u01, u11, f.x), f.y);',
       '}',
       'vec3 toLin(vec3 c){ return pow(c, vec3(2.2)); }',
       'void main(){',
-      '  float u = bilinU(vUv);',
-      // mild gain: the far field never reaches the source amplitude, and
-      // without it the light palette reads as pale pastel
-      '  float t = clamp(u * 1.4, -1.0, 1.0);',
-      '  vec3 col = t < 0.0 ? mix(toLin(uMid), toLin(uNeg), -t) : mix(toLin(uMid), toLin(uPos), t);',
+      '  vec2 ub = bilinRB(vUv);',
+      '  vec3 col;',
+      '  if (uView > 0.5) {',
+      // sqrt of the mean square is the RMS; the sqrt(2) puts a plane wave of
+      // amplitude 1 at the same brightness as its crests in the wave view
+      '    float a = clamp(sqrt(max(ub.y, 0.0)) * 1.4142 * uGain, 0.0, 1.0);',
+      '    col = mix(toLin(uMid), toLin(uPos), a);',
+      '  } else {',
+      '    float t = clamp(ub.x * uGain, -1.0, 1.0);',
+      '    col = t < 0.0 ? mix(toLin(uMid), toLin(uNeg), -t) : mix(toLin(uMid), toLin(uPos), t);',
+      '  }',
       '  vec2 m = texture(uMedium, vUv).rg;',
       // the glass channel is slowness, so rescale it before using it as a tint
       '  col = mix(col, toLin(uGlass), clamp(m.g * 3.0, 0.0, 1.0) * 0.35);',
@@ -908,7 +925,7 @@
         GW = w; GH = h;
         allocOk = true;
         for (var i = 0; i < 2; i++) {
-          var t = makeTarget(w, h, gl.RG32F, gl.NEAREST);
+          var t = makeTarget(w, h, gl.RGBA32F, gl.NEAREST);
           stateTex[i] = t.tex; stateFbo[i] = t.fbo;
           if (!t.ok) allocOk = false;
           var q = makeTarget(w, h, gl.RG8, gl.LINEAR);
@@ -993,6 +1010,8 @@
                                  Math.floor(Math.min(GW, GH) * 0.25));
         gl.uniform1f(simU.uSponge, spongeTex);
         gl.uniform1f(simU.uSpongeK, core.SPONGE_K);
+        // blend factor for the u^2 average: time constant ACC_PERIODS periods
+        gl.uniform1f(simU.uAccK, Math.min(1, omega() / (2 * Math.PI * core.ACC_PERIODS)));
         gl.uniform1f(simU.uDrive, drive);
         gl.uniform1i(simU.uSrcType, srcType);
         gl.uniform2f(simU.uSrcPos, params.srcX * GW, params.srcY * GH);
@@ -1033,6 +1052,8 @@
         gl.uniform3fv(showU.uPos, palette.pos);
         gl.uniform3fv(showU.uWall, palette.wall);
         gl.uniform3fv(showU.uGlass, palette.glass);
+        gl.uniform1f(showU.uGain, params.gain);
+        gl.uniform1f(showU.uView, params.view === 'intensity' ? 1 : 0);
         drawInto(null);
       }
 
@@ -1116,7 +1137,7 @@
       canvas.addEventListener('webglcontextlost', onLost);
 
       // ---- main loop
-      var recorder = null, recChunks = [], recLoopLeft = 0;
+      var recorder = null, recChunks = [];
 
       var lastTs = -1, fpsAccum = 0, fpsFrames = 0;
       function frame(ts) {
@@ -1129,13 +1150,6 @@
         if (running) {
           var n = Math.max(1, Math.round(params.steps));
           for (var i = 0; i < n; i++) simStep();
-          if (recorder && recLoopLeft > 0) {
-            recLoopLeft -= n;
-            if (recLoopLeft <= 0) {
-              recLoopLeft = 0;
-              if (recorder.state !== 'inactive') recorder.stop();
-            }
-          }
         }
         display();
 
@@ -1195,7 +1209,7 @@
         /* WebM capture via MediaRecorder: zero dependencies, and the canvas
            stream captures on present, so preserveDrawingBuffer can stay off.
            Returns false when the browser lacks the machinery. */
-        startRecord: function (onDone, loopSteps) {
+        startRecord: function (onDone) {
           if (recorder || !canvas.captureStream || typeof MediaRecorder === 'undefined') return false;
           var stream = canvas.captureStream(60);
           var mime = MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
@@ -1210,20 +1224,10 @@
             recChunks = []; recorder = null;
             if (onDone) onDone(blob);
           };
-          recLoopLeft = (loopSteps > 0) ? loopSteps : 0;
           recorder.start();
           return true;
         },
-        /* Record exactly one source period (rounded to whole frames), so the
-           file loops seamlessly once the field has settled. */
-        startRecordLoop: function (onDone) {
-          var n = Math.max(1, Math.round(params.steps));
-          var P = 2 * Math.PI / omega();
-          var N = Math.max(n, Math.round(P / n) * n);
-          return api.startRecord(onDone, N);
-        },
         stopRecord: function () {
-          recLoopLeft = 0;
           if (recorder && recorder.state !== 'inactive') recorder.stop();
         },
         snapshot: function () {
@@ -1490,13 +1494,6 @@
         if (e.startRecord(saveBlob)) setRec(true);
       };
 
-      const recordLoop = () => {
-        const e = engineRef.current;
-        if (!e || rec) return;
-        if (!running) setRunning(true);        // a paused loop would never end
-        if (e.startRecordLoop(saveBlob)) setRec(true);
-      };
-
       const copyLink = () => {
         const hash = '#' + C.encodeState(st, shapes);
         history.replaceState(null, '', location.pathname + hash);
@@ -1671,9 +1668,22 @@
                 )}
               </Section>
 
-              <Section id="look" title="Look" summary={paletteName}
+              <Section id="look" title="Look"
+                       summary={paletteName + (st.view === 'intensity' ? ' · intensity' : '')}
                        open={sec === 'look'} onToggle={toggleSec}>
+                <div className="rt-row" style={{ marginBottom: 9 }}>
+                  <Seg items={[{ id: 'waves', name: 'Waves' }, { id: 'intensity', name: 'Intensity' }]}
+                       value={st.view} onChange={v => set({ view: v })} />
+                </div>
                 <Seg items={C.PALETTES} value={st.palette} onChange={v => set({ palette: v })} />
+                <div style={{ height: 9 }} />
+                <Slider label="Contrast" value={st.gain} min={C.RANGES.gain[0]} max={C.RANGES.gain[1]}
+                        step={0.05} fmt={v => '×' + v.toFixed(2)} onChange={v => set({ gain: v })} />
+                <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
+                  {st.view === 'intensity'
+                    ? 'Time-averaged amplitude over the last ~2.5 periods: the standing pattern without the phase. Takes a moment to settle after a change.'
+                    : 'The wave height maps linearly to colour and clips beyond the contrast limit.'}
+                </p>
               </Section>
 
               <Section id="perf" title="Speed &amp; grid" summary={st.steps + '/frame · ' + st.res}
@@ -1697,18 +1707,13 @@
                           style={rec ? { color: '#f87171', borderColor: '#f87171' } : null}>
                     {rec ? '⏹ Stop recording' : '⏺ Record video'}
                   </button>
-                  <button type="button" className="rt-btn lang-seg" onClick={recordLoop} disabled={rec}>
-                    ⟳ Record loop
-                  </button>
                   <button type="button" className="rt-btn lang-seg" onClick={copyLink}>
                     {copied ? 'Copied' : 'Copy link'}
                   </button>
                 </div>
                 <p style={{ fontSize: 11, color: COL.foot, margin: '7px 0 0', lineHeight: 1.6 }}>
                   Recording captures the canvas as WebM until you stop it, then downloads.
-                  Record loop stops itself after exactly one source period, so the file
-                  loops seamlessly once the field has settled. The link carries the
-                  settings and the shapes, not the paint.
+                  The link carries the settings and the shapes, not the paint.
                 </p>
               </Section>
 
@@ -1738,9 +1743,11 @@
                   </p>
                   <p>
                     The colours are a diverging map over the wave height: one hue for
-                    crests, one for troughs, still water sits at the midpoint. Every
-                    piece of glass carries its own n; painted glass bakes in the n it
-                    was painted with. The absorbing band at the edges is about one
+                    crests, one for troughs, still water sits at the midpoint. The
+                    intensity view shows the time-averaged amplitude instead, which is
+                    the diffraction pattern a long photographic exposure would see.
+                    Every piece of glass carries its own n; painted glass bakes in the
+                    n it was painted with. The absorbing band at the edges is about one
                     wavelength deep, so long waves dim visibly towards the border;
                     that is the sponge doing its job, not a rendering bug.
                   </p>
