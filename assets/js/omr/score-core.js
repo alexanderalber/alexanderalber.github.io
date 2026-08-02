@@ -7,6 +7,9 @@
  *   - buildMusicXml(ir)          MusicXML score-partwise 4.0 string
  *   - ruleCheck(ir)              deterministic validation findings for the UI
  *   - voiceLabels / noteToMidi / midiName / expectedMeasureDiv helpers
+ *   - edit operations for the measure editor (and the future music suite):
+ *     buildEvent / specFromEvent / editEvent / insertEvent / deleteEvent /
+ *     setMeasureEvents / resetMeasure / tieIssues / suggestFromTokens
  *
  * Plain script, no DOM, no imports, no async: it must run in the page, in a
  * Web Worker (importScripts) and under Node (evaluated by the test suite).
@@ -484,6 +487,207 @@
     return out;
   }
 
+  /* ---------------- edit operations ----------------
+   *
+   * Pure and immutable: every function returns a NEW ir (path-cloned, the
+   * untouched parts are shared by reference), so the result can go straight
+   * into React state. Events created here carry `edited: true` (an additive
+   * Score-IR 1.x extension, reported to the model repo) and confidence 1;
+   * their tokens are rebuilt so ruleCheck's accidental logic and
+   * buildMusicXml's printed accidentals stay consistent with the new pitch.
+   * measureIdx is the array position in part.measures, which equals the
+   * measure's `index` field (findingMarkers already relies on that).
+   */
+
+  var EDIT_BASES = ["0", "1", "2", "3", "4", "6", "8", "12", "16", "24", "32"];
+  var ALTER_TOKENS = { "1": "#", "2": "##", "-1": "-", "-2": "--" };
+  var TIE_TOKENS = { start: "[", stop: "]", "continue": "_" };
+
+  /* Same arithmetic as omr-decode's dur(): triplet bases (3/6/12/24) carry
+   * their exact division count directly, dots add halving remainders. */
+  function durationFrom(base, dots) {
+    base = String(base);
+    if (EDIT_BASES.indexOf(base) < 0) return null;
+    dots = dots || 0;
+    var d = base === "0" ? DIV_WHOLE * 2 : Math.floor(DIV_WHOLE / parseInt(base, 10));
+    var total = d, add = d;
+    for (var i = 0; i < dots; i++) { add = Math.floor(add / 2); total += add; }
+    return { divisions: total, base: base, dots: dots };
+  }
+
+  /* kern pitch spelling: c = C4, cc = C5, C = C3, CC = C2, ... */
+  function pitchToken(step, octave) {
+    if (octave >= 4) return new Array(octave - 3 + 1).join(step.toLowerCase());
+    return new Array(4 - octave + 1).join(step.toUpperCase());
+  }
+
+  /* spec: { kind: "note"|"rest", base, dots, step, alter, octave, tie, fermata }.
+   * Returns a full IR event or null for an invalid duration base. src is null;
+   * editEvent carries the replaced event's src over so the measure stays
+   * locatable on the page. */
+  function buildEvent(spec) {
+    var dur = durationFrom(spec.base, spec.dots);
+    if (!dur) return null;
+    var durTok = dur.base;
+    for (var i = 0; i < dur.dots; i++) durTok += ".";
+    if (spec.kind === "rest") {
+      return { kind: "rest", duration: dur, confidence: 1,
+               tokens: [durTok, "r"], src: null, edited: true };
+    }
+    var alter = spec.alter || 0;
+    var tokens = [durTok, pitchToken(spec.step, spec.octave)];
+    if (ALTER_TOKENS[String(alter)]) tokens.push(ALTER_TOKENS[String(alter)]);
+    var tie = spec.tie || null;
+    if (tie && TIE_TOKENS[tie]) tokens.push(TIE_TOKENS[tie]);
+    if (spec.fermata) tokens.push(";");
+    return { kind: "note", duration: dur, confidence: 1,
+             pitch: { step: spec.step, alter: alter, octave: spec.octave },
+             tie: tie, fermata: !!spec.fermata,
+             tokens: tokens, src: null, edited: true };
+  }
+
+  function specFromEvent(e) {
+    return {
+      kind: e.kind,
+      base: e.duration.base,
+      dots: e.duration.dots || 0,
+      step: e.pitch ? e.pitch.step : null,
+      alter: e.pitch ? (e.pitch.alter || 0) : 0,
+      octave: e.pitch ? e.pitch.octave : null,
+      tie: (e.kind === "note" && e.tie) || null,
+      fermata: !!e.fermata,
+    };
+  }
+
+  function withMeasureEvents(ir, partIdx, measureIdx, fn) {
+    var next = Object.assign({}, ir);
+    next.parts = ir.parts.slice();
+    var part = Object.assign({}, next.parts[partIdx]);
+    part.measures = part.measures.slice();
+    var m = Object.assign({}, part.measures[measureIdx]);
+    m.events = fn(m.events.slice());
+    part.measures[measureIdx] = m;
+    next.parts[partIdx] = part;
+    return next;
+  }
+
+  function setMeasureEvents(ir, partIdx, measureIdx, events) {
+    return withMeasureEvents(ir, partIdx, measureIdx, function () { return events; });
+  }
+
+  function editEvent(ir, partIdx, measureIdx, evIndex, spec) {
+    return withMeasureEvents(ir, partIdx, measureIdx, function (evs) {
+      var ev = buildEvent(spec);
+      ev.src = (evs[evIndex] && evs[evIndex].src) || null;
+      evs[evIndex] = ev;
+      return evs;
+    });
+  }
+
+  function insertEvent(ir, partIdx, measureIdx, evIndex, spec) {
+    return withMeasureEvents(ir, partIdx, measureIdx, function (evs) {
+      evs.splice(evIndex, 0, buildEvent(spec));
+      return evs;
+    });
+  }
+
+  function deleteEvent(ir, partIdx, measureIdx, evIndex) {
+    return withMeasureEvents(ir, partIdx, measureIdx, function (evs) {
+      evs.splice(evIndex, 1);
+      return evs;
+    });
+  }
+
+  /* Restore one measure's events from the unedited recognition result. */
+  function resetMeasure(ir, partIdx, measureIdx, originalIr) {
+    var orig = originalIr.parts[partIdx].measures[measureIdx].events;
+    return setMeasureEvents(ir, partIdx, measureIdx,
+                            JSON.parse(JSON.stringify(orig)));
+  }
+
+  /* Tie diagnostics, mirroring flattenPart's join semantics: a tie start (or
+   * continue) that nothing seamless and pitch-identical resolves is dangling,
+   * a stop/continue with no matching open chain is an orphan. Edits may break
+   * chains legitimately (flattenPart just ends them); the editor marks these
+   * spots instead of forbidding them.
+   * Returns [{ measure, event, issue: "dangling-start" | "orphan-stop" }]. */
+  function tieIssues(part) {
+    var out = [];
+    var open = {};            /* midi -> { measure, event, end } */
+    var pos = 0;
+    for (var mi = 0; mi < part.measures.length; mi++) {
+      var m = part.measures[mi];
+      for (var ei = 0; ei < m.events.length; ei++) {
+        var e = m.events[ei];
+        if (e.kind === "note") {
+          var midi = noteToMidi(e.pitch);
+          var prev = open[midi];
+          var joins = prev && (e.tie === "stop" || e.tie === "continue") &&
+                      prev.end === pos;
+          if ((e.tie === "stop" || e.tie === "continue") && !joins) {
+            out.push({ measure: m.index, event: ei, issue: "orphan-stop" });
+          }
+          if (joins) {
+            prev.end = pos + e.duration.divisions;
+            if (e.tie === "stop") delete open[midi];
+          } else {
+            if (prev) {
+              out.push({ measure: prev.measure, event: prev.event,
+                         issue: "dangling-start" });
+              delete open[midi];
+            }
+            if (e.tie === "start" || e.tie === "continue") {
+              open[midi] = { measure: m.index, event: ei,
+                             end: pos + e.duration.divisions };
+            }
+          }
+        }
+        pos += e.duration.divisions;
+      }
+    }
+    for (var k in open) {
+      out.push({ measure: open[k].measure, event: open[k].event,
+                 issue: "dangling-start" });
+    }
+    return out;
+  }
+
+  /* Editor prefill from an unparseable-tokens warning: pull whatever the raw
+   * tokens do carry; fields the tokens leave open stay null and the UI fills
+   * defaults. */
+  function suggestFromTokens(tokens) {
+    var ACC = { "#": 1, "##": 2, "-": -1, "--": -2, "n": 0 };
+    var spec = { kind: "note", base: null, dots: 0, step: null, alter: 0,
+                 octave: null, tie: null, fermata: false };
+    (tokens || []).forEach(function (t) {
+      t = String(t);
+      var stripped = t.replace(/\.+$/, "");
+      if (spec.base === null && EDIT_BASES.indexOf(stripped) >= 0) {
+        spec.base = stripped;
+        spec.dots = t.length - stripped.length;
+      } else if (t === "r") {
+        spec.kind = "rest";
+      } else if (spec.step === null && /^([a-g])\1*$/.test(t)) {
+        spec.step = t[0].toUpperCase();
+        spec.octave = 3 + t.length;
+      } else if (spec.step === null && /^([A-G])\1*$/.test(t)) {
+        spec.step = t[0];
+        spec.octave = 4 - t.length;
+      } else if (t in ACC) {
+        spec.alter = ACC[t];
+      } else if (t === "[") {
+        spec.tie = "start";
+      } else if (t === "]") {
+        spec.tie = "stop";
+      } else if (t === "_") {
+        spec.tie = "continue";
+      } else if (t === ";") {
+        spec.fermata = true;
+      }
+    });
+    return spec;
+  }
+
   globalThis.ScoreCore = {
     DIV_WHOLE: DIV_WHOLE,
     DIV_QUARTER: DIV_QUARTER,
@@ -497,5 +701,15 @@
     buildMidi: buildMidi,
     buildMusicXml: buildMusicXml,
     ruleCheck: ruleCheck,
+    durationFrom: durationFrom,
+    buildEvent: buildEvent,
+    specFromEvent: specFromEvent,
+    setMeasureEvents: setMeasureEvents,
+    editEvent: editEvent,
+    insertEvent: insertEvent,
+    deleteEvent: deleteEvent,
+    resetMeasure: resetMeasure,
+    tieIssues: tieIssues,
+    suggestFromTokens: suggestFromTokens,
   };
 })();
