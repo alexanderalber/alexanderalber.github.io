@@ -135,7 +135,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Ripple Tank",
-    "description": "A two-dimensional wave equation simulated on the GPU in WebGL2 and rendered full screen. A plane or point source drives the field, walls reflect, regions of slower wave speed refract, and the edges absorb. Slits, lenses and prisms can be dropped in and dragged around or painted freehand; wavelength, refractive index, palette and relief lighting are adjustable.",
+    "description": "A two-dimensional wave equation simulated on the GPU in WebGL2 and rendered full screen. A plane or point source drives the field, walls reflect, regions of slower wave speed refract, and the edges absorb. Slits, lenses and prisms can be dropped in and dragged around or painted freehand; wavelength, per-object refractive index and palette are adjustable.",
     "url": "https://alber.me/miscellaneous/tools/ripple-tank.html",
     "applicationCategory": "EducationalApplication",
     "inLanguage": "en",
@@ -195,13 +195,17 @@
 
     var RANGES = {
       lambda: [0.02, 0.30],
-      amp: [0.3, 2.0],
       n: [1.1, 3.0],
-      steps: [1, 16],
-      brush: [0.006, 0.08],
-      relief: [0, 24],
-      light: [0, 6.2832]
+      steps: [1, 8],
+      brush: [0.006, 0.08]
     };
+
+    /* The medium texture's glass channel stores slowness 1 - 1/n directly
+       (0 = free space, 0.67 = n of 3), so every piece of glass can carry its
+       own refractive index and the sim shader needs no n uniform at all. */
+    function slowness(n) {
+      return 1 - 1 / Math.max(1.001, n);
+    }
 
     function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
@@ -218,23 +222,19 @@
     ];
 
     /* ---------- palettes ----------
-       Diverging triples over a dark midpoint: troughs get neg, crests get pos,
-       rest is mid. The hollywood pair of hues is the site default. wall and
-       glass are the overlay colours of the two materials. RGB in 0..1. */
+       Diverging triples: troughs get neg, crests get pos, still water is mid.
+       Hollywood (the site's default diverging pair) over a dark midpoint, and
+       Paper: dark navy troughs and burnt orange crests on warm off-white, the
+       look of the classic printed wave-optics figures. wall and glass are the
+       overlay colours of the two materials. RGB in 0..1. */
 
     var PALETTES = [
       { id: 'hollywood', name: 'Hollywood',
         neg: [1.00, 0.55, 0.26], mid: [0.043, 0.055, 0.078], pos: [0.00, 0.55, 0.55],
         wall: [0.58, 0.64, 0.72], glass: [0.45, 0.75, 0.85] },
-      { id: 'ocean', name: 'Ocean',
-        neg: [0.10, 0.25, 0.80], mid: [0.030, 0.045, 0.075], pos: [0.55, 0.95, 1.00],
-        wall: [0.62, 0.66, 0.72], glass: [0.55, 0.85, 0.90] },
-      { id: 'ember', name: 'Ember',
-        neg: [0.55, 0.08, 0.10], mid: [0.055, 0.038, 0.045], pos: [1.00, 0.75, 0.30],
-        wall: [0.60, 0.55, 0.52], glass: [0.85, 0.65, 0.45] },
-      { id: 'mono', name: 'Mono',
-        neg: [0.02, 0.02, 0.03], mid: [0.10, 0.12, 0.15], pos: [0.92, 0.94, 0.96],
-        wall: [0.65, 0.68, 0.72], glass: [0.60, 0.75, 0.80] }
+      { id: 'paper', name: 'Paper',
+        neg: [0.10, 0.13, 0.25], mid: [0.94, 0.91, 0.86], pos: [0.78, 0.38, 0.24],
+        wall: [0.06, 0.06, 0.09], glass: [0.35, 0.55, 0.65] }
     ];
 
     var PALETTE_BY_ID = {};
@@ -258,7 +258,7 @@
 
     var shapeSeq = 1;
     function makeShape(type) {
-      var s = { id: 's' + (shapeSeq++), type: type, x: 0.5, y: 0.5, rot: 0, mat: 'wall', p1: 0.1, p2: 0 };
+      var s = { id: 's' + (shapeSeq++), type: type, x: 0.5, y: 0.5, rot: 0, mat: 'wall', p1: 0.1, p2: 0, n: 1.5 };
       if (type === 'circle') { s.p1 = 0.09; }
       else if (type === 'box') { s.p1 = 0.02; s.p2 = 0.20; }
       else if (type === 'lens') { s.p1 = 0.22; s.p2 = 0.055; s.mat = 'glass'; }
@@ -358,16 +358,16 @@
     /* ---------- defaults and shareable state ---------- */
 
     var DEFAULTS = {
-      lambda: 0.08, amp: 1.0, n: 1.5,
-      steps: 6, res: 512, palette: 'hollywood',
+      lambda: 0.08, n: 1.5,
+      steps: 1, res: 1024, palette: 'hollywood',
       source: 'plane', srcX: 0.22, srcY: 0.5,
-      brush: 0.02, relief: 10, light: 2.2
+      brush: 0.02
     };
 
-    var STATE_KEYS = ['lambda', 'amp', 'n', 'steps', 'res', 'brush', 'relief', 'light', 'srcX', 'srcY'];
+    var STATE_KEYS = ['lambda', 'n', 'steps', 'res', 'brush', 'srcX', 'srcY'];
     var RES_STEPS = [256, 512, 1024, 2048];
 
-    /* One shape: "t!x!y!p1!p2!rot!m" with t in c/b/l/p and m in w/g; shapes
+    /* One shape: "t!x!y!p1!p2!rot!m!n" with t in c/b/l/p and m in w/g; shapes
        joined by "~", or "none". "_" stays the outer separator of the hash. */
     function encodeShapes(shapes) {
       if (!shapes || !shapes.length) return 'none';
@@ -377,7 +377,7 @@
         if (TYPE_INDEX[s.type] === undefined) continue;
         out.push([s.type.charAt(0), (+s.x).toFixed(3), (+s.y).toFixed(3),
                   (+s.p1).toFixed(3), (+s.p2 || 0).toFixed(3), (+s.rot || 0).toFixed(2),
-                  s.mat === 'glass' ? 'g' : 'w'].join('!'));
+                  s.mat === 'glass' ? 'g' : 'w', (+s.n || 1.5).toFixed(2)].join('!'));
       }
       return out.length ? out.join('~') : 'none';
     }
@@ -402,6 +402,8 @@
         if (type === 'box') s.p2 = clamp(s.p2, 0.005, 0.6);
         s.rot = isFinite(rot) ? rot : 0;
         s.mat = f[6] === 'g' ? 'glass' : 'wall';
+        var n = parseFloat(f[7]);
+        s.n = isFinite(n) ? clampTo('n', n) : 1.5;
         out.push(s);
       }
       return out;
@@ -474,8 +476,9 @@
        refraction slowdown, sponge decay and wall blocking without a GPU.
 
        field: { w, h, u, up } with Float32Arrays of length w*h.
-       medium: { wall, glass } same length, or null for free space.
-       opt: { invN, sponge, srcType ('plane'|'point'|'off'), drive, srcX, srcY } */
+       medium: { wall, glass } same length, or null for free space; glass
+       stores slowness 1 - 1/n per cell, exactly like the texture channel.
+       opt: { sponge, srcType ('plane'|'point'|'off'), drive, srcX, srcY } */
 
     function createField(w, h) {
       return { w: w, h: h, u: new Float32Array(w * h), up: new Float32Array(w * h) };
@@ -484,7 +487,6 @@
     function stepCPU(f, medium, opt) {
       opt = opt || {};
       var w = f.w, h = f.h, u = f.u, up = f.up;
-      var invN = isFinite(opt.invN) ? opt.invN : 1;
       var S = isFinite(opt.sponge) ? opt.sponge : 0;
       var C2 = COURANT * COURANT;
       var out = new Float32Array(w * h);
@@ -495,8 +497,7 @@
           var xl = x > 0 ? i - 1 : i, xr = x < w - 1 ? i + 1 : i;
           var yd = y > 0 ? i - w : i, yu = y < h - 1 ? i + w : i;
           var lap = u[xl] + u[xr] + u[yd] + u[yu] - 4 * u[i];
-          var glass = medium && medium.glass ? medium.glass[i] : 0;
-          var crel = 1 + (invN - 1) * glass;
+          var crel = 1 - (medium && medium.glass ? medium.glass[i] : 0);
           var un = 2 * u[i] - up[i] + C2 * crel * crel * lap;
           var damp = 1;
           if (S > 0) {
@@ -530,7 +531,7 @@
     return {
       COURANT: COURANT, SPONGE: SPONGE, SPONGE_K: SPONGE_K,
       SRC_COLS: SRC_COLS, SRC_RADIUS: SRC_RADIUS,
-      omegaFor: omegaFor, spongeDamp: spongeDamp,
+      omegaFor: omegaFor, spongeDamp: spongeDamp, slowness: slowness,
       RANGES: RANGES, RES_STEPS: RES_STEPS, DEFAULTS: DEFAULTS, STATE_KEYS: STATE_KEYS,
       clamp: clamp, clampTo: clampTo,
       SOURCES: SOURCES,
@@ -574,7 +575,7 @@
       'uniform sampler2D uState;',
       'uniform sampler2D uMedium;',
       'uniform ivec2 uSize;',
-      'uniform float uC2, uInvN, uSponge, uSpongeK;',
+      'uniform float uC2, uSponge, uSpongeK;',
       'uniform float uDrive, uSrcR;',
       'uniform int uSrcType;',
       'uniform vec2 uSrcPos;',
@@ -588,7 +589,7 @@
       '  vec2 c = texelFetch(uState, p, 0).rg;',
       '  vec2 m = texelFetch(uMedium, p, 0).rg;',
       '  float lap = at(p+ivec2(1,0)) + at(p+ivec2(-1,0)) + at(p+ivec2(0,1)) + at(p+ivec2(0,-1)) - 4.0*c.r;',
-      '  float crel = mix(1.0, uInvN, m.g);',
+      '  float crel = 1.0 - m.g;',   // glass channel stores slowness 1 - 1/n
       '  float un = 2.0*c.r - c.g + uC2*crel*crel*lap;',
       '  vec2 pf = vec2(p);',
       '  float d = min(min(pf.x, float(uSize.x-1)-pf.x), min(pf.y, float(uSize.y-1)-pf.y));',
@@ -612,7 +613,7 @@
       'in vec2 vUv;',
       'uniform sampler2D uPaint;',
       'uniform vec2 uA, uB;',
-      'uniform float uRadius, uAspect, uMode;',
+      'uniform float uRadius, uAspect, uMode, uSlow;',
       'out vec4 frag;',
       'float sdSeg(vec2 p, vec2 a, vec2 b){',
       '  vec2 pa = p - a, ba = b - a;',
@@ -624,9 +625,10 @@
       '  vec2 p = vec2(vUv.x * uAspect, vUv.y);',
       '  float d = sdSeg(p, vec2(uA.x * uAspect, uA.y), vec2(uB.x * uAspect, uB.y));',
       '  float amt = 1.0 - smoothstep(uRadius * 0.6, uRadius, d);',
+      // glass strokes bake in the slowness of the n they were painted with
       '  if (uMode < 0.5) st *= (1.0 - amt);',
       '  else if (uMode < 1.5) st.r = max(st.r, amt);',
-      '  else st.g = max(st.g, amt);',
+      '  else st.g = max(st.g, amt * uSlow);',
       '  frag = vec4(st, 0.0, 1.0);',
       '}'
     ].join('\n');
@@ -642,7 +644,7 @@
       'uniform sampler2D uPaint;',
       'uniform int uCount;',
       'uniform vec4 uSA[24];',   // x, y, p1, p2
-      'uniform vec4 uSB[24];',   // rot, type, mat, unused
+      'uniform vec4 uSB[24];',   // rot, type, slowness (0 = wall), unused
       'uniform float uAspect;',
       'uniform float uEdge;',
       'out vec4 frag;',
@@ -683,7 +685,7 @@
       '    else if (t == 2) d = sdLens(q, a.z, a.w);',
       '    else d = sdPrism(q, a.z);',
       '    float cov = 1.0 - smoothstep(-uEdge, uEdge, d);',
-      '    if (b.z < 0.5) wall = max(wall, cov); else glass = max(glass, cov);',
+      '    if (b.z <= 0.0) wall = max(wall, cov); else glass = max(glass, cov * b.z);',
       '  }',
       '  frag = vec4(min(wall, 1.0), min(glass, 1.0), 0.0, 1.0);',
       '}'
@@ -703,7 +705,6 @@
       'uniform sampler2D uMedium;',
       'uniform vec2 uGrid;',
       'uniform vec3 uNeg, uMid, uPos, uWall, uGlass;',
-      'uniform float uAmp, uRelief, uLight;',
       'out vec4 frag;',
       'float bilinU(vec2 uv){',
       '  vec2 g = uv * uGrid - 0.5;',
@@ -728,18 +729,20 @@
       '  float ur = bilinU(vUv + vec2(tx.x, 0.0));',
       '  float ud = bilinU(vUv - vec2(0.0, tx.y));',
       '  float uu = bilinU(vUv + vec2(0.0, tx.y));',
-      '  float amp = max(uAmp, 0.001);',
-      '  float t = clamp(u / amp, -1.0, 1.0);',
+      // relief and light direction are baked: they were sliders once and
+      // nobody ever wanted anything but these values
+      '  float t = clamp(u, -1.0, 1.0);',
       '  vec3 base = t < 0.0 ? mix(toLin(uMid), toLin(uNeg), -t) : mix(toLin(uMid), toLin(uPos), t);',
-      '  vec2 grd = vec2(ur - ul, uu - ud) * 0.5 * (uRelief / amp);',
+      '  vec2 grd = vec2(ur - ul, uu - ud) * 5.0;',
       '  vec3 n = normalize(vec3(-grd, 1.0));',
-      '  vec3 L = normalize(vec3(cos(uLight), sin(uLight), 0.6));',
+      '  vec3 L = normalize(vec3(-0.5885, 0.8085, 0.6));',
       '  float diff = max(dot(n, L), 0.0);',
       '  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));',
-      '  float spec = pow(max(dot(n, H), 0.0), 60.0) * 0.35 * clamp(uRelief / 6.0, 0.0, 1.0);',
+      '  float spec = pow(max(dot(n, H), 0.0), 60.0) * 0.35;',
       '  vec3 col = base * (0.45 + 0.75 * diff) + vec3(spec);',
       '  vec2 m = texture(uMedium, vUv).rg;',
-      '  col = mix(col, toLin(uGlass), m.g * 0.35);',
+      // the glass channel is slowness, so rescale it before using it as a tint
+      '  col = mix(col, toLin(uGlass), clamp(m.g * 3.0, 0.0, 1.0) * 0.35);',
       '  col = mix(col, toLin(uWall), clamp(m.r * 1.15, 0.0, 1.0));',
       '  col = col / (1.0 + col * 0.15);',
       '  frag = vec4(pow(clamp(col, 0.0, 1.0), vec3(0.4545)), 1.0);',
@@ -930,7 +933,7 @@
         // ramp the source in over two periods so the front is not a broadband bang
         var rampSteps = 2 * Math.PI * 2 / omega();
         var ramp = Math.min(1, stepsSinceClear / rampSteps);
-        var drive = params.amp * Math.sin(phase) * ramp;
+        var drive = Math.sin(phase) * ramp;
         var srcType = params.source === 'plane' ? 1 : params.source === 'point' ? 2 : 0;
 
         var src = cur, dst = 1 - cur;
@@ -943,7 +946,6 @@
         gl.uniform1i(simU.uMedium, 1);
         gl.uniform2i(simU.uSize, GW, GH);
         gl.uniform1f(simU.uC2, core.COURANT * core.COURANT);
-        gl.uniform1f(simU.uInvN, 1 / Math.max(1.001, params.n));
         gl.uniform1f(simU.uSponge, core.SPONGE);
         gl.uniform1f(simU.uSpongeK, core.SPONGE_K);
         gl.uniform1f(simU.uDrive, drive);
@@ -966,6 +968,7 @@
         gl.uniform1f(brushU.uRadius, params.brush);
         gl.uniform1f(brushU.uAspect, GH > 0 ? GW / GH : 1);
         gl.uniform1f(brushU.uMode, m);
+        gl.uniform1f(brushU.uSlow, core.slowness(params.n));
         drawInto(paintFbo[dst]);
         pcur = dst;
         mediumDirty = true;
@@ -985,9 +988,6 @@
         gl.uniform3fv(showU.uPos, palette.pos);
         gl.uniform3fv(showU.uWall, palette.wall);
         gl.uniform3fv(showU.uGlass, palette.glass);
-        gl.uniform1f(showU.uAmp, params.amp);
-        gl.uniform1f(showU.uRelief, params.relief);
-        gl.uniform1f(showU.uLight, params.light);
         drawInto(null);
       }
 
@@ -1071,6 +1071,8 @@
       canvas.addEventListener('webglcontextlost', onLost);
 
       // ---- main loop
+      var recorder = null, recChunks = [];
+
       var lastTs = -1, fpsAccum = 0, fpsFrames = 0;
       function frame(ts) {
         if (disposed || ctxLost) return;
@@ -1110,7 +1112,7 @@
             shapeA[j] = s.x; shapeA[j + 1] = s.y; shapeA[j + 2] = s.p1; shapeA[j + 3] = s.p2 || 0;
             shapeB[j] = s.rot || 0;
             shapeB[j + 1] = core.TYPE_INDEX[s.type] || 0;
-            shapeB[j + 2] = s.mat === 'glass' ? 1 : 0;
+            shapeB[j + 2] = s.mat === 'glass' ? core.slowness(s.n || 1.5) : 0;
             shapeB[j + 3] = 0;
           }
           mediumDirty = true;
@@ -1138,6 +1140,30 @@
           if (!running) { compose(); mediumDirty = false; display(); }
         },
         getAspect: function () { return GH > 0 ? GW / GH : 1; },
+        /* WebM capture via MediaRecorder: zero dependencies, and the canvas
+           stream captures on present, so preserveDrawingBuffer can stay off.
+           Returns false when the browser lacks the machinery. */
+        startRecord: function (onDone) {
+          if (recorder || !canvas.captureStream || typeof MediaRecorder === 'undefined') return false;
+          var stream = canvas.captureStream(60);
+          var mime = MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+            ? 'video/webm;codecs=vp9' : 'video/webm';
+          try {
+            recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8000000 });
+          } catch (e) { recorder = null; return false; }
+          recChunks = [];
+          recorder.ondataavailable = function (ev) { if (ev.data && ev.data.size) recChunks.push(ev.data); };
+          recorder.onstop = function () {
+            var blob = new Blob(recChunks, { type: 'video/webm' });
+            recChunks = []; recorder = null;
+            if (onDone) onDone(blob);
+          };
+          recorder.start();
+          return true;
+        },
+        stopRecord: function () {
+          if (recorder && recorder.state !== 'inactive') recorder.stop();
+        },
         snapshot: function () {
           if (mediumDirty) { compose(); mediumDirty = false; }
           display();                        // re-render, then read before the compositor runs
@@ -1145,6 +1171,7 @@
         },
         dispose: function () {
           disposed = true;
+          if (recorder && recorder.state !== 'inactive') { try { recorder.stop(); } catch (e) {} }
           if (rafId) cancelAnimationFrame(rafId);
           if (ro) ro.disconnect();
           canvas.removeEventListener('pointerdown', onDown);
@@ -1240,6 +1267,7 @@
       const [webgl, setWebgl] = useState(true);
       const [hud, setHud] = useState(null);
       const [copied, setCopied] = useState(false);
+      const [rec, setRec] = useState(false);
 
       const stageRef = useRef(null);
       const engineRef = useRef(null);
@@ -1381,6 +1409,22 @@
         a.click();
       };
 
+      const toggleRec = () => {
+        const e = engineRef.current;
+        if (!e) return;
+        if (rec) { e.stopRecord(); return; }   // onDone below flips the state back
+        const ok = e.startRecord(blob => {
+          setRec(false);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'ripple-tank.webm';
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+        });
+        if (ok) setRec(true);
+      };
+
       const copyLink = () => {
         const hash = '#' + C.encodeState(st, shapes);
         history.replaceState(null, '', location.pathname + hash);
@@ -1407,7 +1451,6 @@
 
       const paletteName = (C.PALETTE_BY_ID[st.palette] || C.PALETTES[0]).name;
       const sourceName = (C.SOURCES.find(s => s.id === st.source) || C.SOURCES[0]).name;
-      const modeName = (MODES.find(m => m.id === mode) || MODES[0]).name;
       const hint = mode === 'move'
         ? 'drag shapes' + (st.source === 'point' ? ' and the source' : '')
         : mode === 'erase' ? 'drag to erase paint'
@@ -1452,9 +1495,17 @@
                 <button type="button" className="rt-btn lang-seg" onClick={clearAll}>Clear all</button>
               </div>
 
-              <div className="rt-row" style={{ marginBottom: 10 }}>
+              <div className="rt-row" style={{ marginBottom: 8 }}>
                 <span style={{ fontSize: 11, color: COL.foot, letterSpacing: '.06em', textTransform: 'uppercase' }}>Pointer</span>
                 <Seg items={MODES} value={mode} onChange={setMode} />
+              </div>
+              <div style={{ marginBottom: 4 }}>
+                <Slider label="Brush size" value={st.brush} min={C.RANGES.brush[0]} max={C.RANGES.brush[1]}
+                        step={0.002} fmt={v => (v * 100).toFixed(1) + '%'} onChange={v => set({ brush: v })} />
+                {mode === 'glass' && (
+                  <Slider label="Glass n (paint)" value={st.n} min={C.RANGES.n[0]} max={C.RANGES.n[1]}
+                          step={0.05} fmt={v => v.toFixed(2)} onChange={v => set({ n: v })} />
+                )}
               </div>
 
               <Section id="wave" title="Wave" summary={sourceName + ' · λ ' + (st.lambda * 100).toFixed(0) + '%'}
@@ -1464,8 +1515,6 @@
                 </div>
                 <Slider label="Wavelength" value={st.lambda} min={C.RANGES.lambda[0]} max={C.RANGES.lambda[1]}
                         step={0.005} fmt={v => (v * 100).toFixed(1) + '%'} onChange={v => set({ lambda: v })} />
-                <Slider label="Amplitude" value={st.amp} min={C.RANGES.amp[0]} max={C.RANGES.amp[1]}
-                        step={0.05} fmt={v => v.toFixed(2)} onChange={v => set({ amp: v })} />
                 <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
                   {st.source === 'plane'
                     ? 'A plane wave rolls in from the left edge.'
@@ -1496,7 +1545,8 @@
                   <div className="rt-sel">
                     <div className="rt-sel-head">
                       <b style={{ color: COL.text }}>{TYPE_NAMES[selected.type]}</b>
-                      <Seg items={MATS} value={selected.mat} onChange={v => updateSel({ mat: v })} />
+                      <Seg items={MATS} value={selected.mat}
+                           onChange={v => updateSel({ mat: v, n: selected.n || 1.5 })} />
                       <button type="button" className="rt-del"
                               onClick={() => { setShapes(list => list.filter(s => s.id !== selected.id)); setSelId(null); }}>
                         Delete
@@ -1530,6 +1580,16 @@
                       <Slider label="Rotation" value={selected.rot} min={-3.1416} max={3.1416} step={0.02}
                               fmt={v => (v * 180 / Math.PI).toFixed(0) + '°'} onChange={v => updateSel({ rot: v })} />
                     )}
+                    {selected.mat === 'glass' && (
+                      <React.Fragment>
+                        <Slider label="Refractive index n" value={selected.n || 1.5}
+                                min={C.RANGES.n[0]} max={C.RANGES.n[1]} step={0.05}
+                                fmt={v => v.toFixed(2)} onChange={v => updateSel({ n: v })} />
+                        <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
+                          Waves run 1/n as fast inside this piece.
+                        </p>
+                      </React.Fragment>
+                    )}
                   </div>
                 )}
                 {!selected && shapes.length > 0 && (
@@ -1537,34 +1597,11 @@
                     Click a shape on the canvas (in Move mode) to edit or delete it.
                   </p>
                 )}
-
-                <div style={{ height: 9 }} />
-                <Slider label="Refractive index n" value={st.n} min={C.RANGES.n[0]} max={C.RANGES.n[1]}
-                        step={0.05} fmt={v => v.toFixed(2)} onChange={v => set({ n: v })} />
-                <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
-                  Waves travel 1/n as fast in glass. Applies to all glass at once, live.
-                </p>
-              </Section>
-
-              <Section id="brush" title="Brush" summary={modeName}
-                       open={sec === 'brush'} onToggle={toggleSec}>
-                <Slider label="Brush size" value={st.brush} min={C.RANGES.brush[0]} max={C.RANGES.brush[1]}
-                        step={0.002} fmt={v => (v * 100).toFixed(1) + '%'} onChange={v => set({ brush: v })} />
-                <p style={{ fontSize: 11, color: COL.foot, margin: '0 0 2px', lineHeight: 1.6 }}>
-                  Pick Wall or Glass above the sections, then drag on the canvas.
-                  Shift-drag erases; Erase mode only removes paint, not shapes.
-                </p>
               </Section>
 
               <Section id="look" title="Look" summary={paletteName}
                        open={sec === 'look'} onToggle={toggleSec}>
                 <Seg items={C.PALETTES} value={st.palette} onChange={v => set({ palette: v })} />
-                <div style={{ height: 9 }} />
-                <Slider label="Relief" value={st.relief} min={C.RANGES.relief[0]} max={C.RANGES.relief[1]}
-                        step={0.5} fmt={v => v.toFixed(1)} onChange={v => set({ relief: v })} />
-                <Slider label="Light angle" value={st.light} min={C.RANGES.light[0]} max={C.RANGES.light[1]}
-                        step={0.05} fmt={v => (v * 180 / Math.PI).toFixed(0) + '°'}
-                        onChange={v => set({ light: v })} />
               </Section>
 
               <Section id="perf" title="Speed &amp; grid" summary={st.steps + '/frame · ' + st.res}
@@ -1585,11 +1622,16 @@
               <Section id="share" title="Export" open={sec === 'share'} onToggle={toggleSec}>
                 <div className="rt-row">
                   <button type="button" className="rt-btn lang-seg" onClick={savePng}>Save PNG</button>
+                  <button type="button" className="rt-btn lang-seg" onClick={toggleRec}
+                          style={rec ? { color: '#f87171', borderColor: '#f87171' } : null}>
+                    {rec ? '⏹ Stop recording' : '⏺ Record video'}
+                  </button>
                   <button type="button" className="rt-btn lang-seg" onClick={copyLink}>
                     {copied ? 'Copied' : 'Copy link'}
                   </button>
                 </div>
                 <p style={{ fontSize: 11, color: COL.foot, margin: '7px 0 0', lineHeight: 1.6 }}>
+                  Recording captures the canvas as WebM until you stop it, then downloads.
                   The link carries the settings and the shapes, not the paint.
                 </p>
               </Section>
@@ -1620,9 +1662,11 @@
                   </p>
                   <p>
                     The colours are a diverging map over the wave height: one hue for
-                    crests, one for troughs, dark for still water. Relief lights the
-                    field as a surface, which is closest to what an actual ripple tank
-                    projects onto its floor.
+                    crests, one for troughs, still water sits at the midpoint. A touch
+                    of relief lighting draws the field as a surface, which is closest
+                    to what an actual ripple tank projects onto its floor. Every piece
+                    of glass carries its own n; painted glass bakes in the n it was
+                    painted with.
                   </p>
                   <p style={{ color: COL.foot }}>
                     Everything runs on your GPU, nothing is uploaded anywhere. The
