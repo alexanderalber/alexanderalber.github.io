@@ -348,43 +348,71 @@
     var labels = voiceLabels(ir);
     var flats = ir.parts.map(flattenPart);
 
-    /* 1. measure sums vs. time signature. Two structural artifacts are normal
-     * and skipped or downgraded: measures with zero events (a line-initial
-     * barline right after the repeated clef/key produces them), and the pickup
-     * pattern, i.e. a short first measure, a short last measure, or a short
-     * measure at a section boundary (right before or after a repeat or final
-     * barline), whose two halves add up across the section. */
-    flats.forEach(function (f, pi) {
-      f.measures.forEach(function (m, k) {
+    /* Cross-part comparisons run over the sequence of non-empty measures:
+     * a line-initial barline yields an attribute-only empty measure in some
+     * voices but not others, which shifts raw measure indices between parts
+     * without anything being musically wrong. */
+    var seqs = flats.map(function (f) {
+      return f.measures.filter(function (m) { return m.sumDiv > 0; });
+    });
+
+    /* 1. measure sums vs. time signature. The pickup pattern (short first or
+     * last measure, or a short measure at a repeat/final boundary whose halves
+     * add up across the section) is downgraded to info. When EVERY voice
+     * deviates identically at the same spot, that is a property of the piece,
+     * not of one voice, and is reported once instead of per voice. */
+    var msPerPart = seqs.map(function (seq) {
+      return seq.map(function (m, k) {
         var exp = expectedMeasureDiv(m.time);
-        if (exp === null || m.sumDiv === exp) return;
-        if (m.sumDiv === 0) return;                 /* attribute-only measure */
-        var prevBar = k > 0 ? f.measures[k - 1].barline : null;
+        if (exp === null || m.sumDiv === exp) return null;
+        var prevBar = k > 0 ? seq[k - 1].barline : null;
         var ownBar = m.barline || "";
         var pickupish = m.sumDiv < exp &&
-          (k === 0 || k === f.measures.length - 1 ||
+          (k === 0 || k === seq.length - 1 ||
            (prevBar && prevBar.indexOf("repeat") >= 0) ||
            ownBar.indexOf("repeat") >= 0 || ownBar.indexOf("final") >= 0);
+        return { sum: m.sumDiv, exp: exp, index: m.index, pickupish: pickupish };
+      });
+    });
+    if (flats.length > 1) {
+      var minLen = Math.min.apply(null, seqs.map(function (s) { return s.length; }));
+      for (var kk = 0; kk < minLen; kk++) {
+        var slot = msPerPart.map(function (s) { return s[kk]; });
+        var first = slot[0];
+        var uniform = first !== null && slot.every(function (x) {
+          return x && x.sum === first.sum && x.exp === first.exp && x.pickupish === first.pickupish;
+        });
+        if (!uniform) continue;
         out.push({
           code: "measure-sum",
-          severity: pickupish ? "info" : "warn",
-          part: pi, measure: m.index,
-          message: labels[pi] + ", measure " + (m.index + 1) + ": " +
-            (pickupish
-              ? "only " + m.sumDiv + " of " + exp + " divisions, looks like a pickup or partial measure"
-              : "durations sum to " + m.sumDiv + " divisions, time signature expects " + exp),
+          severity: first.pickupish ? "info" : "warn",
+          part: null, measure: seqs[0][kk].index,
+          message: "All voices, measure " + (seqs[0][kk].index + 1) + ": " +
+            (first.pickupish
+              ? "only " + first.sum + " of " + first.exp + " divisions, looks like a pickup or partial measure"
+              : "durations sum to " + first.sum + " divisions, time signature expects " + first.exp +
+                "; consistent across all voices, so possibly a real meter change the engraving does not spell out"),
+        });
+        msPerPart.forEach(function (s) { s[kk] = null; });
+      }
+    }
+    msPerPart.forEach(function (s, pi) {
+      s.forEach(function (x) {
+        if (!x) return;
+        out.push({
+          code: "measure-sum",
+          severity: x.pickupish ? "info" : "warn",
+          part: pi, measure: x.index,
+          message: labels[pi] + ", measure " + (x.index + 1) + ": " +
+            (x.pickupish
+              ? "only " + x.sum + " of " + x.exp + " divisions, looks like a pickup or partial measure"
+              : "durations sum to " + x.sum + " divisions, time signature expects " + x.exp),
         });
       });
     });
 
-    /* 2. voices in sync. Compared over the sequence of non-empty measures:
-     * a line-initial barline yields an attribute-only empty measure in some
-     * voices but not others, which shifts raw measure indices between parts
-     * without anything being musically wrong. */
+    /* 2. voices in sync */
     if (flats.length > 1) {
-      var seqs = flats.map(function (f) {
-        return f.measures.filter(function (m) { return m.sumDiv > 0; });
-      });
       var counts = seqs.map(function (s) { return s.length; });
       var maxCount = Math.max.apply(null, counts);
       counts.forEach(function (c, pi) {
