@@ -48,12 +48,15 @@
     .nc-side h3 + p { margin-top: -4px; }
     .nc-list { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow-y: auto; }
     .nc-list li { display: flex; align-items: center; gap: 8px; padding: 3px 2px;
-      border-bottom: 1px solid var(--tool-hairline); font-size: 13px; }
+      border-bottom: 1px solid var(--tool-hairline); font-size: 13px; cursor: pointer; }
     .nc-list li:last-child { border-bottom: 0; }
     .nc-list input[type=checkbox] { margin: 0; flex: none; }
     .nc-swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-    .nc-nm { flex: 1 1 auto; color: var(--tool-text); cursor: text; overflow: hidden;
+    .nc-nm { flex: 1 1 auto; color: var(--tool-text); overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
+    .nc-edit { flex: none; color: var(--tool-note); opacity: .5; cursor: pointer;
+      font-size: 12px; line-height: 1; padding: 1px 3px; }
+    .nc-list li:hover .nc-edit { opacity: 1; }
     .nc-list li.off .nc-nm { color: var(--tool-note); }
     .nc-list li.unsure .nc-nm { font-style: italic; }
     .nc-ct { color: var(--tool-note); font-variant-numeric: tabular-nums; font-size: 11.5px; flex: none; }
@@ -3265,6 +3268,38 @@
       var out = [];
       var forced = o.presence || null;
       var cooc = o.cooc || null;
+
+      /* With a state sequence per character the whole session machinery is
+       * moot: a group is simply everyone whose state agrees, and the states
+       * carry the inertia. Group order follows the clustered leaf order so
+       * the bands stack the same way in every column. */
+      if (o.states && forced) {
+        var home = o.home || null;
+        for (var si = 0; si < sliceRanges.length; si++) {
+          var pres = forced[si].slice().sort(function (a, b) { return a - b; });
+          var byState = new Map();
+          for (var pi = 0; pi < pres.length; pi++) {
+            var st = o.states[si][pres[pi]];
+            if (st === undefined) st = -1;
+            if (!byState.has(st)) byState.set(st, []);
+            byState.get(st).push(pres[pi]);
+          }
+          var gs = Array.from(byState.values());
+          var meanHome = function (g) {
+            var sum = 0;
+            for (var i = 0; i < g.length; i++) sum += home ? home[g[i]] : g[i];
+            return sum / g.length;
+          };
+          gs.sort(function (a, b) { return meanHome(a) - meanHome(b); });
+          for (var gi = 0; gi < gs.length; gi++) {
+            gs[gi].sort(function (a, b) { return a - b; });
+          }
+          out.push({ index: si, from: sliceRanges[si].from, to: sliceRanges[si].to,
+            title: sliceRanges[si].title, present: pres, groups: gs });
+        }
+        return out;
+      }
+
       for (var s = 0; s < sliceRanges.length; s++) {
         var r = sliceRanges[s];
         var present = [], home = Object.create(null), silent = [];
@@ -3387,6 +3422,118 @@
       return out;
     }
 
+    /* Which bundle a character sits with, per column, made deliberately inert.
+     *
+     * Reading the grouping off each column independently (argmax over the
+     * column's scenes) is honest and unusable: on Pride and Prejudice the
+     * companion set of every character changed at every single column
+     * boundary, so no coordinate assignment could ever draw a flat line. The
+     * original's grammar is the opposite: a line keeps its company until the
+     * story moves it.
+     *
+     * So company gets the same treatment presence got: a hidden state per
+     * character (which cluster it currently sits with), evidence per column
+     * (co-namings with each cluster's members, normalised to a distribution),
+     * a fixed price per switch, Viterbi. Evidence has to be strong for a few
+     * columns to move a line; a single shared dinner does not.
+     *
+     * A co-naming is weighted by how rare the partner is. Unweighted, the
+     * viewpoint character's cluster wins every column for everyone (she is in
+     * every scene, so she out-counts anything) and the chart collapses to the
+     * single braid again, one level up from where connected components did the
+     * same thing. Sharing a scene with someone who is everywhere says nothing;
+     * sharing one with someone rare is the signal. */
+    function clusterStates(sceneSets, ranges, presence, cluster, opts) {
+      var o = opts || {};
+      var tau = o.groupSwitchCost == null ? 2 : o.groupSwitchCost;
+      var eps = 0.5;
+      var n = ranges.length;
+      var charCount = cluster.length;
+      var K = 1;
+      for (var i = 0; i < charCount; i++) K = Math.max(K, cluster[i] + 1);
+      var sceneCount = new Array(charCount).fill(0), totalScenes = 0;
+      for (var sc = 0; sc < sceneSets.length; sc++) {
+        totalScenes++;
+        for (var ck in sceneSets[sc]) sceneCount[Number(ck)]++;
+      }
+      var meanCount = 0;
+      for (var mc = 0; mc < charCount; mc++) meanCount += 1 + sceneCount[mc];
+      meanCount /= Math.max(1, charCount);
+      // Rescaled to the raw-count ballpark so eps keeps its meaning.
+      var weight = sceneCount.map(function (v) { return meanCount / (1 + v); });
+      var E = [];
+      for (var c = 0; c < charCount; c++) {
+        var per = [];
+        for (var s = 0; s < n; s++) per.push(new Array(K).fill(0));
+        E.push(per);
+      }
+      for (var s2 = 0; s2 < n; s2++) {
+        for (var i2 = ranges[s2].from; i2 <= ranges[s2].to; i2++) {
+          var here = [];
+          for (var key in sceneSets[i2]) here.push(Number(key));
+          for (var a = 0; a < here.length; a++) {
+            for (var b = 0; b < here.length; b++) {
+              if (a !== b) E[here[a]][s2][cluster[here[b]]] += weight[here[b]];
+            }
+          }
+        }
+      }
+      /* Per member, not per cluster: with the weights above every member's
+       * expected contribution is roughly equal, so a six-person cluster
+       * otherwise collects six times the background evidence of a singleton
+       * and wins every column on size alone. */
+      var clusterSize = new Array(K).fill(0);
+      for (var cs = 0; cs < charCount; cs++) clusterSize[cluster[cs]]++;
+      for (var ce = 0; ce < charCount; ce++) {
+        for (var se = 0; se < n; se++) {
+          for (var ke = 0; ke < K; ke++) {
+            E[ce][se][ke] /= Math.max(1, clusterSize[ke]);
+          }
+        }
+      }
+      var out = [];
+      for (var s3 = 0; s3 < n; s3++) out.push(Object.create(null));
+      for (var c2 = 0; c2 < charCount; c2++) {
+        var cols = [];
+        for (var s4 = 0; s4 < n; s4++) {
+          if (presence[s4].indexOf(c2) >= 0) cols.push(s4);
+        }
+        if (!cols.length) continue;
+        var emit = [];
+        for (var t = 0; t < cols.length; t++) {
+          var row = E[c2][cols[t]], tot = 0, e = [];
+          for (var k = 0; k < K; k++) tot += row[k];
+          for (var k2 = 0; k2 < K; k2++) {
+            e.push(-Math.log((row[k2] + eps) / (tot + K * eps)));
+          }
+          emit.push(e);
+        }
+        // Starting anywhere but the home cluster costs one switch.
+        var dp = [], back = [];
+        for (var k3 = 0; k3 < K; k3++) {
+          dp.push(emit[0][k3] + (k3 === cluster[c2] ? 0 : tau));
+        }
+        for (var t2 = 1; t2 < cols.length; t2++) {
+          var bestJ = 0;
+          for (var j = 1; j < K; j++) if (dp[j] < dp[bestJ]) bestJ = j;
+          var nextDp = [], bk = [];
+          for (var k4 = 0; k4 < K; k4++) {
+            var stay = dp[k4], jump = dp[bestJ] + tau;
+            if (stay <= jump) { nextDp.push(stay + emit[t2][k4]); bk.push(k4); }
+            else { nextDp.push(jump + emit[t2][k4]); bk.push(bestJ); }
+          }
+          dp = nextDp; back.push(bk);
+        }
+        var at = 0;
+        for (var k5 = 1; k5 < K; k5++) if (dp[k5] < dp[at]) at = k5;
+        for (var t3 = cols.length - 1; t3 >= 0; t3--) {
+          out[cols[t3]][c2] = at;
+          if (t3 > 0) at = back[t3 - 1][at];
+        }
+      }
+      return out;
+    }
+
     // ══ stage 4b: who belongs with whom, over the whole book ═════════════════
 
     /* Co-occurrence at scene level, which is the only level where "together"
@@ -3484,11 +3631,19 @@
      * puts the whole cast in one cluster. What is stable across books is where
      * the merge distances jump, so that is what gets measured. Bounded on both
      * sides: one cluster is no information, and more than a handful stops being
-     * a reading aid and becomes confetti. */
+     * a reading aid and becomes confetti.
+     *
+     * The lower bound is three, not two, since the Game of Thrones round: with
+     * two allowed, the widest gap separates Essos from Westeros and the whole
+     * Stark diaspora stays one braid for the entire book. Requiring three lets
+     * the elbow land on five there (measured: Tyrion alone, the King's Landing
+     * court, the northern boys, the girls, Daenerys), and the books that were
+     * already fine (Dune, Ender, P&P) sit at three or more anyway, so nothing
+     * else moved. */
     function clusterAssign(merges, n, opts) {
       var o = opts || {};
       var maxK = Math.max(2, Math.min(o.maxClusters || 5, n));
-      var minK = Math.max(2, Math.min(o.minClusters || 2, n));
+      var minK = Math.max(2, Math.min(o.minClusters == null ? 3 : o.minClusters, n));
       var take = Math.max(0, n - minK);
       if (n > minK && merges.length) {
         var bestGap = -Infinity;
@@ -3750,56 +3905,120 @@
       return { rows: rows, height: height, lane: lane };
     }
 
-    /* Three-tap smoothing per character, clamped twice over: a smoothed line
-     * can never pass a neighbour it does not actually cross, and it can never
-     * move further than one lane from where the grouping put it.
+    /* Stillness as the objective, not as an afterthought. The stacked layout
+     * from assignY re-packs every column from scratch, so a line moves whenever
+     * anything above it changes, and the chart wiggles everywhere. The original
+     * reads the other way round: a line is flat unless its company changes, and
+     * ordering plus minimum separations are mere constraints on that.
      *
-     * The second clamp is the important one and it was missing at first. Left
-     * free, the smoothing pulls a line towards where it sits in the next
-     * column, and since that column has a different grouping, the bundles
-     * dissolve into a set of evenly spaced curves. The whole point of the
-     * picture is that a bundle is tight and the space between bundles is wide,
-     * so the smoothing is allowed to round the corners and nothing else. */
-    function smoothY(rows, orders, opts) {
-      var o = opts || {};
-      var rounds = o.rounds == null ? 2 : o.rounds;
-      var lane = o.lane || 22;
-      var limit = o.smoothLimit == null ? lane : o.smoothLimit;
-      var base = rows.map(function (row) {
-        var copy = Object.create(null);
-        for (var c in row.ys) copy[c] = row.ys[c];
-        return copy;
-      });
-      for (var r = 0; r < rounds; r++) {
-        var next = rows.map(function (row) {
-          var copy = Object.create(null);
-          for (var c in row.ys) copy[c] = row.ys[c];
-          return copy;
-        });
-        for (var s = 0; s < rows.length; s++) {
-          for (var c2 in rows[s].ys) {
-            var prev = s > 0 && rows[s - 1].ys[c2] !== undefined ? rows[s - 1].ys[c2] : null;
-            var nxt = s + 1 < rows.length && rows[s + 1].ys[c2] !== undefined ? rows[s + 1].ys[c2] : null;
-            if (prev === null && nxt === null) continue;
-            var sum = rows[s].ys[c2] * 2, n = 2;
-            if (prev !== null) { sum += prev; n++; }
-            if (nxt !== null) { sum += nxt; n++; }
-            var target = sum / n;
-            var lo = base[s][c2] - limit, hi = base[s][c2] + limit;
-            var idx = orders[s].indexOf(Number(c2));
-            if (idx > 0) lo = Math.max(lo, rows[s].ys[orders[s][idx - 1]] + lane * 0.5);
-            if (idx >= 0 && idx + 1 < orders[s].length) {
-              hi = Math.min(hi, rows[s].ys[orders[s][idx + 1]] - lane * 0.5);
-            }
-            var v = Math.min(hi, Math.max(lo, target));
-            // Over-constrained (a tight bundle against a nearby neighbour):
-            // do not smooth at all rather than pick an arbitrary side.
-            next[s][c2] = lo > hi ? base[s][c2] : v;
-          }
-        }
-        for (var t = 0; t < rows.length; t++) rows[t].ys = next[t];
+     * So the pixel positions are relaxed towards Σ|y[s][c] - y[s-1][c]| = 0
+     * subject to the column's constraints. Three choices carry the look:
+     *
+     * - A bundle is a rigid block, its members exactly one lane apart. A
+     *   minimum-distance constraint alone never pulls two companions together;
+     *   rigidity is what makes "they met" visible as lines that touch.
+     * - Block targets are medians of member votes, not means. L2 spreads a
+     *   forced move into a ramp across many columns; L1 concentrates it into
+     *   one step at one gap, which is the xkcd grammar. On ties the value
+     *   nearest the current position wins, so ambiguity never causes motion.
+     * - The per-column projection is exact (pool-adjacent-violators on the
+     *   slack), so separations hold at every round and determinism is free. */
+    function median(votes, prefer) {
+      var v = votes.slice().sort(function (a, b) { return a - b; });
+      var m = v.length >> 1;
+      if (v.length % 2 === 1) return v[m];
+      return Math.min(v[m], Math.max(v[m - 1], prefer));
+    }
+
+    /* L2 projection of desired block tops onto the chain
+     * top[b+1] >= top[b] + height[b] + gap, via PAV on the slack variables. */
+    function chainProject(desired, heights, gap) {
+      var cum = [0];
+      for (var b = 1; b < desired.length; b++) {
+        cum.push(cum[b - 1] + heights[b - 1] + gap);
       }
-      return rows;
+      var val = [], wt = [], len = [];
+      for (var i = 0; i < desired.length; i++) {
+        var cv = desired[i] - cum[i], cw = 1, cl = 1;
+        while (val.length && val[val.length - 1] >= cv) {
+          cv = (cv * cw + val[val.length - 1] * wt[wt.length - 1]) / (cw + wt[wt.length - 1]);
+          cw += wt[wt.length - 1];
+          cl += len[len.length - 1];
+          val.pop(); wt.pop(); len.pop();
+        }
+        val.push(cv); wt.push(cw); len.push(cl);
+      }
+      var out = [], k = 0;
+      for (var g = 0; g < val.length; g++) {
+        for (var j = 0; j < len[g]; j++) { out.push(val[g] + cum[k]); k++; }
+      }
+      return out;
+    }
+
+    function relaxY(rows, orders, slices, opts) {
+      var o = opts || {};
+      var lane = o.lane || 22;
+      var gap = o.groupGap == null ? 18 : o.groupGap;
+      var rounds = o.relaxRounds == null ? 60 : o.relaxRounds;
+      var n = orders.length;
+      var cols = [];
+      for (var s = 0; s < n; s++) {
+        var blocks = groupBlocks(orders[s], slices[s].groups);
+        var off = Object.create(null), heights = [], top = [];
+        for (var b = 0; b < blocks.length; b++) {
+          for (var i = 0; i < blocks[b].length; i++) {
+            off[blocks[b][i]] = { blk: b, dy: i * lane };
+          }
+          heights.push((blocks[b].length - 1) * lane);
+          top.push(rows[s].ys[blocks[b][0]]);
+        }
+        cols.push({ blocks: blocks, off: off, heights: heights, top: top });
+      }
+      function yOf(s2, c) {
+        var p = cols[s2].off[c];
+        return p === undefined ? undefined : cols[s2].top[p.blk] + p.dy;
+      }
+      for (var r = 0; r < rounds; r++) {
+        var fwd = r % 2 === 0;
+        for (var q = 0; q < n; q++) {
+          var at = fwd ? q : n - 1 - q;
+          var col = cols[at];
+          var desired = [];
+          for (var b2 = 0; b2 < col.blocks.length; b2++) {
+            var votes = [];
+            for (var m = 0; m < col.blocks[b2].length; m++) {
+              var c2 = col.blocks[b2][m];
+              var prev = at > 0 ? yOf(at - 1, c2) : undefined;
+              var nxt = at + 1 < n ? yOf(at + 1, c2) : undefined;
+              if (prev !== undefined) votes.push(prev - col.off[c2].dy);
+              if (nxt !== undefined) votes.push(nxt - col.off[c2].dy);
+            }
+            // The block's own position votes too. Without this the projections
+            // ratchet: each column follows its neighbours' spread a little
+            // further out every round, and the chart slowly inflates. With it
+            // the iteration is a strict descent and settles.
+            votes.push(col.top[b2]);
+            desired.push(median(votes, col.top[b2]));
+          }
+          col.top = chainProject(desired, col.heights, gap);
+        }
+      }
+      // Write back, shifted as a whole so the chart starts at zero. The shift
+      // must be global: a per-column shift would re-introduce the wiggle.
+      var lo = Infinity, hi = -Infinity;
+      for (var s3 = 0; s3 < n; s3++) {
+        for (var c3 in rows[s3].ys) {
+          var y = yOf(s3, Number(c3));
+          rows[s3].ys[c3] = y;
+          if (y < lo) lo = y;
+          if (y > hi) hi = y;
+        }
+      }
+      if (lo === Infinity) { lo = 0; hi = 0; }
+      for (var s4 = 0; s4 < n; s4++) {
+        for (var c4 in rows[s4].ys) rows[s4].ys[c4] -= lo;
+      }
+      return { rows: rows, height: hi - lo + lane };
     }
 
     /* Contiguous runs of slices per character, in pixel space. Each slice
@@ -3828,40 +4047,29 @@
 
     /* An SVG path for one run: flat inside a slice, an S-curve with horizontal
      * tangents across the gap. Horizontal tangents mean the curve cannot
-     * overshoot past its endpoints, so no clamping is needed. */
+     * overshoot past its endpoints, so no clamping is needed.
+     *
+     * The move is compressed into the middle of the gap rather than spread
+     * over all of it: the original's transitions are short and decisive, and
+     * the longer the flat shoulders, the more a move reads as an event rather
+     * than as a slope. */
     function linePath(run) {
       if (!run.length) return '';
       var d = 'M' + n2(run[0].x0) + ',' + n2(run[0].y) + 'L' + n2(run[0].x1) + ',' + n2(run[0].y);
       for (var i = 1; i < run.length; i++) {
         var a = run[i - 1], b = run[i];
-        var dx = (b.x0 - a.x1) / 2;
-        d += 'C' + n2(a.x1 + dx) + ',' + n2(a.y) + ' ' + n2(b.x0 - dx) + ',' + n2(b.y)
-          + ' ' + n2(b.x0) + ',' + n2(b.y);
+        if (b.y === a.y) { d += 'L' + n2(b.x1) + ',' + n2(b.y); continue; }
+        var lead = (b.x0 - a.x1) * 0.28;
+        var x1 = a.x1 + lead, x2 = b.x0 - lead;
+        var mid = (x1 + x2) / 2;
+        d += 'L' + n2(x1) + ',' + n2(a.y)
+          + 'C' + n2(mid) + ',' + n2(a.y) + ' ' + n2(mid) + ',' + n2(b.y)
+          + ' ' + n2(x2) + ',' + n2(b.y);
         d += 'L' + n2(b.x1) + ',' + n2(b.y);
       }
       return d;
     }
     function n2(v) { return Math.round(v * 100) / 100; }
-
-    /* A deterministic wobble, so the hand-drawn version exports the same twice.
-     * splitmix32, the same generator the leverage tool uses. */
-    function rng(seed) {
-      var a = seed >>> 0;
-      return function () {
-        a = (a + 0x9E3779B9) >>> 0;
-        var t = a;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-      };
-    }
-
-    function jitterRun(run, amp, seed) {
-      var r = rng(seed);
-      return run.map(function (p) {
-        return { s: p.s, x0: p.x0, x1: p.x1, y: p.y + (r() - 0.5) * 2 * amp };
-      });
-    }
 
     /* Labels along the line, repeated the way the original does it, and only
      * on flat stretches so the text never sits on a diagonal.
@@ -3886,24 +4094,41 @@
             var isStart = i === 0;
             var flat = i === 0 || Math.abs(run[i].y - run[i - 1].y) < 1;
             if (!isStart && !(flat && (run[i].s % every === 0))) continue;
-            cands.push({ c: c, x: run[i].x0 + 2, y: run[i].y, s: run[i].s });
+            cands.push({ c: c, x: run[i].x0 + 2, y: run[i].y, s: run[i].s, run: r, st: isStart });
           }
         }
         cands.sort(function (a, b) { return a.x - b.x; });
-        var lastX = -Infinity;
+        /* The minimum distance stops "Shaftoe Shaftoe" across a short bridged
+           gap, but only when the line comes back at the same height, where it
+           reads as a continuation. A run that reappears at a different height
+           is not traceable from the previous label and gets its own name even
+           close by; without this, a POV novel is full of anonymous dashes. */
+        var lastX = -Infinity, lastY = Infinity, perRun = Object.create(null);
         for (var k = 0; k < cands.length; k++) {
-          if (cands[k].x - lastX < minGap) continue;
+          var far = cands[k].x - lastX >= minGap;
+          var movedRow = cands[k].st && Math.abs(cands[k].y - lastY) >= (o.labelHeight || 11)
+            && cands[k].x - lastX >= 44;
+          if (!far && !movedRow) continue;
           cands[k].w = textWidth(names ? names[c] : '', o);
           out.push(cands[k]);
+          perRun[cands[k].run] = (perRun[cands[k].run] || 0) + 1;
           lastX = cands[k].x;
+          lastY = cands[k].y;
+        }
+        for (var k2 = 0; k2 < out.length; k2++) {
+          if (out[k2].c === c) out[k2].sole = perRun[out[k2].run] === 1;
         }
       });
 
       /* Second pass, across characters: two lines one lane apart put their
          labels 16 pixels apart vertically, which is not enough for two words
-         that overlap horizontally. Leftmost wins, the other waits for its next
-         chance further along the line. */
-      out.sort(function (a, b) { return (a.x - b.x) || (a.c - b.c); });
+         that overlap horizontally. A run's only label outranks the repeats of
+         its neighbours, so a short one-column appearance is never an anonymous
+         dash (POV novels are full of those); among equals, leftmost wins and
+         the loser waits for its next chance further along the line. */
+      out.sort(function (a, b) {
+        return ((b.sole ? 1 : 0) - (a.sole ? 1 : 0)) || (a.x - b.x) || (a.c - b.c);
+      });
       var kept = [];
       for (var i2 = 0; i2 < out.length; i2++) {
         var a2 = out[i2], clash = false;
@@ -3916,6 +4141,27 @@
       }
       kept.sort(function (a, b) { return (a.s - b.s) || (a.c - b.c); });
       return kept;
+    }
+
+    /* Stroke width per character from its mention count, exponent-controlled:
+     * 0 keeps every line at the base width, 1 is fully proportional. The
+     * mean width stays at the base whatever the exponent, so the slider
+     * changes the spread between major and minor characters, not the overall
+     * weight of the picture. Clamped so a walk-on part stays clickable and a
+     * protagonist does not become a river. */
+    function lineWeights(counts, exp, base) {
+      var b = base || 3;
+      var n = counts.length;
+      if (!n) return [];
+      var pow = [], sum = 0;
+      for (var i = 0; i < n; i++) {
+        pow.push(Math.pow(Math.max(1, counts[i]), exp || 0));
+        sum += pow[i];
+      }
+      var mean = sum / n;
+      return pow.map(function (p) {
+        return Math.min(b * 3, Math.max(1.6, b * p / mean));
+      });
     }
 
     // Rough advance width of the label, used only to keep two of them apart.
@@ -4086,8 +4332,10 @@
       });
       var presence = presenceIntervals(colCounts, ranges.length, chars.length, cur);
 
+      var states = clusterStates(sceneSets, ranges, presence, struct.cluster, cur);
       var slices = buildSlices(sceneSets, ranges, chars.length,
-        Object.assign({}, cur, { presence: presence, cooc: struct.cooc }));
+        Object.assign({}, cur, { presence: presence, cooc: struct.cooc,
+          states: states, home: struct.home }));
       var used = slices.filter(function (s) { return s.present.length > 0; })
         .map(function (s, i) { return Object.assign({}, s, { index: i }); });
 
@@ -4111,7 +4359,8 @@
       }
 
       var lay = assignY(orders, used, o);
-      smoothY(lay.rows, orders, Object.assign({ lane: lay.lane }, o));
+      var relaxed = relaxY(lay.rows, orders, used, Object.assign({ lane: lay.lane }, o));
+      lay.height = relaxed.height;
       var runs = buildRibbons(orders, lay.rows, geo);
 
       return {
@@ -4138,13 +4387,15 @@
       classifyCandidates: classifyCandidates, extract: extract,
       mergeAliases: mergeAliases,
       sliceScenes: sliceScenes, segmentScenes: segmentScenes, buildSlices: buildSlices,
-      presenceIntervals: presenceIntervals, cooccurrence: cooccurrence,
+      presenceIntervals: presenceIntervals, clusterStates: clusterStates,
+      cooccurrence: cooccurrence,
       hierarchical: hierarchical, leafOrder: leafOrder, clusterAssign: clusterAssign,
       globalStructure: globalStructure, clusterColors: clusterColors, oklchToHex: oklchToHex,
       countCrossings: countCrossings, totalCrossings: totalCrossings, enforceGroups: enforceGroups,
       initialOrder: initialOrder, barycenterSweep: barycenterSweep, localSwapPass: localSwapPass,
-      orderSlices: orderSlices, assignY: assignY, smoothY: smoothY, buildRibbons: buildRibbons,
-      linePath: linePath, jitterRun: jitterRun, labelPositions: labelPositions, rng: rng,
+      orderSlices: orderSlices, assignY: assignY, relaxY: relaxY,
+      median: median, chainProject: chainProject, buildRibbons: buildRibbons,
+      linePath: linePath, labelPositions: labelPositions, lineWeights: lineWeights,
       analyze: analyze, buildChart: buildChart,
     };
   })();
@@ -4289,14 +4540,21 @@
 
     const fmt = (n) => n.toLocaleString('en-US');
 
-    function Chart({ chart, colors, jitter, labelEvery, onPick }) {
+    /* Hand drawn is an SVG displacement filter rather than jittered points:
+       one fractal noise field bends lines and labels together, so the strands
+       of a bundle wobble in step the way a pen stroke would, instead of each
+       column point getting its own scratch. Fixed seed, so the export is
+       reproducible. The casual font stack is system fonts only. */
+    const ROUGH_FONT = "'Segoe Print','Comic Sans MS','Chalkboard SE','Comic Neue',cursive";
+
+    function Chart({ chart, colors, jitter, labelEvery, weightExp, onPick }) {
       const width = chart.width;
       const height = chart.height + PAD_TOP + PAD_BOT;
+      const weights = NARR.lineWeights(chart.chars.map((c) => c.count), weightExp);
       const runs = [];
       chart.runs.forEach((list, c) => {
         list.forEach((run, ri) => {
-          const use = jitter ? NARR.jitterRun(run, 2.2, (c + 1) * 7919 + ri) : run;
-          runs.push({ c, d: NARR.linePath(use), key: c + ':' + ri });
+          runs.push({ c, d: NARR.linePath(run), key: c + ':' + ri });
         });
       });
       const labels = NARR.labelPositions(chart.runs, {
@@ -4318,22 +4576,34 @@
         <svg width={width} height={height} viewBox={'0 0 ' + width + ' ' + height}
              xmlns="http://www.w3.org/2000/svg" role="img"
              aria-label="Narrative chart: one line per character over the course of the book">
+          {jitter && (
+            <defs>
+              <filter id="nc-rough" x="-2%" y="-6%" width="104%" height="112%">
+                <feTurbulence type="fractalNoise" baseFrequency="0.011" numOctaves="2"
+                              seed="7" result="n" />
+                <feDisplacementMap in="SourceGraphic" in2="n" scale="4"
+                                   xChannelSelector="R" yChannelSelector="G" />
+              </filter>
+            </defs>
+          )}
           <g>
             {marks.map((m, i) => (
               <line key={i} x1={m.x} x2={m.x} y1={PAD_TOP - 8} y2={height - PAD_BOT}
                     stroke={COL.hair} strokeWidth="1" />
             ))}
           </g>
-          <g transform={'translate(0,' + PAD_TOP + ')'}>
+          <g transform={'translate(0,' + PAD_TOP + ')'}
+             filter={jitter ? 'url(#nc-rough)' : undefined}>
             {runs.map((r) => (
               <path key={r.key} d={r.d} fill="none" stroke={colors[r.c]}
-                    strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"
+                    strokeWidth={weights[r.c]} strokeLinecap="round" strokeLinejoin="round"
                     onClick={() => onPick && onPick(r.c)} style={{ cursor: 'pointer' }}>
                 <title>{chart.chars[r.c] ? chart.chars[r.c].name : ''}</title>
               </path>
             ))}
             {labels.map((l, i) => (
-              <text key={i} x={l.x} y={l.y - 5} fontSize="9.5" fontFamily="system-ui, sans-serif"
+              <text key={i} x={l.x} y={l.y - 5} fontSize={jitter ? 10 : 9.5}
+                    fontFamily={jitter ? ROUGH_FONT : 'system-ui, sans-serif'}
                     fill={colors[l.c]} stroke={COL.halo} strokeWidth="2.6"
                     paintOrder="stroke" strokeLinejoin="round">
                 {chart.chars[l.c] ? chart.chars[l.c].name : ''}
@@ -4382,8 +4652,9 @@
         <div className="nc-card nc-side">
           <h3>Characters</h3>
           <p className="nc-note" style={{ marginBottom: 10 }}>
-            Found by heuristic, so expect to correct it. Tick to show, click a name to rename,
-            select rows to merge two spellings of one person or to pull an over-eager merge apart.
+            Found by heuristic, so expect to correct it. Tick to show. Click rows to select them,
+            then merge two spellings of one person or pull an over-eager merge apart. The pencil
+            renames.
           </p>
           <div className="nc-bar">
             <button className="lang-seg" onClick={mergeSelected} disabled={selected.length < 2}>Merge</button>
@@ -4401,19 +4672,21 @@
               return (
                 <li key={g.id} style={newBand ? { borderTop: '1px solid ' + COL.hair, marginTop: 3, paddingTop: 5 } : null}
                     className={(on ? '' : 'off ') + (g.verdict === 'person' ? '' : 'unsure ')
-                      + (selected.indexOf(g.id) >= 0 ? 'nc-sel' : '')}>
+                      + (selected.indexOf(g.id) >= 0 ? 'nc-sel' : '')}
+                    onClick={() => {
+                      if (editing === g.id) return;
+                      setSelected(selected.indexOf(g.id) >= 0
+                        ? selected.filter((x) => x !== g.id) : selected.concat([g.id]));
+                    }}>
                   <input type="checkbox" checked={on} onChange={() => toggle(g)}
+                         onClick={(e) => e.stopPropagation()}
                          aria-label={'Show ' + g.display} />
                   <span className="nc-swatch" style={{ background: col || 'transparent',
                         border: col ? 'none' : '1px solid ' + COL.hair }} />
-                  <span className="nc-nm" onClick={(e) => {
-                        if (e.shiftKey || e.metaKey || e.ctrlKey) {
-                          setSelected(selected.indexOf(g.id) >= 0
-                            ? selected.filter((x) => x !== g.id) : selected.concat([g.id]));
-                        } else setEditing(g.id);
-                      }}>
+                  <span className="nc-nm">
                     {editing === g.id ? (
                       <input autoFocus defaultValue={(curation.rename[g.id]) || g.display}
+                             onClick={(e) => e.stopPropagation()}
                              onBlur={(e) => {
                                const rename = Object.assign({}, curation.rename);
                                rename[g.id] = e.target.value.trim() || g.display;
@@ -4424,14 +4697,13 @@
                                if (e.key === 'Escape') setEditing(null); }} />
                     ) : ((curation.rename[g.id]) || g.display)}
                   </span>
+                  <span className="nc-edit" title={'Rename ' + g.display}
+                        onClick={(e) => { e.stopPropagation(); setEditing(g.id); }}>&#9998;</span>
                   <span className="nc-ct">{g.count}</span>
                 </li>
               );
             })}
           </ul>
-          <p className="nc-note" style={{ marginTop: 8 }}>
-            Hold shift and click a name to select it for merging.
-          </p>
         </div>
       );
     }
@@ -4447,6 +4719,7 @@
       const [selected, setSelected] = useState([]);
       const [jitter, setJitter] = useState(false);
       const [labelEvery, setLabelEvery] = useState(5);
+      const [weightExp, setWeightExp] = useState(0.3);
       const [fit, setFit] = useState(true);
       // Two spacings, not one scaled pair. A bundle only reads as a bundle when
       // the lines inside it nearly touch and the space to the next bundle is
@@ -4462,7 +4735,7 @@
         // where the flat stretch inside a column is still long enough to read
         // as flat rather than as one long diagonal.
         columnMode: 'adaptive', columns: 36, scenesPerSlice: 4,
-        clusterStrength: 0.35,
+        clusterStrength: 0.35, groupSwitchCost: 2,
       });
       const fileRef = useRef(null);
       const svgRef = useRef(null);
@@ -4512,9 +4785,7 @@
 
       const layout = useMemo(() => ({
         sliceWidth: 34, gapWidth: 24, x0: 8,
-        // Smoothing is worth about 8% less wiggle and costs bundle contrast at
-        // a much steeper rate, so it is kept on a short leash.
-        lane, groupGap: bundleGap, smoothLimit: Math.max(2, Math.round(lane * 0.3)),
+        lane, groupGap: bundleGap,
         fitWidth: fit ? Math.max(320, stageW - 2) : 0,
       }), [lane, bundleGap, fit, stageW]);
 
@@ -4618,7 +4889,13 @@
               <div className="nc-wrap">
                 <div className="nc-stage" ref={svgRef}>
                   {chart && chart.chars.length > 0 ? (
-                    <Chart chart={chart} colors={colors} jitter={jitter} labelEvery={labelEvery} />
+                    <Chart chart={chart} colors={colors} jitter={jitter} labelEvery={labelEvery}
+                           weightExp={weightExp}
+                           onPick={(c) => {
+                             const id = chart.chars[c].id;
+                             setSelected(selected.indexOf(id) >= 0
+                               ? selected.filter((x) => x !== id) : selected.concat([id]));
+                           }} />
                   ) : (
                     <p style={{ padding: 20, color: 'var(--tool-note)' }}>
                       No characters left to draw. Lower the mention threshold or tick a few names
@@ -4638,8 +4915,8 @@
                     </div>
                     {curation.columnMode === 'adaptive' && (
                       <div>
-                        <label className="nc-lab"><b>{curation.columns}</b> columns, cut where the cast changes</label>
-                        <input className="nc-range" type="range" min="12" max="90" step="1"
+                        <label className="nc-lab"><b>{curation.columns}</b> columns, boundaries snapped to chapter starts</label>
+                        <input className="nc-range" type="range" min="18" max="60" step="1"
                                value={curation.columns}
                                onChange={(e) => set({ columns: Number(e.target.value) })} />
                       </div>
@@ -4669,11 +4946,21 @@
                       costs proportionally more than bridging a short one.
                     </p>
 
+                    <label className="nc-lab">Group inertia: <b>{curation.groupSwitchCost}</b></label>
+                    <input className="nc-range" type="range" min="0.5" max="4.5" step="0.25"
+                           value={curation.groupSwitchCost}
+                           onChange={(e) => set({ groupSwitchCost: Number(e.target.value) })} />
+                    <p className="nc-note" style={{ marginTop: -6, marginBottom: 12 }}>
+                      How much scene-sharing it takes to move a line into another bundle. Low, the
+                      chart follows every dinner party; high, everyone stays with their own faction
+                      and nothing ever meets. The flat stretches live in the middle.
+                    </p>
+
                     <label className="nc-lab">Inside a bundle: <b>{lane}</b> px</label>
-                    <input className="nc-range" type="range" min="5" max="30" step="1"
+                    <input className="nc-range" type="range" min="6" max="18" step="1"
                            value={lane} onChange={(e) => setLane(Number(e.target.value))} />
                     <label className="nc-lab">Between bundles: <b>{bundleGap}</b> px</label>
-                    <input className="nc-range" type="range" min="10" max="140" step="2"
+                    <input className="nc-range" type="range" min="24" max="110" step="2"
                            value={bundleGap} onChange={(e) => setBundleGap(Number(e.target.value))} />
                     <p className="nc-note" style={{ marginTop: -6, marginBottom: 12 }}>
                       Who is in a scene with whom is readable only from the contrast between these
@@ -4696,9 +4983,17 @@
                            value={curation.maxChars}
                            onChange={(e) => set({ maxChars: Number(e.target.value) })} />
                     <label className="nc-lab">At least <b>{curation.minMentions}</b> mentions</label>
-                    <input className="nc-range" type="range" min="1" max="60" step="1"
+                    <input className="nc-range" type="range" min="3" max="40" step="1"
                            value={curation.minMentions}
                            onChange={(e) => set({ minMentions: Number(e.target.value) })} />
+                    <label className="nc-lab">Weight by importance: <b>{weightExp.toFixed(2)}</b></label>
+                    <input className="nc-range" type="range" min="0" max="1" step="0.05"
+                           value={weightExp} onChange={(e) => setWeightExp(Number(e.target.value))} />
+                    <p className="nc-note" style={{ marginTop: -6, marginBottom: 12 }}>
+                      Line thickness follows how often a character is named, raised to this power.
+                      Zero draws everyone equal; one is fully proportional. The average thickness
+                      stays put, only the spread changes.
+                    </p>
                     <label className="nc-lab">Repeat names every <b>{labelEvery}</b> columns</label>
                     <input className="nc-range" type="range" min="2" max="12" step="1"
                            value={labelEvery} onChange={(e) => setLabelEvery(Number(e.target.value))} />
@@ -4714,8 +5009,11 @@
                 How this is built: the book is cut into scenes, capitalised names are collected and
                 scored on how they are used (spoken to, possessive, followed by a verb of speech
                 against sitting after a preposition of place), spellings of one person are merged
-                conservatively, and the lines are then ordered column by column to make as few
-                crossings as possible. There is no coreference resolution, so a character carried
+                conservatively, and each character is then tracked as a hidden state: whether it is
+                on stage, and which company it currently keeps, both priced per switch so a line
+                stays put until the story actually moves it. The pixel positions are relaxed
+                towards perfect stillness under the ordering constraints, which is why the lines
+                run flat between events. There is no coreference resolution, so a character carried
                 through a chapter only by "he" is invisible to it, and a first-person narrator is
                 invisible throughout.
               </p>
