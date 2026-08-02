@@ -461,18 +461,18 @@
 
     /* ---------- playback ---------- */
 
+    /* No Tone.Transport on purpose. The global transport keeps hidden state
+     * across stop/start (a restart after a manual stop went silent until a
+     * hard reload); instead a plain lookahead scheduler triggers the synths
+     * against the audio clock, and every Play builds everything from scratch. */
     function stopPlayback() {
       const t = toneRef.current;
       if (t) {
-        /* cancel BEFORE stop: the other way round can cancel the transport's
-         * own just-scheduled stop and leave it stuck in "started", after which
-         * the next start() is a no-op. Each teardown step is armored so one
-         * throw cannot leave the whole chain half-dead. */
-        try { t.transport.cancel(0); } catch (e) {}
-        try { t.transport.stop(); } catch (e) {}
-        t.parts.forEach((p) => { try { p.stop(0); p.dispose(); } catch (e) {} });
-        t.synths.forEach((s) => { try { s.releaseAll(); s.dispose(); } catch (e) {} });
-        t.vols.forEach((v) => { try { v.dispose(); } catch (e) {} });
+        clearInterval(t.timer);
+        t.voices.forEach((v) => {
+          try { v.synth.releaseAll(); v.synth.dispose(); } catch (e) {}
+          try { v.vol.dispose(); } catch (e) {}
+        });
         toneRef.current = null;
       }
       setPlaying(false);
@@ -481,29 +481,34 @@
     function startPlayback() {
       stopPlayback();
       loadScript("/assets/js/Tone.js").then(() => Tone.start()).then(() => {
-        if (Tone.Transport.state !== "stopped") Tone.Transport.stop();
-        Tone.Transport.cancel(0);
-        Tone.Transport.position = 0;
         const pb = playbackParts(ir, bpm);
-        const synths = [], parts = [], vols = [];
+        const voices = [];
         pb.parts.forEach((notes, pi) => {
           if (mode === "solo" && pi !== voice) return;
           const db = mode === "highlight" ? (pi === voice ? 0 : -16) : -2;
           const vol = new Tone.Volume(db).toDestination();
-          vols.push(vol);
           const synth = new Tone.PolySynth(Tone.Synth, {
             oscillator: { type: "triangle" },
             envelope: { attack: 0.02, decay: 0.1, sustain: 0.6, release: 0.15 },
           }).connect(vol);
-          synths.push(synth);
-          const part = new Tone.Part((time, n) => {
-            synth.triggerAttackRelease(Tone.Frequency(n.midi, "midi"), Math.max(0.05, n.d * 0.95), time);
-          }, notes.map((n) => [n.t, n])).start(0);
-          parts.push(part);
+          voices.push({ synth, vol, notes, next: 0 });
         });
-        Tone.Transport.schedule(() => { stopPlayback(); }, pb.totalSec + 0.5);
-        toneRef.current = { transport: Tone.Transport, synths, parts, vols };
-        Tone.Transport.start();
+        const t0 = Tone.now() + 0.15;
+        const HORIZON = 0.6;               /* seconds scheduled ahead */
+        const tick = () => {
+          const now = Tone.now();
+          voices.forEach((v) => {
+            while (v.next < v.notes.length && t0 + v.notes[v.next].t < now + HORIZON) {
+              const n = v.notes[v.next++];
+              v.synth.triggerAttackRelease(
+                Tone.Frequency(n.midi, "midi"), Math.max(0.05, n.d * 0.95), t0 + n.t);
+            }
+          });
+          if (now > t0 + pb.totalSec + 0.5) stopPlayback();
+        };
+        const timer = setInterval(tick, 100);
+        toneRef.current = { timer, voices };
+        tick();
         setPlaying(true);
       }).catch((e) => setError("Playback failed: " + e.message));
     }
