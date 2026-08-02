@@ -65,6 +65,9 @@
     .s2m-pagemini > div { width: 100%; background: var(--tool-sig-info); opacity: .55; transition: height .25s; }
     .s2m-note { font-size: .72rem; color: var(--tool-note); line-height: 1.55; }
     .s2m-warnbox { padding: 10px 14px; border-radius: 8px; background: var(--tool-warn-bg); border: 1px solid var(--tool-warn-border); color: var(--tool-warn-text); font-size: .78rem; line-height: 1.55; margin-top: 10px; }
+    /* warning lists (recognizer warnings, unparseable suggestions) can run to
+       dozens of lines on real material: cap and scroll instead of growing */
+    .s2m-warnbox.scrolly { max-height: 180px; overflow-y: auto; }
     .s2m-okbox { padding: 10px 14px; border-radius: 8px; background: var(--tool-ok-bg); border: 1px solid var(--tool-ok-border); color: var(--tool-ok-text); font-size: .78rem; line-height: 1.55; margin-top: 10px; }
     .s2m-struct { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
     .s2m-struct label { margin: 0; }
@@ -95,7 +98,9 @@
     .s2m-seg { display: inline-flex; }
     /* measure editor. The crop shows original ink, i.e. paper: white in every
        theme, like the PDF pages and the OSMD panel. */
-    .s2m-crop { background: #fff; border: 1px solid var(--tool-border); border-radius: 6px; padding: 4px; text-align: center; }
+    .s2m-croprow { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; margin-top: 8px; }
+    .s2m-croprow > div { flex: 1 1 320px; min-width: 0; }
+    .s2m-crop { background: #fff; border: 1px solid var(--tool-border); border-radius: 6px; padding: 4px; text-align: center; overflow: auto; }
     .s2m-crop canvas { max-width: 100%; max-height: 190px; display: inline-block; }
     .s2m-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 10px 0 8px; }
     .s2m-chip { padding: 4px 9px; border-radius: 8px; border: 1.5px solid var(--tool-border); background: var(--tool-surface); color: var(--tool-text); font-size: .78rem; font-family: inherit; cursor: pointer; margin: 0; width: auto; }
@@ -274,6 +279,20 @@
     return null;
   }
 
+  /* One-measure IR for the editor's live notation preview: the draft events
+   * under the attribute state effective at that measure, fed to the shared
+   * MusicXML writer and rendered by a small OSMD instance in the panel. */
+  function previewIr(ir, part, measure, events) {
+    var eff = ScoreCore.effectiveAttributes(ir.parts[part], measure);
+    var attrs = {};
+    if (eff.clef) attrs.clef = eff.clef;
+    if (typeof eff.keyFifths === "number") attrs.keyFifths = eff.keyFifths;
+    if (eff.time) attrs.time = eff.time;
+    return { parts: [{ index: 0, label: null, measures: [
+      { index: 0, events: events, attributes: attrs, barline: { type: "regular" } },
+    ] }] };
+  }
+
   function downloadName(base, ext, mode, voice, labels) {
     var stem = base.replace(/\.pdf$/i, "").replace(/[^\w.-]+/g, "_") || "score";
     if (mode === "solo") stem += "." + labels[voice].toLowerCase();
@@ -393,6 +412,8 @@
     const [sel, setSel] = useState(m.events.length ? 0 : -1);
     const cropRef = useRef(null);
     const boxRef = useRef(null);
+    const previewDivRef = useRef(null);
+    const previewOsmdRef = useRef(null);
 
     const crop = useMemo(() => measureCropBox(measureBoxes(ir), part, measure), [ir, part, measure]);
     useEffect(() => {
@@ -415,6 +436,31 @@
 
     const draftEvents = () => draft.map((d) =>
       d.dirty ? Object.assign(ScoreCore.buildEvent(d.spec), { src: d.src }) : d.orig);
+
+    /* Live notation preview of the draft: one measure through the shared
+     * MusicXML writer into a private OSMD instance. Edits are click-driven,
+     * so rendering per draft change is cheap enough for a single measure.
+     * autoResize stays off: the editor remounts per target and OSMD's resize
+     * listener would pile up. */
+    useEffect(() => {
+      let cancelled = false;
+      if (draft.length === 0) {
+        if (previewDivRef.current) previewDivRef.current.innerHTML = "";
+        return;
+      }
+      loadScript("/assets/js/opensheetmusicdisplay.min.js").then(() => {
+        if (cancelled || !previewDivRef.current) return;
+        if (!previewOsmdRef.current) {
+          previewOsmdRef.current = new opensheetmusicdisplay.OpenSheetMusicDisplay(previewDivRef.current, {
+            autoResize: false, backend: "svg", drawTitle: false, drawPartNames: false,
+          });
+        }
+        const osmd = previewOsmdRef.current;
+        const xml = ScoreCore.buildMusicXml(previewIr(ir, part, measure, draftEvents()));
+        osmd.load(xml).then(() => { if (!cancelled) osmd.render(); }).catch(() => {});
+      }).catch(() => {});
+      return () => { cancelled = true; };
+    }, [draft]);
 
     const flat = useMemo(() => ScoreCore.flattenPart(ir.parts[part]), [ir, part]);
     const expected = ScoreCore.expectedMeasureDiv(flat.measures[measure] && flat.measures[measure].time);
@@ -502,16 +548,25 @@
           </div>
         </div>
 
-        {hasPages && crop ? (
-          <div style={{ marginTop: 8 }}>
-            <div className="s2m-crop"><canvas ref={cropRef}></canvas></div>
-            {crop.approx && <p className="s2m-note" style={{ margin: "2px 0 0" }}>
-              This measure has no located elements; the strip is estimated from its neighbours.</p>}
+        <div className="s2m-croprow">
+          <div>
+            <span className="s2m-lbl">Original</span>
+            {hasPages && crop ? (
+              <div>
+                <div className="s2m-crop"><canvas ref={cropRef}></canvas></div>
+                {crop.approx && <p className="s2m-note" style={{ margin: "2px 0 0" }}>
+                  This measure has no located elements; the strip is estimated from its neighbours.</p>}
+              </div>
+            ) : (
+              <p className="s2m-note" style={{ marginTop: 4 }}>
+                {hasPages ? "No image of this spot (no located elements in this measure)." : "No original image (Score JSON import)."}</p>
+            )}
           </div>
-        ) : (
-          <p className="s2m-note" style={{ marginTop: 8 }}>
-            {hasPages ? "No image of this spot (no located elements in this measure)." : "No original image (Score JSON import)."}</p>
-        )}
+          <div>
+            <span className="s2m-lbl">As edited</span>
+            <div className="s2m-crop"><div ref={previewDivRef}></div></div>
+          </div>
+        </div>
 
         <div className="s2m-chips">
           <button className="s2m-ins" onClick={() => insertAt(0)} title="Insert before">+</button>
@@ -594,7 +649,7 @@
         )}
 
         {suggestions.length > 0 && (
-          <div className="s2m-warnbox">
+          <div className="s2m-warnbox scrolly">
             <div style={{ marginBottom: 4 }}>The recognizer saw ink on this line it could not parse.
               You can insert a guess at the selected position and fix it up:</div>
             {suggestions.map((w, i) => (
@@ -1182,7 +1237,7 @@
                   ))}
                 </div>
                 {(ir.warnings || []).length > 0 && (
-                  <div className="s2m-warnbox">
+                  <div className="s2m-warnbox scrolly">
                     {ir.warnings.map((w, i) => <div key={i}>{w.code}: {w.message}</div>)}
                   </div>
                 )}

@@ -652,6 +652,22 @@
     return out;
   }
 
+  /* Attribute state effective at a measure: the last clef/key/time declared
+   * at or before it (omr-decode attaches attributes only where they change).
+   * The editor's one-measure notation preview needs this to render the draft
+   * under the right clef and key. */
+  function effectiveAttributes(part, measureIdx) {
+    var out = { clef: null, keyFifths: null, time: null };
+    for (var mi = 0; mi <= measureIdx && mi < part.measures.length; mi++) {
+      var a = part.measures[mi].attributes;
+      if (!a) continue;
+      if (a.clef) out.clef = a.clef;
+      if (typeof a.keyFifths === "number") out.keyFifths = a.keyFifths;
+      if (a.time) out.time = a.time;
+    }
+    return out;
+  }
+
   /* Editor prefill from an unparseable-tokens warning: pull whatever the raw
    * tokens do carry; fields the tokens leave open stay null and the UI fills
    * defaults. */
@@ -709,6 +725,7 @@
     insertEvent: insertEvent,
     deleteEvent: deleteEvent,
     resetMeasure: resetMeasure,
+    effectiveAttributes: effectiveAttributes,
     tieIssues: tieIssues,
     suggestFromTokens: suggestFromTokens,
   };
