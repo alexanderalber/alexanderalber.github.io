@@ -469,10 +469,27 @@
       const t = toneRef.current;
       if (t) {
         clearInterval(t.timer);
+        /* Silence instantly by disconnecting, but do NOT dispose yet: the
+         * synths still own internally scheduled attack/release events for
+         * everything the lookahead committed. An event firing on a disposed
+         * synth throws inside Tone's shared timeout loop BEFORE the event is
+         * removed, which jams the queue permanently and kills all future
+         * playback (the "works once until reload" bug). Dispose only after
+         * the last committed event is safely in the past. */
+        let lastEnd = 0;
         t.voices.forEach((v) => {
-          try { v.synth.releaseAll(); v.synth.dispose(); } catch (e) {}
-          try { v.vol.dispose(); } catch (e) {}
+          if (v.end > lastEnd) lastEnd = v.end;
+          try { v.synth.releaseAll(); } catch (e) {}
+          try { v.synth.disconnect(); } catch (e) {}
         });
+        const grave = t.voices;
+        const delayMs = Math.max(0, (lastEnd - Tone.now()) * 1000) + 1000;
+        setTimeout(() => {
+          grave.forEach((v) => {
+            try { v.synth.dispose(); } catch (e) {}
+            try { v.vol.dispose(); } catch (e) {}
+          });
+        }, delayMs);
         toneRef.current = null;
       }
       setPlaying(false);
@@ -491,7 +508,7 @@
             oscillator: { type: "triangle" },
             envelope: { attack: 0.02, decay: 0.1, sustain: 0.6, release: 0.15 },
           }).connect(vol);
-          voices.push({ synth, vol, notes, next: 0 });
+          voices.push({ synth, vol, notes, next: 0, end: 0 });
         });
         const t0 = Tone.now() + 0.15;
         const HORIZON = 0.6;               /* seconds scheduled ahead */
@@ -500,8 +517,10 @@
           voices.forEach((v) => {
             while (v.next < v.notes.length && t0 + v.notes[v.next].t < now + HORIZON) {
               const n = v.notes[v.next++];
-              v.synth.triggerAttackRelease(
-                Tone.Frequency(n.midi, "midi"), Math.max(0.05, n.d * 0.95), t0 + n.t);
+              const dur = Math.max(0.05, n.d * 0.95);
+              v.synth.triggerAttackRelease(Tone.Frequency(n.midi, "midi"), dur, t0 + n.t);
+              const end = t0 + n.t + dur;
+              if (end > v.end) v.end = end;
             }
           });
           if (now > t0 + pb.totalSec + 0.5) stopPlayback();
