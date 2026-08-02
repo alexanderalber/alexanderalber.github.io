@@ -8,9 +8,16 @@
   /* Theme switcher. A click flips data-theme right away and sets .theme-morph,
      so the colours travel over half a second. Pages carrying data-theme-live
      stay put and get a `themechange` event on window (canvas/WebGL tools re-read
-     the palette on it); pages without the flag reload once the morph has landed. */
+     the palette on it); pages without the flag reload once the morph has landed.
+
+     Two attributes, not one. data-skin carries what the user picked (light,
+     dark, grey), data-theme only its polarity (light or dark). Grey is a dark
+     skin, so it inherits Pico's dark block and the dark --tool-* ladder and
+     overrides from there; the tools that branch on data-theme keep reading a
+     value they understand. POLARITY is the single place that maps the two. */
   (function () {
-    var cur = el.dataset.theme, def = el.dataset.themeDefault || 'dark';
+    var POLARITY = { light: 'light', dark: 'dark', grey: 'dark' };
+    var cur = el.dataset.skin || el.dataset.theme, def = el.dataset.themeDefault || 'dark';
     var live = el.hasAttribute('data-theme-live');
     var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     var segs = document.querySelectorAll('.theme-seg');
@@ -26,8 +33,9 @@
         var url = new URL(location.href);
         if (v === def) url.searchParams.delete('theme'); else url.searchParams.set('theme', v);
         var apply = function () {
-          el.dataset.theme = v;
-          el.style.colorScheme = v;
+          el.dataset.skin = v;
+          el.dataset.theme = POLARITY[v] || 'dark';
+          el.style.colorScheme = el.dataset.theme;
           cur = v;
           mark(v);
         };
