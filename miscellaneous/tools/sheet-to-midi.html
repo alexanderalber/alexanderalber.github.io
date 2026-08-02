@@ -293,7 +293,7 @@
     const [mode, setMode] = useState("all");        // all | solo | highlight
     const [voice, setVoice] = useState(0);
     const [bpm, setBpm] = useState(100);
-    const [playing, setPlaying] = useState(false);
+    const [playState, setPlayState] = useState("stopped");   // stopped | playing | paused
     const [syncScroll, setSyncScroll] = useState(true);
     const [pageCount, setPageCount] = useState(0);
     const [dragOver, setDragOver] = useState(false);
@@ -305,6 +305,7 @@
     const osmdDivRef = useRef(null);
     const osmdRef = useRef(null);
     const toneRef = useRef(null);
+    const playPosRef = useRef(0);       /* paused position in divisions */
     const fileInputRef = useRef(null);
 
     const findings = useMemo(() => (ir && !ir.rejected ? ScoreCore.ruleCheck(ir) : []), [ir]);
@@ -464,41 +465,60 @@
     /* No Tone.Transport on purpose. The global transport keeps hidden state
      * across stop/start (a restart after a manual stop went silent until a
      * hard reload); instead a plain lookahead scheduler triggers the synths
-     * against the audio clock, and every Play builds everything from scratch. */
+     * against the audio clock, and every Play builds everything from scratch.
+     * Pause remembers the musical position in divisions (tempo-independent,
+     * so the tempo may change while paused); Resume is a start from there. */
+    function teardownVoices(t) {
+      clearInterval(t.timer);
+      /* Silence instantly by disconnecting, but do NOT dispose yet: the
+       * synths still own internally scheduled attack/release events for
+       * everything the lookahead committed. An event firing on a disposed
+       * synth throws inside Tone's shared timeout loop BEFORE the event is
+       * removed, which jams the queue permanently and kills all future
+       * playback (the "works once until reload" bug). Dispose only after
+       * the last committed event is safely in the past. */
+      let lastEnd = 0;
+      t.voices.forEach((v) => {
+        if (v.end > lastEnd) lastEnd = v.end;
+        try { v.synth.releaseAll(); } catch (e) {}
+        try { v.synth.disconnect(); } catch (e) {}
+      });
+      const grave = t.voices;
+      const delayMs = Math.max(0, (lastEnd - Tone.now()) * 1000) + 1000;
+      setTimeout(() => {
+        grave.forEach((v) => {
+          try { v.synth.dispose(); } catch (e) {}
+          try { v.vol.dispose(); } catch (e) {}
+        });
+      }, delayMs);
+      toneRef.current = null;
+    }
+
     function stopPlayback() {
       const t = toneRef.current;
-      if (t) {
-        clearInterval(t.timer);
-        /* Silence instantly by disconnecting, but do NOT dispose yet: the
-         * synths still own internally scheduled attack/release events for
-         * everything the lookahead committed. An event firing on a disposed
-         * synth throws inside Tone's shared timeout loop BEFORE the event is
-         * removed, which jams the queue permanently and kills all future
-         * playback (the "works once until reload" bug). Dispose only after
-         * the last committed event is safely in the past. */
-        let lastEnd = 0;
-        t.voices.forEach((v) => {
-          if (v.end > lastEnd) lastEnd = v.end;
-          try { v.synth.releaseAll(); } catch (e) {}
-          try { v.synth.disconnect(); } catch (e) {}
-        });
-        const grave = t.voices;
-        const delayMs = Math.max(0, (lastEnd - Tone.now()) * 1000) + 1000;
-        setTimeout(() => {
-          grave.forEach((v) => {
-            try { v.synth.dispose(); } catch (e) {}
-            try { v.vol.dispose(); } catch (e) {}
-          });
-        }, delayMs);
-        toneRef.current = null;
-      }
-      setPlaying(false);
+      if (t) teardownVoices(t);
+      playPosRef.current = 0;
+      setPlayState("stopped");
+    }
+
+    function pausePlayback() {
+      const t = toneRef.current;
+      if (!t) return;
+      const posSec = Math.min(Math.max(Tone.now() - t.t0, 0), t.spanSec) + t.offsetSec;
+      teardownVoices(t);
+      playPosRef.current = posSec / t.secPerDiv;    /* musical divisions */
+      setPlayState("paused");
     }
 
     function startPlayback() {
-      stopPlayback();
+      const prev = toneRef.current;
+      if (prev) teardownVoices(prev);
       loadScript("/assets/js/Tone.js").then(() => Tone.start()).then(() => {
         const pb = playbackParts(ir, bpm);
+        const secPerDiv = 60 / (bpm * 48);
+        const offsetSec = playPosRef.current * secPerDiv;
+        if (offsetSec >= pb.totalSec) playPosRef.current = 0;
+        const fromSec = playPosRef.current * secPerDiv;
         const voices = [];
         pb.parts.forEach((notes, pi) => {
           if (mode === "solo" && pi !== voice) return;
@@ -508,27 +528,31 @@
             oscillator: { type: "triangle" },
             envelope: { attack: 0.02, decay: 0.1, sustain: 0.6, release: 0.15 },
           }).connect(vol);
-          voices.push({ synth, vol, notes, next: 0, end: 0 });
+          /* resume mid-piece: skip notes that started before the position */
+          let next = 0;
+          while (next < notes.length && notes[next].t < fromSec - 1e-6) next++;
+          voices.push({ synth, vol, notes, next, end: 0 });
         });
         const t0 = Tone.now() + 0.15;
         const HORIZON = 0.6;               /* seconds scheduled ahead */
         const tick = () => {
           const now = Tone.now();
           voices.forEach((v) => {
-            while (v.next < v.notes.length && t0 + v.notes[v.next].t < now + HORIZON) {
+            while (v.next < v.notes.length && t0 + v.notes[v.next].t - fromSec < now + HORIZON) {
               const n = v.notes[v.next++];
               const dur = Math.max(0.05, n.d * 0.95);
-              v.synth.triggerAttackRelease(Tone.Frequency(n.midi, "midi"), dur, t0 + n.t);
-              const end = t0 + n.t + dur;
+              v.synth.triggerAttackRelease(Tone.Frequency(n.midi, "midi"), dur, t0 + n.t - fromSec);
+              const end = t0 + n.t - fromSec + dur;
               if (end > v.end) v.end = end;
             }
           });
-          if (now > t0 + pb.totalSec + 0.5) stopPlayback();
+          if (now > t0 + (pb.totalSec - fromSec) + 0.5) stopPlayback();
         };
         const timer = setInterval(tick, 100);
-        toneRef.current = { timer, voices };
+        toneRef.current = { timer, voices, t0, offsetSec: fromSec, secPerDiv,
+                            spanSec: pb.totalSec - fromSec };
         tick();
-        setPlaying(true);
+        setPlayState("playing");
       }).catch((e) => setError("Playback failed: " + e.message));
     }
 
@@ -732,11 +756,15 @@
                 {modeSeg}
                 <div className="s2m-row" style={{ marginTop: 10 }}>
                   <span className="s2m-lbl">Tempo</span>
-                  <input type="range" min="40" max="200" value={bpm} disabled={playing}
+                  <input type="range" min="40" max="200" value={bpm} disabled={playState === "playing"}
                     onChange={(e) => setBpm(Number(e.target.value))} style={{ width: 180, margin: 0 }} />
                   <span className="s2m-note">{bpm} bpm</span>
-                  <button className="s2m-btn primary" onClick={playing ? stopPlayback : startPlayback}>
-                    {playing ? "Stop" : "Play"}
+                  <button className="s2m-btn primary"
+                    onClick={playState === "playing" ? pausePlayback : startPlayback}>
+                    {playState === "playing" ? "Pause" : playState === "paused" ? "Resume" : "Play"}
+                  </button>
+                  <button className="s2m-btn" onClick={stopPlayback} disabled={playState === "stopped"}>
+                    Stop
                   </button>
                 </div>
               </div>
