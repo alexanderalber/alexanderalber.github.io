@@ -1,14 +1,11 @@
 /* omr-worker.js -- recognition worker for sheet-to-midi.
  *
  * Module worker. Pipeline per page:
- *   RGBA page bitmap -> omrPreprocess (staff detection + normalisation)
+ *   RGBA page bitmap -> grayscale (PIL convert("L") semantics, see below)
+ *   -> preprocessPage (omr-preprocess.js: staff detection + normalisation)
  *   -> ONNX line model (onnxruntime-web, WASM EP, single-threaded: GitHub
  *      Pages cannot send COOP/COEP, so no SharedArrayBuffer)
  *   -> decodeLine / lineFragment / assembleIR (omr-decode.js) -> Score-IR.
- *
- * omr-preprocess.js is the one module still owed by the model repo (its
- * phase 5). Until it exists next to this file, "recognize" answers with
- * error code "preprocess-missing" and the UI says so honestly.
  *
  * Messages in:
  *   { type: "recognize", pages: [{ data: ArrayBuffer(RGBA), width, height, dpi }] }
@@ -19,7 +16,8 @@
  *   { type: "error", code, message }
  */
 
-import { decodeLine, lineFragment, assembleIR, i2wFromVocab } from "./omr-decode.js";
+import { decodeLine, lineFragment, assembleIR, i2wFromVocab, IR_VERSION }
+  from "./omr-decode.js";
 
 const MODEL_URL = "/assets/files/omr/omr-2026-08/omr-2026-08.fp16.onnx";
 const VOCAB_URL = "/assets/files/omr/omr-2026-08/vocab-2026-08.json";
@@ -29,6 +27,19 @@ let ortReady = null;      /* Promise of { ort, session, i2w, C } */
 let cancelled = false;
 
 function post(m) { self.postMessage(m); }
+
+/* The reference chain reads pages via PIL Image.convert("L"): Rec. 601 luma
+ * in 16.16 fixed point with rounding. Reproduced bit for bit so a colored
+ * PDF binarizes the same way it would in the model repo's harness. */
+function lumaFromRgba(rgba, n) {
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    out[i] = (rgba[j] * 19595 + rgba[j + 1] * 38470 + rgba[j + 2] * 7471 +
+              0x8000) >> 16;
+  }
+  return out;
+}
 
 function fetchWithProgress(url, onPart) {
   return fetch(url).then((res) => {
@@ -87,7 +98,8 @@ async function recognize(msg) {
     pre = await import("./omr-preprocess.js");
   } catch (e) {
     post({ type: "error", code: "preprocess-missing",
-           message: "The preprocessing module (omr-preprocess.js) has not been delivered by the model repo yet. Everything else is wired up and waiting for it." });
+           message: "The preprocessing module (omr-preprocess.js) failed to load: " +
+                    String((e && e.message) || e) });
     return;
   }
 
@@ -95,42 +107,51 @@ async function recognize(msg) {
 
   const lines = [];
   const pagesMeta = [];
+  const extraWarnings = [];
   for (let pi = 0; pi < msg.pages.length; pi++) {
     if (cancelled) return;
     const page = msg.pages[pi];
     pagesMeta.push({ index: pi, widthPx: page.width, heightPx: page.height, dpi: page.dpi });
     post({ type: "progress", stage: "page", page: pi, pages: msg.pages.length });
 
-    const out = pre.omrPreprocess({
-      data: new Uint8ClampedArray(page.data),
-      width: page.width, height: page.height, dpi: page.dpi,
-    }, { page: pi });
+    const n = page.width * page.height;
+    const gray = pre.grayFromBytes(
+      lumaFromRgba(new Uint8ClampedArray(page.data), n), n);
+    const { inputs } = pre.preprocessPage(gray, page.width, page.height);
 
-    for (let ti = 0; ti < out.tiles.length; ti++) {
+    for (let ti = 0; ti < inputs.length; ti++) {
       if (cancelled) return;
-      const tile = out.tiles[ti];
-      const feeds = { input: new ort.Tensor("float32", tile.tensor, tile.shape) };
+      const input = inputs[ti];
+      const feeds = { input: new ort.Tensor("float32", input.data,
+                                            [1, 1, input.height, input.width]) };
       const res = await session.run(feeds);
       const logits = res.logits;
       const T = logits.dims[1];
       const events = decodeLine(logits.data, T, C, i2w);
-      /* tile.meta carries the staff geometry per contract 1; the exact field
-       * mapping gets its final check when omr-preprocess.js lands */
+      const box = input.box;
       const staff = {
         page: pi,
-        system: tile.meta.system,
-        staffIndex: tile.meta.staffIndex,
-        bbox: tile.meta.bbox,
-        lineSpacingPx: tile.meta.lineSpacingPx,
-        normSpacing: tile.meta.normSpacing,
+        system: box.system,
+        staffIndex: box.voice,
+        bbox: [box.x, box.y, box.w, box.h],
+        lineSpacingPx: box.lineSpacing,
+        normSpacing: pre.TARGET_SPACING,
       };
+      if (input.truncated) {
+        extraWarnings.push({ code: "line-truncated", system: box.system,
+                             staff: box.voice,
+                             message: `Page ${pi + 1}, system ${box.system + 1}, ` +
+                                      `staff ${box.voice + 1}: line wider than the ` +
+                                      `model window, right edge not read` });
+      }
       lines.push({ staff, elements: lineFragment(events, staff) });
       post({ type: "progress", stage: "line", page: pi, line: ti + 1,
-             lines: out.tiles.length });
+             lines: inputs.length });
     }
   }
 
-  const ir = assembleIR(lines, pagesMeta, "omr-decode.js 1.0");
+  const ir = assembleIR(lines, pagesMeta, "omr-decode.js " + IR_VERSION);
+  ir.warnings.push(...extraWarnings);
   post({ type: "result", ir });
 }
 

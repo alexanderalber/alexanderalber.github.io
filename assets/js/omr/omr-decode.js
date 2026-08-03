@@ -14,7 +14,7 @@
  *   i2wFromVocab(vocabTokens)             -> index map (class 0 = CTC blank)
  */
 
-export const IR_VERSION = "1.0";
+export const IR_VERSION = "1.1";
 export const WIDTH_REDUCTION = 4;
 export const DIV_WHOLE = 192;
 
@@ -29,6 +29,12 @@ const BARLINE_TYPES = {
   "=:|!": "repeat-end", "=!|:": "repeat-start", "=:|!|:": "repeat-both",
   "==:|!": "final-repeat-end",
 };
+
+/* v1.1 null-bar collapse. The net double-emits at printed double bars
+ * (`=||` AND `=` for one object -> zero-duration measure, +1 bar count).
+ * Adjacent barline records merge -- EXCEPT the two pairings the ground
+ * truth itself contains (empty printed measures): `=`+`=` and `=`+`==`. */
+const LEGITIMATE_ADJACENT = new Set(["= =", "= =="]);
 
 /* Python round(): decimal round-half-even. Math.round / toFixed both round
  * ties differently; parity against the Python-emitted golden IR needs this. */
@@ -87,6 +93,37 @@ function records(tokenEvents) {
   }
   if (cur.length) recs.push(cur);
   return recs;
+}
+
+/* Two adjacent barline records -> one. The more specific token survives
+ * (if exactly one of the pair is a plain `=`, the other one); the span
+ * widens to the union, because both emissions point at the same ink and
+ * the bbox should cover it. Confidence stays the survivor's. */
+function mergeBarlines(a, b) {
+  const keep = (a[0].token === "=" && b[0].token !== "=") ? b : a;
+  const f0 = Math.min(a[0].f0, b[0].f0);
+  const f1 = Math.max(a[a.length - 1].f1, b[b.length - 1].f1);
+  const first = { ...keep[0], f0, f1 };
+  return [first, ...keep.slice(1)];
+}
+
+/* v1.1: merge adjacent barline records unless the pairing is legitimate
+ * ground truth (empty printed measures, LEGITIMATE_ADJACENT). Runs while
+ * appending, so a chain of three emissions merges into one. */
+function collapseBarlines(recs) {
+  const out = [];
+  for (const rec of recs) {
+    out.push(rec);
+    while (out.length >= 2) {
+      const a = out[out.length - 2], b = out[out.length - 1];
+      if (!(a[0].token.startsWith("=") && b[0].token.startsWith("="))) break;
+      if (LEGITIMATE_ADJACENT.has(a[0].token + " " + b[0].token)) break;
+      const merged = mergeBarlines(a, b);
+      out.length -= 2;
+      out.push(merged);
+    }
+  }
+  return out;
 }
 
 function dur(token) {
@@ -177,7 +214,7 @@ function bboxOf(record, staff) {
 
 export function lineFragment(tokenEvents, staff) {
   const out = [];
-  for (const record of records(tokenEvents)) {
+  for (const record of collapseBarlines(records(tokenEvents))) {
     const el = classify(record);
     if (el === null) continue;
     el.tokens = record.map((ev) => ev.token);
