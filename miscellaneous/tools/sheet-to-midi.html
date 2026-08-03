@@ -186,6 +186,38 @@
     return t && t.num ? t.num + "/" + t.den : "unknown";
   }
 
+  /* Recognizer warnings carry a code, a location and a German message (the
+   * model repo is German-speaking, this tool is English-only). We render our
+   * own text from code + fields and keep the delivered message only for codes
+   * we do not know yet, so a future addition still shows up instead of
+   * silently vanishing. Counts that live only inside the German sentence
+   * (staff-count-mismatch) are lost; asked for as data fields in v1.3. */
+  function warnText(w) {
+    var at = function (parts) { return parts.filter(Boolean).join(", ") + ": "; };
+    var page = w.page === undefined || w.page === null ? null : "page " + (w.page + 1);
+    var sys = w.system === undefined || w.system === null ? null : "system " + (w.system + 1);
+    var staff = w.staff === undefined || w.staff === null ? null : "staff " + (w.staff + 1);
+    switch (w.code) {
+      case "scan-suspected":
+        return "These pages look like a scan. The tool is built for digital engraving; " +
+          "recognition ran anyway, but expect the result to be unusable.";
+      case "closed-score-suspected":
+        return "Two staves per system: two voices are sharing one staff (closed score). " +
+          "Assigning notes to voices is not possible that way.";
+      case "no-staves-found":
+        return "No staves found on these pages.";
+      case "staff-count-mismatch":
+        return at([page, sys]) + "a different number of staves than the rest of the score.";
+      case "line-truncated":
+        return at([page, sys, staff]) + "the line is wider than the model window, " +
+          "the right end was not read.";
+      case "unparseable-tokens":
+        return at([page, sys, staff]) + "unreadable tokens “" + w.message + "”.";
+      default:
+        return w.code + ": " + w.message;
+    }
+  }
+
   var CLEF_CHOICES = ["G2", "G2v8", "F4", "C3", "C4"];
   var CLEF_LABELS = { G2: "Treble (G)", G2v8: "Treble, octave down (G8)", F4: "Bass (F)", C3: "Alto (C3)", C4: "Tenor (C4)" };
 
@@ -487,9 +519,16 @@
       return { marks, elsewhere };
     }, [draft, ir, part, measure]);
 
+    /* System indices restart on every page, so from v1.2 on the page has to
+       match as well: without it, a warning from system 0 of page 2 would be
+       offered inside system 0 of page 1. The measure knows its page through
+       the first located event; warnings without `page` (older scores, Score
+       JSON from v1.1) fall back to the system-only match. */
+    const mPage = (m.events.find((e) => e.src) || { src: null }).src;
     const suggestions = (ir.warnings || []).filter((w) =>
       w.code === "unparseable-tokens" && w.staff === part &&
-      m.system !== undefined && w.system === m.system);
+      m.system !== undefined && w.system === m.system &&
+      (w.page === undefined || w.page === null || !mPage || w.page === mPage.page));
 
     const changed = draft.length !== m.events.length || draft.some((d) => d.dirty);
 
@@ -1102,7 +1141,8 @@
           <h1 className="s2m-h1">Sheet to MIDI</h1>
           <p className="s2m-sub">Upload a PDF of cleanly engraved choir music, get practice MIDI back.
             Everything runs in your browser; the score never leaves your machine.</p>
-          <p className="s2m-scope">Reads clean digital engraving (SATB choral scores). Scans and closed score are detected and rejected.
+          <p className="s2m-scope">Reads clean digital engraving (SATB choral scores). Closed score is detected and rejected; a scan is
+            flagged and then read anyway, with poor results.
             Expect to proofread: on real-world material about 70 percent of measures come out right on the first pass;
             accidentals and durations are the most common fixes. Lyrics, dynamics and chord symbols are not read.</p>
 
@@ -1147,6 +1187,7 @@
               {status === "recognizing" && progress && (
                 <div>
                   <p className="s2m-note" style={{ marginBottom: 4 }}>
+                    {progress.stage === "detect" && "Checking page " + (progress.page + 1) + " of " + progress.pages + " for staves"}
                     {progress.stage === "model" && "Downloading the recognition model (one-time, cached afterwards)"}
                     {progress.stage === "page" && "Reading page " + (progress.page + 1) + " of " + progress.pages}
                     {progress.stage === "line" && "Page " + (progress.page + 1) + ": staff line " + progress.line + " of " + progress.lines}
@@ -1174,12 +1215,21 @@
             <div className="s2m-card">
               <h2>This one is out of scope</h2>
               <div className="s2m-warnbox">
-                {(ir.warnings || []).map((w, i) => <div key={i}>{w.message}</div>)}
+                {(ir.warnings || []).map((w, i) => <div key={i}>{warnText(w)}</div>)}
                 <div style={{ marginTop: 6 }}>This tool only reads cleanly engraved digital scores with one voice per staff.</div>
               </div>
               <div className="s2m-row" style={{ marginTop: 10 }}>
                 <button className="s2m-btn" onClick={reset}>Try another file</button>
               </div>
+            </div>
+          )}
+
+          {/* v1.2: a suspected scan is a warning, not a rejection. It says so
+              once, prominently, and the recognition below runs regardless. */}
+          {ir && !ir.rejected && (ir.warnings || []).some((w) => w.code === "scan-suspected") && (
+            <div className="s2m-warnbox">
+              {warnText({ code: "scan-suspected" })}{" "}
+              You can still work with what comes out, and the measure editor is there for the rest.
             </div>
           )}
 
@@ -1240,7 +1290,7 @@
                 </div>
                 {(ir.warnings || []).length > 0 && (
                   <div className="s2m-warnbox scrolly">
-                    {ir.warnings.map((w, i) => <div key={i}>{w.code}: {w.message}</div>)}
+                    {ir.warnings.map((w, i) => <div key={i}>{warnText(w)}</div>)}
                   </div>
                 )}
               </div>
