@@ -88,6 +88,22 @@
     /* each segmented control needs its own wrapper: custom.css rounds
        .lang-seg corners via :first-child/:last-child within the parent */
     .s2m-seg { display: inline-flex; }
+    /* measure editor. The crop shows original ink, i.e. paper: white in every
+       theme, like the PDF pages and the OSMD panel. */
+    .s2m-crop { background: #fff; border: 1px solid var(--tool-hairline); border-radius: 6px; padding: 4px; text-align: center; }
+    .s2m-crop canvas { max-width: 100%; max-height: 190px; display: inline-block; }
+    .s2m-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 10px 0 8px; }
+    .s2m-chip { padding: 4px 9px; border-radius: 8px; border: 1.5px solid var(--tool-border); background: var(--tool-surface); color: var(--tool-text); font-size: .78rem; font-family: inherit; cursor: pointer; margin: 0; width: auto; }
+    .s2m-chip.edited { border-style: dashed; }
+    .s2m-chip.tiewarn { border-color: var(--tool-warn-border); background: var(--tool-warn-bg); color: var(--tool-warn-text); }
+    .s2m-chip.sel { border-color: var(--tool-info-border); background: var(--tool-info-bg); color: var(--tool-info-text); font-weight: 600; }
+    .s2m-ins { width: 20px; height: 20px; padding: 0; border-radius: 50%; border: 1px dashed var(--tool-border); background: transparent; color: var(--tool-faint); font-size: .72rem; line-height: 1; cursor: pointer; margin: 0; }
+    .s2m-ins:hover { border-color: var(--tool-faint); color: var(--tool-text); }
+    .s2m-edit-controls { padding: 8px 10px; border: 1px solid var(--tool-hairline); border-radius: 8px; background: var(--tool-subtle); }
+    .s2m-edit-controls select, .s2m-edit-controls input { margin: 0; padding: 3px 6px; font-size: .78rem; height: auto; width: auto; min-width: 0; }
+    .s2m-sum { font-size: .78rem; font-weight: 600; padding: 2px 10px; border-radius: 9px; }
+    .s2m-sum.ok { background: var(--tool-ok-bg); border: 1px solid var(--tool-ok-border); color: var(--tool-ok-text); }
+    .s2m-sum.bad { background: var(--tool-danger-bg); border: 1px solid var(--tool-danger-border); color: var(--tool-danger-text); }
     .s2m-footer-note { font-size: 11px; color: var(--tool-note); margin-top: 18px; line-height: 1.6; }
     .s2m-disclaimer { font-size: 10px; color: var(--tool-faint); margin-top: 4px; line-height: 1.6; }
   </style>
@@ -217,6 +233,32 @@
     return out;
   }
 
+  /* Crop rectangle for the measure editor: the measure's own union box, or
+   * failing that (measure without located elements) a strip derived from the
+   * nearest located neighbours in the same part. The gap between the previous
+   * measure's right edge and the next one's left edge IS the missing measure
+   * when both sit on the same page; otherwise the nearest neighbour's strip
+   * is better than nothing. Fallbacks carry approx: true so the UI can say so. */
+  function measureCropBox(boxes, part, measure) {
+    var row = boxes[part];
+    if (!row) return null;
+    if (row[measure]) return row[measure];
+    var before = null, after = null;
+    for (var i = measure - 1; i >= 0; i--) if (row[i]) { before = row[i]; break; }
+    for (var j = measure + 1; j < row.length; j++) if (row[j]) { after = row[j]; break; }
+    if (before && after && before.page === after.page) {
+      var x0 = before.bbox[0] + before.bbox[2];
+      var x1 = after.bbox[0];
+      if (x1 - x0 < 20) { x0 = before.bbox[0]; x1 = after.bbox[0] + after.bbox[2]; }
+      var y0 = Math.min(before.bbox[1], after.bbox[1]);
+      var y1 = Math.max(before.bbox[1] + before.bbox[3], after.bbox[1] + after.bbox[3]);
+      return { page: before.page, bbox: [x0, y0, x1 - x0, y1 - y0], approx: true };
+    }
+    var n = before || after;
+    if (n) return { page: n.page, bbox: n.bbox.slice(), approx: true };
+    return null;
+  }
+
   function downloadName(base, ext, mode, voice, labels) {
     var stem = base.replace(/\.pdf$/i, "").replace(/[^\w.-]+/g, "_") || "score";
     if (mode === "solo") stem += "." + labels[voice].toLowerCase();
@@ -265,7 +307,7 @@
 
   /* Top-level on purpose: defined inside App it would remount (and rebuild
    * the page DOM) on every state change. */
-  function PdfPages({ pagesRef, markers, findings, pageCount }) {
+  function PdfPages({ pagesRef, markers, findings, pageCount, onMarkClick }) {
     const holder = useRef(null);
     useEffect(() => {
       const el = holder.current;
@@ -285,12 +327,291 @@
           m.style.width = (mk.bbox[2] / p.width * 100) + "%";
           m.style.height = (mk.bbox[3] / p.height * 100) + "%";
           m.title = findings[mk.finding] ? findings[mk.finding].message : "";
+          if (onMarkClick) m.onclick = () => onMarkClick(mk.finding);
           div.appendChild(m);
         });
         el.appendChild(div);
       });
     }, [pageCount, markers]);
     return <div ref={holder}></div>;
+  }
+
+  /* ---------- measure editor ---------- */
+
+  const DUR_LABELS = {
+    "0": "breve", "1": "whole", "2": "half", "4": "quarter", "8": "eighth",
+    "16": "16th", "32": "32nd",
+    "3": "half triplet", "6": "quarter triplet", "12": "eighth triplet", "24": "16th triplet",
+  };
+  const DUR_SHORT = {
+    "0": "2/1", "1": "1/1", "2": "1/2", "4": "1/4", "8": "1/8", "16": "1/16", "32": "1/32",
+    "3": "1/2t", "6": "1/4t", "12": "1/8t", "24": "1/16t",
+  };
+  const ALTER_NAMES = { "-2": "bb", "-1": "b", "0": "", "1": "#", "2": "##" };
+  const STEPS = ["C", "D", "E", "F", "G", "A", "B"];
+
+  function chipLabel(s) {
+    let dur = DUR_SHORT[s.base] || "?";
+    for (let i = 0; i < s.dots; i++) dur += "·";
+    if (s.kind === "rest") return dur + " rest";
+    let p = s.step + ALTER_NAMES[String(s.alter)] + s.octave;
+    if (s.tie === "stop" || s.tie === "continue") p = "~" + p;
+    if (s.tie === "start" || s.tie === "continue") p = p + "~";
+    return dur + " " + p;
+  }
+
+  function defaultSpec(neighbour) {
+    const n = neighbour && neighbour.kind === "note" ? neighbour : null;
+    return { kind: "note", base: "4", dots: 0, step: n ? n.step : "C",
+             alter: n ? n.alter : 0, octave: n ? n.octave : 4, tie: null, fermata: false };
+  }
+
+  /* Top-level like PdfPages: defined inside App it would remount on every
+   * state change. The parent keys this component with part:measure:nonce, so
+   * a fresh draft is built whenever the target or the underlying IR changes. */
+  function MeasureEditor({ ir, part, measure, labels, pagesRef, hasPages, canReset,
+                           onApply, onReset, onPreview, onClose, onTarget }) {
+    const m = ir.parts[part].measures[measure];
+    const [draft, setDraft] = useState(() => m.events.map((e) => ({
+      spec: ScoreCore.specFromEvent(e), orig: e, src: e.src || null, dirty: false,
+    })));
+    const [sel, setSel] = useState(m.events.length ? 0 : -1);
+    const cropRef = useRef(null);
+    const boxRef = useRef(null);
+
+    const crop = useMemo(() => measureCropBox(measureBoxes(ir), part, measure), [ir, part, measure]);
+    useEffect(() => {
+      const c = cropRef.current;
+      if (!c || !crop) return;
+      const p = pagesRef.current[crop.page];
+      if (!p) return;
+      const pad = 14;
+      const x = Math.max(0, Math.floor(crop.bbox[0] - pad));
+      const y = Math.max(0, Math.floor(crop.bbox[1] - pad));
+      const w = Math.min(p.width - x, Math.ceil(crop.bbox[2] + 2 * pad));
+      const h = Math.min(p.height - y, Math.ceil(crop.bbox[3] + 2 * pad));
+      if (w <= 0 || h <= 0) return;
+      c.width = w; c.height = h;
+      c.getContext("2d").drawImage(p.canvas, x, y, w, h, 0, 0, w, h);
+    }, [crop]);
+    useEffect(() => {
+      if (boxRef.current) boxRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, [part, measure]);
+
+    const draftEvents = () => draft.map((d) =>
+      d.dirty ? Object.assign(ScoreCore.buildEvent(d.spec), { src: d.src }) : d.orig);
+
+    const flat = useMemo(() => ScoreCore.flattenPart(ir.parts[part]), [ir, part]);
+    const expected = ScoreCore.expectedMeasureDiv(flat.measures[measure] && flat.measures[measure].time);
+    const sum = draft.reduce((s, d) => {
+      const dur = ScoreCore.durationFrom(d.spec.base, d.spec.dots);
+      return s + (dur ? dur.divisions : 0);
+    }, 0);
+
+    /* Tie diagnostics on the candidate part (draft in place of this measure),
+     * shown, not enforced: a broken chain just ends at playback. Issues the
+     * unedited part already had elsewhere are not this edit's doing. */
+    const tieInfo = useMemo(() => {
+      const measures = ir.parts[part].measures.map((mm, i) =>
+        i === measure ? Object.assign({}, mm, { events: draftEvents() }) : mm);
+      const issues = ScoreCore.tieIssues({ measures });
+      const baseline = ScoreCore.tieIssues(ir.parts[part])
+        .map((it) => it.measure + "/" + it.event + "/" + it.issue);
+      const marks = {};
+      let elsewhere = 0;
+      issues.forEach((it) => {
+        if (it.measure === m.index) marks[it.event] = it.issue;
+        else if (baseline.indexOf(it.measure + "/" + it.event + "/" + it.issue) < 0) elsewhere++;
+      });
+      return { marks, elsewhere };
+    }, [draft, ir, part, measure]);
+
+    const suggestions = (ir.warnings || []).filter((w) =>
+      w.code === "unparseable-tokens" && w.staff === part &&
+      m.system !== undefined && w.system === m.system);
+
+    const changed = draft.length !== m.events.length || draft.some((d) => d.dirty);
+
+    function patch(i, upd) {
+      setDraft(draft.map((d, k) => k === i
+        ? { spec: Object.assign({}, d.spec, upd), orig: d.orig, src: d.src, dirty: true } : d));
+    }
+    function insertAt(i, spec) {
+      const next = draft.slice();
+      next.splice(i, 0, { spec: spec || defaultSpec((draft[i - 1] || draft[i] || {}).spec), orig: null, src: null, dirty: true });
+      setDraft(next);
+      setSel(i);
+    }
+    function removeAt(i) {
+      const next = draft.slice();
+      next.splice(i, 1);
+      setDraft(next);
+      setSel(Math.min(i, next.length - 1));
+    }
+    function insertSuggestion(w) {
+      const s = ScoreCore.suggestFromTokens(w.message.split(" "));
+      const fallback = defaultSpec((draft[draft.length - 1] || {}).spec);
+      const spec = {
+        kind: s.kind,
+        base: s.base === null ? fallback.base : s.base, dots: s.dots,
+        step: s.step === null ? fallback.step : s.step,
+        alter: s.alter, octave: s.octave === null ? fallback.octave : s.octave,
+        tie: s.tie, fermata: s.fermata,
+      };
+      insertAt(sel >= 0 ? sel + 1 : draft.length, spec);
+    }
+
+    const d = sel >= 0 ? draft[sel] : null;
+    const sumCls = expected === null ? "" : (sum === expected ? " ok" : " bad");
+
+    return (
+      <div className="s2m-card" ref={boxRef}>
+        <div className="s2m-row" style={{ justifyContent: "space-between" }}>
+          <h2 style={{ margin: 0 }}>Edit measure {m.index + 1} · {labels[part]}</h2>
+          <div className="s2m-row">
+            {labels.length > 1 && (
+              <span className="s2m-seg">
+                {labels.map((l, i) => (
+                  <button key={l} className={"lang-seg" + (part === i ? " active" : "")}
+                    onClick={() => onTarget(i, measure)}>{l}</button>
+                ))}
+              </span>
+            )}
+            <span className="s2m-seg">
+              <button className="lang-seg" disabled={measure === 0}
+                onClick={() => onTarget(part, measure - 1)} title="Previous measure">&#8592;</button>
+              <button className="lang-seg" disabled={measure >= ir.parts[part].measures.length - 1}
+                onClick={() => onTarget(part, measure + 1)} title="Next measure">&#8594;</button>
+            </span>
+            <button className="s2m-btn" onClick={onClose}>Close</button>
+          </div>
+        </div>
+
+        {hasPages && crop ? (
+          <div style={{ marginTop: 8 }}>
+            <div className="s2m-crop"><canvas ref={cropRef}></canvas></div>
+            {crop.approx && <p className="s2m-note" style={{ margin: "2px 0 0" }}>
+              This measure has no located elements; the strip is estimated from its neighbours.</p>}
+          </div>
+        ) : (
+          <p className="s2m-note" style={{ marginTop: 8 }}>
+            {hasPages ? "No image of this spot (no located elements in this measure)." : "No original image (Score JSON import)."}</p>
+        )}
+
+        <div className="s2m-chips">
+          <button className="s2m-ins" onClick={() => insertAt(0)} title="Insert before">+</button>
+          {draft.map((di, i) => (
+            <React.Fragment key={i}>
+              <button
+                className={"s2m-chip" + (i === sel ? " sel" : "") +
+                  (di.dirty || (di.orig && di.orig.edited) ? " edited" : "") +
+                  (tieInfo.marks[i] ? " tiewarn" : "")}
+                title={tieInfo.marks[i] === "dangling-start" ? "Tie starts here but nothing resolves it"
+                  : tieInfo.marks[i] === "orphan-stop" ? "Tie ends here but nothing started it" : ""}
+                onClick={() => setSel(i)}>{chipLabel(di.spec)}</button>
+              <button className="s2m-ins" onClick={() => insertAt(i + 1)} title="Insert here">+</button>
+            </React.Fragment>
+          ))}
+          {draft.length === 0 && <span className="s2m-note">No events in this measure.</span>}
+        </div>
+
+        {d && (
+          <div className="s2m-row s2m-edit-controls">
+            <span className="s2m-seg">
+              <button className={"lang-seg" + (d.spec.kind === "note" ? " active" : "")}
+                onClick={() => patch(sel, d.spec.step === null
+                  ? Object.assign({ kind: "note" }, defaultSpec((draft[sel - 1] || {}).spec), { base: d.spec.base, dots: d.spec.dots })
+                  : { kind: "note" })}>Note</button>
+              <button className={"lang-seg" + (d.spec.kind === "rest" ? " active" : "")}
+                onClick={() => patch(sel, { kind: "rest", tie: null })}>Rest</button>
+            </span>
+            <label>
+              <span className="s2m-lbl">Length</span>{" "}
+              <select value={d.spec.base} onChange={(e) => patch(sel, { base: e.target.value })}>
+                {Object.keys(DUR_SHORT).map((b) => <option key={b} value={b}>{DUR_LABELS[b]}</option>)}
+              </select>
+            </label>
+            <label>
+              <span className="s2m-lbl">Dots</span>{" "}
+              <select value={d.spec.dots} onChange={(e) => patch(sel, { dots: Number(e.target.value) })}>
+                {[0, 1, 2].map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
+            {d.spec.kind === "note" && (
+              <React.Fragment>
+                <label>
+                  <span className="s2m-lbl">Step</span>{" "}
+                  <select value={d.spec.step} onChange={(e) => patch(sel, { step: e.target.value })}>
+                    {STEPS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </label>
+                <label>
+                  <span className="s2m-lbl">Accidental</span>{" "}
+                  <select value={d.spec.alter} onChange={(e) => patch(sel, { alter: Number(e.target.value) })}>
+                    <option value={-2}>bb</option><option value={-1}>b</option>
+                    <option value={0}>(none)</option>
+                    <option value={1}>#</option><option value={2}>##</option>
+                  </select>
+                </label>
+                <label>
+                  <span className="s2m-lbl">Octave</span>{" "}
+                  <span className="s2m-seg">
+                    <button className="lang-seg" disabled={d.spec.octave <= 1}
+                      onClick={() => patch(sel, { octave: d.spec.octave - 1 })}>&#8722;</button>
+                    <button className="lang-seg" disabled>{d.spec.octave}</button>
+                    <button className="lang-seg" disabled={d.spec.octave >= 7}
+                      onClick={() => patch(sel, { octave: d.spec.octave + 1 })}>+</button>
+                  </span>
+                </label>
+                <label>
+                  <span className="s2m-lbl">Tie</span>{" "}
+                  <select value={d.spec.tie || ""} onChange={(e) => patch(sel, { tie: e.target.value || null })}>
+                    <option value="">(none)</option>
+                    <option value="start">start</option>
+                    <option value="continue">continue</option>
+                    <option value="stop">stop</option>
+                  </select>
+                </label>
+              </React.Fragment>
+            )}
+            <button className="s2m-btn" onClick={() => removeAt(sel)} style={{ marginLeft: "auto" }}>Delete</button>
+          </div>
+        )}
+
+        {suggestions.length > 0 && (
+          <div className="s2m-warnbox">
+            <div style={{ marginBottom: 4 }}>The recognizer saw ink on this line it could not parse.
+              You can insert a guess at the selected position and fix it up:</div>
+            {suggestions.map((w, i) => (
+              <div key={i} className="s2m-row" style={{ marginTop: 4 }}>
+                <code style={{ fontSize: ".74rem" }}>{w.message}</code>
+                <button className="s2m-btn" onClick={() => insertSuggestion(w)}>Insert</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="s2m-row" style={{ marginTop: 10 }}>
+          <span className={"s2m-sum" + sumCls}>
+            {sum}{expected !== null ? " / " + expected : ""} divisions
+          </span>
+          {tieInfo.elsewhere > 0 && (
+            <span className="s2m-note">This edit leaves {tieInfo.elsewhere} tie{tieInfo.elsewhere === 1 ? "" : "s"} in
+              neighbouring measures unresolved (playback simply ends them).</span>
+          )}
+          <button className="s2m-btn" onClick={() => onPreview(draftEvents())} disabled={draft.length === 0}>
+            Play this measure
+          </button>
+          <button className="s2m-btn primary" onClick={() => onApply(draftEvents())} disabled={!changed}>
+            Apply
+          </button>
+          <button className="s2m-btn" onClick={onReset} disabled={!canReset}
+            title="Discard all edits in this measure and restore what was recognized">
+            Reset to recognition
+          </button>
+        </div>
+      </div>
+    );
   }
 
   function App() {
@@ -308,8 +629,12 @@
     const [syncScroll, setSyncScroll] = useState(true);
     const [pageCount, setPageCount] = useState(0);
     const [dragOver, setDragOver] = useState(false);
+    const [editTarget, setEditTarget] = useState(null);   // {part, measure} | null
+    const [editNonce, setEditNonce] = useState(0);        // bumps on apply/reset so the editor rebuilds its draft
 
     const pagesRef = useRef([]);        // [{canvas, width, height, dpi}]
+    const originalIrRef = useRef(null); // IR as recognized/imported, for per-measure reset
+    const previewRef = useRef(null);    // teardown of a running measure preview
     const workerRef = useRef(null);
     const pdfPaneRef = useRef(null);
     const osmdPaneRef = useRef(null);
@@ -325,10 +650,13 @@
 
     function reset() {
       stopPlayback();
+      stopPreview();
       if (workerRef.current) { workerRef.current.terminate(); workerRef.current = null; }
       pagesRef.current = [];
+      originalIrRef.current = null;
       setFileName(null); setStatus("idle"); setError(null); setProgress(null);
       setIr(null); setConfirmed(false); setStructEdit(null); setPageCount(0);
+      setEditTarget(null);
       osmdRef.current = null;
     }
 
@@ -343,6 +671,9 @@
             if (!parsed.irVersion || !parsed.parts) throw new Error("not a Score JSON from this tool");
             reset();
             setFileName(file.name);
+            /* per-measure reset baseline; for an imported JSON that is the
+               imported state (edits it carries become the new baseline) */
+            originalIrRef.current = JSON.parse(txt);
             setIr(parsed);
             setStatus("done");
           } catch (e) { setError("Could not read this JSON: " + e.message); }
@@ -390,6 +721,7 @@
         if (m.type === "progress") setProgress(m);
         else if (m.type === "result") {
           worker.terminate(); workerRef.current = null;
+          originalIrRef.current = JSON.parse(JSON.stringify(m.ir));
           setIr(m.ir); setStatus("done");
         } else if (m.type === "error") {
           worker.terminate(); workerRef.current = null;
@@ -439,11 +771,14 @@
         if (cancelled || !osmdDivRef.current) return;
         const xml = ScoreCore.buildMusicXml(ir);
         /* No theme coloring on purpose: the pane is styled as paper (white,
-         * black notation) in every theme, like the PDF pages next to it. */
-        const osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(osmdDivRef.current, {
-          autoResize: true, backend: "svg", drawTitle: false, drawPartNames: true,
-        });
-        osmdRef.current = osmd;
+         * black notation) in every theme, like the PDF pages next to it.
+         * The instance is reused across IR edits; load() replaces the sheet. */
+        if (!osmdRef.current) {
+          osmdRef.current = new opensheetmusicdisplay.OpenSheetMusicDisplay(osmdDivRef.current, {
+            autoResize: true, backend: "svg", drawTitle: false, drawPartNames: true,
+          });
+        }
+        const osmd = osmdRef.current;
         osmd.load(xml).then(() => { if (!cancelled) osmd.render(); })
           .catch((e) => setError("Notation rendering failed: " + e.message));
       }).catch((e) => setError(e.message));
@@ -565,7 +900,71 @@
       }).catch((e) => setError("Playback failed: " + e.message));
     }
 
-    useEffect(() => () => stopPlayback(), []);
+    useEffect(() => () => { stopPlayback(); stopPreview(); }, []);
+
+    /* ---------- measure editor ---------- */
+
+    function stopPreview() {
+      if (previewRef.current) { previewRef.current(); previewRef.current = null; }
+    }
+
+    /* One-shot preview of a single measure's (draft) events. Everything is
+     * committed up front, so no lookahead loop is needed, but the teardown
+     * discipline is the same as the main player's: disconnect to silence,
+     * dispose only after the last committed event is safely in the past. */
+    function previewEvents(events) {
+      stopPlayback();
+      stopPreview();
+      loadScript("/assets/js/Tone.js").then(() => Tone.start()).then(() => {
+        const secPerDiv = 60 / (bpm * 48);
+        const fl = ScoreCore.flattenPart({ measures: [{ index: 0, events }] });
+        const vol = new Tone.Volume(-2).toDestination();
+        const synth = new Tone.PolySynth(Tone.Synth, {
+          oscillator: { type: "triangle" },
+          envelope: { attack: 0.02, decay: 0.1, sustain: 0.6, release: 0.15 },
+        }).connect(vol);
+        const t0 = Tone.now() + 0.1;
+        let lastEnd = t0;
+        fl.notes.forEach((n) => {
+          const dur = Math.max(0.05, n.durDiv * secPerDiv * 0.95);
+          synth.triggerAttackRelease(Tone.Frequency(n.midi, "midi"), dur, t0 + n.startDiv * secPerDiv);
+          const end = t0 + n.startDiv * secPerDiv + dur;
+          if (end > lastEnd) lastEnd = end;
+        });
+        let done = false;
+        const teardown = () => {
+          if (done) return;
+          done = true;
+          try { synth.releaseAll(); } catch (e) {}
+          try { synth.disconnect(); } catch (e) {}
+          const delay = Math.max(0, (lastEnd - Tone.now()) * 1000) + 1000;
+          setTimeout(() => {
+            try { synth.dispose(); } catch (e) {}
+            try { vol.dispose(); } catch (e) {}
+          }, delay);
+        };
+        const timer = setTimeout(teardown, Math.max(0, (lastEnd - Tone.now()) * 1000) + 300);
+        previewRef.current = () => { clearTimeout(timer); teardown(); };
+      }).catch((e) => setError("Playback failed: " + e.message));
+    }
+
+    function openEditor(f) {
+      jumpToFinding(f);
+      if (f.measure === null || f.measure === undefined) return;
+      const p = f.part === null || f.part === undefined ? 0 : f.part;
+      setEditTarget({ part: p, measure: Math.min(f.measure, ir.parts[p].measures.length - 1) });
+    }
+
+    function applyMeasure(events) {
+      setIr(ScoreCore.setMeasureEvents(ir, editTarget.part, editTarget.measure, events));
+      setEditNonce(editNonce + 1);
+    }
+
+    function resetMeasureEdit() {
+      if (!originalIrRef.current) return;
+      setIr(ScoreCore.resetMeasure(ir, editTarget.part, editTarget.measure, originalIrRef.current));
+      setEditNonce(editNonce + 1);
+    }
 
     /* ---------- export ---------- */
 
@@ -740,14 +1139,16 @@
                 {findings.length === 0 && <div className="s2m-okbox">No rule check complaints. Still worth a look before the concert.</div>}
                 {warns.length > 0 && (
                   <p className="s2m-note">{warns.length} hard finding{warns.length === 1 ? "" : "s"} (red): the durations do not add up,
-                    at least one note or rest is wrong there. {infos.length > 0 ? infos.length + " softer hints (yellow)." : ""}</p>
+                    at least one note or rest is wrong there. {infos.length > 0 ? infos.length + " softer hints (yellow)." : ""}{" "}
+                    Click a finding (or its marker on the page) to fix the measure right here.</p>
                 )}
                 {warns.length === 0 && infos.length > 0 && (
-                  <p className="s2m-note">{infos.length} soft hint{infos.length === 1 ? "" : "s"}, mostly pickup measures and unusual accidentals.</p>
+                  <p className="s2m-note">{infos.length} soft hint{infos.length === 1 ? "" : "s"}, mostly pickup measures and unusual accidentals.
+                    Click one to open the measure editor.</p>
                 )}
                 <div className="s2m-findings">
                   {findings.map((f, i) => (
-                    <div key={i} className="s2m-finding" onClick={() => jumpToFinding(f)}>
+                    <div key={i} className="s2m-finding" onClick={() => openEditor(f)}>
                       <span className={"sev " + f.severity}>{f.severity === "warn" ? "check" : "hint"}</span>
                       <span>{f.message}</span>
                     </div>
@@ -759,6 +1160,20 @@
                   </div>
                 )}
               </div>
+
+              {editTarget && (
+                <MeasureEditor
+                  key={editTarget.part + ":" + editTarget.measure + ":" + editNonce}
+                  ir={ir} part={editTarget.part} measure={editTarget.measure}
+                  labels={labels} pagesRef={pagesRef} hasPages={pageCount > 0}
+                  canReset={!!originalIrRef.current}
+                  onApply={applyMeasure} onReset={resetMeasureEdit} onPreview={previewEvents}
+                  onClose={() => setEditTarget(null)}
+                  onTarget={(p, mi) => setEditTarget({
+                    part: p,
+                    measure: Math.max(0, Math.min(ir.parts[p].measures.length - 1, mi)),
+                  })} />
+              )}
 
               <div className="s2m-card">
                 <h2>Practice playback</h2>
@@ -782,7 +1197,8 @@
                 <div className="s2m-pane" ref={pdfPaneRef}>
                   <div className="s2m-pane-title">Original PDF, findings marked</div>
                   {pageCount > 0
-                    ? <PdfPages pagesRef={pagesRef} markers={markers} findings={findings} pageCount={pageCount} />
+                    ? <PdfPages pagesRef={pagesRef} markers={markers} findings={findings} pageCount={pageCount}
+                        onMarkClick={(fi) => findings[fi] && openEditor(findings[fi])} />
                     : <p className="s2m-note" style={{ padding: 12 }}>No PDF pages (Score JSON import).</p>}
                 </div>
                 <div className="s2m-pane" ref={osmdPaneRef}>
