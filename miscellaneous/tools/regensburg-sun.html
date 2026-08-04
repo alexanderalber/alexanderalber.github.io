@@ -103,14 +103,30 @@
     }
     .rs-map { display: block; width: 100%; height: auto; cursor: crosshair; }
     .rs-map.dragging { cursor: grabbing; }
+    /* Zwei Gruppen mit Abstand dazwischen: links, was die Karte anders zeichnet,
+       rechts, was woanders hinspringt. Ohne die Lücke ist es eine Reihe aus vier
+       Knöpfen, in der zwei ein- und ausrastbar sind und zwei nicht, und man
+       liest die Trennung erst nach dem Ausprobieren. */
     .rs-map-overlay {
       position: absolute;
       left: 10px; bottom: 10px;
       display: flex;
+      gap: 10px;
+      /* Vier Gruppen passen auf einem Telefon nicht nebeneinander. Umbrochen
+         wird nach oben, weil die Leiste unten verankert ist, und die Breite
+         hört vor dem Maßstab auf, der rechts daneben sitzt. */
+      flex-wrap: wrap;
+      max-width: calc(100% - 120px);
+    }
+    /* Die Fläche trägt die Gruppe und nicht die einzelnen Segmente: die Karte
+       liegt darunter, und der aktive Zustand ist eine durchscheinende Tönung,
+       die sonst auf Häuser statt auf Untergrund gemischt würde. Die Rundung an
+       den Enden holen sich die Segmente selbst über :first-child und
+       :last-child, und die zählen je Gruppe -- deshalb ist die Gruppe ein
+       eigenes Element und nicht nur ein Abstand. */
+    .rs-map-group {
+      display: flex;
       gap: 0;
-      /* Die Fläche trägt die Reihe und nicht die einzelnen Segmente: die
-         Karte liegt darunter, und der aktive Zustand ist eine durchscheinende
-         Tönung, die sonst auf Häuser statt auf Untergrund gemischt würde. */
       background: var(--tool-surface);
       border-radius: 5px;
     }
@@ -154,6 +170,22 @@
          Bewegung dazwischen ist Kosmetik und darf träge sein, aber nicht so
          träge, dass sie einer fertigen Rechnung hinterherläuft. */
       transition: width 120ms linear;
+    }
+    /* Legende der Sonnenstundenkarte: der Farbverlauf selbst, mit drei Marken
+       darunter. Die Skala läuft von null bis zur Tageslänge und nicht bis zum
+       größten Wert im Bild, sonst hieße dieselbe Farbe im Dezember etwas
+       anderes als im Juni. */
+    .rs-hours-bar {
+      height: 10px;
+      border-radius: 3px;
+      border: 1px solid var(--tool-hairline);
+    }
+    .rs-hours-ticks {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.7rem;
+      color: var(--tool-label);
+      margin-top: 3px;
     }
     .rs-legend {
       display: flex;
@@ -684,8 +716,35 @@
       const eyeHeight = opts.eyeHeight === undefined ? 0.0 : opts.eyeHeight;
       const sampling = opts.sampling || 'terrain_max';
 
+      /* Der Abstand zur Schattenhöhe, falls jemand danach fragt: wie viele Meter
+       * über (positiv) oder unter (negativ) der Schattengrenze eine Zelle liegt.
+       * Besonnt ist genau margin >= 0, die Ja-Nein-Karte ist also das Vorzeichen
+       * dieses Feldes.
+       *
+       * Wozu. Über die Zeit hinweg ist das Vorzeichen eine Treppe, der Abstand
+       * dagegen eine stetige Größe. Wer Sonnenstunden aus einem Zeitraster
+       * summiert, kann deshalb aus zwei benachbarten Abständen den Zeitpunkt
+       * des Vorzeichenwechsels interpolieren, statt auf ganze Zeitschritte zu
+       * runden. Das ist derselbe Gedanke wie bei einer Isolinie, nur in der
+       * Zeit statt im Raum, und er kostet nichts: der Wert fällt in der
+       * Rekurrenz ohnehin an.
+       *
+       * Gekappt bei einem Kilometer, damit der erste Streifen ohne
+       * Vorgeschichte (Schattenhöhe NO_OBSTACLE, also -1e6) keine Zahl liefert,
+       * die jede Interpolation an sich zieht.
+       */
+      const margin = opts.margin || null;
+      const capM = (v) => (v > 1e3 ? 1e3 : (v < -1e3 ? -1e3 : v));
+
       const lit = new Uint8Array(rows * cols);
-      if (elevDeg <= 0.0) return lit;
+      if (elevDeg <= 0.0) {
+        // Auch hier das Feld füllen. Sonst stünde nach einem Aufruf unter dem
+        // Horizont noch der Abstand des vorigen Aufrufs darin, und der
+        // Aufrufer summierte Sonnenstunden aus einem Zeitpunkt, den es nicht
+        // mehr gibt.
+        if (margin) margin.fill(-1e3);
+        return lit;
+      }
 
       // Richtung zur Sonne; das Licht läuft entgegengesetzt. Ost wächst mit der
       // Spalte, Nord fällt mit der Zeile, deshalb kippt nur eines der beiden
@@ -738,6 +797,7 @@
         if (k === 0) {
           // Erster Streifen: keine Vorgeschichte, alles besonnt.
           for (let i = 0; i < nMinor; i++) lit[idx(i, j)] = 1;
+          if (margin) for (let i = 0; i < nMinor; i++) margin[idx(i, j)] = heights[idx(i, j)] === heights[idx(i, j)] ? 1e3 : NaN;
           shade.fill(NO_OBSTACLE);
         } else {
           for (let i = 0; i < nMinor; i++) {
@@ -753,7 +813,10 @@
           }
           const swap = shade; shade = next; next = swap;
           for (let i = 0; i < nMinor; i++) {
-            lit[idx(i, j)] = heights[idx(i, j)] + eyeHeight >= shade[i] ? 1 : 0;
+            const p = idx(i, j);
+            const d = heights[p] + eyeHeight - shade[i];
+            lit[p] = d >= 0 ? 1 : 0;
+            if (margin) margin[p] = capM(d);
           }
         }
         const swap = prev; prev = cur; cur = swap;
@@ -1318,6 +1381,164 @@
       }
       return cov;
     }
+
+    // ------------------------------------------------------- Sonnenstunden
+
+    /* Wie fein die Sonnenstundenkarte gerechnet wird. Gröber als die
+     * Schattenkarte, und zwar um den Faktor zwei: sie kostet einen Sweep je
+     * Zeitschritt statt einen einzigen, und sie wird flächig gelesen. Wer
+     * Sonnenstunden anschaut, fragt nach dem Hinterhof und nicht nach der
+     * einzelnen Dachgaube.
+     */
+    function hoursCellsize(hm, mPerPx) {
+      const base = hm.ndom.cellsize;
+      return Math.min(8 * base, Math.max(2 * base, shadowCellsize(hm, 2 * mPerPx)));
+    }
+
+    /* Sonnenstunden je Zelle für einen Tag.
+     *
+     * Das Verfahren, und warum es nicht das naheliegende ist. Naheliegend wäre
+     * ein Minutenraster: 1440 Sweeps, und die Karte wäre am Abend fertig. Was
+     * hier läuft, ist ein grobes Zeitraster von wenigen Minuten, in dem der
+     * Zeitpunkt jedes Besonnungswechsels aus dem Abstandsfeld interpoliert
+     * wird: das Vorzeichen wechselt zwischen zwei Abtastungen, und wo genau,
+     * verrät der Abstand selbst. Damit sind die Sonnenstunden nicht auf den
+     * Zeitschritt gerundet, obwohl nur alle paar Minuten gerechnet wird. Das
+     * ist die zeitliche Fassung dessen, was Marching Squares im Raum tut.
+     *
+     * Was der Zeitschritt trotzdem kostet: ein Sonnenfenster, das kürzer ist
+     * als er, fällt ganz durch. Zwischen zwei Häusern blitzt die Sonne
+     * vielleicht acht Minuten lang in einen Hof, und bei zwanzig Minuten
+     * Schrittweite sieht die Karte davon nichts, weil beide Enden im Schatten
+     * liegen. Deshalb ist die Schrittweite eine Bedienung und keine Konstante,
+     * und deshalb steht in der Legende, welche gewählt war.
+     *
+     * Der Fernhorizont steckt in `horizon`, einem Profil für das ganze Fenster.
+     * Er begrenzt den Tag von außen: er entscheidet, wann die Sonne über den
+     * Hügeln steht, und das entscheidet er für den Fensterausschnitt gemeinsam.
+     * Über ein bis zwei Kilometer ändert sich das Profil kaum; die Alternative
+     * wäre, es je Zelle zu interpolieren, und das kostet mehr als der ganze
+     * Rest zusammen.
+     */
+    function sunHoursMap(heights, rows, cols, cellsize, ymd, opts) {
+      opts = opts || {};
+      const stepMin = opts.stepMin || 10;
+      const mode = opts.mode || 'center';
+      const prof = opts.horizon || null;
+      const sampling = opts.sampling || 'terrain_max';
+      const onProgress = opts.onProgress || null;
+      const n = rows * cols;
+
+      const hours = new Float32Array(n);
+      for (let i = 0; i < n; i++) if (heights[i] !== heights[i]) hours[i] = NaN;
+
+      /* Die Tagesfenster erst einmal ohne jedes Gebäude, minutenweise. Das
+       * kostet 1440 Sonnenstände, also nichts, und liefert die Ränder des Tages
+       * auf die Minute genau. Innerhalb dieser Fenster wird dann gerastert,
+       * statt über einen Tag zu laufen, dessen Hälfte Nacht ist.
+       */
+      const litAt = (t) => {
+        const s = solarPosition(berlinMinuteToJd(ymd.y, ymd.m, ymd.d, t, 0));
+        return sunAboveHorizonAngle(s.elev, prof ? horizonAt(prof, s.az) : 0, mode);
+      };
+
+      /* Die Grenzen des Fensters nachschärfen. Das Minutenraster liefert die
+       * erste Minute mit Sonne und die erste ohne, die Grenze liegt also
+       * irgendwo in der Minute davor. Eine Bisektion macht daraus eine
+       * Sekunde, und sie ist geschenkt: ein Sonnenstand kostet nichts gegen
+       * einen Sweep.
+       *
+       * Ohne das ist die Grenze nicht nur ungenau, sondern falsch herum: bei
+       * der ersten Fassung lag die letzte Abtastung eines Tages auf der ersten
+       * Minute ohne Sonne. Der Sweep meldete für sie alles im Schatten, die
+       * Interpolation legte den Wechsel damit an den Anfang des letzten
+       * Intervalls, und jede Zelle verlor eine halbe Schrittweite Sonne. Auf
+       * der freien Ebene, wo die Antwort bekannt ist, waren das zehn Minuten,
+       * die niemandem aufgefallen wären.
+       */
+      const bisect = (lo, hi) => {
+        const at = litAt(lo);
+        for (let i = 0; i < 20; i++) {
+          const mid = (lo + hi) / 2;
+          if (litAt(mid) === at) lo = mid; else hi = mid;
+        }
+        return (lo + hi) / 2;
+      };
+      const windows = sunlitIntervals(ymd.y, ymd.m, ymd.d, { mode: mode, horizon: prof, stepMin: 1 })
+        .map(([a, b]) => [a > 0 ? bisect(a - 1, a) : a, b < 1440 ? bisect(b - 1, b) : b]);
+      const dayMinutes = windows.reduce((a, [s, e]) => a + (e - s), 0);
+      if (!windows.length) {
+        if (onProgress) onProgress(1);
+        return { hours: hours, dayHours: 0, steps: 0 };
+      }
+
+      let total = 0;
+      for (const [a, b] of windows) total += Math.max(1, Math.ceil((b - a) / stepMin)) + 1;
+      let done = 0;
+
+      let prev = new Float32Array(n);
+      let cur = new Float32Array(n);
+
+      for (const [a, b] of windows) {
+        const steps = Math.max(1, Math.ceil((b - a) / stepMin));
+        const dt = (b - a) / steps;
+        // Genau auf der Grenze steht die Sonne im Horizont, und der Sweep
+        // liefert dort ein Schattenbild ohne Aussage. Die Geometrie wird
+        // deshalb um eine Winzigkeit nach innen genommen, das Zeitgewicht
+        // bleibt bei der echten Grenze.
+        const eps = Math.min(0.05, dt / 1000);
+        for (let k = 0; k <= steps; k++) {
+          const t = a + k * dt;
+          const tg = Math.min(b - eps, Math.max(a + eps, t));
+          const s = solarPosition(berlinMinuteToJd(ymd.y, ymd.m, ymd.d, tg, 0));
+          shadowMap(heights, rows, cols, cellsize, s.az, s.elev + elevationMargin(mode), {
+            margin: cur, sampling: sampling
+          });
+          if (k > 0) {
+            const hpi = dt / 60;
+            for (let i = 0; i < n; i++) {
+              const dp = prev[i], dc = cur[i];
+              // NaN fällt durch beide Vergleiche und lässt die Stunden auf NaN
+              // stehen, also unbekannt statt null.
+              if (dp >= 0 && dc >= 0) { hours[i] += hpi; continue; }
+              if (dp >= 0 || dc >= 0) {
+                // Genau hier liegt der Gewinn: der Anteil des Intervalls bis
+                // zum Vorzeichenwechsel, linear aus den beiden Abständen.
+                const f = dp / (dp - dc);
+                hours[i] += (dp >= 0 ? f : 1 - f) * hpi;
+              }
+            }
+          }
+          const swap = prev; prev = cur; cur = swap;
+          done++;
+          if (onProgress) onProgress(done / total);
+        }
+      }
+      if (onProgress) onProgress(1);
+      return { hours: hours, dayHours: dayMinutes / 60, steps: total };
+    }
+
+    /* Farbe einer Sonnenstundenzahl. Die Rampe ist eine Liste von Stützstellen
+     * [Anteil, r, g, b], linear dazwischen. Sie kommt von außen, weil sie zum
+     * Skin gehört und nicht zur Rechnerei.
+     *
+     * Normiert wird auf die Tageslänge und nicht auf das Maximum im Bild: sonst
+     * hieße dieselbe Farbe im engen Hof etwas anderes als auf dem freien Feld,
+     * und ein Blick auf den Dezember sähe aus wie ein Blick auf den Juni.
+     */
+    function rampColor(ramp, x) {
+      const t = x <= 0 ? 0 : (x >= 1 ? 1 : x);
+      let i = 0;
+      while (i < ramp.length - 2 && t > ramp[i + 1][0]) i++;
+      const a = ramp[i], b = ramp[i + 1];
+      const span = b[0] - a[0];
+      const f = span > 0 ? (t - a[0]) / span : 0;
+      return [
+        Math.round(a[1] + (b[1] - a[1]) * f),
+        Math.round(a[2] + (b[2] - a[2]) * f),
+        Math.round(a[3] + (b[3] - a[3]) * f)
+      ];
+    }
   </script>
 
   <script id="mapio">
@@ -1532,6 +1753,50 @@
           });
         },
 
+        /* Die Sonnenstundenkarte. Derselbe Ausschnitt wie die Schattenkarte,
+         * aber ein Sweep je Zeitschritt statt einem einzigen: das ist die
+         * teuerste Rechnung des Tools, sie dauert Sekunden statt Millisekunden
+         * und wird deshalb nicht beim Schieben der Karte nachgezogen, sondern
+         * auf Ansage.
+         *
+         * Der Zuschlag um den Ausschnitt ist fest und nicht wie bei der
+         * Schattenkarte von der Sonnenhöhe abhängig. Das ist eine bewusste
+         * Grenze: über einen Tag hinweg geht die Sonne einmal ganz tief, und
+         * der ehrliche Zuschlag dafür wären zwei Kilometer nach jeder Seite,
+         * also das Dreizehnfache an Fläche. Was jenseits der 400 m steht, sieht
+         * nur noch der Fernhorizont, und der kennt Gelände, aber keine Häuser.
+         * Wo das trägt, steht in den Hinweisen unter der Karte.
+         */
+        sunhours: function (req, onProgress) {
+          const report = onProgress || function () { };
+          const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
+          let wLoad = 0;
+          return store.ensure(list, (done, total) => {
+            wLoad = total > 0 ? 0.25 : 0;
+            if (total > 0) report(wLoad * done / total);
+          }).then(() => {
+            const rest = 1 - wLoad;
+            const cs = req.cellsize;
+            const cols = Math.ceil((req.e1 - req.e0) / cs);
+            const rows = Math.ceil((req.n1 - req.n0) / cs);
+            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
+            const heights = assemble(spec);
+            report(wLoad + rest * 0.05);
+            // Das Fernhorizontprofil für die Mitte des Fensters, einmal.
+            const ce = (req.e0 + req.e1) / 2, cn = (req.n0 + req.n1) / 2;
+            const prof = new Float32Array(360);
+            for (let b = 0; b < 360; b++) prof[b] = farHorizonAt(hm, far, ce, cn, b);
+            const r = sunHoursMap(heights, rows, cols, cs, { y: req.y, m: req.m, d: req.d }, {
+              stepMin: req.stepMin, mode: req.mode, horizon: prof,
+              onProgress: p => report(wLoad + rest * (0.05 + 0.95 * p))
+            });
+            return {
+              hours: r.hours, dayHours: r.dayHours, steps: r.steps, stepMin: req.stepMin,
+              rows: rows, cols: cols, cellsize: cs, spec: spec
+            };
+          });
+        },
+
         point: function (req) {
           const e = req.e, n = req.n;
           const list = tilesForExtent(hm, e - NEAR_M, n - NEAR_M, e + NEAR_M, n + NEAR_M);
@@ -1603,6 +1868,17 @@
         }).catch(err => postMessage({ type: 'shadow', token: msg.token, error: String(err) }));
         return;
       }
+      if (msg.type === 'sunhours') {
+        const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
+        WORKER_ENGINE.sunhours(msg, tell).then(r => {
+          postMessage({
+            type: 'sunhours', token: msg.token, hours: r.hours, dayHours: r.dayHours,
+            steps: r.steps, stepMin: r.stepMin, rows: r.rows, cols: r.cols,
+            cellsize: r.cellsize, spec: r.spec
+          }, [r.hours.buffer]);
+        }).catch(err => postMessage({ type: 'sunhours', token: msg.token, error: String(err) }));
+        return;
+      }
       if (msg.type === 'point') {
         WORKER_ENGINE.point(msg)
           .then(r => postMessage({ type: 'point', token: msg.token, answer: r }))
@@ -1662,8 +1938,17 @@
         shadowBusy:   'wird gerechnet',
         shadowFar:    'Zum Rechnen der Schattenkarte weiter hineinzoomen.',
         shadowNight:  'Die Sonne steht unter dem Horizont, es liegt alles im Schatten.',
+        shadowShow:   'Anzeigen',
         smoothLabel:  'Glätten',
         smoothHint:   'Einzeln stehende Schattenzellen fallen weg, die Kanten bekommen Zwischenstufen. Ausgeschaltet steht jede gerechnete Zelle für sich.',
+        hoursLabel:   'Sonnenstunden',
+        hoursHint:    'Wie lange die Sonne an diesem Tag jede Stelle erreicht. Das kostet einen Schattenwurf je Zeitschritt und dauert deshalb Sekunden.',
+        hoursFar:     'Zum Rechnen der Sonnenstunden weiter hineinzoomen.',
+        hoursStale:   'Die Sonnenstunden gelten für einen anderen Ausschnitt oder einen anderen Tag.',
+        hoursRecalc:  'Neu rechnen',
+        hoursMax:     'Tageslänge',
+        hoursScale:   'Skala von null bis zur Tageslänge am freien Horizont, damit dieselbe Farbe im Dezember dasselbe heißt wie im Juni. Gerechnet aus {n} Schattenwürfen im Abstand von {s} Minuten, die Besonnungswechsel dazwischen interpoliert.',
+        stepHint:     'Zeitschritt zwischen zwei Schattenwürfen. Die Wechsel dazwischen werden interpoliert, ein Sonnenfenster kürzer als der Schritt kann aber ganz durchfallen.',
         pickPrompt:   'Noch kein Ort gewählt. Klick in die Karte.',
         here:         'Gewählter Ort',
         verdictSun:   'Hier scheint die Sonne.',
@@ -1731,8 +2016,17 @@
         shadowBusy:   'computing',
         shadowFar:    'Zoom in further to compute the shadow map.',
         shadowNight:  'The sun is below the horizon, everything is in shadow.',
+        shadowShow:   'Show',
         smoothLabel:  'Smooth',
         smoothHint:   'Single stray shadow cells drop out and the edges get intermediate steps. Switched off, every computed cell stands on its own.',
+        hoursLabel:   'Hours of sun',
+        hoursHint:    'How long the sun reaches each spot on this day. That costs one shadow cast per time step and therefore takes seconds.',
+        hoursFar:     'Zoom in further to compute the hours of sun.',
+        hoursStale:   'The hours of sun are for a different window or a different day.',
+        hoursRecalc:  'Recompute',
+        hoursMax:     'day length',
+        hoursScale:   'The scale runs from zero to the length of the day on a free horizon, so that the same colour means the same thing in December as in June. Computed from {n} shadow casts {s} minutes apart, with the transitions in between interpolated.',
+        stepHint:     'Time between two shadow casts. The transitions in between are interpolated, but a window of sun shorter than the step can fall through entirely.',
         pickPrompt:   'No spot picked yet. Click the map.',
         here:         'Picked spot',
         verdictSun:   'The sun reaches this spot.',
@@ -1770,6 +2064,9 @@
       return pad2(Math.floor(m / 60) % 24) + ':' + pad2(m % 60);
     }
     function fmtDeg(v, digits) { return v.toFixed(digits === undefined ? 1 : digits) + '°'; }
+    // Stunden mit einer Nachkommastelle. Mehr behauptet eine Genauigkeit, die
+    // ein Modell mit halbmetrigen Objekthöhen nicht hat.
+    function fmtHours(v) { return v.toFixed(1) + ' h'; }
     function compassName(az) { return t.compass[Math.round(mod360(az) / 45) % 8]; }
 
     function todayParts() {
@@ -1897,8 +2194,8 @@
       let token = 0;
       let hm = null;
       let settled = false;
-      const queued = { shadow: null, point: null };
-      const busy = { shadow: false, point: false };
+      const queued = { shadow: null, point: null, sunhours: null };
+      const busy = { shadow: false, point: false, sunhours: false };
 
       function done(ok) { if (!settled) { settled = true; readyResolve(ok); } }
 
@@ -1914,7 +2211,7 @@
         if (worker) { try { worker.terminate(); } catch (e) { /* egal */ } worker = null; }
         inline = makeEngine(hm);
         inline.loadHeavy().then(
-          () => { done(true); pump('shadow'); pump('point'); },
+          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); },
           err => { console.warn(err); done(false); }
         );
       }
@@ -2012,14 +2309,20 @@
         road: ['#414d60', '#333d4c', '#28303b'],
         building: '#2c3644', buildingEdge: '#3b4757',
         shadow: [8, 12, 20, 0.60], label: '#8492a5', labelHalo: '#10151c',
-        marker: '#f2b544', ray: '#f2b544'
+        marker: '#f2b544', ray: '#f2b544',
+        hours: [[0, 20, 26, 44], [0.3, 62, 44, 92], [0.6, 168, 68, 63], [0.85, 240, 176, 58], [1, 255, 233, 168]]
       },
       light: {
         land: '#f5f3ed', green: '#e4efdd', water: '#d7e7f4',
         road: ['#ffffff', '#fbfaf7', '#f2f0ea'],
         building: '#dcd6cb', buildingEdge: '#c3bbac',
         shadow: [46, 58, 82, 0.34], label: '#6f6a5e', labelHalo: '#f5f3ed',
-        marker: '#b34700', ray: '#b34700'
+        marker: '#b34700', ray: '#b34700',
+        /* Dieselbe Rampe wie im dunklen Thema, nur unten nicht ganz so tief:
+         * über einem hellen Grund braucht das dunkle Ende weniger Kontrast, um
+         * als wenig gelesen zu werden, und ein tiefes Blauschwarz auf Sandfarbe
+         * sähe aus wie ein Loch im Bild. */
+        hours: [[0, 46, 54, 92], [0.3, 96, 68, 128], [0.6, 190, 88, 68], [0.85, 240, 176, 58], [1, 255, 240, 190]]
       },
       /* Der graue Skin nimmt der Karte die Farbe und gibt sie dem Schatten:
        * Straßen, Gebäude, Wasser und Grün laufen in einer Graustufenreihe, und
@@ -2052,7 +2355,12 @@
          * erkennen ist, dunkel genug, dass sie abdunkelt.
          */
         shadow: [18, 42, 44, 0.55], label: '#eef1f2', labelHalo: '#3a3e43',
-        marker: '#ffffff', ray: '#ffffff'
+        marker: '#ffffff', ray: '#ffffff',
+        /* Achromatisch, wie der ganze Skin, mit demselben Satz wie beim
+         * Schatten: mehr Sonne ist heller. Am oberen Ende darf der eine Akzent
+         * mitkommen, damit die Spitze nicht mit dem Weiß der Beschriftung
+         * verschmilzt. */
+        hours: [[0, 30, 34, 37], [0.35, 74, 80, 85], [0.7, 150, 157, 162], [0.9, 214, 219, 221], [1, 143, 231, 218]]
       }
     };
 
@@ -2232,6 +2540,63 @@
       return cv;
     }
 
+    /* Die Sonnenstundenkarte als Bild. Anders als der Schatten ist sie
+     * flächendeckend und nicht durchscheinend gedacht: sie ist keine Aussage
+     * über einen Augenblick, die man auf der Basiskarte verorten will, sondern
+     * eine über den ganzen Tag, und die Basiskarte darunter würde sie nur
+     * einfärben. Deshalb hohe Deckung; die Beschriftung liegt trotzdem darüber.
+     *
+     * Geglättet wird mit demselben Binomialgewicht wie beim Schatten, hier aber
+     * auf einer stetigen Größe statt auf einer Ja-Nein-Karte. Ein Entsprenkeln
+     * gibt es nicht: es gibt keine Sprenkel, weil über einen Tag gemittelt wird.
+     */
+    function hoursCanvas(data, colors, maxHours, smooth) {
+      const cols = data.cols, rows = data.rows;
+      const cv = document.createElement('canvas');
+      cv.width = cols; cv.height = rows;
+      const ctx = cv.getContext('2d');
+      const img = ctx.createImageData(cols, rows);
+      const h = data.hours;
+      const ramp = colors.hours;
+      const scale = maxHours > 0 ? maxHours : 1;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          let v = h[i], w = 1;
+          if (smooth) {
+            v = 0; w = 0;
+            for (let dr = -1; dr <= 1; dr++) {
+              const rr = r + dr;
+              if (rr < 0 || rr >= rows) continue;
+              for (let dc = -1; dc <= 1; dc++) {
+                const cc = c + dc;
+                if (cc < 0 || cc >= cols) continue;
+                const x = h[rr * cols + cc];
+                if (x !== x) continue;
+                const g = (dr === 0 ? 2 : 1) * (dc === 0 ? 2 : 1);
+                v += g * x; w += g;
+              }
+            }
+            v = w ? v / w : NaN;
+          }
+          // Unbekannt bleibt durchsichtig. Eine Zelle ohne Kacheldaten hat
+          // keine Sonnenstunden, auch nicht null.
+          if (h[i] !== h[i] || v !== v) continue;
+          const [rr2, gg, bb] = rampColor(ramp, v / scale);
+          img.data[i * 4] = rr2; img.data[i * 4 + 1] = gg;
+          img.data[i * 4 + 2] = bb; img.data[i * 4 + 3] = 216;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      return cv;
+    }
+
+    // Die Legende als CSS-Verlauf, aus derselben Rampe wie das Bild.
+    function rampCss(ramp) {
+      return 'linear-gradient(to right,' +
+        ramp.map(s => `rgb(${s[1]},${s[2]},${s[3]}) ${Math.round(s[0] * 100)}%`).join(',') + ')';
+    }
+
     // ------------------------------------------------------------ Maßstab
 
     function scaleBar(mPerPx, maxPx) {
@@ -2306,10 +2671,19 @@
       const [pick, setPick] = useState(null);
       const [answer, setAnswer] = useState(null);
       const [shadow, setShadow] = useState(null);
-      const [showShadow, setShowShadow] = useState(true);
+      // Gilt für die jeweils gewählte Ebene und nicht nur für den Schatten:
+      // beide legen sich über die Basiskarte, und beide will man beim
+      // Hinsehen kurz wegnehmen können.
+      const [showLayer, setShowLayer] = useState(true);
       const [smooth, setSmooth] = useState(true);
       const [busy, setBusy] = useState(false);
       const [progress, setProgress] = useState(0);
+      const [layer, setLayer] = useState('shadow');
+      const [hours, setHours] = useState(null);
+      const [stepMin, setStepMin] = useState(10);
+      // Welcher Ausschnitt schon einmal angefangen wurde. Ohne das versucht die
+      // Karte nach einer gescheiterten Rechnung bei jeder Mausbewegung wieder.
+      const hoursTried = useRef(null);
       const [colors, setColors] = useState(readMapColors);
       const model = MODEL;
 
@@ -2360,9 +2734,19 @@
 
       const tooFar = tilesNeeded ? tilesNeeded.list.length > MAX_TILES : false;
 
+      /* Die Abbruchwege löschen die Anzeige "wird gerechnet" mit. Eine Anfrage,
+       * die während der Rechnung überflüssig wird -- weil die Ebene gewechselt
+       * hat, weil jemand den Schatten weggeschaltet hat, weil die Sonne unter
+       * den Horizont gerutscht ist -- kommt zwar noch zurück, wird aber
+       * verworfen und räumt deshalb nicht mehr auf. Ohne das steht der
+       * Fortschrittsbalken danach für immer da.
+       */
+      const stopBusy = () => { setShadow(null); setBusy(false); };
+
       useEffect(() => {
-        if (!showShadow || !tilesNeeded || tooFar || !model || !model.ready) { setShadow(null); return; }
-        if (sun.elev <= 0) { setShadow(null); return; }
+        if (layer !== 'shadow') { stopBusy(); return; }
+        if (!showLayer || !tilesNeeded || tooFar || !model || !model.ready) { stopBusy(); return; }
+        if (sun.elev <= 0) { stopBusy(); return; }
         let alive = true;
         setBusy(true);
         setProgress(0);
@@ -2386,7 +2770,64 @@
           });
         }, 140);
         return () => { alive = false; clearTimeout(timer); };
-      }, [showShadow, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw]);
+      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw]);
+
+      // ---------------------------------------------- Sonnenstundenkarte rechnen
+
+      /* Der Zuschlag um den Ausschnitt, fest und nicht von der Sonnenhöhe
+       * abhängig: über einen Tag geht die Sonne einmal ganz tief, und ein
+       * ehrlicher Zuschlag dafür wäre das Dreizehnfache an Fläche. 400 m ist
+       * dieselbe Reichweite, mit der die Punktabfrage rechnet, und dahinter
+       * übernimmt der Fernhorizont.
+       */
+      const HOURS_MARGIN_M = 400;
+
+      const hoursReq = useMemo(() => {
+        if (!vw || !model || !model.ready) return null;
+        const ext = vw.extent(HOURS_MARGIN_M);
+        const e0 = model.hm.bounds[0] + ext[0], n0 = model.hm.bounds[1] + ext[1];
+        const e1 = model.hm.bounds[0] + ext[2], n1 = model.hm.bounds[1] + ext[3];
+        const cs = hoursCellsize(model.hm, vw.mPerPx);
+        // Der Schlüssel sagt, wofür ein Ergebnis gilt. Ändert sich einer der
+        // Werte darin, ist die vorhandene Karte veraltet -- und das wird
+        // angezeigt statt stillschweigend nachgerechnet, weil Nachrechnen hier
+        // Sekunden kostet und nicht Millisekunden.
+        return {
+          e0: e0, n0: n0, e1: e1, n1: n1, cellsize: cs,
+          tiles: tilesForExtent(model.hm, e0, n0, e1, n1).length,
+          key: [Math.round(e0), Math.round(n0), Math.round(e1), Math.round(n1),
+                cs, ymd.y, ymd.m, ymd.d, mode, stepMin].join('|')
+        };
+      }, [vw, model, stage, ymd.y, ymd.m, ymd.d, mode, stepMin]);
+
+      const hoursFar = hoursReq ? hoursReq.tiles > MAX_TILES : false;
+      const hoursStale = !!(hours && hoursReq && hours.key !== hoursReq.key);
+
+      const computeHours = useCallback(() => {
+        if (!hoursReq || hoursFar || !model || !model.ready) return;
+        const key = hoursReq.key;
+        hoursTried.current = key;
+        setBusy(true);
+        setProgress(0);
+        model.client.ask('sunhours', {
+          e0: hoursReq.e0, n0: hoursReq.n0, e1: hoursReq.e1, n1: hoursReq.n1,
+          cellsize: hoursReq.cellsize, mode: mode, stepMin: stepMin,
+          y: ymd.y, m: ymd.m, d: ymd.d
+        }, p => setProgress(p)).then(r => {
+          if (r.superseded) return;
+          setBusy(false);
+          if (!r.error) setHours(Object.assign({ key: key }, r));
+        });
+      }, [hoursReq, hoursFar, model, mode, stepMin, ymd.y, ymd.m, ymd.d]);
+
+      // Beim ersten Blick auf die Ebene wird von allein gerechnet, danach nur
+      // noch auf Ansage. Der Versuchsschlüssel hält den Fall in Schach, dass
+      // die Rechnung scheitert: sonst finge sie bei jeder Mausbewegung neu an.
+      useEffect(() => {
+        if (layer !== 'hours' || !hoursReq || hoursFar || hours) return;
+        if (hoursTried.current === hoursReq.key) return;
+        computeHours();
+      }, [layer, hoursReq, hoursFar, hours, computeHours]);
 
       // ------------------------------------------------------ Punkt beantworten
 
@@ -2417,6 +2858,11 @@
         [shadow, colors, smooth]
       );
 
+      const hoursBitmap = useMemo(
+        () => (hours ? hoursCanvas(hours, colors, hours.dayHours, smooth) : null),
+        [hours, colors, smooth]
+      );
+
       useEffect(() => {
         const cv = canvasRef.current;
         if (!cv) return;
@@ -2443,22 +2889,27 @@
           drawBuildings(ctx, vw, queryIndex(model.index, ext[0], ext[1], ext[2], ext[3]), colors);
         }
 
-        if (shadowBitmap && showShadow) {
-          const cv2 = shadowBitmap;
-          const x0 = vw.sx(shadow.spec.originE - model.hm.bounds[0]);
-          const y0 = vw.sy(shadow.spec.originN - model.hm.bounds[1] + shadow.rows * shadow.cellsize);
-          /* Die zweite Hälfte der Glättung, und sie kostet nichts: das Bild
-           * liegt in Rasterzellen vor und wird auf Bildschirmpixel gezogen.
-           * Weich heißt hier, den Zwischenwerten des Deckungsbildes auch
-           * zwischen den Zellen zu folgen; hart heißt, die Zelle als Kästchen
-           * zu zeigen, was beim Hineinzoomen ehrlicher ist, weil die
-           * Rasterweite dann sichtbar wird.
-           */
+        // Ein Rasterbild an seinen Platz in der Karte ziehen. Der Ursprung des
+        // Ausschnitts liegt in seiner Südwestecke, das Bild beginnt oben links,
+        // deshalb die Zeilenhöhe obendrauf.
+        const drawGrid = (bmp, g) => {
+          const x0 = vw.sx(g.spec.originE - model.hm.bounds[0]);
+          const y0 = vw.sy(g.spec.originN - model.hm.bounds[1] + g.rows * g.cellsize);
           ctx.imageSmoothingEnabled = smooth;
-          ctx.drawImage(cv2, x0, y0, shadow.cols * shadow.cellsize / vw.mPerPx,
-                              shadow.rows * shadow.cellsize / vw.mPerPx);
+          ctx.drawImage(bmp, x0, y0, g.cols * g.cellsize / vw.mPerPx,
+                                     g.rows * g.cellsize / vw.mPerPx);
           ctx.imageSmoothingEnabled = true;
-        }
+        };
+
+        if (layer === 'hours' && hoursBitmap && showLayer) drawGrid(hoursBitmap, hours);
+
+        /* Die zweite Hälfte der Glättung steckt in drawGrid und kostet nichts:
+         * das Bild liegt in Rasterzellen vor und wird auf Bildschirmpixel
+         * gezogen. Weich heißt, den Zwischenwerten auch zwischen den Zellen zu
+         * folgen; hart heißt, die Zelle als Kästchen zu zeigen, was beim
+         * Hineinzoomen ehrlicher ist, weil die Rasterweite dann sichtbar wird.
+         */
+        if (layer === 'shadow' && shadowBitmap && showLayer) drawGrid(shadowBitmap, shadow);
 
         if (model.base.labels) drawLabels(ctx, vw, model.base.labels, colors);
 
@@ -2488,7 +2939,8 @@
           ctx.strokeStyle = colors.labelHalo;
           ctx.stroke();
         }
-      }, [vw, model, stage, shadowBitmap, shadow, showShadow, smooth, colors, size.w, size.h, pick, sun.az, sun.elev]);
+      }, [vw, model, stage, shadowBitmap, shadow, showLayer, smooth, colors, size.w, size.h,
+          pick, sun.az, sun.elev, layer, hoursBitmap, hours]);
 
       // ------------------------------------------------------------ Bedienung
 
@@ -2584,6 +3036,19 @@
         : stage === 'nomodel' ? t.mapNoModel
         : t.mapLoading + ' ' + '·' + ' ' + (stage === 'base' ? t.mapLoadBase : stage === 'buildings' ? t.mapLoadBuild : t.mapLoadModel);
 
+      /* Eine Zeile, eine Aussage, und in dieser Reihenfolge: was kaputt ist,
+       * was noch lädt, was zu weit weg ist, was gerade rechnet, was veraltet
+       * ist. Ohne die feste Reihenfolge stünde beim Herauszoomen während einer
+       * laufenden Rechnung beides gleichzeitig da.
+       */
+      const statusText = failed ? t.mapFailed
+        : loadingText ? loadingText
+        : (layer === 'shadow' ? tooFar : hoursFar) ? (layer === 'shadow' ? t.shadowFar : t.hoursFar)
+        : busy ? (layer === 'hours' ? t.hoursLabel : t.shadowLabel) + ' ' + '·' + ' '
+                 + t.shadowBusy + ' ' + Math.round(progress * 100) + ' %'
+        : (layer === 'hours' && hoursStale) ? t.hoursStale
+        : null;
+
       return html`
         <${React.Fragment}>
           <div className="rs-cap" style=${{ marginBottom: 6 }}>${t.mapTitle}<//>
@@ -2592,30 +3057,59 @@
                     style=${{ width: size.w + 'px', height: size.h + 'px' }}
                     onPointerDown=${onPointerDown} onPointerMove=${onPointerMove}
                     onPointerUp=${onPointerUp} onPointerCancel=${onPointerCancel}/>
-            ${(loadingText || failed || tooFar || busy) && html`
+            ${statusText && html`
               <div className="rs-map-status">
-                ${failed ? t.mapFailed
-                  : loadingText ? loadingText
-                  : tooFar ? t.shadowFar
-                  : t.shadowLabel + ' ' + '·' + ' ' + t.shadowBusy
-                    + ' ' + Math.round(progress * 100) + ' %'}
-                ${!failed && !loadingText && !tooFar && busy && html`
+                ${statusText}
+                ${busy && html`
                   <div className="rs-bar"><i style=${{ width: (progress * 100) + '%' }}/><//>`}
               <//>`}
             <div className="rs-map-overlay">
-              <button className=${'lang-seg' + (showShadow ? ' active' : '')}
-                      onClick=${() => setShowShadow(s => !s)}>${t.shadowLabel}<//>
-              <button className=${'lang-seg' + (smooth ? ' active' : '')}
-                      title=${t.smoothHint}
-                      onClick=${() => setSmooth(s => !s)}>${t.smoothLabel}<//>
-              <button className="lang-seg" onClick=${() => goto(HOME, 1.1)}>${t.mapZoomOld}<//>
-              <button className="lang-seg" onClick=${() => goto(CITY, 14)}>${t.mapZoomOut}<//>
+              <div className="rs-map-group">
+                <button className=${'lang-seg' + (layer === 'shadow' ? ' active' : '')}
+                        onClick=${() => setLayer('shadow')}>${t.shadowLabel}<//>
+                <button className=${'lang-seg' + (layer === 'hours' ? ' active' : '')}
+                        title=${t.hoursHint}
+                        onClick=${() => setLayer('hours')}>${t.hoursLabel}<//>
+              <//>
+              <div className="rs-map-group">
+                <button className=${'lang-seg' + (showLayer ? ' active' : '')}
+                        onClick=${() => setShowLayer(s => !s)}>${t.shadowShow}<//>
+                <button className=${'lang-seg' + (smooth ? ' active' : '')}
+                        title=${t.smoothHint}
+                        onClick=${() => setSmooth(s => !s)}>${t.smoothLabel}<//>
+              <//>
+              ${layer === 'hours' && hoursStale && !busy && html`
+                <div className="rs-map-group">
+                  <button className="lang-seg" onClick=${computeHours}>${t.hoursRecalc}<//>
+                <//>`}
+              <div className="rs-map-group">
+                <button className="lang-seg" onClick=${() => goto(HOME, 1.1)}>${t.mapZoomOld}<//>
+                <button className="lang-seg" onClick=${() => goto(CITY, 14)}>${t.mapZoomOut}<//>
+              <//>
             <//>
             <div className="rs-scale">
               <span style=${{ display: 'inline-block', width: bar.px + 'px', borderBottom: '2px solid currentColor', marginRight: 6, verticalAlign: 2 }}/>
               ${bar.m >= 1000 ? (bar.m / 1000) + ' km' : bar.m + ' m'}
             <//>
           <//>
+          ${layer === 'hours' && hours && html`
+            <div style=${{ marginTop: 10 }}>
+              <div className="rs-hours-bar" style=${{ background: rampCss(colors.hours) }}/>
+              <div className="rs-hours-ticks">
+                <span>${'0 h'}<//>
+                <span>${fmtHours(hours.dayHours / 2)}<//>
+                <span>${fmtHours(hours.dayHours) + ' ' + '·' + ' ' + t.hoursMax}<//>
+              <//>
+              <p className="rs-note" style=${{ margin: '6px 0 0' }}>
+                ${t.hoursScale.replace('{n}', hours.steps).replace('{s}', hours.stepMin)}
+              <//>
+              <div className="rs-map-group" style=${{ marginTop: 8, display: 'inline-flex' }}>
+                ${[20, 10, 5].map(s => html`
+                  <button key=${'st' + s} className=${'lang-seg' + (stepMin === s ? ' active' : '')}
+                          title=${t.stepHint}
+                          onClick=${() => setStepMin(s)}>${s + ' min'}<//>`)}
+              <//>
+            <//>`}
           <p className="rs-note" style=${{ margin: '8px 0 0' }}>${t.mapHint}<//>
           <${PickReadout} pick=${pick} answer=${answer} sun=${sun}/>
         <//>`;
