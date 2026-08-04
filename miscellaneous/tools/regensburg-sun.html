@@ -1417,6 +1417,42 @@
       return Math.min(8 * base, Math.max(base, Math.round(raw / base) * base));
     }
 
+    /* Dasselbe, aber mit einem Deckel auf der Zellzahl. Nur für den
+     * automatischen Weg.
+     *
+     * "So fein wie das Bild" ist eine Regel über den Maßstab und weiß nichts
+     * über die Fläche, und genau daran zerbricht sie am Abend. Der gerechnete
+     * Ausschnitt ist das Bild plus einem Zuschlag von 150 m geteilt durch den
+     * Tangens der Sonnenhöhe -- das ist die Entfernung, aus der ein 150 m
+     * hohes Hindernis gerade noch ins Bild wirft. Bei fünfzig Grad sind das
+     * 200 m ringsum, bei fünf Grad 1715 m, und ein Bild von 900 x 700 Pixeln
+     * wird dann über 4,3 x 4,1 Kilometer gerechnet. Gemessen an genau diesem
+     * Bild, bei einem Meter je Pixel:
+     *
+     *     50 Grad  1,4 Mio Zellen      10 Grad   6,3 Mio
+     *     20 Grad  2,6 Mio              5 Grad  17,9 Mio
+     *     15 Grad  3,7 Mio              3 Grad  23,0 Mio
+     *
+     * Das Sechzehnfache, und daran hängt nicht nur der Sweep: die Höhen sind
+     * dann 92 MB, die Deckungsbilder laufen über dieselbe Zellzahl, das
+     * Schattenbild wird eine Zeichenfläche mit 23 Millionen Pixeln, und die
+     * wird bei jedem Verschieben neu ins Bild gezogen. Es ist nicht der
+     * Schatten, der bei tiefer Sonne teuer wird, es ist die Fläche, über die
+     * gerechnet werden muss, um ihn zu kennen.
+     *
+     * Deshalb gilt für den automatischen Weg dieselbe Frage wie für den Regler
+     * daneben, nur mit der anderen Antwort: die feste Wahl wird abgeschaltet,
+     * wenn sie zu teuer wird, und die automatische wird vergröbert. Sie darf
+     * das, weil sie nichts versprochen hat außer "so wie es sich ausgeht".
+     */
+    function fitCellsize(hm, mPerPx, widthM, heightM, budget) {
+      const base = hm.ndom.cellsize;
+      const max = 8 * base;
+      let cs = shadowCellsize(hm, mPerPx, 0);
+      while (cs < max && Math.ceil(widthM / cs) * Math.ceil(heightM / cs) > budget) cs += base;
+      return cs;
+    }
+
     /* Aus der Ja-Nein-Karte ein Deckungsbild machen: je Zelle, wie viel von
      * ihrer Umgebung im Schatten liegt, als 0 bis 255.
      *
@@ -1591,6 +1627,255 @@
         }
       }
       return cov;
+    }
+
+    /* ------------------------------------------- Die Kante als Umriss
+     *
+     * `edgeCover` liest die Kante aus dem Abstandsfeld und schreibt sie in ein
+     * Deckungsbild zurück. Das ist subzellengenau gerechnet und wird trotzdem
+     * wieder als Bild ausgeliefert, und ein Bild hat eine Auflösung: beim
+     * Hineinzoomen wird eine Zelle irgendwann zwanzig Pixel breit, und dann
+     * sieht man die weiche Rampe, aus der die Kante besteht. Die Kante selbst
+     * ist aber keine Rampe, sondern eine Linie, und sie liegt bekannt: es ist
+     * die Nulllinie desselben Feldes.
+     *
+     * Hier wird diese Nulllinie als Vieleck herausgezogen. Damit ist der
+     * Schatten Geometrie und kein Rasterbild mehr, und er bleibt bei jedem
+     * Maßstab scharf. Das kostet, was Geometrie immer kostet: das Ergebnis
+     * ist nicht mehr proportional zur Bildfläche, sondern zur Länge der
+     * Schattenkanten, und die kann in einer Altstadt lang sein.
+     *
+     * Drei Entscheidungen, die man kennen muss:
+     *
+     * 1. Vor dem Konturieren wird entsprenkelt. Sonst umrandet die Linie das
+     *    Rauschen des Oberflächenmodells: über Bäumen und über der
+     *    Uferböschung ragen einzelne Zellen einen halben Meter heraus, und aus
+     *    jeder von ihnen würde ein eigener kleiner Ring. Als Bild war das ein
+     *    Sprenkel unter tausend Pixeln, als Umriss ist es eine gezeichnete
+     *    Behauptung.
+     * 2. Der Rand wird umlaufen. Das Feld bekommt einen Ring "Sonne"
+     *    umgelegt, damit jeder Ring geschlossen ist; ein Schatten, der aus dem
+     *    Ausschnitt hinausläuft, endet an dessen Kante. Offene Linienzüge
+     *    ließen sich nicht füllen.
+     * 3. Löcher entstehen von selbst. Alle Ringe laufen mit derselben
+     *    Regel (der Schatten liegt links), dadurch drehen Außenring und Loch
+     *    gegenläufig, und die Füllregel `nonzero` des Canvas macht daraus ohne
+     *    weiteres Zutun einen Hof im Häuserblock.
+     */
+
+    // Was jenseits des Ausschnitts liegt und was unbekannt ist, gilt als
+    // besonnt. Der Wert ist nur ein Vorzeichen mit Abstand: er steht weit
+    // außerhalb der Kappung von `margin` (ein Kilometer), damit die
+    // Sattelpunktregel unten ihn nie überstimmt.
+    const ISO_OUTSIDE = 1e6;
+
+    /* Einzeln stehende Zellen aus dem Abstandsfeld nehmen, mit derselben
+     * Regel wie `smoothShade`: eine Zelle kippt erst, wenn `isolation` ihrer
+     * acht bekannten Nachbarn anders urteilen. Der Unterschied ist, was danach
+     * dort steht. Auf einer Ja-Nein-Karte kippt das Urteil und fertig; auf
+     * einem Feld muss ein Wert her, und der Betrag der Ausreißerzelle taugt
+     * nicht: ein Zaunpfahl steht einen halben Meter über der Schattenhöhe, und
+     * dieses Vorzeichen umzudrehen ließe ihn einen halben Meter darunter
+     * stehen, also genau so weit von der Nulllinie entfernt wie vorher. Die
+     * Kontur liefe dann immer noch um ihn herum, nur andersherum.
+     *
+     * Stattdessen bekommt die Zelle den Mittelwert genau der Nachbarn, die sie
+     * überstimmt haben. Damit hat sie deren Vorzeichen von der Konstruktion
+     * her, und ihr Abstand ist der ihrer Umgebung: sie verschwindet in der
+     * Fläche, statt eine Delle in die Kante zu drücken.
+     */
+    function despeckleField(margin, heights, rows, cols, opts) {
+      opts = opts || {};
+      const iso = opts.isolation === undefined ? 7 : opts.isolation;
+      const out = Float32Array.from(margin);
+      if (iso > 8) return out;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          const m = margin[i];
+          if (m !== m || heights[i] !== heights[i]) continue;
+          const dark = m < 0;
+          let seen = 0, differ = 0, sum = 0;
+          for (let dr = -1; dr <= 1; dr++) {
+            const rr = r + dr;
+            if (rr < 0 || rr >= rows) continue;
+            for (let dc = -1; dc <= 1; dc++) {
+              const cc = c + dc;
+              if ((dr === 0 && dc === 0) || cc < 0 || cc >= cols) continue;
+              const j = rr * cols + cc;
+              const x = margin[j];
+              if (x !== x || heights[j] !== heights[j]) continue;
+              seen++;
+              if ((x < 0) !== dark) { differ++; sum += x; }
+            }
+          }
+          // Am Rand des Ausschnitts hat eine Zelle keine acht Nachbarn. Dort
+          // wird nicht gekippt, wie bei smoothShade auch.
+          if (seen >= iso && differ >= iso) out[i] = sum / differ;
+        }
+      }
+      return out;
+    }
+
+    /* Marching Squares auf dem Abstandsfeld, Schwellwert null.
+     *
+     * Gerechnet wird auf dem Gitter der Zellmittelpunkte: vier benachbarte
+     * Mittelpunkte spannen ein Quadrat auf, und die Kontur schneidet dessen
+     * Seiten. Die Schnittpunkte liegen also zwischen den Zellen, und genau da
+     * gehören sie hin. Ein Schnittpunkt gehört immer zu einer Gitterkante,
+     * und diese Kante hat eine Kennung -- daran hängt der ganze Trick, die
+     * Strecken hinterher zu Ringen zusammenzusetzen: zwei Strecken gehören
+     * aneinander, wenn sie sich eine Kantenkennung teilen, und nicht, wenn
+     * zwei Fließkommazahlen zufällig gleich sind.
+     *
+     * Jede Kante hat global genau eine hinausführende und eine hereinführende
+     * Strecke (sie liegt in genau zwei Quadraten, und in einem ist sie Ausgang
+     * und im anderen Eingang). Die Verkettung ist damit eine Permutation, und
+     * das Verfolgen kann nicht in einer Sackgasse enden.
+     *
+     * Die beiden mehrdeutigen Fälle sind die diagonalen: zwei sich
+     * gegenüberliegende Ecken im Schatten, die anderen beiden in der Sonne.
+     * Ob das eine durchgehende Diagonale ist oder zwei getrennte Ecken, sagt
+     * das Feld selbst nicht. Entschieden wird über den Mittelwert der vier
+     * Ecken -- liegt die Mitte im Schatten, hängt die Diagonale zusammen. Das
+     * ist die übliche Regel und die einzige Stelle im Verfahren, an der eine
+     * Wahl getroffen wird.
+     *
+     * Zurück kommen alle Punkte in einem Feld (x, y, x, y, …) und dazu die
+     * Anfänge der Ringe darin, beides als eine einzige Anlage statt als
+     * hundert kleine: so lässt es sich am Stück durch die Fadengrenze
+     * schieben. Die Koordinaten stehen in Zellen, mit dem Mittelpunkt der
+     * Zelle (0,0) als Ursprung; `placeContours` macht daraus Meter.
+     */
+    function isoContours(margin, heights, rows, cols) {
+      // Ein Ring "Sonne" ringsum, damit jede Kontur geschlossen ist.
+      const R2 = rows + 2, C2 = cols + 2;
+      const f = new Float32Array(R2 * C2);
+      f.fill(ISO_OUTSIDE);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          const m = margin[i];
+          // Unbekannt zählt als besonnt: dort ist nichts bekannt, und ein
+          // gezeichneter Umriss wäre eine Aussage.
+          f[(r + 1) * C2 + c + 1] = (m === m && heights[i] === heights[i]) ? m : ISO_OUTSIDE;
+        }
+      }
+
+      const HCOUNT = R2 * C2;
+      const seen = new Map();   // Kantenkennung -> Punktnummer
+      const next = new Map();   // Kantenkennung -> nächste Kantenkennung
+      const xs = [], ys = [];
+
+      // Waagerechte Gitterkante von (r,c) nach (r,c+1), senkrechte von (r,c)
+      // nach (r+1,c). Der Schnittpunkt wird beim ersten Zugriff gerechnet und
+      // gemerkt, damit beide angrenzenden Quadrate denselben Punkt bekommen.
+      const hEdge = (r, c) => {
+        const id = r * C2 + c;
+        if (!seen.has(id)) {
+          const a = f[r * C2 + c], b = f[r * C2 + c + 1];
+          seen.set(id, xs.length);
+          xs.push(c + a / (a - b)); ys.push(r);
+        }
+        return id;
+      };
+      const vEdge = (r, c) => {
+        const id = HCOUNT + r * C2 + c;
+        if (!seen.has(id)) {
+          const a = f[r * C2 + c], b = f[(r + 1) * C2 + c];
+          seen.set(id, xs.length);
+          xs.push(c); ys.push(r + a / (a - b));
+        }
+        return id;
+      };
+
+      for (let r = 0; r < R2 - 1; r++) {
+        for (let c = 0; c < C2 - 1; c++) {
+          const v0 = f[r * C2 + c];            // oben links
+          const v1 = f[r * C2 + c + 1];        // oben rechts
+          const v2 = f[(r + 1) * C2 + c + 1];  // unten rechts
+          const v3 = f[(r + 1) * C2 + c];      // unten links
+          // Im Schatten ist margin < 0; die Null gehört zur Sonne, genau wie
+          // im Sweep (dort ist besonnt d >= 0).
+          const code = (v0 < 0 ? 8 : 0) | (v1 < 0 ? 4 : 0) | (v2 < 0 ? 2 : 0) | (v3 < 0 ? 1 : 0);
+          if (code === 0 || code === 15) continue;
+          /* Die Richtung ist überall dieselbe Regel: der Schatten liegt links
+           * der Laufrichtung (im Bildkoordinatensystem, y nach unten). Für
+           * eine einzelne Ecke im Schatten läuft die Strecke deshalb im
+           * Zyklus links -> oben -> rechts -> unten -> links weiter, für eine
+           * einzelne Ecke in der Sonne genau andersherum.
+           */
+          switch (code) {
+            case 8:  next.set(vEdge(r, c), hEdge(r, c)); break;
+            case 4:  next.set(hEdge(r, c), vEdge(r, c + 1)); break;
+            case 2:  next.set(vEdge(r, c + 1), hEdge(r + 1, c)); break;
+            case 1:  next.set(hEdge(r + 1, c), vEdge(r, c)); break;
+            case 7:  next.set(hEdge(r, c), vEdge(r, c)); break;
+            case 11: next.set(vEdge(r, c + 1), hEdge(r, c)); break;
+            case 13: next.set(hEdge(r + 1, c), vEdge(r, c + 1)); break;
+            case 14: next.set(vEdge(r, c), hEdge(r + 1, c)); break;
+            case 12: next.set(vEdge(r, c), vEdge(r, c + 1)); break;
+            case 6:  next.set(hEdge(r, c), hEdge(r + 1, c)); break;
+            case 3:  next.set(vEdge(r, c + 1), vEdge(r, c)); break;
+            case 9:  next.set(hEdge(r + 1, c), hEdge(r, c)); break;
+            case 10:
+              // Schatten oben links und unten rechts.
+              if (v0 + v1 + v2 + v3 < 0) {
+                next.set(vEdge(r, c + 1), hEdge(r, c));
+                next.set(vEdge(r, c), hEdge(r + 1, c));
+              } else {
+                next.set(vEdge(r, c), hEdge(r, c));
+                next.set(vEdge(r, c + 1), hEdge(r + 1, c));
+              }
+              break;
+            case 5:
+              // Schatten oben rechts und unten links.
+              if (v0 + v1 + v2 + v3 < 0) {
+                next.set(hEdge(r, c), vEdge(r, c));
+                next.set(hEdge(r + 1, c), vEdge(r, c + 1));
+              } else {
+                next.set(hEdge(r, c), vEdge(r, c + 1));
+                next.set(hEdge(r + 1, c), vEdge(r, c));
+              }
+              break;
+          }
+        }
+      }
+
+      const xy = [], starts = [];
+      const done = new Set();
+      for (const id of next.keys()) {
+        if (done.has(id)) continue;
+        starts.push(xy.length / 2);
+        let cur = id;
+        while (!done.has(cur)) {
+          done.add(cur);
+          const k = seen.get(cur);
+          // Den umgelegten Ring wieder abziehen: das Ergebnis zählt in Zellen
+          // des echten Ausschnitts.
+          xy.push(xs[k] - 1, ys[k] - 1);
+          cur = next.get(cur);
+        }
+      }
+      starts.push(xy.length / 2);
+      return { xy: Float32Array.from(xy), starts: Uint32Array.from(starts) };
+    }
+
+    /* Die Umrisse von Zellen in Meter setzen, an Ort und Stelle.
+     *
+     * Das ist dieselbe Rechnung, die `drawGrid` für das Rasterbild macht, nur
+     * je Punkt statt je Bild: Zeile 0 liegt im Norden, der Ursprung des
+     * Ausschnitts in seiner Südwestecke, und der Mittelpunkt der Zelle (0,0)
+     * liegt eine halbe Zelle davon entfernt. Gerechnet wird in die
+     * Kartenkoordinaten der Ansicht (Meter ab der Südwestecke des Modells),
+     * damit `tracePath` die Punkte ohne weitere Umrechnung nehmen kann.
+     */
+    function placeContours(xy, rows, cellsize, ox, oy) {
+      for (let i = 0; i < xy.length; i += 2) {
+        xy[i] = ox + (xy[i] + 0.5) * cellsize;
+        xy[i + 1] = oy + (rows - 0.5 - xy[i + 1]) * cellsize;
+      }
+      return xy;
     }
 
     // ------------------------------------------------------- Sonnenstunden
@@ -2202,9 +2487,25 @@
              */
             const edge = edgeCover(marg, heights, rows, cols);
             const cov = smoothShade(lit, heights, rows, cols);
+            /* Der Umriss dagegen nur auf Anfrage, und das ist der Unterschied
+             * zu den beiden Deckungsbildern: er kostet nicht ein Byte je
+             * Zelle, sondern eine Länge. Gemessen an einer nachgebauten Stadt
+             * aus 3,8 Millionen Zellen: 170 ms und 3,5 MB Punkte, wenn die
+             * Dächer glatt sind, und 780 ms und 12 MB, wenn jede Zelle für
+             * sich springt. Der Sweep davor kostet 90 ms. Wer die Karte als
+             * Bild anschaut, soll das nicht mitbezahlen.
+             *
+             * Gesetzt wird sofort in Kartenmeter. Umrechnen beim Zeichnen
+             * hieße, es in jedem Bildaufbau für jeden Punkt zu tun.
+             */
+            let iso = null;
+            if (req.iso) {
+              iso = isoContours(despeckleField(marg, heights, rows, cols), heights, rows, cols);
+              placeContours(iso.xy, rows, cs, spec.originE - hm.bounds[0], spec.originN - hm.bounds[1]);
+            }
             report(1);
             return {
-              lit: lit, cov: cov, edge: edge, heights: heights,
+              lit: lit, cov: cov, edge: edge, heights: heights, iso: iso,
               rows: rows, cols: cols, cellsize: cs, spec: spec
             };
           });
@@ -2352,11 +2653,17 @@
          */
         const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
         WORKER_ENGINE.shadow(msg, tell).then(r => {
+          const move = [r.lit.buffer, r.cov.buffer, r.edge.buffer, r.heights.buffer];
+          // Die Punkte des Umrisses gehen mit über die Fadengrenze, statt
+          // kopiert zu werden. Ohne die beiden Puffer in dieser Liste wandern
+          // bei einer verwinkelten Altstadt ein paar Megabyte durch den
+          // strukturierten Klon, und zwar bei jedem Schritt des Zeitschiebers.
+          if (r.iso) move.push(r.iso.xy.buffer, r.iso.starts.buffer);
           postMessage({
             type: 'shadow', token: msg.token, lit: r.lit, cov: r.cov, edge: r.edge,
-            heights: r.heights,
+            heights: r.heights, iso: r.iso,
             rows: r.rows, cols: r.cols, cellsize: r.cellsize, spec: r.spec
-          }, [r.lit.buffer, r.cov.buffer, r.edge.buffer, r.heights.buffer]);
+          }, move);
         }).catch(err => postMessage({ type: 'shadow', token: msg.token, error: String(err) }));
         return;
       }
@@ -2431,9 +2738,11 @@
         shadowShow:   'Anzeigen',
         viewCells:    'Zellen',
         viewEdge:     'Kante',
+        viewIso:      'Umriss',
         viewBlur:     'Weich',
         viewCellsHint: 'Jede gerechnete Zelle als Kästchen, ohne Zwischenwerte. Beim Hineinzoomen sieht man dadurch, wie fein wirklich gerechnet wurde.',
         viewEdgeHint: 'Die Kante wird aus dem Abstandsfeld gelesen, das der Schattenwurf ohnehin ausrechnet: wie viele Meter über oder unter der Schattenhöhe eine Zelle liegt. Der Übergang ist damit genau eine Zelle breit und liegt zwischen den Zellen richtig, statt über drei Zellen verschmiert. Das Innere bleibt unangetastet.',
+        viewIsoHint:  'Der Schatten als Umriss statt als Bild: gezeichnet wird die Nulllinie desselben Abstandsfeldes, aus dem auch die Kantenstufe kommt, aber als Vieleck. Die Kante bleibt deshalb bei jedem Maßstab scharf, während ein noch so fein gerechnetes Bild beim Hineinzoomen irgendwann seine Zellen zeigt. Einzeln stehende Zellen fallen vorher heraus, sonst umrandet die Linie das Gesprenkel über Bäumen und Böschungen.',
         viewBlurHint: 'Einzeln stehende Zellen fallen weg, danach wird weichgezeichnet. Ruhiger als die anderen beiden, verwischt dafür auch die Kante zwischen Hof und Gasse.',
         hoursHint:    'Wie lange die Sonne an diesem Tag jede Stelle erreicht. Das kostet einen Schattenwurf je Zeitschritt und dauert deshalb Sekunden.',
         hoursFar:     'Zum Rechnen der Sonnenstunden weiter hineinzoomen.',
@@ -2464,7 +2773,8 @@
         cellAuto:     'nach Bild',
         cellTooFine:  'In diesem Ausschnitt zu fein. Weiter hineinzoomen, dann geht es wieder; bei tiefer Sonne früher, weil der gerechnete Ausschnitt dann weit über das Bild hinausreicht.',
         cellFallback: 'Raster {c} m statt {w} m: {w} m wäre in diesem Ausschnitt zu fein.',
-        cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein.',
+        cellAutoCoarse: 'Raster {c} m: bei tiefer Sonne wird über ein Vielfaches des Bildes gerechnet, und feiner bliebe die Karte am Zeitschieber nicht mehr flüssig.',
+        cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein. Bei tiefer Sonne wird gröber gerechnet, weil der Ausschnitt dann weit über das Bild hinausreicht.',
         rampHint:     'Die fünf oberen sind wahrnehmungsgleichmäßig: gleiche Farbschritte sind gleiche Wertschritte. Die unteren geben ihren Kontrast ungleich aus und zeigen dafür mehr am dunklen Ende.',
         hoursLabel:   'Sonnenstunden am Tag',
         yearLabel:    'Sonnenstunden im Jahr',
@@ -2561,9 +2871,11 @@
         shadowShow:   'Show',
         viewCells:    'Cells',
         viewEdge:     'Edge',
+        viewIso:      'Outline',
         viewBlur:     'Blur',
         viewCellsHint: 'Every computed cell as a box, no intermediate values. Zooming in then shows how finely it was actually computed.',
         viewEdgeHint: 'The edge is read from the distance field the shadow cast produces anyway: how many metres above or below the shadow height a cell sits. The transition is then exactly one cell wide and sits correctly between cells, instead of being smeared across three. The interior is left alone.',
+        viewIsoHint:  'The shadow as an outline rather than an image: what gets drawn is the zero line of the same distance field the edge setting reads, but as a polygon. The edge therefore stays sharp at any scale, whereas an image, however finely computed, eventually shows its cells when you zoom in. Stray single cells drop out beforehand, or the line would trace the speckle over trees and embankments.',
         viewBlurHint: 'Stray single cells drop out, then the field is blurred. Calmer than the other two, but it smears the edge between courtyard and alley along with everything else.',
         hoursHint:    'How long the sun reaches each spot on this day. That costs one shadow cast per time step and therefore takes seconds.',
         hoursFar:     'Zoom in further to compute the hours of sun.',
@@ -2588,7 +2900,8 @@
         cellAuto:     'to fit',
         cellTooFine:  'Too fine for this view. Zoom in and it comes back; with a low sun that takes longer, because the computed area then reaches well beyond the image.',
         cellFallback: 'Cell size {c} m instead of {w} m: {w} m would be too fine for this view.',
-        cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value.',
+        cellAutoCoarse: 'Cell size {c} m: with a low sun the computed area is a multiple of the image, and anything finer would no longer keep up with the time slider.',
+        cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value. With a low sun it computes coarser, because the area then reaches well beyond the image.',
         rampHint:     'The top five are perceptually uniform: equal steps in colour are equal steps in value. The lower ones spend their contrast unevenly and show more at the dark end in return.',
         hoursLabel:   'Hours of sun, day',
         yearLabel:    'Hours of sun, year',
@@ -2787,6 +3100,23 @@
      * eine, die man gerade nicht wählen kann.
      */
     const MAX_SHADOW_CELLS = 12e6;
+
+    /* Und der Deckel für den automatischen Weg, der viel tiefer liegt.
+     *
+     * Er ist keine Notbremse wie der obige, sondern die Zahl, bei der die
+     * Karte am Zeitschieber noch flüssig bleibt: gemessen an einer nachgebauten
+     * Stadt kostet eine Karte aus 3,8 Millionen Zellen rund 90 ms Sweep und
+     * dazu zweimal 180 ms für die Deckungsbilder, und das Schattenbild ist
+     * dann eine Zeichenfläche mit 15 MB. Vier Millionen ist die Stelle, an der
+     * das noch zusammen unter einer halben Sekunde bleibt.
+     *
+     * Was er praktisch bedeutet, bei einem Meter je Bildschirmpixel: über
+     * etwa fünfzehn Grad Sonnenhöhe ändert er nichts, bei zehn Grad rechnet
+     * die Karte mit zwei Metern, bei fünf mit drei. Vergröbert wird in
+     * Schritten der Modellrasterweite und nicht in Verdopplungen, damit es
+     * die kleinste Vergröberung ist, die reicht.
+     */
+    const AUTO_SHADOW_CELLS = 4e6;
 
     /* Der Klient zum Modellmotor. Er versteckt, ob im Worker oder im
      * Hauptfaden gerechnet wird, und er hält zwei Zusagen, die zusammen das
@@ -3698,7 +4028,15 @@
        * Ausschnitt bei tiefer Sonne auch automatisch teuer werden kann, ist
        * eine ältere Grenze des Zuschlags und nicht die Sache dieses Reglers.
        */
-      const csAuto = model && model.ready && vw ? shadowCellsize(model.hm, vw.mPerPx, 0) : 0;
+      /* Die automatische Weite folgt dem Maßstab, aber nicht über den Deckel
+       * hinaus: bei tiefer Sonne ist der gerechnete Ausschnitt ein Vielfaches
+       * des Bildes, und dann ist "eine Zelle je Bildschirmpixel" eine Regel,
+       * die über das Bild spricht und die Fläche bezahlt.
+       */
+      const csAuto = model && model.ready && vw && tilesNeeded
+        ? fitCellsize(model.hm, vw.mPerPx, tilesNeeded.e1 - tilesNeeded.e0,
+                      tilesNeeded.n1 - tilesNeeded.n0, AUTO_SHADOW_CELLS)
+        : 0;
       const csFitsFor = cs => {
         if (!model || !model.ready || !vw) return true;
         return shadowCellsize(model.hm, vw.mPerPx, cs) >= csAuto ||
@@ -3738,6 +4076,21 @@
        */
       const stopBusy = () => { setShadow(null); setBusy(false); };
 
+      /* Der Umriss wird gerechnet, sobald ihn zum ersten Mal jemand sehen
+       * will, und danach weiter -- auch wenn zwischendurch eine andere Lesart
+       * eingestellt ist.
+       *
+       * Warum nicht einfach immer: er kostet je nach Stadt bis zum
+       * Achtfachen des Schattenwurfs selbst, und die drei Bildlesarten
+       * brauchen ihn nicht. Warum nicht genau dann, wenn er eingestellt ist:
+       * dann kostete jedes Hin und Her am Knopf einen vollen Schattenwurf,
+       * auch das Zurückschalten auf ein Bild, das längst daliegt. Einmal
+       * einschalten und mitlaufen lassen ist beides nicht: der erste Klick
+       * kostet eine Rechnung, jeder weitere nichts.
+       */
+      const [isoWanted, setIsoWanted] = useState(false);
+      useEffect(() => { if (viewBy.shadow === 'iso') setIsoWanted(true); }, [viewBy.shadow]);
+
       useEffect(() => {
         if (layer !== 'shadow') { stopBusy(); return; }
         if (!showLayer || !tilesNeeded || tooFar || !model || !model.ready) { stopBusy(); return; }
@@ -3752,10 +4105,13 @@
          * die Arbeit, sie zu verwerfen.
          */
         const timer = setTimeout(() => {
-          const cs = shadowCellsize(model.hm, vw.mPerPx, shadowCsUsed);
+          // Ohne eigene Wahl gilt die gedeckelte automatische Weite, nicht die
+          // rohe Regel "eine Zelle je Bildschirmpixel".
+          const cs = shadowCsUsed ? shadowCellsize(model.hm, vw.mPerPx, shadowCsUsed) : csAuto;
           model.client.ask('shadow', {
             e0: tilesNeeded.e0, n0: tilesNeeded.n0, e1: tilesNeeded.e1, n1: tilesNeeded.n1,
-            cellsize: cs, az: sun.az, elev: sun.elev, mode: mode, eyeHeight: eye
+            cellsize: cs, az: sun.az, elev: sun.elev, mode: mode, eyeHeight: eye,
+            iso: isoWanted
           }, p => { if (alive) setProgress(p); }).then(r => {
             // Überholt heißt: eine neuere Anfrage läuft schon, also bleibt die
             // Anzeige auf "wird gerechnet" stehen und wartet auf die.
@@ -3765,7 +4121,7 @@
           });
         }, 140);
         return () => { alive = false; clearTimeout(timer); };
-      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw, shadowCsUsed, eye]);
+      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw, shadowCsUsed, csAuto, eye, isoWanted]);
 
       // ---------------------------------------------- Sonnenstundenkarte rechnen
 
@@ -3872,9 +4228,18 @@
        * Schatten selbst nichts geändert hatte. Beim Verschieben und Zoomen wird
        * dasselbe Bild einfach an eine andere Stelle skaliert.
        */
+      /* Bis der erste Umriss da ist, bleibt die Kantenstufe stehen. Der erste
+       * Klick auf "Umriss" kostet eine Rechnung, und in dieser Zeit wäre die
+       * Karte sonst leer -- das sähe aus, als hätte der Knopf den Schatten
+       * abgeschaltet.
+       */
+      const shadowView = viewBy.shadow === 'iso' && !(shadow && shadow.iso) ? 'edge' : viewBy.shadow;
+
       const shadowBitmap = useMemo(
-        () => (shadow ? shadowCanvas(shadow, colors, viewBy.shadow) : null),
-        [shadow, colors, viewBy.shadow]
+        // Beim Umriss gibt es kein Bild zu bauen, und der Durchlauf über ein
+        // paar Millionen Pixel ist gespart.
+        () => (shadow && shadowView !== 'iso' ? shadowCanvas(shadow, colors, shadowView) : null),
+        [shadow, colors, shadowView]
       );
 
       const ramp = useMemo(() => hoursRamp(rampId), [rampId]);
@@ -3945,6 +4310,36 @@
           ctx.imageSmoothingEnabled = true;
         };
 
+        /* Der Umriss geht nicht durch drawGrid, weil er kein Bild ist: er wird
+         * in Bildkoordinaten gezeichnet und nicht in Bildkoordinaten gezogen.
+         * Das ist der ganze Unterschied, um den es bei dieser Lesart geht --
+         * ein Rasterbild wird beim Hineinzoomen unweigerlich zu Kästchen oder
+         * zu einer Rampe, ein Vieleck bleibt eine Kante.
+         *
+         * Alle Ringe kommen in einen einzigen Pfad, und gefüllt wird mit der
+         * Voreinstellung `nonzero`. Daran hängt es, dass ein Hof mitten im
+         * verschatteten Häuserblock hell bleibt: die Konturierung lässt Löcher
+         * andersherum umlaufen als Außenränder, und diese Füllregel ist die,
+         * die das versteht. Als getrennte Pfade gezeichnet legte sich jedes
+         * Loch als zweite Schicht über seinen Block.
+         *
+         * `tracePath` dünnt dabei mit derselben Regel aus wie bei Häusern und
+         * Straßen: zwei Punkte näher als ein Dreiviertelpixel sind im Bild ein
+         * Punkt. Bei weitem Ausschnitt fällt damit der Großteil der Kontur weg,
+         * und genau dort gäbe es sonst am meisten davon.
+         */
+        const drawIso = (g) => {
+          const iso = g && g.iso;
+          if (!iso || !iso.starts || iso.starts.length < 2) return;
+          ctx.beginPath();
+          for (let k = 0; k + 1 < iso.starts.length; k++) {
+            tracePath(ctx, iso.xy.subarray(iso.starts[k] * 2, iso.starts[k + 1] * 2), vw, true);
+          }
+          const [sr, sg, sb, sa] = colors.shadow;
+          ctx.fillStyle = 'rgba(' + sr + ',' + sg + ',' + sb + ',' + sa + ')';
+          ctx.fill();
+        };
+
         if (layer !== 'shadow' && hoursBitmap && showLayer) drawGrid(hoursBitmap, hours);
 
         /* Die zweite Hälfte der Glättung steckt in drawGrid und kostet nichts:
@@ -3953,7 +4348,10 @@
          * folgen; hart heißt, die Zelle als Kästchen zu zeigen, was beim
          * Hineinzoomen ehrlicher ist, weil die Rasterweite dann sichtbar wird.
          */
-        if (layer === 'shadow' && shadowBitmap && showLayer) drawGrid(shadowBitmap, shadow);
+        if (layer === 'shadow' && shadow && showLayer) {
+          if (shadowView === 'iso') drawIso(shadow);
+          else if (shadowBitmap) drawGrid(shadowBitmap, shadow);
+        }
 
         if (model.base.labels && showLabels) drawLabels(ctx, vw, model.base.labels, colors);
 
@@ -4236,6 +4634,13 @@
       // ------------------------------------------------------------- Ausgabe
 
       const bar = scaleBar(view.mPerPx, Math.min(160, size.w * 0.3));
+
+      // Nachschlagen statt einer Kette von Fragezeichen: bei drei Lesarten war
+      // die noch zu lesen, bei vier steht der letzte Fall ohne eigene Bedingung
+      // da und bekommt stillschweigend alles ab, was sonst durchfällt.
+      const VIEW_LABEL = { cells: t.viewCells, edge: t.viewEdge, iso: t.viewIso, blur: t.viewBlur };
+      const VIEW_HINT = { cells: t.viewCellsHint, edge: t.viewEdgeHint, iso: t.viewIsoHint, blur: t.viewBlurHint };
+
       const loadingText = stage === 'ready' ? null
         : stage === 'nomodel' ? t.mapNoModel
         : t.mapLoading + ' ' + '·' + ' ' + (stage === 'base' ? t.mapLoadBase : stage === 'buildings' ? t.mapLoadBuild : t.mapLoadModel);
@@ -4259,6 +4664,14 @@
         // stammen, in dem die Wahl noch getragen hat.
         : (layer === 'shadow' && !csFits && shadow && shadow.cellsize !== shadowCs)
           ? t.cellFallback.replace(/\{c\}/g, String(shadow.cellsize)).replace(/\{w\}/g, String(shadowCs))
+        /* Und dasselbe für den automatischen Weg, der nicht ablehnt, sondern
+         * vergröbert. Ohne die Zeile stünde am Abend wortlos eine gröbere
+         * Karte da als am Mittag, und der Unterschied sähe nach einem Fehler
+         * im Modell aus statt nach einer Entscheidung über die Rechenzeit.
+         */
+        : (layer === 'shadow' && shadowCs === 0 && shadow && model && vw
+            && shadow.cellsize > shadowCellsize(model.hm, vw.mPerPx, 0))
+          ? t.cellAutoCoarse.replace(/\{c\}/g, String(shadow.cellsize))
         : null;
 
       /* Die beiden Ansichten sind Reiter und keine Ebenen, weil sie sich
@@ -4300,16 +4713,16 @@
                         title=${t.labelsHint}
                         onClick=${() => setShowLabels(s => !s)}>${t.labelsLabel}<//>
               <//>
-              <!-- Eine eigene Gruppe, weil es drei Lesarten desselben Bildes
-                   sind und keine drei unabhängigen Schalter. Die Kantenstufe
-                   gibt es nur beim Schatten: die Stundenkarten sind schon
-                   stetig, dort gibt es keine Kante zu verorten. -->
+              <!-- Eine eigene Gruppe, weil es Lesarten desselben Bildes sind
+                   und keine unabhängigen Schalter. Kante und Umriss gibt es
+                   nur beim Schatten: die Stundenkarten sind schon stetig,
+                   dort gibt es keine Kante zu verorten. -->
               <div className="rs-map-group">
-                ${(layer === 'shadow' ? ['cells', 'edge', 'blur'] : ['cells', 'blur']).map(v => html`
+                ${(layer === 'shadow' ? ['cells', 'edge', 'iso', 'blur'] : ['cells', 'blur']).map(v => html`
                   <button key=${'vw' + v} className=${'lang-seg' + (viewBy[layer] === v ? ' active' : '')}
-                          title=${v === 'cells' ? t.viewCellsHint : v === 'edge' ? t.viewEdgeHint : t.viewBlurHint}
+                          title=${VIEW_HINT[v]}
                           onClick=${() => setViewBy(s => Object.assign({}, s, { [layer]: v }))}>
-                    ${v === 'cells' ? t.viewCells : v === 'edge' ? t.viewEdge : t.viewBlur}
+                    ${VIEW_LABEL[v]}
                   <//>`)}
               <//>
               <div className="rs-map-group">
