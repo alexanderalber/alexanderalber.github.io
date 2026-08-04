@@ -10,11 +10,21 @@
  * API (two layers, contract 5):
  *   decodeLine(logits, T, C, i2w)         -> token events with spans + confs
  *   lineFragment(events, staff)           -> IR elements for one line
- *   assembleIR(lines, pages, generator)   -> the IR object for one score
+ *   assembleIR(lines, pages, generator, rejection)
+ *                                         -> the IR object for one score
  *   i2wFromVocab(vocabTokens)             -> index map (class 0 = CTC blank)
+ *
+ * `rejection` is the verdict of omr-reject.js::decide(), passed in because it
+ * needs the grey page, which this layer never sees. It stays the only source
+ * of `rejected` -- please do not compute a second opinion in the frontend.
+ * Omitting it keeps the v1.1 behaviour (`rejected: false`).
  */
 
-export const IR_VERSION = "1.1";
+/* 1.2: `rejected` gets a real producer (omr-reject.js), `scan-suspected`
+ * changed from a rejection reason to a warning, warnings carry `page`, and
+ * `line-truncated` moved here from the site repo's worker. Additive fields,
+ * but the MEANING of scan-suspected moved -- hence the bump. */
+export const IR_VERSION = "1.2";
 export const WIDTH_REDUCTION = 4;
 export const DIV_WHOLE = 192;
 
@@ -166,7 +176,10 @@ function classify(record) {
     } else if (first.startsWith("*k[")) {
       const inner = first.slice(3, -1);
       const sharps = (inner.match(/#/g) || []).length;
-      el.keyFifths = sharps || -(inner.match(/-/g) || []).length;
+      /* v1.2: `sharps || -flats` yields -0 for C major, which only becomes
+       * 0 on a JSON roundtrip. Normalised here so the field is 0 in the
+       * object too, not just in the serialisation. */
+      el.keyFifths = (sharps || -(inner.match(/-/g) || []).length) + 0;
     } else if (first.startsWith("*M")) {
       const [num, den] = first.slice(2).split("/");
       el.time = { num: parseInt(num, 10), den: parseInt(den, 10) };
@@ -225,8 +238,14 @@ export function lineFragment(tokenEvents, staff) {
   return out;
 }
 
+/* Most common value; on a tie the LARGER one wins (v1.2). `modal` decides how
+ * many parts exist, and a line with staffIndex >= modal is dropped from the IR
+ * entirely -- so the smaller count deletes a voice in silence, while the
+ * larger one merely raises staff-count-mismatch on the short systems. A lost
+ * voice is the most expensive error this project knows; a warning is the
+ * cheapest. */
 function modal(values) {
-  const uniq = [...new Set(values)].sort((a, b) => a - b);
+  const uniq = [...new Set(values)].sort((a, b) => b - a);
   let best = 0, n = 0;
   for (const v of uniq) {
     const c = values.filter((x) => x === v).length;
@@ -264,21 +283,33 @@ function systemsOf(lines) {
   return out;
 }
 
-export function assembleIR(lines, pages, generator = "omr-decode.js") {
+export function assembleIR(lines, pages, generator = "omr-decode.js",
+                           rejection = null) {
+  /* v1.2: keyed by page AND system. System indices restart at 0 on every
+   * page, so the v1.1 counting folded system n of page 1 together with system
+   * n of page 2 -- invisible on a one-page score, simply wrong on a
+   * multi-page one. */
   const counts = new Map();
   for (const ln of lines) {
     const s = ln.staff;
-    counts.set(s.system, Math.max(counts.get(s.system) ?? 0, s.staffIndex + 1));
+    const key = `${s.page}/${s.system}`;
+    counts.set(key, Math.max(counts.get(key) ?? 0, s.staffIndex + 1));
   }
   const m = counts.size ? modal([...counts.values()]) : 0;
 
   const warnings = [];
-  for (const sysno of [...counts.keys()].sort((a, b) => a - b)) {
-    const n = counts.get(sysno);
+  const keys = [...counts.keys()].sort((a, b) => {
+    const [pa, sa] = a.split("/").map(Number);
+    const [pb, sb] = b.split("/").map(Number);
+    return pa - pb || sa - sb;
+  });
+  for (const key of keys) {
+    const [page, sysno] = key.split("/").map(Number);
+    const n = counts.get(key);
     if (n !== m) {
-      warnings.push({ code: "staff-count-mismatch", system: sysno,
-                      message: `System ${sysno}: ${n} Zeilen erkannt, ` +
-                               `Struktur sagt ${m}` });
+      warnings.push({ code: "staff-count-mismatch", page, system: sysno,
+                      message: `Seite ${page}, System ${sysno}: ` +
+                               `${n} Zeilen erkannt, Struktur sagt ${m}` });
     }
   }
 
@@ -300,11 +331,22 @@ export function assembleIR(lines, pages, generator = "omr-decode.js") {
   for (const ln of lines) {
     const st = ln.staff;
     const p = st.staffIndex;
+    /* v1.2: the preprocessing reports `truncated` per line (MAX_WIDTH); until
+     * now the site repo's worker appended this code after the fact. The
+     * namespace keeps one source, so it is emitted here. */
+    if (st.truncated) {
+      warnings.push({ code: "line-truncated", page: st.page,
+                      system: st.system, staff: p,
+                      message: `Seite ${st.page}, System ${st.system}, `
+                        + `Zeile ${p}: rechts abgeschnitten (MAX_WIDTH) -- `
+                        + `was dahinter steht, wurde nicht gelesen` });
+    }
     if (p >= m) continue;
     for (const el of ln.elements) {
       if (el.kind === "unparseable") {
-        warnings.push({ code: "unparseable-tokens", system: st.system,
-                        staff: p, message: el.tokens.join(" ") });
+        warnings.push({ code: "unparseable-tokens", page: st.page,
+                        system: st.system, staff: p,
+                        message: el.tokens.join(" ") });
         continue;
       }
       if (el.kind === "attribute") {
@@ -337,14 +379,20 @@ export function assembleIR(lines, pages, generator = "omr-decode.js") {
     }
   }
 
+  /* The rejection reasons come first: they explain the page as a whole,
+   * while the decode warnings explain single spots on it. */
+  const allWarnings = rejection ? [...(rejection.warnings ?? []), ...warnings]
+                                : warnings;
+
   return {
     irVersion: IR_VERSION,
     generator: { model: "omr-2026-08", decoder: generator },
-    rejected: false,
+    rejected: rejection ? Boolean(rejection.rejected) : false,
+    rejectionReason: rejection ? rejection.reason : null,
     source: { pages },
     structure: { recognized: structure, confirmed: null },
     systems: systemsOf(lines),
     parts,
-    warnings,
+    warnings: allWarnings,
   };
 }

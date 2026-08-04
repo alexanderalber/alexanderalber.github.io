@@ -1,23 +1,27 @@
 /* omr-worker.js -- recognition worker for sheet-to-midi.
  *
- * Module worker. Pipeline per page:
- *   RGBA page bitmap -> grayscale (PIL convert("L") semantics, see below)
- *   -> preprocessPage (omr-preprocess.js: staff detection + normalisation)
- *   -> ONNX line model (onnxruntime-web, WASM EP, single-threaded: GitHub
- *      Pages cannot send COOP/COEP, so no SharedArrayBuffer)
- *   -> decodeLine / lineFragment / assembleIR (omr-decode.js) -> Score-IR.
+ * Module worker. Two passes over the pages:
+ *   1. RGBA -> grayscale (PIL convert("L") semantics, see below) -> pageStats
+ *      + detect (omr-reject.js / omr-preprocess.js) -> decide(): is this a
+ *      scan, is this closed score? A rejected score stops here, before the
+ *      model is fetched.
+ *   2. grayscale -> preprocessPage (staff detection + normalisation)
+ *      -> ONNX line model (onnxruntime-web, WASM EP, single-threaded: GitHub
+ *         Pages cannot send COOP/COEP, so no SharedArrayBuffer)
+ *      -> decodeLine / lineFragment / assembleIR (omr-decode.js) -> Score-IR.
  *
  * Messages in:
  *   { type: "recognize", pages: [{ data: ArrayBuffer(RGBA), width, height, dpi }] }
  *   { type: "cancel" }
  * Messages out:
- *   { type: "progress", stage: "model" | "page" | "line", ...counts }
+ *   { type: "progress", stage: "detect" | "model" | "page" | "line", ...counts }
  *   { type: "result", ir }
  *   { type: "error", code, message }
  */
 
 import { decodeLine, lineFragment, assembleIR, i2wFromVocab, IR_VERSION }
   from "./omr-decode.js";
+import { pageStats, decide } from "./omr-reject.js";
 
 const MODEL_URL = "/assets/files/omr/omr-2026-08/omr-2026-08.fp16.onnx";
 const VOCAB_URL = "/assets/files/omr/omr-2026-08/vocab-2026-08.json";
@@ -103,21 +107,47 @@ async function recognize(msg) {
     return;
   }
 
-  const { ort, session, i2w, C } = await ensureModel();
+  const pagesMeta = msg.pages.map((p, i) => ({
+    index: i, widthPx: p.width, heightPx: p.height, dpi: p.dpi }));
+  const grayOf = (page) => pre.grayFromBytes(
+    lumaFromRgba(new Uint8ClampedArray(page.data), page.width * page.height),
+    page.width * page.height);
 
-  const lines = [];
-  const pagesMeta = [];
-  const extraWarnings = [];
+  /* Pass 1: the verdict, before the model is fetched. decide() is the only
+   * producer of `rejected` (no second heuristic here, by agreement with the
+   * model repo); it needs every page, so a rejected score would otherwise cost
+   * the user a 6 MB download plus minutes of inference for nothing. The
+   * grayscale and the detection are recomputed in pass 2 rather than kept: a
+   * page of float32 grey is 25 MB, and the recomputation costs seconds where
+   * the model costs minutes. */
+  const stats = [];
+  const staffCounts = [];
   for (let pi = 0; pi < msg.pages.length; pi++) {
     if (cancelled) return;
     const page = msg.pages[pi];
-    pagesMeta.push({ index: pi, widthPx: page.width, heightPx: page.height, dpi: page.dpi });
+    post({ type: "progress", stage: "detect", page: pi, pages: msg.pages.length });
+    const gray = grayOf(page);
+    stats.push(pageStats(gray, page.width, page.height));
+    for (const sys of pre.detect(gray, page.width, page.height).systems) {
+      staffCounts.push(sys.length);
+    }
+  }
+  const verdict = decide(stats, staffCounts);
+  if (verdict.rejected) {
+    post({ type: "result",
+           ir: assembleIR([], pagesMeta, "omr-decode.js " + IR_VERSION, verdict) });
+    return;
+  }
+
+  const { ort, session, i2w, C } = await ensureModel();
+
+  const lines = [];
+  for (let pi = 0; pi < msg.pages.length; pi++) {
+    if (cancelled) return;
+    const page = msg.pages[pi];
     post({ type: "progress", stage: "page", page: pi, pages: msg.pages.length });
 
-    const n = page.width * page.height;
-    const gray = pre.grayFromBytes(
-      lumaFromRgba(new Uint8ClampedArray(page.data), n), n);
-    const { inputs } = pre.preprocessPage(gray, page.width, page.height);
+    const { inputs } = pre.preprocessPage(grayOf(page), page.width, page.height);
 
     for (let ti = 0; ti < inputs.length; ti++) {
       if (cancelled) return;
@@ -136,23 +166,17 @@ async function recognize(msg) {
         bbox: [box.x, box.y, box.w, box.h],
         lineSpacingPx: box.lineSpacing,
         normSpacing: pre.TARGET_SPACING,
+        /* v1.2: assembleIR emits line-truncated itself, from this field. */
+        truncated: input.truncated,
       };
-      if (input.truncated) {
-        extraWarnings.push({ code: "line-truncated", system: box.system,
-                             staff: box.voice,
-                             message: `Page ${pi + 1}, system ${box.system + 1}, ` +
-                                      `staff ${box.voice + 1}: line wider than the ` +
-                                      `model window, right edge not read` });
-      }
       lines.push({ staff, elements: lineFragment(events, staff) });
       post({ type: "progress", stage: "line", page: pi, line: ti + 1,
              lines: inputs.length });
     }
   }
 
-  const ir = assembleIR(lines, pagesMeta, "omr-decode.js " + IR_VERSION);
-  ir.warnings.push(...extraWarnings);
-  post({ type: "result", ir });
+  post({ type: "result",
+         ir: assembleIR(lines, pagesMeta, "omr-decode.js " + IR_VERSION, verdict) });
 }
 
 self.onmessage = (ev) => {
