@@ -1386,15 +1386,24 @@
       };
     }
 
-    /* Wie fein die Schattenkarte gerechnet wird. Sie soll die Bildschirmzelle
-     * treffen und nicht feiner sein als nötig: unter der Pixelgröße kostet jede
-     * Halbierung das Vierfache und ändert am sichtbaren Bild nichts. Nach unten
-     * begrenzt das Raster selbst, nach oben die Erkennbarkeit einer Häuserzeile.
+    /* Wie fein die Schattenkarte gerechnet wird. Ohne Vorgabe soll sie die
+     * Bildschirmzelle treffen und nicht feiner sein als nötig: unter der
+     * Pixelgröße kostet jede Halbierung das Vierfache und ändert am sichtbaren
+     * Bild nichts. Nach unten begrenzt das Raster selbst, nach oben die
+     * Erkennbarkeit einer Häuserzeile.
+     *
+     * `meters` überstimmt das. Das ist kein Widerspruch zur Regel oben, sondern
+     * ihre andere Hälfte: automatisch heißt "so fein wie das Bild", von Hand
+     * heißt "so fein wie die Frage". Wer wissen will, ob die Sonne in den Hof
+     * fällt, will einen Meter auch dann, wenn er weit genug herausgezoomt hat,
+     * dass vier reichen würden. Die Schranken bleiben in beiden Fällen
+     * dieselben, weil feiner als das Modell Auflösung erfindet und gröber als
+     * acht Meter eine Häuserzeile verschluckt.
      */
-    function shadowCellsize(hm, mPerPx) {
+    function shadowCellsize(hm, mPerPx, meters) {
       const base = hm.ndom.cellsize;
-      const raw = Math.max(base, mPerPx);
-      return Math.min(8 * base, Math.round(raw / base) * base);
+      const raw = meters ? meters : Math.max(base, mPerPx);
+      return Math.min(8 * base, Math.max(base, Math.round(raw / base) * base));
     }
 
     /* Aus der Ja-Nein-Karte ein Deckungsbild machen: je Zelle, wie viel von
@@ -1777,6 +1786,90 @@
         Math.round(a[2] + (b[2] - a[2]) * f),
         Math.round(a[3] + (b[3] - a[3]) * f)
       ];
+    }
+
+    // ------------------------------------------------ Detailstufen fürs Malen
+
+    /* Warum es das gibt. Die Basiskarte ist für die Altstadt gemacht, und dort
+     * ist sie richtig: 70.960 Gebäude mit 423.980 Punkten, 15.475 Straßen mit
+     * 53.760, dazu 3.455 Grünflächen. In der Altstadt liegt davon ein Bruchteil
+     * im Bild. Zieht man auf die ganze Stadt heraus, liegt alles im Bild, und
+     * dann schreibt jedes Neuzeichnen eine halbe Million Pfadbefehle -- für ein
+     * Bild, in dem ein Haus zwei Pixel breit ist. Das ist kein Grund, das
+     * Herauszoomen zu verbieten; es ist ein Grund, weniger zu zeichnen.
+     *
+     * Die Regel ist überall dieselbe und hängt nur an der Bildgröße des Dings,
+     * nicht am Maßstab: was man nicht sehen kann, wird nicht gezeichnet.
+     */
+
+    // Kleiner als das in beiden Richtungen: fällt ganz weg. Eineinhalb Pixel
+    // sind ein Fleck, und ein Fleck weniger fällt in einer Stadt aus Flecken
+    // niemandem auf.
+    const LOD_MIN_PX = 1.5;
+    // Kleiner als das: als Rechteck statt als Umriss. Ein Haus von vier Pixeln
+    // hat keine erkennbare Form mehr, nur noch eine Lage und eine Größe, und
+    // die kann sein umschließendes Rechteck genauso gut.
+    const LOD_BOX_PX = 4;
+    // Zwei Punkte, die im Bild näher beieinander liegen: der zweite fällt weg.
+    // Das ist der Schritt ohne jeden Preis -- er ändert am Bild nichts, weil
+    // die Strecke dazwischen kürzer ist als ein Pixel.
+    const LOD_STEP_PX = 0.75;
+
+    /* Nebenstraßen ab diesem Maßstab weglassen. Ihre Strichbreite steht bei
+     * 2,6 m ohnehin schon seit 3,7 m/px auf dem Mindestwert, ab da wird die
+     * Karte mit jedem Schritt nach außen nur dichter und nicht genauer. Weg
+     * fällt die ganze Klasse und nicht die kurze Straße: einzelne Stücke
+     * wegzulassen risse Löcher mitten in Straßenzüge, weil die Daten eine
+     * Straße in Abschnitte je Kreuzung zerlegen.
+     */
+    const LOD_MINOR_ROAD_MPP = 8;
+
+    function roadVisible(cls, mPerPx) { return cls < 2 || mPerPx < LOD_MINOR_ROAD_MPP; }
+
+    /* 0 = gar nicht zeichnen, 1 = als Rechteck, 2 = ausführlich. Die Prüfung
+     * fragt nach "in beiden Richtungen klein" und nicht nach der Fläche: ein
+     * langer schmaler Streifen ist im Bild eine Linie und keine Fläche, und
+     * verschwände unter einer Flächenschwelle, obwohl man ihn sieht.
+     */
+    function lodLevel(box, mPerPx) {
+      const w = (box[2] - box[0]) / mPerPx, h = (box[3] - box[1]) / mPerPx;
+      if (w < LOD_MIN_PX && h < LOD_MIN_PX) return 0;
+      if (w < LOD_BOX_PX && h < LOD_BOX_PX) return 1;
+      return 2;
+    }
+
+    /* Einen Linienzug in den Pfad schreiben und dabei ausdünnen.
+     *
+     * `ctx` wird nur über moveTo/lineTo/closePath angefasst, deshalb kann der
+     * Test einen Mitschreiber hineinreichen statt einer Zeichenfläche.
+     *
+     * Der letzte Punkt bleibt immer stehen, auch wenn er nah am vorigen liegt:
+     * ohne ihn endete eine Straße vor ihrer Kreuzung, und ein Ring schlösse
+     * sich an der falschen Stelle. Gibt die Zahl der geschriebenen Punkte
+     * zurück, damit der Test das Ausdünnen messen kann.
+     */
+    function tracePath(ctx, pts, view, closed) {
+      const n = pts.length;
+      if (n < 4) return 0;
+      let lx = view.sx(pts[0]), ly = view.sy(pts[1]);
+      ctx.moveTo(lx, ly);
+      let drawn = 1;
+      for (let i = 2; i < n; i += 2) {
+        const x = view.sx(pts[i]), y = view.sy(pts[i + 1]);
+        if (i < n - 2 && Math.abs(x - lx) < LOD_STEP_PX && Math.abs(y - ly) < LOD_STEP_PX) continue;
+        ctx.lineTo(x, y);
+        lx = x; ly = y; drawn++;
+      }
+      if (closed) ctx.closePath();
+      return drawn;
+    }
+
+    // Ein Ding durch sein Rechteck vertreten. Mindestens einen Dreiviertelpixel
+    // groß, sonst fiele es beim Rastern zwischen die Pixel und das Haus wäre
+    // gar nicht da.
+    function traceBox(ctx, box, view) {
+      const w = (box[2] - box[0]) / view.mPerPx, h = (box[3] - box[1]) / view.mPerPx;
+      ctx.rect(view.sx(box[0]), view.sy(box[3]), Math.max(0.75, w), Math.max(0.75, h));
     }
   </script>
 
@@ -2225,6 +2318,10 @@
         optRamp:      'Farbskala',
         optRun:       'Rechnen',
         spaceHint:    'Kantenlänge einer gerechneten Zelle. Doppelt so grob ist ein Viertel der Rechenzeit, verliert aber die schmalen Höfe und Gassen. Ein Meter ist die Rasterweite des Modells selbst, feiner geht nicht.',
+        cellAuto:     'nach Bild',
+        cellTooFine:  'In diesem Ausschnitt zu fein. Weiter hineinzoomen, dann geht es wieder; bei tiefer Sonne früher, weil der gerechnete Ausschnitt dann weit über das Bild hinausreicht.',
+        cellFallback: 'Raster {c} m statt {w} m: {w} m wäre in diesem Ausschnitt zu fein.',
+        cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein.',
         rampHint:     'Die fünf oberen sind wahrnehmungsgleichmäßig: gleiche Farbschritte sind gleiche Wertschritte. Die unteren geben ihren Kontrast ungleich aus und zeigen dafür mehr am dunklen Ende.',
         hoursLabel:   'Sonnenstunden am Tag',
         yearLabel:    'Sonnenstunden im Jahr',
@@ -2337,6 +2434,10 @@
         optRamp:      'Colour scale',
         optRun:       'Compute',
         spaceHint:    'Edge length of one computed cell. Twice as coarse is a quarter of the time, but loses the narrow courtyards and alleys. One metre is the raster of the model itself, and nothing finer exists.',
+        cellAuto:     'to fit',
+        cellTooFine:  'Too fine for this view. Zoom in and it comes back; with a low sun that takes longer, because the computed area then reaches well beyond the image.',
+        cellFallback: 'Cell size {c} m instead of {w} m: {w} m would be too fine for this view.',
+        cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value.',
         rampHint:     'The top five are perceptually uniform: equal steps in colour are equal steps in value. The lower ones spend their contrast unevenly and show more at the dark end in return.',
         hoursLabel:   'Hours of sun, day',
         yearLabel:    'Hours of sun, year',
@@ -2515,6 +2616,19 @@
     // hier gut 5 MB im schlimmsten Fall. Das ist die Grenze zwischen "kurz
     // warten" und "die halbe Stadt laden, weil jemand herausgezoomt hat".
     const MAX_TILES = 36;
+
+    /* Und wie viele Zellen eine einzelne Schattenkarte höchstens haben darf.
+     * Solange die Rasterweite dem Maßstab folgte, brauchte es die Zahl nicht:
+     * eine Zelle war ungefähr ein Bildschirmpixel, und mehr Pixel als der
+     * Bildschirm hat kann ein Ausschnitt nicht bekommen. Mit einer festen
+     * Rasterweite ist das vorbei -- ein Meter über einen Ausschnitt, der bei
+     * tiefer Sonne mitsamt Zuschlag vier Kilometer breit ist, sind zwanzig
+     * Millionen Zellen und allein achtzig Megabyte Höhen. Die zu feinen Stufen
+     * werden deshalb nicht stillschweigend vergröbert, sondern abgeschaltet:
+     * eine Einstellung, die etwas anderes tut als sie sagt, ist schlimmer als
+     * eine, die man gerade nicht wählen kann.
+     */
+    const MAX_SHADOW_CELLS = 12e6;
 
     /* Der Klient zum Modellmotor. Er versteckt, ob im Worker oder im
      * Hauptfaden gerechnet wird, und er hält zwei Zusagen, die zusammen das
@@ -2832,15 +2946,23 @@
 
     // ------------------------------------------------------------- Zeichnen
 
+    /* Die drei Malfunktionen gehen alle über `lodLevel` und `tracePath` aus
+     * mapcore. Was dort steht, gilt hier: was im Bild kleiner ist als ein paar
+     * Pixel, wird vereinfacht oder weggelassen, und zwar nach seiner Bildgröße
+     * und nicht nach dem Maßstab.
+     */
+
     function drawPolys(ctx, view, polys, fill) {
       ctx.fillStyle = fill;
       ctx.beginPath();
       for (const p of polys) {
-        for (const ring of p.rings) {
-          ctx.moveTo(view.sx(ring[0]), view.sy(ring[1]));
-          for (let i = 2; i < ring.length; i += 2) ctx.lineTo(view.sx(ring[i]), view.sy(ring[i + 1]));
-          ctx.closePath();
-        }
+        const lod = lodLevel(p.box, view.mPerPx);
+        if (lod === 0) continue;
+        // Ein Ding, das als Rechteck durchgeht, wird ganz durch sein Rechteck
+        // vertreten, samt seiner Löcher. Ein Loch in einer Fläche von drei
+        // Pixeln ist kein Loch mehr.
+        if (lod === 1) { traceBox(ctx, p.box, view); continue; }
+        for (const ring of p.rings) tracePath(ctx, ring, view, true);
       }
       // evenodd, damit die Löcher Löcher bleiben. Die Donau durch die Altstadt
       // hat zwei davon, und sie heißen Oberer und Unterer Wöhrd.
@@ -2850,15 +2972,18 @@
     function drawRoads(ctx, view, roads, colors) {
       const widths = [7, 4.5, 2.6];
       for (let cls = 0; cls < 3; cls++) {
+        if (!roadVisible(cls, view.mPerPx)) continue;
         ctx.strokeStyle = colors.road[cls];
         ctx.lineWidth = Math.max(0.7, widths[cls] / view.mPerPx);
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.beginPath();
         for (const r of roads) {
-          if (r.cls !== cls) continue;
-          ctx.moveTo(view.sx(r.pts[0]), view.sy(r.pts[1]));
-          for (let i = 2; i < r.pts.length; i += 2) ctx.lineTo(view.sx(r.pts[i]), view.sy(r.pts[i + 1]));
+          // Eine Straße wird nicht durch ihr Rechteck vertreten: ein Strich hat
+          // keine Fläche, und das Rechteck stünde quer zu ihm. Zu klein heißt
+          // hier deshalb weg, ausgedünnt wird sie sonst.
+          if (r.cls !== cls || lodLevel(r.box, view.mPerPx) === 0) continue;
+          tracePath(ctx, r.pts, view, false);
         }
         ctx.stroke();
       }
@@ -2868,11 +2993,10 @@
       ctx.fillStyle = colors.building;
       ctx.beginPath();
       for (const b of items) {
-        for (const ring of b.rings) {
-          ctx.moveTo(view.sx(ring[0]), view.sy(ring[1]));
-          for (let i = 2; i < ring.length; i += 2) ctx.lineTo(view.sx(ring[i]), view.sy(ring[i + 1]));
-          ctx.closePath();
-        }
+        const lod = lodLevel(b.box, view.mPerPx);
+        if (lod === 0) continue;
+        if (lod === 1) { traceBox(ctx, b.box, view); continue; }
+        for (const ring of b.rings) tracePath(ctx, ring, view, true);
       }
       ctx.fill('evenodd');
       // Die Kante erst ab einem Maßstab, in dem ein Haus mehr als ein paar
@@ -3253,6 +3377,15 @@
       // Richtungen statt ein paar Dutzend Zeitpunkte gerechnet werden; sie
       // faengt deshalb groeber an. Und sie wird ohnehin flaechig gelesen.
       const [csBy, setCsBy] = useState({ day: 2, year: 4 });
+      /* Die Rasterweite der Schattenkarte steht daneben und nicht darin, weil
+       * sie eine Möglichkeit mehr hat: 0 heißt "richtet euch nach dem Bild"
+       * und ist die Voreinstellung. Die Schattenkarte rechnet beim Schieben und
+       * Zoomen von selbst nach, deshalb ist eine Weite, die dem Maßstab folgt,
+       * dort die vernünftige Grundeinstellung -- und deshalb war sie bisher die
+       * einzige. Sie ist trotzdem nicht immer die richtige: wer den Hof ansieht,
+       * will einen Meter, auch wenn das Bild vier verträgt.
+       */
+      const [shadowCs, setShadowCs] = useState(0);
       // Grob als Voreinstellung: 118 Richtungen statt 225, halbe Wartezeit,
       // und fuer den Ueberblick sieht man den Unterschied nicht.
       const [dirs, setDirs] = useState(0);
@@ -3331,6 +3464,45 @@
 
       const tooFar = tilesNeeded ? tilesNeeded.list.length > MAX_TILES : false;
 
+      /* Was eine Rasterweite in diesem Ausschnitt kosten würde, in Zellen.
+       * Gerechnet wird über genau die Fläche, die auch der Motor rechnet --
+       * der Zuschlag für die tiefe Sonne steckt schon in `tilesNeeded`, und er
+       * ist gerade bei tiefer Sonne der ganze Punkt: dort wächst der Ausschnitt
+       * auf das Zwanzigfache, während das Bild dasselbe bleibt.
+       */
+      const shadowCells = useCallback(cs => {
+        if (!tilesNeeded || !model || !model.ready || !vw) return 0;
+        const c = shadowCellsize(model.hm, vw.mPerPx, cs);
+        return Math.ceil((tilesNeeded.e1 - tilesNeeded.e0) / c) *
+               Math.ceil((tilesNeeded.n1 - tilesNeeded.n0) / c);
+      }, [tilesNeeded, model, vw]);
+
+      /* Die Schranke wird an der Weite gemessen, die dabei herauskäme, und
+       * nicht an der Zahl auf dem Knopf.
+       *
+       * Sonst verbietet sie sich selbst: bei einem Meter je Pixel liefert
+       * "nach Bild" ebenfalls einen Meter, und dann stünde da "Raster 1 m
+       * statt 1 m, 1 m wäre zu fein" -- eine Wahl abgelehnt zugunsten von
+       * genau derselben Rechnung. Wer nichts Feineres verlangt, als das Bild
+       * ohnehin bekommt, verlangt nichts Zusätzliches: dass ein weiter
+       * Ausschnitt bei tiefer Sonne auch automatisch teuer werden kann, ist
+       * eine ältere Grenze des Zuschlags und nicht die Sache dieses Reglers.
+       */
+      const csAuto = model && model.ready && vw ? shadowCellsize(model.hm, vw.mPerPx, 0) : 0;
+      const csFitsFor = cs => {
+        if (!model || !model.ready || !vw) return true;
+        return shadowCellsize(model.hm, vw.mPerPx, cs) >= csAuto ||
+               shadowCells(cs) <= MAX_SHADOW_CELLS;
+      };
+
+      /* Eine zu fein gewordene Wahl wird nicht zurückgesetzt, sondern für
+       * diesen Ausschnitt nicht befolgt. Zurücksetzen wäre bequemer zu
+       * schreiben und ärgerlicher zu bedienen: der Meter ginge beim
+       * Herauszoomen verloren und käme beim Hineinzoomen nicht wieder.
+       */
+      const csFits = shadowCs === 0 || csFitsFor(shadowCs);
+      const shadowCsUsed = csFits ? shadowCs : 0;
+
       /* Die Abbruchwege löschen die Anzeige "wird gerechnet" mit. Eine Anfrage,
        * die während der Rechnung überflüssig wird -- weil die Ebene gewechselt
        * hat, weil jemand den Schatten weggeschaltet hat, weil die Sonne unter
@@ -3354,7 +3526,7 @@
          * die Arbeit, sie zu verwerfen.
          */
         const timer = setTimeout(() => {
-          const cs = shadowCellsize(model.hm, vw.mPerPx);
+          const cs = shadowCellsize(model.hm, vw.mPerPx, shadowCsUsed);
           model.client.ask('shadow', {
             e0: tilesNeeded.e0, n0: tilesNeeded.n0, e1: tilesNeeded.e1, n1: tilesNeeded.n1,
             cellsize: cs, az: sun.az, elev: sun.elev, mode: mode
@@ -3367,7 +3539,7 @@
           });
         }, 140);
         return () => { alive = false; clearTimeout(timer); };
-      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw]);
+      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw, shadowCsUsed]);
 
       // ---------------------------------------------- Sonnenstundenkarte rechnen
 
@@ -3578,15 +3750,33 @@
         }
       };
 
+      /* Gemalt wird im nächsten Bildaufbau und nicht sofort.
+       *
+       * Am Mausrad kommen mehr Ereignisse an, als der Browser Bilder zeigt,
+       * und jedes setzt den Ausschnitt neu. Malte der Effekt sofort, arbeitete
+       * der Browser eine Schlange überholter Bilder ab und käme beim Zoomen
+       * immer weiter hinter die Hand zurück -- was sich anfühlt, als hinge das
+       * Tool, obwohl es nur zu gehorsam ist. Über `requestAnimationFrame`
+       * fällt jedes Bild weg, das schon veraltet ist, bevor es an der Reihe
+       * war, und es bleibt höchstens eines je Bildaufbau übrig.
+       *
+       * Die Zeichenfläche wird trotzdem sofort auf Maß gebracht: sie hängt an
+       * der Größe des Kastens und nicht am Inhalt, und ein Bild später wäre
+       * sie beim Ziehen am Fensterrand einen Zug zu spät.
+       */
       useEffect(() => {
         const cv = canvasRef.current;
         if (!cv) return;
         const dpr = Math.min(2, window.devicePixelRatio || 1);
-        cv.width = Math.round(size.w * dpr);
-        cv.height = Math.round(size.h * dpr);
-        const ctx = cv.getContext('2d');
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        paint(ctx, true);
+        const w = Math.round(size.w * dpr), h = Math.round(size.h * dpr);
+        // Die Breite zu setzen löscht die Fläche, auch wenn sie gleich bleibt.
+        if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+        const id = requestAnimationFrame(() => {
+          const ctx = cv.getContext('2d');
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          paint(ctx, true);
+        });
+        return () => cancelAnimationFrame(id);
       }, [vw, model, stage, shadowBitmap, shadow, showLayer, smoothBy, showLabels, colors, size.w, size.h,
           pick, sun.az, sun.elev, layer, hoursBitmap, hours]);
 
@@ -3728,7 +3918,12 @@
         const title = layer === 'year' ? t.yearLabel + ' ' + '·' + ' ' + ymd.y + how
           : layer === 'day' ? t.hoursLabel + ' ' + '·' + ' ' + day + how
           : t.mapTitle + ' ' + '·' + ' ' + day + ', ' + hhmm(minute)
-            + ' ' + '·' + ' ' + t.pngSun.replace('{a}', fmtDeg(sun.az)).replace('{e}', fmtDeg(sun.elev));
+            + ' ' + '·' + ' ' + t.pngSun.replace('{a}', fmtDeg(sun.az)).replace('{e}', fmtDeg(sun.elev))
+            // Die Rasterweite steht seit dem Regler auch hier: sie ist jetzt
+            // eine Einstellung und nicht mehr eine Folge des Maßstabs, und ohne
+            // sie ließe sich auf dem weitergereichten Bild nicht ablesen, wie
+            // fein gerechnet wurde.
+            + (shadow ? ' ' + '·' + ' ' + shadow.cellsize + ' m' : '');
 
         // Der Streifen bekommt denselben Maßstab wie die Karte, sonst schrumpft
         // die Beschriftung mit wachsender Auflösung relativ zum Bild.
@@ -3765,6 +3960,14 @@
         : busy ? (layer === 'shadow' ? t.shadowLabel : layer === 'year' ? t.yearLabel : t.hoursLabel) + ' ' + '·' + ' '
                  + t.shadowBusy + ' ' + Math.round(progress * 100) + ' %'
         : (layer !== 'shadow' && hoursStale) ? t.hoursStale.replace('{b}', t.hoursRecalc)
+        // Ganz am Ende, weil es der harmloseste Fall ist: die Karte steht, sie
+        // ist nur gröber als bestellt. Wer davon nichts erführe, hielte das
+        // Ergebnis für die Antwort auf seine Einstellung.
+        // Und nur, wenn wirklich etwas anderes herauskam. `shadow` hält das
+        // zuletzt gerechnete Ergebnis, und das kann aus einem Ausschnitt
+        // stammen, in dem die Wahl noch getragen hat.
+        : (layer === 'shadow' && !csFits && shadow && shadow.cellsize !== shadowCs)
+          ? t.cellFallback.replace(/\{c\}/g, String(shadow.cellsize)).replace(/\{w\}/g, String(shadowCs))
         : null;
 
       /* Die beiden Ansichten sind Reiter und keine Ebenen, weil sie sich
@@ -3828,6 +4031,33 @@
                nach Reiter zu wandern. -->
           <div className="rs-panel" style=${{ marginTop: 10 }}>
             <div className="rs-opts">
+              <!-- Dieselbe Frage wie im Stundenreiter, nur mit der zusätzlichen
+                   Antwort "nach dem Bild". Sie steht zuerst, damit die
+                   Rasterweite in allen drei Reitern an derselben Stelle sitzt. -->
+              ${layer === 'shadow' && html`
+                <div>
+                  <div className="rs-cap">${t.optSpace}<//>
+                  <div className="rs-map-group" style=${{ display: 'inline-flex', marginTop: 4 }}>
+                    <!-- Vier Meter ist das Gröbste, das angeboten wird. Darüber
+                         verschluckt eine Zelle die Häuserzeile, und die Karte
+                         zeigte etwas anderes, als sie behauptet. Der
+                         automatische Weg darf trotzdem bis acht gehen: dort ist
+                         eine Zelle kleiner als ein Bildschirmpixel, und feiner
+                         zu rechnen als das Bild zeigt, kostet nur. -->
+                    ${[[0, t.cellAuto], [1, '1 m'], [2, '2 m'], [4, '4 m']].map(([c, label]) => {
+                      // Die gewählte Stufe bleibt hervorgehoben, auch wenn sie
+                      // gerade nicht trägt: sie ist die Wahl und kommt beim
+                      // Hineinzoomen zurück. Was gerade wirklich gerechnet
+                      // wird, steht in der Statuszeile.
+                      const fits = c === 0 || csFitsFor(c);
+                      return html`
+                      <button key=${'sc' + c} className=${'lang-seg' + (shadowCs === c ? ' active' : '')}
+                              disabled=${!fits}
+                              title=${!fits ? t.cellTooFine : c === 0 ? t.cellAutoHint : t.spaceHint}
+                              onClick=${() => setShadowCs(c)}>${label}<//>`;
+                    })}
+                  <//>
+                <//>`}
               ${layer !== 'shadow' && html`
                 <${React.Fragment}>
                   <div>
@@ -3842,7 +4072,10 @@
                   <div>
                     <div className="rs-cap">${t.optSpace}<//>
                     <div className="rs-map-group" style=${{ display: 'inline-flex', marginTop: 4 }}>
-                      ${[1, 2, 4, 8].map(c => html`
+                      <!-- Vier Meter ist auch hier das Gröbste: darüber kennt
+                           eine Zelle keine Hinterhöfe mehr, und genau danach
+                           fragt eine Sonnenstundenkarte. -->
+                      ${[1, 2, 4].map(c => html`
                         <button key=${'co' + c} className=${'lang-seg' + (hoursCs === c ? ' active' : '')}
                                 title=${t.spaceHint}
                                 onClick=${() => setCsBy(b => Object.assign({}, b, { [span]: c }))}>${c + ' m'}<//>`)}
