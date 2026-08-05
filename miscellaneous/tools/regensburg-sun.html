@@ -232,6 +232,17 @@
       background-position: right 6px center;
       background-size: 12px auto;
     }
+    /* Dasselbe für das Zahlenfeld, plus eine Breite: Pico lässt ein input auf
+       volle Spaltenbreite laufen, und ein Feld für "1,7" wäre dann acht
+       Zentimeter breit. */
+    input.rs-numfield {
+      width: 4.5em;
+      margin: 4px 0 0;
+      padding: 2px 8px;
+      font-size: 0.75rem;
+      height: auto;
+      display: inline-block;
+    }
     .rs-hours-bar {
       height: 10px;
       border-radius: 3px;
@@ -1502,6 +1513,86 @@
       return cov;
     }
 
+    /* Deckungsgrad aus dem Abstandsfeld, statt aus der Ja-Nein-Karte.
+     *
+     * Der Unterschied zu `smoothShade` ist nicht die Stärke, sondern die
+     * Quelle. `smoothShade` filtert die *Antwort*: der Sweep entscheidet je
+     * Zelle hart, danach versucht ein Weichzeichner, aus dem Treppenmuster
+     * wieder eine Kante zu raten. Die Auskunft, wo die Kante wirklich lag, ist
+     * beim Binarisieren weggeworfen worden -- und sie liegt daneben. `margin`
+     * sagt je Zelle, wie viele Meter über oder unter der Schattenhöhe sie
+     * liegt; das Vorzeichen ist die Treppe, der Betrag ist stetig.
+     *
+     * Der Rechenweg ist der, mit dem Schriften aus Distanzfeldern gerastert
+     * werden. Der Betrag steht in Metern Höhe und muss erst in Zellen Abstand
+     * umgerechnet werden, und der Umrechnungsfaktor ist der örtliche Gradient
+     * des Feldes: `abstand = margin / |grad margin|`. Danach ist die Deckung
+     * einfach `0,5 + abstand`, gekappt auf 0 bis 1 -- die halbe Zelle ist die
+     * Kante selbst.
+     *
+     * Zwei Eigenschaften, die ein Weichzeichner nicht haben kann. Erstens ist
+     * der Übergang **immer genau eine Zelle breit** und liegt subzellengenau,
+     * statt über drei Zellen zu verlaufen. Zweitens bleibt das Innere
+     * unangetastet: der Hof neben der Gasse behält seine Kante, weil dort
+     * nichts zu mitteln ist. Das ist die Rasterfassung dessen, was Marching
+     * Squares im Raum täte, ohne Polygone, ohne Sattelpunktregel.
+     *
+     * Der Gradient wird aus bekannten Nachbarn gebildet, mit zentraler
+     * Differenz, wo beide da sind, und einseitig, wo nur einer da ist. Fehlt
+     * eine Achse ganz, gilt sie als flach. Wo das Feld flach ist -- tief im
+     * Schatten, weit in der Sonne, oder weil `margin` bei einem Kilometer
+     * gekappt wird -- gibt es keine Kante zu verorten, und das Vorzeichen
+     * entscheidet allein.
+     *
+     * An einer Hauswand ist der Gradient riesig, weil das Dach zwanzig Meter
+     * über der Schattenhöhe liegt und die Straße darunter. Der Übergang wird
+     * dort also winzig, die Kante hart. Das ist richtig: die Wand ist Geometrie
+     * und keine Unschärfe.
+     */
+    function edgeCover(margin, heights, rows, cols) {
+      const n = rows * cols;
+      const cov = new Uint8Array(n);
+      const known = new Uint8Array(n);
+      for (let i = 0; i < n; i++) if (heights[i] === heights[i]) known[i] = 1;
+
+      // Unter diesem Gradienten ist das Feld flach genug, dass der gerechnete
+      // Abstand nur noch Rundungsrauschen wäre.
+      const FLAT = 1e-9;
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          if (!known[i]) continue;
+          const m = margin[i];
+          if (m !== m) continue;
+
+          const step = (ja, jb) => {
+            const a = ja >= 0 && known[ja] ? margin[ja] : NaN;
+            const b = jb >= 0 && known[jb] ? margin[jb] : NaN;
+            if (a === a && b === b) return (b - a) / 2;
+            if (a === a) return m - a;
+            if (b === b) return b - m;
+            return 0;
+          };
+          const gx = step(c > 0 ? i - 1 : -1, c < cols - 1 ? i + 1 : -1);
+          const gy = step(r > 0 ? i - cols : -1, r < rows - 1 ? i + cols : -1);
+          const g = Math.sqrt(gx * gx + gy * gy);
+
+          let f;
+          if (g < FLAT) {
+            f = m >= 0 ? 1 : 0;
+          } else {
+            f = 0.5 + m / g;
+            if (f < 0) f = 0; else if (f > 1) f = 1;
+          }
+          // Gespeichert wird die Deckung des *Schattens*, wie bei smoothShade:
+          // das Bild legt Schatten auf die Basiskarte und nicht Sonne.
+          cov[i] = Math.round(255 * (1 - f));
+        }
+      }
+      return cov;
+    }
+
     // ------------------------------------------------------- Sonnenstunden
 
     /* Wie fein die Sonnenstundenkarte gerechnet wird. Gröber als die
@@ -1554,6 +1645,9 @@
       const mode = opts.mode === undefined ? 'center' : opts.mode;
       const prof = opts.horizon || null;
       const sampling = opts.sampling || 'terrain_max';
+      // Nicht mit ||, aus demselben Grund wie oben beim Modus: die Null ist hier
+      // eine Antwort ("auf der Oberfläche") und keine fehlende Angabe.
+      const eyeHeight = opts.eyeHeight === undefined ? 0 : opts.eyeHeight;
       const onProgress = opts.onProgress || null;
       const n = rows * cols;
 
@@ -1620,7 +1714,7 @@
           const tg = Math.min(b - eps, Math.max(a + eps, t));
           const s = solarPosition(berlinMinuteToJd(ymd.y, ymd.m, ymd.d, tg, 0));
           shadowMap(heights, rows, cols, cellsize, s.az, s.elev + elevationMargin(mode), {
-            margin: cur, sampling: sampling
+            margin: cur, sampling: sampling, eyeHeight: eyeHeight
           });
           if (k > 0) {
             const hpi = dt / 60;
@@ -1745,6 +1839,7 @@
       opts = opts || {};
       const mode = opts.mode === undefined ? 'center' : opts.mode;
       const sampling = opts.sampling || 'terrain_max';
+      const eyeHeight = opts.eyeHeight === undefined ? 0 : opts.eyeHeight;
       const onProgress = opts.onProgress || null;
       const n = rows * cols;
 
@@ -1756,7 +1851,7 @@
       for (let p = 0; p < patches.length; p++) {
         const pa = patches[p];
         shadowMap(heights, rows, cols, cellsize, pa.az, pa.elev + margin, {
-          lit: lit, sampling: sampling
+          lit: lit, sampling: sampling, eyeHeight: eyeHeight
         });
         const w = pa.hours;
         for (let i = 0; i < n; i++) if (lit[i]) hours[i] += w;
@@ -1786,6 +1881,21 @@
         Math.round(a[2] + (b[2] - a[2]) * f),
         Math.round(a[3] + (b[3] - a[3]) * f)
       ];
+    }
+
+    /* Eine Palettenfarbe durchsichtig machen, für Verläufe: eine Farbe ohne
+     * Alphaanteil kann kein Verlaufsende sein.
+     *
+     * Die drei Skins schreiben ihre Farben als sechsstelliges Hex. Alles andere
+     * kommt unverändert zurück, statt einen Fehler zu werfen: ein Verlauf, der
+     * nicht verblasst, ist ein Schönheitsfehler; ein Fehler mitten im Malen
+     * hinterlässt eine leere Karte.
+     */
+    function withAlpha(hex, a) {
+      const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+      if (!m) return hex;
+      return 'rgba(' + parseInt(m[1], 16) + ',' + parseInt(m[2], 16) + ',' +
+             parseInt(m[3], 16) + ',' + a + ')';
     }
 
     // ------------------------------------------------ Detailstufen fürs Malen
@@ -2073,15 +2183,30 @@
             report(wLoad + rest * 0.2);
             // Die Sichtbarkeitsschwelle wandert in die Sonnenhöhe, damit der
             // Sweep nur eine Zahl kennen muss.
+            /* Das Abstandsfeld wird mitgerechnet, nicht nachgerechnet: es fällt
+             * in der Rekurrenz des Sweeps ohnehin an, und aus ihm entsteht die
+             * Kantendeckung. Es kostet vier Byte je Zelle im Worker und geht
+             * nicht mit zurück -- die App braucht das Feld nicht, nur was
+             * daraus wird.
+             */
+            const marg = new Float32Array(rows * cols);
             const lit = shadowMap(heights, rows, cols, cs, req.az, req.elev + elevationMargin(req.mode), {
+              eyeHeight: req.eyeHeight, margin: marg,
               onProgress: p => report(wLoad + rest * (0.2 + 0.65 * p))
             });
-            // Das Deckungsbild entsteht hier und nicht in der App: hier liegen
-            // die Daten schon, hier läuft es im Worker, und die App bekommt
-            // ein fertiges Feld, aus dem sie nur noch Farbe macht.
+            /* Beide Deckungsbilder entstehen hier und nicht in der App: hier
+             * liegen die Daten schon, hier läuft es im Worker, und die App
+             * bekommt fertige Felder, aus denen sie nur noch Farbe macht. Beide,
+             * weil der Knopf dann ohne Nachrechnen umschaltet -- zusammen ein
+             * Byte je Zelle.
+             */
+            const edge = edgeCover(marg, heights, rows, cols);
             const cov = smoothShade(lit, heights, rows, cols);
             report(1);
-            return { lit: lit, cov: cov, heights: heights, rows: rows, cols: cols, cellsize: cs, spec: spec };
+            return {
+              lit: lit, cov: cov, edge: edge, heights: heights,
+              rows: rows, cols: cols, cellsize: cs, spec: spec
+            };
           });
         },
 
@@ -2132,7 +2257,7 @@
                 onProgress: p => tell(0.15 * p)
               });
               const ry = sunYearMap(heights, rows, cols, cs, sp.patches, {
-                mode: req.mode, onProgress: p => tell(0.15 + 0.85 * p)
+                mode: req.mode, eyeHeight: req.eyeHeight, onProgress: p => tell(0.15 + 0.85 * p)
               });
               return {
                 hours: ry.hours, dayHours: sp.total, steps: ry.steps, stepMin: req.stepMin,
@@ -2141,7 +2266,8 @@
             }
 
             const r = sunHoursMap(heights, rows, cols, cs, { y: req.y, m: req.m, d: req.d }, {
-              stepMin: req.stepMin, mode: req.mode, horizon: prof, onProgress: tell
+              stepMin: req.stepMin, mode: req.mode, horizon: prof,
+              eyeHeight: req.eyeHeight, onProgress: tell
             });
             return {
               hours: r.hours, dayHours: r.dayHours, steps: r.steps, stepMin: req.stepMin,
@@ -2164,7 +2290,19 @@
             const ground = grid.heightAt(e, n);
             if (ground === null || Number.isNaN(ground)) return { known: false };
 
-            const opts = { mode: req.mode, eyeHeight: 1.7, maxDistance: NEAR_M - 20 };
+            /* Die Höhe kommt aus der Anfrage und steht nicht mehr hier.
+             *
+             * `sunlitAt` und `horizonProfile` haben von sich aus 1,7 m, weil
+             * ihre Vorlage im Backend das so hält; die Karten rechnen von sich
+             * aus auf der Oberfläche. Solange beide Seiten ihre eigene
+             * Voreinstellung mitbrachten, beantworteten Klick und Karte
+             * verschiedene Fragen, und an einer Schattenkante widersprachen sie
+             * sich sichtbar. Jetzt gibt es eine Höhe für das ganze Tool, und
+             * sie steht hier ausdrücklich, damit keine der beiden
+             * Voreinstellungen wieder durchschlägt.
+             */
+            const eye = req.eyeHeight === undefined ? 0 : req.eyeHeight;
+            const opts = { mode: req.mode, eyeHeight: eye, maxDistance: NEAR_M - 20 };
             const now = sunlitAt(grid, hm, far, e, n, req.az, req.elev, opts);
 
             /* Der eigentliche Gewinn des Horizontprofils: es kostet einmal so
@@ -2172,7 +2310,7 @@
              * Uhrzeit des Tages ein Vergleich. Ohne das wären Sonnenstunden pro
              * Ort nicht bezahlbar.
              */
-            const prof = horizonProfile(grid, e, n, { bins: 360, eyeHeight: 1.7, maxDistance: NEAR_M - 20 });
+            const prof = horizonProfile(grid, e, n, { bins: 360, eyeHeight: eye, maxDistance: NEAR_M - 20 });
             if (prof) {
               for (let b = 0; b < 360; b++) {
                 const f = farHorizonAt(hm, far, e, n, b);
@@ -2215,9 +2353,10 @@
         const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
         WORKER_ENGINE.shadow(msg, tell).then(r => {
           postMessage({
-            type: 'shadow', token: msg.token, lit: r.lit, cov: r.cov, heights: r.heights,
+            type: 'shadow', token: msg.token, lit: r.lit, cov: r.cov, edge: r.edge,
+            heights: r.heights,
             rows: r.rows, cols: r.cols, cellsize: r.cellsize, spec: r.spec
-          }, [r.lit.buffer, r.cov.buffer, r.heights.buffer]);
+          }, [r.lit.buffer, r.cov.buffer, r.edge.buffer, r.heights.buffer]);
         }).catch(err => postMessage({ type: 'shadow', token: msg.token, error: String(err) }));
         return;
       }
@@ -2290,8 +2429,12 @@
         shadowFar:    'Zum Rechnen der Schattenkarte weiter hineinzoomen.',
         shadowNight:  'Die Sonne steht unter dem Horizont, es liegt alles im Schatten.',
         shadowShow:   'Anzeigen',
-        smoothLabel:  'Glätten',
-        smoothHint:   'Einzeln stehende Schattenzellen fallen weg, die Kanten bekommen Zwischenstufen. Ausgeschaltet steht jede gerechnete Zelle für sich.',
+        viewCells:    'Zellen',
+        viewEdge:     'Kante',
+        viewBlur:     'Weich',
+        viewCellsHint: 'Jede gerechnete Zelle als Kästchen, ohne Zwischenwerte. Beim Hineinzoomen sieht man dadurch, wie fein wirklich gerechnet wurde.',
+        viewEdgeHint: 'Die Kante wird aus dem Abstandsfeld gelesen, das der Schattenwurf ohnehin ausrechnet: wie viele Meter über oder unter der Schattenhöhe eine Zelle liegt. Der Übergang ist damit genau eine Zelle breit und liegt zwischen den Zellen richtig, statt über drei Zellen verschmiert. Das Innere bleibt unangetastet.',
+        viewBlurHint: 'Einzeln stehende Zellen fallen weg, danach wird weichgezeichnet. Ruhiger als die anderen beiden, verwischt dafür auch die Kante zwischen Hof und Gasse.',
         hoursHint:    'Wie lange die Sonne an diesem Tag jede Stelle erreicht. Das kostet einen Schattenwurf je Zeitschritt und dauert deshalb Sekunden.',
         hoursFar:     'Zum Rechnen der Sonnenstunden weiter hineinzoomen.',
         /* Sagt, was zu tun ist, und nicht, was der Fall ist. Die erste Fassung
@@ -2355,7 +2498,11 @@
         horizonHere:  'Horizont hier',
         sunHere:      'Sonne an dieser Stelle',
         hoursHere:    'Sonnenstunden heute',
-        eyeNote:      'Gerechnet in 1,7 m Augenhöhe über dem Gelände.',
+        eyeNote:      'Gerechnet auf der Oberfläche, also auf dem Boden, auf dem Dach oder auf der Baumkrone.',
+        eyeNoteH:     'Gerechnet {h} m über der Oberfläche.',
+        optEye:       'Höhe',
+        pngEye:       'über der Oberfläche',
+        eyeHint:      'Höhe über der Oberfläche, in Metern. Sie gilt für die Karten und für die angeklickte Antwort gleichermaßen. Null ist die Fläche selbst, 1,7 m ein stehender Mensch. Gemeint ist die Oberfläche und nicht der Erdboden: auf einem Haus zählt sie ab dem Dach, unter einem Baum ab der Krone, weil das Modell nur Oberflächen kennt. Höhe macht sonnig: bei flacher Sonne holen 1,7 m rund zehn Meter Boden zurück.',
         legendSun:    'besonnt',
         legendShade:  'verschattet',
         legendPick:   'gewählter Ort',
@@ -2412,8 +2559,12 @@
         shadowFar:    'Zoom in further to compute the shadow map.',
         shadowNight:  'The sun is below the horizon, everything is in shadow.',
         shadowShow:   'Show',
-        smoothLabel:  'Smooth',
-        smoothHint:   'Single stray shadow cells drop out and the edges get intermediate steps. Switched off, every computed cell stands on its own.',
+        viewCells:    'Cells',
+        viewEdge:     'Edge',
+        viewBlur:     'Blur',
+        viewCellsHint: 'Every computed cell as a box, no intermediate values. Zooming in then shows how finely it was actually computed.',
+        viewEdgeHint: 'The edge is read from the distance field the shadow cast produces anyway: how many metres above or below the shadow height a cell sits. The transition is then exactly one cell wide and sits correctly between cells, instead of being smeared across three. The interior is left alone.',
+        viewBlurHint: 'Stray single cells drop out, then the field is blurred. Calmer than the other two, but it smears the edge between courtyard and alley along with everything else.',
         hoursHint:    'How long the sun reaches each spot on this day. That costs one shadow cast per time step and therefore takes seconds.',
         hoursFar:     'Zoom in further to compute the hours of sun.',
         hoursStale:   'This picture is out of date: click {b}.',
@@ -2471,7 +2622,11 @@
         horizonHere:  'Horizon here',
         sunHere:      'Sun at this spot',
         hoursHere:    'Hours of sun today',
-        eyeNote:      'Computed at eye level, 1.7 m above the ground.',
+        eyeNote:      'Computed on the surface: on the ground, on the roof, or on the treetop.',
+        eyeNoteH:     'Computed {h} m above the surface.',
+        optEye:       'Height',
+        pngEye:       'above the surface',
+        eyeHint:      'Height above the surface, in metres. It applies to the maps and to the answer for a picked spot alike. Zero is the surface itself, 1.7 m a standing person. Surface, not ground level: on a building it counts from the roof, under a tree from the crown, because the model only knows surfaces. Height means sun: with a low sun, 1.7 m buys back about ten metres of ground.',
         legendSun:    'sunlit',
         legendShade:  'shaded',
         legendPick:   'picked spot',
@@ -2502,6 +2657,9 @@
     // Stunden mit einer Nachkommastelle. Mehr behauptet eine Genauigkeit, die
     // ein Modell mit halbmetrigen Objekthöhen nicht hat.
     function fmtHours(v) { return v.toFixed(1) + ' h'; }
+    // Die Höhe steht in einem Fließtext und bekommt deshalb das Dezimalzeichen
+    // der Sprache, in der der Satz steht.
+    function fmtEye(v) { return lang === 'de' ? String(v).replace('.', ',') : String(v); }
     function compassName(az) { return t.compass[Math.round(mod360(az) / 45) % 8]; }
 
     function todayParts() {
@@ -2952,6 +3110,12 @@
      * und nicht nach dem Maßstab.
      */
 
+    /* Über wie viele Meter der Sonnenstrahl verblasst, wenn er nichts trifft.
+     * Zehn Meter sind genug, um die Richtung zu lesen, und zu wenig, um wie
+     * eine Aussage über die Ferne auszusehen.
+     */
+    const RAY_FADE_M = 10;
+
     function drawPolys(ctx, view, polys, fill) {
       ctx.fillStyle = fill;
       ctx.beginPath();
@@ -3090,18 +3254,32 @@
      * bleibt. Unbekannte Zellen bleiben ebenfalls durchsichtig: dort ist
      * nichts bekannt, und eine eingefärbte Fläche würde als Aussage gelesen.
      */
-    function shadowCanvas(shade, colors, smooth) {
+    /* Drei Lesarten desselben Sweeps, und zwar wirklich drei und nicht eine mit
+     * Stärkeregler:
+     *
+     *   'cells' -- die reine Ja-Nein-Karte, eine Zelle ein Kästchen. Ehrlich
+     *              beim Hineinzoomen, weil die gerechnete Rasterweite sichtbar
+     *              wird, und genau deshalb nicht wegrationalisiert.
+     *   'edge'  -- die Deckung aus dem Abstandsfeld. Kante subzellengenau und
+     *              eine Zelle breit, Inneres unangetastet. Voreinstellung.
+     *   'blur'  -- entsprenkelt und weichgezeichnet. Nimmt den Mastschatten
+     *              mit und verwischt die Kante zwischen Hof und Gasse, ist
+     *              dafür ruhig.
+     *
+     * Der Unterschied ist eine Darstellungsfrage und keine Modellfrage, deshalb
+     * sind es Knöpfe und keine zweite Rechnung: alle drei Felder liegen ohnehin
+     * vor.
+     */
+    function shadowCanvas(shade, colors, view) {
       const cv = document.createElement('canvas');
       cv.width = shade.cols; cv.height = shade.rows;
       const ctx = cv.getContext('2d');
       const img = ctx.createImageData(shade.cols, shade.rows);
       const [r, g, b, a] = colors.shadow;
       const alpha = a * 255;
-      // Weich: die Deckung kommt aus dem gefilterten Feld. Hart: die reine
-      // Ja-Nein-Karte, ohne Zwischenwerte. Der Unterschied ist eine
-      // Darstellungsfrage und keine Modellfrage, deshalb ist er ein Knopf und
-      // keine zweite Rechnung -- beide Felder liegen ohnehin vor.
-      const cov = smooth && shade.cov ? shade.cov : null;
+      const cov = view === 'blur' ? (shade.cov || null)
+        : view === 'edge' ? (shade.edge || null)
+        : null;
       for (let i = 0; i < shade.lit.length; i++) {
         let f;
         if (cov) {
@@ -3347,14 +3525,23 @@
       // beide legen sich über die Basiskarte, und beide will man beim
       // Hinsehen kurz wegnehmen können.
       const [showLayer, setShowLayer] = useState(true);
-      /* Glätten hat je Reiter seinen eigenen Zustand und seine eigene
-       * Voreinstellung, weil die Frage in beiden eine andere ist. Die
-       * Schattenkarte ist eine Ja-Nein-Karte und franst ohne Glätten aus, die
-       * Stundenkarte ist schon ein Mittel über einen ganzen Tag und braucht
-       * keines; dort verwischt es nur die Kante zwischen Hof und Gasse, also
-       * genau das, was man ansehen wollte.
+      /* Wie das Ergebnisbild gelesen wird, je Reiter einzeln.
+       *
+       * 'cells' zeigt die gerechneten Zellen als Kästchen, 'edge' die Deckung
+       * aus dem Abstandsfeld, 'blur' das entsprenkelte und weichgezeichnete
+       * Feld. Das war einmal ein Ja-Nein-Schalter "Glätten", und der stand vor
+       * einer falschen Wahl: entweder ausgefranst oder verwischt. 'edge' ist
+       * keine dritte Stärke, sondern eine andere Quelle -- es liest den
+       * Abstand, den der Sweep ohnehin ausrechnet, statt die Ja-Nein-Karte
+       * nachträglich zu filtern. Deshalb ist es beim Schatten die
+       * Voreinstellung.
+       *
+       * Die Stundenkarten kennen es nicht: sie sind schon stetig, ein Mittel
+       * über einen ganzen Tag, und haben keine Kante zu verorten. Dort bleibt
+       * es bei Kästchen und Weichzeichner, und Kästchen ist die Voreinstellung,
+       * weil der Weichzeichner dort die Kante zwischen Hof und Gasse verwischt.
        */
-      const [smoothBy, setSmoothBy] = useState({ shadow: true, day: false, year: false });
+      const [viewBy, setViewBy] = useState({ shadow: 'edge', day: 'cells', year: 'cells' });
       // Beschriftung an, aber abschaltbar: sie verortet die Karte, und sie liegt
       // ueber genau den Stellen, die man bei einer Schattenkante ansehen will.
       const [showLabels, setShowLabels] = useState(true);
@@ -3386,6 +3573,29 @@
        * will einen Meter, auch wenn das Bild vier verträgt.
        */
       const [shadowCs, setShadowCs] = useState(0);
+      /* Die Höhe über der Oberfläche, für das ganze Tool eine einzige: Schatten,
+       * beide Stundenkarten und die Punktabfrage. Vorher hatten die Karten 0 m
+       * und der Klick 1,7 m, und an einer Schattenkante widersprachen sie sich
+       * deshalb sichtbar -- bei flacher Sonne kaufen 1,7 m Höhe rund zehn Meter
+       * Boden zurück.
+       *
+       * Ein Feld statt Knöpfe, weil die sinnvollen Werte nicht abzählbar sind:
+       * Terrasse, Kopfhöhe, Fensterbank im zweiten Stock, Balkonbrüstung.
+       *
+       * Voreinstellung 1,7 m, also Kopfhöhe. Die Fläche selbst wäre die
+       * strengere Auslegung, aber auf ihr besteht die Karte zu weiten Teilen aus
+       * den Schatten von Sträuchern, Zäunen und Böschungskanten, und die
+       * Bildaussage kippt: sie sieht schattiger aus, als die Stadt sich anfühlt.
+       * Anderthalb Meter höher fällt dieses Kleinzeug heraus, und übrig bleiben
+       * die Schatten, die man auch meint. Wer die Fläche selbst wissen will --
+       * Beet, Terrasse, Rasen -- tippt eine Null.
+       *
+       * Getippt wird in `eyeText`, gerechnet wird mit `eye`. Die beiden sind
+       * getrennt, weil sonst jeder Tastendruck eine Anfrage auslöste und der
+       * Weg zu "1.7" über "1" und "17" führte.
+       */
+      const [eye, setEye] = useState(1.7);
+      const [eyeText, setEyeText] = useState(fmtEye(1.7));
       // Grob als Voreinstellung: 118 Richtungen statt 225, halbe Wartezeit,
       // und fuer den Ueberblick sieht man den Unterschied nicht.
       const [dirs, setDirs] = useState(0);
@@ -3503,6 +3713,22 @@
       const csFits = shadowCs === 0 || csFitsFor(shadowCs);
       const shadowCsUsed = csFits ? shadowCs : 0;
 
+      /* Die getippte Höhe übernehmen, beim Verlassen des Feldes oder auf
+       * Eingabetaste. Was sich nicht als Zahl lesen lässt, fällt auf den
+       * zuletzt gültigen Wert zurück statt die Karte auf NaN zu schicken --
+       * ein NaN käme als leeres Bild zurück und sähe aus wie ein Ausfall des
+       * Motors. Das Komma wird mitgelesen, weil eine deutsche Seite eines
+       * bekommt, und auf einen Dezimeter gerundet, weil das Modell in halben
+       * Metern über Grund liegt und die dritte Stelle Genauigkeit vortäuschte.
+       */
+      const commitEye = () => {
+        const v = parseFloat(String(eyeText).replace(',', '.'));
+        if (!isFinite(v) || v < 0 || v > 100) { setEyeText(fmtEye(eye)); return; }
+        const r = Math.round(v * 10) / 10;
+        setEye(r);
+        setEyeText(fmtEye(r));
+      };
+
       /* Die Abbruchwege löschen die Anzeige "wird gerechnet" mit. Eine Anfrage,
        * die während der Rechnung überflüssig wird -- weil die Ebene gewechselt
        * hat, weil jemand den Schatten weggeschaltet hat, weil die Sonne unter
@@ -3529,7 +3755,7 @@
           const cs = shadowCellsize(model.hm, vw.mPerPx, shadowCsUsed);
           model.client.ask('shadow', {
             e0: tilesNeeded.e0, n0: tilesNeeded.n0, e1: tilesNeeded.e1, n1: tilesNeeded.n1,
-            cellsize: cs, az: sun.az, elev: sun.elev, mode: mode
+            cellsize: cs, az: sun.az, elev: sun.elev, mode: mode, eyeHeight: eye
           }, p => { if (alive) setProgress(p); }).then(r => {
             // Überholt heißt: eine neuere Anfrage läuft schon, also bleibt die
             // Anzeige auf "wird gerechnet" stehen und wartet auf die.
@@ -3539,7 +3765,7 @@
           });
         }, 140);
         return () => { alive = false; clearTimeout(timer); };
-      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw, shadowCsUsed]);
+      }, [layer, showLayer, tilesNeeded, tooFar, sun.az, sun.elev, mode, model, vw, shadowCsUsed, eye]);
 
       // ---------------------------------------------- Sonnenstundenkarte rechnen
 
@@ -3588,9 +3814,9 @@
           tiles: tilesForExtent(model.hm, e0, n0, e1, n1).length,
           key: [span, Math.round(e0), Math.round(n0), Math.round(e1), Math.round(n1),
                 cs, ymd.y, span === 'day' ? ymd.m : 0, span === 'day' ? ymd.d : 0,
-                mode, stepMin, span === 'year' ? dir.az + 'x' + dir.el : ''].join('|')
+                mode, stepMin, eye, span === 'year' ? dir.az + 'x' + dir.el : ''].join('|')
         };
-      }, [vw, model, stage, span, ymd.y, ymd.m, ymd.d, mode, stepMin, hoursCs, dirs]);
+      }, [vw, model, stage, span, ymd.y, ymd.m, ymd.d, mode, stepMin, hoursCs, dirs, eye]);
 
       const hoursFar = hoursReq ? hoursReq.tiles > MAX_TILES : false;
       const hoursStale = !!(hours && hoursReq && hours.key !== hoursReq.key);
@@ -3604,7 +3830,7 @@
         model.client.ask('sunhours', {
           e0: hoursReq.e0, n0: hoursReq.n0, e1: hoursReq.e1, n1: hoursReq.n1,
           cellsize: hoursReq.cellsize, mode: mode, stepMin: stepMin, span: span,
-          azBin: hoursReq.azBin, elBin: hoursReq.elBin,
+          azBin: hoursReq.azBin, elBin: hoursReq.elBin, eyeHeight: eye,
           y: ymd.y, m: ymd.m, d: ymd.d
         }, p => setProgress(p)).then(r => {
           if (r.superseded) return;
@@ -3629,13 +3855,13 @@
         let alive = true;
         model.client.ask('point', {
           e: pick.e, n: pick.n, az: sun.az, elev: sun.elev, mode: mode,
-          y: ymd.y, m: ymd.m, d: ymd.d
+          y: ymd.y, m: ymd.m, d: ymd.d, eyeHeight: eye
         }).then(r => {
           if (!alive || r.superseded) return;
           setAnswer(r.error ? null : r.answer);
         });
         return () => { alive = false; };
-      }, [pick, model, stage, sun.az, sun.elev, mode, ymd.y, ymd.m, ymd.d]);
+      }, [pick, model, stage, sun.az, sun.elev, mode, ymd.y, ymd.m, ymd.d, eye]);
 
       // -------------------------------------------------------------- Zeichnen
 
@@ -3647,8 +3873,8 @@
        * dasselbe Bild einfach an eine andere Stelle skaliert.
        */
       const shadowBitmap = useMemo(
-        () => (shadow ? shadowCanvas(shadow, colors, smoothBy.shadow) : null),
-        [shadow, colors, smoothBy.shadow]
+        () => (shadow ? shadowCanvas(shadow, colors, viewBy.shadow) : null),
+        [shadow, colors, viewBy.shadow]
       );
 
       const ramp = useMemo(() => hoursRamp(rampId), [rampId]);
@@ -3665,9 +3891,12 @@
       const hoursMaxLabel = span === 'year' ? t.hoursMaxYearTotal
         : norm === 'year' ? t.hoursMaxYear : t.hoursMax;
 
+      // `smoothBy.hours` stand hier einmal, und diesen Schlüssel gab es nie:
+      // die Stundenkarte wurde also nie geglättet, egal was der Knopf sagte.
+      // Der Reiter ist der Schlüssel.
       const hoursBitmap = useMemo(
-        () => (hours ? hoursCanvas(hours, ramp, hoursMax, smoothBy.hours) : null),
-        [hours, ramp, hoursMax, smoothBy.hours]
+        () => (hours ? hoursCanvas(hours, ramp, hoursMax, viewBy[span] === 'blur') : null),
+        [hours, ramp, hoursMax, viewBy, span]
       );
 
       /* Das Zeichnen steht in einer eigenen Funktion und nicht im Effekt, weil
@@ -3704,7 +3933,13 @@
         const drawGrid = (bmp, g) => {
           const x0 = vw.sx(g.spec.originE - model.hm.bounds[0]);
           const y0 = vw.sy(g.spec.originN - model.hm.bounds[1] + g.rows * g.cellsize);
-          ctx.imageSmoothingEnabled = smoothBy[layer];
+          /* Kästchen heißt Kästchen: keine Zwischenwerte beim Vergrößern, damit
+           * die gerechnete Rasterweite beim Hineinzoomen sichtbar bleibt. Die
+           * beiden anderen Lesarten liegen als Deckungsfeld vor und wollen
+           * bilinear vergrößert werden -- gerade die Kantenstufe, deren ganzer
+           * Sinn der subzellengenaue Übergang ist.
+           */
+          ctx.imageSmoothingEnabled = viewBy[layer] !== 'cells';
           ctx.drawImage(bmp, x0, y0, g.cols * g.cellsize / vw.mPerPx,
                                      g.rows * g.cellsize / vw.mPerPx);
           ctx.imageSmoothingEnabled = true;
@@ -3728,17 +3963,69 @@
           // Ein kurzer Strahl in Richtung Sonne. Er beantwortet nichts, aber er
           // macht sofort sichtbar, ob die Karte den Azimut richtig herum hat,
           // und genau das ist der Fehler, den die Tests nicht sehen.
+          /* Der Strahl zeigt zur Sonne, und seit er eine Länge hat, sagt er
+           * auch etwas.
+           *
+           * Im Schatten läuft er bis zu dem, was verdeckt: die Entfernung
+           * rechnet die Punktabfrage ohnehin aus, sie stand bisher nur als Zahl
+           * im Text ("verdeckt von etwas in 202 m Entfernung"), und eine Zahl
+           * in Metern muss man auf einer Karte erst suchen. Am Ende sitzt ein
+           * Querstrich, damit die Stelle auch dann zu finden ist, wenn der
+           * Strahl über eine ganze Häuserzeile läuft.
+           *
+           * In der Sonne gibt es nichts zu treffen, und dann wäre jede Länge
+           * eine Behauptung. Er verblasst deshalb nach ein paar Metern: die
+           * Richtung bleibt ablesbar, das Ende sagt nichts.
+           *
+           * Verdeckt der Fernhorizont, ist der Verdecker kilometerweit weg und
+           * liegt nicht im Bild. Auch dann verblasst der Strahl, denn ein
+           * Strich bis zum Bildrand zeigte auf ein Haus, das gar nicht gemeint
+           * ist.
+           */
           if (sun.elev > 0) {
             const d = directionVector(sun.az);
-            ctx.strokeStyle = colors.ray;
+            // Ost nach rechts, Nord nach oben, deshalb steht vor dn ein Minus.
+            const toPx = (m) => [px + d.de * m / vw.mPerPx, py - d.dn * m / vw.mPerPx];
+            const hit = answer && answer.known && !answer.lit
+              && answer.reason !== 'far' && answer.blocker !== null && answer.blocker > 0
+              ? answer.blocker : null;
+
             ctx.lineWidth = 1.4;
             ctx.setLineDash([5, 4]);
-            ctx.beginPath();
-            ctx.moveTo(px, py);
-            // Ost nach rechts, Nord nach oben, deshalb steht vor dn ein Minus.
-            ctx.lineTo(px + d.de * 70, py - d.dn * 70);
-            ctx.stroke();
+            if (hit !== null) {
+              const [ex, ey] = toPx(hit);
+              ctx.strokeStyle = colors.ray;
+              ctx.beginPath();
+              ctx.moveTo(px, py);
+              ctx.lineTo(ex, ey);
+              ctx.stroke();
+              // Der Querstrich steht senkrecht zum Strahl, also auf der
+              // gedrehten Richtung.
+              ctx.setLineDash([]);
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(ex - d.dn * 5, ey - d.de * 5);
+              ctx.lineTo(ex + d.dn * 5, ey + d.de * 5);
+              ctx.stroke();
+            } else {
+              /* Verblassen über RAY_FADE_M Meter, mindestens aber über eine
+               * ablesbare Strecke: bei „Ganze Stadt" wären zehn Meter ein
+               * halber Pixel, und die Richtung ginge verloren -- gerade sie
+               * ist das Prüfmittel gegen den gespiegelten Azimut.
+               */
+              const len = Math.max(45, RAY_FADE_M / vw.mPerPx);
+              const [ex, ey] = [px + d.de * len, py - d.dn * len];
+              const g = ctx.createLinearGradient(px, py, ex, ey);
+              g.addColorStop(0, colors.ray);
+              g.addColorStop(1, withAlpha(colors.ray, 0));
+              ctx.strokeStyle = g;
+              ctx.beginPath();
+              ctx.moveTo(px, py);
+              ctx.lineTo(ex, ey);
+              ctx.stroke();
+            }
             ctx.setLineDash([]);
+            ctx.lineWidth = 1;
           }
           ctx.beginPath();
           ctx.arc(px, py, 6, 0, Math.PI * 2);
@@ -3777,8 +4064,8 @@
           paint(ctx, true);
         });
         return () => cancelAnimationFrame(id);
-      }, [vw, model, stage, shadowBitmap, shadow, showLayer, smoothBy, showLabels, colors, size.w, size.h,
-          pick, sun.az, sun.elev, layer, hoursBitmap, hours]);
+      }, [vw, model, stage, shadowBitmap, shadow, showLayer, viewBy, showLabels, colors, size.w, size.h,
+          pick, answer, sun.az, sun.elev, layer, hoursBitmap, hours]);
 
       // ------------------------------------------------------------ Bedienung
 
@@ -3914,8 +4201,12 @@
           : layer === 'day' ? iso
           : iso + '-' + pad2(Math.floor(minute / 60)) + pad2(minute % 60);
         const how = hours ? ' ' + '·' + ' ' + hours.stepMin + ' min ' + '·' + ' ' + hours.cellsize + ' m' : '';
+        // Die Höhe nur, wenn sie nicht die Voreinstellung ist: ein Bild von der
+        // Oberfläche braucht die Null nicht im Titel, ein Bild aus 1,7 m schon,
+        // weil es sonst als dieselbe Karte durchginge.
+        const hi = eye > 0 ? ' ' + '·' + ' ' + fmtEye(eye) + ' m ' + t.pngEye : '';
 
-        const title = layer === 'year' ? t.yearLabel + ' ' + '·' + ' ' + ymd.y + how
+        const title = (layer === 'year' ? t.yearLabel + ' ' + '·' + ' ' + ymd.y + how
           : layer === 'day' ? t.hoursLabel + ' ' + '·' + ' ' + day + how
           : t.mapTitle + ' ' + '·' + ' ' + day + ', ' + hhmm(minute)
             + ' ' + '·' + ' ' + t.pngSun.replace('{a}', fmtDeg(sun.az)).replace('{e}', fmtDeg(sun.elev))
@@ -3923,7 +4214,7 @@
             // eine Einstellung und nicht mehr eine Folge des Maßstabs, und ohne
             // sie ließe sich auf dem weitergereichten Bild nicht ablesen, wie
             // fein gerechnet wurde.
-            + (shadow ? ' ' + '·' + ' ' + shadow.cellsize + ' m' : '');
+            + (shadow ? ' ' + '·' + ' ' + shadow.cellsize + ' m' : '')) + hi;
 
         // Der Streifen bekommt denselben Maßstab wie die Karte, sonst schrumpft
         // die Beschriftung mit wachsender Auflösung relativ zum Bild.
@@ -4005,14 +4296,21 @@
               <div className="rs-map-group">
                 <button className=${'lang-seg' + (showLayer ? ' active' : '')}
                         onClick=${() => setShowLayer(s => !s)}>${t.shadowShow}<//>
-                <button className=${'lang-seg' + (smoothBy[layer] ? ' active' : '')}
-                        title=${t.smoothHint}
-                        onClick=${() => setSmoothBy(s => Object.assign({}, s, { [layer]: !s[layer] }))}>
-                  ${t.smoothLabel}
-                <//>
                 <button className=${'lang-seg' + (showLabels ? ' active' : '')}
                         title=${t.labelsHint}
                         onClick=${() => setShowLabels(s => !s)}>${t.labelsLabel}<//>
+              <//>
+              <!-- Eine eigene Gruppe, weil es drei Lesarten desselben Bildes
+                   sind und keine drei unabhängigen Schalter. Die Kantenstufe
+                   gibt es nur beim Schatten: die Stundenkarten sind schon
+                   stetig, dort gibt es keine Kante zu verorten. -->
+              <div className="rs-map-group">
+                ${(layer === 'shadow' ? ['cells', 'edge', 'blur'] : ['cells', 'blur']).map(v => html`
+                  <button key=${'vw' + v} className=${'lang-seg' + (viewBy[layer] === v ? ' active' : '')}
+                          title=${v === 'cells' ? t.viewCellsHint : v === 'edge' ? t.viewEdgeHint : t.viewBlurHint}
+                          onClick=${() => setViewBy(s => Object.assign({}, s, { [layer]: v }))}>
+                    ${v === 'cells' ? t.viewCells : v === 'edge' ? t.viewEdge : t.viewBlur}
+                  <//>`)}
               <//>
               <div className="rs-map-group">
                 <button className="lang-seg" onClick=${() => goto(HOME, 1.1)}>${t.mapZoomOld}<//>
@@ -4031,6 +4329,20 @@
                nach Reiter zu wandern. -->
           <div className="rs-panel" style=${{ marginTop: 10 }}>
             <div className="rs-opts">
+              <!-- Die Höhe steht in jedem Reiter, weil sie in jedem gilt: sie
+                   geht in beide Stundenkarten, in die Schattenkarte und in die
+                   Punktabfrage. -->
+              <div>
+                <div className="rs-cap">${t.optEye}<//>
+                <div>
+                  <input className="rs-numfield" type="text" inputMode="decimal"
+                         value=${eyeText} title=${t.eyeHint}
+                         onChange=${e => setEyeText(e.target.value)}
+                         onBlur=${commitEye}
+                         onKeyDown=${e => { if (e.key === 'Enter') e.target.blur(); }}/>
+                  ${' '}<span className="rs-note">m<//>
+                <//>
+              <//>
               <!-- Dieselbe Frage wie im Stundenreiter, nur mit der zusätzlichen
                    Antwort "nach dem Bild". Sie steht zuerst, damit die
                    Rasterweite in allen drei Reitern an derselben Stelle sitzt. -->
@@ -4168,13 +4480,13 @@
               <//>`}
           <//>
           <p className="rs-note" style=${{ margin: '8px 0 0' }}>${t.mapHint}<//>
-          <${PickReadout} pick=${pick} answer=${answer} sun=${sun}/>
+          <${PickReadout} pick=${pick} answer=${answer} sun=${sun} eye=${eye}/>
         <//>`;
     }
 
     // ------------------------------------------------------ Ablesezeile Ort
 
-    function PickReadout({ pick, answer, sun }) {
+    function PickReadout({ pick, answer, sun, eye }) {
       if (!pick) return html`<p className="rs-note" style=${{ margin: '8px 0 0' }}>${t.pickPrompt}<//>`;
       if (!answer) return html`<p className="rs-note" style=${{ margin: '8px 0 0' }}>${'…'}<//>`;
       if (!answer.known) return html`<p className="rs-warn" style=${{ marginTop: 10 }}>${t.verdictNone}<//>`;
@@ -4212,7 +4524,12 @@
               <div className="rs-note" style=${{ marginTop: 4 }}>${Math.round(answer.ground)} m ${'ü'}. NN<//>
             <//>
           <//>
-          <p className="rs-note" style=${{ margin: '8px 0 0' }}>${t.eyeNote}<//>
+          <!-- Der Satz sagt die eingestellte Höhe und nicht mehr eine feste.
+               Bei null steht dort, was "Oberfläche" heißt, weil genau das die
+               Stelle ist, an der jemand sonst Erdboden liest und im Hof unter
+               dem Baum die falsche Antwort erwartet. -->
+          <p className="rs-note" style=${{ margin: '8px 0 0' }}>
+            ${eye > 0 ? t.eyeNoteH.replace('{h}', fmtEye(eye)) : t.eyeNote}<//>
         <//>`;
     }
 
