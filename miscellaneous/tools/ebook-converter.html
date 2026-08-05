@@ -161,8 +161,14 @@
     .ec-files li { display: flex; align-items: baseline; gap: 10px; padding: 3px 0;
       border-top: 1px solid var(--tool-hairline); }
     .ec-files li:first-child { border-top: 0; }
-    .ec-fname { color: var(--tool-text); flex: 1 1 auto; overflow: hidden;
-      text-overflow: ellipsis; white-space: nowrap; }
+    /* Folder batches: the path is dimmed and gives way first, so that a long
+       folder gets the ellipsis and the file name stays readable. */
+    .ec-fname { color: var(--tool-text); flex: 1 1 auto; min-width: 0;
+      display: flex; align-items: baseline; white-space: nowrap; }
+    .ec-fdir { color: var(--tool-note); flex: 0 5 auto; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; }
+    .ec-fbase { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .ec-skipped { color: var(--tool-note); font-size: 12px; margin: -8px 0 12px; }
     .ec-fstat { flex: 0 0 auto; color: var(--tool-note); font-size: 12px; }
     .ec-fstat.done { color: #0fb5ad; }
     .ec-fstat.failed { color: #fca5a5; }
@@ -458,7 +464,10 @@
           const def = await deflateRaw(e.bytes);
           if (def.length < e.bytes.length) { method = 8; payload = def; }
         }
-        const flags = e.store ? 0 : 0x0800; // 0x0800 = names are UTF-8
+        // 0x0800 = names are UTF-8. Stored entries went without it, which is
+        // fine for the ASCII names EPUB needs but turns folder names with
+        // umlauts into mojibake once a batch ships stored EPUBs inside a zip.
+        const flags = (e.store && !/[^\x00-\x7f]/.test(e.name)) ? 0 : 0x0800;
 
         const lh = new Uint8Array(30 + nameBytes.length);
         const ldv = new DataView(lh.buffer);
@@ -5646,6 +5655,32 @@
     // Already-compressed containers: deflating a zip inside a zip is pure heat.
     const STORED_OUT = { epub: 1, docx: 1, zip: 1, 'pandoc.zip': 1 };
 
+    // A dropped folder keeps its shape: the input path becomes the path inside
+    // the zip. Every segment is sanitised, because an entry name is taken
+    // literally by every unpacker and "..\" or "C:" would write outside the
+    // folder the user unpacks into.
+    function safeSegment(raw) {
+      return String(raw)
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .replace(/[\x00-\x1f\x7f]/g, '')
+        .replace(/\.+$/, '')
+        .trim();
+    }
+
+    // 'Tolkien/Silmarillion.azw3' -> 'Tolkien/'; a bare file name -> ''.
+    function outDirOf(path) {
+      const parts = String(path || '').split(/[\\/]+/);
+      parts.pop(); // the file name itself
+      const clean = [];
+      for (const raw of parts) {
+        const t = raw.trim();
+        if (!t || t === '.' || t === '..' || /^[A-Za-z]:$/.test(t)) continue;
+        const seg = safeSegment(t);
+        if (seg) clean.push(seg);
+      }
+      return clean.length ? clean.join('/') + '/' : '';
+    }
+
     async function convertMany(items, target, opts, onProgress) {
       opts = opts || {};
       const results = [];
@@ -5657,7 +5692,7 @@
         const item = items[i];
         report(i, { name: item.name, status: 'working' });
         const log = makeLog();
-        const entry = { name: item.name, ok: false, error: '', outName: '', outSize: 0, notes: [] };
+        const entry = { name: item.name, path: item.path || item.name, ok: false, error: '', outName: '', outSize: 0, notes: [] };
         try {
           let bytes = new Uint8Array(await item.getBytes());
           let book = await read(bytes, log, item.name);
@@ -5674,10 +5709,14 @@
           }
           const out = await write(book, target);
           book = null;
-          let name = (item.name.replace(/\.[A-Za-z0-9]+$/, '') || 'book') + '.' + out.ext;
+          // Deduplication is per folder: two books of the same name in two
+          // folders are not a collision once the folders are kept.
+          const dir = outDirOf(item.path || item.name);
+          const stem = safeSegment(item.name.replace(/\.[A-Za-z0-9]+$/, '')) || 'book';
+          let name = dir + stem + '.' + out.ext;
           let n = 2;
           while (used.has(name.toLowerCase())) {
-            name = (item.name.replace(/\.[A-Za-z0-9]+$/, '') || 'book') + ' (' + n + ').' + out.ext;
+            name = dir + stem + ' (' + n + ').' + out.ext;
             n++;
           }
           used.add(name.toLowerCase());
@@ -5698,7 +5737,7 @@
       const lines = ['E-book converter batch', 'Target format: ' + target,
         okCount + ' of ' + results.length + ' converted', ''];
       for (const r of results) {
-        lines.push((r.ok ? 'OK   ' : 'FAIL ') + r.name + (r.ok ? '  ->  ' + r.outName : ''));
+        lines.push((r.ok ? 'OK   ' : 'FAIL ') + (r.path || r.name) + (r.ok ? '  ->  ' + r.outName : ''));
         if (r.error) lines.push('       ' + r.error);
         for (const n of r.notes) lines.push('       ' + n);
       }
@@ -5749,7 +5788,7 @@
       buildHtmlParts: buildHtmlParts, writeHtmlReader: writeHtmlReader,
       readerTocHtml: readerTocHtml, readerJs: readerJs,
       readerThemes: READER_THEMES, readerFonts: READER_FONTS,
-      convertMany: convertMany,
+      convertMany: convertMany, outDirOf: outDirOf, safeSegment: safeSegment,
     };
   })();
   </script>
@@ -5774,6 +5813,77 @@
       .filter((id) => FORMATS[id].read === true)
       .map((id) => FORMATS[id].exts.join(','))
       .join(',') + ',application/epub+zip,text/plain';
+
+    // A folder picker and a folder drop both ignore `accept`, so the same
+    // registry has to do the filtering by hand.
+    const READ_EXTS = new Set(
+      Object.keys(FORMATS)
+        .filter((id) => FORMATS[id].read === true)
+        .reduce((acc, id) => acc.concat(FORMATS[id].exts), [])
+        .map((e) => e.replace(/^\./, '').toLowerCase())
+    );
+    function isReadable(name) {
+      const m = /\.([A-Za-z0-9]+)$/.exec(name || '');
+      return !!m && READ_EXTS.has(m[1].toLowerCase());
+    }
+
+    // ---- dropped folders -------------------------------------------------
+    // Three things bite here, all of them silently:
+    //   * dataTransfer.items is emptied the moment the handler yields, so every
+    //     entry must be taken synchronously, before the first await;
+    //   * readEntries() hands out at most 100 children per call, so it has to be
+    //     called until it returns an empty list, or folder number 101 onwards
+    //     simply does not exist;
+    //   * browsers without webkitGetAsEntry still give a flat file list, which
+    //     is exactly the old behaviour.
+    const MAX_DEPTH = 16; // guards against symlink cycles
+
+    function readAllEntries(reader) {
+      return new Promise((resolve, reject) => {
+        const all = [];
+        const step = () => reader.readEntries((chunk) => {
+          if (!chunk.length) { resolve(all); return; }
+          for (const c of chunk) all.push(c);
+          step();
+        }, reject);
+        step();
+      });
+    }
+
+    function walkEntry(entry, prefix, out, depth) {
+      if (!entry || depth > MAX_DEPTH) return Promise.resolve();
+      if (entry.isFile) {
+        return new Promise((resolve) => {
+          entry.file(
+            (f) => { out.push({ file: f, path: prefix + f.name }); resolve(); },
+            () => resolve()
+          );
+        });
+      }
+      if (!entry.isDirectory) return Promise.resolve();
+      const sub = prefix + entry.name + '/';
+      return readAllEntries(entry.createReader())
+        .then((kids) => kids.reduce(
+          (p, k) => p.then(() => walkEntry(k, sub, out, depth + 1)),
+          Promise.resolve()
+        ))
+        .catch(() => {});
+    }
+
+    function collectDropped(dt) {
+      const roots = [];
+      const items = dt.items ? Array.from(dt.items) : [];
+      for (const it of items) {
+        const e = it.webkitGetAsEntry && it.webkitGetAsEntry();
+        if (e) roots.push(e);
+      }
+      const flat = Array.from(dt.files || []).map((f) => ({ file: f, path: f.name }));
+      if (!roots.length) return Promise.resolve(flat);
+      const out = [];
+      return roots
+        .reduce((p, e) => p.then(() => walkEntry(e, '', out, 0)), Promise.resolve())
+        .then(() => (out.length ? out : flat));
+    }
 
     function fmtSize(n) {
       if (n < 1024) return n + ' B';
@@ -6830,18 +6940,36 @@
         setTab('convert');
       };
 
-      // One file behaves exactly as before; two or more open the batch.
-      const loadFiles = useCallback((list) => {
-        if (!list || !list.length) return;
-        if (list.length === 1) { loadFile(list[0]); return; }
+      // Takes [{ file, path }]. One file behaves exactly as before, extension
+      // and all: sniff() can still recognise a book called ".bin". Only a
+      // multi-file pick gets filtered, because a folder brings along covers,
+      // notes and whatever else lives next to the books.
+      const loadPicked = useCallback((picked) => {
+        if (!picked || !picked.length) return;
+        if (picked.length === 1) { loadFile(picked[0].file); return; }
+        const books = picked.filter((p) => isReadable(p.file.name));
+        const skipped = picked.length - books.length;
+        if (!books.length) {
+          reset();
+          setError('None of those ' + picked.length + ' files is in a format this converter reads.');
+          return;
+        }
+        if (books.length === 1) { loadFile(books[0].file); return; }
         reset();
         setBatch({
-          files: Array.from(list).map((f) => ({
-            file: f, name: f.name, size: f.size, status: 'queued', error: '', outName: '', outSize: 0,
+          files: books.map((p) => ({
+            file: p.file, name: p.file.name, path: p.path || p.file.name, size: p.file.size,
+            status: 'queued', error: '', outName: '', outSize: 0,
           })),
-          running: false, done: 0, current: '',
+          skipped: skipped, running: false, done: 0, current: '',
         });
       }, []);
+
+      const loadFileList = useCallback((list) => {
+        loadPicked(Array.from(list || []).map((f) => ({
+          file: f, path: f.webkitRelativePath || f.name,
+        })));
+      }, [loadPicked]);
 
       const loadFile = useCallback((file) => {
         if (!file) return;
@@ -6890,6 +7018,7 @@
           files: b.files.map((f) => Object.assign({}, f, { status: 'queued', error: '' })) }));
         const items = batch.files.map((f) => ({
           name: f.name,
+          path: f.path || f.name,
           getBytes: () => f.file.arrayBuffer().then((buf) => new Uint8Array(buf)),
         }));
         const opts = {
@@ -6963,13 +7092,15 @@
             onDrop=${(e) => {
               e.preventDefault();
               setOver(false);
-              loadFiles(e.dataTransfer.files);
+              collectDropped(e.dataTransfer).then(loadPicked).catch(() => {
+                loadFileList(e.dataTransfer.files);
+              });
             }}
             style=${{ marginBottom: 18 }}
           >
             ${book || batch ? html`
               <div style=${{ color: 'var(--tool-note)', fontSize: 13 }}>
-                Drop other e-books here, or click to choose them
+                Drop other e-books or a folder here, or click to choose files
               </div>
             ` : html`
               <${React.Fragment}>
@@ -6977,7 +7108,8 @@
                   Drop an e-book here, or click to choose one
                 </div>
                 <div style=${{ color: 'var(--tool-note)', fontSize: 13 }}>
-                  EPUB, MOBI, AZW3, TXT, Markdown or HTML · several at once for batch mode
+                  EPUB, MOBI, AZW3, TXT, Markdown or HTML · several at once for batch mode ·
+                  drop a whole folder and the output keeps its structure
                 </div>
               <//>
             `}
@@ -6987,7 +7119,7 @@
               accept=${ACCEPT}
               multiple
               style=${{ display: 'none' }}
-              onChange=${(e) => loadFiles(e.target.files)}
+              onChange=${(e) => loadFileList(e.target.files)}
             />
           </div>
 
@@ -7023,10 +7155,22 @@
                 </dd>
               </dl>
 
+              ${batch.skipped > 0 && html`
+                <p className="ec-skipped">
+                  ${batch.skipped} other ${batch.skipped === 1 ? 'file' : 'files'} skipped:
+                  not an e-book format this converter reads.
+                </p>
+              `}
+
               <ul className="ec-files">
                 ${batch.files.map((f, i) => html`
                   <li key=${i}>
-                    <span className="ec-fname">${f.name}</span>
+                    <span className="ec-fname">
+                      ${f.path && f.path !== f.name && html`
+                        <span className="ec-fdir">${f.path.slice(0, f.path.length - f.name.length)}</span>
+                      `}
+                      <span className="ec-fbase">${f.name}</span>
+                    </span>
                     <span className=${'ec-fstat ' + f.status}>
                       ${f.status === 'done'
                         ? f.outName + ' · ' + fmtSize(f.outSize)

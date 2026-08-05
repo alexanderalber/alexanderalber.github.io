@@ -64,6 +64,31 @@
       grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
       gap: 10px 14px;
     }
+    /* Die Ablesewerte hängen im selben Kasten wie die Steuerung, getrennt nur
+       durch eine Haarlinie. Zwei Kästen kosteten zwei Polsterungen und den
+       Abstand dazwischen, gut vierzig Pixel Höhe, und trennten nichts, was die
+       Linie nicht auch trennt. */
+    .rs-readout.rs-attached {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1.5px solid var(--tool-hairline);
+    }
+    /* Datum und die beiden Sprungknöpfe in einer Zeile statt übereinander: das
+       Feld braucht nicht die volle Spaltenbreite, und Picos Vorgabe für ein
+       Eingabefeld ist reichlich hoch. Die Knöpfe stehen mittig, nicht gestreckt
+       -- auf Feldhöhe gezogen wären sie doppelt so hoch wie überall sonst. */
+    .rs-daterow {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .rs-daterow > input[type=date] {
+      flex: 0 1 11rem;
+      min-width: 0;
+      margin: 0;
+      padding: 6px 10px;
+      height: auto;
+    }
     .rs-num {
       font-variant-numeric: tabular-nums;
       font-size: 1.35rem;
@@ -229,44 +254,9 @@
        also wie eine Einstellung unter vielen. Der Unterstrich liegt auf der
        Grundlinie der ganzen Leiste, deshalb trägt die Leiste den Strich und
        der aktive Reiter überzeichnet ihn dicker in der Akzentfarbe. */
-    .rs-tabstrip {
-      display: flex;
-      gap: 18px;
-      border-bottom: 1px solid var(--tool-hairline);
-    }
-    .rs-tab {
-      margin: 0;
-      padding: 4px 2px 6px;
-      width: auto;
-      background: transparent;
-      border: none;
-      border-bottom: 2px solid transparent;
-      border-radius: 0;
-      font-size: 0.85rem;
-      font-weight: 500;
-      line-height: 1.3;
-      color: var(--tool-label);
-      cursor: pointer;
-      /* Der Strich sitzt auf dem Strich der Leiste und nicht darunter. */
-      margin-bottom: -1px;
-    }
-    /* Pico setzt auf button:is(:hover,:active,:focus) eine eigene Farbe und
-       einen Rahmen; beides muss hier ausdrücklich zurückgenommen werden. */
-    .rs-tab:hover:not(.active),
-    .rs-tab:focus:not(.active) {
-      background: transparent;
-      border-color: transparent;
-      border-bottom-color: var(--tool-hairline);
-      color: var(--tool-emph);
-    }
-    .rs-tab.active,
-    .rs-tab.active:hover,
-    .rs-tab.active:focus {
-      background: transparent;
-      color: var(--pico-primary);
-      border-bottom-color: var(--pico-primary);
-      font-weight: 600;
-    }
+    /* Die Reiter selbst sind seit dem 2026-08-05 das zentrale .tabstrip in
+       custom.css: sechs weitere Werkzeuge wollten dasselbe Muster, und zwei
+       Quellen dafür wären eine zu viel. Hier bleibt nur ihr Rahmen. */
     .rs-tabs {
       margin-bottom: 8px;
       display: flex;
@@ -2419,6 +2409,128 @@
       return { hours: hours, steps: patches.length };
     }
 
+    // ------------------------------------------ Die vorberechnete Jahreskarte
+
+    /* Dieselbe Karte, nur nicht gerechnet, sondern nachgeschlagen.
+     *
+     * Warum es sie gibt: die Jahreskarte kostet Sekunden, ist bei 12 Mio Zellen
+     * gedeckelt und liefert am Ende eine einzige Zahl je Zelle. Auf 1 m für die
+     * ganze Stadt vorberechnet sind das 8 MB WebP -- weniger als die Gebäude
+     * daneben -- und damit gibt es sie zum ersten Mal überhaupt für mehr als
+     * einen Ausschnitt: 169 Mio Zellen reißen den Deckel um Faktor 14, und
+     * gerechnet wären es zweieinhalb Stunden im Browserfaden.
+     *
+     * Was nicht mitkommt, ist der Parameterraum. Vorberechnet ist genau eine
+     * Augenhöhe und genau eine Sichtbarkeitsschwelle; wer daran dreht, bekommt
+     * wieder den Rechenweg. Alles andere fällt weg: der Ausschnitt (das
+     * übernimmt die Kachelung), die Rasterweite (fein abgelegt, gröber
+     * abgetastet), Fächerfeinheit und Zeitschritt (immer die feinste Stufe) und
+     * das Jahr, denn die Sonnenbahn ändert sich zwischen zwei Jahren um
+     * weniger, als die Quantisierung ohnehin verschluckt.
+     *
+     * Die Zahlen dahinter stehen in notes/tools/regensburg-sun/.
+     */
+
+    /* Die im Jahr mögliche Sonnenscheindauer an dieser Stelle -- der Wert, bis
+     * zu dem die Farbskala läuft.
+     *
+     * Er ist über die Stadt nicht konstant, sondern schwankt zwischen 4099 und
+     * 4401 Stunden, je nachdem wieviel Himmel der Fernhorizont wegnimmt. Ohne
+     * ihn hieße dieselbe Farbe im Westen etwas anderes als im Osten. Abgelegt
+     * ist er je 2-km-Block, weil er in dieser Auflösung entsteht: ein
+     * Fernhorizontprofil je Blockmitte, genau wie der Rechenweg eines je
+     * Fenstermitte nimmt.
+     *
+     * Gesucht wird der nächstgelegene Block und nicht der zuständige: die
+     * Blockliste hat Löcher (wo keine Kacheln liegen, wurde nichts gerechnet),
+     * und ein Ausschnitt am Stadtrand fiele sonst auf null zurück.
+     */
+    function sunYearPossible(meta, e, n) {
+      const bl = meta && meta.blocks;
+      if (!bl || !bl.length) return 0;
+      const km = meta.blockKm * 1000;
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < bl.length; i++) {
+        const ce = bl[i][0] * 1000 + km / 2, cn = bl[i][1] * 1000 + km / 2;
+        const d = (ce - e) * (ce - e) + (cn - n) * (cn - n);
+        if (d < bestD) { bestD = d; best = bl[i][2]; }
+      }
+      return best;
+    }
+
+    /* Das Stundenfeld für einen Ausschnitt aus den Kacheln zusammensetzen.
+     *
+     * Dieselbe Form wie `assembleHeights`, und mit Absicht dieselbe Geometrie:
+     * Zeile 0 im Norden, Ursprung in der Südwestecke, Zellmitte eine halbe
+     * Zelle davon entfernt. Wer hier eine halbe Zelle verschiebt, verschiebt
+     * die Jahreskarte gegen die Schattenkarte, und das sieht man erst an einer
+     * Häuserkante im tiefen Zoom.
+     *
+     * Bei gröberer Rasterweite wird gemittelt und nicht abgetastet, und das ist
+     * der eine Punkt, an dem der Nachschlageweg bewusst anders rechnet als der
+     * Rechenweg: der nimmt bei 4 m das Höhenmaximum je Zelle, weil ein Mittel
+     * die Giebel schrumpfen ließe, von denen der Schatten kommt. Hier gibt es
+     * keine Höhen mehr, sondern fertige Stundenzahlen, und deren Mittel über
+     * vier Quadratmeter ist wieder eine Stundenzahl. Abtasten hieße, von
+     * sechzehn Werten fünfzehn wegzuwerfen.
+     *
+     * `tileAt(eKm, nKm)` liefert die entpackte Kachel oder null. Woher sie
+     * kommt, weiß dieser Block nicht -- deshalb ist er in Node prüfbar.
+     */
+    function sunYearField(meta, spec, tileAt) {
+      const rows = spec.rows, cols = spec.cols, cellsize = spec.cellsize;
+      const out = new Float32Array(rows * cols);
+      const topN = spec.originN + rows * cellsize;
+      const px = meta.px, km = px * meta.cellsize;
+      const scale = meta.scaleMax / 254;
+      /* 255 heißt unbekannt -- aber nur, wenn es unbekannte Zellen gibt. Sonst
+       * ist jede 255 ein Überschwinger des Packers an einer hellen Dachkante,
+       * und die als Loch zu lesen risse über die Stadt hunderttausend
+       * durchsichtige Punkte in eine lückenlose Karte. Wieviele es wirklich
+       * sind, sagt das Manifest.
+       */
+      const unk = meta.unknownCount > 0 ? meta.unknown : -1;
+      const sub = Math.max(1, Math.round(cellsize / meta.cellsize));
+      const subSize = cellsize / sub;
+
+      // Die zuletzt benutzte Kachel merken, aus demselben Grund wie in
+      // `assembleHeights`: gelaufen wird zeilenweise, also ist es fast immer
+      // dieselbe, und der Nachschlag kostet sonst mehr als das Mitteln.
+      let lastE = NaN, lastN = NaN, lastTile = null;
+
+      for (let row = 0; row < rows; row++) {
+        const nTop = topN - row * cellsize;
+        for (let col = 0; col < cols; col++) {
+          const eLeft = spec.originE + col * cellsize;
+          let sum = 0, cnt = 0;
+          for (let dy = 0; dy < sub; dy++) {
+            const n = nTop - (dy + 0.5) * subSize;
+            const nKm = Math.floor(n / km);
+            for (let dx = 0; dx < sub; dx++) {
+              const e = eLeft + (dx + 0.5) * subSize;
+              const eKm = Math.floor(e / km);
+              if (eKm !== lastE || nKm !== lastN) {
+                lastE = eKm; lastN = nKm; lastTile = tileAt(eKm, nKm);
+              }
+              if (!lastTile) continue;
+              let c = Math.floor((e - eKm * km) / meta.cellsize);
+              let r = Math.floor(((nKm + 1) * km - n) / meta.cellsize);
+              if (c < 0) c = 0; else if (c >= px) c = px - 1;
+              if (r < 0) r = 0; else if (r >= px) r = px - 1;
+              const v = lastTile[r * px + c];
+              if (v === unk) continue;
+              sum += v; cnt++;
+            }
+          }
+          // Keine einzige bekannte Teilprobe heißt unbekannt, nicht null. Der
+          // Unterschied ist derselbe wie beim Höhenmodell: eine Null läse sich
+          // als Ort ohne jede Sonne, und den gibt es hier nicht.
+          out[row * cols + col] = cnt ? (sum / cnt) * scale : NaN;
+        }
+      }
+      return out;
+    }
+
     /* Farbe einer Sonnenstundenzahl. Die Rampe ist eine Liste von Stützstellen
      * [Anteil, r, g, b], linear dazwischen. Sie kommt von außen, weil sie zum
      * Skin gehört und nicht zur Rechnerei.
@@ -2957,6 +3069,42 @@
       });
     }
 
+    /* Wieviele Kacheln gleichzeitig durch die Entpackstrecke dürfen.
+     *
+     * Das ist keine Höflichkeit gegenüber dem Server, sondern eine
+     * Speicherschranke, und sie hat sich in der elften Session als nötig
+     * erwiesen. Eine Kachel kostet beim Entpacken kurzzeitig das Achtfache
+     * ihrer Bytes: die Bitmap mit vier Kanälen (4 MB) und daneben das
+     * ImageData, das `getImageData` noch einmal frisch anlegt (4 MB). Bei
+     * 112 Kacheln auf einmal -- der ganzen Stadt -- sind das rund 900 MB, die
+     * gleichzeitig offen stehen. Der Browser wirft dann irgendwo, und weil ein
+     * Ladefehler bisher stillschweigend "diese Kachel gibt es eben nicht"
+     * hiess, kam die Karte mit Löchern heraus, an jedem Versuch an anderer
+     * Stelle. Das sah nach fehlenden Daten aus und war Speichermangel.
+     *
+     * Sechs ist nicht gemessen, sondern die Zahl, die auch der Browser für
+     * gleichzeitige Verbindungen zu einem Host nimmt: darüber hinaus wartet
+     * ohnehin etwas, nur eben mit schon belegtem Speicher.
+     */
+    const TILE_LANES = 6;
+    let tileActive = 0;
+    const tileWaiting = [];
+    function tileLane(job) {
+      return new Promise((resolve, reject) => {
+        const start = () => {
+          tileActive++;
+          job().then(
+            v => { tileActive--; tileNext(); resolve(v); },
+            e => { tileActive--; tileNext(); reject(e); }
+          );
+        };
+        if (tileActive < TILE_LANES) start(); else tileWaiting.push(start);
+      });
+    }
+    function tileNext() {
+      while (tileActive < TILE_LANES && tileWaiting.length) tileWaiting.shift()();
+    }
+
     /* Ein WebP in seine Bytes zurückverwandeln.
      *
      * colorSpaceConversion 'none' ist nicht kosmetisch: die Bilder tragen keine
@@ -2985,7 +3133,11 @@
         });
     }
 
-    function loadNdomTile(url) {
+    // Ein Bild, in dem nur der Rotkanal etwas bedeutet, als Bytefeld. Das gilt
+    // für zweierlei Kacheln: die Objekthöhen des nDOM und die vorberechneten
+    // Jahres-Sonnenstunden. Der Dekoder ist derselbe, die Bedeutung nicht --
+    // die steht im jeweiligen Manifest.
+    function loadByteTile(url) {
       return loadPixels(url).then(img => {
         const out = new Uint8Array(img.w * img.h);
         for (let i = 0; i < out.length; i++) out[i] = img.rgba[i * 4];
@@ -3006,15 +3158,40 @@
      * rechnen will, und danach behalten. Die Obergrenze ist da, weil ein
      * ausgiebiges Herumschieben über die Stadt sonst alle 112 Kacheln im
      * Speicher sammelt, also gut 112 MB.
+     *
+     * Die Liste und der Pfad kommen als Argument, weil es zwei Sätze Kacheln
+     * gibt: die Objekthöhen und die vorberechnete Jahreskarte. Beide sind
+     * 1000 x 1000 Byte, beide liegen im selben 1-km-Raster, beide werden nach
+     * demselben Muster geholt und behalten -- nur die Bedeutung ist eine andere,
+     * und die steht nicht hier.
      */
-    function makeTileStore(hm) {
+    function makeTileStore(tiles, path, limit) {
       const cache = new Map();
       const pending = new Map();
-      const exists = new Set(hm.ndom.tiles.map(([e, n]) => tileKey(e, n)));
-      const LIMIT = 64;
+      const exists = new Set(tiles.map(([e, n]) => tileKey(e, n)));
+      const LIMIT = limit || 64;
+      // Kacheln, die es geben müsste und die trotzdem nicht kamen. Nicht
+      // dasselbe wie eine Kachel, die es nie gab, und deshalb getrennt gezählt:
+      // die eine ist der Rand des Modells, die andere ein Fehler.
+      let lost = 0;
 
       function url(eKm, nKm) {
-        return DATA + hm.ndom.path.replace('{e}', eKm).replace('{n}', nKm);
+        return DATA + path.replace('{e}', eKm).replace('{n}', nKm);
+      }
+
+      /* Ein zweiter Versuch, bevor eine Kachel aufgegeben wird.
+       *
+       * Der erste Fehlschlag ist fast nie "die Datei ist nicht da" -- das
+       * wüsste `exists` schon vorher -- sondern ein Abbruch unterwegs. Ein
+       * einzelner Wiederholungsversuch holt genau die zurück, und die kurze
+       * Pause davor ist der Unterschied zwischen "nochmal in dieselbe
+       * Verstopfung hinein" und "nachdem die anderen durch sind".
+       */
+      function fetchTile(eKm, nKm) {
+        const u = url(eKm, nKm);
+        return tileLane(() => loadByteTile(u)).catch(
+          () => new Promise(res => setTimeout(res, 250)).then(() => tileLane(() => loadByteTile(u)))
+        );
       }
       return {
         // Für assembleHeights: rein synchron, null heißt "nicht da".
@@ -3034,23 +3211,35 @@
             keep.add(k);
             if (cache.has(k) || !exists.has(k)) continue;
             if (!pending.has(k)) {
-              pending.set(k, loadNdomTile(url(e, nn))
+              pending.set(k, fetchTile(e, nn)
                 .then(d => { cache.set(k, d); pending.delete(k); })
-                // Eine Kachel, die nicht lädt, bleibt unbekannt. Das ist
-                // dieselbe Lage wie eine, die es nie gab, und der Strahlmarsch
-                // bricht daran ab, statt Sonne zu behaupten.
-                .catch(() => { pending.delete(k); }));
+                /* Eine Kachel, die auch beim zweiten Versuch nicht lädt, bleibt
+                 * unbekannt: der Strahlmarsch bricht daran ab, statt Sonne zu
+                 * behaupten. Sie wird aber gezählt und gemeldet, und das ist
+                 * der Unterschied zu vorher. Ein Loch mitten in der Stadt sieht
+                 * aus wie fehlende Daten, und wer nicht erfährt, dass da etwas
+                 * schiefging, sucht den Fehler im Modell.
+                 */
+                .catch(err => {
+                  lost++;
+                  pending.delete(k);
+                  console.warn('regensburg-sun: Kachel ' + k + ' kam nicht.', err);
+                }));
             }
             // Eine Kachel, die schon für eine frühere Anfrage lädt, wird hier
             // mitgezählt und mitgemeldet: für den Wartenden ist sie dasselbe.
             jobs.push(pending.get(k).then(tick, tick));
           }
           if (onTiles) onTiles(0, jobs.length);
+          const before = lost;
           return Promise.all(jobs).then(() => {
             for (const k of cache.keys()) {
               if (cache.size <= LIMIT) break;
               if (!keep.has(k)) cache.delete(k);
             }
+            // Was dieser Aufruf verloren hat, nicht was je verlorenging: der
+            // Anrufer will wissen, ob *sein* Bild vollständig ist.
+            return lost - before;
           });
         }
       };
@@ -3066,8 +3255,20 @@
      * beantwortet zwei Fragen: eine Fläche und einen Punkt. Er weiß nichts von
      * Workern und nichts von React, deshalb läuft er in beidem.
      */
-    function makeEngine(hm) {
-      const store = makeTileStore(hm);
+    function makeEngine(hm, ymeta) {
+      const store = makeTileStore(hm.ndom.tiles, hm.ndom.path, 64);
+      /* Der zweite Kachelsatz, und er ist nur da, wenn die Datei da ist: das
+       * Tool läuft ohne die vorberechnete Jahreskarte vollständig weiter, es
+       * rechnet dann eben. Deshalb wird ihr Fehlen nirgends als Fehler
+       * behandelt, sondern als "gibt es hier nicht".
+       *
+       * Der kleinere Vorrat als beim nDOM ist Absicht. Wer die ganze Stadt
+       * anschaut, hält kurzzeitig alle 112 Kacheln, das lässt sich nicht
+       * umgehen; danach soll er wieder auf ein erträgliches Maß fallen, und
+       * zwar auf ein kleineres als der Höhensatz, der die teurere Rechnung
+       * bedient.
+       */
+      const yearStore = ymeta ? makeTileStore(ymeta.tiles, ymeta.path, 48) : null;
       let dgm = null, far = null;
 
       function assemble(spec) {
@@ -3221,6 +3422,53 @@
           });
         },
 
+        /* Die Jahreskarte nachschlagen statt rechnen.
+         *
+         * Von außen sieht die Antwort aus wie die von `sunhours` mit
+         * `span: 'year'` -- dasselbe Feld, dieselben Maße, derselbe Bezugswert
+         * -- damit die Karte oben nicht zwei Fälle malen muss. Der Unterschied
+         * steht in einem einzigen Feld: `precomputed`. Die Statuszeile sagt es
+         * weiter, denn der Unterschied ist für den Bedienenden spürbar (sofort
+         * gegen Sekunden) und darf nicht unerklärt bleiben.
+         *
+         * Kein Zuschlag um den Ausschnitt, und das ist der zweite Unterschied:
+         * die 400 m sind beim Rechnen nötig, damit ein Haus jenseits des
+         * Randes noch Schatten wirft. Hier steckt der Zuschlag längst in den
+         * Kacheln. Ihn trotzdem zu holen, hieße die anderthalbfache Fläche zu
+         * laden, um sie danach wegzuschneiden.
+         */
+        sunyear: function (req, onProgress) {
+          const report = onProgress || function () { };
+          if (!yearStore) return Promise.reject(new Error('keine vorberechnete Jahreskarte'));
+          const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
+          return yearStore.ensure(list, (done, total) => {
+            // Das Zusammensetzen ist gegen das Laden so schnell, dass ein
+            // eigener Anteil im Balken nur ein Zucken am Ende wäre.
+            if (total > 0) report(0.95 * done / total);
+          }).then((missing) => {
+            const cs = req.cellsize;
+            const cols = Math.ceil((req.e1 - req.e0) / cs);
+            const rows = Math.ceil((req.n1 - req.n0) / cs);
+            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
+            const hours = sunYearField(ymeta, spec, yearStore.tileAt);
+            const ce = (req.e0 + req.e1) / 2, cn = (req.n0 + req.n1) / 2;
+            report(1);
+            return {
+              hours: hours, dayHours: sunYearPossible(ymeta, ce, cn),
+              /* Keine Fächerzahl, und das ist kein Vergessen. Die Fußnote unter
+               * der Legende meldet sonst, über wieviele Richtungen summiert
+               * wurde, weil das die teure Einstellung ist. Vorberechnet ist es
+               * keine Einstellung mehr, und die Zahl wäre auch keine: sie lag
+               * je 2-km-Block zwischen 578 und 591. Die Fußnote sagt an ihrer
+               * Stelle, woher die Karte kommt.
+               */
+              steps: 0, stepMin: ymeta.stepMin,
+              span: 'year', precomputed: true, missing: missing || 0,
+              rows: rows, cols: cols, cellsize: cs, spec: spec
+            };
+          });
+        },
+
         point: function (req) {
           const e = req.e, n = req.n;
           const list = tilesForExtent(hm, e - NEAR_M, n - NEAR_M, e + NEAR_M, n + NEAR_M);
@@ -3282,7 +3530,7 @@
       const msg = ev.data;
       if (msg.type === 'init') {
         if (msg.origin) setDataOrigin(msg.origin);
-        WORKER_ENGINE = makeEngine(msg.hm);
+        WORKER_ENGINE = makeEngine(msg.hm, msg.sunyear);
         WORKER_ENGINE.loadHeavy()
           .then(() => postMessage({ type: 'ready' }))
           .catch(err => postMessage({ type: 'failed', message: String(err) }));
@@ -3320,6 +3568,22 @@
             cellsize: r.cellsize, spec: r.spec
           }, [r.hours.buffer]);
         }).catch(err => postMessage({ type: 'sunhours', token: msg.token, error: String(err) }));
+        return;
+      }
+      // Eigene Art und nicht ein Schalter in 'sunhours': der Klient hält je Art
+      // genau eine Anfrage vor, und die beiden Wege sollen sich nicht
+      // gegenseitig überholen. Wer an der Augenhöhe dreht, schickt eine
+      // Rechnung los, während vielleicht noch ein Nachschlagen unterwegs ist.
+      if (msg.type === 'sunyear') {
+        const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
+        WORKER_ENGINE.sunyear(msg, tell).then(r => {
+          postMessage({
+            type: 'sunyear', token: msg.token, hours: r.hours, dayHours: r.dayHours,
+            steps: r.steps, stepMin: r.stepMin, span: r.span, precomputed: true,
+            missing: r.missing,
+            rows: r.rows, cols: r.cols, cellsize: r.cellsize, spec: r.spec
+          }, [r.hours.buffer]);
+        }).catch(err => postMessage({ type: 'sunyear', token: msg.token, error: String(err) }));
         return;
       }
       if (msg.type === 'point') {
@@ -3458,6 +3722,11 @@
         yearHint:     'Wie viele Stunden Sonne eine Stelle im ganzen Jahr bekommt. Gerechnet wird nicht Tag für Tag, sondern über die Richtungen, in denen die Sonne im Lauf des Jahres steht.',
         yearNorm:     'Die Skala läuft bis zur im Jahr überhaupt möglichen Sonnenscheindauer an dieser Stelle, im Mittel {d} am Tag.',
         yearScale:    'Gerechnet aus {n} Sonnenrichtungen, in die das Jahr in Schritten von {s} Minuten einsortiert wurde.',
+        yearPre:      'Nachgeschlagen statt gerechnet: diese Karte liegt für die ganze Stadt auf einem Meter fertig bereit, in der feinsten Richtungsstufe, für {e} m Augenhöhe und {m} sichtbare Sonnenscheibe.',
+        yearWhyEye:   'Gerechnet, weil die Augenhöhe von den vorberechneten {e} m abweicht. Zurück auf {e} m, und die Karte ist sofort da.',
+        yearWhyMode:  'Gerechnet, weil die Sichtbarkeitsschwelle von den vorberechneten {m} abweicht. Zurück auf {m}, und die Karte ist sofort da.',
+        yearFetch:    'wird geholt',
+        tilesLost:    '{n} Kacheln sind nicht angekommen; dort hat die Karte Löcher. Noch einmal holen hilft meistens.',
         optDirs:      'Richtungen',
         dirsCoarse:   'grob',
         dirsMid:      'mittel',
@@ -3609,6 +3878,11 @@
         yearHint:     'How many hours of sun a spot gets over a whole year. Not computed day by day, but over the directions the sun occupies during the year.',
         yearNorm:     'The scale runs to the sunshine hours possible at this spot over a year, an average of {d} a day.',
         yearScale:    'Computed from {n} sun directions, into which the year was sorted in steps of {s} minutes.',
+        yearPre:      'Looked up rather than computed: this map is ready for the whole city at one metre, at the finest direction setting, for an eye height of {e} m and {m} of the sun visible.',
+        yearWhyEye:   'Computed, because the eye height differs from the precomputed {e} m. Back to {e} m and the map is there at once.',
+        yearWhyMode:  'Computed, because the visibility threshold differs from the precomputed {m}. Back to {m} and the map is there at once.',
+        yearFetch:    'loading',
+        tilesLost:    '{n} tiles did not arrive; the map has holes there. Fetching again usually helps.',
         optDirs:      'Directions',
         dirsCoarse:   'coarse',
         dirsMid:      'medium',
@@ -3916,9 +4190,10 @@
       const ready = new Promise(res => { readyResolve = res; });
       let token = 0;
       let hm = null;
+      let ymeta = null;
       let settled = false;
-      const queued = { shadow: null, point: null, sunhours: null };
-      const busy = { shadow: false, point: false, sunhours: false };
+      const queued = { shadow: null, point: null, sunhours: null, sunyear: null };
+      const busy = { shadow: false, point: false, sunhours: false, sunyear: false };
 
       function done(ok) { if (!settled) { settled = true; readyResolve(ok); } }
 
@@ -3932,9 +4207,9 @@
         if (settled || inline) return;
         console.warn('regensburg-sun: Worker faellt aus, es rechnet der Hauptfaden.', why);
         if (worker) { try { worker.terminate(); } catch (e) { /* egal */ } worker = null; }
-        inline = makeEngine(hm);
+        inline = makeEngine(hm, ymeta);
         inline.loadHeavy().then(
-          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); },
+          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); pump('sunyear'); },
           err => { console.warn(err); done(false); }
         );
       }
@@ -3982,10 +4257,11 @@
       }
 
       return {
-        start: function (manifest) {
+        start: function (manifest, sunyearMeta) {
           hm = manifest;
+          ymeta = sunyearMeta || null;
           if (worker) {
-            worker.postMessage({ type: 'init', hm: hm, origin: location.origin });
+            worker.postMessage({ type: 'init', hm: hm, sunyear: ymeta, origin: location.origin });
             // Ein Worker, der nach dieser Frist weder fertig noch kaputt ist,
             // kommt auch nicht mehr. Ohne die Frist bliebe die Karte für immer
             // bei "wird geladen" stehen, und genau das ist schwerer zu
@@ -4694,14 +4970,25 @@
 
     function loadModel(stage) {
       if (MODEL_JOB) return MODEL_JOB;
-      const model = { hm: null, client: null, ready: false, base: null, buildings: null, index: null };
-      MODEL_JOB = loadJson(DATA + 'heightmap.json')
-        .then(hm => {
+      const model = { hm: null, sunyear: null, client: null, ready: false, base: null, buildings: null, index: null };
+      /* Das Manifest der vorberechneten Jahreskarte kommt mit dem Höhenmodell
+       * zusammen, 2 kB, und sein Fehlen ist kein Fehler: ohne die Datei rechnet
+       * der dritte Reiter wie eh und je. Es wird hier oben geladen und nicht im
+       * Motor, weil beide es brauchen -- der Motor zum Nachschlagen, die
+       * Bedienung, um zu wissen, für welche Augenhöhe und welche
+       * Sichtbarkeitsschwelle das Nachschlagen überhaupt gilt.
+       */
+      MODEL_JOB = Promise.all([
+        loadJson(DATA + 'heightmap.json'),
+        loadJson(DATA + 'sunyear.json').catch(() => null)
+      ])
+        .then(([hm, ym]) => {
           model.hm = hm;
+          model.sunyear = ym;
           // Der Motor fängt sofort an, Gelände und Fernhorizont zu holen, und
           // tut das neben dem Laden der Basiskarte statt danach.
           model.client = makeModelClient();
-          model.clientReady = model.client.start(hm);
+          model.clientReady = model.client.start(hm, ym);
           return Promise.all([
             loadJson(DATA + 'water.json'), loadJson(DATA + 'green.json'),
             loadJson(DATA + 'roads.json'), loadJson(DATA + 'labels.json')
@@ -4793,7 +5080,21 @@
       const [showLabels, setShowLabels] = useState(true);
       const [busy, setBusy] = useState(false);
       const [progress, setProgress] = useState(0);
-      const [layer, setLayer] = useState('shadow');
+      /* Der Reiter, mit dem die Karte aufschlägt.
+       *
+       * Bis zur elften Session war es der Schatten, und das war richtig,
+       * solange die beiden Stundenkarten Sekunden kosteten: ein Tool, das mit
+       * einem Fortschrittsbalken beginnt, hat seine erste Aussage nicht
+       * gemacht. Seit die Jahreskarte nachgeschlagen wird, ist sie das
+       * Gegenteil davon -- sie ist sofort da, sie deckt die ganze Fläche, und
+       * sie beantwortet die Frage, die man ohne Uhrzeit und ohne Datum stellen
+       * kann. Der Schatten braucht beides und ist einen Klick entfernt.
+       *
+       * Ohne die vorberechneten Kacheln wäre das eine schlechte Wahl. Deshalb
+       * rechnet der erste Blick auf diesen Reiter nur dann von selbst, wenn
+       * nachgeschlagen werden kann; sonst wartet er auf den Knopf.
+       */
+      const [layer, setLayer] = useState('year');
       /* Ergebnisse und Zeitschritt hängen an der Zeitspanne, nicht am Tool:
        * Tages- und Jahreskarte sind zwei Bilder, und wer zwischen den Reitern
        * hin und her schaut, will nicht jedes Mal neu rechnen. Beim Zeitschritt
@@ -4805,11 +5106,20 @@
        */
       const [hoursBy, setHoursBy] = useState({ day: null, year: null });
       const [stepBy, setStepBy] = useState({ day: 20, year: 20 });
-      // Auch die Rasterweite haengt an der Zeitspanne. Die Jahreskarte kostet
-      // je Zelle das Zwei- bis Zehnfache der Tageskarte, weil ein paar hundert
-      // Richtungen statt ein paar Dutzend Zeitpunkte gerechnet werden; sie
-      // faengt deshalb groeber an. Und sie wird ohnehin flaechig gelesen.
-      const [csBy, setCsBy] = useState({ day: 2, year: 4 });
+      /* Auch die Rasterweite hängt an der Zeitspanne. Die Tageskarte kostet je
+       * Zelle ein Vielfaches der Schattenkarte und fängt deshalb gröber an.
+       *
+       * Die Jahreskarte stand aus demselben Grund auf vier Metern und steht
+       * seit der elften Session auf einem: sie wird nachgeschlagen, und ein
+       * Meter ist die Weite, in der sie auf der Platte liegt. Feiner als das
+       * Bild zu rechnen kostet trotzdem, deshalb hebt `hoursCsFloor` sie beim
+       * Herauszoomen von selbst an -- die Wahl bleibt stehen und kommt beim
+       * Hineinzoomen zurück. Wer die Vorberechnung wegdreht (andere Augenhöhe,
+       * andere Schwelle), sollte hier nachfassen, bevor er rechnen lässt: ein
+       * Meter über einen weiten Ausschnitt ist die teuerste Rechnung, die
+       * dieses Tool kennt.
+       */
+      const [csBy, setCsBy] = useState({ day: 2, year: 1 });
       /* Die Rasterweite der Schattenkarte steht daneben und nicht darin, weil
        * sie eine Möglichkeit mehr hat: 0 heißt "richtet euch nach dem Bild"
        * und ist die Voreinstellung. Sie stammt aus der Zeit, in der die
@@ -4893,6 +5203,29 @@
         window.addEventListener('themechange', onTheme);
         return () => window.removeEventListener('themechange', onTheme);
       }, []);
+
+      /* Der Ausschnitt beim Aufschlagen: die Innenstadt ganz, und zwar auf
+       * jedem Bildschirm dieselbe.
+       *
+       * Bis zur elften Session stand hier ein fester Maßstab von 1,1 m je
+       * Bildpunkt. Der zeigt auf einem breiten Schirm zwei Kilometer und auf
+       * einem Telefon vierhundert Meter -- also einmal die Altstadt und einmal
+       * drei Straßenzüge. Was gemeint war, ist eine Breite in der Welt und
+       * nicht eine Zahl im Nenner: dreieinhalb Kilometer fassen die Innenstadt
+       * von Prüfening bis zum Ostenviertel.
+       *
+       * Gedeckelt nach beiden Seiten, weil aus einem sehr schmalen Fenster
+       * sonst ein Maßstab würde, in dem die Stadt ein Fleck ist, und aus einem
+       * sehr breiten einer, der schon in einzelne Häuser hineingeht.
+       */
+      const START_WIDTH_M = 3500;
+      const startZoom = useRef(false);
+      useEffect(() => {
+        if (startZoom.current || !size.w) return;
+        startZoom.current = true;
+        const mpp = Math.max(1.0, Math.min(8, START_WIDTH_M / size.w));
+        setView(v => Object.assign({}, v, { mPerPx: mpp }));
+      }, [size.w]);
 
       useEffect(() => {
         const el = wrapRef.current;
@@ -5227,16 +5560,50 @@
       const stepMin = stepBy[span];
       const hoursCs = csBy[span];
 
+      /* Ob die Jahreskarte nachgeschlagen statt gerechnet werden kann.
+       *
+       * Zwei Dinge hängen daran, und nur diese zwei: die Augenhöhe und die
+       * Sichtbarkeitsschwelle. Sie sind der Grund, warum die Vorberechnung den
+       * Rechenweg ergänzt und nicht ersetzt. Alles andere fällt weg -- der
+       * Ausschnitt, die Rasterweite, die Fächerfeinheit, der Zeitschritt und
+       * auch das Jahr, denn zwischen zwei Jahren verschiebt sich die
+       * Sonnenbahn um weniger, als die abgelegte Genauigkeit auflöst.
+       *
+       * Die Augenhöhe wird mit Toleranz verglichen und nicht auf Gleichheit:
+       * sie kommt aus einem Textfeld, und 1.70 soll dasselbe sein wie 1.7.
+       */
+      const yearMeta = (model && model.sunyear) || null;
+      const yearPre = !!yearMeta && span === 'year'
+        && Math.abs(eye - yearMeta.eyeHeight) < 1e-6 && mode === yearMeta.mode;
+
+      /* Warum es die vorberechnete Karte gerade nicht gibt, für die Anzeige.
+       * Null heißt: es gibt sie. Der Unterschied zwischen "diese Augenhöhe ist
+       * nicht abgelegt" und "diese Schwelle ist nicht abgelegt" ist für den
+       * Bedienenden der Unterschied zwischen zwei Reglern, an denen er drehen
+       * kann, und deshalb steht er da.
+       */
+      const yearWhy = !yearMeta || span !== 'year' ? null
+        : Math.abs(eye - yearMeta.eyeHeight) >= 1e-6 ? 'eye'
+        : mode !== yearMeta.mode ? 'mode' : null;
+
       /* Wie viele Zellen eine Stundenkarte in diesem Ausschnitt hätte. Das ist
        * das Gegenstück zu `shadowCells`, nur ohne Sonnenstand: der Zuschlag ist
        * hier fest, also hängt die Fläche allein am Bild.
        */
+      /* Der Zuschlag entfällt beim Nachschlagen. Er ist beim Rechnen nötig,
+       * damit ein Haus jenseits des Bildrandes noch Schatten in das Bild
+       * werfen kann; in den vorberechneten Kacheln steckt er längst drin. Ihn
+       * trotzdem zu nehmen hieße, bei einem 2-km-Ausschnitt die anderthalb-
+       * fache Fläche zu laden, um sie danach wegzuschneiden.
+       */
+      const hoursMargin = yearPre ? 0 : HOURS_MARGIN_M;
+
       const hoursCells = useCallback(c => {
         if (!vw || !model || !model.ready) return 0;
-        const ext = vw.extent(HOURS_MARGIN_M);
+        const ext = vw.extent(hoursMargin);
         const cs = hoursCellsize(model.hm, c);
         return Math.ceil((ext[2] - ext[0]) / cs) * Math.ceil((ext[3] - ext[1]) / cs);
-      }, [vw, model, stage]);
+      }, [vw, model, stage, hoursMargin]);
       const hoursCsFitsFor = c => hoursCells(c) <= MAX_HOURS_CELLS;
 
       /* Und die andere Antwort als beim Schatten, wo eine zu feine Wahl
@@ -5250,14 +5617,42 @@
        * Kachelschranke durchlässt, sind das gut zwei Millionen Zellen.
        */
       const HOURS_CS_CHOICES = [1, 2, 4];
-      const hoursCsFits = hoursCsFitsFor(hoursCs);
-      const hoursCsUsed = hoursCsFits ? hoursCs
-        : (HOURS_CS_CHOICES.find(c => c > hoursCs && hoursCsFitsFor(c))
-           || HOURS_CS_CHOICES[HOURS_CS_CHOICES.length - 1]);
+      /* Und wohin es zurückfällt, wenn auch die gröbste angebotene Stufe nicht
+       * trägt. Bis zur elften Session konnte das nicht vorkommen: die
+       * Kachelschranke hielt den Ausschnitt so klein, dass vier Meter immer
+       * gingen. Für den Nachschlageweg gilt sie nicht mehr, und über die ganze
+       * Stadt sind vier Meter zehneinhalb Millionen Zellen -- knapp unter dem
+       * Deckel, aber ein größerer Bildschirm reißt ihn. Ohne diese beiden
+       * Stufen bliebe der Rückfall bei vier Metern stehen und die Karte hielte
+       * sich nicht an ihren eigenen Deckel.
+       *
+       * Als Knöpfe stehen sie nicht da: acht Meter kennen keine Hinterhöfe
+       * mehr, und danach fragt eine Sonnenstundenkarte. Sie sind ein Rückfall
+       * und keine Wahl.
+       */
+      const HOURS_CS_FALLBACK = [1, 2, 4, 8, 16];
+
+      /* Beim Nachschlagen zusätzlich: nie feiner als ein Drittel Bildpunkt.
+       *
+       * Der Grund ist derselbe, aus dem die Schattenkarte ihre Rasterweite von
+       * sich aus ans Bild koppelt -- feiner zu rechnen, als das Bild zeigt,
+       * kostet nur. Beim Rechenweg ist die Wahl eine bewusste und teuer
+       * bezahlte, deshalb gilt diese Schranke nur hier. Ein Drittel und nicht
+       * ein ganzer Bildpunkt, weil das Vergrößern bis zum Dreifachen geht und
+       * eine Zelle, die kleiner als ein Drittel Pixel ist, im Bild ohnehin
+       * niemand mehr auseinanderhält.
+       */
+      const hoursCsFloor = yearPre && vw
+        ? (HOURS_CS_FALLBACK.find(c => c >= vw.mPerPx / 3) || 16) : 1;
+      const hoursCsWanted = Math.max(hoursCs, hoursCsFloor);
+      const hoursCsFits = hoursCsFitsFor(hoursCsWanted);
+      const hoursCsUsed = hoursCsFits ? hoursCsWanted
+        : (HOURS_CS_FALLBACK.find(c => c > hoursCsWanted && hoursCsFitsFor(c))
+           || HOURS_CS_FALLBACK[HOURS_CS_FALLBACK.length - 1]);
 
       const hoursReq = useMemo(() => {
         if (!vw || !model || !model.ready) return null;
-        const ext = vw.extent(HOURS_MARGIN_M);
+        const ext = vw.extent(hoursMargin);
         const e0 = model.hm.bounds[0] + ext[0], n0 = model.hm.bounds[1] + ext[1];
         const e1 = model.hm.bounds[0] + ext[2], n1 = model.hm.bounds[1] + ext[3];
         const cs = hoursCellsize(model.hm, hoursCsUsed);
@@ -5271,17 +5666,35 @@
          * am Jahr und nicht am Datum, sonst gälte sie nach jedem Blättern im
          * Kalender als veraltet, obwohl sich an ihr nichts geändert hat.
          */
+        /* Beim Nachschlagen fallen drei Werte aus dem Schlüssel: der
+         * Zeitschritt, die Fächerfeinheit und das Jahr. Sie stehen darin, weil
+         * sie eine Rechnung teurer oder genauer machen; für eine Karte, die
+         * schon fertig auf der Platte liegt, tun sie beides nicht. Blieben sie
+         * drin, meldete sich die Karte nach einem Klick auf "gröber" als
+         * veraltet und böte an, dasselbe noch einmal zu holen.
+         */
         return {
           e0: e0, n0: n0, e1: e1, n1: n1, cellsize: cs,
-          azBin: dir.az, elBin: dir.el,
+          azBin: dir.az, elBin: dir.el, pre: yearPre,
           tiles: tilesForExtent(model.hm, e0, n0, e1, n1).length,
           key: [span, Math.round(e0), Math.round(n0), Math.round(e1), Math.round(n1),
-                cs, ymd.y, span === 'day' ? ymd.m : 0, span === 'day' ? ymd.d : 0,
-                mode, stepMin, eye, span === 'year' ? dir.az + 'x' + dir.el : ''].join('|')
+                cs, yearPre ? 'pre' : ymd.y,
+                span === 'day' ? ymd.m : 0, span === 'day' ? ymd.d : 0,
+                mode, yearPre ? '' : stepMin, eye,
+                span === 'year' && !yearPre ? dir.az + 'x' + dir.el : ''].join('|')
         };
-      }, [vw, model, stage, span, ymd.y, ymd.m, ymd.d, mode, stepMin, hoursCsUsed, dirs, eye]);
+      }, [vw, model, stage, span, ymd.y, ymd.m, ymd.d, mode, stepMin, hoursCsUsed, dirs, eye,
+          yearPre, hoursMargin]);
 
-      const hoursFar = hoursReq ? hoursReq.tiles > MAX_TILES : false;
+      /* Die Kachelschranke gilt für das Rechnen und nicht für das
+       * Nachschlagen. Sie wehrt das Herausziehen auf die ganze Stadt ab, weil
+       * dort zweihundert Kacheln zusammenzusetzen und durchzurechnen wären --
+       * und genau das ist der Fall, den die Vorberechnung erledigt hat. Über
+       * die ganze Stadt sind es 112 Kacheln zu je 69 kB, die nebenher
+       * eintrudeln, und was den Speicher begrenzt, ist danach die Zellenzahl
+       * und nicht die Kachelzahl.
+       */
+      const hoursFar = hoursReq && !yearPre ? hoursReq.tiles > MAX_TILES : false;
       /* Dieselbe Form wie beim Schatten, und das ist eine Änderung: "veraltet"
        * heißt jetzt auch "es gibt gar keins". Vorher hieß es nur "es gibt ein
        * anderes", und nach einer gescheiterten ersten Rechnung stand die Karte
@@ -5290,13 +5703,32 @@
        */
       const hoursStale = !!hoursReq && (!hours || hours.key !== hoursReq.key);
 
+      /* Ob jemand gefragt werden muss. Veraltet ist die vorberechnete Karte
+       * genauso wie die gerechnete, nur ist das keine Nachricht wert: sie holt
+       * sich in zwei Zehntelsekunden selbst nach. Ein Knopf mit der Aufschrift
+       * "Neu rechnen" und ein Hinweis, das Bild sei veraltet, wären hier eine
+       * Aufforderung zu etwas, das schon läuft.
+       */
+      /* Zwei Fälle, und der zweite ist der Grund, warum das nicht einfach
+       * `hoursStale && !yearPre` heißen kann: sind Kacheln nicht angekommen,
+       * hat die vorhandene Karte Löcher, ist aber nach dem Schlüssel aktuell.
+       * Von selbst holt sie sich dann nichts mehr, und ohne diesen Zweig
+       * stünde daneben die Aufforderung "noch einmal holen hilft" und ein
+       * grauer Knopf.
+       */
+      const hoursAsk = (hoursStale && !yearPre)
+        || !!(hours && hours.missing && span === 'year');
+
       const computeHours = useCallback(() => {
         if (!hoursReq || hoursFar || !model || !model.ready) return;
         const key = hoursReq.key;
         hoursTried.current = key;
         setBusy(true);
         setProgress(0);
-        model.client.ask('sunhours', {
+        // Zwei Arten, eine Antwortform. Welche gefragt wird, entscheidet allein
+        // `pre`; der Rest dieser Funktion weiß davon nichts, und die Karte
+        // darunter auch nicht.
+        model.client.ask(hoursReq.pre ? 'sunyear' : 'sunhours', {
           e0: hoursReq.e0, n0: hoursReq.n0, e1: hoursReq.e1, n1: hoursReq.n1,
           cellsize: hoursReq.cellsize, mode: mode, stepMin: stepMin, span: span,
           azBin: hoursReq.azBin, elBin: hoursReq.elBin, eyeHeight: eye,
@@ -5311,8 +5743,39 @@
       // Beim ersten Blick auf die Ebene wird von allein gerechnet, danach nur
       // noch auf Ansage. Der Versuchsschlüssel hält den Fall in Schach, dass
       // die Rechnung scheitert: sonst finge sie bei jeder Mausbewegung neu an.
+      /* Die vorberechnete Jahreskarte zieht beim Schieben und Zoomen von selbst
+       * nach, wie die Schattenkarte es früher tat und aus demselben Grund, aus
+       * dem sie es nicht mehr tut: es kostet nichts. Was hier passiert, ist ein
+       * paar Kacheln holen und ein Feld zusammensetzen -- nicht ein paar
+       * hundert Sweeps. Wer für so etwas auf einen Knopf drücken muss, drückt
+       * ihn nach dem dritten Mal nicht mehr und sieht sich eine Karte an, die
+       * woanders hingehört.
+       *
+       * Die Ruhepause ist dieselbe wie beim Schatten und aus demselben Grund:
+       * beim Ziehen kommen zwanzig Ausschnitte in der Sekunde, und jeder von
+       * ihnen wäre sonst eine Anfrage, die die vorige überholt.
+       */
+      useEffect(() => {
+        if (layer !== 'year' || !hoursReq || !hoursReq.pre || anim) return;
+        if (hours && hours.key === hoursReq.key) return;
+        const timer = setTimeout(() => computeHours(), 140);
+        return () => clearTimeout(timer);
+      }, [layer, hoursReq, hours, anim, computeHours]);
+
       useEffect(() => {
         if (layer === 'shadow' || !hoursReq || hoursFar || hours) return;
+        // Der vorberechnete Weg hat seinen eigenen Effekt darüber, und der
+        // rechnet nicht einmal, sondern immer.
+        if (hoursReq.pre) return;
+        /* Und die Jahreskarte rechnet überhaupt nur auf Ansage, seit sie der
+         * Reiter ist, mit dem die Karte aufschlägt. Von selbst loszurechnen
+         * war vertretbar, solange man diesen Reiter absichtlich anklickte;
+         * als erste Handlung nach dem Aufschlagen wäre es eine Rechnung über
+         * Minuten, die niemand bestellt hat -- die Rasterweite steht hier auf
+         * einem Meter, weil die Vorberechnung so fein ist, und für den
+         * Rechenweg ist das die teuerste Wahl.
+         */
+        if (span === 'year') return;
         if (hoursTried.current === hoursReq.key) return;
         // Und derselbe Merker wie beim Schatten, aus demselben Grund: nach dem
         // Verwerfen einer weggeschobenen Karte wäre der nächste Blick sonst
@@ -6065,7 +6528,7 @@
        * derselben Bedeutung, und ein zweites Exemplar liefe beim nächsten
        * Umbau auseinander.
        */
-      const runStale = layer === 'shadow' ? shadowStale : hoursStale;
+      const runStale = layer === 'shadow' ? shadowStale : hoursAsk;
       /* Wann der Knopf grau ist, und die Liste ist länger, als sie aussieht.
        *
        * Ein Knopf, der aussieht wie ein Angebot und keines ist, ist schlimmer
@@ -6104,11 +6567,15 @@
         // nichts zu rechnen, nichts nachzuladen und nichts zu bemängeln.
         : (layer === 'shadow' && !sunUp) ? t.shadowNight
         : (layer === 'shadow' ? tooFar : hoursFar) ? (layer === 'shadow' ? t.shadowFar : t.hoursFar)
+        // "Wird geholt" und nicht "wird gerechnet", wenn nichts gerechnet wird:
+        // der Balken zählt hier Kacheln aus dem Netz, und wer das für eine
+        // Rechnung hält, sucht den Fehler bei seinem Rechner statt bei seiner
+        // Leitung.
         : busy ? (layer === 'shadow' ? t.shadowLabel : layer === 'year' ? t.yearLabel : t.hoursLabel) + ' ' + '·' + ' '
-                 + t.shadowBusy + ' ' + Math.round(progress * 100) + ' %'
+                 + (yearPre ? t.yearFetch : t.shadowBusy) + ' ' + Math.round(progress * 100) + ' %'
         // Veraltet gilt für alle drei Reiter, seit auch der Schatten auf
         // Ansage rechnen kann, wenn jemand ihm ein teures Raster gibt.
-        : (layer === 'shadow' ? shadowStale : hoursStale) ? t.hoursStale.replace('{b}', t.hoursRecalc)
+        : (layer === 'shadow' ? shadowStale : hoursAsk) ? t.hoursStale.replace('{b}', t.hoursRecalc)
         // Ganz am Ende, weil es der harmloseste Fall ist: die Karte steht, sie
         // ist nur gröber als bestellt. Wer davon nichts erführe, hielte das
         // Ergebnis für die Antwort auf seine Einstellung.
@@ -6117,12 +6584,24 @@
         // stammen, in dem die Wahl noch getragen hat.
         : (layer === 'shadow' && !csFits && shadow && shadow.cellsize !== shadowCs)
           ? t.cellFallback.replace(/\{c\}/g, String(shadow.cellsize)).replace(/\{w\}/g, String(shadowCs))
+        /* Kacheln, die nicht angekommen sind. Steht weit oben in der Kette,
+         * weil es das einzige hier ist, was auf einen Fehler hindeutet: die
+         * Karte hat dann Löcher, und die sehen aus wie fehlende Daten.
+         */
+        : (hours && hours.missing) ? t.tilesLost.replace('{n}', String(hours.missing))
         /* Und dasselbe für die Stundenkarten. Dort steht es schon vor der
          * Rechnung da und nicht erst danach, denn hier ist die gröbere Weite
          * keine Rückfallentscheidung des Motors, sondern schon die Bestellung:
          * `hoursReq` fragt mit ihr.
+         *
+         * `hoursCsUsed !== hoursCs` steht seit der elften Session dabei, und
+         * ohne das stand hier der Satz "4 m statt 4 m: 4 m wäre zu fein für
+         * diese Ansicht". Möglich wurde er, als die Kachelschranke für den
+         * Nachschlageweg fiel: seither gibt es Ausschnitte, in denen auch die
+         * gröbste Wahl nicht mehr trägt, und dann ist die benutzte Weite die
+         * gewählte, obwohl sie nicht passt.
          */
-        : (layer !== 'shadow' && !hoursCsFits)
+        : (layer !== 'shadow' && !hoursCsFits && hoursCsUsed !== hoursCs)
           ? t.cellFallback.replace(/\{c\}/g, String(hoursCsUsed)).replace(/\{w\}/g, String(hoursCs))
         /* Und dasselbe für den automatischen Weg, der nicht ablehnt, sondern
          * vergröbert. Ohne die Zeile stünde am Abend wortlos eine gröbere
@@ -6147,13 +6626,13 @@
        * bestimmt, was die halbe Seite darunter überhaupt zeigt. */
       const tab = (id, label, hint) => html`
         <button key=${id} type="button" role="tab" aria-selected=${layer === id}
-                className=${'rs-tab' + (layer === id ? ' active' : '')}
+                className=${layer === id ? 'active' : ''}
                 title=${hint} onClick=${() => setLayer(id)}>${label}<//>`;
 
       return html`
         <${React.Fragment}>
           <div className="rs-tabs">
-            <div className="rs-tabstrip" role="tablist">
+            <div className="tabstrip" role="tablist">
               ${tab('shadow', t.mapTitle, t.shadowTabHint)}
               ${tab('day', t.hoursLabel, t.hoursHint)}
               ${tab('year', t.yearLabel, t.yearHint)}
@@ -6209,12 +6688,28 @@
                 <span>${fmtHours(hoursMax / 2)}<//>
                 <span>${fmtHours(hoursMax) + ' ' + '·' + ' ' + hoursMaxLabel}<//>
               <//>
+              <!-- Woher die Karte kommt, steht hier unten und nicht in der
+                   Statuszeile über der Karte: die meldet, was gerade zu tun
+                   ist, und hier ist nichts zu tun. Es ist eine Auskunft über
+                   das Bild, und die gehört zur Legende. Der Hinweis auf die
+                   Abweichung steht auch dann da, wenn gerade gerechnet wurde --
+                   sonst wäre nicht zu erklären, warum dieselbe Karte einmal
+                   sofort erscheint und einmal Sekunden braucht. -->
               <p className="rs-note" style=${{ margin: '6px 0 0' }}>
                 ${span === 'year'
                   ? t.yearNorm.replace('{d}', fmtHours(hoursMax / yearDays))
-                    + ' ' + t.yearScale.replace('{n}', hours.steps).replace('{s}', hours.stepMin)
+                    + ' ' + (hours.precomputed
+                      ? t.yearPre.replace(/\{e\}/g, fmtEye(yearMeta.eyeHeight))
+                                 .replace(/\{m\}/g, Math.round(yearMeta.mode * 100) + ' %')
+                      : t.yearScale.replace('{n}', hours.steps).replace('{s}', hours.stepMin))
                   : (norm === 'year' ? t.hoursNormYear : t.hoursNormDay) + ' '
                     + t.hoursScale.replace('{n}', hours.steps).replace('{s}', hours.stepMin)}
+                ${yearWhy && html`
+                  <span style=${{ color: 'var(--tool-sig-warn)' }}>
+                    ${' ' + (yearWhy === 'eye'
+                      ? t.yearWhyEye.replace(/\{e\}/g, fmtEye(yearMeta.eyeHeight))
+                      : t.yearWhyMode.replace(/\{m\}/g, Math.round(yearMeta.mode * 100) + ' %'))}
+                  <//>`}
               <//>
             <//>`}
           <p className="rs-note" style=${{ margin: '8px 0 0' }}>${t.mapHint}<//>
@@ -6283,6 +6778,15 @@
                 <//>`}
               ${layer !== 'shadow' && html`
                 <${React.Fragment}>
+                  <!-- Zeitschritt und Richtungen sind die beiden Regler, die es
+                       nur gibt, weil eine Rechnung Zeit kostet. Für eine Karte,
+                       die fertig auf der Platte liegt, haben sie keine
+                       Bedeutung mehr: sie ist in der feinsten Stufe abgelegt.
+                       Sie stehen zu lassen und wirkungslos zu schalten, hiesse
+                       zwei Knopfleisten anzubieten, an denen sich nichts ändert.
+                       Sobald jemand an Augenhöhe oder Schwelle dreht, wird
+                       wieder gerechnet, und dann sind sie wieder da. -->
+                  ${!yearPre && html`
                   <div>
                     <div className="rs-cap">${t.optTime}<//>
                     <div className="rs-map-group" style=${{ display: 'inline-flex', marginTop: 4 }}>
@@ -6291,7 +6795,7 @@
                                 title=${t.stepHint}
                                 onClick=${() => setStepBy(b => Object.assign({}, b, { [span]: s }))}>${s + ' min'}<//>`)}
                     <//>
-                  <//>
+                  <//>`}
                   <div>
                     <div className="rs-cap">${t.optSpace}<//>
                     <div className="rs-map-group" style=${{ display: 'inline-flex', marginTop: 4 }}>
@@ -6314,7 +6818,7 @@
                       })}
                     <//>
                   <//>
-                  ${layer === 'year' && html`
+                  ${layer === 'year' && !yearPre && html`
                     <div>
                       <div className="rs-cap">${t.optDirs}<//>
                       <div className="rs-map-group" style=${{ display: 'inline-flex', marginTop: 4 }}>
@@ -6572,10 +7076,25 @@
        * Schieber da.
        */
       const [minute, setMinute] = useState(NOON_MINUTE);
-      // Voreinstellung: ein Zehntel der Scheibe. Das ist die Auslegung, die
-      // der klassischen Sonnenuntergangsdefinition am nächsten kommt, ohne den
-      // Grenzfall zu nehmen, bei dem gerade nichts mehr zu sehen ist.
-      const [mode, setMode] = useState(0.1);
+      /* Voreinstellung: die halbe Scheibe.
+       *
+       * Bis zur elften Session war es ein Zehntel -- die Auslegung, die der
+       * klassischen Sonnenuntergangsdefinition am nächsten kommt, ohne den
+       * Grenzfall zu nehmen, bei dem gerade nichts mehr zu sehen ist. Dagegen
+       * steht seit der Vorberechnung ein handfestes Argument: die
+       * Jahreskarte liegt für genau eine Schwelle fertig auf der Platte, und
+       * das ist die halbe Scheibe. Stünde hier weiter ein Zehntel, wäre der
+       * Rückfallpfad nicht die Ausnahme, sondern der Normalfall, und die
+       * teuerste Karte des Tools wäre beim ersten Aufschlagen eine Rechnung
+       * über Sekunden statt eines Bildes, das da ist.
+       *
+       * Die halbe Scheibe ist auch für sich vertretbar: sie ist die Mitte der
+       * drei angebotenen Auslegungen, und der Unterschied zum Zehntel sind
+       * knapp zwei Zehntel Grad Sonnenhöhe, also gut eine Minute Uhrzeit.
+       * Wer es anders will, stellt es um -- und bekommt dann eben eine
+       * gerechnete Jahreskarte, was die Fußnote unter der Legende sagt.
+       */
+      const [mode, setMode] = useState(0.5);
       // Was die Karte über ihren Rechnen-Knopf meldet, damit er auch hier oben
       // stehen kann. Vor der ersten Meldung ist er nicht da statt tot.
       const [mapRun, setMapRun] = useState(null);
@@ -6618,19 +7137,34 @@
       return html`
         <div className="container" style=${{ paddingBottom: 32 }}>
           <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-emph)', marginBottom: 4 }}>${t.title}<//>
-          <p className="rs-note" style=${{ marginBottom: 16 }}>${t.subtitle}<//>
+          <p className="rs-note" style=${{ marginBottom: 12 }}>${t.subtitle}<//>
 
           <div className="rs-panel" style=${{ marginBottom: 14 }}>
             <div className="rs-cols">
               <div>
                 <label className="rs-cap" htmlFor="rs-date">${t.date}<//>
-                <input id="rs-date" type="date" value=${date} onInput=${e => setDate(e.target.value)} style=${{ marginBottom: 8 }}/>
-                <!-- gap 0, wie bei den Modus-Buttons: die Rundung sitzt nur an
-                     den beiden Enden der Reihe, deshalb sehen auseinander
-                     gezogene Segmente wie zerbrochene Hälften aus. -->
-                <div style=${{ display: 'flex', gap: 0 }}>
-                  <button className="lang-seg" onClick=${setToday}>${t.now}<//>
-                  <button className="lang-seg" onClick=${setTomorrow}>${t.tomorrow}<//>
+                <!-- gap 0 bei den Knöpfen, wie bei den Modus-Buttons: die
+                     Rundung sitzt nur an den beiden Enden der Reihe, deshalb
+                     sehen auseinander gezogene Segmente wie zerbrochene
+                     Hälften aus. -->
+                <div className="rs-daterow">
+                  <input id="rs-date" type="date" value=${date} onInput=${e => setDate(e.target.value)}/>
+                  <div style=${{ display: 'flex', gap: 0 }}>
+                    <button className="lang-seg" onClick=${setToday}>${t.now}<//>
+                    <button className="lang-seg" onClick=${setTomorrow}>${t.tomorrow}<//>
+                  <//>
+                <//>
+                <!-- Die Sichtbarkeitsschwelle steht in der linken Spalte, weil
+                     die Panelhöhe die der volleren Spalte ist: rechts stehen
+                     Schieber, Tagesband, Marken und der Rechnen-Knopf, links
+                     sonst nur zwei Zeilen. Unten stünde sie in einer Spalte,
+                     die schon leer nach unten ausläuft. -->
+                <div className="rs-cap" style=${{ marginTop: 12 }}>${t.mode}<//>
+                <div style=${{ display: 'flex', gap: 0, marginTop: 4 }}>
+                  ${SUN_FRACTIONS.map(f => html`
+                    <button key=${f} className=${'lang-seg' + (mode === f ? ' active' : '')} onClick=${() => setMode(f)}>
+                      ${Math.round(f * 100) + ' %'}
+                    <//>`)}
                 <//>
               <//>
               <div>
@@ -6669,42 +7203,35 @@
                     ${mapRun.stale && !mapRun.busy && html`
                       <span className="rs-note" style=${{ color: 'var(--tool-sig-warn)' }}>${t.runStale}<//>`}
                   <//>`}
-                <div className="rs-cap" style=${{ marginTop: 10 }}>${t.mode}<//>
-                <div style=${{ display: 'flex', gap: 0, marginTop: 4 }}>
-                  ${SUN_FRACTIONS.map(f => html`
-                    <button key=${f} className=${'lang-seg' + (mode === f ? ' active' : '')} onClick=${() => setMode(f)}>
-                      ${Math.round(f * 100) + ' %'}
-                    <//>`)}
-                <//>
               <//>
             <//>
             ${conv.ambiguous && html`<p className="rs-warn" style=${{ marginTop: 12 }}>${t.ambiguous}<//>`}
             ${conv.nonexistent && html`<p className="rs-warn" style=${{ marginTop: 12 }}>${t.nonexistent}<//>`}
-          <//>
 
-          <div className="rs-panel rs-readout" style=${{ marginBottom: 14 }}>
-            <div>
-              <div className="rs-cap">${t.azimuth}<//>
-              <div className="rs-num">${fmtDeg(sun.az)}<//>
-              <div className="rs-note">${compassName(sun.az)}<//>
-            <//>
-            <div>
-              <div className="rs-cap">${t.elevation}<//>
-              <div className="rs-num">${fmtDeg(sun.elev)}<//>
-              <div className="rs-note">${fmtDeg(sunGeom.elev, 2)} ${t.elevGeom}<//>
-            <//>
-            <div>
-              <div className="rs-cap">${t.sunrise}<//>
-              <div className="rs-num">${rise === null ? '–' : hhmm(rise)}<//>
-            <//>
-            <div>
-              <div className="rs-cap">${t.sunset}<//>
-              <div className="rs-num">${set === null ? '–' : hhmm(set)}<//>
-            <//>
-            <div>
-              <div className="rs-cap">${t.daylength}<//>
-              <div className="rs-num">${Math.floor(dayLen / 60)}:${pad2(Math.round(dayLen) % 60)}<//>
-              ${!lit && html`<div className="rs-note">${t.below}<//>`}
+            <div className="rs-readout rs-attached">
+              <div>
+                <div className="rs-cap">${t.azimuth}<//>
+                <div className="rs-num">${fmtDeg(sun.az)}<//>
+                <div className="rs-note">${compassName(sun.az)}<//>
+              <//>
+              <div>
+                <div className="rs-cap">${t.elevation}<//>
+                <div className="rs-num">${fmtDeg(sun.elev)}<//>
+                <div className="rs-note">${fmtDeg(sunGeom.elev, 2)} ${t.elevGeom}<//>
+              <//>
+              <div>
+                <div className="rs-cap">${t.sunrise}<//>
+                <div className="rs-num">${rise === null ? '–' : hhmm(rise)}<//>
+              <//>
+              <div>
+                <div className="rs-cap">${t.sunset}<//>
+                <div className="rs-num">${set === null ? '–' : hhmm(set)}<//>
+              <//>
+              <div>
+                <div className="rs-cap">${t.daylength}<//>
+                <div className="rs-num">${Math.floor(dayLen / 60)}:${pad2(Math.round(dayLen) % 60)}<//>
+                ${!lit && html`<div className="rs-note">${t.below}<//>`}
+              <//>
             <//>
           <//>
 
