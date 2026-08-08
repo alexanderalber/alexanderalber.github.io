@@ -1679,14 +1679,23 @@
      * dieselben, weil feiner als das Modell Auflösung erfindet und gröber als
      * acht Meter eine Häuserzeile verschluckt.
      */
-    function shadowCellsize(hm, mPerPx, meters) {
+    function shadowCellsize(hm, mPerPx, meters, fineAuto) {
       const base = hm.ndom.cellsize;
       // Die halbe Stufe des feinen Satzes ist eine ausdrückliche Wahl und
       // entgeht dem Runden aufs Modellraster: sie ist ja gerade feiner als
-      // das. Der automatische Weg (meters = 0) bleibt beim groben Satz --
-      // unter einem Meter je Bildpunkt ist eine Zelle schon ein Pixel, und
-      // feiner zu rechnen, als das Bild zeigt, kostet nur.
+      // das.
       if (meters && hm.ndom.fein && meters === hm.ndom.fein.cellsize) return meters;
+      /* Der automatische Weg darf auf die halbe Stufe, aber nur, wenn das
+       * Bild sie verlangt (die Zelle wäre sonst schon ein Pixel) und der
+       * Aufrufer sagt, dass der feine Satz den Ausschnitt deckt (`fineAuto`,
+       * das ist `fineCovers` über dem sichtbaren Bild). "So fein wie das
+       * Bild" heißt seither wirklich das, und nicht "so fein wie das grobe
+       * Modell": wer in die Altstadt hineinzoomt, bekommt die Gassen auf
+       * 0,5 m, ohne einen Knopf zu wissen.
+       */
+      if (!meters && fineAuto && hm.ndom.fein && mPerPx <= hm.ndom.fein.cellsize) {
+        return hm.ndom.fein.cellsize;
+      }
       const raw = meters ? meters : Math.max(base, mPerPx);
       return Math.min(8 * base, Math.max(base, Math.round(raw / base) * base));
     }
@@ -1719,11 +1728,15 @@
      * wenn sie zu teuer wird, und die automatische wird vergröbert. Sie darf
      * das, weil sie nichts versprochen hat außer "so wie es sich ausgeht".
      */
-    function fitCellsize(hm, mPerPx, widthM, heightM, budget) {
+    function fitCellsize(hm, mPerPx, widthM, heightM, budget, fineAuto) {
       const base = hm.ndom.cellsize;
       const max = 8 * base;
-      let cs = shadowCellsize(hm, mPerPx, 0);
-      while (cs < max && Math.ceil(widthM / cs) * Math.ceil(heightM / cs) > budget) cs += base;
+      const over = c => Math.ceil(widthM / c) * Math.ceil(heightM / c) > budget;
+      let cs = shadowCellsize(hm, mPerPx, 0, fineAuto);
+      // Von der halben Stufe wird nicht in halben Schritten vergröbert: der
+      // nächste ehrliche Halt ist das Modellraster, danach seine Vielfachen.
+      if (cs < base && over(cs)) cs = base;
+      while (cs < max && over(cs)) cs += base;
       return cs;
     }
 
@@ -2254,6 +2267,22 @@
       // Hinterhöfe mehr, und die Karte zeigte etwas anderes als sie behauptet.
       const snapped = Math.round((meters || 2 * base) / base) * base;
       return Math.min(16 * base, Math.max(base, snapped));
+    }
+
+    /* Die automatische Rasterweite der Stundenkarten: so fein wie das Bild,
+     * nach derselben Regel wie beim Schatten. Eine Zelle je Bildpunkt -- feiner
+     * kostet das Vierfache je Halbierung und ändert am sichtbaren Bild nichts,
+     * gröber verschenkt Auflösung, die das Bild zeigen könnte. Die halbe Stufe
+     * des feinen Satzes kommt nur, wenn der Aufrufer sagt, dass er den
+     * sichtbaren Ausschnitt deckt (`fineAuto`), und nur, wo das Bild sie
+     * verlangt. Ob die Weite den Zellendeckel hält, prüft nicht diese
+     * Funktion: dafür steht der Rückfall auf die nächstgröbere Stufe schon da,
+     * und er soll für die Automatik derselbe sein wie für eine feste Wahl.
+     */
+    function hoursAutoCellsize(hm, mPerPx, fineAuto) {
+      const fein = hm.ndom.fein;
+      if (fineAuto && fein && mPerPx <= fein.cellsize) return fein.cellsize;
+      return hoursCellsize(hm, Math.max(hm.ndom.cellsize, mPerPx));
     }
 
     /* Sonnenstunden je Zelle für einen Tag.
@@ -3150,6 +3179,94 @@
       return Math.max(1, Math.min(3, Math.round(cellsize / mPerPx)));
     }
 
+    /* Der 3x3-Binomialweichzeichner der Lesart "Weich", herausgezogen aus dem
+     * App-Block, weil er seit der Worker-Vergrößerung dort läuft, wo die
+     * Vergrößerung läuft. Unbekannt bleibt unbekannt, auch wenn die Nachbarn
+     * etwas wissen: eine Zelle ohne Kacheldaten hat keine Sonnenstunden, auch
+     * nicht die gemittelten der Nachbarschaft.
+     */
+    function blurField(h, cols, rows) {
+      const out = new Float32Array(cols * rows);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          let v = 0, w = 0;
+          for (let dr = -1; dr <= 1; dr++) {
+            const rr = r + dr;
+            if (rr < 0 || rr >= rows) continue;
+            for (let dc = -1; dc <= 1; dc++) {
+              const cc = c + dc;
+              if (cc < 0 || cc >= cols) continue;
+              const x = h[rr * cols + cc];
+              if (x !== x) continue;
+              const g = (dr === 0 ? 2 : 1) * (dc === 0 ? 2 : 1);
+              v += g * x; w += g;
+            }
+          }
+          out[r * cols + c] = (h[r * cols + c] !== h[r * cols + c] || !w) ? NaN : v / w;
+        }
+      }
+      return out;
+    }
+
+    /* Weichzeichnen und Vergrößern in einem Aufruf, für die Fadengrenze: das
+     * ist die Arbeit, die der Worker für die Anfrageart `upsample` tut. Erst
+     * glätten, dann vergrößern -- andersherum wäre das Mittel über neun
+     * Nachbarn ein Mittel über neun Zwischenwerte, also fast kein Mittel.
+     */
+    function upsampleForView(src, cols, rows, factor, blur) {
+      const field = blur ? blurField(src, cols, rows) : src;
+      const up = upsampleField(field, cols, rows, factor > 1 ? factor : 1);
+      return { values: up.values, cols: up.cols, rows: up.rows };
+    }
+
+    /* Welcher Teil eines Stundenfeldes fürs Bild gebraucht wird, in
+     * Zellindizes (Zeile 0 am Nordrand, wie das Bild). Der Grund steht in der
+     * Messung von sun-upsample-bench.mjs: das Vergrößern kostet je Quellzelle
+     * rund eine Mikrosekunde, und ein 0,5-m-Feld über der Innenstadt hat
+     * davon Millionen -- das ganze Feld zu vergrößern, um ein Fenster davon zu
+     * zeigen, war der Zehn-Sekunden-Hänger der Browserrunde vom 2026-08-09.
+     *
+     * Der Ausschnitt wird um `pad` Zellen erweitert (der Weichzeichner und
+     * die Interpolation lesen Nachbarn) und dann auf Blöcke von `quant`
+     * Zellen gerastert: die Blockkanten sind die Stellen, an denen sich beim
+     * Schieben etwas ändert, alles dazwischen ist derselbe Zuschnitt und
+     * kostet nichts. Deckt der Ausschnitt das ganze Feld, kommt null zurück
+     * -- dann gibt es nichts zuzuschneiden, und der Aufrufer soll das eine,
+     * ganze Bild behalten statt es je Blockkante neu zu bauen.
+     */
+    function fieldCropRect(spec, e0, n0, e1, n1, quant, pad) {
+      const q = quant || 64, p = pad === undefined ? 2 : pad;
+      const cs = spec.cellsize;
+      const topN = spec.originN + spec.rows * cs;
+      let c0 = Math.floor((e0 - spec.originE) / cs) - p;
+      let c1 = Math.ceil((e1 - spec.originE) / cs) + p;
+      let r0 = Math.floor((topN - n1) / cs) - p;
+      let r1 = Math.ceil((topN - n0) / cs) + p;
+      c0 = Math.max(0, Math.floor(c0 / q) * q);
+      r0 = Math.max(0, Math.floor(r0 / q) * q);
+      c1 = Math.min(spec.cols, Math.ceil(c1 / q) * q);
+      r1 = Math.min(spec.rows, Math.ceil(r1 / q) * q);
+      /* Liegt das Feld ganz außerhalb des Bildes, bleibt ein Randblock übrig
+       * statt eines leeren Rechtecks: ein leeres Bild wäre als "kein Bild"
+       * unsichtbar und sähe aus wie ein verlorenes Ergebnis.
+       */
+      if (c1 <= c0) { c0 = Math.max(0, Math.min(c0, spec.cols - q)); c1 = Math.min(spec.cols, c0 + q); }
+      if (r1 <= r0) { r0 = Math.max(0, Math.min(r0, spec.rows - q)); r1 = Math.min(spec.rows, r0 + q); }
+      if (c0 === 0 && r0 === 0 && c1 >= spec.cols && r1 >= spec.rows) return null;
+      return { c0: c0, r0: r0, c1: c1, r1: r1 };
+    }
+
+    // Den Ausschnitt aus dem Feld kopieren, zeilenweise.
+    function cropFloatField(values, cols, rect) {
+      const w = rect.c1 - rect.c0, h = rect.r1 - rect.r0;
+      const out = new Float32Array(w * h);
+      for (let r = 0; r < h; r++) {
+        const src = (rect.r0 + r) * cols + rect.c0;
+        out.set(values.subarray(src, src + w), r * w);
+      }
+      return out;
+    }
+
     // Ein Ding durch sein Rechteck vertreten. Mindestens einen Dreiviertelpixel
     // groß, sonst fiele es beim Rastern zwischen die Pixel und das Haus wäre
     // gar nicht da.
@@ -3726,6 +3843,17 @@
           });
         },
 
+        /* Weichzeichnen und Vergrößern eines Stundenfeld-Ausschnitts. Braucht
+         * weder Kacheln noch Modell und steht trotzdem am Motor: so läuft es
+         * im Worker, und der Hauptfaden steht währenddessen nicht -- das war
+         * der Zehn-Sekunden-Hänger der interpolierenden Lesarten. Das alte
+         * Bild bleibt beim Klienten stehen, bis das neue da ist.
+         */
+        upsample: function (req) {
+          return Promise.resolve(
+            upsampleForView(req.field, req.cols, req.rows, req.factor, req.blur));
+        },
+
         point: function (req) {
           const e = req.e, n = req.n;
           /* Liegt die Kachel des Klickpunkts fein vor, rechnet der Nahbereich
@@ -3883,6 +4011,13 @@
         }).catch(err => postMessage({ type: 'sunyear', token: msg.token, error: String(err) }));
         return;
       }
+      if (msg.type === 'upsample') {
+        WORKER_ENGINE.upsample(msg).then(r => {
+          postMessage({ type: 'upsample', token: msg.token, values: r.values,
+                        cols: r.cols, rows: r.rows }, [r.values.buffer]);
+        }).catch(err => postMessage({ type: 'upsample', token: msg.token, error: String(err) }));
+        return;
+      }
       if (msg.type === 'point') {
         WORKER_ENGINE.point(msg)
           .then(r => postMessage({ type: 'point', token: msg.token, answer: r }))
@@ -4014,7 +4149,8 @@
         cellFallback: 'Raster {c} m statt {w} m: {w} m wäre in diesem Ausschnitt zu fein.',
         cellFallbackFine: 'Raster {c} m statt {w} m: das 0,5-m-Modell deckt diesen Ausschnitt nicht.',
         cellAutoCoarse: 'Raster {c} m: bei tiefer Sonne wird über ein Vielfaches des Bildes gerechnet, und feiner würde jede Rechnung entsprechend teurer. Wer sie trotzdem feiner will, stellt die Weite fest ein.',
-        cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein. Bei tiefer Sonne wird gröber gerechnet, weil der Ausschnitt dann weit über das Bild hinausreicht.',
+        cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel, tief in die Altstadt hineingezoomt auch 0,5 m. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein. Bei tiefer Sonne wird gröber gerechnet, weil der Ausschnitt dann weit über das Bild hinausreicht.',
+        cellAutoHintHours: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel, tief in die Altstadt hineingezoomt auch 0,5 m. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein.',
         rampHint:     'Die fünf oberen sind wahrnehmungsgleichmäßig: gleiche Farbschritte sind gleiche Wertschritte. Die unteren geben ihren Kontrast ungleich aus und zeigen dafür mehr am dunklen Ende.',
         hoursLabel:   'Sonnenstunden am Tag',
         yearLabel:    'Sonnenstunden im Jahr',
@@ -4024,6 +4160,8 @@
         yearPre:      'Nachgeschlagen statt gerechnet: diese Karte liegt für die ganze Stadt auf einem Meter fertig bereit, in der feinsten Richtungsstufe, für {e} m Augenhöhe und {m} sichtbare Sonnenscheibe.',
         yearWhyEye:   'Gerechnet, weil die Augenhöhe von den vorberechneten {e} m abweicht. Zurück auf {e} m, und die Karte ist sofort da.',
         yearWhyMode:  'Gerechnet, weil die Sichtbarkeitsschwelle von den vorberechneten {m} abweicht. Zurück auf {m}, und die Karte ist sofort da.',
+        yearWhyCs:    'Gerechnet, weil 0,5 m gewählt sind: die vorberechnete Karte liegt in 1 m vor, das feinere Raster gibt es nur auf dem Rechenweg. Zurück auf Automatik oder eine ganze Stufe, und die Karte wird wieder nachgeschlagen.',
+        cellHalfOrders: 'Die vorberechnete Jahreskarte liegt in 1 m vor. 0,5 m zu wählen schaltet auf den Rechenweg: die Karte wird dann auf Ansage gerechnet und braucht Sekunden statt sofort da zu sein.',
         yearFetch:    'wird geholt',
         tilesLost:    '{n} Kacheln sind nicht angekommen; dort hat die Karte Löcher. Noch einmal holen hilft meistens.',
         optDirs:      'Richtungen',
@@ -4176,7 +4314,8 @@
         cellFallback: 'Cell size {c} m instead of {w} m: {w} m would be too fine for this view.',
         cellFallbackFine: 'Cell size {c} m instead of {w} m: the 0.5 m model does not cover this view.',
         cellAutoCoarse: 'Cell size {c} m: with a low sun the computed area is a multiple of the image, so computing finer would cost accordingly more. Set a fixed cell size to have it finer anyway.',
-        cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value. With a low sun it computes coarser, because the area then reaches well beyond the image.',
+        cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel, down to 0.5 m when zoomed deep into the old town. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value. With a low sun it computes coarser, because the area then reaches well beyond the image.',
+        cellAutoHintHours: 'The cell size follows the scale: one computed cell is about one screen pixel, down to 0.5 m when zoomed deep into the old town. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value.',
         rampHint:     'The top five are perceptually uniform: equal steps in colour are equal steps in value. The lower ones spend their contrast unevenly and show more at the dark end in return.',
         hoursLabel:   'Hours of sun, day',
         yearLabel:    'Hours of sun, year',
@@ -4186,6 +4325,8 @@
         yearPre:      'Looked up rather than computed: this map is ready for the whole city at one metre, at the finest direction setting, for an eye height of {e} m and {m} of the sun visible.',
         yearWhyEye:   'Computed, because the eye height differs from the precomputed {e} m. Back to {e} m and the map is there at once.',
         yearWhyMode:  'Computed, because the visibility threshold differs from the precomputed {m}. Back to {m} and the map is there at once.',
+        yearWhyCs:    'Computed, because 0.5 m is selected: the precomputed map exists at 1 m, the finer grid only exists on the computed path. Back to automatic or any whole step, and the map is looked up again.',
+        cellHalfOrders: 'The precomputed year map exists at 1 m. Choosing 0.5 m switches to the computed path: the map is then computed on demand and takes seconds instead of being there at once.',
         yearFetch:    'loading',
         tilesLost:    '{n} tiles did not arrive; the map has holes there. Fetching again usually helps.',
         optDirs:      'Directions',
@@ -4511,8 +4652,8 @@
       let hm = null;
       let ymeta = null;
       let settled = false;
-      const queued = { shadow: null, point: null, sunhours: null, sunyear: null };
-      const busy = { shadow: false, point: false, sunhours: false, sunyear: false };
+      const queued = { shadow: null, point: null, sunhours: null, sunyear: null, upsample: null };
+      const busy = { shadow: false, point: false, sunhours: false, sunyear: false, upsample: false };
 
       function done(ok) { if (!settled) { settled = true; readyResolve(ok); } }
 
@@ -4528,7 +4669,7 @@
         if (worker) { try { worker.terminate(); } catch (e) { /* egal */ } worker = null; }
         inline = makeEngine(hm, ymeta);
         inline.loadHeavy().then(
-          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); pump('sunyear'); },
+          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); pump('sunyear'); pump('upsample'); },
           err => { console.warn(err); done(false); }
         );
       }
@@ -5019,51 +5160,21 @@
      * der Stundenzahl und nicht auf der Farbe, sonst liefe die Interpolation
      * durch die Rampe hindurch und erfände Farben zwischen den Werten.
      */
-    function hoursCanvas(data, ramp, maxHours, smooth, up) {
-      const cols = data.cols, rows = data.rows;
-      const h = data.hours;
-
-      /* Erst glätten, dann vergrößern. Andersherum wäre das Mittel über neun
-       * Nachbarn ein Mittel über neun Zwischenwerten, also fast kein Mittel:
-       * das Entfernen der Zahl aus dem Hinterhof ist der Zweck dieser Lesart,
-       * und der Weichzeichner muss dafür auf gerechneten Zellen laufen.
-       */
-      let field = h;
-      if (smooth) {
-        field = new Float32Array(cols * rows);
-        for (let r = 0; r < rows; r++) {
-          for (let c = 0; c < cols; c++) {
-            let v = 0, w = 0;
-            for (let dr = -1; dr <= 1; dr++) {
-              const rr = r + dr;
-              if (rr < 0 || rr >= rows) continue;
-              for (let dc = -1; dc <= 1; dc++) {
-                const cc = c + dc;
-                if (cc < 0 || cc >= cols) continue;
-                const x = h[rr * cols + cc];
-                if (x !== x) continue;
-                const g = (dr === 0 ? 2 : 1) * (dc === 0 ? 2 : 1);
-                v += g * x; w += g;
-              }
-            }
-            // Unbekannt bleibt unbekannt, auch wenn die Nachbarn etwas wissen:
-            // eine Zelle ohne Kacheldaten hat keine Sonnenstunden, auch nicht
-            // die gemittelten der Nachbarschaft.
-            field[r * cols + c] = (h[r * cols + c] !== h[r * cols + c] || !w) ? NaN : v / w;
-          }
-        }
-      }
-
-      const grid = upsampleField(field, cols, rows, up || 1);
-      const gc = grid.cols, gr = grid.rows, g = grid.values;
-
+    /* Ein Stundenfeld färben, mehr nicht. Weichzeichnen und Vergrößern
+     * passieren seit der fünfzehnten Session nicht mehr hier: sie laufen als
+     * Anfrageart `upsample` im Worker und nur über dem sichtbaren Ausschnitt
+     * des Feldes -- das ganze Feld im Hauptfaden zu vergrößern war der
+     * Zehn-Sekunden-Hänger der interpolierenden Lesarten (gemessen in
+     * notes/dev/sun-upsample-bench.mjs).
+     */
+    function hoursFieldCanvas(values, cols, rows, ramp, maxHours) {
       const cv = document.createElement('canvas');
-      cv.width = gc; cv.height = gr;
+      cv.width = cols; cv.height = rows;
       const ctx = cv.getContext('2d');
-      const img = ctx.createImageData(gc, gr);
+      const img = ctx.createImageData(cols, rows);
       const scale = maxHours > 0 ? maxHours : 1;
-      for (let i = 0; i < gc * gr; i++) {
-        const v = g[i];
+      for (let i = 0; i < cols * rows; i++) {
+        const v = values[i];
         // Unbekannt bleibt durchsichtig.
         if (v !== v) continue;
         const [rr2, gg, bb] = rampColor(ramp, v / scale);
@@ -5425,20 +5536,20 @@
        */
       const [hoursBy, setHoursBy] = useState({ day: null, year: null });
       const [stepBy, setStepBy] = useState({ day: 20, year: 20 });
-      /* Auch die Rasterweite hängt an der Zeitspanne. Die Tageskarte kostet je
-       * Zelle ein Vielfaches der Schattenkarte und fängt deshalb gröber an.
-       *
-       * Die Jahreskarte stand aus demselben Grund auf vier Metern und steht
-       * seit der elften Session auf einem: sie wird nachgeschlagen, und ein
-       * Meter ist die Weite, in der sie auf der Platte liegt. Feiner als das
-       * Bild zu rechnen kostet trotzdem, deshalb hebt `hoursCsFloor` sie beim
-       * Herauszoomen von selbst an -- die Wahl bleibt stehen und kommt beim
-       * Hineinzoomen zurück. Wer die Vorberechnung wegdreht (andere Augenhöhe,
-       * andere Schwelle), sollte hier nachfassen, bevor er rechnen lässt: ein
-       * Meter über einen weiten Ausschnitt ist die teuerste Rechnung, die
-       * dieses Tool kennt.
+      /* Auch die Rasterweite hängt an der Zeitspanne, und die Voreinstellung
+       * ist seit der fünfzehnten Session in beiden Reitern die Automatik
+       * (0 heißt wie beim Schatten "richtet euch nach dem Bild"): je nach
+       * Zoomstufe soll von selbst eine Weite dastehen, die zum Bildausschnitt
+       * passt -- in der Altstadt hineingezoomt die halbe Stufe des feinen
+       * Satzes, weit draußen eine grobe, ohne dass jemand einen Knopf kennen
+       * muss (Ansage des Owners). Die festen Stufen bleiben daneben stehen:
+       * wer den Hof ansieht, will einen Meter auch dann, wenn das Bild vier
+       * verträgt. Davor stand hier Tag 2 m / Jahr 1 m; die Jahres-1 stammte
+       * aus der elften Session, als die Weite des Nachschlagesatzes die
+       * naheliegende Voreinstellung war -- die Automatik landet beim
+       * Startausschnitt in derselben Gegend und folgt danach dem Zoom.
        */
-      const [csBy, setCsBy] = useState({ day: 2, year: 1 });
+      const [csBy, setCsBy] = useState({ day: 0, year: 0 });
       /* Die Rasterweite der Schattenkarte steht daneben und nicht darin, weil
        * sie eine Möglichkeit mehr hat: 0 heißt "richtet euch nach dem Bild"
        * und ist die Voreinstellung. Sie stammt aus der Zeit, in der die
@@ -5580,6 +5691,24 @@
 
       const tilesTooMany = tilesNeeded ? tilesNeeded.list.length > MAX_TILES : false;
 
+      /* Ob es den feinen Satz gibt und ob er den sichtbaren Ausschnitt deckt.
+       * Gemessen wird am Bild ohne den Zuschlag: der Zuschlagsrand darf grob
+       * bleiben (die grobe Zelle ist das Maximum ihrer vier feinen, ein
+       * Hindernis dort wird allenfalls dick gerechnet, nie übersehen) --
+       * was man ansieht, soll dagegen ganz auf einer Auflösung stehen.
+       * Steht vor der Weitenwahl, weil der automatische Weg seit der
+       * fünfzehnten Session selbst auf die halbe Stufe darf, wenn das Bild
+       * sie verlangt und der feine Satz den Ausschnitt deckt.
+       */
+      const hasFine = !!(model && model.ready && model.hm.ndom.fein);
+      const fineOK = useMemo(() => {
+        if (!hasFine || !vw) return false;
+        const ext = vw.extent(0);
+        return fineCovers(model.hm,
+          model.hm.bounds[0] + ext[0], model.hm.bounds[1] + ext[1],
+          model.hm.bounds[0] + ext[2], model.hm.bounds[1] + ext[3]);
+      }, [hasFine, vw, model, stage]);
+
       /* Was eine Rasterweite in diesem Ausschnitt kosten würde, in Zellen.
        * Gerechnet wird über genau die Fläche, die auch der Motor rechnet --
        * der Zuschlag für die tiefe Sonne steckt schon in `tilesNeeded`, und er
@@ -5611,7 +5740,7 @@
        */
       const csAutoFit = model && model.ready && vw && tilesNeeded
         ? fitCellsize(model.hm, vw.mPerPx, tilesNeeded.e1 - tilesNeeded.e0,
-                      tilesNeeded.n1 - tilesNeeded.n0, AUTO_SHADOW_CELLS)
+                      tilesNeeded.n1 - tilesNeeded.n0, AUTO_SHADOW_CELLS, fineOK)
         : 0;
       /* Jenseits der Kachelschranke kommen die Höhen aus der Übersicht, und
        * die bedient nur ihre Stufenvielfachen: die automatische Weite rundet
@@ -5637,20 +5766,6 @@
       const tooFar = tilesTooMany &&
         (!(model && csAuto && overviewLevelFor(model.hm, csAuto)) ||
          autoCells > MAX_SHADOW_CELLS);
-      /* Ob es den feinen Satz gibt und ob er den sichtbaren Ausschnitt deckt.
-       * Gemessen wird am Bild ohne den Zuschlag: der Zuschlagsrand darf grob
-       * bleiben (die grobe Zelle ist das Maximum ihrer vier feinen, ein
-       * Hindernis dort wird allenfalls dick gerechnet, nie übersehen) --
-       * was man ansieht, soll dagegen ganz auf einer Auflösung stehen.
-       */
-      const hasFine = !!(model && model.ready && model.hm.ndom.fein);
-      const fineOK = useMemo(() => {
-        if (!hasFine || !vw) return false;
-        const ext = vw.extent(0);
-        return fineCovers(model.hm,
-          model.hm.bounds[0] + ext[0], model.hm.bounds[1] + ext[1],
-          model.hm.bounds[0] + ext[2], model.hm.bounds[1] + ext[3]);
-      }, [hasFine, vw, model, stage]);
 
       const csFitsFor = cs => {
         if (!model || !model.ready || !vw) return true;
@@ -5937,8 +6052,14 @@
        * sie kommt aus einem Textfeld, und 1.70 soll dasselbe sein wie 1.7.
        */
       const yearMeta = (model && model.sunyear) || null;
+      /* Die halbe Stufe kippt das Nachschlagen: die vorberechnete Karte liegt
+       * in 1 m, wer 0,5 wählt, bestellt damit den Rechenweg -- mit allem, was
+       * dazugehört (Zeitschritt, Richtungen, Rechnen-Knopf, Sekunden statt
+       * sofort). Der Weg zurück ist der Auto-Knopf oder jede ganze Stufe.
+       */
       const yearPre = !!yearMeta && span === 'year'
-        && Math.abs(eye - yearMeta.eyeHeight) < 1e-6 && mode === yearMeta.mode;
+        && Math.abs(eye - yearMeta.eyeHeight) < 1e-6 && mode === yearMeta.mode
+        && csBy.year !== 0.5;
 
       /* Warum es die vorberechnete Karte gerade nicht gibt, für die Anzeige.
        * Null heißt: es gibt sie. Der Unterschied zwischen "diese Augenhöhe ist
@@ -5948,7 +6069,8 @@
        */
       const yearWhy = !yearMeta || span !== 'year' ? null
         : Math.abs(eye - yearMeta.eyeHeight) >= 1e-6 ? 'eye'
-        : mode !== yearMeta.mode ? 'mode' : null;
+        : mode !== yearMeta.mode ? 'mode'
+        : csBy.year === 0.5 ? 'cs' : null;
 
       /* Wie viele Zellen eine Stundenkarte in diesem Ausschnitt hätte. Das ist
        * das Gegenstück zu `shadowCells`, nur ohne Sonnenstand: der Zuschlag ist
@@ -5971,11 +6093,12 @@
       const hoursCsFitsFor = c => hoursCells(c) <= MAX_HOURS_CELLS;
 
       /* Und die andere Antwort als beim Schatten, wo eine zu feine Wahl
-       * abgeschaltet wird und die automatische Weite einspringt: hier gibt es
-       * keine automatische, also muss die nächstgröbere einspringen, die noch
-       * trägt. Der Knopf bleibt trotzdem hervorgehoben und wird beim
-       * Hineinzoomen von selbst wieder eingelöst -- die Wahl gilt, sie ist nur
-       * in diesem Ausschnitt nicht zu haben, und die Statuszeile sagt es.
+       * abgeschaltet wird und die automatische Weite einspringt: hier springt
+       * die nächstgröbere Stufe ein, die noch trägt -- auch für die
+       * Automatik, die seit der fünfzehnten Session Voreinstellung ist. Der
+       * Knopf bleibt trotzdem hervorgehoben und wird beim Hineinzoomen von
+       * selbst wieder eingelöst -- die Wahl gilt, sie ist nur in diesem
+       * Ausschnitt nicht zu haben, und die Statuszeile sagt es.
        *
        * Vier Meter tragen immer: über den weitesten Ausschnitt, den die
        * Kachelschranke durchlässt, sind das gut zwei Millionen Zellen.
@@ -6036,7 +6159,15 @@
        * darunter jede Wahl durch, auch die halbe Stufe des feinen Satzes. */
       const hoursCsFloor = yearPre && vw
         ? (HOURS_CS_FALLBACK.find(c => c >= vw.mPerPx / 3) || 16) : 0;
-      const hoursCsWanted = Math.max(hoursCs, hoursCsFloor);
+      /* Die Automatik (hoursCs = 0, Voreinstellung): so fein wie das Bild,
+       * samt der halben Stufe, wo der feine Satz das sichtbare Bild deckt --
+       * nur nicht beim Nachschlagen, dort liegt nichts Feineres als 1 m auf
+       * der Platte. Ob die Weite trägt, prüft dieselbe Rückfallkette wie bei
+       * einer festen Wahl; die Statuszeile nennt dann die gröbere Stufe.
+       */
+      const hoursAutoCs = model && model.ready && vw
+        ? hoursAutoCellsize(model.hm, vw.mPerPx, fineOK && !yearPre) : 2;
+      const hoursCsWanted = Math.max(hoursCs === 0 ? hoursAutoCs : hoursCs, hoursCsFloor);
       const hoursCsFits = hoursCsOK(hoursCsWanted);
       const hoursCsUsed = hoursCsFits ? hoursCsWanted
         : (HOURS_CS_FALLBACK.find(c => c > hoursCsWanted && hoursCsOK(c))
@@ -6299,10 +6430,72 @@
       const hoursUp = hours && vw && hoursView !== 'cells'
         ? upsampleFactor(hours.cellsize, vw.mPerPx) : 1;
 
-      const hoursBitmap = useMemo(
-        () => (hours ? hoursCanvas(hours, ramp, hoursMax, hoursView === 'blur', hoursUp) : null),
-        [hours, ramp, hoursMax, hoursView, hoursUp]
-      );
+      /* Welcher Ausschnitt des Feldes fürs Bild vergrößert werden muss. Null
+       * heißt: das Bild zeigt ohnehin das ganze Feld. Der Schlüssel daneben
+       * ist das, woran der Effekt hängt -- das Rechteck selbst ist bei jedem
+       * Durchlauf ein neues Objekt und wäre als Abhängigkeit eine
+       * Endlosschleife.
+       */
+      const hoursCrop = useMemo(() => {
+        if (!hours || !vw || !model) return null;
+        const ext = vw.extent(0);
+        return fieldCropRect(hours.spec,
+          model.hm.bounds[0] + ext[0], model.hm.bounds[1] + ext[1],
+          model.hm.bounds[0] + ext[2], model.hm.bounds[1] + ext[3], 64, 2);
+      }, [hours, vw, model, stage]);
+      const hoursCropKey = hoursCrop
+        ? [hoursCrop.c0, hoursCrop.r0, hoursCrop.c1, hoursCrop.r1].join(',') : '';
+
+      /* Das Stundenbild ist seit der fünfzehnten Session Zustand und kein
+       * Memo: Weichzeichnen und Vergrößern laufen im Worker (Anfrageart
+       * `upsample`), und zwar nur über dem sichtbaren Ausschnitt. Der
+       * Hauptfaden färbt nur noch. Solange die Antwort unterwegs ist, bleibt
+       * das alte Bild stehen -- beim ersten Bild eines frischen Ergebnisses
+       * steht stattdessen sofort die ungeglättete Färbung da, damit ein
+       * Rechenergebnis nicht erst nach einer zweiten Wartezeit erscheint.
+       *
+       * `sub` sagt dem Zeichnen, für welchen Zellausschnitt des Feldes das
+       * Bild gilt; ohne `sub` gilt es für das ganze Feld.
+       */
+      const [hoursBmp, setHoursBmp] = useState(null);
+      const hoursBmpSeq = useRef(0);
+      useEffect(() => {
+        if (!hours) { setHoursBmp(null); return; }
+        const seq = ++hoursBmpSeq.current;
+        // Wofür ein fertiges Bild gilt: Ergebnis, Färbung, Lesart. Der
+        // Zuschnitt steht mit Absicht nicht darin -- ein Bild eines anderen
+        // Zuschnitts ist nicht falsch, nur kleiner oder größer.
+        const forKey = [hours.key, rampId, hoursMax, hoursView].join('|');
+        const needWork = hoursView === 'blur' || hoursUp > 1;
+        if (!needWork) {
+          // Nicht neu färben, wenn schon das richtige ganze Bild dasteht: der
+          // Zuschnittsschlüssel steht in den Abhängigkeiten und wechselt beim
+          // Schieben, aber hier hängt nichts an ihm.
+          setHoursBmp(prev => prev && prev.forKey === forKey && !prev.sub ? prev
+            : { canvas: hoursFieldCanvas(hours.hours, hours.cols, hours.rows, ramp, hoursMax),
+                sub: null, forKey: forKey });
+          return;
+        }
+        setHoursBmp(prev => prev && prev.forKey === forKey ? prev
+          : { canvas: hoursFieldCanvas(hours.hours, hours.cols, hours.rows, ramp, hoursMax),
+              sub: null, forKey: forKey });
+        if (!model || !model.client) return;
+        const rect = hoursCrop;
+        const cols = rect ? rect.c1 - rect.c0 : hours.cols;
+        const rows = rect ? rect.r1 - rect.r0 : hours.rows;
+        const field = rect ? cropFloatField(hours.hours, hours.cols, rect) : hours.hours;
+        model.client.ask('upsample', {
+          field: field, cols: cols, rows: rows,
+          factor: hoursUp, blur: hoursView === 'blur'
+        }).then(r => {
+          if (r.superseded || r.error || hoursBmpSeq.current !== seq) return;
+          setHoursBmp({
+            canvas: hoursFieldCanvas(r.values, r.cols, r.rows, ramp, hoursMax),
+            sub: rect ? { c0: rect.c0, r0: rect.r0, cols: cols, rows: rows } : null,
+            forKey: forKey
+          });
+        });
+      }, [hours, ramp, rampId, hoursMax, hoursView, hoursUp, hoursCropKey, model]);
 
       /* Das Zeichnen steht in einer eigenen Funktion und nicht im Effekt, weil
        * es zwei Abnehmer hat: den Bildschirm und den PNG-Export. Der Export
@@ -6344,9 +6537,16 @@
         // diesem Bauteil die Sichtbarkeitsschwelle, und ein Name, der sie
         // innerhalb der Funktion verdeckt, ist die Sorte, an der der nächste
         // Handgriff scheitert.
-        const drawGrid = (bmp, g, viewMode) => {
-          const x0 = vw.sx(g.spec.originE - model.hm.bounds[0]);
-          const y0 = vw.sy(g.spec.originN - model.hm.bounds[1] + g.rows * g.cellsize);
+        /* `sub` (optional) sagt, dass das Bild nur einen Zellausschnitt des
+         * Feldes trägt: seit die Vergrößerung im Worker läuft, wird nur der
+         * sichtbare Teil vergrößert, und das Bild gehört dann an dessen Platz
+         * und nicht an den des ganzen Feldes.
+         */
+        const drawGrid = (bmp, g, viewMode, sub) => {
+          const c0 = sub ? sub.c0 : 0, r0 = sub ? sub.r0 : 0;
+          const nc = sub ? sub.cols : g.cols, nr = sub ? sub.rows : g.rows;
+          const x0 = vw.sx(g.spec.originE - model.hm.bounds[0] + c0 * g.cellsize);
+          const y0 = vw.sy(g.spec.originN - model.hm.bounds[1] + (g.rows - r0) * g.cellsize);
           /* Kästchen heißt Kästchen: keine Zwischenwerte beim Vergrößern, damit
            * die gerechnete Rasterweite beim Hineinzoomen sichtbar bleibt. Die
            * beiden anderen Lesarten liegen als Deckungsfeld vor und wollen
@@ -6395,7 +6595,9 @@
           ctx.fill();
         };
 
-        if (layer !== 'shadow' && hoursBitmap && showLayer) drawGrid(hoursBitmap, hours, hoursView);
+        if (layer !== 'shadow' && hoursBmp && showLayer) {
+          drawGrid(hoursBmp.canvas, hours, hoursView, hoursBmp.sub);
+        }
 
         /* Die zweite Hälfte der Glättung steckt in drawGrid und kostet nichts:
          * das Bild liegt in Rasterzellen vor und wird auf Bildschirmpixel
@@ -6547,7 +6749,7 @@
          * ein Grund, neu zu malen.
          */
       }, [vw, model, stage, shadowBitmap, shadow, showLayer, viewBy, showLabels, colors, size.w, size.h,
-          pick, answer, sun.az, sun.elev, mode, layer, hoursBitmap, hours]);
+          pick, answer, sun.az, sun.elev, mode, layer, hoursBmp, hours]);
 
       // ------------------------------------------------------------ Bedienung
 
@@ -7009,16 +7211,23 @@
          * gröbste Wahl nicht mehr trägt, und dann ist die benutzte Weite die
          * gewählte, obwohl sie nicht passt.
          */
-        : (layer !== 'shadow' && !hoursCsFits && hoursCsUsed !== hoursCs)
-          ? (hoursCs < 1 && !fineOK ? t.cellFallbackFine : t.cellFallback)
-              .replace(/\{c\}/g, fmtCs(hoursCsUsed)).replace(/\{w\}/g, fmtCs(hoursCs))
+        /* Bei der Automatik heißt der Rückfall nicht "statt deiner Wahl",
+         * denn gewählt war "nach Bild": die Zeile sagt nur, dass gröber
+         * gerechnet wird, mit demselben Text wie beim automatischen
+         * Schattenweg.
+         */
+        : (layer !== 'shadow' && !hoursCsFits && hoursCsUsed !== hoursCsWanted)
+          ? (hoursCs === 0
+              ? t.cellAutoCoarse.replace(/\{c\}/g, fmtCs(hoursCsUsed))
+              : (hoursCsWanted < 1 && !fineOK ? t.cellFallbackFine : t.cellFallback)
+                  .replace(/\{c\}/g, fmtCs(hoursCsUsed)).replace(/\{w\}/g, fmtCs(hoursCsWanted)))
         /* Und dasselbe für den automatischen Weg, der nicht ablehnt, sondern
          * vergröbert. Ohne die Zeile stünde am Abend wortlos eine gröbere
          * Karte da als am Mittag, und der Unterschied sähe nach einem Fehler
          * im Modell aus statt nach einer Entscheidung über die Rechenzeit.
          */
         : (layer === 'shadow' && shadowCs === 0 && shadow && model && vw
-            && shadow.cellsize > shadowCellsize(model.hm, vw.mPerPx, 0))
+            && shadow.cellsize > shadowCellsize(model.hm, vw.mPerPx, 0, fineOK))
           ? t.cellAutoCoarse.replace(/\{c\}/g, fmtCs(shadow.cellsize))
         : null;
 
@@ -7117,6 +7326,7 @@
                   <span style=${{ color: 'var(--tool-sig-warn)' }}>
                     ${' ' + (yearWhy === 'eye'
                       ? t.yearWhyEye.replace(/\{e\}/g, fmtEye(yearMeta.eyeHeight))
+                      : yearWhy === 'cs' ? t.yearWhyCs
                       : t.yearWhyMode.replace(/\{m\}/g, Math.round(yearMeta.mode * 100) + ' %'))}
                   <//>`}
               <//>
@@ -7223,18 +7433,29 @@
                            Angebot. Die gewählte Stufe bleibt trotzdem
                            hervorgehoben, auch wenn gerade eine gröbere
                            gerechnet wird. -->
-                      <!-- Die halbe Stufe nur auf dem Rechenweg: die
-                           vorberechnete Jahreskarte liegt in 1 m vor, ein
-                           0,5-m-Knopf am Nachschlagen verspräche etwas, das
-                           nicht auf der Platte liegt. -->
-                      ${(hasFine && !yearPre ? [0.5].concat(HOURS_CS_CHOICES) : HOURS_CS_CHOICES).map(c => {
-                        const fits = hoursCsOK(c);
-                        const offWhy = c < 1 && !fineOK ? t.cellNoFine : t.cellTooFine;
+                      <!-- Die Automatik steht zuerst und ist die
+                           Voreinstellung: die Weite folgt dem Bild, samt der
+                           halben Stufe, wo der feine Satz das Bild deckt. -->
+                      <!-- Die halbe Stufe steht auch im Nachschlagemodus da,
+                           und sie zu wählen bestellt den Rechenweg: die
+                           vorberechnete Jahreskarte liegt in 1 m vor, und
+                           gerade die 0,5-m-Jahreskarte ist der Hebel gegen
+                           das Würfelmuster an Kronenrändern. Der Tooltip und
+                           die Fußnote (yearWhyCs) sagen, was der Klick
+                           kostet. -->
+                      ${[0].concat(hasFine ? [0.5] : [], HOURS_CS_CHOICES).map(c => {
+                        const fits = c === 0 ? true
+                          : c === 0.5 && yearPre
+                            ? (fineOK && hoursCsFitsFor(0.5) && !hoursTooMany)
+                            : hoursCsOK(c);
+                        const offWhy = c > 0 && c < 1 && !fineOK ? t.cellNoFine : t.cellTooFine;
+                        const hint = c === 0 ? t.cellAutoHintHours
+                          : c === 0.5 && yearPre ? t.cellHalfOrders : t.spaceHint;
                         return html`
                         <button key=${'co' + c} className=${'lang-seg' + (hoursCs === c ? ' active' : '')}
                                 disabled=${!fits}
-                                title=${fits ? t.spaceHint : offWhy}
-                                onClick=${() => setCsBy(b => Object.assign({}, b, { [span]: c }))}>${fmtCs(c) + ' m'}<//>`;
+                                title=${fits ? hint : offWhy}
+                                onClick=${() => setCsBy(b => Object.assign({}, b, { [span]: c }))}>${c === 0 ? t.cellAuto : fmtCs(c) + ' m'}<//>`;
                       })}
                     <//>
                   <//>
