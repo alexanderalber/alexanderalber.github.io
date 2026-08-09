@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Background Remover | Alexander Alber</title>
+  <meta name="description" content="Remove a white or single-coloured background from an image, entirely in your browser. Flood fill keeps enclosed white areas, soft edges avoid white fringes, and unevenly lit scans can be flattened first.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/background-remover.html">
+  <meta property="og:title" content="Background Remover">
+  <meta property="og:description" content="Remove a white or single-coloured background from an image, entirely in your browser. Flood fill keeps enclosed white areas, soft edges avoid white fringes.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/background-remover.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/bgremove-core.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Background Remover",
+    "description": "Remove a white or single-coloured background from an image, entirely in your browser. Flood fill keeps enclosed white areas, soft edges avoid white fringes.",
+    "url": "https://alber.me/miscellaneous/tools/background-remover.html",
+    "applicationCategory": "MultimediaApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+  <style>
+    h1.bg-h1 { font-size: 1.5rem; font-weight: 700; color: var(--tool-emph); margin: 0 0 6px; }
+    p.bg-sub { font-size: .84rem; color: var(--tool-note); margin: 0 0 16px; max-width: 76ch; }
+
+    .bg-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: 16px; align-items: start; }
+    @media (max-width: 767px) { .bg-layout { grid-template-columns: 1fr; } }
+
+    .bg-card { background: var(--tool-surface); border: 1px solid var(--tool-hairline); border-radius: 12px; padding: 14px 16px; }
+    .bg-stage { min-width: 0; }
+    .bg-stagehead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .bg-backdropseg { margin-left: auto; }
+    .bg-seg { display: inline-flex; }
+
+    /* Two neutral greys so the checkerboard reads the same in every skin. The
+       user's image is the only thing on this canvas, so no palette JS here. */
+    .bg-canvas { display: block; width: 100%; height: auto; border-radius: 8px;
+      background-color: #666666;
+      background-image: conic-gradient(#666666 25%, #b3b3b3 0 50%, #666666 0 75%, #b3b3b3 0);
+      background-size: 24px 24px;
+      background-repeat: repeat; /* Pico sets no-repeat on * */ }
+    .bg-canvas.picking { cursor: crosshair; }
+    /* Backdrop for the result view. Solid values on purpose: they are what the
+       cutout will sit on later, not part of the site palette. */
+    .bg-canvas.bd-white { background-image: none; background-color: #ffffff; }
+    .bg-canvas.bd-gray  { background-image: none; background-color: #808080; }
+    .bg-canvas.bd-black { background-image: none; background-color: #000000; }
+    .bg-canvaswrap { position: relative; line-height: 0; touch-action: none; }
+    .bg-overlay { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 8px; pointer-events: none; }
+    .bg-swatches { display: flex; gap: 4px; flex-wrap: wrap; }
+    .bg-swatches .bg-swatch { width: 18px; height: 18px; }
+
+    .bg-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+      min-height: 320px; padding: 28px 22px; text-align: center; cursor: pointer;
+      border: 2px dashed var(--tool-border); border-radius: 12px; background: var(--tool-subtle);
+      color: var(--tool-label); font-size: .86rem; line-height: 1.6; }
+    .bg-drop:hover, .bg-drop.over { border-color: var(--tool-sig-info); color: var(--tool-text); }
+    .bg-drop .bg-drop-hint { font-size: .72rem; color: var(--tool-faint); }
+
+    .bg-group { border-top: 1px solid var(--tool-hairline); padding-top: 11px; margin-top: 11px; }
+    .bg-group:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+    .bg-glabel { font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; color: var(--tool-note); margin-bottom: 5px; }
+    .bg-expl { font-size: .7rem; color: var(--tool-faint); line-height: 1.5; margin: 5px 0 0; }
+    .bg-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .bg-val { font-size: .72rem; color: var(--tool-label); font-variant-numeric: tabular-nums; }
+    input.bg-slider { width: 100%; margin: 4px 0 0; }
+    .bg-check { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: var(--tool-text); margin: 0; }
+    .bg-check input { margin: 0; }
+    .bg-swatch { width: 22px; height: 22px; border-radius: 5px; border: 1px solid var(--tool-border); flex: 0 0 auto; }
+    .bg-swatchrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .bg-hex { font-size: .72rem; color: var(--tool-label); font-family: ui-monospace, monospace; }
+
+    .bg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .bg-btn { padding: .4rem .9rem; font-size: .8rem; font-family: inherit; cursor: pointer; border-radius: 8px;
+      border: 1.5px solid var(--tool-border); background: var(--tool-surface); color: var(--tool-text); margin: 0; width: auto; }
+    .bg-btn:hover:not(:disabled) { border-color: var(--tool-faint); }
+    .bg-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .bg-note { font-size: .68rem; color: var(--tool-faint); line-height: 1.6; margin: 12px 0 0; max-width: 76ch; }
+    .bg-warn { margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: var(--tool-warn-bg);
+      border: 1px solid var(--tool-warn-border); color: var(--tool-warn-text); font-size: .72rem; line-height: 1.5; }
+    .bg-status { font-size: .7rem; color: var(--tool-note); }
+  </style>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#images" id="nav-cat">Images</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:var(--tool-emph);margin-bottom:8px">Background Remover</h1>
+        <p style="color:var(--tool-label);max-width:70ch">Drops the white or single-coloured background out of an image and gives you a transparent PNG. The removal runs as a flood fill from the image border, so white inside the subject stays white; scans with uneven lighting can be flattened first, and edges come out soft instead of fringed. Everything happens in your browser, nothing is uploaded.</p>
+        <ul style="color:var(--tool-label);max-width:70ch;font-size:0.95rem">
+          <li>Drop, paste or browse for a PNG, JPEG or WebP; the background colour is detected from the image border, picked from a pixel, or painted over with a brush so a whole range of shades counts as background.</li>
+          <li>Edges only removes the background connected to the border, Everywhere removes the colour across the whole image.</li>
+          <li>Tolerance, feathering and a speck filter handle JPEG noise and scanner dust; the uneven-background option corrects a gradient across the page before the comparison.</li>
+          <li>Soft edges use fractional transparency and unmix the edge pixels, which keeps thin hair and soft shadows without a white halo.</li>
+        </ul>
+      </div>
+    </div>
+  </main>
+
+  <script id="app">
+    // Markup is htm, not JSX: backticks tagged with `html`, ${...} for values,
+    // style always an object. All image logic lives in /assets/js/bgremove-core.js.
+    const { useState, useEffect, useRef, useCallback } = React;
+    const html = htm.bind(React.createElement);
+
+    const PREVIEW_LIMIT = 1600000;
+    const MAX_SAMPLES = 20000;
+    const DEFAULTS = { tolerance: 0.12, flatten: 48, expand: 0, smooth: 0, feather: 0, despeckle: 0 };
+
+    const clamp255 = (v) => Math.max(0, Math.min(255, Math.round(v)));
+    const toCss = (c) => c ? 'rgb(' + clamp255(c[0]) + ', ' + clamp255(c[1]) + ', ' + clamp255(c[2]) + ')' : 'transparent';
+    const toHex = (c) => c ? '#' + [c[0], c[1], c[2]].map((v) => clamp255(v).toString(16).padStart(2, '0')).join('') : '';
+
+    function toImageData(buf) {
+      const arr = buf.data instanceof Uint8ClampedArray ? buf.data : new Uint8ClampedArray(buf.data);
+      return new ImageData(arr, buf.width, buf.height);
+    }
+
+    function drawToImageData(src, w, h) {
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(src, 0, 0, w, h);
+      return ctx.getImageData(0, 0, w, h);
+    }
+
+    function decode(file) {
+      if (typeof createImageBitmap === 'function') return createImageBitmap(file);
+      return new Promise((res, rej) => {
+        const url = URL.createObjectURL(file);
+        const im = new Image();
+        im.onload = () => { URL.revokeObjectURL(url); res(im); };
+        im.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Could not decode this file.')); };
+        im.src = url;
+      });
+    }
+
+    function Seg({ value, options, onChange }) {
+      return html`
+        <div className="bg-seg">
+          ${options.map((o) => html`
+            <button key=${o.value} type="button"
+              className=${'lang-seg' + (o.value === value ? ' active' : '')}
+              onClick=${() => onChange(o.value)}>${o.label}</button>
+          `)}
+        </div>
+      `;
+    }
+
+    function Slider({ label, value, min, max, step, unit, signed, onChange }) {
+      const shown = (signed && value > 0 ? '+' : '') + value;
+      return html`
+        <div>
+          <div className="bg-row">
+            <span className="bg-val">${label}</span>
+            <span className="bg-val">${shown}${unit || ''}</span>
+          </div>
+          <input className="bg-slider" type="range" min=${min} max=${max} step=${step} value=${value}
+            onInput=${(e) => onChange(parseFloat(e.target.value))} />
+        </div>
+      `;
+    }
+
+    function App() {
+      const [image, setImage] = useState(null);   // { name, full, preview, scale }
+      const [autoBg, setAutoBg] = useState(null);
+      const [picked, setPicked] = useState(null);
+      const [bgMode, setBgMode] = useState('auto');
+      const [mode, setMode] = useState('edges');
+      const [tolerance, setTolerance] = useState(DEFAULTS.tolerance);
+      const [uneven, setUneven] = useState(false);
+      const [flatten, setFlatten] = useState(DEFAULTS.flatten);
+      const [softEdges, setSoftEdges] = useState(true);
+      const [expand, setExpand] = useState(DEFAULTS.expand);
+      const [smooth, setSmooth] = useState(DEFAULTS.smooth);
+      const [feather, setFeather] = useState(DEFAULTS.feather);
+      const [backdrop, setBackdrop] = useState('checker');
+      const [despeckle, setDespeckle] = useState(DEFAULTS.despeckle);
+      const [view, setView] = useState('result');
+      const [result, setResult] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [working, setWorking] = useState(false);
+      const [error, setError] = useState('');
+      const [dragOver, setDragOver] = useState(false);
+      const [copied, setCopied] = useState('');
+      const [brush, setBrush] = useState(16);
+      const [sampleCount, setSampleCount] = useState(0);
+      const [bgModel, setBgModel] = useState(null);
+
+      const canvasRef = useRef(null);
+      const overlayRef = useRef(null);
+      const fileRef = useRef(null);
+      const samplesRef = useRef([]);
+      const strokeRef = useRef(null);
+
+      const core = typeof BgCore !== 'undefined' ? BgCore : null;
+      const canCopy = typeof ClipboardItem !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.write);
+      const activeBg = bgMode === 'pick' ? (picked || autoBg) : autoBg;
+      const usingModel = bgMode === 'sample' && !!bgModel;
+      const centers = usingModel && Array.isArray(bgModel.centersRgb) ? bgModel.centersRgb.slice(0, 8) : null;
+
+      const options = useCallback(() => ({
+        bg: bgMode === 'pick' && picked ? picked : null,
+        bgModel: bgMode === 'sample' ? bgModel : null,
+        mode,
+        tolerance,
+        flatten: uneven ? flatten : 0,
+        softEdges,
+        expand,
+        smooth,
+        feather,
+        despeckle
+      }), [bgMode, picked, bgModel, mode, tolerance, uneven, flatten, softEdges, expand, smooth, feather, despeckle]);
+
+      const loadFile = useCallback((file) => {
+        if (!file) return;
+        if (file.type && !/^image\//.test(file.type)) { setError('That file is not an image.'); return; }
+        setError('');
+        setWorking(true);
+        decode(file).then((src) => {
+          const w = src.width || src.naturalWidth;
+          const h = src.height || src.naturalHeight;
+          if (!w || !h) throw new Error('Could not read the image size.');
+          const full = drawToImageData(src, w, h);
+          const px = w * h;
+          const scale = px > PREVIEW_LIMIT ? Math.sqrt(PREVIEW_LIMIT / px) : 1;
+          const preview = scale < 1
+            ? drawToImageData(src, Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)))
+            : full;
+          if (src.close) src.close();
+          setPicked(null);
+          setBgMode('auto');
+          setView('result');
+          setResult(null);
+          samplesRef.current = [];
+          setSampleCount(0);
+          setBgModel(null);
+          setImage({ name: file.name || '', full, preview, scale });
+          try { setAutoBg(core ? core.estimateBgColor(preview) : null); }
+          catch (e) { setAutoBg(null); }
+          setWorking(false);
+        }).catch((e) => {
+          setWorking(false);
+          setError(e && e.message ? e.message : 'Could not open that image.');
+        });
+      }, [core]);
+
+      // Clipboard paste anywhere on the page.
+      useEffect(() => {
+        const onPaste = (e) => {
+          const items = e.clipboardData && e.clipboardData.items;
+          if (!items) return;
+          for (let i = 0; i < items.length; i++) {
+            if (items[i].type && items[i].type.indexOf('image/') === 0) {
+              const f = items[i].getAsFile();
+              if (f) { e.preventDefault(); loadFile(f); return; }
+            }
+          }
+        };
+        document.addEventListener('paste', onPaste);
+        return () => document.removeEventListener('paste', onPaste);
+      }, [loadFile]);
+
+      // Debounced preview recompute.
+      useEffect(() => {
+        if (!image) { setResult(null); return; }
+        if (!core) { setError('The processing engine did not load.'); return; }
+        const id = setTimeout(() => {
+          try {
+            setResult(core.removeBackground(image.preview, options()));
+            setError('');
+          } catch (e) {
+            setError(e && e.message ? e.message : 'Processing failed.');
+          }
+        }, 150);
+        return () => clearTimeout(id);
+      }, [image, core, options]);
+
+      // Paint whatever the view asks for.
+      useEffect(() => {
+        const cv = canvasRef.current;
+        if (!cv || !image) return;
+        const buf = view === 'original' ? image.preview : (result ? toImageData(result) : image.preview);
+        cv.width = buf.width;
+        cv.height = buf.height;
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.putImageData(buf, 0, 0);
+      }, [image, result, view]);
+
+      // Overlay for the sampling stroke. Sized once per image, so a recompute of
+      // the result never wipes the painted trail.
+      useEffect(() => {
+        const ov = overlayRef.current;
+        if (!ov || !image) return;
+        if (ov.width !== image.preview.width || ov.height !== image.preview.height) {
+          ov.width = image.preview.width;
+          ov.height = image.preview.height;
+        }
+      }, [image]);
+
+      // One place for display pixels to image pixels. The canvas is laid out with
+      // width:100% and height:auto, so the two axes share a factor, but they are
+      // read separately in case a stylesheet ever letterboxes the element.
+      function mapping() {
+        const cv = canvasRef.current;
+        if (!cv || !image) return null;
+        const r = cv.getBoundingClientRect();
+        if (!r.width || !r.height) return null;
+        return {
+          rect: r,
+          fx: image.full.width / r.width,
+          fy: image.full.height / r.height,
+          px: cv.width / r.width,
+          py: cv.height / r.height
+        };
+      }
+
+      function pixelAt(m, dx, dy) {
+        const full = image.full;
+        const x = Math.max(0, Math.min(full.width - 1, Math.floor(dx * m.fx)));
+        const y = Math.max(0, Math.min(full.height - 1, Math.floor(dy * m.fy)));
+        return (y * full.width + x) * 4;
+      }
+
+      function stampSamples(m, dx, dy, out) {
+        const full = image.full;
+        const step = 2;
+        const r2 = brush * brush;
+        for (let oy = -brush; oy <= brush; oy += step) {
+          for (let ox = -brush; ox <= brush; ox += step) {
+            if (ox * ox + oy * oy > r2) continue;
+            const sx = dx + ox, sy = dy + oy;
+            if (sx < 0 || sy < 0 || sx > m.rect.width || sy > m.rect.height) continue;
+            const i = pixelAt(m, sx, sy);
+            out.push([full.data[i], full.data[i + 1], full.data[i + 2]]);
+          }
+        }
+      }
+
+      function paintStroke(m, dx, dy) {
+        const ov = overlayRef.current;
+        if (!ov) return;
+        const ctx = ov.getContext('2d');
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+        ctx.beginPath();
+        ctx.arc(dx * m.px, dy * m.py, brush * m.px, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      function onPointerDown(e) {
+        if (!image) return;
+        const m = mapping();
+        if (!m) return;
+        const dx = e.clientX - m.rect.left, dy = e.clientY - m.rect.top;
+        if (bgMode === 'pick') {
+          const i = pixelAt(m, dx, dy);
+          setPicked([image.full.data[i], image.full.data[i + 1], image.full.data[i + 2]]);
+          return;
+        }
+        if (bgMode !== 'sample') return;
+        e.preventDefault();
+        if (e.target.setPointerCapture) { try { e.target.setPointerCapture(e.pointerId); } catch (x) {} }
+        strokeRef.current = { x: dx, y: dy, buf: [] };
+        stampSamples(m, dx, dy, strokeRef.current.buf);
+        paintStroke(m, dx, dy);
+      }
+
+      function onPointerMove(e) {
+        const stroke = strokeRef.current;
+        if (!stroke) return;
+        const m = mapping();
+        if (!m) return;
+        const dx = e.clientX - m.rect.left, dy = e.clientY - m.rect.top;
+        const dist = Math.hypot(dx - stroke.x, dy - stroke.y);
+        const spacing = Math.max(2, brush * 0.5);
+        const steps = Math.floor(dist / spacing);
+        for (let s = 1; s <= steps; s++) {
+          const t = s / steps;
+          const ix = stroke.x + (dx - stroke.x) * t;
+          const iy = stroke.y + (dy - stroke.y) * t;
+          stampSamples(m, ix, iy, stroke.buf);
+          paintStroke(m, ix, iy);
+        }
+        if (steps > 0) { stroke.x = dx; stroke.y = dy; }
+      }
+
+      function onPointerUp() {
+        const stroke = strokeRef.current;
+        strokeRef.current = null;
+        if (!stroke || !stroke.buf.length) return;
+        let all = samplesRef.current.concat(stroke.buf);
+        if (all.length > MAX_SAMPLES) {
+          const keep = Math.ceil(all.length / MAX_SAMPLES);
+          all = all.filter((v, i) => i % keep === 0);
+        }
+        samplesRef.current = all;
+        setSampleCount(all.length);
+        if (!core) return;
+        try {
+          setBgModel(core.buildBgModel(all));
+          setError('');
+        } catch (err) {
+          setBgModel(null);
+          setError(err && err.message ? err.message : 'Could not build a colour model from the samples.');
+        }
+      }
+
+      function clearSamples() {
+        samplesRef.current = [];
+        setSampleCount(0);
+        setBgModel(null);
+        const ov = overlayRef.current;
+        if (ov) ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
+      }
+
+      function renderFull() {
+        const out = core.removeBackground(image.full, options());
+        const cv = document.createElement('canvas');
+        cv.width = out.width;
+        cv.height = out.height;
+        cv.getContext('2d').putImageData(toImageData(out), 0, 0);
+        return cv;
+      }
+
+      function download() {
+        if (!image || !core) return;
+        setBusy(true);
+        setTimeout(() => {
+          try {
+            const base = (image.name || '').replace(/\.[^.]+$/, '').trim();
+            const name = base ? base + '-cutout.png' : 'cutout.png';
+            renderFull().toBlob((blob) => {
+              setBusy(false);
+              if (!blob) { setError('Export failed.'); return; }
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }, 'image/png');
+          } catch (e) {
+            setBusy(false);
+            setError(e && e.message ? e.message : 'Export failed.');
+          }
+        }, 20);
+      }
+
+      function copyPng() {
+        if (!image || !core || !canCopy) return;
+        setBusy(true);
+        setCopied('');
+        setTimeout(() => {
+          try {
+            renderFull().toBlob((blob) => {
+              if (!blob) { setBusy(false); setError('Export failed.'); return; }
+              navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+                .then(() => { setBusy(false); setCopied('Copied'); setTimeout(() => setCopied(''), 1800); })
+                .catch(() => { setBusy(false); setError('The browser refused the clipboard write.'); });
+            }, 'image/png');
+          } catch (e) {
+            setBusy(false);
+            setError(e && e.message ? e.message : 'Copy failed.');
+          }
+        }, 20);
+      }
+
+      function onDrop(e) {
+        e.preventDefault();
+        setDragOver(false);
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) loadFile(f);
+      }
+
+      const downscaled = !!image && image.scale < 1;
+
+      return html`
+        <div className="container">
+          <h1 className="bg-h1">Background Remover</h1>
+          <p className="bg-sub">Removes a white or single-coloured background and gives you a transparent PNG. Everything runs locally in this tab.</p>
+
+          ${!core ? html`<div className="bg-warn">The processing engine (bgremove-core.js) did not load, so nothing can be computed.</div>` : null}
+
+          <div className="bg-layout">
+            <div className="bg-stage">
+              <div className="bg-stagehead">
+                <${Seg} value=${view} onChange=${setView} options=${[
+                  { value: 'original', label: 'Original' },
+                  { value: 'result', label: 'Result' }
+                ]} />
+                ${working ? html`<span className="bg-status">Reading image...</span>` : null}
+                ${image ? html`<span className="bg-status">${image.full.width} x ${image.full.height} px</span>` : null}
+                ${view === 'result' ? html`
+                  <span className="bg-backdropseg">
+                    <${Seg} value=${backdrop} onChange=${setBackdrop} options=${[
+                      { value: 'checker', label: 'Checker' },
+                      { value: 'white', label: 'White' },
+                      { value: 'gray', label: 'Gray' },
+                      { value: 'black', label: 'Black' }
+                    ]} />
+                  </span>
+                ` : null}
+              </div>
+
+              <div
+                onDragOver=${(e) => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave=${() => setDragOver(false)}
+                onDrop=${onDrop}>
+                ${image ? html`
+                  <div className="bg-canvaswrap">
+                    <canvas ref=${canvasRef}
+                      className=${'bg-canvas' + (bgMode === 'auto' ? '' : ' picking')
+                        + (view === 'result' && backdrop !== 'checker' ? ' bd-' + backdrop : '')}
+                      onPointerDown=${onPointerDown}
+                      onPointerMove=${onPointerMove}
+                      onPointerUp=${onPointerUp}
+                      onPointerCancel=${onPointerUp}></canvas>
+                    <canvas ref=${overlayRef} className="bg-overlay"
+                      style=${{ opacity: bgMode === 'sample' ? 1 : 0 }}></canvas>
+                  </div>
+                ` : html`
+                  <div className=${'bg-drop' + (dragOver ? ' over' : '')}
+                    onClick=${() => fileRef.current && fileRef.current.click()}>
+                    <span>Drop an image, paste, or click to browse.</span>
+                    <span className="bg-drop-hint">Everything stays in your browser. PNG, JPEG or WebP.</span>
+                  </div>
+                `}
+              </div>
+
+              <input ref=${fileRef} type="file" accept="image/png,image/jpeg,image/webp"
+                style=${{ display: 'none' }}
+                onChange=${(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) loadFile(f); }} />
+
+              ${image ? html`
+                <div className="bg-actions">
+                  <button className="bg-btn" type="button" onClick=${() => fileRef.current && fileRef.current.click()}>Open another image</button>
+                  <button className="bg-btn" type="button" disabled=${busy || !core} onClick=${download}>${busy ? 'Working...' : 'Download PNG'}</button>
+                  ${canCopy ? html`
+                    <button className="bg-btn" type="button" disabled=${busy || !core} onClick=${copyPng}>${copied ? copied : 'Copy to clipboard'}</button>
+                  ` : html`
+                    <button className="bg-btn" type="button" disabled title="This browser cannot write images to the clipboard.">Copy to clipboard</button>
+                  `}
+                </div>
+                ${downscaled ? html`<p className="bg-expl">Preview downscaled for speed, the export is full resolution.</p>` : null}
+              ` : null}
+
+              ${error ? html`<div className="bg-warn">${error}</div>` : null}
+            </div>
+
+            <aside className="bg-card">
+              <div className="bg-group">
+                <div className="bg-glabel">Background colour</div>
+                <div className="bg-swatchrow">
+                  ${usingModel ? null : html`<span className="bg-swatch" style=${{ background: toCss(activeBg) }}></span>`}
+                  ${usingModel ? null : html`<span className="bg-hex">${activeBg ? toHex(activeBg) : 'no image'}</span>`}
+                  <${Seg} value=${bgMode} onChange=${setBgMode} options=${[
+                    { value: 'auto', label: 'Auto' },
+                    { value: 'pick', label: 'Pick' },
+                    { value: 'sample', label: 'Sample' }
+                  ]} />
+                </div>
+                ${centers ? html`
+                  <div className="bg-swatches" style=${{ marginTop: 8 }}>
+                    ${centers.map((c, i) => html`
+                      <span key=${i} className="bg-swatch" style=${{ background: toCss(c) }} title=${toHex(c)}></span>
+                    `)}
+                  </div>
+                ` : null}
+                ${bgMode === 'sample' ? html`
+                  <${Slider} label="Brush size" value=${brush} min=${4} max=${48} step=${1} unit=" px"
+                    onChange=${setBrush} />
+                  <div className="bg-row" style=${{ marginTop: 6 }}>
+                    <span className="bg-val">${sampleCount} samples</span>
+                    <button className="bg-btn" type="button" disabled=${!sampleCount}
+                      style=${{ padding: '.2rem .6rem', fontSize: '.72rem' }}
+                      onClick=${clearSamples}>Clear samples</button>
+                  </div>
+                ` : null}
+                <p className="bg-expl">${bgMode === 'sample'
+                  ? 'Paint over the background; everything similar to the sampled colors is removed.'
+                  : (bgMode === 'pick'
+                    ? 'Click a pixel in the preview to use its colour as the background.'
+                    : 'Detected from the image border.')}</p>
+              </div>
+
+              <div className="bg-group">
+                <div className="bg-glabel">Mode</div>
+                <${Seg} value=${mode} onChange=${setMode} options=${[
+                  { value: 'edges', label: 'Edges only' },
+                  { value: 'global', label: 'Everywhere' }
+                ]} />
+                <p className="bg-expl">Edges only removes just the background connected to the image border, so white areas inside the subject survive. Everywhere removes the colour wherever it appears.</p>
+              </div>
+
+              <div className="bg-group">
+                <div className="bg-glabel">Matching</div>
+                <${Slider} label="Tolerance" value=${tolerance} min=${0} max=${0.35} step=${0.005}
+                  onChange=${setTolerance} />
+                <p className="bg-expl">How far a pixel may differ from the background colour and still count as background.</p>
+              </div>
+
+              <div className="bg-group">
+                <div className="bg-glabel">Scans</div>
+                <label className="bg-check">
+                  <input type="checkbox" checked=${uneven} disabled=${usingModel} onChange=${(e) => setUneven(e.target.checked)} />
+                  <span>Uneven background</span>
+                </label>
+                ${uneven && !usingModel ? html`
+                  <${Slider} label="Correction radius" value=${flatten} min=${8} max=${128} step=${1} unit=" px"
+                    onChange=${setFlatten} />
+                ` : null}
+                <p className="bg-expl">${usingModel
+                  ? 'Not used with sampled colours: the samples already describe the background variation.'
+                  : 'Flattens a lighting gradient across the page before comparing, for photographed or scanned paper.'}</p>
+              </div>
+
+              <div className="bg-group">
+                <div className="bg-glabel">Edges</div>
+                <label className="bg-check">
+                  <input type="checkbox" checked=${softEdges} onChange=${(e) => setSoftEdges(e.target.checked)} />
+                  <span>Soft edges</span>
+                </label>
+                <${Slider} label="Grow/shrink" value=${expand} min=${-10} max=${10} step=${1} unit=" px" signed
+                  onChange=${setExpand} />
+                <${Slider} label="Smooth outline" value=${smooth} min=${0} max=${10} step=${1} unit=" px"
+                  onChange=${setSmooth} />
+                <${Slider} label="Feather" value=${feather} min=${0} max=${10} step=${0.5} unit=" px"
+                  onChange=${setFeather} />
+                <p className="bg-expl">Four different things happen at the cut. Soft edges give border pixels fractional transparency and unmix their colour, which avoids white fringes and keeps soft shadows. Grow/shrink moves the cut: positive leaves a safety margin of background around the subject, negative trims into it, so pick whichever error hurts less. Smooth outline straightens a jagged or noisy edge without softening it. Feather blurs the finished transparency mask.</p>
+              </div>
+
+              <div className="bg-group">
+                <div className="bg-glabel">Cleanup</div>
+                <${Slider} label="Remove specks" value=${despeckle} min=${0} max=${64} step=${1} unit=" px"
+                  onChange=${setDespeckle} />
+                <p className="bg-expl">Drops leftover fragments smaller than this area, for JPEG noise and scanner dust.</p>
+              </div>
+            </aside>
+          </div>
+
+          <p className="bg-note">Processing happens entirely in this browser tab. The image is never uploaded, and nothing about it leaves your machine.</p>
+        </div>
+      `;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
