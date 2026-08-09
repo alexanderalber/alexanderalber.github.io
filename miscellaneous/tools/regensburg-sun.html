@@ -1302,7 +1302,15 @@
      * verschwände zuerst. Beim Gelände wäre das Maximum falsch, weil es
      * Hänge systematisch anhöbe; dort bleibt es beim nächsten Nachbarn.
      */
-    function assembleHeights(hm, spec, src) {
+    /* `objOut` (optional, Uint8Array mit rows*cols Plätzen) bekommt das
+     * Zellmaximum der rohen Objekthöhen-Bytes mitgeschrieben -- es fällt in
+     * der Schleife ohnehin an. Unbekannte Zellen stehen als 0 da; wer das
+     * Feld liest, prüft die Höhe daneben (UNKNOWN), nicht die 0, denn 0 ist
+     * auch ein gültiger Bodenwert. Alle Quellen (Kacheln, fein, Übersicht)
+     * teilen die nDOM-Quantisierung, das Byte ist also überall dieselbe
+     * Einheit.
+     */
+    function assembleHeights(hm, spec, src, objOut) {
       const nd = hm.ndom, dg = hm.dgm;
       const rows = spec.rows, cols = spec.cols, cellsize = spec.cellsize;
       const out = new Float32Array(rows * cols);
@@ -1364,12 +1372,44 @@
               if (v > obj) obj = v;
             }
           }
+          if (objOut) objOut[row * cols + col] = known ? obj : 0;
           if (!known) { out[row * cols + col] = UNKNOWN; continue; }
           const q = dgmValueAt(hm, src.dgm, eLeft + cellsize / 2, nTop - cellsize / 2);
           out[row * cols + col] = q === dg.nodata
             ? UNKNOWN
             : q * dg.scale + dg.offset + obj * nd.scale;
         }
+      }
+      return out;
+    }
+
+    /* Wo vermutlich Bäume stehen, als Deckungsfeld 0..255.
+     *
+     * Das Modell kennt keine Klassen, nur Oberflächen. Was hoch ist und kein
+     * Gebäude, ist in einer Stadt fast immer Bewuchs -- gelegentlich eine
+     * Mauer, ein Kran, eine Brücke, und das ist der Preis der Heuristik, der
+     * im Tooltip des Knopfes steht. Die Gebäude kommen als Maske herein
+     * (gerastert aus den Umrisspolygonen der Basiskarte, in der App, weil
+     * dafür ein Canvas gebraucht wird); hier wird nur noch kombiniert, und
+     * genau deshalb ist diese Hälfte prüfbar.
+     *
+     * Die Deckung wächst linear von `minM` (dort schwach, aber sichtbar) bis
+     * `fullM`: eine Hecke ist eine Andeutung, eine Platane eine Fläche. Unter
+     * `minM` bleibt es leer, damit Autos, Absätze und Rauschen des Modells
+     * nicht die halbe Stadt grün sprenkeln. Unbekannte Zellen bleiben leer,
+     * aus demselben Grund wie beim Schattenbild: eine Färbung würde als
+     * Aussage gelesen. `scale` ist die nDOM-Quantisierung (Meter je Byte).
+     */
+    function vegCover(obj, heights, n, mask, scale, minM, fullM) {
+      const out = new Uint8Array(n);
+      const lo = minM / scale, hi = fullM / scale;
+      for (let i = 0; i < n; i++) {
+        if (Number.isNaN(heights[i])) continue;
+        if (mask && mask[i]) continue;
+        const v = obj[i];
+        if (v < lo) continue;
+        const f = v >= hi ? 1 : (v - lo) / (hi - lo);
+        out[i] = Math.round(96 + 159 * f);
       }
       return out;
     }
@@ -3684,7 +3724,11 @@
             const rows = Math.ceil((hs.n1 - hs.n0) / cs);
             const spec = { originE: hs.e0, originN: hs.n0, cellsize: cs, rows: rows, cols: cols };
             report(wLoad + rest * 0.05);
-            const heights = assembleHeights(hm, spec, hs.src);
+            // Das Objekthöhen-Byte je Zelle geht mit hinaus: die App deutet
+            // daraus die Bäume an (hoch und kein Gebäude), und es fällt beim
+            // Zusammensetzen ohnehin an. Ein Byte je Zelle, wie cov und edge.
+            const objBytes = new Uint8Array(rows * cols);
+            const heights = assembleHeights(hm, spec, hs.src, objBytes);
             report(wLoad + rest * 0.2);
             // Die Sichtbarkeitsschwelle wandert in die Sonnenhöhe, damit der
             // Sweep nur eine Zahl kennen muss.
@@ -3725,8 +3769,8 @@
             }
             report(1);
             return {
-              lit: lit, cov: cov, edge: edge, heights: heights, iso: iso,
-              rows: rows, cols: cols, cellsize: cs, spec: spec
+              lit: lit, cov: cov, edge: edge, heights: heights, obj: objBytes,
+              iso: iso, rows: rows, cols: cols, cellsize: cs, spec: spec
             };
           });
         },
@@ -3970,7 +4014,7 @@
          */
         const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
         WORKER_ENGINE.shadow(msg, tell).then(r => {
-          const move = [r.lit.buffer, r.cov.buffer, r.edge.buffer, r.heights.buffer];
+          const move = [r.lit.buffer, r.cov.buffer, r.edge.buffer, r.heights.buffer, r.obj.buffer];
           // Die Punkte des Umrisses gehen mit über die Fadengrenze, statt
           // kopiert zu werden. Ohne die beiden Puffer in dieser Liste wandern
           // bei einer verwinkelten Altstadt ein paar Megabyte durch den
@@ -3978,7 +4022,7 @@
           if (r.iso) move.push(r.iso.xy.buffer, r.iso.starts.buffer);
           postMessage({
             type: 'shadow', token: msg.token, lit: r.lit, cov: r.cov, edge: r.edge,
-            heights: r.heights, iso: r.iso,
+            heights: r.heights, obj: r.obj, iso: r.iso,
             rows: r.rows, cols: r.cols, cellsize: r.cellsize, spec: r.spec
           }, move);
         }).catch(err => postMessage({ type: 'shadow', token: msg.token, error: String(err) }));
@@ -4113,6 +4157,8 @@
         runHint:      'Die Karte für die eingestellte Zeit neu rechnen. Alle drei Karten rechnen auf Ansage und nicht beim Schieben: bei tiefer Sonne wird über das Sechzehnfache der Fläche gerechnet, und dann wäre jede Handbewegung eine Rechnung, die niemand bestellt hat.',
         labelsLabel:  'Namen',
         labelsHint:   'Orts-, Straßen- und Flussnamen ein- und ausblenden. Sie liegen über genau den Stellen, an denen man eine Schattenkante nachsehen will.',
+        vegLabel:     'Bäume',
+        vegHint:      'Bewuchs grün andeuten: was im Höhenmodell ab etwa 2,5 m aufragt und kein Gebäude ist, sind in der Stadt fast immer Bäume und Hecken. Gelegentlich erwischt es eine Mauer, einen Kran oder eine Brücke, denn das Modell kennt nur Oberflächen, keine Arten.',
         optExport:    'Herunterladen',
         // Zwei Beschriftungen statt einer: unter "Herunterladen" standen vier
         // gleich aussehende Gruppen in einer Reihe, und dass die dritte den
@@ -4282,6 +4328,8 @@
         runHint:      'Recompute the map for the time you set. All three maps compute on request rather than while you drag: with a low sun the computed area is sixteen times the size, and every hand movement would then start a computation nobody asked for.',
         labelsLabel:  'Labels',
         labelsHint:   'Show or hide place, street and river names. They sit right on top of the spots where you want to check a shadow edge.',
+        vegLabel:     'Trees',
+        vegHint:      'Tint likely greenery: anything in the height model rising above roughly 2.5 m that is not a building is almost always a tree or hedge in a city. Occasionally it catches a wall, a crane or a bridge, because the model only knows surfaces, not species.',
         optExport:    'Download',
         optImage:     'Image',
         optVideo:     'Video',
@@ -4768,6 +4816,11 @@
         road: ['#414d60', '#333d4c', '#28303b'],
         building: '#2c3644', buildingEdge: '#3b4757',
         shadow: [8, 12, 20, 0.60], label: '#8492a5', labelHalo: '#10151c',
+        // Die Baumandeutung. Deutlich grüner als die Grünflächen darunter,
+        // aber halbdurchsichtig: sie ist ein Hinweis auf der Basiskarte und
+        // keine eigene Karte, und der Schatten legt sich darüber und dunkelt
+        // sie ab wie alles andere.
+        veg: [96, 178, 108, 0.32],
         marker: '#f2b544', ray: '#f2b544'
       },
       light: {
@@ -4775,6 +4828,7 @@
         road: ['#ffffff', '#fbfaf7', '#f2f0ea'],
         building: '#dcd6cb', buildingEdge: '#c3bbac',
         shadow: [46, 58, 82, 0.34], label: '#6f6a5e', labelHalo: '#f5f3ed',
+        veg: [86, 148, 84, 0.30],
         marker: '#b34700', ray: '#b34700'
       },
       /* Der graue Skin nimmt der Karte die Farbe und gibt sie dem Schatten:
@@ -4811,6 +4865,11 @@
          * erkennen ist, dunkel genug, dass sie abdunkelt.
          */
         shadow: [18, 42, 44, 0.55], label: '#eef1f2', labelHalo: '#3a3e43',
+        /* Entsättigt, mit Absicht: in diesem Skin gehört die Farbe dem
+         * Schatten. Ein graugrüner Hauch reicht, um Bewuchs von Mauerwerk zu
+         * trennen, ohne dem Türkis den Rang abzulaufen.
+         */
+        veg: [118, 142, 112, 0.38],
         marker: '#ffffff', ray: '#ffffff'
       }
     };
@@ -5138,6 +5197,70 @@
         if (f <= 0) continue;
         img.data[i * 4] = r; img.data[i * 4 + 1] = g;
         img.data[i * 4 + 2] = b; img.data[i * 4 + 3] = Math.round(alpha * f);
+      }
+      ctx.putImageData(img, 0, 0);
+      return cv;
+    }
+
+    /* Die Baumandeutung des Schattenreiters, zwei Schritte.
+     *
+     * Schritt eins: die Gebäudemaske. Die Umrisspolygone der Basiskarte
+     * werden auf das Raster des Schattenergebnisses gerastert -- per Canvas,
+     * weil das die Rasterung ist, die es umsonst gibt. Gefüllt wird je
+     * Gebäude mit evenodd, damit Innenhöfe Löcher bleiben: gerade dort
+     * stehen Bäume, um die es geht. Dazu ein Strich als Dilatation, denn das
+     * nDOM misst die Traufkante samt Dachüberstand und das Kataster die
+     * Wand; ohne den Rand bekäme jedes Dach einen grünen Saum. Mindestens
+     * eine Zelle je Seite, bei feinem Raster mindestens anderthalb Meter.
+     *
+     * Schritt zwei macht `vegCover` in mapcore (hoch und kein Gebäude ->
+     * Deckung), hier wird nur noch gefärbt.
+     */
+    const VEG_MIN_M = 2.5, VEG_FULL_M = 8;
+
+    function buildingMaskFor(g, model) {
+      const cols = g.cols, rows = g.rows, cs = g.cellsize;
+      const cv = document.createElement('canvas');
+      cv.width = cols; cv.height = rows;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      const ox = g.spec.originE - model.hm.bounds[0];
+      const oy = g.spec.originN - model.hm.bounds[1];
+      // Zellkoordinaten: x = (e - ox) / cs, y läuft von Norden nach unten.
+      ctx.setTransform(1 / cs, 0, 0, -1 / cs, -ox / cs, (oy + rows * cs) / cs);
+      const items = queryIndex(model.index, ox, oy, ox + cols * cs, oy + rows * cs);
+      ctx.beginPath();
+      for (const b of items) {
+        for (const ring of b.rings) {
+          ctx.moveTo(ring[0], ring[1]);
+          for (let i = 2; i < ring.length; i += 2) ctx.lineTo(ring[i], ring[i + 1]);
+          ctx.closePath();
+        }
+      }
+      ctx.fill('evenodd');
+      // lineWidth lebt im transformierten Raum, ist also in Metern.
+      ctx.lineWidth = Math.max(2 * cs, 3);
+      ctx.stroke();
+      const a = ctx.getImageData(0, 0, cols, rows).data;
+      const mask = new Uint8Array(cols * rows);
+      // Halbe Deckung zählt als Gebäude: die Kante des Strichs ist geglättet,
+      // und ein Saum aus Viertelpixeln soll die Maske nicht ausfransen.
+      for (let i = 0; i < mask.length; i++) mask[i] = a[i * 4 + 3] >= 96 ? 1 : 0;
+      return mask;
+    }
+
+    function vegCanvas(shade, mask, colors, scale) {
+      const cov = vegCover(shade.obj, shade.heights, shade.rows * shade.cols,
+                           mask, scale, VEG_MIN_M, VEG_FULL_M);
+      const cv = document.createElement('canvas');
+      cv.width = shade.cols; cv.height = shade.rows;
+      const ctx = cv.getContext('2d');
+      const img = ctx.createImageData(shade.cols, shade.rows);
+      const [r, g, b, a] = colors.veg;
+      const alpha = a * 255;
+      for (let i = 0; i < cov.length; i++) {
+        if (!cov[i]) continue;
+        img.data[i * 4] = r; img.data[i * 4 + 1] = g;
+        img.data[i * 4 + 2] = b; img.data[i * 4 + 3] = Math.round(alpha * cov[i] / 255);
       }
       ctx.putImageData(img, 0, 0);
       return cv;
@@ -5508,6 +5631,11 @@
       // Beschriftung an, aber abschaltbar: sie verortet die Karte, und sie liegt
       // ueber genau den Stellen, die man bei einer Schattenkante ansehen will.
       const [showLabels, setShowLabels] = useState(true);
+      /* Die Baumandeutung im Schattenreiter, an als Voreinstellung: ein
+       * Schatten mitten auf dem Platz ist ohne sie ein Schatten von nichts,
+       * denn die Basiskarte kennt nur Gebäude und der Werfer ist ein Baum.
+       */
+      const [vegOn, setVegOn] = useState(true);
       const [busy, setBusy] = useState(false);
       const [progress, setProgress] = useState(0);
       /* Der Reiter, mit dem die Karte aufschlägt.
@@ -6396,6 +6524,28 @@
         [shadow, colors, shadowView]
       );
 
+      /* Die Baumlage als kleiner Vorrat statt useMemo, weil sie zwei Abnehmer
+       * hat: das Ergebnis im Zustand und die fünfzig Bilder des Films, die
+       * nie im Zustand stehen. Schlüssel ist die Geometrie plus Farbe -- der
+       * Zeitschieber ändert nur den Sonnenstand, Maske und Deckung bleiben
+       * dieselben, und der Film trifft fünfzigmal denselben Eintrag. Vier
+       * Einträge reichen für das Nebeneinander von Schirm und Film.
+       */
+      const vegCacheRef = useRef(new Map());
+      const vegFor = (sh) => {
+        if (!sh || !sh.obj || !model || !model.index) return null;
+        const key = [sh.spec.originE, sh.spec.originN, sh.cellsize, sh.cols,
+                     sh.rows, colors.veg.join(',')].join('|');
+        const cache = vegCacheRef.current;
+        let hit = cache.get(key);
+        if (!hit) {
+          hit = vegCanvas(sh, buildingMaskFor(sh, model), colors, model.hm.ndom.scale);
+          cache.set(key, hit);
+          if (cache.size > 4) cache.delete(cache.keys().next().value);
+        }
+        return hit;
+      };
+
       const ramp = useMemo(() => hoursRamp(rampId), [rampId]);
 
       /* Der längste Tag des Jahres am freien Horizont, gerechnet und nicht als
@@ -6620,6 +6770,17 @@
          * Hineinzoomen ehrlicher ist, weil die Rasterweite dann sichtbar wird.
          */
         const sh = shot ? shot.shadow : shadow;
+        /* Die Bäume liegen unter dem Schatten und nicht darüber: sie gehören
+         * zur Basiskarte (was dort steht), der Schatten ist die Aussage (was
+         * gerade dunkel ist), und ein verschatteter Baum soll abgedunkelt
+         * aussehen wie alles andere im Schatten. Auch nachts bleiben sie
+         * stehen -- ein Baum ist keine Eigenschaft des Sonnenstands -- und
+         * werden von der Ganzflächen-Abdunklung mit abgedunkelt.
+         */
+        if (layer === 'shadow' && sh && vegOn && (showLayer || shot)) {
+          const veg = vegFor(sh);
+          if (veg) drawGrid(veg, sh, 'veg');
+        }
         /* Im Film wird der Schatten gezeigt, auch wenn er auf dem Schirm
          * gerade weggeschaltet ist: ein Film ohne Schatten wäre kein Film.
          * Und unter dem Horizont wird er nicht gezeigt, obwohl das Bild noch
@@ -7527,6 +7688,13 @@
                   <button className=${'lang-seg' + (showLabels ? ' active' : '')}
                           title=${t.labelsHint}
                           onClick=${() => setShowLabels(s => !s)}>${t.labelsLabel}<//>
+                  <!-- Nur beim Schatten: unter den fast deckenden Stundenkarten
+                       wäre die Tönung unsichtbar, und ein Knopf ohne sichtbare
+                       Wirkung ist ein kaputter Knopf. -->
+                  ${layer === 'shadow' && html`
+                    <button className=${'lang-seg' + (vegOn ? ' active' : '')}
+                            title=${t.vegHint}
+                            onClick=${() => setVegOn(v => !v)}>${t.vegLabel}<//>`}
                 <//>
               <//>
               <!-- Lesarten desselben Bildes, deshalb aneinander. Kante und
