@@ -372,6 +372,48 @@
       return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
     }
 
+    /* Trimmings for a free picture layer, the ones that make a pasted cutout
+       read as lying on top of the meme rather than being part of it. Defaults
+       live here so the renderer, the inspector and the tests read the same
+       numbers, and so a layer made before the feature existed still draws:
+       everything merges over these. Both widths are fractions of the canvas
+       width, like every other free-layer measure. */
+    var FREE_FRAME = { on: false, w: 0.006, color: '#ffffff' };
+    var FREE_SHADOW = { on: false, blur: 0.02, offset: 0.012, color: '#000000', alpha: 0.5 };
+
+    /* A hex colour plus an alpha, in the form canvas takes. Shorthand counts.
+       Anything else is handed back untouched: a named colour or an rgba()
+       string is still a colour the canvas understands, and swallowing it would
+       paint nothing at all. */
+    function rgba(hex, alpha) {
+      var a = alpha == null ? 1 : Math.max(0, Math.min(1, alpha));
+      var m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(hex == null ? '' : hex));
+      if (!m) return hex;
+      var h = m[1];
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      var n = parseInt(h, 16);
+      return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+    }
+
+    /* Shadow settings in pixels for a canvas W wide. The offset is one number
+       and the shadow falls down and to the right at 45 degrees: these are
+       cutouts lying on one picture, and a light that changes direction from
+       layer to layer reads as a mistake rather than as a choice. Canvas ignores
+       the transform for shadowOffsetX/Y, so a rotated picture keeps its shadow
+       falling the same way as all the others, which is the point. */
+    function shadowSpec(sh, W) {
+      var s = {};
+      for (var k in FREE_SHADOW) s[k] = FREE_SHADOW[k];
+      if (sh) for (var j in sh) if (sh[j] != null) s[j] = sh[j];
+      var d = s.offset * W;
+      return {
+        color: rgba(s.color, s.alpha),
+        blur: Math.max(0, s.blur * W),
+        dx: d * Math.SQRT1_2,
+        dy: d * Math.SQRT1_2
+      };
+    }
+
     /* Layout of the empty-slot marker: a square upload button with a caption
        under it, the pair centred in the cell as one block. Drawn from this and
        hit-tested against this, so the button really is where it looks.
@@ -791,6 +833,7 @@
       FORMATS: FORMATS, formatById: formatById,
       layoutFormat: layoutFormat, cellRects: cellRects, cellsOfKind: cellsOfKind,
       borderRect: borderRect, placeholderLayout: placeholderLayout, inRect: inRect,
+      FREE_FRAME: FREE_FRAME, FREE_SHADOW: FREE_SHADOW, rgba: rgba, shadowSpec: shadowSpec,
       coverFit: coverFit, containFit: containFit, zoomRange: zoomRange,
       clampPan: clampPan, imageRectInCell: imageRectInCell,
       captionHeight: captionHeight, remapLayers: remapLayers,
@@ -965,6 +1008,11 @@
        one object rather than as two stacked translucent ones.
        The current transform is copied over, so fn draws in the same
        coordinates it would have used on the real context. */
+    function clearShadow(ctx) {
+      ctx.shadowColor = 'rgba(0,0,0,0)';
+      ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+    }
+
     function drawWithAlpha(ctx, W, H, alpha, fn) {
       // Without getTransform the layer would land in the wrong place, which is
       // a far worse failure than the wrong opacity. So: draw it solid.
@@ -1076,14 +1124,41 @@
 
     /* Defined at module level on purpose. A component declared inside App would
        be a new type on every render, so React would unmount and remount the
-       input mid-drag and the slider would drop the pointer after one pixel. */
+       input mid-drag and the slider would drop the pointer after one pixel.
+
+       The thumb runs on local state while the pointer is down, and the document
+       is patched at most once per animation frame. A fully controlled range
+       input hands every single input event to a re-render plus a preview
+       redraw, and the browser fires those faster than that work finishes: the
+       value written back to the input is then a frame or two old, and the thumb
+       stalls, jumps back or stops following the cursor altogether. Reading it
+       from the local value decouples it from however long a frame takes. */
     function Slider(props) {
+      const [live, setLive] = useState(null);
+      const raf = useRef(0);
+      const last = useRef(0);
+      const onChange = props.onChange;
+
+      function commit() { raf.current = 0; onChange(last.current); }
+      function onInput(e) {
+        last.current = parseFloat(e.target.value);
+        setLive(last.current);
+        if (!raf.current) raf.current = requestAnimationFrame(commit);
+      }
+      // Hand the last value over and give the prop the thumb back.
+      function end() {
+        if (raf.current) { cancelAnimationFrame(raf.current); raf.current = 0; onChange(last.current); }
+        setLive(null);
+      }
+
+      const value = live == null ? props.value : live;
       return html`
         <div className="mm-row">
           <label>${props.label}</label>
           <input type="range" min=${props.min} max=${props.max} step=${props.step}
-            value=${props.value} onInput=${e => props.onChange(parseFloat(e.target.value))}/>
-          <span className="mm-val">${props.fmt ? props.fmt(props.value) : props.value}</span>
+            value=${value} onInput=${onInput}
+            onPointerUp=${end} onPointerCancel=${end} onKeyUp=${end} onBlur=${end}/>
+          <span className="mm-val">${props.fmt ? props.fmt(value) : value}</span>
         </div>`;
     }
 
@@ -1116,7 +1191,6 @@
       const fileRef = useRef(null);
       const dragRef = useRef(null);
       const histRef = useRef({ past: [], future: [] });
-      const renderIdRef = useRef(0);
       const docRef = useRef(doc);
       const selRef = useRef(sel);
       docRef.current = doc; selRef.current = sel;
@@ -1444,9 +1518,38 @@
 
           if (L.kind === 'image' && L.img && imgsRef.current.has(L.img)) {
             const bmp = await filteredBitmap(L.img, L.filter, drafting);
+            const frame = L.frame && L.frame.on ? { ...MEME.FREE_FRAME, ...L.frame } : null;
+            const fw = frame ? Math.max(1, frame.w * W) : 0;
             ctx.globalAlpha = L.opacity == null ? 1 : L.opacity;
+
+            /* Shadow, picture, frame, in that order. Without a frame the shadow
+               is cast by the picture's own alpha, so a cutout PNG throws the
+               shape of the cutout and not of its bounding box. With one, the
+               frame casts it instead: it is the outline you actually see, and
+               that also puts a mat behind a transparent picture. The filled
+               rectangle is covered exactly by the picture plus the stroke, so
+               it is never visible itself. */
+            if (L.shadow && L.shadow.on) {
+              const sp = MEME.shadowSpec(L.shadow, W);
+              ctx.shadowColor = sp.color; ctx.shadowBlur = sp.blur;
+              ctx.shadowOffsetX = sp.dx; ctx.shadowOffsetY = sp.dy;
+              if (frame) {
+                ctx.fillStyle = frame.color;
+                ctx.fillRect(local.x - fw / 2, local.y - fw / 2, local.w + fw, local.h + fw);
+                clearShadow(ctx);
+              }
+            }
             if (L.flipH) { ctx.translate(local.x * 2 + local.w, 0); ctx.scale(-1, 1); }
             ctx.drawImage(bmp, local.x, local.y, local.w, local.h);
+            clearShadow(ctx);
+            if (frame) {
+              // Straddling the edge, like the cell borders: what you drag is
+              // then also what the frame runs along.
+              ctx.strokeStyle = frame.color;
+              ctx.lineWidth = fw;
+              ctx.lineJoin = 'miter';
+              ctx.strokeRect(local.x, local.y, local.w, local.h);
+            }
             ctx.globalAlpha = 1;
 
           } else if (L.kind === 'text') {
@@ -1543,23 +1646,42 @@
         return cv;
       }, [layout, filteredBitmap]);
 
-      // Preview. Last write wins: a slow deep fry must not paint over a newer frame.
+      /* Preview, one frame at a time. renderTo awaits image work, so a dragged
+         slider used to start a fresh full-size frame on every input event while
+         the earlier ones were still running: each allocated its own canvas and
+         did the whole drawing job, and all but the last were thrown away. A new
+         request now replaces the pending one instead of running beside it, so
+         the cost of a gesture is bounded by what a single frame costs.
+         renderTo comes out of a ref because the loop outlives the render that
+         started it and has to draw with the current layout, not with the one
+         that was in force when the gesture began. */
+      const renderToRef = useRef(renderTo);
+      renderToRef.current = renderTo;
+      const renderJobRef = useRef({ running: false, pending: null });
       useEffect(() => {
         if (!fontsReady) return;
-        const id = ++renderIdRef.current;
-        const W = Math.min(PREVIEW_MAX, Math.max(240, Math.round(stageW)));
-        let cancelled = false;
+        const job = renderJobRef.current;
+        job.pending = Math.min(PREVIEW_MAX, Math.max(240, Math.round(stageW)));
+        if (job.running) return;
+        job.running = true;
         setBusy(true);
-        renderTo(W, true, draft).then(cv => {
-          if (cancelled || id !== renderIdRef.current) return;
-          const target = canvasRef.current;
-          if (!target) return;
-          target.width = cv.width; target.height = cv.height;
-          target.style.width = '100%';
-          target.getContext('2d').drawImage(cv, 0, 0);
-          setBusy(false);
-        });
-        return () => { cancelled = true; };
+        (async () => {
+          try {
+            while (job.pending != null) {
+              const W = job.pending;
+              job.pending = null;
+              const cv = await renderToRef.current(W, true, draftRef.current);
+              const target = canvasRef.current;
+              if (!target) break;
+              target.width = cv.width; target.height = cv.height;
+              target.style.width = '100%';
+              target.getContext('2d').drawImage(cv, 0, 0);
+            }
+          } finally {
+            job.running = false;
+            setBusy(false);
+          }
+        })();
       }, [doc, ver, stageW, fontsReady, draft, renderTo]);
 
       /* ---- pointer interaction ---- */
@@ -1946,6 +2068,14 @@
         if (L.kind === 'image') {
           const zb = zoomBounds(L);
           const canFit = zb.min < 0.999;
+          // Merged over the defaults so a layer from before these existed still
+          // has something to show, and so one changed field never drops the rest.
+          const fr = { ...MEME.FREE_FRAME, ...(L.frame || {}) };
+          const sh = { ...MEME.FREE_SHADOW, ...(L.shadow || {}) };
+          const setFrame = (k, v, mark) =>
+            updateLayer(L.id, l => ({ ...l, frame: { ...fr, [k]: v } }), mark);
+          const setShadow = (k, v, mark) =>
+            updateLayer(L.id, l => ({ ...l, shadow: { ...sh, [k]: v } }), mark);
           return html`<${React.Fragment}>
             <div className="mm-btns" style=${{ marginBottom: 10 }}>
               <button className="secondary" onClick=${() => openFileFor({ target: L.id })}>
@@ -1973,10 +2103,40 @@
                   ${canFit ? 'Fit leaves paper at the sides.' : 'Same shape as the slot.'}</span>
               </div>
             <//>`}
-            ${!L.slot && html`<${Slider} label="Opacity" min=${0.05} max=${1} step=${0.05}
-              value=${L.opacity == null ? 1 : L.opacity}
-              onChange=${v => updateLayer(L.id, l => ({ ...l, opacity: v }), false)}
-              fmt=${v => Math.round(v * 100) + '%'}/>`}
+            ${!L.slot && html`<${React.Fragment}>
+              <${Slider} label="Opacity" min=${0.05} max=${1} step=${0.05}
+                value=${L.opacity == null ? 1 : L.opacity}
+                onChange=${v => updateLayer(L.id, l => ({ ...l, opacity: v }), false)}
+                fmt=${v => Math.round(v * 100) + '%'}/>
+              <div className="mm-row">
+                <label>Border</label>
+                <button className=${'mm-pill' + (fr.on ? ' active' : '')}
+                  title="Draw a line around this picture"
+                  onClick=${() => setFrame('on', !fr.on)}>${fr.on ? 'On' : 'Off'}</button>
+                <input className="mm-swatch" type="color" value=${fr.color} title="Border colour"
+                  onInput=${e => setFrame('color', e.target.value, false)}/>
+                <span className="mm-note" style=${{ flex: '1 1 auto' }}>a line around the picture</span>
+              </div>
+              ${fr.on && html`<${Slider} label="Line" min=${0.001} max=${0.03} step=${0.001} value=${fr.w}
+                onChange=${v => setFrame('w', v, false)} fmt=${v => (v * 1000).toFixed(0)}/>`}
+              <div className="mm-row">
+                <label>Shadow</label>
+                <button className=${'mm-pill' + (sh.on ? ' active' : '')}
+                  title="Drop a shadow, so the picture reads as lying on top"
+                  onClick=${() => setShadow('on', !sh.on)}>${sh.on ? 'On' : 'Off'}</button>
+                <input className="mm-swatch" type="color" value=${sh.color} title="Shadow colour"
+                  onInput=${e => setShadow('color', e.target.value, false)}/>
+                <span className="mm-note" style=${{ flex: '1 1 auto' }}>falls down and to the right</span>
+              </div>
+              ${sh.on && html`<${React.Fragment}>
+                <${Slider} label="Blur" min=${0} max=${0.06} step=${0.002} value=${sh.blur}
+                  onChange=${v => setShadow('blur', v, false)} fmt=${v => (v * 1000).toFixed(0)}/>
+                <${Slider} label="Distance" min=${0} max=${0.05} step=${0.002} value=${sh.offset}
+                  onChange=${v => setShadow('offset', v, false)} fmt=${v => (v * 1000).toFixed(0)}/>
+                <${Slider} label="Strength" min=${0.05} max=${1} step=${0.05} value=${sh.alpha}
+                  onChange=${v => setShadow('alpha', v, false)} fmt=${v => Math.round(v * 100) + '%'}/>
+              <//>`}
+            <//>`}
             ${filterEditor(L.filter, f => updateLayer(L.id, l => ({ ...l, filter: f })))}
             <p className="mm-hint">Drag inside the slot to move the picture, scroll to zoom. It always stays big enough to fill the slot.</p>
           <//>`;
@@ -2192,12 +2352,17 @@
               </div>
             </div>
 
+            <!-- Ein Zeilenumbruch darf hier nur innerhalb eines Textes stehen, nie zwischen
+                 Text und <a>: htm streicht Leerraum, in dem ein Zeilenumbruch vorkommt, am
+                 Rand eines Textstuecks ganz weg, statt ihn wie HTML zu einem Leerzeichen
+                 zusammenzuziehen. Aus demselben Grund steht dieser Kommentar vor dem Absatz
+                 und nicht darin: auch er beendet ein Textstueck. -->
             <p className="mm-foot">
               No templates are shipped with this tool and nothing is uploaded: the layouts are geometry, the
               pictures are yours, and both the editing and the export happen in this tab.
-              Headline face <a href="https://fonts.google.com/specimen/Anton">Anton</a> and body face
-              <a href="https://fonts.google.com/specimen/Inter">Inter</a>, both under the
-              <a href="/assets/fonts/OFL.txt">SIL Open Font License</a>.
+              Headline face <a href="https://fonts.google.com/specimen/Anton">Anton</a> and body
+              face <a href="https://fonts.google.com/specimen/Inter">Inter</a>, both under
+              the <a href="/assets/fonts/OFL.txt">SIL Open Font License</a>.
               <br/><span className="mm-disc">Whether a given meme is fair game is your call, not the tool's.
               Private hobby project, non-commercial.</span>
             </p>
