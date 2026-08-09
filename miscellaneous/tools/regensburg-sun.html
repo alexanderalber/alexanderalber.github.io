@@ -391,7 +391,7 @@
         <h1 style="font-size:1.5rem;color:var(--tool-emph);margin-bottom:8px">Sonne über Regensburg</h1>
         <p style="color:var(--tool-label);max-width:70ch">Scheint an dieser Stelle in Regensburg morgen um 20:15 noch die Sonne. Klick auf einen Ort in der Karte beantwortet die Frage für genau diesen Punkt, ein Zeitschieber schiebt den Schatten über die Stadt.</p>
         <ul style="color:var(--tool-label);max-width:70ch;font-size:0.95rem">
-          <li>Schattenwurf aus dem amtlichen Oberflächenmodell der Bayerischen Vermessungsverwaltung, Gebäude und Bäume inbegriffen, mit einem Meter Rasterweite.</li>
+          <li>Schattenwurf aus dem amtlichen Oberflächenmodell der Bayerischen Vermessungsverwaltung, Gebäude und Bäume inbegriffen, mit einem Meter Rasterweite, rund um die Altstadt einem halben.</li>
           <li>Azimut und Höhe der Sonne, gerechnet nach dem NOAA-Verfahren, mit atmosphärischer Refraktion.</li>
           <li>Auf- und Untergang wahlweise für den Sonnenmittelpunkt oder für die Oberkante der Sonnenscheibe. Zwischen beiden liegen am Abend ein paar Minuten.</li>
           <li>Sommerzeit inklusive: Eingabe ist immer die Uhrzeit auf der Küchenuhr, gerechnet wird in UTC.</li>
@@ -399,7 +399,7 @@
         </ul>
       </div>
     </div>
-    <script>(function(){if((localStorage.getItem('lang')||'de')!=='en')return;var r=document.getElementById('root');r.querySelector('h1').textContent='Sun over Regensburg';var t=['Will the sun still reach this spot in Regensburg tomorrow at 20:15. Click a place on the map to answer the question for that exact point; a time slider pushes the shadows across town.','Shadows cast from the official surface model of the Bavarian survey authority, buildings and trees included, on a one metre raster.','Solar azimuth and elevation by the NOAA method, including atmospheric refraction.','Sunrise and sunset for either the centre of the sun or the upper limb of the disc. In the evening those are minutes apart.','Daylight saving included: you enter the time on the kitchen clock, the maths happens in UTC.','Hours of sun for the picked spot, from the horizon profile at that exact place.'];r.querySelectorAll('p,li').forEach(function(el,i){if(t[i])el.textContent=t[i];});})()</script>
+    <script>(function(){if((localStorage.getItem('lang')||'de')!=='en')return;var r=document.getElementById('root');r.querySelector('h1').textContent='Sun over Regensburg';var t=['Will the sun still reach this spot in Regensburg tomorrow at 20:15. Click a place on the map to answer the question for that exact point; a time slider pushes the shadows across town.','Shadows cast from the official surface model of the Bavarian survey authority, buildings and trees included, on a one metre raster, half a metre around the old town.','Solar azimuth and elevation by the NOAA method, including atmospheric refraction.','Sunrise and sunset for either the centre of the sun or the upper limb of the disc. In the evening those are minutes apart.','Daylight saving included: you enter the time on the kitchen clock, the maths happens in UTC.','Hours of sun for the picked spot, from the horizon profile at that exact place.'];r.querySelectorAll('p,li').forEach(function(el,i){if(t[i])el.textContent=t[i];});})()</script>
   </main>
 
   <script id="suncore">
@@ -1232,18 +1232,50 @@
 
     // Objekthöhe an einer Koordinate, als roher Bytewert. null heißt: die
     // Kachel gibt es nicht, hier ist nichts bekannt.
-    function ndomByteAt(hm, tileAt, e, n) {
+    //
+    // `fineAt` ist, wenn es dasteht, der zweite Kachelsatz (`hm.ndom.fein`,
+    // 0,5 m um die Altstadt). Liegt dort eine Kachel, geht sie vor: sie sagt
+    // dasselbe genauer, und die beiden können sich nicht widersprechen, weil
+    // das Maximum über je 2 x 2 feine Zellen exakt die grobe Kachel ist
+    // (Zusage des Backends, 15 Mio Zellen geprüft). Quantisierung und Boden
+    // stehen mit Absicht nur einmal im Manifest und gelten für beide Sätze.
+    function ndomByteAt(hm, tileAt, e, n, fineAt) {
       const nd = hm.ndom, km = hm.tile_m;
       const eKm = Math.floor(e / km), nKm = Math.floor(n / km);
-      const tile = tileAt(eKm, nKm);
+      let px = 0;
+      let tile = fineAt ? fineAt(eKm, nKm) : null;
+      if (tile) { px = nd.fein.px; } else { tile = tileAt(eKm, nKm); px = nd.px; }
       if (!tile) return null;
-      const px = nd.px, size = km / px;
+      const size = km / px;
       let col = Math.floor((e - eKm * km) / size);
       let row = Math.floor(((nKm + 1) * km - n) / size);
       // Nur die Rundung an der Kachelkante auffangen, nicht echte Ausreißer.
       if (col < 0) col = 0; else if (col >= px) col = px - 1;
       if (row < 0) row = 0; else if (row >= px) row = px - 1;
       return tile[row * px + col];
+    }
+
+    /* Deckt der feine Satz einen Ausschnitt vollständig? Wahr nur, wenn jede
+     * berührte Kachel, die das Modell überhaupt kennt, auch fein vorliegt --
+     * und mindestens eine: ein Ausschnitt ganz außerhalb des Modells ist
+     * nicht "gedeckt", dort gibt es nichts, was feiner würde. Die Frage
+     * stellt die Bedienung, bevor sie die 0,5-m-Stufe anbietet: eine Karte,
+     * die zur Hälfte auf feinen und zur Hälfte auf groben Daten steht, sähe
+     * aus wie eine Karte mit einem Fehler an einer geraden Linie.
+     */
+    function fineCovers(hm, e0, n0, e1, n1) {
+      const fe = hm.ndom.fein;
+      if (!fe || !fe.tiles) return false;
+      const have = new Set(fe.tiles.map(t => tileKey(t[0], t[1])));
+      const known = new Set(hm.ndom.tiles.map(t => tileKey(t[0], t[1])));
+      let any = false;
+      for (const [eKm, nKm] of tilesForExtent(hm, e0, n0, e1, n1)) {
+        const k = tileKey(eKm, nKm);
+        if (!known.has(k)) continue;
+        if (!have.has(k)) return false;
+        any = true;
+      }
+      return any;
     }
 
     // Geländehöhe an einer Koordinate, als roher uint16. Der Wert nodata
@@ -1280,7 +1312,16 @@
        * wird dann in Schritten der Stufenweite statt in Metern: dieselbe
        * Stufenzelle mehrfach zu lesen brächte demselben Maximum nichts.
        */
-      const srcCell = src.objCellsize || nd.cellsize;
+      /* Die Schrittweite misst sich an der feinsten beteiligten Quelle, und
+       * das ist der Grund, warum der gemischte Betrieb (fein um die Altstadt,
+       * grob drumherum) kein "sub je Kachel" braucht: die grobe Quelle in
+       * feineren Schritten abzutasten liest dieselbe Zelle mehrfach und lässt
+       * das Maximum unverändert -- die feine in groben Schritten zu lesen
+       * ließe dagegen Hindernisse aus. Überabtasten ist exakt, Unterabtasten
+       * nicht, also wird überabgetastet.
+       */
+      const srcCell = src.objCellsize ||
+        (src.fineAt && nd.fein ? nd.fein.cellsize : nd.cellsize);
       const sub = Math.max(1, Math.round(cellsize / srcCell));
       const subSize = cellsize / sub;
 
@@ -1291,15 +1332,22 @@
          * zeilenweise gelaufen wird, ist es fast immer dieselbe Kachel wie beim
          * vorigen Mal. Ohne das Merken kostet jede Abfrage einen Nachschlag in
          * der Kachelverwaltung, und aus einer Viertelsekunde werden Sekunden.
+         * Beide Sätze hängen am selben Merkzettel, weil sie im selben
+         * Kilometerraster liegen.
          */
-        let lastE = NaN, lastN = NaN, lastTile = null;
-        const tileAt = function (eKm, nKm) {
+        let lastE = NaN, lastN = NaN, lastTile = null, lastFine = null;
+        const step = function (eKm, nKm) {
           if (eKm !== lastE || nKm !== lastN) {
-            lastE = eKm; lastN = nKm; lastTile = src.ndomTile(eKm, nKm);
+            lastE = eKm; lastN = nKm;
+            lastTile = src.ndomTile(eKm, nKm);
+            lastFine = src.fineAt ? src.fineAt(eKm, nKm) : null;
           }
-          return lastTile;
         };
-        objAt = function (e, n) { return ndomByteAt(hm, tileAt, e, n); };
+        const tileAt = function (eKm, nKm) { step(eKm, nKm); return lastTile; };
+        const fineAt = src.fineAt
+          ? function (eKm, nKm) { step(eKm, nKm); return lastFine; }
+          : null;
+        objAt = function (e, n) { return ndomByteAt(hm, tileAt, e, n, fineAt); };
       }
 
       for (let row = 0; row < rows; row++) {
@@ -1633,6 +1681,12 @@
      */
     function shadowCellsize(hm, mPerPx, meters) {
       const base = hm.ndom.cellsize;
+      // Die halbe Stufe des feinen Satzes ist eine ausdrückliche Wahl und
+      // entgeht dem Runden aufs Modellraster: sie ist ja gerade feiner als
+      // das. Der automatische Weg (meters = 0) bleibt beim groben Satz --
+      // unter einem Meter je Bildpunkt ist eine Zelle schon ein Pixel, und
+      // feiner zu rechnen, als das Bild zeigt, kostet nur.
+      if (meters && hm.ndom.fein && meters === hm.ndom.fein.cellsize) return meters;
       const raw = meters ? meters : Math.max(base, mPerPx);
       return Math.min(8 * base, Math.max(base, Math.round(raw / base) * base));
     }
@@ -2191,6 +2245,9 @@
      */
     function hoursCellsize(hm, meters) {
       const base = hm.ndom.cellsize;
+      // Dieselbe Ausnahme wie in shadowCellsize: die halbe Stufe des feinen
+      // Satzes ist eine eigene Wahl und wird nicht aufs Modellraster gerundet.
+      if (meters && hm.ndom.fein && meters === hm.ndom.fein.cellsize) return meters;
       // Auf ein Vielfaches der Rasterweite des Modells einrasten und in den
       // erlaubten Bereich zwingen. Feiner als das Modell zu rechnen erfindet
       // Auflösung, die es nicht gibt; über 16 m kennt eine Zelle keine
@@ -3360,11 +3417,21 @@
        * bedient.
        */
       const yearStore = ymeta ? makeTileStore(ymeta.tiles, ymeta.path, 48) : null;
+      /* Der dritte Kachelsatz: die Objekthöhen zu 0,5 m um die Altstadt
+       * (`hm.ndom.fein`). Wie die Jahreskarte ist er nur da, wenn das Manifest
+       * ihn führt -- ein altes Manifest im Zwischenspeicher kennt ihn nicht,
+       * und dann läuft alles wie vorher auf dem groben Satz.
+       *
+       * Der kleine Vorrat reicht: eine Anfrage, die den feinen Satz überhaupt
+       * braucht, ist über die Zellendeckel auf wenige Quadratkilometer
+       * begrenzt, und eine feine Kachel wiegt entpackt vier Megabyte.
+       */
+      const fineMeta = hm.ndom.fein && hm.ndom.fein.tiles ? hm.ndom.fein : null;
+      const fineStore = fineMeta ? makeTileStore(fineMeta.tiles, fineMeta.path, 12) : null;
+      const feinSet = fineMeta ? new Set(fineMeta.tiles.map(t => tileKey(t[0], t[1]))) : null;
       let dgm = null, far = null;
-
-      function assemble(spec) {
-        return assembleHeights(hm, spec, { ndomTile: store.tileAt, dgm: dgm });
-      }
+      // Das Nahbereichsraster der letzten Punktabfrage, siehe `point`.
+      let pointMemo = null;
 
       /* Die Übersichtsstufen: die Objekthöhe als je ein Bild fürs ganze
        * Gebiet, 4 und 8 m. Geladen wird eine Stufe beim ersten Gebrauch und
@@ -3416,6 +3483,35 @@
        */
       function heightSource(req, onTiles) {
         const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
+        /* Unterhalb des Modellrasters trägt nur der feine Satz -- die
+         * Rasterweite 0,5 m gibt es als Wahl überhaupt nur, wenn er im
+         * Manifest steht. Ab einem Meter aufwärts wird er dagegen nie
+         * geholt: das Maximum über je 2 x 2 feine Zellen ist exakt die grobe
+         * Kachel, dieselbe Antwort für das Vierfache an Bytes.
+         *
+         * Grob geladen wird nur, was nicht fein vorliegt: der Zuschlagsrand
+         * einer Altstadt-Anfrage. Dort stehen dann 1-m-Werte neben
+         * 0,5-m-Werten, und das ist in Ordnung -- die grobe Zelle ist das
+         * Maximum ihrer vier feinen, Hindernisse werden am Rand also
+         * allenfalls dick gerechnet, nie übersehen, und an der Nahtlinie
+         * entsteht keine Stufe.
+         */
+        if (fineStore && req.cellsize < hm.ndom.cellsize) {
+          const coarse = list.filter(([e, nn]) => !feinSet.has(tileKey(e, nn)));
+          const done = [0, 0], total = [0, 0];
+          const tell = i => (d, tt) => {
+            done[i] = d; total[i] = tt;
+            if (onTiles) onTiles(done[0] + done[1], total[0] + total[1]);
+          };
+          return Promise.all([
+            fineStore.ensure(list, tell(0)),
+            store.ensure(coarse, tell(1))
+          ]).then(([mf, mc]) => ({
+            e0: req.e0, n0: req.n0, e1: req.e1, n1: req.n1,
+            src: { ndomTile: store.tileAt, fineAt: fineStore.tileAt, dgm: dgm },
+            missing: mf + mc
+          }));
+        }
         const lv = overviewLevelFor(hm, req.cellsize);
         if (lv && !store.hasAll(list)) {
           return ensureOverview(lv, onTiles).then(() => {
@@ -3632,15 +3728,51 @@
 
         point: function (req) {
           const e = req.e, n = req.n;
+          /* Liegt die Kachel des Klickpunkts fein vor, rechnet der Nahbereich
+           * auf 0,5 m. Das ist der eigentliche Ertrag des feinen Satzes: auf
+           * dem 1-m-Maximum-Raster existieren 4,2 % der Freifläche im
+           * Altstadtkern nicht mehr als Freifläche -- eine Zelle neben einer
+           * Hauswand wird zur Zelle auf dem Dach, und die Antwort gilt für
+           * einen Standort in 13 m Höhe. Das feine Raster halbiert die
+           * Fehlerquote und viertelt genau diese hartnäckigen Fälle
+           * (gemessen im Backend, check_refine_cellsize.py).
+           *
+           * Entschieden wird an der Kachel des Punkts, nicht am ganzen
+           * Nahbereich: reicht der über den feinen Satz hinaus, kommt der
+           * Rest in 1 m -- als Hindernis konservativ, siehe heightSource.
+           */
+          const fineHere = !!(fineStore &&
+            feinSet.has(tileKey(Math.floor(e / hm.tile_m), Math.floor(n / hm.tile_m))));
+          const cs = fineHere ? fineMeta.cellsize : hm.ndom.cellsize;
           const list = tilesForExtent(hm, e - NEAR_M, n - NEAR_M, e + NEAR_M, n + NEAR_M);
-          return store.ensure(list).then(() => {
-            const cells = NEAR_M * 2;
+          const jobs = [store.ensure(list)];
+          if (fineHere) jobs.push(fineStore.ensure(list));
+          return Promise.all(jobs).then(lost => {
+            /* Das zusammengesetzte Raster überlebt die Anfrage. Der
+             * Zeitschieber stellt dieselbe Frage für denselben Punkt mit
+             * anderem Sonnenstand viele Male hintereinander, und auf 0,5 m
+             * sind es zehn Megabyte je Aufbau. Gemerkt wird nur ein
+             * vollständiges Raster: fehlt eine Kachel, soll der nächste
+             * Versuch sie nachholen dürfen, statt das Loch festzuhalten.
+             */
+            const cells = Math.round(NEAR_M * 2 / cs);
             const spec = {
               originE: e - NEAR_M, originN: n - NEAR_M,
-              cellsize: hm.ndom.cellsize, rows: cells, cols: cells
+              cellsize: cs, rows: cells, cols: cells
             };
-            const grid = makeGrid(assemble(spec), spec.originE, spec.originN,
-                                  spec.cellsize, spec.rows, spec.cols);
+            const memoKey = e + '|' + n + '|' + cs;
+            let grid = pointMemo && pointMemo.key === memoKey ? pointMemo.grid : null;
+            if (!grid) {
+              const heights = assembleHeights(hm, spec, {
+                ndomTile: store.tileAt, dgm: dgm,
+                fineAt: fineHere ? fineStore.tileAt : null
+              });
+              grid = makeGrid(heights, spec.originE, spec.originN,
+                              spec.cellsize, spec.rows, spec.cols);
+              if (lost.reduce((a, b) => a + (b || 0), 0) === 0) {
+                pointMemo = { key: memoKey, grid: grid };
+              }
+            }
             const ground = grid.heightAt(e, n);
             if (ground === null || Number.isNaN(ground)) return { known: false };
 
@@ -3677,6 +3809,10 @@
               blocker: now.blocker, farHorizon: now.farHorizon,
               horizonHere: prof ? horizonAt(prof, req.az) : 0,
               hours: iv.reduce((a, [s, x]) => a + (x - s), 0) / 60,
+              // Auf welchem Raster geantwortet wurde. Die Ablesezeile sagt es
+              // dazu, wenn es das feine war -- ein Unterschied in der Antwort
+              // an einer Hauswand ist sonst nicht einzuordnen.
+              fine: fineHere,
               intervals: iv
             };
           });
@@ -3871,10 +4007,12 @@
         optSpace:     'Rasterweite',
         optRamp:      'Farbskala',
         optRun:       'Rechnen',
-        spaceHint:    'Kantenlänge einer gerechneten Zelle. Doppelt so grob ist ein Viertel der Rechenzeit, verliert aber die schmalen Höfe und Gassen. Ein Meter ist die Rasterweite des Modells selbst, feiner geht nicht.',
+        spaceHint:    'Kantenlänge einer gerechneten Zelle. Doppelt so grob ist ein Viertel der Rechenzeit, verliert aber die schmalen Höfe und Gassen. Ein Meter ist die Rasterweite des Modells; 0,5 m gibt es dort, wo das feinere Modell liegt, rund um die Altstadt.',
+        cellNoFine:   'Das 0,5-m-Modell deckt nur die Gegend um die Altstadt, und dieser Ausschnitt liegt nicht vollständig darin.',
         cellAuto:     'nach Bild',
         cellTooFine:  'In diesem Ausschnitt zu fein: dafür reicht der Speicher nicht. Weiter hineinzoomen, dann geht es wieder; bei tiefer Sonne früher, weil der gerechnete Ausschnitt dann weit über das Bild hinausreicht.',
         cellFallback: 'Raster {c} m statt {w} m: {w} m wäre in diesem Ausschnitt zu fein.',
+        cellFallbackFine: 'Raster {c} m statt {w} m: das 0,5-m-Modell deckt diesen Ausschnitt nicht.',
         cellAutoCoarse: 'Raster {c} m: bei tiefer Sonne wird über ein Vielfaches des Bildes gerechnet, und feiner würde jede Rechnung entsprechend teurer. Wer sie trotzdem feiner will, stellt die Weite fest ein.',
         cellAutoHint: 'Die Rasterweite folgt dem Maßstab: eine gerechnete Zelle ist ungefähr ein Bildschirmpixel. Feiner zu rechnen als das Bild zeigen kann, kostet das Vierfache und ändert nichts; wer trotzdem in die Höfe schauen will, stellt einen festen Wert ein. Bei tiefer Sonne wird gröber gerechnet, weil der Ausschnitt dann weit über das Bild hinausreicht.',
         rampHint:     'Die fünf oberen sind wahrnehmungsgleichmäßig: gleiche Farbschritte sind gleiche Wertschritte. Die unteren geben ihren Kontrast ungleich aus und zeigen dafür mehr am dunklen Ende.',
@@ -3911,6 +4049,7 @@
         verdictNight: 'Die Sonne steht unter dem Horizont.',
         verdictNone:  'Für diese Stelle liegen keine Höhendaten vor.',
         byNear:       'Verdeckt von etwas in {d} Entfernung.',
+        fineNote:     'gerechnet auf dem 0,5-m-Modell der Altstadt',
         byFar:        'Die Sonne steht unter dem Geländehorizont, der hier bei {a} liegt.',
         horizonHere:  'Horizont hier',
         sunHere:      'Sonne an dieser Stelle',
@@ -3929,7 +4068,7 @@
         caveatAge1:   'Das Modell stammt aus der Befliegung vom {d}. Was seither gebaut oder abgerissen wurde, fehlt darin.',
         caveatAgeN:   'Das Modell stammt aus mehreren Befliegungen: {list}. Was seither gebaut oder abgerissen wurde, fehlt darin.',
         caveatTiles:  'Kacheln',
-        caveatRes:    'Ausgeliefert wird das Modell mit Objekthöhen in halben Metern auf 1 m Raster und Gelände auf 5 m. Gegenüber den Rohdaten kippen dadurch rund 2 % der Ja-Nein-Antworten, fast alle davon an Schattenkanten.',
+        caveatRes:    'Ausgeliefert wird das Modell mit Objekthöhen in halben Metern auf 1 m Raster (rund um die Altstadt zusätzlich auf 0,5 m) und Gelände auf 5 m. Gegenüber den Rohdaten kippen dadurch rund 2 % der Ja-Nein-Antworten, fast alle davon an Schattenkanten.',
         caveatSweep:  'Die Fläche wird anders gerechnet als der einzelne Ort: die Karte läuft einmal in Lichtrichtung über das Raster und tastet quer dazu ab, der gewählte Ort wird Zelle für Zelle exakt durchquert. Wo beide sich widersprechen, gilt der gewählte Ort.',
         caveatHead:   'Was diese Karte nicht weiß, und woher sie kommt',
         caveatHours:  'Die Sonnenstundenkarte rechnet nur, was im geladenen Ausschnitt und 400 m darum herum steht. Ein Hochhaus einen Kilometer weiter westlich nimmt dem Abend Sonne, ohne dass die Karte davon weiß; der Fernhorizont dahinter kennt Gelände, aber keine Häuser. Der Punktabfrage geht es an dieser Stelle genauso.',
@@ -4030,10 +4169,12 @@
         optSpace:     'Cell size',
         optRamp:      'Colour scale',
         optRun:       'Compute',
-        spaceHint:    'Edge length of one computed cell. Twice as coarse is a quarter of the time, but loses the narrow courtyards and alleys. One metre is the raster of the model itself, and nothing finer exists.',
+        spaceHint:    'Edge length of one computed cell. Twice as coarse is a quarter of the time, but loses the narrow courtyards and alleys. One metre is the raster of the model; 0.5 m exists where the finer model covers, around the old town.',
+        cellNoFine:   'The 0.5 m model only covers the area around the old town, and this view does not lie fully within it.',
         cellAuto:     'to fit',
         cellTooFine:  'Too fine for this view: there is not enough memory for it. Zoom in and it comes back; with a low sun that takes longer, because the computed area then reaches well beyond the image.',
         cellFallback: 'Cell size {c} m instead of {w} m: {w} m would be too fine for this view.',
+        cellFallbackFine: 'Cell size {c} m instead of {w} m: the 0.5 m model does not cover this view.',
         cellAutoCoarse: 'Cell size {c} m: with a low sun the computed area is a multiple of the image, so computing finer would cost accordingly more. Set a fixed cell size to have it finer anyway.',
         cellAutoHint: 'The cell size follows the scale: one computed cell is about one screen pixel. Computing finer than the image can show costs four times as much and changes nothing; to look into the courtyards anyway, set a fixed value. With a low sun it computes coarser, because the area then reaches well beyond the image.',
         rampHint:     'The top five are perceptually uniform: equal steps in colour are equal steps in value. The lower ones spend their contrast unevenly and show more at the dark end in return.',
@@ -4070,6 +4211,7 @@
         verdictNight: 'The sun is below the horizon.',
         verdictNone:  'No height data for this spot.',
         byNear:       'Blocked by something {d} away.',
+        fineNote:     'computed on the 0.5 m model of the old town',
         byFar:        'The sun is below the terrain horizon, which sits at {a} here.',
         horizonHere:  'Horizon here',
         sunHere:      'Sun at this spot',
@@ -4088,7 +4230,7 @@
         caveatAge1:   'The model comes from the survey flight of {d}. Anything built or demolished since is missing.',
         caveatAgeN:   'The model comes from several survey flights: {list}. Anything built or demolished since is missing.',
         caveatTiles:  'tiles',
-        caveatRes:    'The model ships with object heights in half metres on a 1 m raster and terrain on 5 m. Against the raw data that flips about 2 % of the yes-no answers, almost all of them at the edges of shadows.',
+        caveatRes:    'The model ships with object heights in half metres on a 1 m raster (plus 0.5 m around the old town) and terrain on 5 m. Against the raw data that flips about 2 % of the yes-no answers, almost all of them at the edges of shadows.',
         caveatSweep:  'The area and the single spot are computed differently: the map sweeps once across the raster along the light and samples sideways, the picked spot is traversed cell by cell exactly. Where the two disagree, the picked spot wins.',
         caveatHead:   'What this map does not know, and where it comes from',
         caveatHours:  'The hours-of-sun map only accounts for what stands inside the loaded window and 400 m around it. A tower block a kilometre to the west takes away evening sun without the map knowing; the far horizon behind that knows terrain, but no buildings. The same holds for the point query.',
@@ -4115,6 +4257,9 @@
     // Die Höhe steht in einem Fließtext und bekommt deshalb das Dezimalzeichen
     // der Sprache, in der der Satz steht.
     function fmtEye(v) { return lang === 'de' ? String(v).replace('.', ',') : String(v); }
+    // Rasterweiten genauso: aus der 0,5-m-Stufe darf im deutschen Text kein
+    // "0.5" werden. Bei den ganzen Metern ändert das nichts.
+    function fmtCs(v) { return lang === 'de' ? String(v).replace('.', ',') : String(v); }
     function compassName(az) { return t.compass[Math.round(mod360(az) / 45) % 8]; }
 
     // Die Uhrzeit, mit der das Tool aufmacht. Zwölf Uhr Ortszeit und nicht der
@@ -5492,8 +5637,25 @@
       const tooFar = tilesTooMany &&
         (!(model && csAuto && overviewLevelFor(model.hm, csAuto)) ||
          autoCells > MAX_SHADOW_CELLS);
+      /* Ob es den feinen Satz gibt und ob er den sichtbaren Ausschnitt deckt.
+       * Gemessen wird am Bild ohne den Zuschlag: der Zuschlagsrand darf grob
+       * bleiben (die grobe Zelle ist das Maximum ihrer vier feinen, ein
+       * Hindernis dort wird allenfalls dick gerechnet, nie übersehen) --
+       * was man ansieht, soll dagegen ganz auf einer Auflösung stehen.
+       */
+      const hasFine = !!(model && model.ready && model.hm.ndom.fein);
+      const fineOK = useMemo(() => {
+        if (!hasFine || !vw) return false;
+        const ext = vw.extent(0);
+        return fineCovers(model.hm,
+          model.hm.bounds[0] + ext[0], model.hm.bounds[1] + ext[1],
+          model.hm.bounds[0] + ext[2], model.hm.bounds[1] + ext[3]);
+      }, [hasFine, vw, model, stage]);
+
       const csFitsFor = cs => {
         if (!model || !model.ready || !vw) return true;
+        // Die halbe Stufe gibt es nur, wo der feine Satz den Ausschnitt deckt.
+        if (cs > 0 && cs < model.hm.ndom.cellsize && !fineOK) return false;
         const w = shadowCellsize(model.hm, vw.mPerPx, cs);
         // Jenseits der Kachelschranke gibt es nur die Übersicht als Quelle,
         // und die bedient nur ihre Stufenvielfachen: vier Meter ja, ein und
@@ -5861,13 +6023,19 @@
        * Nachschlageweg ist ausgenommen, er hat seinen eigenen Kachelsatz.
        */
       const hoursCsOK = c => {
+        /* Die halbe Stufe braucht den feinen Satz unter dem ganzen Bild, und
+         * den Rechenweg: die vorberechnete Jahreskarte liegt in 1 m auf der
+         * Platte, feiner nachzuschlagen gäbe es nicht. */
+        if (model && model.ready && c < model.hm.ndom.cellsize && (yearPre || !fineOK)) return false;
         if (!hoursCsFitsFor(c)) return false;
         if (yearPre || !hoursTooMany) return true;
         return !!(model && model.ready &&
                   overviewLevelFor(model.hm, hoursCellsize(model.hm, c)));
       };
+      /* Ohne Nachschlagen keine Untergrenze: die 0 lässt in der Max-Bildung
+       * darunter jede Wahl durch, auch die halbe Stufe des feinen Satzes. */
       const hoursCsFloor = yearPre && vw
-        ? (HOURS_CS_FALLBACK.find(c => c >= vw.mPerPx / 3) || 16) : 1;
+        ? (HOURS_CS_FALLBACK.find(c => c >= vw.mPerPx / 3) || 16) : 0;
       const hoursCsWanted = Math.max(hoursCs, hoursCsFloor);
       const hoursCsFits = hoursCsOK(hoursCsWanted);
       const hoursCsUsed = hoursCsFits ? hoursCsWanted
@@ -6533,7 +6701,7 @@
         const stamp = layer === 'year' ? String(ymd.y)
           : layer === 'day' ? iso
           : iso + '-' + pad2(Math.floor(minute / 60)) + pad2(minute % 60);
-        const how = hours ? ' ' + '·' + ' ' + hours.stepMin + ' min ' + '·' + ' ' + hours.cellsize + ' m' : '';
+        const how = hours ? ' ' + '·' + ' ' + hours.stepMin + ' min ' + '·' + ' ' + fmtCs(hours.cellsize) + ' m' : '';
         // Die Höhe nur, wenn sie nicht die Voreinstellung ist: ein Bild von der
         // Oberfläche braucht die Null nicht im Titel, ein Bild aus 1,7 m schon,
         // weil es sonst als dieselbe Karte durchginge.
@@ -6547,7 +6715,7 @@
             // eine Einstellung und nicht mehr eine Folge des Maßstabs, und ohne
             // sie ließe sich auf dem weitergereichten Bild nicht ablesen, wie
             // fein gerechnet wurde.
-            + (shadow ? ' ' + '·' + ' ' + shadow.cellsize + ' m' : '')) + hi;
+            + (shadow ? ' ' + '·' + ' ' + fmtCs(shadow.cellsize) + ' m' : '')) + hi;
 
         // Der Streifen bekommt denselben Maßstab wie die Karte, sonst schrumpft
         // die Beschriftung mit wachsender Auflösung relativ zum Bild.
@@ -6592,7 +6760,7 @@
       const shadowTitle = (mm, s, cs) =>
         t.mapTitle + ' ' + '·' + ' ' + pad2(ymd.d) + '.' + pad2(ymd.m) + '.' + ymd.y + ', ' + hhmm(mm)
         + ' ' + '·' + ' ' + t.pngSun.replace('{a}', fmtDeg(s.az)).replace('{e}', fmtDeg(s.elev))
-        + ' ' + '·' + ' ' + cs + ' m'
+        + ' ' + '·' + ' ' + fmtCs(cs) + ' m'
         + (eye > 0 ? ' ' + '·' + ' ' + fmtEye(eye) + ' m ' + t.pngEye : '');
 
       const runAnimation = () => {
@@ -6819,7 +6987,11 @@
         // zuletzt gerechnete Ergebnis, und das kann aus einem Ausschnitt
         // stammen, in dem die Wahl noch getragen hat.
         : (layer === 'shadow' && !csFits && shadow && shadow.cellsize !== shadowCs)
-          ? t.cellFallback.replace(/\{c\}/g, String(shadow.cellsize)).replace(/\{w\}/g, String(shadowCs))
+          // Scheitert die halbe Stufe an der Deckung des feinen Satzes, ist
+          // "zu fein" der falsche Grund: hineinzoomen hälfe dann nichts,
+          // hinschieben schon.
+          ? (shadowCs < 1 && !fineOK ? t.cellFallbackFine : t.cellFallback)
+              .replace(/\{c\}/g, fmtCs(shadow.cellsize)).replace(/\{w\}/g, fmtCs(shadowCs))
         /* Kacheln, die nicht angekommen sind. Steht weit oben in der Kette,
          * weil es das einzige hier ist, was auf einen Fehler hindeutet: die
          * Karte hat dann Löcher, und die sehen aus wie fehlende Daten.
@@ -6838,7 +7010,8 @@
          * gewählte, obwohl sie nicht passt.
          */
         : (layer !== 'shadow' && !hoursCsFits && hoursCsUsed !== hoursCs)
-          ? t.cellFallback.replace(/\{c\}/g, String(hoursCsUsed)).replace(/\{w\}/g, String(hoursCs))
+          ? (hoursCs < 1 && !fineOK ? t.cellFallbackFine : t.cellFallback)
+              .replace(/\{c\}/g, fmtCs(hoursCsUsed)).replace(/\{w\}/g, fmtCs(hoursCs))
         /* Und dasselbe für den automatischen Weg, der nicht ablehnt, sondern
          * vergröbert. Ohne die Zeile stünde am Abend wortlos eine gröbere
          * Karte da als am Mittag, und der Unterschied sähe nach einem Fehler
@@ -6846,7 +7019,7 @@
          */
         : (layer === 'shadow' && shadowCs === 0 && shadow && model && vw
             && shadow.cellsize > shadowCellsize(model.hm, vw.mPerPx, 0))
-          ? t.cellAutoCoarse.replace(/\{c\}/g, String(shadow.cellsize))
+          ? t.cellAutoCoarse.replace(/\{c\}/g, fmtCs(shadow.cellsize))
         : null;
 
       /* Die beiden Ansichten sind Reiter und keine Ebenen, weil sie sich
@@ -6998,16 +7171,22 @@
                          automatische Weg darf trotzdem bis acht gehen: dort ist
                          eine Zelle kleiner als ein Bildschirmpixel, und feiner
                          zu rechnen als das Bild zeigt, kostet nur. -->
-                    ${[[0, t.cellAuto], [1, '1 m'], [2, '2 m'], [4, '4 m']].map(([c, label]) => {
+                    <!-- Die halbe Stufe steht nur da, wenn das Manifest den
+                         feinen Satz führt: ein Knopf für Daten, die es nicht
+                         gibt, wäre eine Behauptung. -->
+                    ${(hasFine
+                        ? [[0, t.cellAuto], [0.5, fmtCs(0.5) + ' m'], [1, '1 m'], [2, '2 m'], [4, '4 m']]
+                        : [[0, t.cellAuto], [1, '1 m'], [2, '2 m'], [4, '4 m']]).map(([c, label]) => {
                       // Die gewählte Stufe bleibt hervorgehoben, auch wenn sie
                       // gerade nicht trägt: sie ist die Wahl und kommt beim
                       // Hineinzoomen zurück. Was gerade wirklich gerechnet
                       // wird, steht in der Statuszeile.
                       const fits = c === 0 || csFitsFor(c);
+                      const offWhy = c > 0 && c < 1 && !fineOK ? t.cellNoFine : t.cellTooFine;
                       return html`
                       <button key=${'sc' + c} className=${'lang-seg' + (shadowCs === c ? ' active' : '')}
                               disabled=${!fits}
-                              title=${!fits ? t.cellTooFine : c === 0 ? t.cellAutoHint : t.spaceHint}
+                              title=${!fits ? offWhy : c === 0 ? t.cellAutoHint : t.spaceHint}
                               onClick=${() => setShadowCs(c)}>${label}<//>`;
                     })}
                   <//>
@@ -7044,13 +7223,18 @@
                            Angebot. Die gewählte Stufe bleibt trotzdem
                            hervorgehoben, auch wenn gerade eine gröbere
                            gerechnet wird. -->
-                      ${HOURS_CS_CHOICES.map(c => {
+                      <!-- Die halbe Stufe nur auf dem Rechenweg: die
+                           vorberechnete Jahreskarte liegt in 1 m vor, ein
+                           0,5-m-Knopf am Nachschlagen verspräche etwas, das
+                           nicht auf der Platte liegt. -->
+                      ${(hasFine && !yearPre ? [0.5].concat(HOURS_CS_CHOICES) : HOURS_CS_CHOICES).map(c => {
                         const fits = hoursCsOK(c);
+                        const offWhy = c < 1 && !fineOK ? t.cellNoFine : t.cellTooFine;
                         return html`
                         <button key=${'co' + c} className=${'lang-seg' + (hoursCs === c ? ' active' : '')}
                                 disabled=${!fits}
-                                title=${fits ? t.spaceHint : t.cellTooFine}
-                                onClick=${() => setCsBy(b => Object.assign({}, b, { [span]: c }))}>${c + ' m'}<//>`;
+                                title=${fits ? t.spaceHint : offWhy}
+                                onClick=${() => setCsBy(b => Object.assign({}, b, { [span]: c }))}>${fmtCs(c) + ' m'}<//>`;
                       })}
                     <//>
                   <//>
@@ -7289,6 +7473,11 @@
                dem Baum die falsche Antwort erwartet. -->
           <p className="rs-note" style=${{ margin: '8px 0 0' }}>
             ${eye > 0 ? t.eyeNoteH.replace('{h}', fmtEye(eye)) : t.eyeNote}<//>
+          <!-- Nur wenn wirklich fein gerechnet wurde: an einer Hauswand kann
+               die Antwort von der Karte daneben abweichen, und ohne den Satz
+               wäre der Unterschied nicht einzuordnen. -->
+          ${answer.fine && html`<p className="rs-note" style=${{ margin: '4px 0 0', color: 'var(--tool-note)' }}>
+            ${t.fineNote}<//>`}
         <//>`;
     }
 
