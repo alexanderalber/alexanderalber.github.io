@@ -1275,22 +1275,32 @@
       const rows = spec.rows, cols = spec.cols, cellsize = spec.cellsize;
       const out = new Float32Array(rows * cols);
       const topN = spec.originN + rows * cellsize;
-      const sub = Math.max(1, Math.round(cellsize / nd.cellsize));
+      /* Die Objekthöhen können statt aus den 1-m-Kacheln aus einer
+       * Übersichtsstufe kommen (`src.objAt` mit `src.objCellsize`). Abgetastet
+       * wird dann in Schritten der Stufenweite statt in Metern: dieselbe
+       * Stufenzelle mehrfach zu lesen brächte demselben Maximum nichts.
+       */
+      const srcCell = src.objCellsize || nd.cellsize;
+      const sub = Math.max(1, Math.round(cellsize / srcCell));
       const subSize = cellsize / sub;
 
-      /* Die zuletzt benutzte Kachel merken. Eine Schattenkarte über ein paar
-       * Quadratkilometer fragt einige Millionen Mal nach einer Höhe, und weil
-       * zeilenweise gelaufen wird, ist es fast immer dieselbe Kachel wie beim
-       * vorigen Mal. Ohne das Merken kostet jede Abfrage einen Nachschlag in
-       * der Kachelverwaltung, und aus einer Viertelsekunde werden Sekunden.
-       */
-      let lastE = NaN, lastN = NaN, lastTile = null;
-      const tileAt = function (eKm, nKm) {
-        if (eKm !== lastE || nKm !== lastN) {
-          lastE = eKm; lastN = nKm; lastTile = src.ndomTile(eKm, nKm);
-        }
-        return lastTile;
-      };
+      let objAt = src.objAt;
+      if (!objAt) {
+        /* Die zuletzt benutzte Kachel merken. Eine Schattenkarte über ein paar
+         * Quadratkilometer fragt einige Millionen Mal nach einer Höhe, und weil
+         * zeilenweise gelaufen wird, ist es fast immer dieselbe Kachel wie beim
+         * vorigen Mal. Ohne das Merken kostet jede Abfrage einen Nachschlag in
+         * der Kachelverwaltung, und aus einer Viertelsekunde werden Sekunden.
+         */
+        let lastE = NaN, lastN = NaN, lastTile = null;
+        const tileAt = function (eKm, nKm) {
+          if (eKm !== lastE || nKm !== lastN) {
+            lastE = eKm; lastN = nKm; lastTile = src.ndomTile(eKm, nKm);
+          }
+          return lastTile;
+        };
+        objAt = function (e, n) { return ndomByteAt(hm, tileAt, e, n); };
+      }
 
       for (let row = 0; row < rows; row++) {
         const nTop = topN - row * cellsize;
@@ -1299,8 +1309,8 @@
           let obj = 0, known = false;
           for (let dy = 0; dy < sub; dy++) {
             for (let dx = 0; dx < sub; dx++) {
-              const v = ndomByteAt(hm, tileAt, eLeft + (dx + 0.5) * subSize,
-                                                nTop - (dy + 0.5) * subSize);
+              const v = objAt(eLeft + (dx + 0.5) * subSize,
+                              nTop - (dy + 0.5) * subSize);
               if (v === null) continue;
               known = true;
               if (v > obj) obj = v;
@@ -1314,6 +1324,70 @@
         }
       }
       return out;
+    }
+
+    /* --------------------------------------------------- Die Übersichtsstufen
+     *
+     * Das Manifest kann die Objekthöhe zusätzlich als ganze Bilder in groben
+     * Stufen führen (`overview.levels`, 4 und 8 m): mit dem Maximum
+     * verdichtet, georeferenziert wie das Gelände, ohne eigene Maske -- wo
+     * keine nDOM-Kachel liegt, steht 0 und bedeutet nichts, die Wahrheit
+     * darüber bleibt die Kachelliste.
+     *
+     * Eine Stufe darf eine Rechnung nur bedienen, wenn die Rasterweite ein
+     * ganzes Vielfaches der Stufenweite ist und der Ausschnitt auf ihrem
+     * Raster eingerastet wird: dann deckt jede gerechnete Zelle ganze
+     * Stufenzellen ab, und weil Maxima schachteln, ist das Maximum über die
+     * Stufe exakt das Maximum über die 1-m-Kacheln. Fünf Meter aus der
+     * 4-m-Stufe wären dagegen ein Maximum über angeschnittene Zellen, also
+     * über ein Mehrfaches der Fläche: Hindernisse dick gerechnet, Höfe
+     * verschluckt. Wer die Übersicht braucht, rundet die Weite deshalb auf
+     * ihr nächstes Vielfaches (`overviewCellsizeUp`) statt sie ungefähr zu
+     * bedienen.
+     */
+
+    // Die gröbste Stufe, die eine Rasterweite exakt bedienen kann; null, wenn
+    // keine. Die gröbste, weil sie das kleinste Bild ist und dasselbe sagt.
+    // Eine Stufe mit anderer Quantisierung als das nDOM wird übergangen: ihre
+    // Bytes wären nicht dieselbe Einheit.
+    function overviewLevelFor(hm, cellsize) {
+      const ov = hm.overview, nd = hm.ndom;
+      if (!ov || !ov.levels) return null;
+      let best = null;
+      for (const lv of ov.levels) {
+        if (lv.scale !== nd.scale) continue;
+        if (!(lv.cellsize > 0) || cellsize % lv.cellsize !== 0) continue;
+        if (!best || lv.cellsize > best.cellsize) best = lv;
+      }
+      return best;
+    }
+
+    // Die nächste Weite ab `cellsize`, die eine Stufe bedienen kann: das
+    // kleinste Vielfache der feinsten Stufe. 0, wenn es keine Stufen gibt --
+    // ein altes Manifest aus dem Zwischenspeicher kennt den Block nicht, und
+    // dann gilt weiter die Kachelschranke.
+    function overviewCellsizeUp(hm, cellsize) {
+      const ov = hm.overview, nd = hm.ndom;
+      if (!ov || !ov.levels) return 0;
+      let fine = 0;
+      for (const lv of ov.levels) {
+        if (lv.scale !== nd.scale || !(lv.cellsize > 0)) continue;
+        if (!fine || lv.cellsize < fine) fine = lv.cellsize;
+      }
+      return fine ? Math.ceil(cellsize / fine) * fine : 0;
+    }
+
+    // Objekthöhe aus einer Stufe, als roher Bytewert wie aus ndomByteAt.
+    // `hasTile` ist die Kachelliste als Frage: außerhalb ist nichts bekannt,
+    // auch wenn im Bild dort eine 0 steht.
+    function overviewByteAt(hm, lv, data, hasTile, e, n) {
+      const km = hm.tile_m;
+      if (!hasTile(Math.floor(e / km), Math.floor(n / km))) return null;
+      const cols = lv.size[0], rows = lv.size[1];
+      const col = Math.floor((e - lv.origin[0]) / lv.cellsize);
+      const row = Math.floor((lv.origin[1] + rows * lv.cellsize - n) / lv.cellsize);
+      if (col < 0 || col >= cols || row < 0 || row >= rows) return null;
+      return data[row * cols + col];
     }
 
     // ------------------------------------------------------------ Fernhorizont
@@ -3200,6 +3274,19 @@
       return {
         // Für assembleHeights: rein synchron, null heißt "nicht da".
         tileAt: function (eKm, nKm) { return cache.get(tileKey(eKm, nKm)) || null; },
+        /* Liegen alle Kacheln eines Ausschnitts schon im Speicher? Was es nie
+         * gab, zählt nicht mit: dort gäbe es auch nichts zu holen. Der Motor
+         * fragt das, bevor er für eine grobe Rasterweite die Übersicht lädt --
+         * eine schon bezahlte Quelle gegen einen neuen Download zu tauschen
+         * wäre verkehrt herum gespart.
+         */
+        hasAll: function (list) {
+          for (const [e, nn] of list) {
+            const k = tileKey(e, nn);
+            if (exists.has(k) && !cache.has(k)) return false;
+          }
+          return true;
+        },
         /* onTiles(fertig, gesamt) meldet den Ladefortschritt. Gemeldet wird die
          * Zahl der Kacheln, die dieser Aufruf tatsächlich holen muss: die
          * bereits im Speicher liegenden zählen nicht mit, sonst stünde der
@@ -3279,6 +3366,78 @@
         return assembleHeights(hm, spec, { ndomTile: store.tileAt, dgm: dgm });
       }
 
+      /* Die Übersichtsstufen: die Objekthöhe als je ein Bild fürs ganze
+       * Gebiet, 4 und 8 m. Geladen wird eine Stufe beim ersten Gebrauch und
+       * danach behalten -- beide zusammen wiegen weniger als zwanzig
+       * 1-m-Kacheln, und wer einmal weit draußen war, kommt wieder. Derselbe
+       * zweite Versuch wie bei den Kacheln, aus demselben Grund.
+       */
+      const ovBytes = new Map();
+      const ovLoading = new Map();
+      function ensureOverview(lv, onTiles) {
+        const k = lv.path;
+        if (ovBytes.has(k)) return Promise.resolve();
+        if (onTiles) onTiles(0, 1);
+        if (!ovLoading.has(k)) {
+          const u = DATA + lv.path;
+          ovLoading.set(k, tileLane(() => loadByteTile(u))
+            .catch(() => new Promise(res => setTimeout(res, 250)).then(() => tileLane(() => loadByteTile(u))))
+            .then(d => { ovBytes.set(k, d); ovLoading.delete(k); },
+                  err => { ovLoading.delete(k); throw err; }));
+        }
+        return ovLoading.get(k).then(() => { if (onTiles) onTiles(1, 1); });
+      }
+      // Die Kachelliste als Frage: die Übersicht hat keine eigene Maske, wo
+      // keine Kachel liegt, steht im Bild eine 0 und bedeutet nichts.
+      const ndomSet = new Set(hm.ndom.tiles.map(t => tileKey(t[0], t[1])));
+      const hasNdomTile = (eKm, nKm) => ndomSet.has(tileKey(eKm, nKm));
+
+      /* Woher die Objekthöhen einer Flächenrechnung kommen.
+       *
+       * Kann eine Übersichtsstufe die Rasterweite exakt bedienen (die Weite
+       * ist ein Vielfaches der Stufe), wird sie genommen, statt Kacheln zu
+       * holen: die ganze Stadt ist dann ein Bild von unter zwei Megabyte
+       * statt zweihundert Kacheln -- der Weg, auf dem "Ganze Stadt" überhaupt
+       * rechenbar ist. Liegen die Kacheln des Ausschnitts aber schon alle im
+       * Speicher, bleiben sie die Quelle: gleich gut, und schon bezahlt.
+       *
+       * Der Ausschnitt wird für die Stufe nach außen auf ihr Raster gelegt.
+       * Nur so deckt jede gerechnete Zelle ganze Stufenzellen ab, und das
+       * Maximum über die Stufe ist exakt das der 1-m-Kacheln; ohne das
+       * Einrasten läge die Stufenzelle bis zur halben Stufenweite neben der
+       * gerechneten. Das Ergebnis sagt über seinen `spec` selbst, wo es
+       * liegt, deshalb darf es etwas größer sein als bestellt.
+       *
+       * Schlägt das Laden der Stufe auch beim zweiten Versuch fehl, scheitert
+       * die Anfrage als Ganzes -- kein stiller Rückfall auf die Kachelliste,
+       * die jenseits der Kachelschranke gerade das ist, was vermieden werden
+       * muss. Der Rechnen-Knopf bleibt scharf, der nächste Klick versucht es
+       * neu.
+       */
+      function heightSource(req, onTiles) {
+        const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
+        const lv = overviewLevelFor(hm, req.cellsize);
+        if (lv && !store.hasAll(list)) {
+          return ensureOverview(lv, onTiles).then(() => {
+            const s = lv.cellsize, data = ovBytes.get(lv.path);
+            const ox = lv.origin[0], oy = lv.origin[1];
+            return {
+              e0: ox + Math.floor((req.e0 - ox) / s) * s,
+              n0: oy + Math.floor((req.n0 - oy) / s) * s,
+              e1: ox + Math.ceil((req.e1 - ox) / s) * s,
+              n1: oy + Math.ceil((req.n1 - oy) / s) * s,
+              src: { objAt: (e, n) => overviewByteAt(hm, lv, data, hasNdomTile, e, n),
+                     objCellsize: s, dgm: dgm },
+              missing: 0
+            };
+          });
+        }
+        return store.ensure(list, onTiles).then(missing => ({
+          e0: req.e0, n0: req.n0, e1: req.e1, n1: req.n1,
+          src: { ndomTile: store.tileAt, dgm: dgm }, missing: missing
+        }));
+      }
+
       return {
         hm: hm,
         loadHeavy: function () {
@@ -3298,22 +3457,21 @@
          */
         shadow: function (req, onProgress) {
           const report = onProgress || function () { };
-          const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
           let wLoad = 0;
-          return store.ensure(list, (done, total) => {
+          return heightSource(req, (done, total) => {
             // Erst mit der ersten Meldung steht fest, ob überhaupt geladen
             // wird. Liegt alles im Speicher, entfällt der Ladeteil und der
             // Rest der Anzeige dehnt sich darüber.
             wLoad = total > 0 ? 0.5 : 0;
             if (total > 0) report(wLoad * done / total);
-          }).then(() => {
+          }).then(hs => {
             const rest = 1 - wLoad;
             const cs = req.cellsize;
-            const cols = Math.ceil((req.e1 - req.e0) / cs);
-            const rows = Math.ceil((req.n1 - req.n0) / cs);
-            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
+            const cols = Math.ceil((hs.e1 - hs.e0) / cs);
+            const rows = Math.ceil((hs.n1 - hs.n0) / cs);
+            const spec = { originE: hs.e0, originN: hs.n0, cellsize: cs, rows: rows, cols: cols };
             report(wLoad + rest * 0.05);
-            const heights = assemble(spec);
+            const heights = assembleHeights(hm, spec, hs.src);
             report(wLoad + rest * 0.2);
             // Die Sichtbarkeitsschwelle wandert in die Sonnenhöhe, damit der
             // Sweep nur eine Zahl kennen muss.
@@ -3376,21 +3534,20 @@
          */
         sunhours: function (req, onProgress) {
           const report = onProgress || function () { };
-          const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
           let wLoad = 0;
-          return store.ensure(list, (done, total) => {
+          return heightSource(req, (done, total) => {
             wLoad = total > 0 ? 0.25 : 0;
             if (total > 0) report(wLoad * done / total);
-          }).then(() => {
+          }).then(hs => {
             const rest = 1 - wLoad;
             const cs = req.cellsize;
-            const cols = Math.ceil((req.e1 - req.e0) / cs);
-            const rows = Math.ceil((req.n1 - req.n0) / cs);
-            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
-            const heights = assemble(spec);
+            const cols = Math.ceil((hs.e1 - hs.e0) / cs);
+            const rows = Math.ceil((hs.n1 - hs.n0) / cs);
+            const spec = { originE: hs.e0, originN: hs.n0, cellsize: cs, rows: rows, cols: cols };
+            const heights = assembleHeights(hm, spec, hs.src);
             report(wLoad + rest * 0.05);
             // Das Fernhorizontprofil für die Mitte des Fensters, einmal.
-            const ce = (req.e0 + req.e1) / 2, cn = (req.n0 + req.n1) / 2;
+            const ce = (hs.e0 + hs.e1) / 2, cn = (hs.n0 + hs.n1) / 2;
             const prof = new Float32Array(360);
             for (let b = 0; b < 360; b++) prof[b] = farHorizonAt(hm, far, ce, cn, b);
             const tell = p => report(wLoad + rest * (0.05 + 0.95 * p));
@@ -4087,8 +4244,15 @@
      * Seit alle drei Karten auf Ansage rechnen, ist Nachladen etwas, das
      * jemand angeklickt hat. 90 Kacheln sind gut 12 MB im schlimmsten Fall,
      * einmal je Sitzung, und decken die tiefe Sonne in jedem Maßstab ab, in
-     * dem man einzelne Häuser sieht. Was sie weiter abwehrt, ist das
-     * Herausziehen auf die ganze Stadt: dort wären es zweihundert und mehr.
+     * dem man einzelne Häuser sieht.
+     *
+     * Seit den Übersichtsstufen ist die Schranke keine Endstation mehr,
+     * sondern der Wechsel der Quelle: jenseits von ihr kommen die Höhen aus
+     * dem 4- oder 8-m-Stufenbild (ein Bild fürs ganze Gebiet, unter zwei
+     * Megabyte) statt aus Kacheln, und die Rasterweite muss dafür ein
+     * Stufenvielfaches sein. "Weiter hineinzoomen" bleibt nur für ein altes
+     * Manifest ohne Übersichtsblock und für Ausschnitte, die selbst auf der
+     * gröbsten Stufe den Zellendeckel rissen.
      */
     const MAX_TILES = 90;
 
@@ -5269,7 +5433,7 @@
         return { list: tilesForExtent(model.hm, e0, n0, e1, n1), e0: e0, n0: n0, e1: e1, n1: n1 };
       }, [vw, model, stage, sun.elev]);
 
-      const tooFar = tilesNeeded ? tilesNeeded.list.length > MAX_TILES : false;
+      const tilesTooMany = tilesNeeded ? tilesNeeded.list.length > MAX_TILES : false;
 
       /* Was eine Rasterweite in diesem Ausschnitt kosten würde, in Zellen.
        * Gerechnet wird über genau die Fläche, die auch der Motor rechnet --
@@ -5300,14 +5464,42 @@
        * des Bildes, und dann ist "eine Zelle je Bildschirmpixel" eine Regel,
        * die über das Bild spricht und die Fläche bezahlt.
        */
-      const csAuto = model && model.ready && vw && tilesNeeded
+      const csAutoFit = model && model.ready && vw && tilesNeeded
         ? fitCellsize(model.hm, vw.mPerPx, tilesNeeded.e1 - tilesNeeded.e0,
                       tilesNeeded.n1 - tilesNeeded.n0, AUTO_SHADOW_CELLS)
         : 0;
+      /* Jenseits der Kachelschranke kommen die Höhen aus der Übersicht, und
+       * die bedient nur ihre Stufenvielfachen: die automatische Weite rundet
+       * dann auf das nächste davon auf (aus sechs oder sieben Metern werden
+       * acht). Ein Manifest ohne Übersichtsblock -- ein alter Zwischenspeicher
+       * -- liefert 0, dann bleibt es bei der Weite des Deckels und unten bei
+       * "weiter hineinzoomen".
+       */
+      const csAuto = tilesTooMany && csAutoFit && model
+        ? (overviewCellsizeUp(model.hm, csAutoFit) || csAutoFit)
+        : csAutoFit;
+      /* "Zu weit draußen" ist seit der Übersicht nicht mehr die Kachelzahl:
+       * die ganze Stadt ist als Stufenbild ein Bild, kein Kachelstapel. Zu
+       * weit ist es erst, wenn es keine Stufen gibt oder selbst die
+       * aufgerundete automatische Weite den Speicherdeckel risse -- der
+       * Schutz gegen das grenzenlose Herauszoomen, den vorher die
+       * Kachelschranke miterledigt hat.
+       */
+      const autoCells = csAuto && tilesNeeded
+        ? Math.ceil((tilesNeeded.e1 - tilesNeeded.e0) / csAuto) *
+          Math.ceil((tilesNeeded.n1 - tilesNeeded.n0) / csAuto)
+        : 0;
+      const tooFar = tilesTooMany &&
+        (!(model && csAuto && overviewLevelFor(model.hm, csAuto)) ||
+         autoCells > MAX_SHADOW_CELLS);
       const csFitsFor = cs => {
         if (!model || !model.ready || !vw) return true;
-        return shadowCellsize(model.hm, vw.mPerPx, cs) >= csAuto ||
-               shadowCells(cs) <= MAX_SHADOW_CELLS;
+        const w = shadowCellsize(model.hm, vw.mPerPx, cs);
+        // Jenseits der Kachelschranke gibt es nur die Übersicht als Quelle,
+        // und die bedient nur ihre Stufenvielfachen: vier Meter ja, ein und
+        // zwei nein.
+        if (tilesTooMany && !overviewLevelFor(model.hm, w)) return false;
+        return w >= csAuto || shadowCells(cs) <= MAX_SHADOW_CELLS;
       };
 
       /* Eine zu fein gewordene Wahl wird nicht zurückgesetzt, sondern für
@@ -5652,12 +5844,34 @@
        * eine Zelle, die kleiner als ein Drittel Pixel ist, im Bild ohnehin
        * niemand mehr auseinanderhält.
        */
+      /* Wie viele Kacheln der Stundenausschnitt bräuchte -- unabhängig von
+       * der Rasterweite, deshalb vor ihr entschieden: ob der Ausschnitt über
+       * die Übersicht laufen muss, bestimmt mit, welche Weite überhaupt gilt.
+       */
+      const hoursTiles = useMemo(() => {
+        if (!vw || !model || !model.ready) return 0;
+        const ext = vw.extent(hoursMargin);
+        return tilesForExtent(model.hm,
+          model.hm.bounds[0] + ext[0], model.hm.bounds[1] + ext[1],
+          model.hm.bounds[0] + ext[2], model.hm.bounds[1] + ext[3]).length;
+      }, [vw, model, stage, hoursMargin]);
+      const hoursTooMany = hoursTiles > MAX_TILES;
+      /* Dieselbe Regel wie beim Schatten: jenseits der Kachelschranke trägt
+       * eine Weite nur, wenn die Übersicht sie bedienen kann. Der
+       * Nachschlageweg ist ausgenommen, er hat seinen eigenen Kachelsatz.
+       */
+      const hoursCsOK = c => {
+        if (!hoursCsFitsFor(c)) return false;
+        if (yearPre || !hoursTooMany) return true;
+        return !!(model && model.ready &&
+                  overviewLevelFor(model.hm, hoursCellsize(model.hm, c)));
+      };
       const hoursCsFloor = yearPre && vw
         ? (HOURS_CS_FALLBACK.find(c => c >= vw.mPerPx / 3) || 16) : 1;
       const hoursCsWanted = Math.max(hoursCs, hoursCsFloor);
-      const hoursCsFits = hoursCsFitsFor(hoursCsWanted);
+      const hoursCsFits = hoursCsOK(hoursCsWanted);
       const hoursCsUsed = hoursCsFits ? hoursCsWanted
-        : (HOURS_CS_FALLBACK.find(c => c > hoursCsWanted && hoursCsFitsFor(c))
+        : (HOURS_CS_FALLBACK.find(c => c > hoursCsWanted && hoursCsOK(c))
            || HOURS_CS_FALLBACK[HOURS_CS_FALLBACK.length - 1]);
 
       const hoursReq = useMemo(() => {
@@ -5686,7 +5900,6 @@
         return {
           e0: e0, n0: n0, e1: e1, n1: n1, cellsize: cs,
           azBin: dir.az, elBin: dir.el, pre: yearPre,
-          tiles: tilesForExtent(model.hm, e0, n0, e1, n1).length,
           key: [span, Math.round(e0), Math.round(n0), Math.round(e1), Math.round(n1),
                 cs, yearPre ? 'pre' : ymd.y,
                 span === 'day' ? ymd.m : 0, span === 'day' ? ymd.d : 0,
@@ -5697,14 +5910,20 @@
           yearPre, hoursMargin]);
 
       /* Die Kachelschranke gilt für das Rechnen und nicht für das
-       * Nachschlagen. Sie wehrt das Herausziehen auf die ganze Stadt ab, weil
-       * dort zweihundert Kacheln zusammenzusetzen und durchzurechnen wären --
-       * und genau das ist der Fall, den die Vorberechnung erledigt hat. Über
-       * die ganze Stadt sind es 112 Kacheln zu je 69 kB, die nebenher
-       * eintrudeln, und was den Speicher begrenzt, ist danach die Zellenzahl
-       * und nicht die Kachelzahl.
+       * Nachschlagen -- und seit der Übersicht heißt sie auch beim Rechnen
+       * nicht mehr "zu weit", sondern nur noch "andere Quelle": jenseits von
+       * ihr rechnen die Stundenkarten aus dem Stufenbild, und die Auswahl
+       * oben hat die Weite schon auf ein Stufenvielfaches gelegt. Übrig
+       * bleibt "weiter hineinzoomen" für zwei Fälle: ein altes Manifest im
+       * Zwischenspeicher kennt den Übersichtsblock nicht, oder der Ausschnitt
+       * reißt selbst auf der letzten Rückfallstufe den Zellendeckel -- den
+       * zweiten Fall hat vorher die Kachelschranke miterledigt, jetzt muss er
+       * selbst dastehen.
        */
-      const hoursFar = hoursReq && !yearPre ? hoursReq.tiles > MAX_TILES : false;
+      const hoursFar = hoursReq && !yearPre
+        ? (hoursTooMany && !overviewLevelFor(model.hm, hoursReq.cellsize))
+          || !hoursCsFitsFor(hoursCsUsed)
+        : false;
       /* Dieselbe Form wie beim Schatten, und das ist eine Änderung: "veraltet"
        * heißt jetzt auch "es gibt gar keins". Vorher hieß es nur "es gibt ein
        * anderes", und nach einer gescheiterten ersten Rechnung stand die Karte
@@ -6413,9 +6632,16 @@
         const fe = hoursReq;
         const animAuto = fitCellsize(model.hm, vw.mPerPx, fe.e1 - fe.e0, fe.n1 - fe.n0,
                                      AUTO_SHADOW_CELLS);
-        const animCs = shadowCsUsed
+        const animCsRaw = shadowCsUsed
           ? Math.max(shadowCellsize(model.hm, vw.mPerPx, shadowCsUsed), animAuto)
           : animAuto;
+        /* Und wie die Karte selbst: jenseits der Kachelschranke kommen die
+         * Höhen aus der Übersicht, also auf deren nächste Stufe aufrunden.
+         * (Gibt es keine, ist der Filmknopf über `hoursFar` längst grau.)
+         */
+        const animCs = hoursTooMany
+          ? (overviewCellsizeUp(model.hm, animCsRaw) || animCsRaw)
+          : animCsRaw;
 
         animStop.current = false;
         setAnim({ phase: 'compute', done: 0, total: mins.length });
@@ -6819,7 +7045,7 @@
                            hervorgehoben, auch wenn gerade eine gröbere
                            gerechnet wird. -->
                       ${HOURS_CS_CHOICES.map(c => {
-                        const fits = hoursCsFitsFor(c);
+                        const fits = hoursCsOK(c);
                         return html`
                         <button key=${'co' + c} className=${'lang-seg' + (hoursCs === c ? ' active' : '')}
                                 disabled=${!fits}
