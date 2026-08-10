@@ -2735,6 +2735,103 @@
       return out;
     }
 
+    /* Die Übersichtsstufe des Nachschlagewegs: die Jahreskarte vergröbert als
+     * ein Bild fürs ganze Gebiet (8 m, verlustfrei), damit die Stadtansicht
+     * nicht alle 92 Kacheln durch den Bilddekoder schieben muss. Dieselbe
+     * Regel wie bei den nDOM-Stufen -- exakt oder gar nicht --, nur mit dem
+     * Mittel statt dem Maximum: hier stehen fertige Stundenzahlen, der
+     * Nachschlageweg mittelt beim Vergröbern ohnehin, und Mittel schachteln
+     * genauso, solange die Rasterweite ein ganzes Vielfaches der Stufenweite
+     * ist und der Ausschnitt auf ihrem Raster liegt. Der Preis ist das halbe
+     * Byte der Blockrundung, auf scaleMax 4600 neun Stunden im Jahr.
+     */
+
+    // Die gröbste Stufe, die eine Rasterweite exakt bedienen kann; null, wenn
+    // keine. Eine Stufe mit fremder Quantisierung wird übergangen, wie bei
+    // overviewLevelFor: ihre Bytes wären nicht dieselbe Einheit.
+    function sunYearOverviewLevelFor(meta, cellsize) {
+      const ov = meta && meta.overview;
+      if (!ov || !ov.levels) return null;
+      let best = null;
+      for (const lv of ov.levels) {
+        if (lv.scaleMax !== meta.scaleMax) continue;
+        if (!(lv.cellsize > 0) || cellsize % lv.cellsize !== 0) continue;
+        if (!best || lv.cellsize > best.cellsize) best = lv;
+      }
+      return best;
+    }
+
+    /* Die Stufenweite, mit der die Automatik einen Ausschnitt nachschlagen
+     * darf: das kleinste Stufenvielfache, das die gewünschte Weite trägt --
+     * aber nur, solange eine Stufenzelle dabei höchstens gut ein Bildpunkt
+     * bleibt (Faktor 1,2 gegen den Maßstab). Größer gezogene Zellen sehen
+     * weich aus, und genau das ist der Maßstab, an dem die erste Fassung
+     * gescheitert ist: sie zählte Kacheln (mehr als 24), maß damit die
+     * Fensterfläche statt der Zellgröße im Bild und servierte einem breiten
+     * Fenster schon das Startbild in 8 m, vierfach hochgezogen
+     * (Browserbefund 2026-08-10, "8 m" im PNG-Titel). 0 heißt: keine Stufe
+     * kann das hier -- der Kachelweg bleibt, auch bei einem alten Manifest
+     * ohne Übersichtsblock.
+     */
+    function sunYearOverviewCellsize(meta, cellsize, mPerPx) {
+      const ov = meta && meta.overview;
+      if (!ov || !ov.levels || !(mPerPx > 0)) return 0;
+      let fine = 0;
+      for (const lv of ov.levels) {
+        if (lv.scaleMax !== meta.scaleMax || !(lv.cellsize > 0)) continue;
+        if (!fine || lv.cellsize < fine) fine = lv.cellsize;
+      }
+      if (!fine) return 0;
+      const up = Math.ceil(cellsize / fine) * fine;
+      return up <= mPerPx * 1.2 ? up : 0;
+    }
+
+    /* Das Stundenfeld aus der Übersichtsstufe statt aus Kacheln, sonst wie
+     * sunYearField: gleiche Geometrie, gemittelt statt abgetastet, keine
+     * einzige bekannte Teilprobe heißt unbekannt. Die Stufe hat mit Absicht
+     * keine eigene Maske -- wo keine sunyear-Kachel liegt, steht im Bild eine
+     * 0 und bedeutet nichts, die Wahrheit darüber bleibt die Kachelliste
+     * (`hasTile`), wie bei den nDOM-Stufen.
+     */
+    function sunYearFieldFromOverview(meta, lv, spec, data, hasTile) {
+      const rows = spec.rows, cols = spec.cols, cellsize = spec.cellsize;
+      const out = new Float32Array(rows * cols);
+      const topN = spec.originN + rows * cellsize;
+      const km = meta.px * meta.cellsize;
+      const scale = meta.scaleMax / 254;
+      const unk = meta.unknownCount > 0 ? meta.unknown : -1;
+      const s = lv.cellsize;
+      const lcols = lv.size[0], lrows = lv.size[1];
+      const topL = lv.origin[1] + lrows * s;
+      const sub = Math.max(1, Math.round(cellsize / s));
+      const subSize = cellsize / sub;
+
+      for (let row = 0; row < rows; row++) {
+        const nTop = topN - row * cellsize;
+        for (let col = 0; col < cols; col++) {
+          const eLeft = spec.originE + col * cellsize;
+          let sum = 0, cnt = 0;
+          for (let dy = 0; dy < sub; dy++) {
+            const n = nTop - (dy + 0.5) * subSize;
+            const nKm = Math.floor(n / km);
+            const r = Math.floor((topL - n) / s);
+            if (r < 0 || r >= lrows) continue;
+            for (let dx = 0; dx < sub; dx++) {
+              const e = eLeft + (dx + 0.5) * subSize;
+              if (!hasTile(Math.floor(e / km), nKm)) continue;
+              const c = Math.floor((e - lv.origin[0]) / s);
+              if (c < 0 || c >= lcols) continue;
+              const v = data[r * lcols + c];
+              if (v === unk) continue;
+              sum += v; cnt++;
+            }
+          }
+          out[row * cols + col] = cnt ? (sum / cnt) * scale : NaN;
+        }
+      }
+      return out;
+    }
+
     /* Farbe einer Sonnenstundenzahl. Die Rampe ist eine Liste von Stützstellen
      * [Anteil, r, g, b], linear dazwischen. Sie kommt von außen, weil sie zum
      * Skin gehört und nicht zur Rechnerei.
@@ -3574,6 +3671,10 @@
        * bedient.
        */
       const yearStore = ymeta ? makeTileStore(ymeta.tiles, ymeta.path, 48) : null;
+      // Die Kachelliste des Jahressatzes als Maske für seine Übersichtsstufe,
+      // dasselbe Muster wie hasNdomTile: die Stufe selbst kennt keine Löcher.
+      const yearSet = ymeta ? new Set(ymeta.tiles.map(t => tileKey(t[0], t[1]))) : null;
+      const hasYearTile = (eKm, nKm) => !!(yearSet && yearSet.has(tileKey(eKm, nKm)));
       /* Der dritte Kachelsatz: die Objekthöhen zu 0,5 m um die Altstadt
        * (`hm.ndom.fein`). Wie die Jahreskarte ist er nur da, wenn das Manifest
        * ihn führt -- ein altes Manifest im Zwischenspeicher kennt ihn nicht,
@@ -3590,11 +3691,13 @@
       // Das Nahbereichsraster der letzten Punktabfrage, siehe `point`.
       let pointMemo = null;
 
-      /* Die Übersichtsstufen: die Objekthöhe als je ein Bild fürs ganze
-       * Gebiet, 4 und 8 m. Geladen wird eine Stufe beim ersten Gebrauch und
-       * danach behalten -- beide zusammen wiegen weniger als zwanzig
-       * 1-m-Kacheln, und wer einmal weit draußen war, kommt wieder. Derselbe
-       * zweite Versuch wie bei den Kacheln, aus demselben Grund.
+      /* Die Übersichtsstufen: je ein Bild fürs ganze Gebiet -- die Objekthöhe
+       * in 4 und 8 m, und seit der siebzehnten Session auch die Jahreskarte
+       * in 8 m (der Lader ist derselbe, der Schlüssel ist der Pfad). Geladen
+       * wird eine Stufe beim ersten Gebrauch und danach behalten -- alle
+       * zusammen wiegen weniger als dreißig 1-m-Kacheln, und wer einmal weit
+       * draußen war, kommt wieder. Derselbe zweite Versuch wie bei den
+       * Kacheln, aus demselben Grund.
        */
       const ovBytes = new Map();
       const ovLoading = new Map();
@@ -3859,17 +3962,11 @@
           const report = onProgress || function () { };
           if (!yearStore) return Promise.reject(new Error('keine vorberechnete Jahreskarte'));
           const list = tilesForExtent(hm, req.e0, req.n0, req.e1, req.n1);
-          return yearStore.ensure(list, (done, total) => {
-            // Das Zusammensetzen ist gegen das Laden so schnell, dass ein
-            // eigener Anteil im Balken nur ein Zucken am Ende wäre.
-            if (total > 0) report(0.95 * done / total);
-          }).then((missing) => {
-            const cs = req.cellsize;
-            const cols = Math.ceil((req.e1 - req.e0) / cs);
-            const rows = Math.ceil((req.n1 - req.n0) / cs);
-            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
-            const hours = sunYearField(ymeta, spec, yearStore.tileAt);
-            const ce = (req.e0 + req.e1) / 2, cn = (req.n0 + req.n1) / 2;
+          const cs = req.cellsize;
+          // Der Bezugswert gilt für die Fenstermitte und hängt nicht daran,
+          // ob der Ausschnitt für die Stufe eingerastet wurde.
+          const ce = (req.e0 + req.e1) / 2, cn = (req.n0 + req.n1) / 2;
+          const finish = (spec, hours, missing) => {
             report(1);
             return {
               hours: hours, dayHours: sunYearPossible(ymeta, ce, cn),
@@ -3882,8 +3979,46 @@
                */
               steps: 0, stepMin: ymeta.stepMin,
               span: 'year', precomputed: true, missing: missing || 0,
-              rows: rows, cols: cols, cellsize: cs, spec: spec
+              rows: spec.rows, cols: spec.cols, cellsize: cs, spec: spec
             };
+          };
+          /* Trägt die Übersichtsstufe die Weite exakt, kommt das Feld aus dem
+           * einen Stufenbild statt aus den Kacheln: die Stadtansicht ist dann
+           * ein Megabyte statt acht durch den Bilddekoder. Liegen die Kacheln
+           * aber schon alle im Speicher, bleiben sie die Quelle -- gleich gut,
+           * und schon bezahlt. Der Ausschnitt wird für die Stufe nach außen
+           * auf ihr Raster gelegt, wie bei heightSource, und aus demselben
+           * Grund: nur so mittelt jede gerechnete Zelle ganze Stufenzellen,
+           * und das Mittel über die Stufe ist das über die 1-m-Kacheln.
+           * Schlägt das Laden der Stufe zweimal fehl, scheitert die Anfrage
+           * als Ganzes; der nächste Klick versucht es neu.
+           */
+          const lv = sunYearOverviewLevelFor(ymeta, cs);
+          if (lv && !yearStore.hasAll(list)) {
+            return ensureOverview(lv, (done, total) => {
+              if (total > 0) report(0.95 * done / total);
+            }).then(() => {
+              const s = lv.cellsize, ox = lv.origin[0], oy = lv.origin[1];
+              const e0 = ox + Math.floor((req.e0 - ox) / s) * s;
+              const n0 = oy + Math.floor((req.n0 - oy) / s) * s;
+              const e1 = ox + Math.ceil((req.e1 - ox) / s) * s;
+              const n1 = oy + Math.ceil((req.n1 - oy) / s) * s;
+              const cols = Math.ceil((e1 - e0) / cs);
+              const rows = Math.ceil((n1 - n0) / cs);
+              const spec = { originE: e0, originN: n0, cellsize: cs, rows: rows, cols: cols };
+              return finish(spec,
+                sunYearFieldFromOverview(ymeta, lv, spec, ovBytes.get(lv.path), hasYearTile), 0);
+            });
+          }
+          return yearStore.ensure(list, (done, total) => {
+            // Das Zusammensetzen ist gegen das Laden so schnell, dass ein
+            // eigener Anteil im Balken nur ein Zucken am Ende wäre.
+            if (total > 0) report(0.95 * done / total);
+          }).then((missing) => {
+            const cols = Math.ceil((req.e1 - req.e0) / cs);
+            const rows = Math.ceil((req.n1 - req.n0) / cs);
+            const spec = { originE: req.e0, originN: req.n0, cellsize: cs, rows: rows, cols: cols };
+            return finish(spec, sunYearField(ymeta, spec, yearStore.tileAt), missing);
           });
         },
 
@@ -6302,7 +6437,28 @@
        */
       const hoursAutoCs = model && model.ready && vw
         ? hoursAutoCellsize(model.hm, vw.mPerPx, fineOK && !yearPre) : 2;
-      const hoursCsWanted = Math.max(hoursCs === 0 ? hoursAutoCs : hoursCs, hoursCsFloor);
+      const hoursCsWanted0 = Math.max(hoursCs === 0 ? hoursAutoCs : hoursCs, hoursCsFloor);
+      /* Die Automatik des Nachschlagewegs zielt auf den Drittel-Pixel-Floor
+       * und nicht auf eine Zelle je Bildpunkt: die Karte liegt in 1 m fertig
+       * auf der Platte, feiner nachzuschlagen kostet fast nichts, und aus dem
+       * Überabtasten (bis zum Dreifachen, mehr sieht niemand -- deshalb ist
+       * der Floor ein Drittel) kommt die Schärfe des Startbilds. Eine Zelle
+       * je Bildpunkt, wie die fünfzehnte Session sie auch hierher übernommen
+       * hatte, sah am Start sichtbar weich aus (Browserbefund 2026-08-10):
+       * das 1-m-Modell enthält echte Unterzellen-Kanten, die bei 1:1 fehlen.
+       *
+       * Kann die sunyear-Übersichtsstufe den Floor tragen, ohne dass ihre
+       * Zelle im Bild über gut einen Bildpunkt wächst, gilt ihr Raster: der
+       * Motor holt dann ein Stufenbild von einem Megabyte statt bis zu 92
+       * Kacheln. Das greift ab der halben Stadt und aufwärts; feiner
+       * hineingezoomt sähe die Stufe weich aus, und dann laufen die Kacheln.
+       * Nur die Automatik -- eine feste Wahl ist eine Bestellung und wird
+       * nicht umgedeutet. Ein altes Manifest ohne Übersichtsblock liefert 0,
+       * dann bleibt alles beim bisherigen Weg.
+       */
+      const hoursCsWanted = yearPre && hoursCs === 0 && hoursCsFloor
+        ? (sunYearOverviewCellsize(yearMeta, hoursCsFloor, vw.mPerPx) || hoursCsFloor)
+        : hoursCsWanted0;
       const hoursCsFits = hoursCsOK(hoursCsWanted);
       const hoursCsUsed = hoursCsFits ? hoursCsWanted
         : (HOURS_CS_FALLBACK.find(c => c > hoursCsWanted && hoursCsOK(c))
@@ -6727,8 +6883,17 @@
            * dem er gestartet wurde.
            */
           ctx.imageSmoothingEnabled = viewMode !== 'cells';
-          ctx.drawImage(bmp, x0, y0, g.cols * g.cellsize / vw.mPerPx,
-                                     g.rows * g.cellsize / vw.mPerPx);
+          /* Gezogen wird auf die Maße des Ausschnitts (`nc`/`nr`), nicht des
+           * ganzen Feldes: ein Bild, das nur den sichtbaren Zuschnitt trägt,
+           * auf Feldmaße gezogen, säße an der Zuschnittsecke verankert und
+           * um das Verhältnis der beiden aufgeblasen -- die Heatmap käme
+           * sichtbar "von woanders" und viel zu grob, während die Gebäude
+           * darüber stimmen (Browserbefund vom 2026-08-10; der Fehler stand
+           * seit der fünfzehnten Session da und fiel erst auf, als die
+           * Stufenfelder der Stadtansicht gröber wurden).
+           */
+          ctx.drawImage(bmp, x0, y0, nc * g.cellsize / vw.mPerPx,
+                                     nr * g.cellsize / vw.mPerPx);
           ctx.imageSmoothingEnabled = true;
         };
 
