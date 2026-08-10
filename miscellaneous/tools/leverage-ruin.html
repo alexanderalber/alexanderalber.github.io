@@ -25,6 +25,12 @@
 
     .lr-card { border: 1px solid var(--tool-border); border-radius: 8px; padding: 14px 16px;
       background: color-mix(in srgb, var(--tool-panel) 55%, transparent); box-shadow: var(--tool-panel-shadow); }
+    /* Sections inside the one parameter card, separated by hairlines. The card's
+       own side padding is what keeps the lines short of the edges. */
+    .lr-card > .lr-sec { padding: 13px 0; }
+    .lr-card > .lr-sec:first-child { padding-top: 0; }
+    .lr-card > .lr-sec:last-child { padding-bottom: 0; }
+    .lr-card > .lr-sec + .lr-sec { border-top: 1px solid var(--tool-hairline); }
     .lr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 22px; }
     .lr-param { margin-bottom: 2px; }
     .lr-param label { display: flex; align-items: baseline; gap: 6px;
@@ -84,6 +90,40 @@
     .lr-lead { color: var(--tool-text); max-width: 70ch; }
     .lr-howto { max-width: 70ch; font-size: 13.5px; color: var(--tool-note); line-height: 1.7;
       border-left: 2px solid var(--tool-border); padding: 2px 0 2px 14px; }
+    /* Collapsible sections, same shape as the soap-film tool: the chevron sits
+       next to the label instead of at Pico's far right edge, and turns when the
+       section opens. Colours come from the central --tool-* variables rather
+       than being hard coded, because this page has three skins and switches
+       them live. */
+    details.lr-help > summary { display: flex; align-items: center; gap: .55rem; width: max-content;
+      color: var(--tool-text); font-size: 1.05rem; font-weight: 600; }
+    details.lr-help > summary::marker { content: ""; }
+    details.lr-help > summary::-webkit-details-marker { display: none; }
+    details.lr-help > summary::after { display: none; }
+    details.lr-help > summary::before { content: ""; flex: 0 0 auto; width: .5em; height: .5em;
+      border-right: 2px solid var(--tool-label); border-bottom: 2px solid var(--tool-label);
+      transform: rotate(45deg); transition: transform .15s ease; }
+    details.lr-help[open] > summary::before { transform: rotate(-135deg); margin-top: .15em; }
+
+    /* Series colours for the charts. These used to be four literals inside
+       readPalette, which meant they survived every skin unchanged. That is
+       wrong under the grey skin, whose whole brief is to spend as few hues as
+       possible: four saturated signal colours in one chart is the opposite of
+       that. As variables the skin can flatten them, and the distinction the
+       chart needs is carried by what already distinguished the lines anyway,
+       namely lightness, stroke width and dashing (Kelly dashed, the measured
+       optimum solid). The light values are darker than the dark ones because
+       amber, violet and green at their dark-skin lightness are close to
+       illegible on white. */
+    html { --lr-mean: #f59e0b; --lr-ruin: #ef4444; --lr-kelly: #a78bfa; --lr-emp: #4ade80; }
+    html[data-theme="light"] { --lr-mean: #b45309; --lr-ruin: #b91c1c; --lr-kelly: #6d28d9; --lr-emp: #15803d; }
+    /* Grey keeps exactly one accent, and the median already spends it on
+       --tool-sig-info. So the rest goes greyscale: white for the two lines that
+       carry the page's thesis (the wipe-out curve and the measured optimum),
+       and dimmer greys for the two that are commentary on it. The two whites
+       meet at one point by design, where the marker crosses the strip, which is
+       the ruin rate at the optimal leverage. */
+    html[data-skin="grey"] { --lr-mean: #c9cfd2; --lr-ruin: #ffffff; --lr-kelly: #dfe3e5; --lr-emp: #ffffff; }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -129,7 +169,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Leverage &amp; Ruin</h1>
-        <p style="color:var(--tool-label);max-width:70ch">A leveraged ETF does exactly what it advertises: on any single day it moves twice as far as its index. Over twenty years it does something else, and the reason is not the fees. This page simulates the full range of outcomes of a leveraged position over a long horizon, and shows the average rising with leverage while the typical path peaks and turns back down.</p>
+        <p style="color:var(--tool-text);max-width:70ch">A leveraged ETF does exactly what it advertises: on any single day it moves twice as far as its index. Over twenty years it does something else, and the reason is not the fees. This page simulates the full range of outcomes of a leveraged position over a long horizon, for a market and a product that you describe yourself.</p>
       </div>
     </div>
   </main>
@@ -203,12 +243,40 @@
          g(L) = m(L) - 0.5 * L^2 * sigma^2
 
        Borrowing costs rf + spread, but cash held below full investment only
-       earns rf, which puts a kink in m at L = 1.                                */
+       earns rf, which puts a kink in m at L = 1.
 
-    function financeRate(L, p) { return L > 1 ? p.rf + p.spread : p.rf; }
+       The analytic curves use the *expected* financing spread, that is the
+       calm-state spread plus the stressed surcharge weighted by the share of
+       time spent in stress. The simulation instead pays the surcharge exactly
+       on the days the chain is in the stressed state, and those are the same
+       days on which the position is most likely to die. So the marker averages
+       the stress away and the paths do not. That gap is not an inconsistency to
+       be papered over, it is the thing worth seeing: the closed form prices a
+       cost that is spread evenly over time, and the cost is not.               */
+
+    /* Financing rate for one day. `stressed` is what the regime chain says
+       about that day; without a regime it is never set and nothing changes. */
+    function financeRate(L, p, stressed) {
+      return L > 1 ? p.rf + p.spread + (stressed ? (p.sspread || 0) : 0) : p.rf;
+    }
+
+    /* Long-run average of the spread over calm and stressed days. The weight is
+       taken from `regimeParams`, not from `p.sshare` directly, because that is
+       the only place that knows whether there is a second state at all. The UI
+       keeps sending a stress share and a surcharge after the regime has been
+       switched off again, and reading them raw would charge the analytic curves
+       a cost that no simulated path pays, with the sliders hidden so nothing on
+       screen could explain the discrepancy. */
+    function expectedSpread(p) {
+      return p.spread + regimeParams(p).pHi * (p.sspread || 0);
+    }
+
+    function expectedFinanceRate(L, p) {
+      return L > 1 ? p.rf + expectedSpread(p) : p.rf;
+    }
 
     function driftRate(L, p) {              // m(L), the arithmetic growth rate
-      return L * p.mu - (L - 1) * financeRate(L, p) - p.ter;
+      return L * p.mu - (L - 1) * expectedFinanceRate(L, p) - p.ter;
     }
 
     function growthRate(L, p) {             // g(L), the geometric growth rate
@@ -224,11 +292,54 @@
     function kelly(p) {
       var v = p.sigma * p.sigma;
       if (v <= 0) return Infinity;
-      var lo = (p.mu - p.rf) / v;
-      var hi = (p.mu - p.rf - p.spread) / v;
+      var lo = (p.mu - expectedFinanceRate(1, p)) / v;
+      // Written as a subtraction of the spread rather than of the composed rate
+      // so that with no stress surcharge the arithmetic is the same one, to the
+      // last bit, that this function has always done.
+      var hi = (p.mu - p.rf - expectedSpread(p)) / v;
       if (lo <= 1) return Math.max(0, lo);
       if (hi >= 1) return hi;
       return 1;
+    }
+
+    /* The same optimum computed at the pessimistic edge of the uncertainty
+       interval, that is with mu replaced by mu - tau.
+
+       This is deliberately not what tau does in the simulation, and the two are
+       easy to confuse. There, mu is drawn once per path symmetrically around its
+       stated value; since E[log W] is linear in mu, the symmetric error cancels
+       and the median optimum does not move at all, tau only widens the fan. A
+       test pins exactly that. What lowers the recommended leverage is therefore
+       never a better distribution, it is a more pessimistic objective, and that
+       is what this function is: take the bad end of the interval seriously and
+       size the position for it.
+
+       It is also not the Bayes optimal leverage under a prior N(mu, tau^2),
+       which would depend on the horizon and on how much the path itself teaches
+       you along the way. This is the simple pessimism haircut instead, because a
+       number a reader can reproduce on paper is worth more here than a correct
+       one they have to take on faith.
+
+       With no volatility kelly returns Infinity before it looks at anything
+       else. That is only defensible while the pessimistic mean still beats the
+       financing, so the degenerate case is decided here rather than passed on.
+
+       Implemented as a surcharge on the risk-free rate rather than as a cut to
+       mu. Inside kelly both branches see the mean only as mu - rf and as
+       mu - rf - spread, so the two are the same formula; charging it to the rate
+       merely puts the doubt where the other hurdles already sit. It also lands
+       on the honest answer at the boundary: a mean that doubt pushes exactly to
+       the risk-free rate has to buy nothing, and in binary floating point
+       mu - (rf + tau) cancels to a clean zero where (mu - tau) - rf leaves dust
+       of the order of 1e-17 and the position would come out microscopically
+       long instead of flat.                                                     */
+    function kellyRobust(p) {
+      var tau = p.tau || 0;
+      if (!(p.sigma * p.sigma > 0)) return p.mu > p.rf + tau ? Infinity : 0;
+      var q = {}, key;
+      for (key in p) if (Object.prototype.hasOwnProperty.call(p, key)) q[key] = p[key];
+      q.rf = p.rf + tau;
+      return kelly(q);
     }
 
     /* Largest L with g(L) = 0, found by bisection above the optimum. Beyond it,
@@ -275,6 +386,86 @@
       return rng.gauss();
     }
 
+    /* ---------- log Gamma ----------
+
+       Needed only by the skew below, which has to know E|X| of a standardized t
+       and that is a ratio of two Gamma functions. Computing them separately
+       overflows for large nu long before the ratio does anything interesting, so
+       the ratio is formed in logs. Lanczos with g = 7 and nine coefficients is
+       the usual choice here: it is a dozen lines, it needs no tables, and its
+       relative error stays near machine precision over the whole positive axis,
+       which is far more than a degrees-of-freedom slider will ever ask for.
+       Below 1/2 the series is not valid and the reflection formula takes over. */
+    var LGAMMA_C = [
+      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+      771.32342877765313, -176.61502916214059, 12.507343278686905,
+      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
+    ];
+    function lgamma(x) {
+      if (x < 0.5) {
+        // Reflection: Gamma(x) * Gamma(1-x) = pi / sin(pi*x).
+        return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+      }
+      var z = x - 1, a = LGAMMA_C[0], t = z + 7.5;
+      for (var i = 1; i < 9; i++) a += LGAMMA_C[i] / (z + i);
+      return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(a);
+    }
+
+    /* ---------- left skewed innovations ----------
+
+       Markets fall faster than they rise, and a leveraged product cares about
+       that asymmetry directly: the daily reset turns a run of large negative
+       days into a loss that no equally large run of positive days undoes. Fat
+       tails alone cannot express it, because a t deviate is symmetric and makes
+       the crash and the melt-up equally likely.
+
+       The transformation is the simple two-piece scaling: stretch the negative
+       half by (1+g), shrink the positive half by (1-g). What matters is what
+       comes after it. If X is symmetric with mean 0 and variance 1 and
+       m1 = E|X|, then with Y the two-piece version,
+
+         E[Y]   = (1+g)*(-m1/2) + (1-g)*(m1/2) = -g*m1
+         E[Y^2] = ((1+g)^2 + (1-g)^2) / 2      = 1 + g^2
+         Var(Y) = 1 + g^2 - g^2*m1^2 = 1 + g^2*(1 - m1^2)
+
+       so re-centring by g*m1 and dividing by the root of that variance gives
+       back mean 0 and variance 1, and only the *shape* is skewed. That is the
+       house rule of this tool, the same one jumpParams, regimeParams and the
+       standardized t already follow: the unconditional variance stays sigma^2
+       and a new switch changes how the risk is arranged, never how much of it
+       there is. Otherwise the chart would once again only show that more
+       volatility is worse, which we knew.                                      */
+
+    /* E|X| of the standardized symmetric innovation. Merton is listed with gauss
+       because in that mode the *diffusion* is normal and the jumps carry their
+       own asymmetry, so the skew rides on a gaussian here. */
+    function skewMoment(dist, nu) {
+      if (dist !== 't') return Math.sqrt(2 / Math.PI);
+      // For a raw t, E|T| = 2*sqrt(nu)*Gamma((nu+1)/2) / ((nu-1)*sqrt(pi)*Gamma(nu/2)),
+      // and the standardized t is that one scaled by sqrt((nu-2)/nu). Finite only
+      // for nu > 2, which the slider guarantees by starting at 3.
+      var lr = lgamma((nu + 1) / 2) - lgamma(nu / 2);
+      return Math.sqrt((nu - 2) / nu) * 2 * Math.sqrt(nu) * Math.exp(lr)
+        / ((nu - 1) * Math.sqrt(Math.PI));
+    }
+
+    /* The transformation itself, deterministic and free of the generator, so the
+       tests can pin it and the simulation can apply it wherever it likes. */
+    function skewApply(x, g, m1) {
+      // The zero case never enters the arithmetic at all. It is not an
+      // optimization: it is what makes a run with the field left alone bit for
+      // bit the run the tool did before the field existed.
+      if (g === 0) return x;
+      var y = x < 0 ? x * (1 + g) : x * (1 - g);
+      return (y + g * m1) / Math.sqrt(1 + g * g * (1 - m1 * m1));
+    }
+
+    /* Draw and skew in one go. The simulation does not use this, because it has
+       to skew after mirroring rather than at the draw; see the note in simulate. */
+    function skewDeviate(rng, dist, nu, g) {
+      return skewApply(innovation(rng, dist, nu), g, skewMoment(dist, nu));
+    }
+
     /* ---------- Merton jump diffusion ----------
 
        On top of the diffusion, shocks arrive as a Poisson process with rate lam
@@ -309,6 +500,50 @@
       };
     }
 
+    /* ---------- two-state volatility regime ----------
+
+       Real volatility clusters: calm years and stressed years arrive in blocks,
+       and a daily reset product does not die of one fat day but of a stretch of
+       months in which the realized volatility is twice what the factsheet says.
+       An i.i.d. model cannot produce that stretch no matter how heavy its tails
+       are, so this adds the block structure directly: a hidden two-state Markov
+       chain that switches the diffusion volatility between calm and stressed.
+
+       The house rule of this tool applies here as well. The unconditional
+       variance stays sigma^2 and only its distribution over time changes, so
+       switching the regime on does not simply add risk. That is why the two
+       states are returned as *multipliers* mLo and mHi rather than as volatility
+       levels: they satisfy pLo*mLo^2 + pHi*mHi^2 = 1, and whoever holds the
+       volatility applies them. In Merton mode that is the already reduced
+       diffusion volatility from jumpParams, so the two modes compose without
+       either of them knowing about the other.
+
+       The transition probabilities follow from the two things a user can state
+       with a straight face: how much of the time the market is stressed and how
+       long a stressed stretch lasts. A stressed day ends the stretch with
+       probability b, so the mean duration is 1/b days, which fixes b. The
+       stationary share of a two-state chain is pHi = a/(a+b), and solving that
+       for a gives a = b*pHi/pLo. Both are clamped at 1, because a mean duration
+       shorter than a day is not a duration.                                     */
+    function regimeParams(p) {
+      var smult = p.smult || 0;
+      var sshare = p.sshare || 0;
+      var sdur = p.sdur || 0;
+      var on = !!p.regime && smult > 1 && sshare > 0 && sshare < 1 && sdur > 0;
+      if (!on) return { on: false, mLo: 1, mHi: 1, a: 0, b: 0, pHi: 0 };
+      var pHi = sshare, pLo = 1 - pHi;
+      var mLo = 1 / Math.sqrt(pLo + pHi * smult * smult);
+      var b = Math.min(1, 1 / (sdur / 12 * DAYS));
+      return {
+        on: true,
+        mLo: mLo,
+        mHi: smult * mLo,
+        a: Math.min(1, b * pHi / pLo),
+        b: b,
+        pHi: pHi
+      };
+    }
+
     /* Number of shocks over the whole horizon, Knuth's method. */
     function poisson(rng, mean) {
       if (mean <= 0) return 0;
@@ -329,7 +564,9 @@
        and the product mechanics are applied on top of it:
          W <- W * [1 + L*r_t - (L-1)*financeRate*dt - ter*dt]
        In Merton mode the day a shock lands is multiplied by exp(Y) on top, and
-       the drift carries the compensator; see jumpParams.
+       the drift carries the compensator; see jumpParams. With the regime on,
+       the diffusion volatility of the day is scaled by the state of the hidden
+       chain and the financing may carry the stress surcharge; see regimeParams.
     */
     function simulate(p, onProgress) {
       var levels = p.levels;
@@ -337,14 +574,30 @@
       var nSteps = Math.max(1, Math.round(p.T * DAYS));
       var dt = 1 / DAYS;
       var jp = jumpParams(p);
+      var rp = regimeParams(p);
       var sigSqrtDt = jp.sigma * Math.sqrt(dt);
       var halfVar = 0.5 * jp.sigma * jp.sigma * dt;
+      // The two states of the chain differ only by a volatility multiplier, so
+      // the whole per-step dependence collapses into two precomputed pairs that
+      // the state indexes into. Cheaper than carrying arrays of length nSteps.
+      var ssdt = [sigSqrtDt * rp.mLo, sigSqrtDt * rp.mHi];
+      var hv = [halfVar * rp.mLo * rp.mLo, halfVar * rp.mHi * rp.mHi];
       var jumpDrift = jp.lam * jp.k * dt;   // compensator, keeps E[return] at mu
       var ter = p.ter * dt;
       var nPaths = Math.max(2, Math.round(p.nPaths));
       var wipe = p.wipe || 0;
       var rng = makeRng(p.seed);
       var dist = p.dist || 'gauss', nu = p.nu || 5;
+      // The skew and the absolute moment it needs are constant over the run, so
+      // the Gamma functions are evaluated once here rather than 25 million times
+      // in the step loop.
+      var skew = p.skew || 0;
+      var m1 = skew !== 0 ? skewMoment(dist, nu) : 0;
+
+      // Does financing depend on the state of the day? Only if there is a chain
+      // to ask and a surcharge to pay. Kept as its own flag because it, and not
+      // the regime as such, is what forces the second inner loop below.
+      var stressCost = rp.on && (p.sspread || 0) > 0;
 
       // per-level financing cost per step (constant, so hoist it out)
       var fin = new Float64Array(nL);
@@ -376,6 +629,14 @@
       // multiply-add and one multiply.
       var cst = new Float64Array(nL);
       for (k = 0; k < nL; k++) cst[k] = 1 - fin[k] - ter;
+      // Same thing for a stressed day, built only when it can be reached.
+      var cstS = null;
+      if (stressCost) {
+        cstS = new Float64Array(nL);
+        for (k = 0; k < nL; k++) {
+          cstS[k] = 1 - (levels[k] - 1) * financeRate(levels[k], p, true) * dt - ter;
+        }
+      }
 
       var zs = new Float64Array(nSteps);
       var rArr = new Float64Array(nSteps);   // underlying returns of one path
@@ -392,6 +653,14 @@
       var jIdx = [], jG = [];
       var jMean = jp.lam * p.T;
 
+      // The regime path is drawn per pair as well and shared by both members:
+      // an antithetic pair mirrors the shocks, not the state of the world. It
+      // is drawn *last* in the block, and only when the regime is on, so that
+      // switching the regime off leaves the random stream in exactly the state
+      // it was in before this feature existed. The reference numbers in the
+      // notes and the equality tests depend on that.
+      var state = rp.on ? new Uint8Array(nSteps) : null;
+
       while (path < nPaths) {
         for (t = 0; t < nSteps; t++) zs[t] = draw();
         var muZ = p.tau > 0 ? rng.gauss() : 0;
@@ -401,6 +670,15 @@
           for (var j = 0; j < nJ; j++) {
             jIdx[j] = Math.min(nSteps - 1, Math.floor(rng.uniform() * nSteps));
             jG[j] = rng.gauss();
+          }
+        }
+        if (rp.on) {
+          // Start in the stationary distribution, so the horizon does not begin
+          // with a burn-in phase that quietly biases the first months calm.
+          var st = rng.uniform() < rp.pHi ? 1 : 0;
+          for (t = 0; t < nSteps; t++) {
+            state[t] = st;
+            st = st ? (rng.uniform() < rp.b ? 0 : 1) : (rng.uniform() < rp.a ? 1 : 0);
           }
         }
 
@@ -415,27 +693,92 @@
           // numbers), so its path is built once and then replayed per level.
           // Keeping wealth in a local rather than an array is what makes the
           // hot loop cheap; a dead path leaves it immediately.
-          for (t = 0; t < nSteps; t++) rArr[t] = Math.exp(mudt + sigSqrtDt * sgn * zs[t]) - 1;
+          // Where the skew is applied decides whether it does anything at all.
+          // zs[t] is drawn once per antithetic pair and the second member sees
+          // -zs[t], so a skew imposed at the draw would give one member a left
+          // skewed market and, through the mirror, the other a right skewed one.
+          // Pooled over all paths the asymmetry would cancel exactly and the
+          // feature would look like it works while changing nothing. So zs stays
+          // the symmetric draw and the skew is applied after the mirroring, to
+          // sgn * zs[t]. The Merton branch below already follows the same rule:
+          // it mirrors jsd*jG but not jmu.
+          //
+          // The four loops are the two regime cases times the two skew cases,
+          // written out rather than branched inside the loop. The cost of the
+          // skew itself is one comparison and two multiplications per step and
+          // side, which is nSteps and not nSteps*nLevels, so it never reaches
+          // the expensive loop below. What must not happen is that switching the
+          // field off changes an expression here: with skew zero the two
+          // original lines run verbatim, and the reference numbers in the notes
+          // and the bit-for-bit tests depend on that.
+          if (rp.on) {
+            // Same construction, except that volatility and its half-variance
+            // correction come from the state of the day.
+            var mdt = (p.mu + sgn * p.tau * muZ) * dt - jumpDrift;
+            if (skew !== 0) {
+              for (t = 0; t < nSteps; t++) {
+                var sq = state[t];
+                rArr[t] = Math.exp(mdt - hv[sq] + ssdt[sq] * skewApply(sgn * zs[t], skew, m1)) - 1;
+              }
+            } else {
+              for (t = 0; t < nSteps; t++) {
+                var s = state[t];
+                rArr[t] = Math.exp(mdt - hv[s] + ssdt[s] * sgn * zs[t]) - 1;
+              }
+            }
+          } else if (skew !== 0) {
+            for (t = 0; t < nSteps; t++) {
+              rArr[t] = Math.exp(mudt + sigSqrtDt * skewApply(sgn * zs[t], skew, m1)) - 1;
+            }
+          } else {
+            for (t = 0; t < nSteps; t++) rArr[t] = Math.exp(mudt + sigSqrtDt * sgn * zs[t]) - 1;
+          }
           // Shocks multiply the day they land on; two on one day compound.
           for (var jj = 0; jj < nJ; jj++) {
             var ji = jIdx[jj];
             rArr[ji] = (1 + rArr[ji]) * Math.exp(jp.jmu + sgn * jp.jsd * jG[jj]) - 1;
           }
 
+          // Two versions of the level loop, chosen once per level rather than
+          // per step. Only a stress surcharge makes the per-day constant depend
+          // on the state; a regime without one leaves `cst[k]` constant and is
+          // fully handled by the return construction above. The duplication is
+          // deliberate: hoisting that constant out of the step loop is what took
+          // a run from 5.1 to 1.9 seconds, and a branch inside the loop would
+          // hand that back for a feature that is off by default.
           for (k = 0; k < nL; k++) {
-            var L = levels[k], c = cst[k], w = 1;
-            if (keep) {
-              var base = (k * nSample + path) * nPts;
-              sample[base] = 1;
-              for (t = 0; t < nSteps; t++) {
-                w = w * (c + L * rArr[t]);
-                if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
-                if (recIdx[t] >= 0) sample[base + recIdx[t]] = w;
+            var L = levels[k], w = 1;
+            if (stressCost) {
+              var cc = cst[k], cs = cstS[k];
+              if (keep) {
+                var baseS = (k * nSample + path) * nPts;
+                sample[baseS] = 1;
+                for (t = 0; t < nSteps; t++) {
+                  w = w * ((state[t] ? cs : cc) + L * rArr[t]);
+                  if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
+                  if (recIdx[t] >= 0) sample[baseS + recIdx[t]] = w;
+                }
+              } else {
+                for (t = 0; t < nSteps; t++) {
+                  w = w * ((state[t] ? cs : cc) + L * rArr[t]);
+                  if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
+                }
               }
             } else {
-              for (t = 0; t < nSteps; t++) {
-                w = w * (c + L * rArr[t]);
-                if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
+              var c = cst[k];
+              if (keep) {
+                var base = (k * nSample + path) * nPts;
+                sample[base] = 1;
+                for (t = 0; t < nSteps; t++) {
+                  w = w * (c + L * rArr[t]);
+                  if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
+                  if (recIdx[t] >= 0) sample[base + recIdx[t]] = w;
+                }
+              } else {
+                for (t = 0; t < nSteps; t++) {
+                  w = w * (c + L * rArr[t]);
+                  if (w <= wipe) { w = 0; ruinYears[k][ruin[k]++] = (t + 1) / DAYS; break; }
+                }
               }
             }
             terminal[k][path] = w;
@@ -449,7 +792,11 @@
         levels: levels, nPaths: nPaths, nSteps: nSteps, T: p.T,
         terminal: terminal, ruin: ruin, ruinYears: ruinYears,
         sample: sample, nSample: nSample, nPts: nPts, times: new Float32Array(times),
-        jump: jp
+        // The barrier travels with the result because whoever averages logs of
+        // terminal wealth later needs a floor, and the threshold that killed the
+        // paths is the only defensible one. See empiricalOptimum.
+        wipe: wipe,
+        jump: jp, regime: rp
       };
     }
 
@@ -497,6 +844,162 @@
           medianGrowth: med > 0 ? Math.log(med) / res.T : -Infinity
         };
       });
+    }
+
+    /* ---------- the measured optimum ----------
+
+       kelly() is a formula in mu and sigma and nothing else. It never learns
+       which distribution the innovations came from, so it returns the same
+       number to the last bit under a normal, under a t with four degrees of
+       freedom and under the Merton mode; only the ruin rate underneath it
+       moves. That is a fair description of the textbook and a poor description
+       of the market, and the gap is the point of this whole tool. So next to
+       the analytic marker there is a second one that is read off the paths:
+       whichever leverage the simulated median actually liked best. It sees the
+       tails, the skew and the regime, because it never assumed them away.      */
+
+    /* Vertex of the parabola through three points.
+
+       Deliberately not the schoolbook x0 + h/2 * (y0 - y2) / (y0 - 2*y1 + y2):
+       that one assumes the three abscissae are equally spaced, and nothing here
+       guarantees that. The tests run on [0, 0.5, 1, 1.5, 2, 3, 4, 5] and the UI
+       on a uniform 0.25 raster, and on the former the schoolbook formula does
+       not fail loudly, it quietly returns a vertex that is off. Newton's divided
+       differences cost one division more and hold for any spacing.
+
+       Returns null when there is nothing to refine, and the caller then keeps
+       the grid point rather than inventing precision it does not have.         */
+    function vertex3(x0, y0, x1, y1, x2, y2) {
+      if (!isFinite(y0) || !isFinite(y1) || !isFinite(y2)) return null;
+      var d1 = (y1 - y0) / (x1 - x0);
+      var d2 = (y2 - y1) / (x2 - x1);
+      var a = (d2 - d1) / (x2 - x0);
+      // A parabola that opens upwards, or one so flat that the curvature is
+      // numerical noise, locates no maximum at all.
+      if (!(a < 0)) return null;
+      var xv = 0.5 * (x0 + x1) - d1 / (2 * a);
+      if (!isFinite(xv)) return null;
+      // The fit is local and so is the answer: never further than the two
+      // neighbouring grid points, whatever the arithmetic says.
+      if (xv < x0) xv = x0;
+      if (xv > x2) xv = x2;
+      return xv;
+    }
+
+    /* Median of arr[from..to), computed on its own copy. */
+    function medianOf(arr, from, to) {
+      var m = to - from;
+      if (m <= 0) return NaN;
+      var buf = new Float64Array(m);
+      for (var i = 0; i < m; i++) buf[i] = arr[from + i];
+      buf.sort();
+      return quantile(buf, 0.5);
+    }
+
+    /* The optimum as the paths report it.
+
+       Returns { L, Lgrid, lo, hi, Llog, LlogGrid }: the refined and the raw
+       median optimum, a noise band around it, and the same pair for the mean of
+       the floored log terminal wealth.
+
+       On the floor, honestly: ruined paths are exact zeros, so E[log W] is minus
+       infinity the moment a single path dies, and any finite answer is the
+       answer to a question with a floor in it. The wipe-out threshold is the
+       only floor with a story behind it, so that is the default, and `floor`
+       overrides it. Llog therefore depends on a choice the user made for another
+       reason, which is precisely why the median is the headline of this tool and
+       Llog is the number printed next to it.
+
+       If nothing survives anywhere, every field is null. A market in which the
+       typical path is dead at every leverage has no optimal leverage, and
+       reporting the least bad grid point would dress that up as advice.         */
+    function empiricalOptimum(res, summ, floor) {
+      var n = summ.length, i, k;
+      var none = { L: null, Lgrid: null, lo: null, hi: null, Llog: null, LlogGrid: null };
+      if (!n) return none;
+
+      // The abscissae come from the summary where it carries them, because a
+      // caller may hand in medians of its own; res.levels is the fallback.
+      var xs = [];
+      for (i = 0; i < n; i++) {
+        xs.push(summ[i] && typeof summ[i].L === 'number' ? summ[i].L : res.levels[i]);
+      }
+
+      var best = -1;
+      for (i = 0; i < n; i++) {
+        if (!(summ[i].median > 0)) continue;
+        if (best < 0 || summ[i].median > summ[best].median) best = i;
+      }
+      if (best < 0) return none;
+      var Lgrid = xs[best], L = Lgrid;
+
+      // Refine on the log median, since that is the quantity that is parabolic
+      // in L, not the median itself. On the rim of the grid there is no third
+      // point, and a zero median next door would make the log infinite; in both
+      // cases the grid point stands unrefined.
+      if (best > 0 && best < n - 1
+          && summ[best - 1].median > 0 && summ[best + 1].median > 0) {
+        var v = vertex3(xs[best - 1], Math.log(summ[best - 1].median),
+                        xs[best], Math.log(summ[best].median),
+                        xs[best + 1], Math.log(summ[best + 1].median));
+        if (v !== null) L = v;
+      }
+
+      var haveTerminal = res.terminal && res.terminal.length === n;
+
+      // Mean of the floored log, per level. Same refinement, so that L and Llog
+      // are two numbers of the same kind rather than a refined one against a
+      // raw grid value.
+      var Llog = null, LlogGrid = null;
+      if (haveTerminal) {
+        var fl = (floor === undefined || floor === null) ? (res.wipe || 0) : floor;
+        fl = Math.max(fl, 1e-6);
+        var lm = [], lbest = -1;
+        for (k = 0; k < n; k++) {
+          var arr = res.terminal[k], sum = 0;
+          for (i = 0; i < arr.length; i++) sum += Math.log(Math.max(arr[i], fl));
+          lm.push(arr.length ? sum / arr.length : -Infinity);
+          if (lbest < 0 || lm[k] > lm[lbest]) lbest = k;
+        }
+        if (isFinite(lm[lbest])) {
+          LlogGrid = xs[lbest];
+          Llog = LlogGrid;
+          if (lbest > 0 && lbest < n - 1) {
+            var vl = vertex3(xs[lbest - 1], lm[lbest - 1], xs[lbest], lm[lbest],
+                             xs[lbest + 1], lm[lbest + 1]);
+            if (vl !== null) Llog = vl;
+          }
+        }
+      }
+
+      // How much of Lgrid is signal. The paths are cut into eight blocks and
+      // each block picks its own winner; the spread of those winners is the
+      // honest error bar of a Monte Carlo estimate, and it is reported as grid
+      // values because a block of an eighth of the paths does not deserve a
+      // refinement. The boundaries must fall on even indices: paths come in
+      // antithetic pairs, and a block that starts mid-pair carries one half of
+      // a mirrored market without the other, which biases the very noise the
+      // band is meant to measure. The remainder goes to the last block.
+      var lo = Lgrid, hi = Lgrid;
+      var nP = haveTerminal && res.terminal[0] ? res.terminal[0].length : 0;
+      var bs = Math.floor(nP / 8);
+      bs -= bs % 2;
+      if (nP >= 16 && bs >= 2) {
+        for (var b = 0; b < 8; b++) {
+          var from = b * bs, to = b === 7 ? nP : from + bs;
+          var bb = -1, bv = 0;
+          for (k = 0; k < n; k++) {
+            var med = medianOf(res.terminal[k], from, to);
+            if (!(med > 0)) continue;
+            if (bb < 0 || med > bv) { bb = k; bv = med; }
+          }
+          if (bb < 0) continue;
+          if (xs[bb] < lo) lo = xs[bb];
+          if (xs[bb] > hi) hi = xs[bb];
+        }
+      }
+
+      return { L: L, Lgrid: Lgrid, lo: lo, hi: hi, Llog: Llog, LlogGrid: LlogGrid };
     }
 
     /* Histogram of log10(terminal wealth) over the surviving paths, plus the
@@ -566,10 +1069,14 @@
     return {
       DAYS: DAYS, N_SAMPLE: N_SAMPLE,
       makeRng: makeRng, tDeviate: tDeviate, innovation: innovation,
-      jumpParams: jumpParams, poisson: poisson,
-      financeRate: financeRate, driftRate: driftRate, growthRate: growthRate,
+      lgamma: lgamma, skewMoment: skewMoment, skewApply: skewApply,
+      skewDeviate: skewDeviate,
+      jumpParams: jumpParams, regimeParams: regimeParams, poisson: poisson,
+      financeRate: financeRate, expectedFinanceRate: expectedFinanceRate,
+      driftRate: driftRate, growthRate: growthRate,
       analyticMean: analyticMean, analyticMedian: analyticMedian,
-      kelly: kelly, breakEven: breakEven,
+      kelly: kelly, kellyRobust: kellyRobust, breakEven: breakEven,
+      empiricalOptimum: empiricalOptimum,
       simulate: simulate, quantile: quantile, summarize: summarize,
       histogram: histogram, fanBands: fanBands, samplePath: samplePath,
       workerMain: workerMain
@@ -625,8 +1132,18 @@
         text: cssVar('--tool-text'), label: cssVar('--tool-label'),
         foot: cssVar('--tool-note'), faint: cssVar('--tool-faint'),
         grid: cssVar('--tool-hairline'), axis: cssVar('--tool-border'),
-        mean: '#f59e0b', median: cssVar('--tool-sig-info'), band: cssVar('--tool-sig-info'),
-        ruin: '#ef4444', kelly: '#a78bfa', thin: cssVar('--tool-note'), alive: cssVar('--tool-faint')
+        mean: cssVar('--lr-mean'), median: cssVar('--tool-sig-info'), band: cssVar('--tool-sig-info'),
+        ruin: cssVar('--lr-ruin'), kelly: cssVar('--lr-kelly'),
+        thin: cssVar('--tool-note'), alive: cssVar('--tool-faint'),
+        // Inline warnings: attention (stale results, the average-line caveat)
+        // and alarm (the jump variance has swallowed the whole of sigma). Both
+        // from the central signal ladder, which the grey skin already renders
+        // as greyscale, so they cost that skin no extra hue.
+        warn: cssVar('--tool-sig-warn'), bad: cssVar('--tool-sig-bad'),
+        // The measured optimum, next to the analytic Kelly marker. All four
+        // series colours live in --lr-* in this page's own style block, so the
+        // grey skin can flatten them to greyscale; see the comment there.
+        emp: cssVar('--lr-emp')
       });
     }
     readPalette();
@@ -640,19 +1157,40 @@
     // financing currency comes along with the market: a leveraged ETF on a USD
     // index borrows at the USD overnight rate even when you buy it in euros.
     // Figures as of late July 2026, see the sources at the bottom of the page.
+    // The regime shape travels with the preset, the regime *switch* does not:
+    // whether the two-state market is on at all is a modelling choice the reader
+    // makes, and a preset button that silently turned it on would change the
+    // picture for a reason the button does not advertise.
+    // No label carries a multiplier, even though the cost figures are taken from
+    // real 2x products: a preset sets the market and the product costs, and the
+    // whole page then sweeps every leverage from 0 to 5. A button saying "2x"
+    // would name the one number the reader is here to choose.
     const PRESETS = [
-      { id: 'world', label: 'MSCI World 2x', mu: 9, sigma: 15, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10 },
-      { id: 'sp500', label: 'S&P 500', mu: 9, sigma: 16, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10 },
-      { id: 'ndx', label: 'Nasdaq-100', mu: 11, sigma: 24, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -6, jsd: 12 },
-      { id: 'estoxx', label: 'Euro Stoxx 50', mu: 8, sigma: 20, rf: 2.1, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10 },
-      { id: 'btc', label: 'Bitcoin', mu: 25, sigma: 50, rf: 3.6, spread: 3.0, ter: 2.0, lam: 2, jmu: -8, jsd: 15 }
+      { id: 'world', label: 'MSCI World', mu: 9, sigma: 15, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10, smult: 2.5, sshare: 25, sdur: 4 },
+      { id: 'sp500', label: 'S&P 500', mu: 9, sigma: 16, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10, smult: 2.5, sshare: 25, sdur: 4 },
+      { id: 'ndx', label: 'Nasdaq-100', mu: 11, sigma: 24, rf: 3.6, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -6, jsd: 12, smult: 2.5, sshare: 25, sdur: 4 },
+      { id: 'estoxx', label: 'Euro Stoxx 50', mu: 8, sigma: 20, rf: 2.1, spread: 0.7, ter: 0.6, lam: 0.6, jmu: -5, jsd: 10, smult: 2.5, sshare: 25, sdur: 4 },
+      { id: 'btc', label: 'Bitcoin', mu: 25, sigma: 50, rf: 3.6, spread: 3.0, ter: 2.0, lam: 2, jmu: -8, jsd: 15, smult: 3, sshare: 35, sdur: 6 }
     ];
-    const PRESET_KEYS = ['mu', 'sigma', 'rf', 'spread', 'ter', 'lam', 'jmu', 'jsd'];
+    const PRESET_KEYS = ['mu', 'sigma', 'rf', 'spread', 'ter', 'lam', 'jmu', 'jsd', 'smult', 'sshare', 'sdur'];
 
     const DEFAULTS = {
       mu: 9, sigma: 15, rf: 3.6, spread: 0.7, ter: 0.6, T: 20,
       nPaths: 10000, tau: 3, wipe: 1, dist: 't', nu: 4, seed: 12345,
-      lam: 0.6, jmu: -5, jsd: 10
+      lam: 0.6, jmu: -5, jsd: 10,
+      // The skew is a shape parameter in [0, 1), not a percentage, so it goes
+      // through to the core unscaled. It ships at 0.15 rather than 0 for the
+      // same reason the distribution ships at t(4) rather than normal: the
+      // default is meant to be the realistic model, not the innocent one. Under
+      // normal innovations 0.15 measures out at a daily skewness of -0.35, and
+      // the S&P 500 since 1990 sits at -0.36 in logs. Leaving it at zero would
+      // have given the distribution as much upside as downside, and since the
+      // arithmetic mean feeds on the upside while ruin feeds on the downside,
+      // that is exactly the assumption that flatters leverage.
+      skew: 0.15,
+      // Volatility regime and stress surcharge, off by default: with `regime`
+      // false the core ignores all four and computes exactly what it always did.
+      regime: false, smult: 2.5, sshare: 25, sdur: 4, sspread: 0
     };
 
     /* Help texts. Every number in here is sourced and dated, because a default
@@ -767,6 +1305,132 @@
         the right; narrow it and the mode collapses into slightly lumpier volatility. The honest caveat:
         this is the least identified of the three numbers, and every estimate of it is an extrapolation
         from a handful of historical events.<//>`,
+      smult: html`<${React.Fragment}>How much more volatile a stress day is than a calm one. The σ you set above stays the
+        total: the model splits it into a calm level and a stress level so that long-run volatility is
+        unchanged, so switching the regime on redistributes risk over time rather than adding any.
+        <b> Where the default comes from:</b> a two-state Gaussian hidden Markov model fitted to daily
+        S&P 500 log returns puts the calm state at about <b>10.8%</b> annualized and the stress state at
+        about <b>28.8%</b> over January 1990 to August 2026, a ratio of 2.7, and the same fit back to 1980
+        gives the same 2.7 at slightly higher levels. Realized volatility in the memorable windows is a
+        good deal higher: 48.9% p.a. from September 2008 to June 2009 and 53.5% from 20 February to
+        30 June 2020, against 10.5% in 2004 to 2006 and 12.9% in 2013 to 2019. The default of 2.5 is the
+        fitted ratio rounded down, because the fitted stress state averages the deep crises together with
+        the merely nervous months, and 2022 at 24.1% was a stress year too.
+        <b> This is realized volatility, not the VIX.</b> Implied volatility carries a risk premium and
+        overshoots in a panic, so a VIX going from 13 to 80 is not a multiplier of six.
+        <b> Measure it yourself:</b> 21-day realized volatility from daily index closes, then compare the
+        top decile with the median.<//>`,
+      sshare: html`<${React.Fragment}>The share of all trading days the market spends in the stress state in the long run.
+        Together with the mean duration below it fixes how often stress arrives, because mean calm length
+        = duration times (1 minus share) divided by share; at 25% and 4 months that is one year of quiet
+        between phases. <b>Where the default comes from:</b> the VIX closed above 25 on <b>17.3%</b> of the
+        9,247 trading days from 2 January 1990 to 7 August 2026 (FRED series VIXCLS). A pointwise count
+        understates a persistent state though, because a regime does not end on the first quiet day. Count
+        instead the time inside episodes that start when the VIX crosses 25 and end when it falls back
+        below 20 and you get <b>28.1%</b>; the hidden Markov fit puts the stationary stress probability at
+        28.7% since 1990 and 22.8% since 1980. The default of 25% sits in the middle of those three. It
+        will feel too high, and that is worth sitting with: a quarter of all trading days being elevated is
+        what a market looks like when volatility clusters, not a claim that a quarter of the calendar was a
+        crisis.<//>`,
+      sdur: html`<${React.Fragment}>The average length of a stress phase in months. The regime is a Markov chain, so lengths
+        are geometric and this is only the mean: the model produces plenty of phases twice this long on its
+        own, and you do not need to set the default to the length of the worst case in order to see one.
+        <b> Where the default comes from:</b> the 50 VIX episodes since 1990 (in above 25, out below 20)
+        have a mean length of <b>2.5 months</b> and a median of 1.0. But the average stress day sits in a
+        much longer episode than the average episode is: weighted by length the mean is <b>7.3 months</b>,
+        and 51% of all stress days fall in episodes of six months or more. The big ones, with dates:
+        9 September 2008 to 22 December 2009 (15.5 months), 24 February 2020 to 12 February 2021 (11.7),
+        13 June 2002 to 9 May 2003 (10.9), 29 July 2011 to 19 January 2012 (5.7). No exponential matches
+        both the plain mean and the length-weighted one, so the default of 4 months is a compromise between
+        them rather than a measurement.
+        <b> This is the slider that moves the result.</b> At μ 20%, σ 30%, wipe-out 10%, 20 years and
+        40,000 paths, stable across three seeds, the ruin rate at the optimal leverage goes from
+        <b>4.5%</b> with the regime off to <b>6.2%</b> at four months and <b>10.0%</b> at eighteen, with the
+        unconditional volatility unchanged throughout. What binds is not the amplitude, it is the
+        persistence. If you want to know what a stretch like 2008/09 does to a position that is levered
+        afresh every morning, turn this one up, not the one next to it.<//>`,
+      sspread: html`<${React.Fragment}>Extra financing spread charged on the borrowed part while the regime is in stress, on top
+        of the spread above. It exists because funding gets expensive at exactly the wrong moment.
+        <b> How big is the effect:</b> the TED spread, the classic gauge of bank funding stress, had a
+        median of 0.42 points from 1986 to 2022 and peaked at <b>4.58 points on 10 October 2008</b>; in the
+        Covid dislocation it reached 1.42 points on 26 March 2020 (FRED series TEDRATE, own calculation).
+        The 3-month LIBOR-OIS spread peaked in the same days, against 7 to 9 basis points before the crisis
+        (San Francisco Fed, 2009). <b>Those are interbank credit spreads, not your product's financing.</b>
+        What a swap counterparty actually charged a leveraged ETF during a crisis is not published
+        anywhere. So the default here is 0, off, and this slider is a what-if rather than a calibrated
+        parameter. If you want to see the mechanism, 0.5 to 1.5 points is the order of magnitude the
+        funding-stress series suggest, and it is an assumption you are making, not a number anyone
+        measured. Expect it to move the picture less than you think: it only applies on stress days, so at
+        a 25% stress share a full point of surcharge raises the average financing cost by a quarter of a
+        point.<//>`,
+      skew: html`<${React.Fragment}>How much the daily returns lean left. At 0 the innovations are symmetric; raising it moves
+        probability from the upper tail into the lower one while holding σ and the mean fixed, so the bad
+        tail gets longer and the good tail pays for it. <b>Why it matters here:</b> a symmetric t(4) gives
+        the distribution exactly as much upside as downside, and since the arithmetic mean feeds on the
+        upside while ruin lives on the downside, symmetric fat tails quietly flatter leverage. Real equity
+        returns are not symmetric.
+        <b> The slider is not the skewness.</b> It is the strength of the transformation, and what comes
+        out depends on the distribution it acts on. Measured on the shipped code under normal innovations,
+        where the mapping is close to linear: 0.15 gives a sample skewness of <b>-0.35</b>, 0.2 gives -0.47
+        and 0.4 gives -0.89. So <b>0.15</b> is the setting that reproduces the daily log skewness measured
+        since 1990, and that is where this ships, for the same reason the distribution ships at t(4) rather
+        than normal: a default should be the realistic model and not the innocent one.
+        <b>Under t(4) there is no comparable number</b>, and that is not an oversight: t(4) has
+        no fourth moment, so the sample skewness estimator has infinite variance and answers differently
+        every time you ask, to the point where symmetric t(4) draws will report a skewness of -0.5 all by
+        themselves. Calibrate the dial under normal innovations, then switch the tail shape back. <b>Where to aim it:</b> sample skewness of daily S&P 500 returns from 1990 to August 2026 is
+        <b>-0.15</b> for simple returns and -0.36 in logs; include 1987 by going back to 1980 and it is
+        -0.66 and -1.05, which tells you how much of this number one day owns, and which is the epoch a
+        setting near 0.4 belongs to. Skewness also grows with the horizon: non-overlapping 21-day log
+        returns since 1990 come out at -1.65, because bad days arrive together rather than spread out. Part
+        of that clustering is already the volatility regime above, so if you have that switched on, do not
+        spend it twice here.<//>`,
+      lstar: html`<${React.Fragment}>The leverage at which the simulated paths actually grew fastest, read off the median
+        terminal wealth curve instead of computed from a formula. <b>Why it sits next to the Kelly
+        marker:</b> Kelly here is a closed form, (μ minus r minus spread) divided by σ², and those four
+        numbers are its entire input. The distribution of the daily shocks does not enter it at all. Switch
+        between normal, Student t(4) and Merton jumps and the Kelly marker does not move by a single bit,
+        while the ruin probability underneath it can go from a rounding error to double digits. The same
+        goes for the skew and for the regime: they change every path in the simulation and leave the
+        formula untouched. This marker is measured on those paths, so it sees the tails, the asymmetry, the
+        regime and the wipe-out barrier.
+        <b> What it does not do is drop when the market clusters.</b> Measured over three seeds at 40,000
+        paths, μ 20%, σ 30%, wipe-out 10%, 20 years: with the regime off the median optimum is
+        <b>1.709</b> and the log-utility one 1.627; at four months of stress they are <b>1.708</b> and
+        1.587; at eighteen months <b>1.771</b> and 1.574. Kelly says 1.744 in all three. Meanwhile the ruin
+        probability at that leverage goes 4.5%, 6.2%, 10.0%. Volatility clustering barely moves the
+        median-optimal leverage and roughly doubles the chance of dying at it. The median is largely blind
+        to how many paths die on the way, as long as fewer than half of them do; the log-utility number
+        beside it is not, and it falls. So the lesson is not that the formula overstates the optimal
+        leverage. It is that two markets can share an optimal leverage and differ by a factor of two in the
+        probability of losing everything at it. An optimal leverage without the ruin rate next to it is
+        half a number.
+        <b> The usual caveats:</b> this value is noisy, it moves with the seed and the path count, it is
+        only as fine as the leverage grid, and it maximizes the median, which is a choice and not a law.<//>`,
+      krobust: html`<${React.Fragment}>Kelly evaluated at μ minus τ rather than at μ, that is, at the pessimistic edge of what you
+        admit you do not know about the expected return. <b>This is not what τ does in the simulation.</b>
+        There, each path draws its own μ from a normal distribution centred on your estimate. Expected log
+        growth is linear in μ, so a symmetric error cancels in the mean: τ widens the outcome distribution,
+        drastically so over long horizons, and leaves the growth-optimal leverage exactly where it was.
+        Uncertainty by itself does not lower the optimum. What lowers it is a different objective, one that
+        declines to be paid for being uncertain: pick the leverage that is best if μ turns out to be one
+        standard deviation below your estimate.
+        <b> At the defaults that gives exactly 1.00x</b>, against a Kelly of 2.09, and the reason is the
+        kink rather than a coincidence. Below 1x uninvested cash earns the risk-free rate, above it the
+        borrowed part costs the rate plus the spread, so there are two parabolas. At μ minus τ the vertex
+        of the lower branch lies above 1 (1.067) and the vertex of the upper branch below it (0.756), so
+        neither vertex sits on its own branch and the maximum lands on the kink. The robust answer at the
+        defaults is therefore: fully invested, no borrowing. The whole series, everything else left alone:
+        τ = 0 gives 2.09, 1% gives 1.64, 2% gives 1.20, 3% gives 1.00, 4% gives 0.62, 6% gives 0.00.
+        Choosing between this marker and the one next to it is a question of which question you are asking,
+        not of which one is correct.<//>`,
+      kelly: html`<${React.Fragment}>The leverage with the highest long-run geometric growth in the closed-form model:
+        (μ − r − spread) / σ², with a kink at 1× because uninvested cash earns r while borrowing costs
+        r plus the spread. Only μ, σ and the costs enter it. The shape of the daily returns does not,
+        which is what the measured L* next to it is for.<//>`,
+      bev: html`<${React.Fragment}>The largest leverage at which the typical path still grows in the long run. Beyond it
+        the median outcome shrinks ever more surely with time, even though the average of all paths
+        keeps rising.<//>`,
       seed: html`<${React.Fragment}>The starting value of the random number generator. The same seed with the same
         parameters reproduces exactly the same result, which is what makes two settings comparable
         at all. Change it to check whether an effect you are looking at is real or a feature of one
@@ -778,7 +1442,11 @@
       mu: u.mu / 100, sigma: u.sigma / 100, rf: u.rf / 100, spread: u.spread / 100,
       ter: u.ter / 100, T: u.T, nPaths: u.nPaths, tau: u.tau / 100, wipe: u.wipe / 100,
       dist: u.dist, nu: u.nu, seed: u.seed, levels: LEVELS,
-      lam: u.lam, jmu: u.jmu / 100, jsd: u.jsd / 100
+      lam: u.lam, jmu: u.jmu / 100, jsd: u.jsd / 100,
+      skew: u.skew,
+      // smult is a factor and sdur is in months, so neither is a percentage.
+      regime: u.regime, smult: u.smult, sdur: u.sdur,
+      sshare: u.sshare / 100, sspread: u.sspread / 100
     });
 
     const isPreset = (u, pr) => PRESET_KEYS.every(k => u[k] === pr[k]);
@@ -894,7 +1562,7 @@
      * Main chart: terminal wealth against leverage, log y, plus the
      * wipe-out probability as a strip sharing the x axis.
      * ------------------------------------------------------------------ */
-    function MainChart({ stats, p, T, hover, setHover, showAnalytic }) {
+    function MainChart({ stats, p, T, hover, setHover, showAnalytic, emp }) {
       const W = 780, H = 520;
       const M = { l: 66, r: 116, t: 16 };
       const plotTop = M.t, plotBot = 352, stripTop = 400, stripBot = 466;
@@ -936,6 +1604,13 @@
         }).join(' L ') + ' Z');
 
       const kOpt = LEV.kelly(p);
+      // The measured optimum and its noise band, drawn only when the run found
+      // one. At the defaults it lands within 0.005 of the Kelly marker, so the
+      // two labels are merged whenever they would collide rather than printed on
+      // top of each other.
+      const eOpt = emp && typeof emp.L === 'number' && emp.L >= 0 && emp.L <= LMAX ? emp.L : null;
+      const kShown = isFinite(kOpt) && kOpt <= LMAX;
+      const together = kShown && eOpt !== null && Math.abs(X(kOpt) - X(eOpt)) < 92;
 
       function onMove(e) {
         const rect = e.currentTarget.getBoundingClientRect();
@@ -965,12 +1640,34 @@
               <line key=${'gx' + L} x1=${X(L)} x2=${X(L)} y1=${plotTop} y2=${plotBot} stroke=${COL.grid} strokeWidth="1" />
             `)}
 
-            <!-- break-even and Kelly markers -->
-            ${isFinite(kOpt) && kOpt <= LMAX && html`
+            <!-- noise band of the measured optimum, behind both markers -->
+            ${eOpt !== null && typeof emp.lo === 'number' && emp.hi > emp.lo && html`
+              <rect x=${X(Math.max(0, emp.lo))} width=${X(Math.min(LMAX, emp.hi)) - X(Math.max(0, emp.lo))}
+                y=${plotTop} height=${stripBot - plotTop} fill=${COL.emp} opacity="0.10" />
+            `}
+
+            <!-- Kelly marker (dashed, from the formula) -->
+            ${kShown && html`
               <g>
                 <line x1=${X(kOpt)} x2=${X(kOpt)} y1=${plotTop} y2=${stripBot} stroke=${COL.kelly} strokeWidth="1.2" strokeDasharray="5 4" opacity="0.8" />
-                <text x=${X(kOpt) + 5} y=${plotTop + 12} fontSize="11" fill=${COL.kelly}>Kelly ${fmtL(kOpt)}×</text>
+                ${!together && html`<text x=${X(kOpt) + 5} y=${plotTop + 12} fontSize="11" fill=${COL.kelly}>Kelly ${fmtL(kOpt)}×</text>`}
               </g>
+            `}
+
+            <!-- measured optimum (solid, read off the simulated paths) -->
+            ${eOpt !== null && html`
+              <g>
+                <line x1=${X(eOpt)} x2=${X(eOpt)} y1=${plotTop} y2=${stripBot} stroke=${COL.emp} strokeWidth="1.6" opacity="0.9" />
+                ${!together && html`<text x=${X(eOpt) + 5} y=${plotTop + 26} fontSize="11" fill=${COL.emp}>L* ${fmtL(eOpt)}×</text>`}
+              </g>
+            `}
+
+            <!-- One label for both when they nearly coincide, which at the
+                 default market they do to within a hundredth of a turn. -->
+            ${together && html`
+              <text x=${Math.max(X(kOpt), X(eOpt)) + 6} y=${plotTop + 12} fontSize="11" fill=${COL.kelly}>
+                Kelly ${fmtL(kOpt)}×<tspan fill=${COL.foot}> · </tspan><tspan fill=${COL.emp}>L* ${fmtL(eOpt)}×</tspan>
+              </text>
             `}
 
             <!-- starting capital -->
@@ -1190,6 +1887,7 @@
       const set = (key) => (v) => setU(prev => ({ ...prev, [key]: v }));
       const p = useMemo(() => toCore(u), [u]);
       const jumpSplit = useMemo(() => LEV.jumpParams(p), [p]);
+      const regSplit = useMemo(() => LEV.regimeParams(p), [p]);
       const atDefaults = useMemo(() => Object.keys(DEFAULTS).every(k => u[k] === DEFAULTS[k]), [u]);
 
       const run = useCallback(() => {
@@ -1203,12 +1901,17 @@
       useEffect(() => () => LEVRun.cancel(), []);
 
       const stats = useMemo(() => res ? LEV.summarize(res) : null, [res]);
+      // The measured optimum comes from the same run as the summary, so it is
+      // computed here rather than inside the chart, which also lets the tile
+      // below print the same number the marker draws.
+      const emp = useMemo(() => (res && stats) ? LEV.empiricalOptimum(res, stats) : null, [res, stats]);
       const stale = !!ranWith && JSON.stringify({ ...ranWith, levels: 0 }) !== JSON.stringify({ ...p, levels: 0 });
       // The closed form reacts to the sliders instantly, so it is worth showing
       // exactly while the simulated curves are missing or out of date.
       const showAnalytic = !stats || stale;
 
       const kOpt = LEV.kelly(p);
+      const kRob = LEV.kellyRobust(p);
       const kZero = LEV.breakEven(p, LMAX * 2);
       const selStat = stats ? stats[sel] : null;
       const one = stats ? stats[4] : null;   // the unleveraged reference, L = 1
@@ -1232,33 +1935,39 @@
             This page simulates the full range of outcomes of a leveraged position over a long
             horizon, for a market and a product that you describe yourself.
           </p>
-          <p style=${{ color: COL.label, maxWidth: '70ch' }}>
-            The result worth knowing before deciding anything is that two perfectly ordinary summaries
-            of the same simulation point in opposite directions. More leverage raises the
-            <em> average</em> outcome across all possible futures, in the frictionless model without any
-            limit at all. It does not raise the outcome of the <em>typical</em> path: that one peaks at a
-            finite leverage, the Kelly
-            point, falls away after it, and eventually drops back below where you started. The reason
-            is a mismatch of exponents. Expected return enters growth in proportion to the leverage,
-            volatility enters it with the <em>square</em> of the leverage, so the second term wins
-            sooner or later. Both curves come out of the same run below, so you can see exactly where
-            they part company.
-          </p>
-          <p style=${{ color: COL.label, maxWidth: '70ch' }}>
-            Put as a slogan: expecting the market to rise is an argument for leverage above zero. It
-            is not an argument for leverage above one. Those are two different claims, and only the
-            first one follows from optimism. The second one depends on numbers, and the point of this
-            page is that those numbers give a finite answer.
-          </p>
-          <p className="lr-howto">
-            How to read this page: set the market and cost parameters to your own product, each one has
-            an "i" that explains where to find the number, then run the simulation. In the chart, follow
-            the median and the P10 line rather than the average. The average is not wrong, it is simply
-            carried by a small number of extreme futures that almost nobody experiences.
-          </p>
+
+          <details className="lr-help" style=${{ marginTop: 18 }}>
+            <summary>Before you start: why the average and the typical path disagree</summary>
+            <p style=${{ color: COL.label, maxWidth: '70ch', fontSize: 13.5, lineHeight: 1.75 }}>
+              Two perfectly ordinary summaries of the same simulation point in opposite directions. More
+              leverage raises the <em>average</em> outcome across all possible futures, in the frictionless
+              model without any limit at all. It does not raise the outcome of the <em>typical</em> path:
+              that one peaks at a finite leverage, the Kelly point, falls away after it, and eventually
+              drops back below where you started. The reason is a mismatch of exponents. Expected return
+              enters growth in proportion to the leverage, volatility enters it with the <em>square</em> of
+              the leverage, so the second term wins sooner or later. Both curves come out of the same run
+              below, so you can see exactly where they part company. Expecting the market to rise is
+              therefore an argument for leverage above zero, not yet for leverage above one; that second
+              claim depends on numbers, and this page computes them.
+            </p>
+            <p style=${{ color: COL.label, maxWidth: '70ch', fontSize: 13.5, lineHeight: 1.75 }}>
+              One number is not enough, though. Let volatility cluster into calm and stressed stretches,
+              at unchanged long-run volatility, and the leverage that grows the typical path fastest
+              barely moves, while the probability of being wiped out at exactly that leverage doubles.
+              An optimal leverage quoted without a ruin rate next to it is half a number, which is why
+              the wipe-out strip below shares its x axis with the wealth curves.
+            </p>
+            <p className="lr-howto">
+              How to read this page: set the market and cost parameters to your own product, each one has
+              an "i" that explains where to find the number, then run the simulation. In the chart, follow
+              the median and the P10 line rather than the average. The average is not wrong, it is simply
+              carried by a small number of extreme futures that almost nobody experiences.
+            </p>
+          </details>
 
           <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 26, marginBottom: 10 }}>Market and product</h2>
           <div className="lr-card">
+            <div className="lr-sec">
             <div className="seg-row" style=${{ marginBottom: 12 }}>
               ${PRESETS.map(pr => html`
                 <button key=${pr.id} type="button"
@@ -1280,18 +1989,15 @@
               <${Slider} label="uncertainty about μ" hint="τ" value=${u.tau} set=${set('tau')} min=${0} max=${8} step=${0.25} unit="%" help=${HELP.tau} />
               <${Slider} label="wipe-out threshold" hint="% of starting capital" value=${u.wipe} set=${set('wipe')} min=${0} max=${50} step=${1} unit="%" help=${HELP.wipe} />
             </div>
-            <div style=${{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'flex-end', marginTop: 10 }}>
-              <div>
-                <${FieldLabel} label="paths" id="paths" openId=${openId} setOpenId=${setOpenId} />
-                <div className="seg-row">
-                  ${[1000, 10000, 50000].map(n => html`
-                    <button key=${n} type="button" className=${'lang-seg' + (u.nPaths === n ? ' active' : '')}
-                      onClick=${() => set('nPaths')(n)}>${n.toLocaleString('en')}</button>
-                  `)}
+            </div>
+
+            <div className="lr-sec">
+              <div style=${{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                <div className="lr-anchor" style=${{ fontSize: 13, color: COL.label }}>
+                  Daily shocks
+                  <${InfoBtn} open=${openId === 'dist'} toggle=${() => setOpenId(openId === 'dist' ? null : 'dist')} label="daily shocks" />
+                  ${openId === 'dist' && html`<${Popover} close=${() => setOpenId(null)}>${HELP.dist}<//>`}
                 </div>
-              </div>
-              <div>
-                <${FieldLabel} label="innovations" id="dist" openId=${openId} setOpenId=${setOpenId} />
                 <div className="seg-row">
                   <button type="button" className=${'lang-seg' + (u.dist === 'gauss' ? ' active' : '')}
                     onClick=${() => set('dist')('gauss')}>normal</button>
@@ -1301,37 +2007,22 @@
                     onClick=${() => set('dist')('merton')}>Merton jumps</button>
                 </div>
               </div>
-              ${u.dist === 't' && html`
-                <div style=${{ minWidth: 170 }}>
-                  <${Slider} label="degrees of freedom" hint="ν" value=${u.nu} set=${set('nu')} min=${3} max=${30} step=${1} unit="" />
+              <!-- The skew rides on the symmetric innovation, so in Merton mode it
+                   would compete with the jumps for the same asymmetry; there the
+                   jump sliders take its place. -->
+              ${u.dist !== 'merton' && html`
+                <div className="lr-grid" style=${{ marginTop: 12 }}>
+                  ${u.dist === 't' && html`<${Slider} label="degrees of freedom" hint="ν" value=${u.nu} set=${set('nu')} min=${3} max=${30} step=${1} unit="" />`}
+                  <${Slider} label="left skew" hint="shape, not skewness" value=${u.skew} set=${set('skew')} min=${0} max=${0.6} step=${0.05} unit="" help=${HELP.skew} />
                 </div>
               `}
-              <div>
-                <${FieldLabel} label="seed" id="seed" openId=${openId} setOpenId=${setOpenId} />
-                <input type="number" value=${u.seed} onChange=${e => set('seed')(parseInt(e.target.value || '0', 10))}
-                  style=${{ width: 110, margin: 0, padding: '4px 10px', height: 'auto', fontSize: 14 }} />
-              </div>
-              <button type="button" onClick=${run} disabled=${busy} style=${{ margin: 0, width: 'auto' }}>
-                ${busy ? 'Simulating…' : 'Run simulation'}
-              </button>
-              <button type="button" className="secondary outline" onClick=${() => setU(DEFAULTS)}
-                disabled=${busy || atDefaults} style=${{ margin: 0, width: 'auto' }}>
-                Reset parameters
-              </button>
-            </div>
-            ${u.dist === 'merton' && html`
-              <div style=${{ marginTop: 14 }}>
-                <div style=${{ fontSize: 12.5, color: COL.label, marginBottom: 6 }}>
-                  Shock process. Total volatility stays at σ = ${u.sigma}%; the diffusion is reduced to
-                  make room for the jumps, so switching the mode on changes the <i>shape</i> of the risk,
-                  not its amount.
-                </div>
-                <div className="lr-grid">
+              ${u.dist === 'merton' && html`
+                <div className="lr-grid" style=${{ marginTop: 12 }}>
                   <${Slider} label="shocks per year" hint="λ" value=${u.lam} set=${set('lam')} min=${0} max=${4} step=${0.1} unit="" help=${HELP.lam} />
                   <${Slider} label="average shock" hint="log size" value=${u.jmu} set=${set('jmu')} min=${-25} max=${0} step=${0.5} unit="%" help=${HELP.jmu} />
                   <${Slider} label="shock spread" hint="sd of log size" value=${u.jsd} set=${set('jsd')} min=${0} max=${30} step=${0.5} unit="%" help=${HELP.jsd} />
                 </div>
-                <p style=${{ margin: '8px 0 0', fontSize: 11.5, color: jumpSplit.saturated ? '#e0796b' : COL.foot, lineHeight: 1.65 }}>
+                <p style=${{ margin: '8px 0 0', fontSize: 11.5, color: jumpSplit.saturated ? COL.bad : COL.foot, lineHeight: 1.65 }}>
                   ${jumpSplit.saturated
                     ? 'These shocks alone carry more variance than the σ you set. The diffusion is switched off and the realized volatility will come out above σ. Lower λ, the size or the spread, or raise σ.'
                     : html`<${React.Fragment}>Jumps carry ${pct(jumpSplit.share, 0)} of the total variance, the diffusion the
@@ -1339,26 +2030,79 @@
                       An average shock is a ${pct(fatal(u.jmu / 100).drop, 1)} day and kills any position
                       above ${fatal(u.jmu / 100).L}; one two spreads worse is a${' '}
                       ${pct(fatal((u.jmu - 2 * u.jsd) / 100).drop, 1)} day and kills everything above${' '}
-                      ${fatal((u.jmu - 2 * u.jsd) / 100).L}. That is the mechanism this mode adds: no
-                      sequence of bad years is needed, one morning is enough.<//>`}
+                      ${fatal((u.jmu - 2 * u.jsd) / 100).L}.<//>`}
                 </p>
+                <p style=${{ margin: '4px 0 0', fontSize: 11.5, color: COL.foot }}>
+                  No skew slider in this mode: the downward jumps already carry the asymmetry.
+                </p>
+              `}
+            </div>
+            <!-- Volatility regime: off by default, and the four sliders only
+                 appear once it is on, same shape as the shocks section above. -->
+            <div className="lr-sec">
+              <div style=${{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                <div style=${{ fontSize: 13, color: COL.label }}>Volatility regime</div>
+                <div className="seg-row">
+                  <button type="button" className=${'lang-seg' + (!u.regime ? ' active' : '')}
+                    onClick=${() => set('regime')(false)}>off</button>
+                  <button type="button" className=${'lang-seg' + (u.regime ? ' active' : '')}
+                    onClick=${() => set('regime')(true)}>two states</button>
+                </div>
               </div>
-            `}
-            <p style=${{ margin: '12px 0 0', fontSize: 11.5, color: COL.foot, lineHeight: 1.65 }}>
-              The defaults describe a swap-based 2x MSCI World ETF as of late July 2026: TER 0.60%,
-              financed in USD at SOFR 3.6% plus an estimated 0.7 points of swap spread. Rates move and
-              spreads are not published, so check the two cost sliders against your own product before
-              believing any number below. The "i" next to each parameter says where to look.
-            </p>
-            ${busy && html`<div className="lr-prog" style=${{ marginTop: 12 }}><i style=${{ width: (prog * 100).toFixed(1) + '%' }} /></div>`}
-            ${!busy && !ranWith && html`<p style=${{ margin: '12px 0 0', fontSize: 13, color: COL.median }}>
-              Nothing simulated yet. The chart below shows the closed form only. Press "Run simulation" to
-              add the simulated curves, which takes a few seconds at 10,000 paths.
-            </p>`}
-            ${!busy && stale && html`<p style=${{ margin: '12px 0 0', fontSize: 13, color: '#d9a05b' }}>
-              Parameters changed. The dotted analytic curves already follow them, the simulated ones do not until you run it again.
-            </p>`}
-            ${err && html`<p className="lr-note" style=${{ marginTop: 12 }}>Simulation failed: ${err}</p>`}
+              ${u.regime && html`
+                <div style=${{ fontSize: 12.5, color: COL.label, margin: '8px 0 6px', lineHeight: 1.65 }}>
+                  ${regSplit.on
+                    ? html`<${React.Fragment}>A hidden two-state Markov chain switches the market between calm and stressed days.
+                      Total volatility stays at σ = ${u.sigma}%: calm days run at${' '}
+                      ${(u.sigma * regSplit.mLo).toFixed(1)}% and stressed days at${' '}
+                      ${(u.sigma * regSplit.mHi).toFixed(1)}%, so the regime rearranges the risk over time
+                      rather than adding any. Between two stress phases lie${' '}
+                      ${(u.sdur * (100 - u.sshare) / u.sshare).toFixed(1)} calm months on average.<//>`
+                    : 'With this share or this multiplier there is no second state left, so the run is the constant-volatility one.'}
+                </div>
+                <div className="lr-grid">
+                  <${Slider} label="stress volatility" hint="× the calm level" value=${u.smult} set=${set('smult')} min=${1} max=${5} step=${0.1} unit="×" help=${HELP.smult} />
+                  <${Slider} label="time in stress" hint="share of all days" value=${u.sshare} set=${set('sshare')} min=${0} max=${60} step=${1} unit="%" help=${HELP.sshare} />
+                  <${Slider} label="length of a stress phase" hint="mean" value=${u.sdur} set=${set('sdur')} min=${1} max=${36} step=${1} unit=" months" help=${HELP.sdur} />
+                  <${Slider} label="extra spread while stressed" hint="on the borrowed part" value=${u.sspread} set=${set('sspread')} min=${0} max=${3} step=${0.1} unit="%" help=${HELP.sspread} />
+                </div>
+              `}
+            </div>
+            <div className="lr-sec">
+              <div style=${{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div>
+                  <${FieldLabel} label="paths" id="paths" openId=${openId} setOpenId=${setOpenId} />
+                  <div className="seg-row">
+                    ${[1000, 10000, 50000].map(n => html`
+                      <button key=${n} type="button" className=${'lang-seg' + (u.nPaths === n ? ' active' : '')}
+                        onClick=${() => set('nPaths')(n)}>${n.toLocaleString('en')}</button>
+                    `)}
+                  </div>
+                </div>
+                <div>
+                  <${FieldLabel} label="seed" id="seed" openId=${openId} setOpenId=${setOpenId} />
+                  <input type="number" value=${u.seed} onChange=${e => set('seed')(parseInt(e.target.value || '0', 10))}
+                    style=${{ width: 110, margin: 0, padding: '4px 10px', height: 'auto', fontSize: 14 }} />
+                </div>
+                <button type="button" onClick=${run} disabled=${busy} style=${{ margin: 0, width: 'auto' }}>
+                  ${busy ? 'Simulating…' : 'Run simulation'}
+                </button>
+                <button type="button" className="secondary outline" onClick=${() => setU(DEFAULTS)}
+                  disabled=${busy || atDefaults} style=${{ margin: 0, width: 'auto' }}>
+                  Reset parameters
+                </button>
+              </div>
+              ${busy && html`<div className="lr-prog" style=${{ marginTop: 12 }}><i style=${{ width: (prog * 100).toFixed(1) + '%' }} /></div>`}
+              ${!busy && stale && html`<p style=${{ margin: '12px 0 0', fontSize: 13, color: COL.warn }}>
+                Parameters changed. The dotted analytic curves already follow them, the simulated ones do not until you run it again.
+              </p>`}
+              ${err && html`<p className="lr-note" style=${{ marginTop: 12 }}>Simulation failed: ${err}</p>`}
+              <p style=${{ margin: '12px 0 0', fontSize: 11.5, color: COL.foot, lineHeight: 1.65 }}>
+                Defaults: a swap-based 2x MSCI World ETF as of late July 2026. Rates move and spreads are
+                not published, so check the two cost sliders against your own product; the "i" next to each
+                parameter says where to look.
+              </p>
+            </div>
           </div>
 
           <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 26, marginBottom: 4 }}>
@@ -1371,35 +2115,60 @@
               <span style=${{ '--dot': 'rgba(56,189,248,.45)' }}>P25 to P75</span>
               <span style=${{ '--dot': 'rgba(56,189,248,.20)' }}>P10 to P90</span>
               <span style=${{ '--dot': COL.ruin }}>wiped out</span>
+              ${emp && emp.L !== null && html`<span style=${{ '--dot': COL.emp }}>L* measured, with its noise band</span>`}
             <//>`}
+            <span style=${{ '--dot': COL.kelly }}>dashed vertical: Kelly, from the formula</span>
             ${showAnalytic && html`<span style=${{ '--dot': COL.thin }}>dotted: closed form, no barrier${u.dist === 'merton' ? ', no jumps' : ''}</span>`}
           </div>
-          <${MainChart} stats=${stats} p=${p} T=${u.T} hover=${hover} setHover=${setHover} showAnalytic=${showAnalytic} />
+          <${MainChart} stats=${stats} p=${p} T=${u.T} hover=${hover} setHover=${setHover}
+            showAnalytic=${showAnalytic} emp=${emp} />
           ${meanNote && html`<p style=${{ color: COL.foot, fontSize: 12.5, margin: '8px 2px 0', lineHeight: 1.65 }}>
-            <b style=${{ color: '#d9a05b', fontWeight: 600 }}>About that average line:</b>${' '}
-            ${meanNote.turnsOver && html`<${React.Fragment}>it turns over at high leverage, which the closed form says it should not.
-              That is the wipe-out threshold at work: an absorbed path contributes zero to the average for the
-              rest of time, so a barrier eventually kills the average too, just much later than the median.${' '}<//>`}
-            ${meanNote.worst && html`<${React.Fragment}>It is also the shakiest number on the chart: at${' '}
-              ${fmtL(meanNote.worst.L)}× the top 1% of paths carry ${pct(meanNote.worst.meanTop1, 0)} of it, so it
-              rests on a handful of futures that ${res.nPaths.toLocaleString('en')} paths cannot pin down. Add
-              paths and it will move; add a barrier and it collapses. The median and the quantile bands do not
-              have this problem, which is the practical reason to read them instead.<//>`}
+            <b style=${{ color: COL.warn, fontWeight: 600 }}>About that average line:</b>${' '}
+            ${meanNote.turnsOver && html`<${React.Fragment}>it turns over at high leverage, which the closed form says it should not:
+              an absorbed path contributes zero for the rest of time, so the barrier eventually kills the
+              average too, just much later than the median.${' '}<//>`}
+            ${meanNote.worst && html`<${React.Fragment}>At ${fmtL(meanNote.worst.L)}× the top 1% of paths carry${' '}
+              ${pct(meanNote.worst.meanTop1, 0)} of it, so it rests on a handful of futures that${' '}
+              ${res.nPaths.toLocaleString('en')} paths cannot pin down. The median and the quantile bands do
+              not have this problem.<//>`}
           </p>`}
 
           <div className="lr-stats" style=${{ marginTop: 18 }}>
-            <div className="lr-stat"><b>${isFinite(kOpt) ? fmtL(kOpt) + '×' : '∞'}</b>Kelly optimum, the leverage with the highest long-run growth</div>
-            <div className="lr-stat"><b>${kZero === null ? 'above 10×' : fmtL(kZero) + '×'}</b>break-even leverage, where long-run growth turns negative</div>
+            <div className="lr-stat lr-anchor">
+              <b>${isFinite(kOpt) ? fmtL(kOpt) + '×' : '∞'}</b>
+              Kelly optimum, from the formula
+              <${InfoBtn} open=${openId === 'kelly'} toggle=${() => setOpenId(openId === 'kelly' ? null : 'kelly')} label="Kelly optimum" />
+              ${openId === 'kelly' && html`<${Popover} close=${() => setOpenId(null)}>${HELP.kelly}<//>`}
+            </div>
+            <div className="lr-stat lr-anchor">
+              <b>${kZero === null ? 'above 10×' : fmtL(kZero) + '×'}</b>
+              break-even leverage
+              <${InfoBtn} open=${openId === 'bev'} toggle=${() => setOpenId(openId === 'bev' ? null : 'bev')} label="break-even leverage" />
+              ${openId === 'bev' && html`<${Popover} close=${() => setOpenId(null)}>${HELP.bev}<//>`}
+            </div>
+            <div className="lr-stat lr-anchor">
+              <b style=${{ color: emp && emp.L !== null ? COL.emp : undefined }}>
+                ${emp && emp.L !== null ? fmtL(emp.L) + '×' : '–'}
+              </b>
+              L* measured${emp && emp.L !== null && emp.hi > emp.lo
+                ? ', block-to-block noise band ' + fmtL(emp.lo) + '× to ' + fmtL(emp.hi) + '×'
+                : (emp ? ', the paths found no leverage worth holding' : ', from the paths once you run them')}
+              <${InfoBtn} open=${openId === 'lstar'} toggle=${() => setOpenId(openId === 'lstar' ? null : 'lstar')} label="L* measured" />
+              ${openId === 'lstar' && html`<${Popover} close=${() => setOpenId(null)}>${HELP.lstar}<//>`}
+            </div>
+            <div className="lr-stat lr-anchor">
+              <b>${isFinite(kRob) ? fmtL(kRob) + '×' : '∞'}</b>
+              L* robust, Kelly at μ minus τ
+              <${InfoBtn} open=${openId === 'krobust'} toggle=${() => setOpenId(openId === 'krobust' ? null : 'krobust')} label="L* robust" />
+              ${openId === 'krobust' && html`<${Popover} close=${() => setOpenId(null)}>${HELP.krobust}<//>`}
+            </div>
             ${one && selStat && html`<${React.Fragment}>
               <div className="lr-stat"><b>${fmtW(one.median)}×</b>median without leverage (1×)</div>
               <div className="lr-stat"><b>${fmtW(selStat.median)}×</b>median at ${fmtL(selStat.L)}× (${pct(selStat.ruinProb)} wiped out)</div>
             <//>`}
           </div>
 
-          <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 30, marginBottom: 4 }}>One leverage level up close</h2>
-          <p style=${{ color: COL.label, fontSize: 14, maxWidth: '70ch', marginBottom: 12 }}>
-            The two charts below show the same simulation from inside, for a single leverage level.
-          </p>
+          <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 30, marginBottom: 10 }}>One leverage level up close</h2>
           <div className="seg-row" style=${{ marginBottom: 14 }}>
             ${[0, 2, 4, 6, 8, 12, 16, 20].map(i => html`
               <button key=${i} type="button" className=${'lang-seg' + (sel === i ? ' active' : '')}
@@ -1414,11 +2183,9 @@
           ${res && selStat && html`<${React.Fragment}>
             <${Histogram} res=${res} k=${sel} stat=${selStat} />
             <p style=${{ color: COL.foot, fontSize: 12.5, margin: '6px 2px 22px', lineHeight: 1.6 }}>
-              At ${fmtL(selStat.L)}× the distribution of outcomes is skewed to the right on a log scale:
-              a thin tail of very large results pulls the average to ${fmtW(selStat.mean)}×, while half of
-              all paths end below ${fmtW(selStat.median)}× and ${pct(selStat.lossProb)} end below the
-              starting capital. The gap between the two markers is the whole argument. The average is
-              real, but almost nobody gets it, because it is carried by outcomes almost nobody sees.
+              At ${fmtL(selStat.L)}× a thin tail of very large results pulls the average to${' '}
+              ${fmtW(selStat.mean)}×, while half of all paths end below ${fmtW(selStat.median)}× and${' '}
+              ${pct(selStat.lossProb)} end below the starting capital.
             </p>
             <${FanChart} res=${res} k=${sel} T=${u.T} />
             <p style=${{ color: COL.foot, fontSize: 12.5, margin: '6px 2px 0', lineHeight: 1.6 }}>
@@ -1428,7 +2195,8 @@
             </p>
           <//>`}
 
-          <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 30, marginBottom: 8 }}>What the model does</h2>
+          <details className="lr-help" style=${{ marginTop: 30 }}>
+            <summary>What the model does</summary>
           <ul style=${{ fontSize: 13.5, color: COL.label, lineHeight: 1.75, maxWidth: '82ch' }}>
             <li><b style=${{ color: COL.text, fontWeight: 600 }}>The underlying</b> follows geometric Brownian motion, drawn from its exact
               solution rather than an Euler step, so returns can never fall below −100%: r = exp[(μ − σ²/2)·Δt + σ·√Δt·z] − 1.</li>
@@ -1440,23 +2208,34 @@
               stays dead at zero. It still counts in every average and quantile. Throwing those paths away would be survivorship bias and
               would quietly reverse the conclusion.</li>
             <li><b style=${{ color: COL.text, fontWeight: 600 }}>Uncertainty about μ</b> is the parameter most other calculators leave out. Instead of
-              a known mean, each path draws its own μ ~ N(μ̂, τ²) and keeps it for its whole life. The default τ = 3% is roughly the standard
-              error of a mean estimated from 40 years of history at σ = 15%, that is σ/√T. Its effect is not the one you might expect: the
-              growth-optimal leverage does not move, because expected log growth is linear in μ and a symmetric error cancels. What moves is
-              the risk. The variance of log terminal wealth is L²σ²T from volatility plus <b style=${{ color: COL.text, fontWeight: 600 }}>L²τ²T² from not knowing μ</b>, and the second
-              term grows with the square of the horizon rather than linearly. At the default parameters the two are equal at 25 years: past
-              that point, uncertainty about the mean is a larger source of risk than volatility. Set τ = 0 and watch the P10 line rather than
-              the median.</li>
+              a known mean, each path draws its own μ ~ N(μ̂, τ²) and keeps it for its whole life. This does not move the growth-optimal
+              leverage, it widens the outcome, with a variance term that grows with the <b style=${{ color: COL.text, fontWeight: 600 }}>square</b> of
+              the horizon; the "i" at the τ slider has the arithmetic.</li>
             <li><b style=${{ color: COL.text, fontWeight: 600 }}>Fat tails</b> come as standardized Student t innovations with the same σ,
-              so only the shape of the tails changes. Volatility understates crash risk, and Kelly is optimistic under fat tails on top of
-              being optimistic already. Half of Kelly is the usual practical recommendation for exactly this reason. t(4) is the default,
-              because a normal distribution of daily returns is not a neutral simplification but a specific error in a specific direction.</li>
+              so only the shape of the tails changes. Kelly is optimistic under fat tails on top of being optimistic already, which is one
+              reason half of Kelly is the usual practical recommendation.</li>
             <li><b style=${{ color: COL.text, fontWeight: 600 }}>Shocks as events.</b> The Merton mode adds a Poisson process of jumps on top of a
-              calmer diffusion, with the total variance held fixed so the two modes are comparable. This is the only setting in which the
-              wipe-out threshold stops being a house rule: a day of -33% ends a 3× position by arithmetic, whatever the threshold says. The
-              jump parameters are the weakest numbers on the page. Whether a violent day was a large diffusion draw or a small jump is nearly
-              unidentifiable from return data, and published estimates for the same index differ by an order of magnitude. Treat the mode as
+              calmer diffusion. This is the only setting in which the wipe-out threshold stops being a house rule: a day of -33% ends a 3×
+              position by arithmetic, whatever the threshold says. The jump parameters are the weakest numbers on the page; treat the mode as
               a demonstration of the mechanism, not as a calibrated crash forecast.</li>
+            <li><b style=${{ color: COL.text, fontWeight: 600 }}>Volatility clusters, in two states.</b> With the regime switched on, a hidden Markov chain
+              moves the market between a calm and a stressed volatility, and every path starts in the stationary distribution, so no horizon
+              begins with an artificially quiet burn-in. This is the setting that separates the two questions the page is about: it leaves the
+              growth-optimal leverage roughly where it was and roughly doubles the ruin probability at it.</li>
+            <li><b style=${{ color: COL.text, fontWeight: 600 }}>Returns lean left.</b> The skew slider stretches the negative half of each standardized
+              innovation and shrinks the positive half, then re-centres and rescales, so mean and σ are untouched and only the asymmetry is
+              new. One implementation detail worth naming, because getting it wrong would have looked like it worked: paths run in antithetic
+              pairs, so the skew is imposed after the mirroring, otherwise half the paths would see a left-skewed market, the other half a
+              right-skewed one, and the effect would cancel exactly.</li>
+            <li><b style=${{ color: COL.text, fontWeight: 600 }}>Financing can get more expensive in a crisis.</b> The stress surcharge is charged on the
+              borrowed part only on the days the chain calls stressed, which are the same days the position is most likely to die. The dotted
+              closed form instead pays the surcharge smoothly, weighted by the share of time in stress; that gap between the marker and the
+              paths is the point, not sloppiness.</li>
+            <li><b style=${{ color: COL.text, fontWeight: 600 }}>Every mode keeps the same σ.</b> Fat tails, jumps, skew and the regime all hold the
+              unconditional variance at σ² and change only the shape: the t is standardized, the jump variance is taken out of the diffusion, the
+              skew transformation is rescaled, and the two regime states are multipliers satisfying p·m² summing to one. Without that rule every
+              switch on this page would demonstrate the same thing, namely that more volatility is worse, which we knew. Held fixed, each switch
+              answers a sharper question: at the volatility you already accept, what does the arrangement of that volatility cost you.</li>
             <li><b style=${{ color: COL.text, fontWeight: 600 }}>Variance reduction:</b> every leverage level sees the same random draws (common
               random numbers), and paths run in antithetic pairs. Without this the curves wobble and the hump near the optimum looks like
               noise. Same seed gives the same result, so you can compare two settings honestly.</li>
@@ -1467,18 +2246,49 @@
               is no useful closed form to draw instead: because a jump can in principle be arbitrarily deep, expected log growth is formally
               minus infinity for every leverage above 1×, which is true and completely useless as a curve.</li>
           </ul>
+          </details>
 
-          <h2 style=${{ fontSize: '1.05rem', color: COL.text, marginTop: 26, marginBottom: 8 }}>What it does not do</h2>
+          <details className="lr-help" style=${{ marginTop: 14 }}>
+            <summary>What it does not do</summary>
           <p style=${{ fontSize: 13.5, color: COL.label, lineHeight: 1.75, maxWidth: '82ch' }}>
-            Constant μ and σ, no autocorrelation, no volatility clustering, no regime changes, no taxes, no
-            margin calls, no interest rate that moves with the market, no contributions over time. All of these
-            are violated in reality. The chart is an argument about distributions under a model, not a forecast.
+            Volatility clusters only in the crude sense of two states with constant levels, not as the
+            continuous dynamics of a GARCH or a stochastic volatility model, so a phase has no build-up and no
+            decay. The returns themselves carry no autocorrelation: momentum and mean reversion do not exist
+            here. The financing spread reacts to the volatility regime and to nothing else, in particular not
+            to the level of the market or to how far your own position is under water. And there are no margin
+            calls, no taxes and no contributions over time. All of these are violated in reality. The chart is an argument about distributions under a model, not a forecast.
             The line at 1× is also not a law of nature but a convention: a 100% equity allocation is already an
             aggressive bet, and there are serious arguments for moderate leverage over long horizons
             (Ayres and Nalebuff, <em>Lifecycle Investing</em>, 2010, contested mainly for underrating sequence
             risk). The point here is not that leverage is evil. It is that the useful question is <em>how much</em>,
             and that this question has a finite, computable answer instead of being a matter of conviction.
           </p>
+          </details>
+
+          <details className="lr-help" style=${{ marginTop: 14 }}>
+            <summary>Where the default numbers come from</summary>
+            <p style=${{ fontSize: 13, color: COL.label, lineHeight: 1.75, maxWidth: '82ch' }}>
+              Default values, all as of late July 2026 and all worth re-checking:
+              overnight rates from the <a href="https://www.newyorkfed.org/markets/reference-rates/sofr" style=${{ color: COL.label }}>New York Fed (SOFR)</a> and
+              the <a href="https://www.ecb.europa.eu/stats/financial_markets_and_interest_rates/euro_short-term_rate/html/index.en.html" style=${{ color: COL.label }}>ECB (€STR)</a>;
+              product costs from the key information documents of existing 2x UCITS ETFs
+              (<a href="https://www.justetf.com/en/etf-profile.html?isin=FR0014010HV4" style=${{ color: COL.label }}>Amundi MSCI World 2x, TER 0.60%</a>);
+              index return and volatility from the <a href="https://www.msci.com/indexes/index/990100" style=${{ color: COL.label }}>MSCI World factsheets</a>;
+              the swap spread is an estimate, because no provider publishes it.
+            </p>
+            <p style=${{ fontSize: 13, color: COL.label, lineHeight: 1.75, maxWidth: '82ch' }}>
+              The regime and skew defaults come from these series, all retrieved on 11 August 2026 and all
+              evaluated here rather than quoted from a paper:
+              Cboe Volatility Index, daily closes 2 January 1990 to 7 August 2026, FRED series${' '}
+              <a href="https://fred.stlouisfed.org/series/VIXCLS" style=${{ color: COL.label }}>VIXCLS</a>, own analysis;
+              TED spread, FRED series${' '}
+              <a href="https://fred.stlouisfed.org/series/TEDRATE" style=${{ color: COL.label }}>TEDRATE</a>, own analysis;
+              S&P 500 daily closes 1980 to 2026, Yahoo Finance ^GSPC, own analysis including the two-state hidden
+              Markov fit; Sengupta and Tam,${' '}
+              <a href="https://www.frbsf.org/research-and-insights/publications/economic-letter/2009/01/libor-financial-crisis/" style=${{ color: COL.label }}>The
+              Behavior of Libor in the Current Financial Crisis</a>, FRBSF Economic Letter 2009-04.
+            </p>
+          </details>
 
           <p style=${{ marginTop: 24, fontSize: 11, color: COL.foot, lineHeight: 1.7 }}>
             Background: the divergence between the ensemble average and the typical path is the ergodicity
@@ -1486,15 +2296,6 @@
             back to Kelly (1956) and Thorp; the concavity of geometric growth in leverage is the same
             mathematics seen from a different angle. Everything runs locally in your browser, nothing is sent
             anywhere.
-          </p>
-          <p style=${{ marginTop: 8, fontSize: 11, color: COL.foot, lineHeight: 1.7 }}>
-            Default values, all as of late July 2026 and all worth re-checking:
-            overnight rates from the <a href="https://www.newyorkfed.org/markets/reference-rates/sofr" style=${{ color: COL.foot }}>New York Fed (SOFR)</a> and
-            the <a href="https://www.ecb.europa.eu/stats/financial_markets_and_interest_rates/euro_short-term_rate/html/index.en.html" style=${{ color: COL.foot }}>ECB (€STR)</a>;
-            product costs from the key information documents of existing 2x UCITS ETFs
-            (<a href="https://www.justetf.com/en/etf-profile.html?isin=FR0014010HV4" style=${{ color: COL.foot }}>Amundi MSCI World 2x, TER 0.60%</a>);
-            index return and volatility from the <a href="https://www.msci.com/indexes/index/990100" style=${{ color: COL.foot }}>MSCI World factsheets</a>;
-            the swap spread is an estimate, because no provider publishes it.
           </p>
           <p style=${{ marginTop: 8, fontSize: 10, color: COL.faint, lineHeight: 1.6 }}>
             Not investment advice, and not a recommendation for or against any product. Index names belong to
