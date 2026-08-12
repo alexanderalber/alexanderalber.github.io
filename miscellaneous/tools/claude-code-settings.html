@@ -67,8 +67,16 @@
 
     .scg-rulelist{ list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:10px; }
     .scg-ruleitem{ display:flex; flex-direction:column; gap:3px; }
-    .scg-rulehead{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-    .scg-ruletext{ font-family:var(--scg-mono, ui-monospace, monospace); font-size:.82rem; word-break:break-all; flex:1 1 200px; }
+    /* Rule strings are long and unbreakable. With a small flex-basis the
+       Allow/Ask/Deny control stayed on the same line and squeezed the rule
+       into a two-line block beside it, which read as a broken layout. The
+       large basis makes the controls wrap below instead, as soon as the rule
+       needs the width. */
+    .scg-rulehead{ display:flex; align-items:center; gap:10px 12px; flex-wrap:wrap; }
+    .scg-ruletext{
+      font-family:var(--scg-mono, ui-monospace, monospace); font-size:.82rem;
+      overflow-wrap:anywhere; flex:1 1 270px; min-width:0;
+    }
 
     /* What a rule actually resolves to, and the mistakes that otherwise only
        show up as a startup warning or not at all. */
@@ -240,11 +248,32 @@
       return "cwd";
     }
 
+    /* A pasted Windows path carries its own root, so it has to be converted
+       BEFORE an anchor goes in front of it. Prepending first produces
+       "//E:\misc\x", where the drive letter is no longer at the start and
+       every later check misses it. */
     function buildSpec(anchorId, path){
-      const p = String(path).trim().replace(/^\.\//, "").replace(/^\/+/, "").replace(/^~\//, "");
+      const raw = String(path).trim();
+      if(hasWinSpelling(raw)) return winToPosix(raw);
+      const p = raw.replace(/^\.\//, "").replace(/^\/+/, "").replace(/^~\//, "");
       const a = ANCHORS.find(x => x.id === anchorId);
       if(!a) return p;
       return a.prefix + p;
+    }
+
+    /* Which anchor an input already implies, so the builder can follow the
+       paste instead of contradicting it. Null when the input implies nothing. */
+    function impliedAnchor(path){
+      const raw = String(path).trim();
+      if(!raw) return null;
+      if(hasWinSpelling(raw)) return "abs";
+      if(raw.startsWith("//")) return "abs";
+      if(raw.startsWith("~/")) return "home";
+      return null;
+    }
+
+    function hasWinSpelling(spec){
+      return /\\/.test(spec) || /^\/*[A-Za-z]:/.test(spec);
     }
 
     /* Resolve a rule against a scope and say in plain words what it matches. */
@@ -252,6 +281,11 @@
       const { tool, spec } = splitRule(rule);
       if(spec === null) return null;
       if(PATH_TOOLS.indexOf(tool) < 0 && !(tool in DEAD_PATH_TOOLS)) return null;
+      /* Real paths never contain a backslash once Claude Code has normalized
+         them, so such a pattern resolves to nothing. Saying "matches
+         /E:\misc\x" would be a sentence that reads like a result and is not
+         one; the lint below says the useful thing instead. */
+      if(/\\/.test(spec)) return null;
       const kind = anchorOf(spec);
       let target;
       if(kind === "abs")       target = spec.slice(1);
@@ -277,10 +311,11 @@
       }
 
       if(PATH_TOOLS.indexOf(tool) >= 0 || tool in DEAD_PATH_TOOLS){
-        if(/\\/.test(spec) || /^[A-Za-z]:/.test(spec)){
+        if(hasWinSpelling(spec)){
           out.push({
             level: "warn",
-            msg: "Windows paths are normalized to POSIX before matching, so C:\\Users\\me is /c/Users/me.",
+            msg: "This is a Windows spelling. Claude Code normalizes paths to POSIX before matching, "
+               + "so a pattern with a drive letter or a backslash matches nothing.",
             fix: tool + "(" + winToPosix(spec) + ")",
           });
         } else if(anchorOf(spec) === "src"){
@@ -298,9 +333,12 @@
     }
 
     function winToPosix(spec){
-      let s = String(spec).replace(/\\/g, "/");
-      s = s.replace(/^([A-Za-z]):/, function(_, d){ return "/" + d.toLowerCase(); });
-      if(s.startsWith("/") && !s.startsWith("//")) s = "/" + s;
+      const s = String(spec).replace(/\\/g, "/");
+      /* The drive letter is matched with any number of slashes in front of it,
+         because by the time this runs an anchor may already have been added. */
+      const m = s.match(/^\/*([A-Za-z]):\/*(.*)$/);
+      if(m) return "//" + m[1].toLowerCase() + (m[2] ? "/" + m[2] : "/**");
+      if(s.startsWith("/") && !s.startsWith("//")) return "/" + s;
       return s;
     }
 
@@ -350,6 +388,8 @@
       splitRule: splitRule,
       anchorOf: anchorOf,
       buildSpec: buildSpec,
+      impliedAnchor: impliedAnchor,
+      hasWinSpelling: hasWinSpelling,
       explainRule: explainRule,
       lintRule: lintRule,
       winToPosix: winToPosix,
@@ -504,6 +544,14 @@
         if(rule in ruleIndex) removeRule(rule); else addRule(rule, bucket);
       }
       function addCustom(){ addRule(custom, customBucket); setCustom(""); }
+
+      /* Pasting "E:\misc\x" or "//srv/**" states an anchor. Following it beats
+         building a rule the user did not ask for and then warning about it. */
+      function setPathBodyFollowingAnchor(v){
+        setPathBody(v);
+        const implied = SCG.impliedAnchor(v);
+        if(implied) setPathAnchor(implied);
+      }
 
       const pathSpec = SCG.buildSpec(pathAnchor, pathBody);
       const pathRule = pathTool + "(" + pathSpec + ")";
@@ -723,7 +771,7 @@
 
                 <div className="scg-addbar" style=${{marginTop:0}}>
                   <input type="text" placeholder=${pathAnchor === "abs" ? "e/misc/**" : "secrets/**"}
-                    value=${pathBody} onChange=${e => setPathBody(e.target.value)}
+                    value=${pathBody} onChange=${e => setPathBodyFollowingAnchor(e.target.value)}
                     onKeyDown=${e => { if(e.key === "Enter") addPathRule(); }}/>
                   <${Seg} value=${pathBucket} onChange=${setPathBucket} options=${[
                     { v:"allow", label:"Allow" }, { v:"ask", label:"Ask" }, { v:"deny", label:"Deny" },
@@ -734,9 +782,11 @@
                 ${pathBody.trim() && html`
                   <div className="scg-preview">
                     <div className="scg-ruletext">${pathRule}</div>
-                    <div className="scg-resolve">
-                      in <strong>${scope}</strong> settings, matches <code>${SCG.explainRule(pathRule, scope)}</code>
-                    </div>
+                    ${SCG.explainRule(pathRule, scope) && html`
+                      <div className="scg-resolve">
+                        in <strong>${scope}</strong> settings, matches <code>${SCG.explainRule(pathRule, scope)}</code>
+                      </div>
+                    `}
                     ${SCG.lintRule(pathRule).map((l, i) => html`
                       <div className="scg-lint" key=${i}>
                         ${l.msg}${l.fix && html`<span> Try <code>${l.fix}</code>.</span>`}
