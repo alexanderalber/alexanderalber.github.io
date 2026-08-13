@@ -20,13 +20,15 @@
     .scg-grid{ display:grid; grid-template-columns:1fr; gap:24px; align-items:start; }
     @media (min-width:1040px){ .scg-grid{ grid-template-columns:minmax(0,1fr) 400px; } }
 
-    .scg-card{
-      border:1px solid var(--pico-card-border-color, #2a3140);
-      border-radius:10px; padding:16px 18px; margin-bottom:20px;
-      background:var(--pico-card-background-color, #1a1f2b);
-    }
-    .scg-card h3{ font-size:1rem; margin:0 0 4px; }
-    .scg-card > .scg-hint{ margin:0 0 14px; }
+    /* Panels are the shared .ctl-card / .ctl-sec from custom.css, not a local
+       variant: same border, radius and shadow as everywhere else, and the
+       hairlines between sections come for free. Only the stacking margin and
+       the card title are local, because ctl-card is normally one card per
+       tool and here there are several down a column. */
+    .ctl-card{ margin-bottom:20px; }
+    .ctl-card h3{ font-size:1rem; margin:0 0 4px; }
+    .ctl-sec > h3 + .scg-hint{ margin:0 0 14px; }
+    .ctl-sec > .scg-hint:only-child{ margin:0; }
     .scg-hint{ color:var(--pico-muted-color); font-size:.82rem; line-height:1.5; }
 
     .scg-row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
@@ -34,16 +36,12 @@
     .scg-row input, .scg-row select{ margin:0; }
     .scg-row input[type=text], .scg-row input[type=number]{ max-width:280px; }
 
-    /* segmented control reuses .lang-seg look */
-    .scg-seg{
-      appearance:none; cursor:pointer; border:1px solid var(--pico-muted-border-color,#333c4d);
-      background:transparent; color:var(--pico-muted-color); font-size:.78rem;
-      padding:4px 10px; line-height:1.2;
-    }
-    .scg-seg:first-child{ border-radius:6px 0 0 6px; }
-    .scg-seg:last-child{ border-radius:0 6px 6px 0; }
-    .scg-seg:not(:last-child){ border-right:none; }
-    .scg-seg.active{ background:var(--pico-primary); color:#0b0f17; border-color:var(--pico-primary); font-weight:600; }
+    /* Segmented controls are the shared .lang-seg, not a local copy. The local
+       one keyed its corners on :first-child / :last-child and never zeroed the
+       middle segment's radius, so Pico's own --pico-border-radius survived
+       there and the middle button read as a detached pill. custom.css keys on
+       adjacency instead and states exactly this failure in its comment. No gap
+       on the row: adjacent segments must touch. */
     .scg-segset{ display:inline-flex; }
 
     .scg-chips{ display:flex; flex-wrap:wrap; gap:7px; margin:6px 0 4px; }
@@ -59,6 +57,13 @@
       background:transparent; color:var(--tool-text);
     }
     .scg-chip:hover{ border-color:var(--pico-primary); }
+    /* Which bucket a chip sits in, spelled out. The fill colour alone carries
+       it only for people who can tell the three apart, and it does not say
+       that clicking again changes the bucket rather than removing the rule. */
+    .scg-chip-tag{
+      font-family:var(--pico-font-family); font-size:.62rem; font-weight:600;
+      text-transform:uppercase; letter-spacing:.05em; opacity:.75; margin-left:7px;
+    }
     .scg-chip.on-allow{ background:rgba(52,199,123,.16); border-color:#34c77b; color:#7ee6ac; }
     .scg-chip.on-ask{ background:rgba(230,180,60,.16); border-color:#e6b43c; color:var(--tool-warn-text); }
     .scg-chip.on-deny{ background:rgba(232,90,90,.16); border-color:#e85a5a; color:var(--tool-danger-text); }
@@ -342,6 +347,27 @@
       return s;
     }
 
+    /* A chip carries the bucket it is usually wanted in, but every chip has a
+       plausible use in the other two: curl as allow, WebFetch as deny, Edit as
+       deny for a read-only session. Clicking cycles through them and ends on
+       "not set", so a chip is always at most three clicks from gone. The
+       chip's own bucket comes first, which keeps the common case at one
+       click. */
+    function chipOrder(defaultBucket){
+      return [defaultBucket].concat(["allow", "ask", "deny"].filter(function(b){
+        return b !== defaultBucket;
+      }));
+    }
+
+    /* Returns the next bucket, or null for "remove the rule". */
+    function nextChipState(current, defaultBucket){
+      const order = chipOrder(defaultBucket);
+      if(current == null) return order[0];
+      const i = order.indexOf(current);
+      if(i < 0) return order[0];
+      return i + 1 < order.length ? order[i + 1] : null;
+    }
+
     /* ── Assemble the settings object in a stable, readable key order ── */
     function buildSettings(s){
       const out = {};
@@ -393,6 +419,8 @@
       explainRule: explainRule,
       lintRule: lintRule,
       winToPosix: winToPosix,
+      chipOrder: chipOrder,
+      nextChipState: nextChipState,
       buildSettings: buildSettings,
     };
   })();
@@ -493,7 +521,6 @@
       return n >= 1000 ? "~" + (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : "~" + n;
     }
 
-    const BUCKETS = ["allow", "ask", "deny"];
     const BUCKET_LABEL = { allow: "Allow", ask: "Ask", deny: "Deny" };
 
     function App(){
@@ -540,8 +567,12 @@
       }
       function removeRule(rule){ setRules(prev => prev.filter(r => r.rule !== rule)); }
       function setBucket(rule, bucket){ setRules(prev => prev.map(r => r.rule === rule ? { ...r, bucket } : r)); }
-      function toggleChip(rule, bucket){
-        if(rule in ruleIndex) removeRule(rule); else addRule(rule, bucket);
+      function cycleChip(rule, defaultBucket){
+        const current = rule in ruleIndex ? rules[ruleIndex[rule]].bucket : null;
+        const next = SCG.nextChipState(current, defaultBucket);
+        if(next === null) removeRule(rule);
+        else if(current === null) addRule(rule, next);
+        else setBucket(rule, next);
       }
       function addCustom(){ addRule(custom, customBucket); setCustom(""); }
 
@@ -604,7 +635,7 @@
         <span className="scg-segset">
           ${options.map(o => html`
             <button key=${o.v}
-              className=${"scg-seg" + (value === o.v ? " active" : "")}
+              className=${"lang-seg" + (value === o.v ? " active" : "")}
               onClick=${() => onChange(o.v)} type="button">${o.label}</button>
           `)}
         </span>
@@ -630,49 +661,62 @@
             <!-- ── Left: controls ── -->
             <div>
               <!-- Scope -->
-              <div className="scg-card">
-                <h3>Where does this file go?</h3>
-                <p className="scg-hint">Only affects the paths shown below. The JSON is the same.</p>
-                <${Seg} value=${scope} onChange=${setScope} options=${[
-                  { v:"user", label:"User" }, { v:"project", label:"Project" }, { v:"local", label:"Local" },
-                ]}/>
-                <p className="scg-hint" style=${{marginTop:10, marginBottom:6}}>${SCOPES[scope].note}</p>
-                <div className="scg-pathlist">
-                  <div><span className="scg-os">Linux</span><span className="scg-path">${SCOPES[scope].linux}</span></div>
-                  <div><span className="scg-os">Windows</span><span className="scg-path">${SCOPES[scope].windows}</span></div>
+              <div className="ctl-card">
+                <div className="ctl-sec">
+                  <h3>Where does this file go?</h3>
+                  <p className="scg-hint">Only affects the paths shown below. The JSON is the same.</p>
+                  <${Seg} value=${scope} onChange=${setScope} options=${[
+                    { v:"user", label:"User" }, { v:"project", label:"Project" }, { v:"local", label:"Local" },
+                  ]}/>
+                </div>
+                <div className="ctl-sec">
+                  <p className="scg-hint" style=${{marginTop:0, marginBottom:6}}>${SCOPES[scope].note}</p>
+                  <div className="scg-pathlist">
+                    <div><span className="scg-os">Linux</span><span className="scg-path">${SCOPES[scope].linux}</span></div>
+                    <div><span className="scg-os">Windows</span><span className="scg-path">${SCOPES[scope].windows}</span></div>
+                  </div>
                 </div>
               </div>
 
               <!-- Permissions -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Permissions</h3>
                 <p className="scg-hint">
-                  Click a rule to add it. <code>deny</code> always wins over <code>allow</code>.
+                  Click a rule to add it in the bucket it is usually wanted in. Clicking again
+                  cycles through the other two and then removes it, so any rule can be an
+                  <code>allow</code>, an <code>ask</code> or a <code>deny</code>.
+                  <code>deny</code> always wins over <code>allow</code>, across every settings file.
                   Bash rules use prefix matching, e.g. <code>Bash(git diff:*)</code>.
                 </p>
+                </div>
 
+                <div className="ctl-sec">
                 ${PALETTE.map(group => html`
                   <div key=${group.label}>
                     <div className="scg-group-label">${group.label}</div>
                     <div className="scg-chips">
                       ${group.items.map(it => {
-                        const active = it.rule in ruleIndex;
-                        const cls = active ? " on-" + rules[ruleIndex[it.rule]].bucket : "";
+                        const cur = it.rule in ruleIndex ? rules[ruleIndex[it.rule]].bucket : null;
+                        const next = SCG.nextChipState(cur, it.bucket);
                         return html`
                           <button key=${it.rule} type="button"
-                            className=${"scg-chip" + cls}
-                            onClick=${() => toggleChip(it.rule, it.bucket)}
-                            title=${active ? "Remove" : "Add to " + BUCKET_LABEL[it.bucket]}>
+                            className=${"scg-chip" + (cur ? " on-" + cur : "")}
+                            onClick=${() => cycleChip(it.rule, it.bucket)}
+                            title=${next === null ? "Click to remove" : "Click to set " + BUCKET_LABEL[next]}>
                             ${it.rule}
+                            ${cur && html`<span className="scg-chip-tag">${BUCKET_LABEL[cur]}</span>`}
                           </button>
                         `;
                       })}
                     </div>
                   </div>
                 `)}
+                </div>
 
                 <!-- custom rule -->
-                <div className="scg-addbar">
+                <div className="ctl-sec">
+                <div className="scg-addbar" style=${{marginTop:0}}>
                   <input type="text" placeholder="Custom rule, e.g. Bash(docker compose:*)"
                     value=${custom} onChange=${e => setCustom(e.target.value)}
                     onKeyDown=${e => { if(e.key === "Enter") addCustom(); }}/>
@@ -681,10 +725,21 @@
                   ]}/>
                   <button type="button" className="scg-small-btn" onClick=${addCustom}>Add</button>
                 </div>
+                </div>
 
                 <!-- selected rules -->
                 ${rules.length > 0 && html`
-                  <ul className="scg-rulelist">
+                  <div className="ctl-sec">
+                  <p className="ctl-sec-h">
+                    Selected rules
+                    <span className="ctl-sec-h-sub">${rules.length}</span>
+                  </p>
+                  <p className="scg-hint" style=${{margin:"-8px 0 10px"}}>
+                    This is what goes into the file. Move a rule between the three buckets here, or
+                    drop it with the ×. Path rules also show what they resolve to in the
+                    <strong> ${scope}</strong> scope selected above.
+                  </p>
+                  <ul className="scg-rulelist" style=${{marginTop:0}}>
                     ${rules.map(r => {
                       const resolved = SCG.explainRule(r.rule, scope);
                       const lints = SCG.lintRule(r.rule);
@@ -711,10 +766,12 @@
                       `;
                     })}
                   </ul>
+                  </div>
                 `}
 
                 <!-- defaultMode -->
-                <div className="scg-row" style=${{marginTop:18, marginBottom:0}}>
+                <div className="ctl-sec">
+                <div className="scg-row" style=${{marginTop:0, marginBottom:0}}>
                   <label htmlFor="scg-mode">Default permission mode</label>
                   <select id="scg-mode" value=${defaultMode} onChange=${e => setMode(e.target.value)} style=${{maxWidth:260}}>
                     ${MODES.map(m => html`<option key=${m.v} value=${m.v}>${m.label}</option>`)}
@@ -738,10 +795,12 @@
                     Forbid bypassPermissions <code>disableBypassPermissionsMode</code>
                   </label>
                 </div>
+                </div>
               </div>
 
               <!-- Path rules -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Path rules</h3>
                 <p className="scg-hint">
                   Which files Claude may read or change. Rules use gitignore patterns, and the
@@ -750,7 +809,9 @@
                   <code>Write</code>, <code>NotebookEdit</code> or <code>Glob</code> is accepted and
                   then ignored. A <code>Read</code> deny also blocks Edit and Write on the same path.
                 </p>
+                </div>
 
+                <div className="ctl-sec">
                 <div className="scg-row">
                   <label>Tool</label>
                   <${Seg} value=${pathTool} onChange=${setPathTool} options=${[
@@ -794,24 +855,31 @@
                     `)}
                   </div>
                 `}
+                </div>
 
-                <p className="scg-hint" style=${{marginTop:14, marginBottom:0}}>
+                <div className="ctl-sec">
+                <p className="scg-hint" style=${{margin:0}}>
                   On Windows, paths are normalized to POSIX before matching:
                   <code>C:\\Users\\me</code> becomes <code>/c/Users/me</code>. A whole drive is
                   <code>//c/**</code>, every drive is <code>//**</code>.
                 </p>
+                </div>
               </div>
 
               <!-- additionalDirectories -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Additional directories</h3>
                 <p className="scg-hint">
                   Folders outside the project that Claude may work in. They grant file access only:
                   no <code>CLAUDE.md</code>, agents or hooks are loaded from them. In project scope
                   they take effect only after you accept the workspace trust dialog.
                 </p>
+                </div>
+
+                <div className="ctl-sec">
                 ${additionalDirs.length > 0 && html`
-                  <ul className="scg-rulelist">
+                  <ul className="scg-rulelist" style=${{marginTop:0}}>
                     ${additionalDirs.map(d => html`
                       <li key=${d} className="scg-ruleitem">
                         <div className="scg-rulehead">
@@ -823,23 +891,27 @@
                     `)}
                   </ul>
                 `}
-                <div className="scg-addbar">
+                <div className="scg-addbar" style=${{marginTop: additionalDirs.length ? 10 : 0}}>
                   <input type="text" placeholder="../shared-lib" value=${dirDraft}
                     onChange=${e => setDirDraft(e.target.value)}
                     onKeyDown=${e => { if(e.key === "Enter") addDir(); }}/>
                   <button type="button" className="scg-small-btn" onClick=${addDir}>Add</button>
                 </div>
+                </div>
               </div>
 
               <!-- Basics -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Basics</h3>
                 <p className="scg-hint">
                   All optional. Leave a field blank to omit it. Effort level, auto memory and
                   attribution are personal preferences: put them in <strong>user</strong> scope
                   rather than in a project file your team shares.
                 </p>
+                </div>
 
+                <div className="ctl-sec">
                 <div className="scg-row">
                   <label htmlFor="scg-model">Model</label>
                   <input id="scg-model" type="text" list="scg-models" placeholder="(unset)"
@@ -863,8 +935,10 @@
                     { v:"unset", label:"Unset" }, { v:"true", label:"On" }, { v:"false", label:"Off" },
                   ]}/>
                 </div>
+                </div>
 
-                <div className="scg-checkrow" style=${{marginTop:16}}>
+                <div className="ctl-sec">
+                <div className="scg-checkrow" style=${{marginTop:0}}>
                   <input id="scg-attr" type="checkbox" className="scg-check"
                     checked=${attributionOn} onChange=${e => setAttributionOn(e.target.checked)}/>
                   <label htmlFor="scg-attr">
@@ -888,18 +962,22 @@
                     </div>
                   <//>
                 `}
+                </div>
 
+                <div className="ctl-sec">
                 <div className="scg-row">
                   <label>Co-authored-by (legacy)</label>
                   <${Seg} value=${coAuthored} onChange=${setCoAuthored} options=${[
                     { v:"unset", label:"Unset" }, { v:"true", label:"On" }, { v:"false", label:"Off" },
                   ]}/>
                 </div>
-                <p className="scg-hint" style=${{margin:"-6px 0 12px"}}>
+                <p className="scg-hint" style=${{margin:"-6px 0 0"}}>
                   <code>includeCoAuthoredBy</code> predates <code>attribution</code> and is no longer
                   listed in the current settings reference. Keep it only for older versions.
                 </p>
+                </div>
 
+                <div className="ctl-sec">
                 <div className="scg-row">
                   <label htmlFor="scg-cleanup">Keep session files (days)</label>
                   <input id="scg-cleanup" type="number" min="1" placeholder="30"
@@ -911,16 +989,21 @@
                     onChange=${e => setSchema(e.target.checked)}/>
                   <label htmlFor="scg-schema">Include <code>$schema</code> line (editor autocomplete only)</label>
                 </div>
+                </div>
               </div>
 
               <!-- Feature toggles -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Feature toggles</h3>
                 <p className="scg-hint">
                   Turn off built-in features you don’t use. Unlike <code>deny</code> rules, these
                   actually keep the feature (and its tooling) out of the context window. Token figures are
                   very rough estimates and vary by version.
                 </p>
+                </div>
+
+                <div className="ctl-sec">
                 ${FEATURES.map(f => html`
                   <div className="scg-checkrow" key=${f.key}>
                     <input id=${"scg-" + f.key} type="checkbox" className="scg-check"
@@ -938,12 +1021,17 @@
                   <span className="scg-save-total">${fmtTokens(featureSaving)} tokens</span>.
                   ${' '}Note that most of the context window is the conversation itself, not tooling.
                 </p>
+                </div>
               </div>
 
               <!-- Env -->
-              <div className="scg-card">
+              <div className="ctl-card">
+                <div className="ctl-sec">
                 <h3>Environment variables</h3>
-                <p className="scg-hint">Injected into every Claude Code session in this scope.</p>
+                <p className="scg-hint" style=${{margin:0}}>Injected into every Claude Code session in this scope.</p>
+                </div>
+
+                <div className="ctl-sec">
                 ${envRows.map((row, i) => html`
                   <div className="scg-envrow" key=${i}>
                     <input type="text" placeholder="NAME" value=${row.k}
@@ -955,12 +1043,13 @@
                   </div>
                 `)}
                 <button type="button" className="scg-small-btn" onClick=${addEnvRow}>+ Add variable</button>
+                </div>
               </div>
             </div>
 
             <!-- ── Right: output ── -->
             <div className="scg-out">
-              <div className="scg-card" style=${{marginBottom:0}}>
+              <div className="ctl-card" style=${{marginBottom:0}}>
                 <h3>settings.json</h3>
                 <p className="scg-hint" style=${{marginBottom:6}}>Save as:</p>
                 <div className="scg-pathlist" style=${{marginBottom:12}}>
