@@ -5,10 +5,10 @@
   <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Claude Code settings.json Generator - alber.me</title>
-  <meta name="description" content="Click together a Claude Code settings.json: permission allow/ask/deny rules, model, environment variables and more. Runs entirely in your browser.">
+  <meta name="description" content="Click together a Claude Code settings.json: permission allow/ask/deny rules, path and drive fences, model, environment variables and more. Runs entirely in your browser.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/claude-code-settings.html">
   <meta property="og:title" content="Claude Code settings.json Generator">
-  <meta property="og:description" content="Click together a Claude Code settings.json: permission allow/ask/deny rules, model, environment variables and more. Runs entirely in your browser.">
+  <meta property="og:description" content="Click together a Claude Code settings.json: permission allow/ask/deny rules, path and drive fences, model, environment variables and more. Runs entirely in your browser.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/claude-code-settings.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -65,9 +65,24 @@
 
     .scg-group-label{ font-size:.74rem; text-transform:uppercase; letter-spacing:.04em; color:var(--pico-muted-color); margin:14px 0 2px; }
 
-    .scg-rulelist{ list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:6px; }
-    .scg-ruleitem{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .scg-rulelist{ list-style:none; padding:0; margin:8px 0 0; display:flex; flex-direction:column; gap:10px; }
+    .scg-ruleitem{ display:flex; flex-direction:column; gap:3px; }
+    .scg-rulehead{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
     .scg-ruletext{ font-family:var(--scg-mono, ui-monospace, monospace); font-size:.82rem; word-break:break-all; flex:1 1 200px; }
+
+    /* What a rule actually resolves to, and the mistakes that otherwise only
+       show up as a startup warning or not at all. */
+    .scg-resolve{ font-size:.78rem; color:var(--pico-muted-color); line-height:1.5; }
+    .scg-resolve code{ font-size:.78rem; background:none; padding:0; color:var(--pico-primary); }
+    .scg-lint{
+      font-size:.78rem; line-height:1.5; color:var(--tool-warn-text);
+      border-left:2px solid #e6b43c; padding-left:9px; margin-top:2px;
+    }
+    .scg-lint code{ font-size:.78rem; background:none; padding:0; color:inherit; }
+    .scg-preview{
+      margin-top:12px; padding:10px 12px; border-radius:8px;
+      border:1px solid var(--pico-muted-border-color,#333c4d); background:var(--tool-subtle);
+    }
     .scg-x{ appearance:none; background:none; border:none; cursor:pointer; color:var(--pico-muted-color); font-size:1.1rem; line-height:1; padding:0 4px; }
     .scg-x:hover{ color:#e85a5a; }
 
@@ -122,7 +137,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Claude Code settings.json Generator",
-    "description": "Interactive builder for a Claude Code settings.json file: permission allow/ask/deny rules, model, environment variables, defaultMode and more. Runs entirely in the browser.",
+    "description": "Interactive builder for a Claude Code settings.json file: permission allow/ask/deny rules, Read and Edit path rules with resolved anchors, model, environment variables, defaultMode and more. Runs entirely in the browser.",
     "url": "https://alber.me/miscellaneous/tools/claude-code-settings.html",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "Any",
@@ -164,14 +179,189 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;margin-bottom:8px">Claude Code settings.json Generator</h1>
-        <p style="color:var(--pico-muted-color);max-width:70ch">Click together a Claude Code settings.json: permission allow/ask/deny rules, model selection, environment variables and more, with the generated JSON ready to copy. Runs entirely in your browser.</p>
+        <p style="color:var(--pico-muted-color);max-width:70ch">Click together a Claude Code settings.json: permission allow/ask/deny rules, Read and Edit path rules resolved against the scope you pick, model selection, environment variables and more, with the generated JSON ready to copy. Runs entirely in your browser.</p>
       </div>
     </div>
   </main>
 
+  <script id="scgcore">
+  /* ── Pure logic: rule parsing, path-anchor resolution, lint, JSON assembly.
+     No DOM, no markup. The Node tests eval this block, so keep the id. ── */
+  (function(){
+
+    /* A "/path" rule does not anchor at the filesystem root. It anchors at a
+       directory belonging to the settings file that defines it, so the same
+       string means three different things in the three scopes this tool
+       offers. That is the single most surprising thing about path rules and
+       the reason this tool resolves them on screen. */
+    const SCOPE_ANCHOR = {
+      user:    "~/.claude",
+      project: "<project root>",
+      local:   "<cwd you started in>",
+    };
+
+    /* The four anchor forms of a Read/Edit rule, gitignore pattern syntax. */
+    const ANCHORS = [
+      { id: "abs",  prefix: "//", label: "//",  name: "Absolute",
+        hint: "From the filesystem root. The only form that means the same thing in every scope." },
+      { id: "home", prefix: "~/", label: "~/",  name: "Home",
+        hint: "From your home directory." },
+      { id: "src",  prefix: "/",  label: "/",   name: "Settings-relative",
+        hint: "Relative to the settings file, NOT the filesystem root." },
+      { id: "cwd",  prefix: "./", label: "./",  name: "Current directory",
+        hint: "Relative to the directory Claude Code runs in. A bare name behaves the same." },
+    ];
+
+    /* Path rules are only ever checked against Read() and Edit(). A path on
+       any other file tool is accepted, never consulted, and warned about at
+       startup. */
+    const PATH_TOOLS = ["Read", "Edit"];
+    const DEAD_PATH_TOOLS = {
+      Write:        "Edit",
+      NotebookEdit: "Edit",
+      MultiEdit:    "Edit",
+      Glob:         "Read",
+    };
+
+    /* First segments that give away an intended absolute path written with a
+       single slash. Single letters cover the POSIX form of Windows drives. */
+    const ROOTISH = /^(Users|home|root|tmp|var|etc|opt|mnt|media|srv|proc|dev|[A-Za-z])$/;
+
+    function splitRule(rule){
+      const m = String(rule).match(/^([A-Za-z_][\w-]*)\((.*)\)$/);
+      if(!m) return { tool: String(rule).trim(), spec: null };
+      return { tool: m[1], spec: m[2] };
+    }
+
+    function anchorOf(spec){
+      if(spec.startsWith("//")) return "abs";
+      if(spec.startsWith("~/")) return "home";
+      if(spec.startsWith("/"))  return "src";
+      return "cwd";
+    }
+
+    function buildSpec(anchorId, path){
+      const p = String(path).trim().replace(/^\.\//, "").replace(/^\/+/, "").replace(/^~\//, "");
+      const a = ANCHORS.find(x => x.id === anchorId);
+      if(!a) return p;
+      return a.prefix + p;
+    }
+
+    /* Resolve a rule against a scope and say in plain words what it matches. */
+    function explainRule(rule, scope){
+      const { tool, spec } = splitRule(rule);
+      if(spec === null) return null;
+      if(PATH_TOOLS.indexOf(tool) < 0 && !(tool in DEAD_PATH_TOOLS)) return null;
+      const kind = anchorOf(spec);
+      let target;
+      if(kind === "abs")       target = spec.slice(1);
+      else if(kind === "home") target = spec;
+      else if(kind === "src")  target = (SCOPE_ANCHOR[scope] || "<settings dir>") + spec;
+      else                     target = "<cwd>/" + spec.replace(/^\.\//, "");
+      return target;
+    }
+
+    /* The mistakes that fail silently or only show up as a startup warning. */
+    function lintRule(rule){
+      const out = [];
+      const { tool, spec } = splitRule(rule);
+      if(spec === null) return out;
+
+      if(tool in DEAD_PATH_TOOLS){
+        out.push({
+          level: "warn",
+          msg: "Claude Code accepts this rule but never checks it, and warns at startup. "
+             + "File permissions are matched against Read() and Edit() only.",
+          fix: DEAD_PATH_TOOLS[tool] + "(" + spec + ")",
+        });
+      }
+
+      if(PATH_TOOLS.indexOf(tool) >= 0 || tool in DEAD_PATH_TOOLS){
+        if(/\\/.test(spec) || /^[A-Za-z]:/.test(spec)){
+          out.push({
+            level: "warn",
+            msg: "Windows paths are normalized to POSIX before matching, so C:\\Users\\me is /c/Users/me.",
+            fix: tool + "(" + winToPosix(spec) + ")",
+          });
+        } else if(anchorOf(spec) === "src"){
+          const first = spec.slice(1).split("/")[0];
+          if(ROOTISH.test(first)){
+            out.push({
+              level: "warn",
+              msg: "A single leading slash anchors at the settings file, not the filesystem root.",
+              fix: tool + "(/" + spec + ")",
+            });
+          }
+        }
+      }
+      return out;
+    }
+
+    function winToPosix(spec){
+      let s = String(spec).replace(/\\/g, "/");
+      s = s.replace(/^([A-Za-z]):/, function(_, d){ return "/" + d.toLowerCase(); });
+      if(s.startsWith("/") && !s.startsWith("//")) s = "/" + s;
+      return s;
+    }
+
+    /* ── Assemble the settings object in a stable, readable key order ── */
+    function buildSettings(s){
+      const out = {};
+      if(s.schema) out["$schema"] = "https://json.schemastore.org/claude-code-settings.json";
+      if(s.model && s.model.trim()) out.model = s.model.trim();
+      if(s.effortLevel) out.effortLevel = s.effortLevel;
+
+      /* An empty string is a meaningful value here: it turns the trailer off.
+         So the two fields are gated by their own checkbox, not by emptiness. */
+      if(s.attributionOn) out.attribution = { commit: s.attributionCommit || "", pr: s.attributionPr || "" };
+      if(s.coAuthored === "true" || s.coAuthored === "false") out.includeCoAuthoredBy = s.coAuthored === "true";
+      if(s.autoMemory === "true" || s.autoMemory === "false") out.autoMemoryEnabled = s.autoMemory === "true";
+
+      const days = parseInt(s.cleanup, 10);
+      if(!isNaN(days) && days > 0) out.cleanupPeriodDays = days;
+
+      (s.featureKeys || []).forEach(function(k){ if(s.features && s.features[k]) out[k] = true; });
+
+      const env = {};
+      (s.envRows || []).forEach(function(row){ if(row.k.trim()) env[row.k.trim()] = row.v; });
+      if(Object.keys(env).length) out.env = env;
+
+      const perm = {};
+      ["allow", "ask", "deny"].forEach(function(b){
+        const list = (s.rules || []).filter(function(r){ return r.bucket === b; })
+                                    .map(function(r){ return r.rule; });
+        if(list.length) perm[b] = list;
+      });
+      const dirs = (s.additionalDirs || []).filter(function(d){ return d.trim(); });
+      if(dirs.length) perm.additionalDirectories = dirs;
+      if(s.defaultMode) perm.defaultMode = s.defaultMode;
+      if(s.disableAutoMode) perm.disableAutoMode = "disable";
+      if(s.disableBypass) perm.disableBypassPermissionsMode = "disable";
+      if(Object.keys(perm).length) out.permissions = perm;
+
+      return out;
+    }
+
+    window.ScgCore = {
+      SCOPE_ANCHOR: SCOPE_ANCHOR,
+      ANCHORS: ANCHORS,
+      PATH_TOOLS: PATH_TOOLS,
+      DEAD_PATH_TOOLS: DEAD_PATH_TOOLS,
+      splitRule: splitRule,
+      anchorOf: anchorOf,
+      buildSpec: buildSpec,
+      explainRule: explainRule,
+      lintRule: lintRule,
+      winToPosix: winToPosix,
+      buildSettings: buildSettings,
+    };
+  })();
+  </script>
+
   <script id="app">
     const { useState, useMemo } = React;
     const html = htm.bind(React.createElement);
+    const SCG = window.ScgCore;
 
     /* ── Curated palette of common permission rules ──
        Claude Code Bash rules use prefix matching with ":*"  →  Bash(git diff:*) */
@@ -212,6 +402,16 @@
         { rule: "Bash(curl:*)",       bucket: "deny" },
         { rule: "Bash(git push:*)",   bucket: "deny" },
       ]},
+      /* These are the absolute forms. They hold in every project, which the
+         cwd-relative guards above do not. */
+      { label: "Drive and path fences", items: [
+        { rule: "Read(//**/.env)",       bucket: "deny" },
+        { rule: "Read(~/.ssh/**)",       bucket: "deny" },
+        { rule: "Read(~/.aws/**)",       bucket: "deny" },
+        { rule: "Edit(//**)",            bucket: "deny" },
+        { rule: "Read(//c/Users/**)",    bucket: "allow" },
+        { rule: "Read(//e/**)",          bucket: "allow" },
+      ]},
     ];
 
     const MODEL_SUGGESTIONS = [
@@ -235,6 +435,20 @@
       { key: "disableRemoteControl",     label: "Disable Remote Control",        save: 300,  hint: "Removes remote-control tooling (v2.1.128+)." },
     ];
 
+    /* permissions.defaultMode. Six values, not the four this tool used to
+       offer. "default" is labelled Manual in the CLI and accepts "manual". */
+    const MODES = [
+      { v: "",                  label: "(unset)",           hint: "" },
+      { v: "default",           label: "default (Manual)",  hint: "Prompts on first use of each tool." },
+      { v: "acceptEdits",       label: "acceptEdits",       hint: "Accepts file edits and common filesystem commands inside the working directories." },
+      { v: "plan",              label: "plan",              hint: "Reads and explores, does not edit your source files." },
+      { v: "auto",              label: "auto",              hint: "Auto-approves tool calls with background safety checks." },
+      { v: "dontAsk",           label: "dontAsk",           hint: "Auto-denies anything not pre-approved by an allow rule." },
+      { v: "bypassPermissions", label: "bypassPermissions", hint: "Skips prompts. Only in a container or VM." },
+    ];
+
+    const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
     function fmtTokens(n){
       return n >= 1000 ? "~" + (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : "~" + n;
     }
@@ -251,10 +465,26 @@
 
       const [schema, setSchema]     = useState(true);
       const [model, setModel]       = useState("");
+      const [effortLevel, setEffort] = useState("");
       const [coAuthored, setCoAuthored] = useState("unset"); // unset | true | false
+      const [autoMemory, setAutoMemory] = useState("unset");
+      const [attributionOn, setAttributionOn] = useState(false);
+      const [attributionCommit, setAttrCommit] = useState("🤖 Generated with Claude Code");
+      const [attributionPr, setAttrPr] = useState("");
       const [cleanup, setCleanup]   = useState("");
       const [features, setFeatures] = useState({}); // { flagKey: true }
       const [envRows, setEnvRows]   = useState([{ k: "", v: "" }]);
+
+      const [additionalDirs, setDirs] = useState([]);
+      const [dirDraft, setDirDraft]   = useState("");
+      const [disableAutoMode, setDisableAuto] = useState(false);
+      const [disableBypass, setDisableBypass] = useState(false);
+
+      /* path-rule builder */
+      const [pathTool, setPathTool]     = useState("Read");
+      const [pathAnchor, setPathAnchor] = useState("abs");
+      const [pathBody, setPathBody]     = useState("");
+      const [pathBucket, setPathBucket] = useState("deny");
 
       const [copied, setCopied]     = useState(false);
 
@@ -275,37 +505,39 @@
       }
       function addCustom(){ addRule(custom, customBucket); setCustom(""); }
 
+      const pathSpec = SCG.buildSpec(pathAnchor, pathBody);
+      const pathRule = pathTool + "(" + pathSpec + ")";
+      function addPathRule(){
+        if(!pathBody.trim()) return;
+        addRule(pathRule, pathBucket);
+        setPathBody("");
+      }
+
+      function addDir(){
+        const d = dirDraft.trim(); if(!d) return;
+        setDirs(prev => prev.indexOf(d) >= 0 ? prev : [...prev, d]);
+        setDirDraft("");
+      }
+      function removeDir(d){ setDirs(prev => prev.filter(x => x !== d)); }
+
       function setEnv(i, key, val){
         setEnvRows(prev => prev.map((row, j) => j === i ? { ...row, [key]: val } : row));
       }
       function addEnvRow(){ setEnvRows(prev => [...prev, { k: "", v: "" }]); }
       function removeEnvRow(i){ setEnvRows(prev => prev.filter((_, j) => j !== i)); }
 
-      /* ── Assemble the settings object in a stable, readable key order ── */
-      const json = useMemo(() => {
-        const out = {};
-        if(schema) out["$schema"] = "https://json.schemastore.org/claude-code-settings.json";
-        if(model.trim()) out.model = model.trim();
-        if(coAuthored !== "unset") out.includeCoAuthoredBy = coAuthored === "true";
-        const days = parseInt(cleanup, 10);
-        if(!isNaN(days) && days > 0) out.cleanupPeriodDays = days;
-
-        FEATURES.forEach(f => { if(features[f.key]) out[f.key] = true; });
-
-        const env = {};
-        envRows.forEach(({ k, v }) => { if(k.trim()) env[k.trim()] = v; });
-        if(Object.keys(env).length) out.env = env;
-
-        const perm = {};
-        BUCKETS.forEach(b => {
-          const list = rules.filter(r => r.bucket === b).map(r => r.rule);
-          if(list.length) perm[b] = list;
-        });
-        if(defaultMode) perm.defaultMode = defaultMode;
-        if(Object.keys(perm).length) out.permissions = perm;
-
-        return JSON.stringify(out, null, 2);
-      }, [schema, model, coAuthored, cleanup, features, envRows, rules, defaultMode]);
+      /* Assembly lives in the core block so the Node tests can reach it. */
+      const json = useMemo(() => JSON.stringify(SCG.buildSettings({
+        schema, model, effortLevel, coAuthored, autoMemory,
+        attributionOn, attributionCommit, attributionPr,
+        cleanup, features, featureKeys: FEATURES.map(f => f.key),
+        envRows, rules, additionalDirs, defaultMode, disableAutoMode, disableBypass,
+      }), null, 2), [
+        schema, model, effortLevel, coAuthored, autoMemory,
+        attributionOn, attributionCommit, attributionPr,
+        cleanup, features, envRows, rules, additionalDirs,
+        defaultMode, disableAutoMode, disableBypass,
+      ]);
 
       function copy(){
         navigator.clipboard?.writeText(json).then(() => {
@@ -340,7 +572,9 @@
           <p className="scg-callout scg-hint">
             This builds a Claude Code <code>settings.json</code>. It does not rewrite Claude’s system
             prompt directly. It controls <strong>permissions</strong> (which tool calls are auto-approved,
-            asked about or blocked), plus the model, environment variables and a few basics. Everything runs
+            asked about or blocked, and which files Claude may read or change), plus the model, environment
+            variables and a few basics. Path rules are resolved against the scope you pick, because the same
+            pattern means different things in a user, project and local settings file. Everything runs
             locally in your browser; nothing is sent anywhere.
           </p>
 
@@ -403,16 +637,31 @@
                 <!-- selected rules -->
                 ${rules.length > 0 && html`
                   <ul className="scg-rulelist">
-                    ${rules.map(r => html`
-                      <li key=${r.rule} className="scg-ruleitem">
-                        <span className="scg-ruletext">${r.rule}</span>
-                        <${Seg} value=${r.bucket} onChange=${b => setBucket(r.rule, b)} options=${[
-                          { v:"allow", label:"Allow" }, { v:"ask", label:"Ask" }, { v:"deny", label:"Deny" },
-                        ]}/>
-                        <button type="button" className="scg-x" title="Remove"
-                          onClick=${() => removeRule(r.rule)}>×</button>
-                      </li>
-                    `)}
+                    ${rules.map(r => {
+                      const resolved = SCG.explainRule(r.rule, scope);
+                      const lints = SCG.lintRule(r.rule);
+                      return html`
+                        <li key=${r.rule} className="scg-ruleitem">
+                          <div className="scg-rulehead">
+                            <span className="scg-ruletext">${r.rule}</span>
+                            <${Seg} value=${r.bucket} onChange=${b => setBucket(r.rule, b)} options=${[
+                              { v:"allow", label:"Allow" }, { v:"ask", label:"Ask" }, { v:"deny", label:"Deny" },
+                            ]}/>
+                            <button type="button" className="scg-x" title="Remove"
+                              onClick=${() => removeRule(r.rule)}>×</button>
+                          </div>
+                          ${resolved && html`
+                            <div className="scg-resolve">matches <code>${resolved}</code></div>
+                          `}
+                          ${lints.map((l, i) => html`
+                            <div className="scg-lint" key=${i}>
+                              ${l.msg}
+                              ${l.fix && html`<span> Try <code>${l.fix}</code>.</span>`}
+                            </div>
+                          `)}
+                        </li>
+                      `;
+                    })}
                   </ul>
                 `}
 
@@ -420,19 +669,126 @@
                 <div className="scg-row" style=${{marginTop:18, marginBottom:0}}>
                   <label htmlFor="scg-mode">Default permission mode</label>
                   <select id="scg-mode" value=${defaultMode} onChange=${e => setMode(e.target.value)} style=${{maxWidth:260}}>
-                    <option value="">(unset)</option>
-                    <option value="default">default</option>
-                    <option value="acceptEdits">acceptEdits</option>
-                    <option value="plan">plan</option>
-                    <option value="bypassPermissions">bypassPermissions</option>
+                    ${MODES.map(m => html`<option key=${m.v} value=${m.v}>${m.label}</option>`)}
                   </select>
+                </div>
+                ${MODES.filter(m => m.v === defaultMode && m.hint).map(m => html`
+                  <p className="scg-hint" key=${m.v} style=${{margin:"4px 0 0"}}>${m.hint}</p>
+                `)}
+
+                <div className="scg-checkrow" style=${{marginTop:14, marginBottom:0}}>
+                  <input id="scg-noauto" type="checkbox" className="scg-check"
+                    checked=${disableAutoMode} onChange=${e => setDisableAuto(e.target.checked)}/>
+                  <label htmlFor="scg-noauto">
+                    Forbid auto mode <code>disableAutoMode</code>
+                  </label>
+                </div>
+                <div className="scg-checkrow" style=${{marginBottom:0}}>
+                  <input id="scg-nobypass" type="checkbox" className="scg-check"
+                    checked=${disableBypass} onChange=${e => setDisableBypass(e.target.checked)}/>
+                  <label htmlFor="scg-nobypass">
+                    Forbid bypassPermissions <code>disableBypassPermissionsMode</code>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Path rules -->
+              <div className="scg-card">
+                <h3>Path rules</h3>
+                <p className="scg-hint">
+                  Which files Claude may read or change. Rules use gitignore patterns, and the
+                  anchor decides where the pattern starts. Only <code>Read</code> and
+                  <code>Edit</code> are ever consulted for file paths; a path on
+                  <code>Write</code>, <code>NotebookEdit</code> or <code>Glob</code> is accepted and
+                  then ignored. A <code>Read</code> deny also blocks Edit and Write on the same path.
+                </p>
+
+                <div className="scg-row">
+                  <label>Tool</label>
+                  <${Seg} value=${pathTool} onChange=${setPathTool} options=${[
+                    { v:"Read", label:"Read" }, { v:"Edit", label:"Edit" },
+                  ]}/>
+                </div>
+
+                <div className="scg-row" style=${{alignItems:"flex-start"}}>
+                  <label>Anchor</label>
+                  <${Seg} value=${pathAnchor} onChange=${setPathAnchor}
+                    options=${SCG.ANCHORS.map(a => ({ v:a.id, label:a.label }))}/>
+                </div>
+                ${SCG.ANCHORS.filter(a => a.id === pathAnchor).map(a => html`
+                  <p className="scg-hint" key=${a.id} style=${{margin:"-4px 0 12px"}}>
+                    <strong>${a.name}.</strong> ${a.hint}
+                  </p>
+                `)}
+
+                <div className="scg-addbar" style=${{marginTop:0}}>
+                  <input type="text" placeholder=${pathAnchor === "abs" ? "e/misc/**" : "secrets/**"}
+                    value=${pathBody} onChange=${e => setPathBody(e.target.value)}
+                    onKeyDown=${e => { if(e.key === "Enter") addPathRule(); }}/>
+                  <${Seg} value=${pathBucket} onChange=${setPathBucket} options=${[
+                    { v:"allow", label:"Allow" }, { v:"ask", label:"Ask" }, { v:"deny", label:"Deny" },
+                  ]}/>
+                  <button type="button" className="scg-small-btn" onClick=${addPathRule}>Add</button>
+                </div>
+
+                ${pathBody.trim() && html`
+                  <div className="scg-preview">
+                    <div className="scg-ruletext">${pathRule}</div>
+                    <div className="scg-resolve">
+                      in <strong>${scope}</strong> settings, matches <code>${SCG.explainRule(pathRule, scope)}</code>
+                    </div>
+                    ${SCG.lintRule(pathRule).map((l, i) => html`
+                      <div className="scg-lint" key=${i}>
+                        ${l.msg}${l.fix && html`<span> Try <code>${l.fix}</code>.</span>`}
+                      </div>
+                    `)}
+                  </div>
+                `}
+
+                <p className="scg-hint" style=${{marginTop:14, marginBottom:0}}>
+                  On Windows, paths are normalized to POSIX before matching:
+                  <code>C:\\Users\\me</code> becomes <code>/c/Users/me</code>. A whole drive is
+                  <code>//c/**</code>, every drive is <code>//**</code>.
+                </p>
+              </div>
+
+              <!-- additionalDirectories -->
+              <div className="scg-card">
+                <h3>Additional directories</h3>
+                <p className="scg-hint">
+                  Folders outside the project that Claude may work in. They grant file access only:
+                  no <code>CLAUDE.md</code>, agents or hooks are loaded from them. In project scope
+                  they take effect only after you accept the workspace trust dialog.
+                </p>
+                ${additionalDirs.length > 0 && html`
+                  <ul className="scg-rulelist">
+                    ${additionalDirs.map(d => html`
+                      <li key=${d} className="scg-ruleitem">
+                        <div className="scg-rulehead">
+                          <span className="scg-ruletext">${d}</span>
+                          <button type="button" className="scg-x" title="Remove"
+                            onClick=${() => removeDir(d)}>×</button>
+                        </div>
+                      </li>
+                    `)}
+                  </ul>
+                `}
+                <div className="scg-addbar">
+                  <input type="text" placeholder="../shared-lib" value=${dirDraft}
+                    onChange=${e => setDirDraft(e.target.value)}
+                    onKeyDown=${e => { if(e.key === "Enter") addDir(); }}/>
+                  <button type="button" className="scg-small-btn" onClick=${addDir}>Add</button>
                 </div>
               </div>
 
               <!-- Basics -->
               <div className="scg-card">
                 <h3>Basics</h3>
-                <p className="scg-hint">All optional. Leave a field blank to omit it.</p>
+                <p className="scg-hint">
+                  All optional. Leave a field blank to omit it. Effort level, auto memory and
+                  attribution are personal preferences: put them in <strong>user</strong> scope
+                  rather than in a project file your team shares.
+                </p>
 
                 <div className="scg-row">
                   <label htmlFor="scg-model">Model</label>
@@ -444,11 +800,55 @@
                 </div>
 
                 <div className="scg-row">
-                  <label>Co-authored-by in commits</label>
+                  <label htmlFor="scg-effort">Effort level</label>
+                  <select id="scg-effort" value=${effortLevel} onChange=${e => setEffort(e.target.value)} style=${{maxWidth:200}}>
+                    <option value="">(unset)</option>
+                    ${EFFORTS.map(v => html`<option key=${v} value=${v}>${v}</option>`)}
+                  </select>
+                </div>
+
+                <div className="scg-row">
+                  <label>Auto memory</label>
+                  <${Seg} value=${autoMemory} onChange=${setAutoMemory} options=${[
+                    { v:"unset", label:"Unset" }, { v:"true", label:"On" }, { v:"false", label:"Off" },
+                  ]}/>
+                </div>
+
+                <div className="scg-checkrow" style=${{marginTop:16}}>
+                  <input id="scg-attr" type="checkbox" className="scg-check"
+                    checked=${attributionOn} onChange=${e => setAttributionOn(e.target.checked)}/>
+                  <label htmlFor="scg-attr">
+                    Set commit and PR attribution <code>attribution</code>
+                    <span className="scg-hint" style=${{display:"block"}}>
+                      An empty field is a real value: it removes the trailer.
+                    </span>
+                  </label>
+                </div>
+                ${attributionOn && html`
+                  <${React.Fragment}>
+                    <div className="scg-row">
+                      <label htmlFor="scg-attr-commit">Commit trailer</label>
+                      <input id="scg-attr-commit" type="text" value=${attributionCommit}
+                        onChange=${e => setAttrCommit(e.target.value)}/>
+                    </div>
+                    <div className="scg-row">
+                      <label htmlFor="scg-attr-pr">PR trailer</label>
+                      <input id="scg-attr-pr" type="text" value=${attributionPr}
+                        onChange=${e => setAttrPr(e.target.value)}/>
+                    </div>
+                  <//>
+                `}
+
+                <div className="scg-row">
+                  <label>Co-authored-by (legacy)</label>
                   <${Seg} value=${coAuthored} onChange=${setCoAuthored} options=${[
                     { v:"unset", label:"Unset" }, { v:"true", label:"On" }, { v:"false", label:"Off" },
                   ]}/>
                 </div>
+                <p className="scg-hint" style=${{margin:"-6px 0 12px"}}>
+                  <code>includeCoAuthoredBy</code> predates <code>attribution</code> and is no longer
+                  listed in the current settings reference. Keep it only for older versions.
+                </p>
 
                 <div className="scg-row">
                   <label htmlFor="scg-cleanup">Keep session files (days)</label>
