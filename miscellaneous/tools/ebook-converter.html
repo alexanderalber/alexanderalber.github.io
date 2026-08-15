@@ -4583,15 +4583,24 @@
     // image for the same bytes. SVG is text and does compress.
     const PRECOMPRESSED = { 'image/jpeg': 1, 'image/png': 1, 'image/gif': 1, 'image/webp': 1 };
 
-    async function writeImagesZip(book) {
+    // The loose files, ready to be placed anywhere: the single-book download
+    // wraps them in their own zip, the batch drops them into a folder inside
+    // the batch zip. Both spellings of "give me the pictures" therefore name
+    // and order the files identically.
+    function imageParts(book) {
       const names = imageZipNames(book, '');
-      if (!names.size) throw new Error('This book has no images.');
-      const entries = [];
+      const parts = [];
       for (const entry of names) {
         const res = book.resources.get(entry[0]);
-        entries.push({ name: entry[1], bytes: res.bytes, store: !!PRECOMPRESSED[res.mime] });
+        parts.push({ name: entry[1], bytes: res.bytes, store: !!PRECOMPRESSED[res.mime] });
       }
-      return zipWrite(entries);
+      return parts;
+    }
+
+    async function writeImagesZip(book) {
+      const parts = imageParts(book);
+      if (!parts.length) throw new Error('This book has no images.');
+      return zipWrite(parts);
     }
 
     // ══ DOCX writer ══════════════════════════════════════════════════════════
@@ -5020,11 +5029,17 @@
       latex: { write: writeLatex, ext: 'tex', mime: 'text/x-tex;charset=utf-8' },
       docx: { write: writeDocx, ext: 'docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
       pandoc: { write: writePandoc, ext: 'pandoc.zip', mime: 'application/zip' },
+      // A folder writer, not a file writer: `parts` instead of `write`. It has
+      // no single-file form, because a book's images are many files and the
+      // batch already has a zip to put them in. write() below therefore
+      // refuses it, and the target is offered in batch mode only.
+      images: { parts: imageParts, ext: '', mime: 'application/zip' },
     };
 
     async function write(book, target) {
       const w = WRITERS[target];
       if (!w) throw new Error('Cannot write ' + target + ' yet.');
+      if (!w.write) throw new Error(target + ' is a batch-only target.');
       return { bytes: await w.write(book), ext: w.ext, mime: w.mime };
     }
 
@@ -5045,6 +5060,10 @@
       latex:  { label: 'LaTeX',         read: false,     write: true,      exts: ['.tex'] },
       docx:   { label: 'DOCX',          read: false,     write: true,      exts: ['.docx'] },
       pandoc: { label: 'Pandoc bundle', read: false,     write: true,      exts: ['.zip'] },
+      // batchOnly keeps it out of the single-book target row (the Images tab
+      // is the single-book answer) and out of the machine diagram, where a row
+      // that can never light up would only puzzle.
+      images: { label: 'Images',        read: false,     write: true,      exts: ['.zip'], batchOnly: true },
     };
 
     // ══ book editing ═════════════════════════════════════════════════════════
@@ -5692,6 +5711,12 @@
       const used = new Set();
       const report = (i, entry) => { if (onProgress) onProgress(i, items.length, entry); };
 
+      const writer = WRITERS[target];
+      if (!writer) throw new Error('Cannot write ' + target + ' yet.');
+      // A folder writer produces the images as they are, so the text transforms
+      // have nothing to act on and are skipped rather than run for nothing.
+      const textOps = !writer.parts;
+
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         report(i, { name: item.name, status: 'working' });
@@ -5701,33 +5726,51 @@
           let bytes = new Uint8Array(await item.getBytes());
           let book = await read(bytes, log, item.name);
           bytes = null;
-          if (opts.typography) {
+          if (textOps && opts.typography) {
             const lang = opts.typography === 'auto' ? null : opts.typography;
             book = cleanTypography(book, lang).book;
           }
-          const rep = opts.replace;
+          const rep = textOps ? opts.replace : null;
           if (rep && rep.query) {
             const r = bookReplace(book, rep.query, rep.replacement || '', rep);
             if (r.error) entry.notes.push('Search and replace skipped: ' + r.error);
             else { book = r.book; entry.notes.push(r.total + ' replacement' + (r.total === 1 ? '' : 's')); }
           }
-          const out = await write(book, target);
-          book = null;
           // Deduplication is per folder: two books of the same name in two
-          // folders are not a collision once the folders are kept.
+          // folders are not a collision once the folders are kept. A folder
+          // writer competes for the same names, so both go through `used`.
           const dir = outDirOf(item.path || item.name);
           const stem = safeSegment(item.name.replace(/\.[A-Za-z0-9]+$/, '')) || 'book';
-          let name = dir + stem + '.' + out.ext;
+          const suffix = writer.parts ? '' : '.' + writer.ext;
+          let name = dir + stem + suffix;
           let n = 2;
           while (used.has(name.toLowerCase())) {
-            name = dir + stem + ' (' + n + ').' + out.ext;
+            name = dir + stem + ' (' + n + ')' + suffix;
             n++;
           }
           used.add(name.toLowerCase());
-          entries.push({ name: name, bytes: out.bytes, store: !!STORED_OUT[out.ext] });
+          if (writer.parts) {
+            const parts = writer.parts(book);
+            book = null;
+            for (const p of parts) {
+              entries.push({ name: name + '/' + p.name, bytes: p.bytes, store: p.store });
+              entry.outSize += p.bytes.length;
+            }
+            // No images is not a failure here: a batch of plain text files
+            // would otherwise read as a total loss. The zip format has no way
+            // to hold an empty folder either, so nothing is written and the
+            // name goes back into circulation.
+            entry.outName = parts.length ? name + '/' : 'no images';
+            entry.notes.push(parts.length + (parts.length === 1 ? ' image' : ' images'));
+            if (!parts.length) used.delete(name.toLowerCase());
+          } else {
+            const out = await write(book, target);
+            book = null;
+            entries.push({ name: name, bytes: out.bytes, store: !!STORED_OUT[out.ext] });
+            entry.outName = name;
+            entry.outSize = out.bytes.length;
+          }
           entry.ok = true;
-          entry.outName = name;
-          entry.outSize = out.bytes.length;
         } catch (e) {
           entry.error = (e && e.message) ? e.message : String(e);
         }
@@ -5788,7 +5831,7 @@
       wrapLines: wrapLines, coverSectionId: COVER_SECTION_ID,
       // image bundle, reader export, batch
       imageResources: imageResources, imageZipNames: imageZipNames,
-      writeImagesZip: writeImagesZip,
+      writeImagesZip: writeImagesZip, imageParts: imageParts,
       buildHtmlParts: buildHtmlParts, writeHtmlReader: writeHtmlReader,
       readerTocHtml: readerTocHtml, readerJs: readerJs,
       readerThemes: READER_THEMES, readerFonts: READER_FONTS,
@@ -5810,9 +5853,12 @@
     // Everything below derives from the core FORMATS registry, so the diagram,
     // the target buttons and the file input can never disagree.
     const FORMATS = Core.formats;
-    const TARGETS = Object.keys(FORMATS)
+    // Two rows, one registry: the batch can write a folder per book, the
+    // single-book view cannot, so batchOnly targets appear on the left only.
+    const BATCH_TARGETS = Object.keys(FORMATS)
       .filter((id) => FORMATS[id].write === true)
       .map((id) => ({ id, label: FORMATS[id].label }));
+    const TARGETS = BATCH_TARGETS.filter((t) => !FORMATS[t.id].batchOnly);
     const ACCEPT = Object.keys(FORMATS)
       .filter((id) => FORMATS[id].read === true)
       .map((id) => FORMATS[id].exts.join(','))
@@ -5900,7 +5946,7 @@
     function Machine({ detected, target }) {
       const ids = Object.keys(FORMATS);
       const inputs = ids.filter((id) => FORMATS[id].read);
-      const outputs = ids.filter((id) => FORMATS[id].write);
+      const outputs = ids.filter((id) => FORMATS[id].write && !FORMATS[id].batchOnly);
       const rowH = 26;
       const H = Math.max(inputs.length, outputs.length) * rowH + 30;
       const boxW = 130, boxH = H - 34;
@@ -7177,7 +7223,7 @@
                     </span>
                     <span className=${'ec-fstat ' + f.status}>
                       ${f.status === 'done'
-                        ? f.outName + ' · ' + fmtSize(f.outSize)
+                        ? f.outName + (f.outSize ? ' · ' + fmtSize(f.outSize) : '')
                         : f.status === 'working' ? 'converting…'
                           : f.status === 'failed' ? 'failed' : fmtSize(f.size)}
                     </span>
@@ -7190,7 +7236,7 @@
                 Convert all to
               </label>
               <div className="seg-row" style=${{ display: 'flex', flexWrap: 'wrap', marginBottom: 14 }}>
-                ${TARGETS.map((t) => html`
+                ${BATCH_TARGETS.map((t) => html`
                   <button
                     key=${t.id}
                     className=${'lang-seg' + (target === t.id ? ' active' : '')}
@@ -7201,12 +7247,19 @@
                 `)}
               </div>
 
-              <${BatchEdits} opts=${bopts} onOpts=${setBopts} />
+              ${target === 'images' ? html`
+                <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
+                  No conversion: one folder per book, holding its images as they are in the file,
+                  cover first. Books without images are listed in the log and take up no folder.
+                </p>
+              ` : html`<${React.Fragment}>
+                <${BatchEdits} opts=${bopts} onOpts=${setBopts} />
 
-              <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
-                Cover and table of contents are single-book tools: drop one file on its own to
-                use them, and to get the preview and the images.
-              </p>
+                <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
+                  Cover and table of contents are single-book tools: drop one file on its own to
+                  use them, and to get the preview and the images.
+                </p>
+              <//>`}
 
               <button onClick=${runBatch} disabled=${batch.running} style=${{ width: 'auto' }}>
                 Convert all
@@ -7229,7 +7282,7 @@
                   </a>
                   <span style=${{ color: 'var(--tool-note)', fontSize: 13 }}>
                     (${fmtSize(result.size)} · ${batch.files.filter((f) => f.status === 'done').length} of${' '}
-                    ${batch.files.length} converted, log included)
+                    ${batch.files.length} ${target === 'images' ? 'read' : 'converted'}, log included)
                   </span>
                 </p>
               `}
@@ -7321,7 +7374,8 @@
           <p style=${{ fontSize: 11, color: 'var(--tool-note)', marginBottom: 4 }}>
             Reads EPUB, MOBI, AZW3, Markdown, HTML and plain text; writes EPUB, MOBI, Markdown, HTML,
             HTML (Reader), LaTeX, DOCX, Pandoc bundle and plain text. Drop several files at once to
-            convert them in one go and get them back as a zip. Encrypted files cannot be opened. Formats
+            convert them in one go and get them back as a zip, or pick Images as the target and get
+            their pictures instead, one folder per book. Encrypted files cannot be opened. Formats
             implemented from their public descriptions. A single Markdown or LaTeX file cannot
             carry images; they are left out there. The Pandoc bundle keeps them: a zip with
             book.md and media/.
