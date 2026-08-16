@@ -1,0 +1,1332 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Patch Similarity Explorer - alber.me</title>
+  <meta name="description" content="Upload an image, click any point, and see a heatmap of how similar every other patch is to it in DINOv3 feature space. Runs fully in your browser, nothing is uploaded to a server.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/patch-similarity.html">
+  <meta property="og:title" content="Patch Similarity Explorer">
+  <meta property="og:description" content="Click a point in your image and see which other regions a vision model considers the same thing. Cosine similarity over DINOv3 patch features, computed in the browser.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/patch-similarity.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Patch Similarity Explorer",
+    "description": "Upload an image, click any point, and see a heatmap of how similar every other patch is to it in DINOv3 feature space. Runs fully in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/patch-similarity.html",
+    "applicationCategory": "MultimediaApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+  <style>
+    /* The page renders into a plain .container, so header, content and footer
+       share Pico's stepped width and nothing has to be capped by hand. */
+    h1.ps-h1 { font-size: 1.5rem; font-weight: 700; color: var(--tool-emph); margin: 0 0 6px; }
+    p.ps-sub { font-size: .84rem; color: var(--tool-note); margin: 0 0 12px; max-width: 76ch; }
+
+    .ps-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(270px, 320px); gap: 16px; align-items: start; }
+    @media (max-width: 861px) { .ps-layout { grid-template-columns: 1fr; } }
+
+    .ps-stage { min-width: 0; }
+    .ps-slots { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    .ps-slots.two { grid-template-columns: 1fr 1fr; }
+    @media (max-width: 640px) { .ps-slots.two { grid-template-columns: 1fr; } }
+
+    .ps-slothead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; min-height: 24px; }
+    .ps-slotname { font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: var(--tool-note); }
+    .ps-slotfile { font-size: .72rem; color: var(--tool-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch; }
+    .ps-slotact { margin-left: auto; display: inline-flex; gap: 6px; }
+
+    /* Frame convention: the frame sits on the thing that shows something. */
+    .ps-canvaswrap { position: relative; line-height: 0; touch-action: none; }
+    .ps-canvas { display: block; width: 100%; height: auto; cursor: crosshair;
+      border: 1px solid var(--tool-border); border-radius: 8px; box-shadow: var(--tool-panel-shadow); }
+    .ps-canvas.busy { opacity: .55; cursor: progress; }
+
+    .ps-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+      min-height: 260px; padding: 26px 20px; text-align: center; cursor: pointer;
+      border: 2px dashed var(--pico-muted-border-color); border-radius: 12px; background: var(--tool-subtle);
+      color: var(--tool-label); font-size: .84rem; line-height: 1.6; }
+    .ps-drop:hover, .ps-drop.over { border-color: var(--tool-sig-info); color: var(--tool-text); }
+    .ps-drop .ps-drophint { font-size: .72rem; color: var(--tool-faint); }
+
+    .ps-btn { display: inline-flex; align-items: center; gap: 6px; width: auto; margin: 0;
+      padding: .28rem .7rem; font-size: .74rem; font-family: inherit; cursor: pointer; border-radius: 7px;
+      border: 1.5px solid var(--tool-border); background: var(--tool-surface); color: var(--tool-text); }
+    .ps-btn:hover:not(:disabled) { border-color: var(--tool-faint); }
+    .ps-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .ps-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .ps-val { font-size: .72rem; color: var(--tool-label); font-variant-numeric: tabular-nums; }
+    .ps-seg { display: inline-flex; }
+    .ps-check { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: var(--tool-text); margin: 0; }
+    .ps-check input { margin: 0; }
+    .ps-hint { font-size: .68rem; color: var(--tool-faint); line-height: 1.5; margin: 6px 0 0; }
+    input.ps-slider { width: 100%; margin: 4px 0 0; }
+
+    .ps-progress { height: 8px; border-radius: 4px; background: var(--tool-subtle); overflow: hidden; margin-top: 6px; }
+    .ps-progress > div { height: 100%; background: var(--tool-sig-info); transition: width .2s; }
+    .ps-status { font-size: .72rem; color: var(--tool-note); line-height: 1.5; }
+    .ps-warn { margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: var(--tool-warn-bg);
+      border: 1px solid var(--tool-warn-border); color: var(--tool-warn-text); font-size: .72rem; line-height: 1.5; }
+
+    .ps-legend { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: .68rem; color: var(--tool-note); }
+    .ps-legendbar { flex: 1 1 auto; height: 8px; border-radius: 4px; border: 1px solid var(--tool-hairline); }
+    .ps-swatches { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .ps-swatch { display: inline-flex; align-items: center; gap: 5px; font-size: .68rem; color: var(--tool-note); }
+    .ps-swatchdot { width: 11px; height: 11px; border-radius: 3px; border: 1px solid var(--tool-hairline); }
+
+    .ps-fold { margin-top: 22px; }
+    p.ps-note { font-size: 11px; color: var(--tool-note); line-height: 1.6; margin-top: 18px; max-width: 76ch; }
+  </style>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#images" id="nav-cat">Images</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:var(--tool-emph);margin-bottom:8px">Patch Similarity Explorer</h1>
+        <p style="color:var(--tool-label);max-width:70ch">Upload an image, click any point in it, and see a heatmap of how similar every other patch of the picture is to the one you clicked. Similarity is the cosine between DINOv3 patch features, so the model decides what counts as the same thing: the same fur, the same brick, the same kind of leaf, not the same colour.</p>
+        <ul style="color:var(--tool-label);max-width:70ch;font-size:0.95rem">
+          <li>Everything runs in your browser. The image is never uploaded to any server, and there is no server to upload it to.</li>
+          <li>The picture is cut into a grid of 16 by 16 pixel patches, each of which becomes one feature vector; the heatmap shows the cosine similarity of every patch to your reference patch.</li>
+          <li>Load a second image and the reference patch is compared against every patch of that one too, which finds like material and like parts across two pictures.</li>
+          <li>The Structure view drops the reference patch: PCA paints the feature space itself as colour, k-means turns it into an unsupervised segmentation.</li>
+          <li>Patch resolution is coarse by construction, so the map is upsampled back to full resolution along the edges of the original image.</li>
+        </ul>
+        <p style="font-size:11px;color:var(--tool-note);max-width:70ch">Built with <a href="https://github.com/facebookresearch/dinov3">DINOv3</a> (ViT-S/16, 4-bit quantized, 15 MB), used under the <a href="/assets/files/dinov3/LICENSE-DINOv3.txt">DINOv3 License</a>. This project is not affiliated with Meta. Private hobby project, non-commercial.</p>
+      </div>
+    </div>
+  </main>
+
+  <script id="dinocore">
+    /* Pure feature-map math for patch-similarity.html: cosine maps, PCA colouring,
+       k-means segmentation, joint bilateral upsampling and the colour ramps.
+       No DOM, no React; the Node tests eval this block by its id.
+
+       Feature layout everywhere: a Float32Array of n*dim, patch i occupying
+       [i*dim, (i+1)*dim). Patch order is row major over the patch grid. */
+
+    const DINO_EPS = 1e-12;
+
+    // Standard mulberry32. Seeded so every derived view (k-means init, PCA start
+    // vectors) is reproducible for the same image and settings.
+    function mulberry32(seed) {
+      let a = seed >>> 0;
+      return function () {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // Pixel in the displayed image to patch index, clamped to the grid.
+    function patchIndexFromPixel(x, y, imgW, imgH, gridW, gridH) {
+      const gx = Math.min(gridW - 1, Math.max(0, Math.floor((x / imgW) * gridW)));
+      const gy = Math.min(gridH - 1, Math.max(0, Math.floor((y / imgH) * gridH)));
+      return gy * gridW + gx;
+    }
+
+    function normsOf(features, n, dim) {
+      const norms = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        const o = i * dim;
+        for (let d = 0; d < dim; d++) s += features[o + d] * features[o + d];
+        norms[i] = Math.sqrt(s);
+      }
+      return norms;
+    }
+
+    // Cosine similarity of every patch to patch refIdx. Zero vectors yield 0.
+    function cosineMap(features, dim, refIdx) {
+      const n = Math.floor(features.length / dim);
+      const out = new Float32Array(n);
+      const norms = normsOf(features, n, dim);
+      const nr = norms[refIdx];
+      if (!(nr > DINO_EPS)) return out;
+      const ro = refIdx * dim;
+      for (let i = 0; i < n; i++) {
+        if (!(norms[i] > DINO_EPS)) continue;
+        let s = 0;
+        const o = i * dim;
+        for (let d = 0; d < dim; d++) s += features[o + d] * features[ro + d];
+        out[i] = s / (norms[i] * nr);
+      }
+      return out;
+    }
+
+    // Reference patch from featsA, map over featsB (image A against image B).
+    function cosineMapCross(featsA, featsB, dim, refIdxA) {
+      const na = Math.floor(featsA.length / dim);
+      const nb = Math.floor(featsB.length / dim);
+      const out = new Float32Array(nb);
+      if (refIdxA < 0 || refIdxA >= na) return out;
+      let rn = 0;
+      const ro = refIdxA * dim;
+      for (let d = 0; d < dim; d++) rn += featsA[ro + d] * featsA[ro + d];
+      rn = Math.sqrt(rn);
+      if (!(rn > DINO_EPS)) return out;
+      const norms = normsOf(featsB, nb, dim);
+      for (let i = 0; i < nb; i++) {
+        if (!(norms[i] > DINO_EPS)) continue;
+        let s = 0;
+        const o = i * dim;
+        for (let d = 0; d < dim; d++) s += featsB[o + d] * featsA[ro + d];
+        out[i] = s / (norms[i] * rn);
+      }
+      return out;
+    }
+
+    function percentile(sorted, p) {
+      if (sorted.length === 0) return 0;
+      const idx = (sorted.length - 1) * p;
+      const lo = Math.floor(idx), hi = Math.ceil(idx);
+      if (lo === hi) return sorted[lo];
+      return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+    }
+
+    /* Top three principal components by power iteration with deflation on the
+       explicit dim x dim covariance. dim is a few hundred, so materializing it
+       is both simpler and faster than repeated passes over n patches.
+       Returns { r, g, b }: three Float32Arrays of length n, each robustly
+       normalized to [0,1] via its 2nd/98th percentile. A component with no
+       variance left (deflated to nothing) comes out flat at 0.5. */
+    function pcaRgb(features, n, dim) {
+      const mean = new Float64Array(dim);
+      for (let i = 0; i < n; i++) {
+        const o = i * dim;
+        for (let d = 0; d < dim; d++) mean[d] += features[o + d];
+      }
+      for (let d = 0; d < dim; d++) mean[d] /= Math.max(1, n);
+
+      const cov = new Float64Array(dim * dim);
+      const row = new Float64Array(dim);
+      for (let i = 0; i < n; i++) {
+        const o = i * dim;
+        for (let d = 0; d < dim; d++) row[d] = features[o + d] - mean[d];
+        for (let a = 0; a < dim; a++) {
+          const va = row[a];
+          if (va === 0) continue;
+          const off = a * dim;
+          for (let b = 0; b < dim; b++) cov[off + b] += va * row[b];
+        }
+      }
+      const denom = Math.max(1, n - 1);
+      for (let k = 0; k < cov.length; k++) cov[k] /= denom;
+
+      const rnd = mulberry32(0x5EED);
+      const comps = [];
+      const lambdas = [];
+      const tmp = new Float64Array(dim);
+      for (let c = 0; c < 3; c++) {
+        const v = new Float64Array(dim);
+        for (let d = 0; d < dim; d++) v[d] = rnd() * 2 - 1;
+        let vn = 0;
+        for (let d = 0; d < dim; d++) vn += v[d] * v[d];
+        vn = Math.sqrt(vn) || 1;
+        for (let d = 0; d < dim; d++) v[d] /= vn;
+        let lambda = 0;
+        for (let it = 0; it < 80; it++) {
+          for (let a = 0; a < dim; a++) {
+            let s = 0;
+            const off = a * dim;
+            for (let b = 0; b < dim; b++) s += cov[off + b] * v[b];
+            tmp[a] = s;
+          }
+          let nrm = 0;
+          for (let d = 0; d < dim; d++) nrm += tmp[d] * tmp[d];
+          nrm = Math.sqrt(nrm);
+          if (!(nrm > DINO_EPS)) { lambda = 0; break; }
+          for (let d = 0; d < dim; d++) v[d] = tmp[d] / nrm;
+          lambda = nrm;
+        }
+        comps.push(Float64Array.from(v));
+        lambdas.push(lambda);
+        if (lambda > DINO_EPS) {
+          for (let a = 0; a < dim; a++) {
+            const off = a * dim, va = v[a];
+            for (let b = 0; b < dim; b++) cov[off + b] -= lambda * va * v[b];
+          }
+        }
+      }
+
+      /* A component whose eigenvalue is numerically nothing next to the first
+         one carries only the deflation residual. Without this test the robust
+         normalization below would stretch that residual over the full [0,1]
+         and paint pure noise into the green and blue channels. */
+      const lamMax = Math.max.apply(null, lambdas);
+      const out = [];
+      for (let c = 0; c < 3; c++) {
+        const proj = new Float32Array(n);
+        if (!(lambdas[c] > 1e-9 * lamMax) || !(lamMax > DINO_EPS)) {
+          proj.fill(0.5);
+          out.push(proj);
+          continue;
+        }
+        const v = comps[c];
+        for (let i = 0; i < n; i++) {
+          const o = i * dim;
+          let s = 0;
+          for (let d = 0; d < dim; d++) s += (features[o + d] - mean[d]) * v[d];
+          proj[i] = s;
+        }
+        const sorted = Array.from(proj).sort((x, y) => x - y);
+        const lo = percentile(sorted, 0.02), hi = percentile(sorted, 0.98);
+        const span = hi - lo;
+        if (!(span > DINO_EPS)) {
+          proj.fill(0.5);
+        } else {
+          for (let i = 0; i < n; i++) proj[i] = Math.min(1, Math.max(0, (proj[i] - lo) / span));
+        }
+        out.push(proj);
+      }
+      return { r: out[0], g: out[1], b: out[2] };
+    }
+
+    function sqDist(features, i, center, dim) {
+      const o = i * dim;
+      let s = 0;
+      for (let d = 0; d < dim; d++) {
+        const t = features[o + d] - center[d];
+        s += t * t;
+      }
+      return s;
+    }
+
+    /* k-means++ init from mulberry32(seed), then Lloyd iterations until the
+       assignment stops changing or 50 rounds are up. Returns Uint16Array n of
+       labels, deterministic for identical input. */
+    function kmeansSegments(features, n, dim, k, seed) {
+      const labels = new Uint16Array(n);
+      if (n === 0 || k <= 1) return labels;
+      const kk = Math.min(k, n);
+      const rnd = mulberry32(seed >>> 0);
+
+      const centers = [];
+      const first = Math.min(n - 1, Math.floor(rnd() * n));
+      centers.push(Float64Array.from(features.subarray(first * dim, first * dim + dim)));
+      const best = new Float64Array(n);
+      for (let i = 0; i < n; i++) best[i] = sqDist(features, i, centers[0], dim);
+      while (centers.length < kk) {
+        let total = 0;
+        for (let i = 0; i < n; i++) total += best[i];
+        let pick = n - 1;
+        if (total > DINO_EPS) {
+          let target = rnd() * total, acc = 0;
+          for (let i = 0; i < n; i++) {
+            acc += best[i];
+            if (acc >= target) { pick = i; break; }
+          }
+        } else {
+          pick = Math.min(n - 1, Math.floor(rnd() * n));
+        }
+        const c = Float64Array.from(features.subarray(pick * dim, pick * dim + dim));
+        centers.push(c);
+        for (let i = 0; i < n; i++) {
+          const d2 = sqDist(features, i, c, dim);
+          if (d2 < best[i]) best[i] = d2;
+        }
+      }
+
+      const sums = new Float64Array(kk * dim);
+      const counts = new Float64Array(kk);
+      for (let it = 0; it < 50; it++) {
+        let moved = false;
+        for (let i = 0; i < n; i++) {
+          let bi = 0, bd = Infinity;
+          for (let c = 0; c < kk; c++) {
+            const d2 = sqDist(features, i, centers[c], dim);
+            if (d2 < bd) { bd = d2; bi = c; }
+          }
+          if (labels[i] !== bi) { labels[i] = bi; moved = true; }
+        }
+        if (!moved && it > 0) break;
+        sums.fill(0);
+        counts.fill(0);
+        for (let i = 0; i < n; i++) {
+          const c = labels[i], o = i * dim, off = c * dim;
+          for (let d = 0; d < dim; d++) sums[off + d] += features[o + d];
+          counts[c]++;
+        }
+        for (let c = 0; c < kk; c++) {
+          if (counts[c] === 0) continue;
+          const off = c * dim;
+          for (let d = 0; d < dim; d++) centers[c][d] = sums[off + d] / counts[c];
+        }
+        if (!moved) break;
+      }
+      return labels;
+    }
+
+    // Rec.601 luma from RGBA bytes, as a Float32Array of w*h in 0..255.
+    function lumaOf(rgbaData, w, h) {
+      const out = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) {
+        const k = i * 4;
+        out[i] = 0.299 * rgbaData[k] + 0.587 * rgbaData[k + 1] + 0.114 * rgbaData[k + 2];
+      }
+      return out;
+    }
+
+    // Per-cell mean of the full-res guide, so the range term compares like with like.
+    function coarseGuide(guideLuma, w, h, gw, gh) {
+      const sum = new Float64Array(gw * gh);
+      const cnt = new Float64Array(gw * gh);
+      for (let y = 0; y < h; y++) {
+        const cy = Math.min(gh - 1, Math.floor((y / h) * gh));
+        for (let x = 0; x < w; x++) {
+          const cx = Math.min(gw - 1, Math.floor((x / w) * gw));
+          const c = cy * gw + cx;
+          sum[c] += guideLuma[y * w + x];
+          cnt[c]++;
+        }
+      }
+      const out = new Float32Array(gw * gh);
+      for (let c = 0; c < gw * gh; c++) out[c] = cnt[c] > 0 ? sum[c] / cnt[c] : 0;
+      return out;
+    }
+
+    /* Joint bilateral upsampling of a gw*gh scalar field to w*h, guided by the
+       full-res luma (Float32Array of w*h, in 0..255, i.e. what lumaOf returns).
+
+       The spatial term is the bilinear weight of the 2x2 coarse neighbourhood
+       around the sample point, not a separate Gaussian: that way a constant
+       guide makes every range weight equal and the whole thing collapses to
+       plain bilinear interpolation, which is the behaviour to fall back on.
+       opts.sigmaR is the range sigma in luma units (default 25). */
+    function bilateralUpsample(coarse, gw, gh, guideLuma, w, h, opts) {
+      const o = opts || {};
+      const sigmaR = o.sigmaR > 0 ? o.sigmaR : 25;
+      const inv2s2 = 1 / (2 * sigmaR * sigmaR);
+      const cg = o.guideCoarse || coarseGuide(guideLuma, w, h, gw, gh);
+      const out = new Float32Array(w * h);
+      const cl = (v, hi) => (v < 0 ? 0 : v > hi ? hi : v);
+
+      for (let y = 0; y < h; y++) {
+        const fy = ((y + 0.5) / h) * gh - 0.5;
+        const y0 = Math.floor(fy), ty = fy - y0;
+        for (let x = 0; x < w; x++) {
+          const fx = ((x + 0.5) / w) * gw - 0.5;
+          const x0 = Math.floor(fx), tx = fx - x0;
+          const gi = guideLuma[y * w + x];
+          let acc = 0, wsum = 0, bacc = 0;
+          for (let dy = 0; dy < 2; dy++) {
+            const wy = dy === 0 ? 1 - ty : ty;
+            const yy = cl(y0 + dy, gh - 1);
+            for (let dx = 0; dx < 2; dx++) {
+              const ws = wy * (dx === 0 ? 1 - tx : tx);
+              if (ws === 0) continue;
+              const xx = cl(x0 + dx, gw - 1);
+              const c = yy * gw + xx;
+              const dI = gi - cg[c];
+              const wt = ws * Math.exp(-dI * dI * inv2s2);
+              acc += wt * coarse[c];
+              wsum += wt;
+              bacc += ws * coarse[c];
+            }
+          }
+          out[y * w + x] = wsum > DINO_EPS ? acc / wsum : bacc;
+        }
+      }
+      return out;
+    }
+
+    /* Diverging maps as { neg, mid, pos } RGB triples, linearly interpolated,
+       site default hollywood. Used for signed views (a similarity map centred
+       on zero, a difference between two references). */
+    const DINO_DIVERGING = {
+      hollywood:  { neg: [255, 140, 66], mid: [245, 245, 245], pos: [0, 139, 139] },
+      greyscale:  { neg: [0, 0, 0],      mid: [128, 128, 128], pos: [255, 255, 255] },
+      tritanopia: { neg: [200, 85, 61],  mid: [245, 245, 245], pos: [74, 172, 143] },
+      rdbu:       { neg: [33, 102, 172], mid: [247, 247, 247], pos: [178, 24, 43] },
+      rdylgn:     { neg: [215, 48, 39],  mid: [255, 255, 191], pos: [26, 152, 80] },
+      spectral:   { neg: [213, 62, 79],  mid: [255, 255, 191], pos: [50, 136, 189] },
+      puor:       { neg: [230, 97, 1],   mid: [247, 247, 247], pos: [94, 60, 153] },
+      brbg:       { neg: [140, 81, 10],  mid: [245, 245, 245], pos: [1, 102, 94] }
+    };
+
+    const lerp3 = (a, b, t) => [
+      Math.round(a[0] + (b[0] - a[0]) * t),
+      Math.round(a[1] + (b[1] - a[1]) * t),
+      Math.round(a[2] + (b[2] - a[2]) * t)
+    ];
+
+    // t in [-1,1]; anything outside is clamped.
+    function divergingColor(t, name) {
+      const m = DINO_DIVERGING[name] || DINO_DIVERGING.hollywood;
+      const v = t < -1 ? -1 : t > 1 ? 1 : t;
+      return v < 0 ? lerp3(m.mid, m.neg, -v) : lerp3(m.mid, m.pos, v);
+    }
+
+    // Sequential ramp for the similarity heatmap, t in [0,1]: dark blue over
+    // teal and green to a pale yellow, so high similarity reads as bright.
+    const DINO_SEQ = [
+      [12, 20, 48], [24, 78, 130], [30, 140, 145], [110, 190, 110], [245, 240, 170]
+    ];
+
+    function sequentialColor(t) {
+      const v = t < 0 ? 0 : t > 1 ? 1 : t;
+      const s = v * (DINO_SEQ.length - 1);
+      const i = Math.min(DINO_SEQ.length - 2, Math.floor(s));
+      return lerp3(DINO_SEQ[i], DINO_SEQ[i + 1], s - i);
+    }
+
+    /* Recolour a map pixel so its Rec.601 luma equals the photograph's, which is
+       what the "Luma x Color" overlay does: structure comes from the picture,
+       hue from the map. Plain scaling overshoots on a bright target, and simply
+       clamping would silently darken the result below the luma it was asked
+       for. So scale only until the first channel reaches 255, then mix towards
+       white, which is the one direction left that still raises luma. Input and
+       output are 0..255; the result is rounded to whole channel values. */
+    function lumaMatch(rgb, targetLuma) {
+      const L = targetLuma < 0 ? 0 : targetLuma > 255 ? 255 : targetLuma;
+      const l = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+      if (!(l > DINO_EPS)) return [Math.round(L), Math.round(L), Math.round(L)];
+      const mx = Math.max(rgb[0], rgb[1], rgb[2]);
+      const s = L / l;
+      if (mx * s <= 255) {
+        return [Math.round(rgb[0] * s), Math.round(rgb[1] * s), Math.round(rgb[2] * s)];
+      }
+      const s0 = 255 / mx;
+      const l0 = l * s0;
+      const t = 255 - l0 > DINO_EPS ? Math.min(1, Math.max(0, (L - l0) / (255 - l0))) : 0;
+      const out = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        const v = rgb[c] * s0;
+        out[c] = Math.round(v + t * (255 - v));
+      }
+      return out;
+    }
+
+    // Site rule for text on a coloured cell: dark ink above luminance 145.
+    function cellTextColor(rgb) {
+      const lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+      return lum > 145 ? '#1e293b' : '#f1f5f9';
+    }
+
+    const DinoCore = {
+      mulberry32,
+      patchIndexFromPixel,
+      cosineMap,
+      cosineMapCross,
+      pcaRgb,
+      kmeansSegments,
+      bilateralUpsample,
+      coarseGuide,
+      lumaOf,
+      lumaMatch,
+      divergingColor,
+      sequentialColor,
+      cellTextColor,
+      DIVERGING: DINO_DIVERGING,
+      SEQUENTIAL: DINO_SEQ
+    };
+
+    globalThis.DinoCore = DinoCore;
+  </script>
+
+  <script id="app">
+    /* Markup is htm, not JSX: backticks tagged with `html`, ${...} for values,
+       style always an object. All feature-map maths lives in the dinocore block
+       above; everything here is loading, painting and controls. */
+    const { useState, useEffect, useRef, useCallback } = React;
+    const html = htm.bind(React.createElement);
+
+    const C = DinoCore;
+
+    const WORKER_URL = '/assets/js/dino/dino-worker.js';
+    const PATCH = 16;
+
+    /* Two buffers per image, on purpose:
+       - `full` is the source for the square model input, capped at 2048px on
+         the long edge so a 40 MP phone photo does not sit in memory as 160 MB
+         of RGBA for no gain (the model sees at most 512x512 anyway).
+       - `disp` is what the canvas shows AND what every heatmap is computed on:
+         the bilateral upsample and the per-pixel composite are O(width*height),
+         so a 1024px cap is the difference between instant and sluggish on every
+         click. The map itself is only grid*grid values, so nothing is lost. */
+    const FULL_MAX = 2048;
+    const DISP_MAX = 1024;
+
+    /* Measured single-thread wasm on a desktop, q4. Phones are slower; the
+       label says "about", which is all anyone can honestly promise. */
+    const SIZES = [
+      { value: 256, label: '256', grid: 16, time: 'about 0.5 s' },
+      { value: 384, label: '384', grid: 24, time: 'about 1.2 s' },
+      { value: 512, label: '512', grid: 32, time: 'about 2.4 s' }
+    ];
+
+    const OVERLAYS = [
+      { value: 'heat', label: 'Heatmap' },
+      { value: 'blend', label: 'Blend' },
+      { value: 'luma', label: 'Luma x Color' }
+    ];
+
+    const SLOTS = ['A', 'B'];
+
+    // Evenly spaced hues for the cluster view. Qualitative, so hue is the only
+    // thing that varies; sampling a sequential ramp would imply an order.
+    function hslRgb(h, s, l) {
+      const k = (n) => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n) => l - a * Math.max(-1, Math.min(Math.min(k(n) - 3, 9 - k(n)), 1));
+      return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+    }
+
+    function clusterColor(i, k) {
+      return hslRgb((i * 360) / Math.max(1, k) + 12, 0.62, i % 2 === 0 ? 0.58 : 0.44);
+    }
+
+    function fitCanvas(src, w, h, cap) {
+      const scale = Math.min(1, cap / Math.max(w, h));
+      const cw = Math.max(1, Math.round(w * scale));
+      const ch = Math.max(1, Math.round(h * scale));
+      const cv = document.createElement('canvas');
+      cv.width = cw;
+      cv.height = ch;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(src, 0, 0, cw, ch);
+      return cv;
+    }
+
+    function decode(file) {
+      if (typeof createImageBitmap === 'function') return createImageBitmap(file);
+      return new Promise((res, rej) => {
+        const url = URL.createObjectURL(file);
+        const im = new Image();
+        im.onload = () => { URL.revokeObjectURL(url); res(im); };
+        im.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Could not decode this file.')); };
+        im.src = url;
+      });
+    }
+
+    function percentileOf(values, p) {
+      const s = Array.from(values).sort((a, b) => a - b);
+      if (!s.length) return 0;
+      const idx = (s.length - 1) * p;
+      const lo = Math.floor(idx), hi = Math.ceil(idx);
+      return lo === hi ? s[lo] : s[lo] + (s[hi] - s[lo]) * (idx - lo);
+    }
+
+    const legendGradient = 'linear-gradient(to right, ' +
+      C.SEQUENTIAL.map((c, i) =>
+        'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ') ' +
+        Math.round((i / (C.SEQUENTIAL.length - 1)) * 100) + '%').join(', ') + ')';
+
+    function Seg({ value, options, onChange, disabled }) {
+      return html`
+        <div className="ps-seg">
+          ${options.map((o) => html`
+            <button key=${o.value} type="button" disabled=${!!disabled}
+              className=${'lang-seg' + (o.value === value ? ' active' : '')}
+              onClick=${() => onChange(o.value)}>${o.label}</button>
+          `)}
+        </div>
+      `;
+    }
+
+    function App() {
+      const [view, setView] = useState('similarity');
+      const [size, setSize] = useState(384);
+      const [overlay, setOverlay] = useState('blend');
+      const [hover, setHover] = useState(false);
+      const [edgeGuided, setEdgeGuided] = useState(true);
+      const [structMode, setStructMode] = useState('pca');
+      const [k, setK] = useState(4);
+
+      const [imgs, setImgs] = useState({ A: null, B: null });
+      const [showB, setShowB] = useState(false);
+      const [feats, setFeats] = useState({});          // 'A:384' -> {data, grid, dim}
+      const [busy, setBusy] = useState({ A: false, B: false });
+      const [progress, setProgress] = useState(null);   // {got, total} while the model downloads
+      const [error, setError] = useState('');
+      const [dragOver, setDragOver] = useState(null);
+      const [ref, setRef] = useState(null);             // { slot, u, v } in [0,1)
+      const [structOut, setStructOut] = useState(null); // { key, kind, rgb | labels }
+      const [structBusy, setStructBusy] = useState(false);
+
+      const canvasRefs = { A: useRef(null), B: useRef(null) };
+      const fileRefs = { A: useRef(null), B: useRef(null) };
+      const workerRef = useRef(null);
+      const pendingRef = useRef(new Map());
+      const inflightRef = useRef(new Set());
+      const idRef = useRef(0);
+      const guideRef = useRef(new Map());               // 'A:24' -> coarse guide
+      const structCacheRef = useRef(new Map());
+      const rafRef = useRef(0);
+
+      const featOf = (slot) => feats[slot + ':' + size] || null;
+
+      /* The worker answers asynchronously, and a slot's picture may have been
+         replaced in the meantime. The stamp is what tells the two apart, and it
+         has to be read from a ref, because the promise closes over the old
+         `imgs` object by definition. */
+      const imgsRef = useRef(imgs);
+      useEffect(() => { imgsRef.current = imgs; }, [imgs]);
+
+      /* ---------------- worker ---------------- */
+
+      const getWorker = useCallback(() => {
+        if (!workerRef.current) {
+          const w = new Worker(WORKER_URL, { type: 'module' });
+          w.onmessage = (ev) => {
+            const m = ev.data;
+            if (m.type === 'progress') { setProgress({ got: m.got, total: m.total }); return; }
+            setProgress(null);
+            const p = pendingRef.current.get(m.id);
+            if (!p) return;
+            pendingRef.current.delete(m.id);
+            if (m.type === 'error') p.reject(new Error(m.message));
+            else p.resolve(m);
+          };
+          w.onerror = () => {
+            setProgress(null);
+            setError('The feature worker failed to start. A module worker and WebAssembly are both required.');
+          };
+          workerRef.current = w;
+        }
+        return workerRef.current;
+      }, []);
+
+      useEffect(() => () => {
+        if (workerRef.current) workerRef.current.terminate();
+      }, []);
+
+      /* The model is not touched until an image exists: 15 MB is not something
+         to spend on a visitor who only reads the page. */
+      const extract = useCallback((slot, S) => {
+        const key = slot + ':' + S;
+        if (inflightRef.current.has(key)) return;
+        const img = imgs[slot];
+        if (!img) return;
+        inflightRef.current.add(key);
+        setBusy((b) => Object.assign({}, b, { [slot]: true }));
+
+        const cv = document.createElement('canvas');
+        cv.width = S;
+        cv.height = S;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        /* Fill the square and ignore the aspect ratio. The patch grid then maps
+           linearly onto the picture in both axes, which is what makes a click
+           position translate into a patch index with one line of arithmetic. */
+        ctx.drawImage(img.full, 0, 0, S, S);
+        const rgba = ctx.getImageData(0, 0, S, S).data;
+
+        const id = ++idRef.current;
+        const done = new Promise((resolve, reject) => {
+          pendingRef.current.set(id, { resolve, reject });
+        });
+        getWorker().postMessage({ type: 'extract', id, rgba, size: S }, [rgba.buffer]);
+
+        done.then((m) => {
+          inflightRef.current.delete(key);
+          setBusy((b) => Object.assign({}, b, { [slot]: false }));
+          const current = imgsRef.current[slot];
+          if (!current || current.stamp !== img.stamp) return;   // picture was replaced meanwhile
+          setFeats((f) => Object.assign({}, f, {
+            [key]: { data: m.data, grid: m.grid, dim: m.dim, stamp: img.stamp }
+          }));
+        }).catch((e) => {
+          inflightRef.current.delete(key);
+          setBusy((b) => Object.assign({}, b, { [slot]: false }));
+          setProgress(null);
+          setError(e && e.message ? e.message : 'Feature extraction failed.');
+        });
+      }, [imgs, getWorker]);
+
+      useEffect(() => {
+        for (const slot of SLOTS) {
+          if (!imgs[slot]) continue;
+          if (feats[slot + ':' + size]) continue;
+          extract(slot, size);
+        }
+      }, [imgs, size, feats, extract]);
+
+      /* ---------------- loading ---------------- */
+
+      const loadFile = useCallback((slot, file) => {
+        if (!file) return;
+        if (file.type && !/^image\//.test(file.type)) { setError('That file is not an image.'); return; }
+        setError('');
+        decode(file).then((src) => {
+          const w = src.width || src.naturalWidth;
+          const h = src.height || src.naturalHeight;
+          if (!w || !h) throw new Error('Could not read the image size.');
+          const full = fitCanvas(src, w, h, FULL_MAX);
+          const disp = fitCanvas(src, w, h, DISP_MAX);
+          if (src.close) src.close();
+          const dctx = disp.getContext('2d', { willReadFrequently: true });
+          const dispData = dctx.getImageData(0, 0, disp.width, disp.height);
+          const entry = {
+            name: file.name || '',
+            full, disp, dispData,
+            w: disp.width, h: disp.height,
+            luma: C.lumaOf(dispData.data, disp.width, disp.height),
+            stamp: Date.now() + ':' + Math.random()
+          };
+          // A new picture invalidates every derived thing that mentions the slot.
+          setFeats((f) => {
+            const next = {};
+            for (const key of Object.keys(f)) if (key.slice(0, 2) !== slot + ':') next[key] = f[key];
+            return next;
+          });
+          for (const key of Array.from(guideRef.current.keys())) {
+            if (key.slice(0, 2) === slot + ':') guideRef.current.delete(key);
+          }
+          structCacheRef.current.clear();
+          setStructOut(null);
+          setRef((r) => (r && r.slot === slot ? null : r));
+          setImgs((prev) => Object.assign({}, prev, { [slot]: entry }));
+          if (slot === 'B') setShowB(true);
+        }).catch((e) => {
+          setError(e && e.message ? e.message : 'Could not open that image.');
+        });
+      }, []);
+
+      // Paste anywhere: into B when B is open and still empty, otherwise into A.
+      useEffect(() => {
+        const onPaste = (e) => {
+          const items = e.clipboardData && e.clipboardData.items;
+          if (!items) return;
+          for (let i = 0; i < items.length; i++) {
+            if (items[i].type && items[i].type.indexOf('image/') === 0) {
+              const f = items[i].getAsFile();
+              if (f) {
+                e.preventDefault();
+                loadFile(view === 'similarity' && showB && !imgs.B ? 'B' : 'A', f);
+                return;
+              }
+            }
+          }
+        };
+        document.addEventListener('paste', onPaste);
+        return () => document.removeEventListener('paste', onPaste);
+      }, [loadFile, imgs.B, showB, view]);
+
+      /* ---------------- structure view ---------------- */
+
+      const structKey = structMode === 'pca'
+        ? 'pca:' + size + ':' + (imgs.A ? imgs.A.stamp : '-')
+        : 'km:' + size + ':' + k + ':' + (imgs.A ? imgs.A.stamp : '-');
+
+      useEffect(() => {
+        if (view !== 'structure') return;
+        const f = featOf('A');
+        if (!f) return;
+        const cached = structCacheRef.current.get(structKey);
+        if (cached) { setStructOut(cached); return; }
+        setStructBusy(true);
+        /* PCA on 1024 patches of 384 dimensions and k-means over the same are
+           both around a tenth of a second. That is short enough to run on the
+           main thread and long enough to be seen, so it goes behind a timeout
+           and a busy note rather than into a second worker. */
+        const t = setTimeout(() => {
+          const n = f.grid * f.grid;
+          let out;
+          if (structMode === 'pca') {
+            out = { key: structKey, kind: 'pca', rgb: C.pcaRgb(f.data, n, f.dim), grid: f.grid };
+          } else {
+            out = { key: structKey, kind: 'km', labels: C.kmeansSegments(f.data, n, f.dim, k, 0xA11CE), k, grid: f.grid };
+          }
+          structCacheRef.current.set(structKey, out);
+          setStructOut(out);
+          setStructBusy(false);
+        }, 20);
+        return () => { clearTimeout(t); setStructBusy(false); };
+      }, [view, structMode, structKey, k, feats, size]);
+
+      /* ---------------- painting ---------------- */
+
+      /* Colourize a coarse grid into a full-resolution RGBA overlay.
+         `colorAt(cellIndex)` gives the cell colour; `field` is the optional
+         scalar map that gets the edge-guided treatment instead. */
+      function overlayFromScalar(img, field) {
+        const w = img.w, h = img.h;
+        const out = new Uint8ClampedArray(w * h * 4);
+        for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+          const c = C.sequentialColor(field[i]);
+          out[p] = c[0]; out[p + 1] = c[1]; out[p + 2] = c[2]; out[p + 3] = 255;
+        }
+        return out;
+      }
+
+      // Coarse cells drawn through the 2D context, so the browser's own
+      // smoothing does the upscale (nearest neighbour when it must stay blocky).
+      function overlayFromCells(img, grid, colorAt, smooth) {
+        const small = document.createElement('canvas');
+        small.width = grid;
+        small.height = grid;
+        const sctx = small.getContext('2d');
+        const sd = sctx.createImageData(grid, grid);
+        for (let i = 0, p = 0; i < grid * grid; i++, p += 4) {
+          const c = colorAt(i);
+          sd.data[p] = c[0]; sd.data[p + 1] = c[1]; sd.data[p + 2] = c[2]; sd.data[p + 3] = 255;
+        }
+        sctx.putImageData(sd, 0, 0);
+
+        const big = document.createElement('canvas');
+        big.width = img.w;
+        big.height = img.h;
+        const bctx = big.getContext('2d', { willReadFrequently: true });
+        bctx.imageSmoothingEnabled = !!smooth;
+        if (smooth) bctx.imageSmoothingQuality = 'high';
+        bctx.drawImage(small, 0, 0, img.w, img.h);
+        return bctx.getImageData(0, 0, img.w, img.h).data;
+      }
+
+      function composite(img, over, mode) {
+        const src = img.dispData.data;
+        const luma = img.luma;
+        const out = new ImageData(img.w, img.h);
+        const d = out.data;
+        for (let i = 0, p = 0; i < img.w * img.h; i++, p += 4) {
+          if (mode === 'heat') {
+            d[p] = over[p]; d[p + 1] = over[p + 1]; d[p + 2] = over[p + 2];
+          } else if (mode === 'blend') {
+            d[p] = over[p] * 0.6 + src[p] * 0.4;
+            d[p + 1] = over[p + 1] * 0.6 + src[p + 1] * 0.4;
+            d[p + 2] = over[p + 2] * 0.6 + src[p + 2] * 0.4;
+          } else {
+            const c = C.lumaMatch([over[p], over[p + 1], over[p + 2]], luma[i]);
+            d[p] = c[0]; d[p + 1] = c[1]; d[p + 2] = c[2];
+          }
+          d[p + 3] = 255;
+        }
+        return out;
+      }
+
+      function guideFor(slot, img, grid) {
+        const key = slot + ':' + grid;
+        let g = guideRef.current.get(key);
+        if (!g) {
+          g = C.coarseGuide(img.luma, img.w, img.h, grid, grid);
+          guideRef.current.set(key, g);
+        }
+        return g;
+      }
+
+      function drawMarker(ctx, img, grid, idx) {
+        const cw = img.w / grid, ch = img.h / grid;
+        const x = (idx % grid) * cw, y = Math.floor(idx / grid) * ch;
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+        ctx.strokeRect(x + 0.5, y + 0.5, cw - 1, ch - 1);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+        ctx.strokeRect(x + 0.5, y + 0.5, cw - 1, ch - 1);
+      }
+
+      function paintSlot(slot) {
+        const cv = canvasRefs[slot].current;
+        const img = imgs[slot];
+        if (!cv || !img) return;
+        if (cv.width !== img.w || cv.height !== img.h) { cv.width = img.w; cv.height = img.h; }
+        const ctx = cv.getContext('2d');
+        ctx.putImageData(img.dispData, 0, 0);
+
+        const f = featOf(slot);
+        if (!f) return;
+        const grid = f.grid;
+
+        if (view === 'structure') {
+          if (slot !== 'A' || !structOut || structOut.key !== structKey || structOut.grid !== grid) return;
+          const over = structOut.kind === 'pca'
+            ? overlayFromCells(img, grid, (i) => [
+                Math.round(structOut.rgb.r[i] * 255),
+                Math.round(structOut.rgb.g[i] * 255),
+                Math.round(structOut.rgb.b[i] * 255)
+              ], true)
+            : overlayFromCells(img, grid, (i) => clusterColor(structOut.labels[i], structOut.k), false);
+          ctx.putImageData(composite(img, over, overlay), 0, 0);
+          return;
+        }
+
+        if (!ref) return;
+        const rf = featOf(ref.slot);
+        if (!rf) return;
+        const refIdx = C.patchIndexFromPixel(
+          ref.u * rf.grid, ref.v * rf.grid, rf.grid, rf.grid, rf.grid, rf.grid);
+        const map = ref.slot === slot
+          ? C.cosineMap(f.data, f.dim, refIdx)
+          : C.cosineMapCross(rf.data, f.data, f.dim, refIdx);
+
+        /* Per-map normalization: the bottom of the ramp is this map's 5th
+           percentile, not a fixed cosine. Absolute cosines between patch
+           features sit in a narrow, image-dependent band, so a fixed scale
+           would show a flat wash for most pictures. The price is that two maps
+           are not comparable to each other, which the footnote says. */
+        const lo = percentileOf(map, 0.05);
+        const span = Math.max(1e-6, 1 - lo);
+        const norm = new Float32Array(map.length);
+        for (let i = 0; i < map.length; i++) {
+          norm[i] = Math.min(1, Math.max(0, (map[i] - lo) / span));
+        }
+
+        let over;
+        if (edgeGuided) {
+          const field = C.bilateralUpsample(norm, grid, grid, img.luma, img.w, img.h,
+            { sigmaR: 25, guideCoarse: guideFor(slot, img, grid) });
+          over = overlayFromScalar(img, field);
+        } else {
+          over = overlayFromCells(img, grid, (i) => C.sequentialColor(norm[i]), true);
+        }
+        ctx.putImageData(composite(img, over, overlay), 0, 0);
+        if (ref.slot === slot) drawMarker(ctx, img, grid, refIdx);
+      }
+
+      useEffect(() => {
+        for (const slot of SLOTS) paintSlot(slot);
+      }, [imgs, feats, ref, view, overlay, edgeGuided, size, structOut, structKey]);
+
+      /* ---------------- pointer ---------------- */
+
+      function pointTo(slot, e) {
+        const cv = canvasRefs[slot].current;
+        if (!cv) return null;
+        const r = cv.getBoundingClientRect();
+        if (!r.width || !r.height) return null;
+        const u = Math.min(0.999999, Math.max(0, (e.clientX - r.left) / r.width));
+        const v = Math.min(0.999999, Math.max(0, (e.clientY - r.top) / r.height));
+        return { slot, u, v };
+      }
+
+      function onCanvasClick(slot, e) {
+        if (view !== 'similarity' || !featOf(slot)) return;
+        const p = pointTo(slot, e);
+        if (p) setRef(p);
+      }
+
+      // Hover mode redraws the whole map on every move, so it is capped at one
+      // update per frame; the map itself is at most 1024 cosines, sub-millisecond.
+      function onCanvasMove(slot, e) {
+        if (!hover || view !== 'similarity' || !featOf(slot)) return;
+        const p = pointTo(slot, e);
+        if (!p) return;
+        if (rafRef.current) return;
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = 0;
+          setRef(p);
+        });
+      }
+
+      /* ---------------- pieces ---------------- */
+
+      function dropZone(slot) {
+        return html`
+          <div className=${'ps-drop' + (dragOver === slot ? ' over' : '')}
+            onClick=${() => fileRefs[slot].current && fileRefs[slot].current.click()}
+            onDragOver=${(e) => { e.preventDefault(); setDragOver(slot); }}
+            onDragLeave=${() => setDragOver(null)}
+            onDrop=${(e) => {
+              e.preventDefault();
+              setDragOver(null);
+              const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+              if (f) loadFile(slot, f);
+            }}>
+            <span>Drop an image here, paste one, or click to browse</span>
+            <span className="ps-drophint">PNG, JPEG or WebP. It stays in your browser.</span>
+          </div>
+        `;
+      }
+
+      function slotCard(slot, label) {
+        const img = imgs[slot];
+        return html`
+          <div key=${slot}>
+            <div className="ps-slothead">
+              <span className="ps-slotname">${label}</span>
+              ${img && html`<span className="ps-slotfile" title=${img.name}>${img.name || 'image'}</span>`}
+              <span className="ps-slotact">
+                ${img && html`
+                  <button type="button" className="ps-btn"
+                    onClick=${() => fileRefs[slot].current && fileRefs[slot].current.click()}>Replace</button>
+                `}
+                ${slot === 'B' && html`
+                  <button type="button" className="ps-btn" onClick=${() => {
+                    setShowB(false);
+                    setImgs((prev) => Object.assign({}, prev, { B: null }));
+                    setFeats((f) => {
+                      const next = {};
+                      for (const key of Object.keys(f)) if (key.slice(0, 2) !== 'B:') next[key] = f[key];
+                      return next;
+                    });
+                    setRef((r) => (r && r.slot === 'B' ? null : r));
+                  }}>Remove</button>
+                `}
+              </span>
+            </div>
+            ${img ? html`
+              <div className="ps-canvaswrap">
+                <canvas ref=${canvasRefs[slot]} className=${'ps-canvas' + (busy[slot] ? ' busy' : '')}
+                  onClick=${(e) => onCanvasClick(slot, e)}
+                  onPointerMove=${(e) => onCanvasMove(slot, e)}></canvas>
+              </div>
+            ` : dropZone(slot)}
+            <input ref=${fileRefs[slot]} type="file" accept="image/png,image/jpeg,image/webp"
+              style=${{ display: 'none' }}
+              onChange=${(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) loadFile(slot, f); }} />
+          </div>
+        `;
+      }
+
+      const activeSize = SIZES.filter((s) => s.value === size)[0] || SIZES[1];
+      const anyBusy = busy.A || busy.B;
+      const pct = progress && progress.total ? (progress.got / progress.total) * 100 : 8;
+      const mb = (v) => (v / 1048576).toFixed(1);
+
+      const statusLine = progress
+        ? 'Downloading the model, ' + mb(progress.got) + ' of ' + mb(progress.total) + ' MB. This happens once per visit.'
+        : anyBusy
+          ? 'Computing features at ' + size + ' by ' + size + ', ' + activeSize.time + '.'
+          : structBusy
+            ? 'Computing the structure view.'
+            : imgs.A
+              ? (view === 'structure'
+                  ? null
+                  : (ref ? null : 'Click a point in the image to set the reference patch.'))
+              : null;
+
+      return html`
+        <div className="container">
+          <h1 className="ps-h1">Patch Similarity Explorer</h1>
+          <p className="ps-sub">
+            Click any point in your image and see how similar every other patch of it is to the one you
+            clicked. Similarity is the cosine between DINOv3 patch features, so the model decides what
+            counts as the same thing: the same fur, the same brick, the same kind of leaf, not the same
+            colour.
+          </p>
+          <p className="tool-shield">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                 strokeLinecap="round" strokeLinejoin="round" style=${{ flexShrink: 0 }} aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            </svg>
+            <span>Your image is never uploaded. It is decoded and analysed on your device and stays there.</span>
+          </p>
+
+          <div className="tabstrip" role="tablist" style=${{ margin: '14px 0 14px' }}>
+            <button role="tab" type="button" aria-selected=${view === 'similarity'}
+              className=${view === 'similarity' ? 'active' : ''}
+              onClick=${() => setView('similarity')}>Similarity</button>
+            <button role="tab" type="button" aria-selected=${view === 'structure'}
+              className=${view === 'structure' ? 'active' : ''}
+              onClick=${() => setView('structure')}>Structure</button>
+          </div>
+
+          <div className="ps-layout">
+            <div className="ps-stage">
+              <div className=${'ps-slots' + (view === 'similarity' && (showB || imgs.B) ? ' two' : '')}>
+                ${slotCard('A', view === 'similarity' && (showB || imgs.B) ? 'Image A' : 'Image')}
+                ${view === 'similarity' && (showB || imgs.B) && slotCard('B', 'Image B')}
+              </div>
+
+              ${view === 'similarity' && !showB && !imgs.B && imgs.A && html`
+                <button type="button" className="ps-btn" style=${{ marginTop: 10 }}
+                  onClick=${() => setShowB(true)}>Add second image</button>
+              `}
+
+              ${view === 'structure' && html`
+                <p className="ps-hint">The structure view uses image A only.</p>
+              `}
+
+              ${view === 'similarity' && imgs.A && html`
+                <div className="ps-legend">
+                  <span>less similar</span>
+                  <span className="ps-legendbar" style=${{ background: legendGradient }}></span>
+                  <span>more similar</span>
+                </div>
+              `}
+
+              ${view === 'structure' && structOut && structOut.kind === 'km' && html`
+                <div className="ps-swatches">
+                  ${Array.from({ length: structOut.k }, (unused, i) => {
+                    const c = clusterColor(i, structOut.k);
+                    return html`
+                      <span className="ps-swatch" key=${i}>
+                        <span className="ps-swatchdot"
+                          style=${{ background: 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')' }}></span>
+                        Cluster ${i + 1}
+                      </span>
+                    `;
+                  })}
+                </div>
+              `}
+
+              ${statusLine && html`<p className="ps-status" style=${{ marginTop: 10 }}>${statusLine}</p>`}
+              ${progress && html`
+                <div className="ps-progress"><div style=${{ width: pct + '%' }}></div></div>
+              `}
+              ${error && html`<p className="ps-warn">${error}</p>`}
+            </div>
+
+            <div className="ctl-card">
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Resolution<span className="ctl-sec-h-sub">${activeSize.grid} by ${activeSize.grid} patches</span></p>
+                <${Seg} value=${size} options=${SIZES} onChange=${setSize} />
+                <p className="ps-hint">
+                  ${activeSize.time} per image on a desktop, once per image and resolution.
+                  Every click after that is instant.
+                </p>
+              </div>
+
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Overlay</p>
+                <${Seg} value=${overlay} options=${OVERLAYS} onChange=${setOverlay} />
+                <p className="ps-hint">
+                  Luma x Color keeps the photograph's brightness and takes only the hue from the map,
+                  so fine detail stays readable underneath.
+                </p>
+              </div>
+
+              ${view === 'similarity' ? html`<${React.Fragment}>
+                <div className="ctl-sec">
+                  <label className="ps-check">
+                    <input type="checkbox" role="switch" checked=${hover}
+                      onChange=${(e) => setHover(e.target.checked)} />
+                    Reference follows the pointer
+                  </label>
+                  <p className="ps-hint">Off: the reference patch is set by clicking, and stays put.</p>
+                </div>
+
+                <div className="ctl-sec">
+                  <label className="ps-check">
+                    <input type="checkbox" role="switch" checked=${edgeGuided}
+                      onChange=${(e) => setEdgeGuided(e.target.checked)} />
+                    Edge-guided upsampling
+                  </label>
+                  <p className="ps-hint">
+                    Joint bilateral upsampling snaps the coarse patch map to the edges of the
+                    photograph. Off shows the raw ${activeSize.grid} by ${activeSize.grid} grid,
+                    smoothly interpolated.
+                  </p>
+                </div>
+              <//>` : html`<${React.Fragment}>
+                <div className="ctl-sec">
+                  <p className="ctl-sec-h">Structure view</p>
+                  <${Seg} value=${structMode} options=${[
+                    { value: 'pca', label: 'PCA' },
+                    { value: 'km', label: 'Clusters' }
+                  ]} onChange=${setStructMode} />
+                  <p className="ps-hint">
+                    ${structMode === 'pca'
+                      ? 'The first three principal components of the patch features, mapped to red, green and blue. Colours mean nothing on their own; equal colour means similar features.'
+                      : 'k-means over the patch features, seeded deterministically, so the same image and k always give the same segmentation.'}
+                  </p>
+                </div>
+
+                ${structMode === 'km' && html`
+                  <div className="ctl-sec">
+                    <div className="ps-row">
+                      <span className="ps-val">Clusters</span>
+                      <span className="ps-val">${k}</span>
+                    </div>
+                    <input className="ps-slider" type="range" min="2" max="8" step="1" value=${k}
+                      onInput=${(e) => setK(parseInt(e.target.value, 10))} />
+                  </div>
+                `}
+              <//>`}
+            </div>
+          </div>
+
+          <details className="fold ps-fold">
+            <summary>What am I looking at?</summary>
+            <div className="fold-body">
+              <p>
+                DINOv3 is a vision model trained without labels. It cuts the image into a grid of
+                16 by 16 pixel patches and produces one 384-number vector per patch, describing what
+                that patch is rather than what colour it has. At 384 pixels input that is a 24 by 24
+                grid, so every square of the map covers about a twentieth of the picture's width.
+              </p>
+              <p>
+                The similarity map is the cosine between your reference patch's vector and every other
+                patch's. Bright means the model considers those patches the same kind of surface. Click
+                a brick and the whole wall lights up, including bricks in shadow, because the features
+                are largely invariant to lighting. Click one leaf and the rest of the foliage follows,
+                but usually not the green painted door next to it. The features also carry a fair
+                amount of position and context, so two patches of identical material at opposite ends
+                of a photograph score lower than two neighbouring ones.
+              </p>
+              <p>
+                With a second image loaded, the reference patch in one image is compared against every
+                patch of the other, which is the same arithmetic across two feature sets. That is how
+                far this goes towards correspondence: it finds like material and like parts, not exact
+                point matches.
+              </p>
+              <p>
+                The Structure view drops the reference patch entirely. PCA projects all patch vectors
+                onto their first three principal components and paints those as red, green and blue,
+                which is the usual way DINO features are shown; the colours are arbitrary, only their
+                agreement is meaningful. Clusters runs k-means over the same vectors, which turns the
+                feature space into an unsupervised segmentation without any notion of objects.
+              </p>
+              <p>
+                The colour ramp is normalised per map: its bottom end is the 5th percentile of the
+                similarity values in that map, its top end is a cosine of 1. Absolute cosines between
+                patch features sit in a narrow and image-dependent band, so a fixed scale would show a
+                flat wash on most pictures. The consequence is that two maps cannot be compared to each
+                other by colour, only within themselves.
+              </p>
+              <p>
+                The image is squashed to a square for the model and the map is stretched back, so the
+                grid is not square on a non-square photograph. Analysis runs on a copy capped at
+                1024 pixels on the long edge.
+              </p>
+            </div>
+          </details>
+
+          <p className="ps-note">
+            Built with ${' '}
+            <a href="https://github.com/facebookresearch/dinov3">DINOv3</a>${' '}
+            (ViT-S/16, 4-bit quantized, 15 MB), used under the${' '}
+            <a href="/assets/files/dinov3/LICENSE-DINOv3.txt">DINOv3 License</a>.
+            Inference runs on onnxruntime-web with the WebAssembly backend, single-threaded.
+            This project is not affiliated with Meta. Private hobby project, non-commercial.
+          </p>
+        </div>
+      `;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
