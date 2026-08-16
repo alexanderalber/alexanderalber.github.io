@@ -363,6 +363,13 @@ function nichtOptionaleKomponenten(rezept) {
   return (rezept.komponenten || []).filter(function (k) { return !k.optional; });
 }
 
+// Komponenten, die tatsaechlich vorproduziert werden (Basis der Ueberlappung).
+function batchKomponenten(rezept) {
+  return (rezept.komponenten || []).filter(function (k) {
+    return !k.optional && k.typ !== 'fresh';
+  });
+}
+
 // Kuerzeste Haltbarkeit ueber nicht-optionale, nicht-fresh Komponenten.
 // Infinity, wenn es keine solche Komponente gibt (dann existiert keine Lagergrenze).
 function minHaltbarkeit(rezept) {
@@ -432,14 +439,23 @@ function scoreRezept(rezept, kontext) {
   const G = SCORE_GEWICHTE;
   let score = 0;
 
-  // Komponenten-Ueberlappung: gleiche nicht-optionale Komponenten-id in
-  // bereits gewaehlten Rezepten, pro Treffer-Paar.
-  const eigeneIds = nichtOptionaleKomponenten(rezept).map(function (k) { return k.id; });
+  // Komponenten-Ueberlappung: gleiche komponenten-id in bereits gewaehlten
+  // Rezepten. Nur nicht-optionale, nicht-fresh Komponenten (frisches wird nicht
+  // vorproduziert, dessen Ueberlappung ist wertlos). Abnehmender Grenznutzen:
+  // Bonus w/n bei n bisherigen Nutzungen der id, sonst schaukelt sich eine
+  // Monokultur auf (Vorfall 2026-08-17: 13 von 17 Gerichten mit ofengemuese).
+  const eigeneIds = batchKomponenten(rezept).map(function (k) { return k.id; });
+  const nutzungen = {};
   for (const g of gewaehlt) {
-    const fremdeIds = new Set(nichtOptionaleKomponenten(g).map(function (k) { return k.id; }));
-    for (const id of eigeneIds) {
-      if (fremdeIds.has(id)) score += G.ueberlappung;
+    for (const k of batchKomponenten(g)) {
+      nutzungen[k.id] = (nutzungen[k.id] || 0) + 1;
     }
+  }
+  // Harte Kappe: ab der dritten Vornutzung gibt es nichts mehr. Drei Gerichte
+  // aus einem Arbeitsgang sind der Gewinn, zehn Bleche sind keiner.
+  for (const id of eigeneIds) {
+    const n = nutzungen[id] || 0;
+    if (n >= 1 && n <= 2) score += G.ueberlappung / n;
   }
 
   // Chip-Zutaten.
@@ -1398,6 +1414,12 @@ globalThis.VP = {
         for (const z of alle) {
           z.treffer = z.zellen.filter(Boolean).length;
           z.titel = z.labels.join(' / ');
+          // Ehrlichkeit: gleiche id heisst "im selben Arbeitsgang produzierbar",
+          // nicht "identisch". Bei abweichenden Labels nicht so tun, als waere
+          // ueberall das erste Gericht gemeint.
+          if (z.labels.length > 1) {
+            z.label = z.labels[0] + ' + ' + (z.labels.length - 1) + ' Varianten';
+          }
         }
         const typen = TYP_ORDNUNG.concat(alle.map(function (z) { return z.typ; }));
         const gruppen = [], gesehen = [];
