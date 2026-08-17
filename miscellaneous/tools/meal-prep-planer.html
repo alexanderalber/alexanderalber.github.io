@@ -202,6 +202,10 @@
       .vp-plan .vp-frame, .vp-plan .vp-card { border-color: #999 !important; }
       .vp-plan .vp-tab th, .vp-plan .vp-tab td { border-bottom-color: #999 !important; padding: 2px 6px; }
       .vp-plan .vp-timer td { color: #444 !important; font-style: italic; }
+      /* Der Zeitstrahl-Tab ist Bildschirm-Ansicht; gedruckt wird immer die Liste,
+         auch wenn gerade der Zeitstrahl offen ist (inline display:none schlaegt
+         das Stylesheet, deshalb !important). */
+      .vp-plan table.vp-tab { display: table !important; }
       .vp-plan h2 { font-size: 13pt; margin: 0 0 4px; }
       .vp-plan h3 { font-size: 11pt; margin: 10px 0 3px; }
       .vp-plan .vp-code { font-size: 11pt; }
@@ -1327,6 +1331,7 @@ globalThis.VP = {
       const [ausSpeicher, setAusSpeicher] = useState(!!GESPEICHERT);
       // Reine Ansichtssache, deshalb nur State und kein localStorage.
       const [reiter, setReiter] = useState('woche');
+      const [sonntagAnsicht, setSonntagAnsicht] = useState('liste');
 
       const slots = woche.slots, zuweisung = woche.zuweisung, pins = woche.pins;
 
@@ -2037,6 +2042,87 @@ globalThis.VP = {
           </div>
         `;
 
+        /* ---- Zeitstrahl: der Sonntag als Gantt ------------------------------ */
+        // Eine Zeile pro Task; die aktive Phase (Haende gebunden) als kraeftiger
+        // Balken, der Timer (Geraet arbeitet allein) als schmaler daran. Identitaet
+        // steht als Zeilenlabel, Farbe kodiert nur den Zustand, deshalb reichen
+        // zwei Farben plus Legende. Im Druck bleibt die Liste das Artefakt.
+        const ganttAnsicht = function (sched) {
+          const reihen = [];
+          const proTask = new Map();
+          for (const z of sched.zeilen) {
+            if (!proTask.has(z.taskId)) {
+              const r = { id: z.taskId, label: '', geraet: z.geraet, aktiv: null, timer: null };
+              proTask.set(z.taskId, r);
+              reihen.push(r);
+            }
+            const r = proTask.get(z.taskId);
+            if (z.art === 'aktiv') { r.aktiv = z; r.label = z.text; }
+            else { r.timer = z; if (!r.label) r.label = z.text; }
+          }
+          const gesamt = Math.max(sched.gesamtMin, 1);
+          const L = 210, W = 610, R = 60, RH = 26, AX = 24;
+          const H = reihen.length * RH + AX;
+          const x = function (min) { return L + (min / gesamt) * W; };
+          const tick = gesamt > 150 ? 30 : 15;
+          const ticks = [];
+          for (let t = 0; t <= gesamt; t += tick) ticks.push(t);
+          return html`
+            <div>
+              <svg viewBox=${'0 0 ' + (L + W + R) + ' ' + H} style=${{ width: '100%', height: 'auto', display: 'block' }}>
+                ${ticks.map(function (t) {
+                  return html`<g key=${'t' + t}>
+                    <line x1=${x(t)} y1="0" x2=${x(t)} y2=${H - AX + 4} stroke="var(--tool-hairline)" strokeWidth="1" />
+                    <text x=${x(t)} y=${H - 8} textAnchor="middle" fontSize="10" fill="var(--tool-faint)">${fmtZeit(t)}</text>
+                  </g>`;
+                })}
+                ${reihen.map(function (r, i) {
+                  const y = i * RH;
+                  const teile = [];
+                  if (r.aktiv && r.aktiv.dauerMin > 0) {
+                    teile.push(html`
+                      <rect key="a" x=${x(r.aktiv.startMin)} y=${y + 6} rx="3"
+                        width=${Math.max(2, x(r.aktiv.startMin + r.aktiv.dauerMin) - x(r.aktiv.startMin))}
+                        height="14" fill="var(--tool-ok-bg)">
+                        <title>${r.label + ': aktiv ' + fmtZeit(r.aktiv.startMin) + ' bis ' + fmtZeit(r.aktiv.startMin + r.aktiv.dauerMin) + ' (' + r.aktiv.dauerMin + ' Min Hände)'}</title>
+                      </rect>`);
+                  }
+                  if (r.timer && r.timer.dauerMin > 0) {
+                    teile.push(html`
+                      <rect key="p" x=${x(r.timer.startMin)} y=${y + 9} rx="3"
+                        width=${Math.max(2, x(r.timer.startMin + r.timer.dauerMin) - x(r.timer.startMin))}
+                        height="8" fill="var(--tool-border)">
+                        <title>${r.label + ': Timer bis ' + fmtZeit(r.timer.startMin + r.timer.dauerMin) + ' (' + r.timer.dauerMin + ' Min, ' + r.geraet + ')'}</title>
+                      </rect>`);
+                  }
+                  const ende = Math.max(
+                    r.aktiv ? r.aktiv.startMin + r.aktiv.dauerMin : 0,
+                    r.timer ? r.timer.startMin + r.timer.dauerMin : 0);
+                  return html`<g key=${r.id}>
+                    <text x=${L - 10} y=${y + 17} textAnchor="end" fontSize="12" fill="var(--tool-text)">
+                      ${kuerze(r.label, 30)}<title>${r.label}</title>
+                    </text>
+                    ${teile}
+                    ${r.geraet !== 'keins'
+                      ? html`<text x=${x(ende) + 5} y=${y + 16} fontSize="10" fill="var(--tool-note)">${r.geraet}</text>`
+                      : null}
+                  </g>`;
+                })}
+              </svg>
+              <p className="vp-faint" style=${{ margin: '6px 0 0', display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span style=${{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                  <span style=${{ width: 14, height: 10, borderRadius: 2, background: 'var(--tool-ok-bg)', display: 'inline-block' }}></span>
+                  aktiv (Hände gebunden)
+                </span>
+                <span style=${{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                  <span style=${{ width: 14, height: 6, borderRadius: 2, background: 'var(--tool-border)', display: 'inline-block' }}></span>
+                  Timer (Gerät arbeitet allein)
+                </span>
+              </p>
+            </div>
+          `;
+        };
+
         planAnsicht = html`
           <section className="vp-plan" style=${{ marginTop: 22 }}>
             <h2 style=${{ fontSize: '1.15rem', color: 'var(--tool-emph)', marginBottom: 10 }}>Plan</h2>
@@ -2079,7 +2165,17 @@ globalThis.VP = {
               <summary>Sonntag<span className="vp-sec-sub">die Zeitleiste des Kochtags</span></summary>
               <div className="vp-sec-body">
                 <div className="vp-frame">
-                  <table className="vp-tab">
+                  <div className="tabstrip no-print" role="tablist" style=${{ margin: '0 0 10px' }}>
+                    ${[['liste', 'Liste'], ['gantt', 'Zeitstrahl']].map(function (r) {
+                      return html`
+                        <button key=${r[0]} role="tab" aria-selected=${sonntagAnsicht === r[0] ? 'true' : 'false'}
+                          className=${sonntagAnsicht === r[0] ? 'active' : ''}
+                          onClick=${function () { setSonntagAnsicht(r[0]); }}>${r[1]}</button>
+                      `;
+                    })}
+                  </div>
+                  ${sonntagAnsicht === 'gantt' ? html`<div className="no-print">${ganttAnsicht(plan.sched)}</div>` : null}
+                  <table className="vp-tab" style=${sonntagAnsicht === 'gantt' ? { display: 'none' } : null}>
                     <thead>
                       <tr><th>Zeit</th><th>Schritt</th><th>Gerät</th><th>Dauer</th></tr>
                     </thead>
