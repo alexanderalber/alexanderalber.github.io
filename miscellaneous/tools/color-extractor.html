@@ -50,8 +50,37 @@
     .cx-drop.has-image:hover,.cx-drop.has-image.drag{border-color:var(--pico-primary)}
     /* The preview is a canvas drawn from the decoded ImageBitmap, not <img src=objectURL>:
        what you see is guaranteed to be what was analysed, and no object URL to clean up. */
-    .cx-drop canvas{display:block;width:100%;height:auto;max-height:58vh;object-fit:contain;margin:0 auto}
+    /* auto width plus both maxima, the same shape as .ps-canvas in
+       patch-similarity: the browser scales a replaced element proportionally, so
+       a portrait photo caps at 78vh instead of running past the screen, and a
+       small image is shown at its own size rather than upscaled to the column.
+       Above the caps in the app block the drawing buffer is downscaled, but such
+       an image is far wider than the column anyway, so max-width binds and the
+       displayed size does not jump when the view changes. */
+    .cx-drop canvas{display:block;width:auto;height:auto;max-width:100%;max-height:78vh;margin-inline:auto}
     .cx-drop input[type=file]{display:none}
+
+    /* Slot header: fixed height and no wrapping, so the two canvases keep the
+       same offset from the top of their slot even when one header carries more
+       buttons than the other. The title is the only part allowed to shrink. */
+    .cx-slothead{display:flex;align-items:center;gap:.5rem;flex-wrap:nowrap;overflow:hidden;
+      height:28px;margin-bottom:.35rem}
+    .cx-slotname{flex:0 1 auto;min-width:0;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+      color:var(--tool-note);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .cx-slotact{flex:0 0 auto;margin-left:auto;display:inline-flex;gap:6px}
+    .cx-slot-b{margin-top:1.4rem}
+
+    .cx-btn{display:inline-flex;align-items:center;gap:5px;width:auto;margin:0;padding:.22rem .6rem;
+      font-size:.74rem;line-height:1.2;font-family:inherit;cursor:pointer;border-radius:7px;
+      border:1.5px solid var(--tool-border);background:var(--tool-surface);color:var(--tool-text)}
+    .cx-btn:hover{border-color:var(--tool-faint)}
+    /* The shared .tool-danger is a full-size button and is declared earlier in the
+       cascade than this page's own rules, so .cx-btn would win on source order.
+       Only its colours are wanted on this small header button, restated here at a
+       specificity that beats .cx-btn without taking over its geometry. */
+    .cx-btn.tool-danger{padding:.22rem .6rem;font-size:.74rem;font-weight:400;border-radius:7px;
+      border:1.5px solid var(--tool-danger-border);background:var(--tool-danger-bg);color:var(--tool-danger-text)}
+    .cx-btn.tool-danger:hover{background:var(--tool-danger-border);color:var(--tool-danger-text)}
 
     .cx-viewbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.5rem}
     .cx-dl{width:auto;margin:0 0 0 auto;font-size:.78rem;padding:.25rem .55rem;
@@ -192,7 +221,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Color Extractor</h1>
-        <p style="color:var(--tool-label);max-width:70ch">Find out which colors a picture is really made of, and copy them as hex codes, CSS or JSON. Everything runs in your browser; your image never leaves your device.</p>
+        <p style="color:var(--tool-label);max-width:70ch">Find out which colors a picture is really made of, and copy them as hex codes, CSS or JSON. A second image can be repainted in the palette you picked, to see how far it carries. Everything runs in your browser; your image never leaves your device.</p>
       </div>
     </div>
   </main>
@@ -917,6 +946,30 @@
     const QUANT_MAX_PX = 4000000;
     const DITHER_MAX_PX = 2200000;
 
+    /* Lucide-style stroke icons, authored by hand and kept inline: the site does
+       not use emoji and does not load an icon font. 13px at viewBox 24 with
+       stroke-width 2, so the strokes stay visible at that size. Same set and same
+       spread as in patch-similarity.html. */
+    const ICON = {
+      width: 13, height: 13, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
+      'aria-hidden': 'true', style: { flexShrink: 0 }
+    };
+    const iconAddImage = html`
+      <svg ...${ICON}>
+        <path d="M16 5h6" /><path d="M19 2v6" />
+        <path d="M21 11.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7.5" />
+        <path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" />
+        <circle cx="9" cy="9" r="2" />
+      </svg>`;
+    const iconRemove = html`
+      <svg ...${ICON}><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>`;
+    const iconSwap = html`
+      <svg ...${ICON}>
+        <path d="m17 2 4 4-4 4" /><path d="M3 11v-1a4 4 0 0 1 4-4h14" />
+        <path d="m7 22-4-4 4-4" /><path d="M21 13v1a4 4 0 0 1-4 4H3" />
+      </svg>`;
+
     /* ---------- the emphasis control ---------------------------------------
        One number: how much colour counts against lightness. It scales chroma and
        hue by the same factor, so it cannot separate the two - the core can (see
@@ -968,16 +1021,27 @@
       const [view, setView] = useState('original');
       const [rendering, setRendering] = useState(false);
 
+      /* The second slot. B is never analysed: it only ever borrows A's palette,
+         so it has a bitmap and a view of its own and nothing else. */
+      const [bitmapB, setBitmapB] = useState(null);
+      const [showB, setShowB] = useState(false);
+      const [viewB, setViewB] = useState('quantized');
+      const [renderingB, setRenderingB] = useState(false);
+      const [draggingB, setDraggingB] = useState(false);
+
       const dropRef = useRef(null);
       const fileRef = useRef(null);
       const canvasRef = useRef(null);
       const dataRef = useRef(null);   // the downsampled ImageData, reused on re-run
+      const fileBRef = useRef(null);
+      const canvasBRef = useRef(null);
 
       /* Preview: draw the decoded ImageBitmap into a canvas rather than pointing
          an <img> at an object URL. Guarantees the preview shows what was analysed
-         and removes the object-URL lifecycle entirely. */
-      const drawPreview = useCallback((bm, mode, pal) => {
-        const cv = canvasRef.current;
+         and removes the object-URL lifecycle entirely.
+         The canvas is a parameter rather than the one ref, because the second slot
+         paints the same way with a palette that was measured on the first one. */
+      const drawPreview = useCallback((cv, bm, mode, pal) => {
         if (!cv || !bm) return;
 
         // Dithering is O(pixels) with a serial dependency, so cap the working
@@ -1013,20 +1077,42 @@
       useEffect(() => {
         if (!bitmap) return;
         if (view === 'original' || !palette.length) {
-          drawPreview(bitmap, 'original', null);
+          drawPreview(canvasRef.current, bitmap, 'original', null);
           return;
         }
         let cancelled = false;
         setRendering(true);
         const id = setTimeout(() => {
           if (cancelled) return;
-          drawPreview(bitmap, view, palette);
+          drawPreview(canvasRef.current, bitmap, view, palette);
           setRendering(false);
         }, 0);
         return () => { cancelled = true; clearTimeout(id); setRendering(false); };
       }, [bitmap, view, openRung, drawPreview]);
 
-      const load = useCallback(async (source) => {
+      /* The same for the second image, driven by the same palette. openRung is in
+         the list rather than the palette array, because the palette is rebuilt on
+         every ladder run: a new rung, a new emphasis setting or a new image A all
+         arrive here as a changed openRung. */
+      useEffect(() => {
+        if (!bitmapB) return;
+        if (viewB === 'original' || !palette.length) {
+          drawPreview(canvasBRef.current, bitmapB, 'original', null);
+          return;
+        }
+        let cancelled = false;
+        setRenderingB(true);
+        const id = setTimeout(() => {
+          if (cancelled) return;
+          drawPreview(canvasBRef.current, bitmapB, viewB, palette);
+          setRenderingB(false);
+        }, 0);
+        return () => { cancelled = true; clearTimeout(id); setRenderingB(false); };
+      }, [bitmapB, viewB, openRung, drawPreview]);
+
+      /* slot 'B' only decodes and stores: nothing is measured on it. Slot 'A'
+         additionally reads the pixels back and drops the ladder of the old image. */
+      const load = useCallback(async (source, slot) => {
         setError('');
         let bm;
         try {
@@ -1037,6 +1123,11 @@
           setError(heic
             ? name + ' is a HEIC/HEIF file, which only Safari can decode. Export it as JPEG or PNG first.'
             : name + ' could not be decoded as an image. Supported: PNG, JPEG, GIF, WebP, AVIF, BMP, SVG (animated files give the first frame).');
+          return;
+        }
+        if (slot === 'B') {
+          setBitmapB(bm);
+          setShowB(true);
           return;
         }
         try {
@@ -1050,6 +1141,24 @@
         setRungs([]);      // the old ladder belongs to the old image
         setBitmap(bm);
       }, []);
+
+      /* Swap: B becomes the analysed image and A the one the palette is applied
+         to. The ladder is rerun by the effect below, because `bitmap` changes;
+         that costs the usual ~290 ms. The open rung and the two views are kept:
+         the k values are the same on any image, so the same band reopens with the
+         new palette instead of collapsing the panel under the pointer. */
+      function swapImages() {
+        if (!bitmap || !bitmapB) return;
+        try {
+          dataRef.current = imageDataFrom(bitmapB);
+        } catch (err) {
+          setError('The image could not be read back from the canvas.');
+          return;
+        }
+        setRungs([]);       // the old ladder belongs to the old image A
+        setBitmapB(bitmap);
+        setBitmap(bitmapB);
+      }
 
       /* Compute the ladder, then publish it in one go. All eight rungs together
          measured ~290 ms, which as a single block is a visible freeze, so the
@@ -1112,7 +1221,9 @@
 
       /* The paste listener has to be global to catch a paste that is not aimed at
          any particular element, but it must not hijack typing in a real field, and
-         must only preventDefault when the clipboard actually held an image. */
+         must only preventDefault when the clipboard actually held an image.
+         Where the image lands: in B while the second slot is open and still empty,
+         otherwise in A. Drag and drop stays per zone, where the target is explicit. */
       useEffect(() => {
         function onPaste(e) {
           const t = e.target;
@@ -1124,17 +1235,17 @@
           const file = item.getAsFile();
           if (!file) return;
           e.preventDefault();
-          load(file);
+          load(file, showB && !bitmapB ? 'B' : 'A');
         }
         document.addEventListener('paste', onPaste);
         return () => document.removeEventListener('paste', onPaste);
-      }, [load]);
+      }, [load, showB, bitmapB]);
 
-      function onDrop(e) {
+      function onDropTo(slot, e) {
         e.preventDefault();
-        setDragging(false);
+        if (slot === 'B') setDraggingB(false); else setDragging(false);
         const f = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
-        if (f) load(f);
+        if (f) load(f, slot);
         else setError('That drop contained no image file.');
       }
 
@@ -1153,16 +1264,17 @@
       }
 
       /* The canvas already holds exactly what is on screen, so export it straight
-         from there instead of quantizing a second time. */
-      function downloadPreview() {
-        const cv = canvasRef.current;
+         from there instead of quantizing a second time. The slot decides which
+         canvas and which name: a file from the second slot says "applied", because
+         its palette was measured on a different picture. */
+      function downloadPreview(cv, viewId, applied) {
         if (!cv) return;
         cv.toBlob(blob => {
           if (!blob) return;
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = 'palette-' + view + '-' + palette.length + '-colors.png';
+          a.download = 'palette-' + (applied ? 'applied-' : '') + viewId + '-' + palette.length + '-colors.png';
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
@@ -1190,6 +1302,28 @@
           <div className="cx-wrap">
 
             <div>
+              <!-- The header row exists as soon as there is an image: it carries the
+                  slot label and the buttons that open, swap or drop the second slot. -->
+              ${bitmap && html`<div className="cx-slothead">
+                <span className="cx-slotname">${showB ? 'Image A, the palette source' : 'Image'}</span>
+                <span className="cx-slotact">
+                  ${!showB &&
+                    html`<button
+                      type="button"
+                      className="cx-btn"
+                      title="Repaint another picture in the palette of the band you have open"
+                      onClick=${() => setShowB(true)}
+                    >${iconAddImage}Apply to a second image</button>`}
+                  ${showB && bitmapB &&
+                    html`<button
+                      type="button"
+                      className="cx-btn"
+                      title="Analyse image B instead and apply its palette to image A"
+                      onClick=${swapImages}
+                    >${iconSwap}Swap</button>`}
+                </span>
+              </div>`}
+
               ${bitmap && palette.length > 0 &&
                 html`<div className="cx-viewbar">
                   <div className="cx-seg">
@@ -1205,7 +1339,8 @@
                   </div>
                   <span className="cx-viewnote">${palette.length} colors</span>
                   ${view !== 'original' &&
-                    html`<button type="button" className="cx-dl" onClick=${downloadPreview}>Download PNG</button>`}
+                    html`<button type="button" className="cx-dl"
+                      onClick=${() => downloadPreview(canvasRef.current, view, false)}>Download PNG</button>`}
                 </div>`}
 
               <div
@@ -1221,7 +1356,7 @@
                 onDragEnter=${e => { e.preventDefault(); setDragging(true); }}
                 onDragOver=${e => { e.preventDefault(); setDragging(true); }}
                 onDragLeave=${e => { e.preventDefault(); setDragging(false); }}
-                onDrop=${onDrop}
+                onDrop=${e => onDropTo('A', e)}
               >
                 ${!bitmap && html`<div>
                   <p><strong>Drop an image here</strong></p>
@@ -1232,7 +1367,7 @@
                   ref=${fileRef}
                   type="file"
                   accept="image/*"
-                  onChange=${e => { const f = e.target.files[0]; if (f) load(f); e.target.value = ''; }}
+                  onChange=${e => { const f = e.target.files[0]; if (f) load(f, 'A'); e.target.value = ''; }}
                 />
               </div>
               ${error && html`<p className="cx-err">${error}</p>`}
@@ -1245,6 +1380,79 @@
                    bitmap.width * bitmap.height > (view === 'dithered' ? DITHER_MAX_PX : QUANT_MAX_PX) &&
                     ' · preview downscaled for speed'}
                 </p>`}
+
+              <!-- The second slot. Same drop zone, same views, same caps; the only
+                  difference is that its palette comes from the other image. -->
+              ${showB && html`<div className="cx-slot-b">
+                <div className="cx-slothead">
+                  <span className="cx-slotname">Image B, painted in that palette</span>
+                  <span className="cx-slotact">
+                    <button
+                      type="button"
+                      className="cx-btn tool-danger"
+                      title="Close the second slot"
+                      onClick=${() => { setBitmapB(null); setShowB(false); }}
+                    >${iconRemove}Remove</button>
+                  </span>
+                </div>
+
+                ${bitmapB &&
+                  html`<div className="cx-viewbar">
+                    <div className="cx-seg">
+                      ${VIEWS.map(v =>
+                        html`<button
+                          key=${v.id}
+                          type="button"
+                          className=${'lang-seg' + (viewB === v.id ? ' active' : '')}
+                          title=${v.hint}
+                          onClick=${() => setViewB(v.id)}
+                        >${v.label}</button>`
+                      )}
+                    </div>
+                    <span className="cx-viewnote">
+                      ${palette.length ? palette.length + ' colors from image A' : 'open a band to pick a palette'}
+                    </span>
+                    ${viewB !== 'original' && palette.length > 0 &&
+                      html`<button type="button" className="cx-dl"
+                        onClick=${() => downloadPreview(canvasBRef.current, viewB, true)}>Download PNG</button>`}
+                  </div>`}
+
+                <div
+                  className=${'cx-drop' + (draggingB ? ' drag' : '') + (bitmapB ? ' has-image' : '')}
+                  tabIndex="0"
+                  role="button"
+                  aria-label="Choose or drop a second image"
+                  onClick=${() => fileBRef.current.click()}
+                  onKeyDown=${e => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileBRef.current.click(); }
+                  }}
+                  onDragEnter=${e => { e.preventDefault(); setDraggingB(true); }}
+                  onDragOver=${e => { e.preventDefault(); setDraggingB(true); }}
+                  onDragLeave=${e => { e.preventDefault(); setDraggingB(false); }}
+                  onDrop=${e => onDropTo('B', e)}
+                >
+                  ${!bitmapB && html`<div>
+                    <p><strong>Drop the second image here</strong></p>
+                    <p className="cx-hint">or click to choose a file, or press <kbd>Ctrl</kbd>+<kbd>V</kbd> to paste one</p>
+                  </div>`}
+                  <canvas ref=${canvasBRef} style=${{ display: bitmapB ? 'block' : 'none' }} aria-label="Second image" />
+                  <input
+                    ref=${fileBRef}
+                    type="file"
+                    accept="image/*"
+                    onChange=${e => { const f = e.target.files[0]; if (f) load(f, 'B'); e.target.value = ''; }}
+                  />
+                </div>
+
+                ${bitmapB &&
+                  html`<p className="cx-note">
+                    ${bitmapB.width} × ${bitmapB.height} px · not analysed, only repainted
+                    ${renderingB && ' · rendering preview…'}
+                    ${viewB !== 'original' && palette.length > 0 &&
+                     bitmapB.width * bitmapB.height > (viewB === 'dithered' ? DITHER_MAX_PX : QUANT_MAX_PX) &&
+                      ' · preview downscaled for speed'}
+                  </p>`}
+              </div>`}
             </div>
 
             <div>
@@ -1374,6 +1582,14 @@
                     the image that color covers. Open a band to read the hex values and to see the
                     picture redrawn with just those colors. The bands are independent runs, so a color
                     can split into two shades one step down rather than the palette simply growing.
+                  </p>
+                  <p>
+                    <b>Apply to a second image</b> opens a second slot and repaints the picture you
+                    put there in the palette of the band that is currently open, so you can see how
+                    far a palette taken from one image carries a different one. On gradients and
+                    skies the dithered version of that mapping looks a good deal better than the hard
+                    one, which flatters the palette: the quantized view is the honest reading of what
+                    those few colors actually cover.
                   </p>
                   <p>
                     <b>Representative</b> is how each group of pixels is turned into one color.
