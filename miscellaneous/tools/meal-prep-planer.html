@@ -109,6 +109,16 @@
     .vp-tab td.vp-t { font-variant-numeric: tabular-nums; white-space: nowrap; }
     .vp-timer td { font-style: italic; color: var(--tool-note); }
 
+    /* Anleitungszeilen ("Mit Anleitung"-Tab und Druck): haengen optisch an
+       ihrer Task-Zeile, deshalb verliert die Zeile darueber ihre Unterkante. */
+    .vp-tab tr.vp-anl { display: none; }
+    .vp-tab.vp-detail tr.vp-anl { display: table-row; }
+    .vp-tab.vp-detail tr:has(+ tr.vp-anl) td { border-bottom: 0; }
+    .vp-tab tr.vp-anl td { padding-top: 0; }
+    .vp-anl-rz { margin: 0 0 2px; font-size: 12px; font-weight: 600; color: var(--tool-note); }
+    .vp-anl-ul { margin: 0 0 3px; padding-left: 16px; font-size: 12.5px; color: var(--tool-note); }
+    .vp-anl-ul li { margin: 0 0 2px; }
+
     .vp-code { display: inline-block; font-size: 14px; word-break: break-all;
       color: var(--tool-emph); }
     .vp-metrics { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 13px;
@@ -323,9 +333,12 @@
       .vp-plan .vp-cols h3 { break-after: avoid; }
 
       /* Auf Papier stehen beide Sonntags-Ansichten untereinander, erst der
-         Zeitstrahl, dann die Liste, egal welcher Tab am Bildschirm offen ist. */
+         Zeitstrahl, dann die Liste MIT den Anleitungszeilen, egal welcher Tab
+         am Bildschirm offen ist. */
       .vp-plan .vp-gantt.vp-hide { display: block; }
       .vp-plan table.vp-tab.vp-hide { display: table; }
+      .vp-plan table.vp-tab tr.vp-anl { display: table-row; }
+      .vp-plan table.vp-tab tr:has(+ tr.vp-anl) td { border-bottom: 0; }
       .vp-plan .vp-gantt { margin-bottom: 12px; break-inside: avoid; }
       .vp-plan .vp-tab th, .vp-plan .vp-tab td { padding: 2px 6px; }
 
@@ -2300,6 +2313,31 @@ globalThis.VP = {
           `;
         };
 
+        // Kurzanleitungen einer Task: ueber rezeptIdxs zurueck zu den
+        // Komponenten der beteiligten Rezepte. Identische Texte (gleiche
+        // Komponente in mehreren Gerichten) kollabieren zu einem Eintrag ohne
+        // Rezeptnamen; nur bei abweichender Wuerzung bleibt die Zuordnung.
+        const anleitungFuer = function (taskId) {
+          const t = plan.tasks.find(function (x) { return x.id === taskId; });
+          if (!t) return [];
+          const eintraege = [];
+          for (const ri of t.rezeptIdxs) {
+            const r = rezeptVon(ri);
+            for (const k of ((r && r.komponenten) || [])) {
+              if (k.id === taskId && Array.isArray(k.anleitung) && k.anleitung.length) {
+                eintraege.push({ rezept: r.name, schritte: k.anleitung });
+              }
+            }
+          }
+          const gleich = eintraege.every(function (e) {
+            return JSON.stringify(e.schritte) === JSON.stringify(eintraege[0].schritte);
+          });
+          if (eintraege.length === 1 || (eintraege.length > 1 && gleich)) {
+            return [{ rezept: null, schritte: eintraege[0].schritte }];
+          }
+          return eintraege;
+        };
+
         // Auf Papier steht der Plan-Code in der Kopfzeile und klein in jeder
         // Abschnittsueberschrift, damit auch ein einzeln abgerissenes Blatt den
         // Plan zurueckholt. Die URL bleibt am Bildschirm: abtippen wird sie niemand.
@@ -2354,7 +2392,7 @@ globalThis.VP = {
                   : null}
                 <div className="vp-frame">
                   <div className="tabstrip no-print" role="tablist" style=${{ margin: '0 0 10px' }}>
-                    ${[['liste', 'Liste'], ['gantt', 'Zeitstrahl']].map(function (r) {
+                    ${[['liste', 'Liste'], ['detail', 'Mit Anleitung'], ['gantt', 'Zeitstrahl']].map(function (r) {
                       return html`
                         <button key=${r[0]} role="tab" aria-selected=${sonntagAnsicht === r[0] ? 'true' : 'false'}
                           className=${sonntagAnsicht === r[0] ? 'active' : ''}
@@ -2364,25 +2402,45 @@ globalThis.VP = {
                   </div>
                   <!-- Beide Ansichten stehen immer im DOM und werden per Klasse
                        versteckt, nicht bedingt gerendert: auf Papier sollen beide
-                       erscheinen (erst der Zeitstrahl, dann die Liste), unabhaengig
-                       davon, welcher Tab gerade offen ist. -->
+                       erscheinen (erst der Zeitstrahl, dann die Liste samt
+                       Anleitungszeilen), unabhaengig davon, welcher Tab gerade
+                       offen ist. Liste und "Mit Anleitung" sind EINE Tabelle;
+                       vp-detail blendet nur die tr.vp-anl ein. -->
                   <div className=${'vp-gantt' + (sonntagAnsicht === 'gantt' ? '' : ' vp-hide')}>
                     ${ganttAnsicht(plan.sched)}
                   </div>
-                  <table className=${'vp-tab' + (sonntagAnsicht === 'gantt' ? ' vp-hide' : '')}>
+                  <table className=${'vp-tab' + (sonntagAnsicht === 'gantt' ? ' vp-hide' : '') + (sonntagAnsicht === 'detail' ? ' vp-detail' : '')}>
                     <thead>
                       <tr><th>Zeit</th><th>Schritt</th><th>Gerät</th><th>Dauer</th></tr>
                     </thead>
                     <tbody>
                       ${plan.sched.zeilen.map(function (z, j) {
-                        return html`
-                          <tr key=${j} className=${z.art === 'timer' ? 'vp-timer' : ''}>
+                        const zeile = html`
+                          <tr key=${'r' + j} className=${z.art === 'timer' ? 'vp-timer' : ''}>
                             <td className="vp-t">${fmtZeit(z.startMin)}</td>
                             <td>${z.art === 'timer' ? 'Timer: ' + z.text : z.text}</td>
                             <td>${z.geraet === 'keins' ? '' : z.geraet}</td>
                             <td className="vp-t">${z.dauerMin} Min</td>
                           </tr>
                         `;
+                        const anl = z.art === 'aktiv' ? anleitungFuer(z.taskId) : [];
+                        if (anl.length === 0) return zeile;
+                        return html`<${React.Fragment} key=${j}>
+                          ${zeile}
+                          <tr className="vp-anl">
+                            <td></td>
+                            <td colSpan="3">
+                              ${anl.map(function (e, m) {
+                                return html`<div key=${m}>
+                                  ${e.rezept ? html`<p className="vp-anl-rz">${e.rezept}</p>` : null}
+                                  <ul className="vp-anl-ul">
+                                    ${e.schritte.map(function (s, n) { return html`<li key=${n}>${s}</li>`; })}
+                                  </ul>
+                                </div>`;
+                              })}
+                            </td>
+                          </tr>
+                        <//>`;
                       })}
                     </tbody>
                   </table>
