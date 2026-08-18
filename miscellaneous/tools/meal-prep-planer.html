@@ -305,9 +305,18 @@ const DEFAULT_HAUSHALT = {
   geraete: { reiskocher: true, thermomix: true, ofen: true }
 };
 
-// Softmax-Temperatur fuer die gewichtete Zufallswahl in vorschlag().
-// 2.0: deutliche Praeferenz fuer hohe Scores, aber echte Varianz zwischen Seeds.
-const SOFTMAX_TEMPERATUR = 2.0;
+// Sampling-Parameter der gewichteten Zufallswahl in vorschlag(). Nomenklatur
+// wie beim LLM-Sampling (die Auswahl ist strukturell die letzte Schicht eines
+// Sprachmodells: Softmax ueber Scores, Kappungen, ein Zug):
+// - temperature: 2.0 = deutliche Praeferenz fuer hohe Scores, echte Varianz.
+// - topK: nur die K besten Kandidaten ziehen mit (0 = aus).
+// - topP: Nucleus-Sampling, kleinste Kandidatenmenge mit kumulierter
+//   Wahrscheinlichkeit >= topP.
+// - minP: relativ zum besten Kandidaten; bei temperature 2 heisst 0.05
+//   "wer mehr als ~6 Punkte hinter dem Besten liegt, fliegt ganz raus"
+//   (exp(-6/2) = 0.05). Vorher konnte der lange Schwanz mit Minigewicht
+//   trotzdem gezogen werden.
+const SAMPLING = { temperature: 2.0, topK: 0, topP: 0.95, minP: 0.05 };
 
 // planTasks: aktivMin waechst bei Zusammenlegung um 30% pro zusaetzlichem Rezept.
 const MERGE_AKTIV_FAKTOR = 0.3;
@@ -523,6 +532,47 @@ function scoreRezept(rezept, kontext) {
 }
 
 // ---------------------------------------------------------------------------
+// sampleIndex: ein Zug aus der Score-Verteilung (LLM-artiges Sampling)
+// ---------------------------------------------------------------------------
+
+// Liefert den Index des gezogenen Kandidaten. Pipeline wie beim LLM-Sampling:
+// Softmax mit Max-Verschiebung (numerisch stabil), dann topK -> minP -> topP,
+// dann ein Zug aus den Verbleibenden. Der beste Kandidat ueberlebt jede
+// Kappung (sein Gewicht ist nach der Verschiebung exakt 1), die Menge ist
+// also nie leer. Deterministisch bei gleichem rng-Zustand: Ties loesen sich
+// ueber den Originalindex auf.
+function sampleIndex(scores, rng, sampling) {
+  const s = sampling || SAMPLING;
+  const maxScore = Math.max.apply(null, scores);
+  let kand = scores.map(function (sc, i) {
+    return { i: i, w: Math.exp((sc - maxScore) / s.temperature) };
+  });
+  kand.sort(function (a, b) { return b.w - a.w || a.i - b.i; });
+
+  if (s.topK > 0 && kand.length > s.topK) kand = kand.slice(0, s.topK);
+  if (s.minP > 0) {
+    const grenze = s.minP * kand[0].w;
+    kand = kand.filter(function (k) { return k.w >= grenze; });
+  }
+  if (s.topP < 1) {
+    const summe = kand.reduce(function (a, k) { return a + k.w; }, 0);
+    let kum = 0;
+    for (let n = 0; n < kand.length; n++) {
+      kum += kand[n].w;
+      if (kum >= s.topP * summe) { kand = kand.slice(0, n + 1); break; }
+    }
+  }
+
+  const summe = kand.reduce(function (a, k) { return a + k.w; }, 0);
+  let ziel = rng() * summe;
+  for (const k of kand) {
+    ziel -= k.w;
+    if (ziel < 0) return k.i;
+  }
+  return kand[kand.length - 1].i;
+}
+
+// ---------------------------------------------------------------------------
 // vorschlag
 // ---------------------------------------------------------------------------
 
@@ -554,19 +604,7 @@ function vorschlag(daten, slots, zuweisung, chips, seed, haushalt = DEFAULT_HAUS
       return scoreRezept(r, { gewaehlt: gewaehlt, chips: chips, daten: daten, slot: slot, haushalt: haushalt, gesamt: slots.length });
     });
 
-    // Softmax mit Max-Verschiebung (numerisch stabil).
-    const maxScore = Math.max.apply(null, scores);
-    const gewichte = scores.map(function (sc) {
-      return Math.exp((sc - maxScore) / SOFTMAX_TEMPERATUR);
-    });
-    const summe = gewichte.reduce(function (a, b) { return a + b; }, 0);
-
-    let ziel = rng() * summe;
-    let wahl = kandidaten.length - 1;
-    for (let i = 0; i < kandidaten.length; i++) {
-      ziel -= gewichte[i];
-      if (ziel < 0) { wahl = i; break; }
-    }
+    const wahl = sampleIndex(scores, rng, SAMPLING);
 
     neu[s] = kandidaten[wahl].idx;
     verwendet.add(kandidaten[wahl].idx);
@@ -1051,6 +1089,7 @@ function decodePlan(code) {
 globalThis.VP = {
   DEFAULT_HAUSHALT: DEFAULT_HAUSHALT,
   mulberry32: mulberry32,
+  sampleIndex: sampleIndex,
   zulaessig: zulaessig,
   scoreRezept: scoreRezept,
   vorschlag: vorschlag,
