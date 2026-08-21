@@ -82,14 +82,14 @@
     .qr-chips .lang-seg{border-right-width:1px;border-right-style:solid;border-radius:6px}
     .qr-chips .lang-seg{font-size:.75rem;padding:.2rem .55rem}
 
-    /* One joined segmented control, the six module shapes. No gap and no
+    /* One joined segmented control, the seven module shapes. No gap and no
        overlap: the central adjacency rule in custom.css already drops the right
        border of every segment that has a neighbour, so each seam is exactly one
        line. The .seg-row 1px overlap was tried here and is wrong for THIS row,
        because flex:1 hands out fractional widths and two borders landing on the
        same fractional pixel render as a smeared double line.
 
-       Six segments fit a 380px column only if they share the width, hence
+       Seven segments fit a 380px column only if they share the width, hence
        flex:1 with min-width:0. And every box in the row is pinned to the same
        height rather than left to stretch, because the reroll's content is an
        emoji: its line box comes from whichever font the system substitutes, so
@@ -247,7 +247,7 @@
           <li>Free foreground and background colours, with a transparent background as the default, exported as PNG or SVG.</li>
           <li>The error-correction slider is the interesting control, so the tool shows what it does: which modules carry your data and which carry redundancy.</li>
           <li>Cover part of the symbol and the tool counts damaged codewords against the actual correction budget, instead of quoting the usual marketing percentage.</li>
-          <li>Six module shapes, from plain squares to a tangle that joins neighbouring modules at random without ever closing a loop. Each carries the resolution it costs, measured against an independent decoder rather than asserted.</li>
+          <li>Seven module shapes, from plain squares to a tangle that joins neighbouring modules at random without ever closing a loop, to a mode that joins only the places where the modules happen to spell a Korean letter. Each carries the resolution it costs, measured against an independent decoder rather than asserted.</li>
           <li>Presets for WiFi credentials, contact cards, email, SMS, geo coordinates and phone numbers.</li>
         </ul>
       </div>
@@ -1103,7 +1103,7 @@
        Even-odd would look identical until two capsules cross and then punch a
        hole where they meet. */
 
-    var MODULE_STYLES = ['square', 'rounded', 'dots', 'capsule', 'tangle', 'loops'];
+    var MODULE_STYLES = ['square', 'rounded', 'dots', 'capsule', 'tangle', 'loops', 'hangul'];
 
     /* Corner radius as a fraction of a module, dot and capsule thickness
        likewise, then the radii of the styled finder and alignment patterns in
@@ -1137,8 +1137,135 @@
       dots: { round: true, thin: true },
       capsule: { round: true, thin: true },
       tangle: { round: true, thin: true },
-      loops: { round: true, thin: true }
+      loops: { round: true, thin: true },
+      hangul: { round: true, thin: true }
     };
+
+    /* The Hangul style needs a table of letters, and the table decides what the
+       style can ever show. Two rules got things into it.
+
+       Axis-aligned only. A shape here is drawn as capsules between neighbouring
+       module centres, and a diagonal one would run through the corner the two
+       modules share, which means through two LIGHT modules. No style here may
+       put ink on a light module, so ㅅ, ㅈ, ㅊ and ㅎ cannot be drawn at all.
+       They can still be SEEN, in the dots, and more often than the table finds
+       anything: an eye reading a footprint forgives the dots around it, a
+       matcher that has to draw one figure cannot.
+
+       Connected only. A letter has to come out as ONE figure, because the whole
+       point is the contrast between a connected figure and the field of dots
+       around it. A jamo with a detached stroke is a jamo plus litter.
+
+       What survives both rules is seventeen letters. Real Hangul is written in
+       syllable blocks, never as a bare jamo, and this style does not and cannot
+       produce those: a five-by-three block needs some twenty modules to fall
+       out a particular way, which is around one symbol in twenty thousand
+       (measured, notes/dev/qr-hangul-search.mjs). So what the style promises is
+       letters, not text. */
+    var JAMO = [
+      ['giyeok', ['###', '..#', '..#']],
+      ['nieun',  ['#..', '#..', '###']],
+      ['digeut', ['###', '#..', '###']],
+      ['mieum',  ['###', '#.#', '###']],     // the one closed loop in the table
+      ['bieup',  ['#.#', '###', '###']],
+      ['kieuk',  ['###', '.##', '..#']],
+      ['rieul',  ['###', '..#', '###', '#..', '###']],
+      ['tieut',  ['###', '#..', '###', '#..', '###']],
+      ['a',      ['#..', '##.', '#..']],
+      ['eo',     ['..#', '.##', '..#']],
+      ['o',      ['.#.', '.#.', '###']],
+      ['u',      ['###', '.#.', '.#.']],
+      ['yo',     ['#.#', '#.#', '###']],
+      ['yu',     ['###', '#.#', '#.#']],
+      ['ae',     ['#.#', '###', '#.#']],     // and ㅔ, which is this on a module grid
+      ['ya',     ['#.', '##', '#.', '##', '#.']],
+      ['yeo',    ['.#', '##', '.#', '##', '.#']]
+    ];
+
+    /* Both numbers are picks, not findings, and both were made by looking at
+       rendered symbols. A version 5 symbol carries around two dozen jamo
+       footprints; drawing all of them turns the code back into a tangle, in
+       which one letter is exactly as invisible as it was before. Six is about
+       where a symbol still reads as "dots, with a few letters in it".
+
+       The ring is the number of dark modules around a letter's box, out of some
+       twenty. Eight is a little under the average density of a symbol, so a
+       chosen letter always sits in a quieter than usual spot. Demanding an
+       empty ring would be the obvious rule and is the wrong one: it happens
+       about once in five hundred symbols, so the style would do nothing at all
+       on almost every code. It does not need to. An unconnected module is drawn
+       as a dot of 0.86 modules, which leaves 0.14 of air to the letter next to
+       it, so the letter stays a separate figure even in company. */
+    var JAMO_MAX = 6;
+    var JAMO_RING = 8;
+
+    /* Every place where the dark modules happen to spell one of the letters
+       above, quietest first, at most JAMO_MAX of them and never two closer than
+       one module. Nothing is planted and nothing is moved: a match requires the
+       stroke cells to be dark AND every other cell of the box to be light, so
+       the letter is already in the symbol and this only decides which strokes
+       get connected. */
+    function findJamo(sym, solid) {
+      var n = sym.size, cand = [], out = [], claimed = new Uint8Array(n * n);
+      var dark = function (r, c) {
+        return r >= 0 && c >= 0 && r < n && c < n && !!sym.modules[r * n + c];
+      };
+      for (var t = 0; t < JAMO.length; t++) {
+        var tpl = JAMO[t][1], h = tpl.length, w = tpl[0].length;
+        for (var r = 0; r + h <= n; r++) {
+          for (var c = 0; c + w <= n; c++) {
+            var ok = true;
+            for (var dr = 0; dr < h && ok; dr++) {
+              for (var dc = 0; dc < w; dc++) {
+                // a finder or an alignment pattern is drawn whole and is off limits
+                if (solid[(r + dr) * n + c + dc]) { ok = false; break; }
+                if ((tpl[dr].charAt(dc) === '#') !== dark(r + dr, c + dc)) { ok = false; break; }
+              }
+            }
+            if (!ok) continue;
+            var ring = 0;
+            for (var rc = -1; rc <= w; rc++) {
+              if (dark(r - 1, c + rc)) ring++;
+              if (dark(r + h, c + rc)) ring++;
+            }
+            for (var rr = 0; rr < h; rr++) {
+              if (dark(r + rr, c - 1)) ring++;
+              if (dark(r + rr, c + w)) ring++;
+            }
+            if (ring > JAMO_RING) continue;
+            /* Bigger letters win ties and more. A ㄹ pins down fifteen modules
+               and turns up in about one symbol in thirty; a ㅁ pins down nine
+               and is in almost every one. Ranking both by tidiness alone means
+               the six slots go to the common shapes every time and the rare
+               find, which is the whole reason to look, never gets drawn. */
+            cand.push({ t: t, r: r, c: c, h: h, w: w, ring: ring, score: ring - (h * w - 9) });
+          }
+        }
+      }
+      // best score first, then top to bottom; no tie may be broken by anything
+      // that is not in the symbol, or the same code would letter differently
+      // on every repaint
+      cand.sort(function (a, b) {
+        return a.score - b.score || a.r - b.r || a.c - b.c || a.t - b.t;
+      });
+      for (var i = 0; i < cand.length && out.length < JAMO_MAX; i++) {
+        var k = cand[i], clash = false;
+        // one module of air around each letter, checked against the boxes
+        // already taken, otherwise two letters merge into one figure
+        for (var yr = k.r - 1; yr <= k.r + k.h && !clash; yr++) {
+          for (var yc = k.c - 1; yc <= k.c + k.w; yc++) {
+            if (yr < 0 || yc < 0 || yr >= n || yc >= n) continue;
+            if (claimed[yr * n + yc]) { clash = true; break; }
+          }
+        }
+        if (clash) continue;
+        for (var zr = k.r; zr < k.r + k.h; zr++) {
+          for (var zc = k.c; zc < k.c + k.w; zc++) claimed[zr * n + zc] = 1;
+        }
+        out.push(k);
+      }
+      return out;
+    }
 
     function styleOpts(o) {
       var m = o && MODULE_STYLES.indexOf(o.module) >= 0 ? o.module : 'square';
@@ -1277,97 +1404,119 @@
          Nothing is added or removed by this. A connection lives entirely inside
          the two dark modules it joins, so no light module is ever touched, and
          the covered area sits between the capsule style and solid squares. */
-      if (o.module === 'tangle' || o.module === 'loops') {
+      /* Hangul: the same strands, but almost none of them. Only the few boxes
+         where the dark modules already spell a Korean letter get connected, and
+         every other module stays a dot, so the letters are the only joined
+         figures in the symbol. That contrast is what carries the style; drawn
+         over a tangle the same letters are invisible, which is the state this
+         started from. */
+      if (o.module === 'tangle' || o.module === 'loops' || o.module === 'hangul') {
         var tth = STYLE_GEO.thick, thalf = tth / 2;
         var tfree = function (i) { return !!sym.modules[i] && !solid[i]; };
-        var parent = new Int32Array(n * n);
-        for (var pi = 0; pi < n * n; pi++) parent[pi] = pi;
-        var find = function (x) {
-          while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
-          return x;
-        };
-        var edges = [];
-        for (var er = 0; er < n; er++) {
-          for (var ec = 0; ec < n; ec++) {
-            var ei = er * n + ec;
-            if (!tfree(ei)) continue;
-            if (ec + 1 < n && tfree(ei + 1)) edges.push(ei * 2);          // to the right
-            if (er + 1 < n && tfree(ei + n)) edges.push(ei * 2 + 1);      // downwards
-          }
-        }
-        var rnd = rngFrom(o.seed || symbolSeed(sym, 0));
-        for (var sh = edges.length - 1; sh > 0; sh--) {
-          var j = Math.floor(rnd() * (sh + 1));
-          var tmp = edges[sh]; edges[sh] = edges[j]; edges[j] = tmp;
-        }
         var hEdge = new Uint8Array(n * n), vEdge = new Uint8Array(n * n);
-        var rejected = [];
-        for (var e2 = 0; e2 < edges.length; e2++) {
-          var from = edges[e2] >> 1, down = edges[e2] & 1;
-          var to = down ? from + n : from + 1;
-          var ra = find(from), rb = find(to);
-          if (ra === rb) { rejected.push(edges[e2]); continue; }           // would close a loop
-          parent[ra] = rb;
-          if (down) vEdge[from] = 1; else hEdge[from] = 1;
-        }
 
-        /* The loops variant puts exactly one of the rejected edges back per
-           connected group, namely the one whose loop encloses the most area.
-           Every rejected edge closes exactly one loop (the tree path between
-           its ends plus itself), so the area is the shoelace of that path.
-
-           The floor is hard: a loop around a plain 2x2 block encloses exactly
-           one square module and does not count as a loop worth drawing. A group
-           that has nothing bigger to offer keeps its tree and stays open. */
-        if (o.module === 'loops' && rejected.length) {
-          var up = new Int32Array(n * n).fill(-1), depth = new Int32Array(n * n);
-          var stack = [], seen = new Uint8Array(n * n);
-          for (var sr = 0; sr < n * n; sr++) {
-            if (!tfree(sr) || seen[sr]) continue;
-            seen[sr] = 1; up[sr] = -1; depth[sr] = 0; stack.push(sr);
-            while (stack.length) {
-              var cur = stack.pop();
-              var nbs = [
-                hEdge[cur] ? cur + 1 : -1,
-                (cur % n > 0 && hEdge[cur - 1]) ? cur - 1 : -1,
-                vEdge[cur] ? cur + n : -1,
-                (cur >= n && vEdge[cur - n]) ? cur - n : -1
-              ];
-              for (var nb = 0; nb < 4; nb++) {
-                var nx = nbs[nb];
-                if (nx < 0 || seen[nx]) continue;
-                seen[nx] = 1; up[nx] = cur; depth[nx] = depth[cur] + 1; stack.push(nx);
+        if (o.module === 'hangul') {
+          var picks = findJamo(sym, solid);
+          for (var pk = 0; pk < picks.length; pk++) {
+            var P = picks[pk], ptpl = JAMO[P.t][1];
+            for (var pr = 0; pr < P.h; pr++) {
+              for (var pc = 0; pc < P.w; pc++) {
+                if (ptpl[pr].charAt(pc) !== '#') continue;
+                var pidx = (P.r + pr) * n + P.c + pc;
+                if (pc + 1 < P.w && ptpl[pr].charAt(pc + 1) === '#') hEdge[pidx] = 1;
+                if (pr + 1 < P.h && ptpl[pr + 1].charAt(pc) === '#') vEdge[pidx] = 1;
               }
             }
           }
-          var xy = function (i) { return [i % n + 0.5, Math.floor(i / n) + 0.5]; };
-          var bestEdge = {}, bestArea = {};
-          for (var rj = 0; rj < rejected.length; rj++) {
-            var ra2 = rejected[rj] >> 1, dn = rejected[rj] & 1;
-            var rb2 = dn ? ra2 + n : ra2 + 1;
-            // walk both ends up to their common ancestor, collecting the polygon
-            var left = [], right = [], x1 = ra2, x2 = rb2;
-            while (depth[x1] > depth[x2]) { left.push(x1); x1 = up[x1]; }
-            while (depth[x2] > depth[x1]) { right.push(x2); x2 = up[x2]; }
-            while (x1 !== x2) { left.push(x1); right.push(x2); x1 = up[x1]; x2 = up[x2]; }
-            left.push(x1);
-            var poly = left.concat(right.reverse());
-            var area2 = 0;
-            for (var pv = 0; pv < poly.length; pv++) {
-              var p1 = xy(poly[pv]), p2 = xy(poly[(pv + 1) % poly.length]);
-              area2 += p1[0] * p2[1] - p2[0] * p1[1];
-            }
-            var area = Math.abs(area2) / 2;
-            var root = find(ra2);
-            if (area > 1.0001 && area > (bestArea[root] || 0)) {
-              bestArea[root] = area;
-              bestEdge[root] = rejected[rj];
+        } else {
+          var parent = new Int32Array(n * n);
+          for (var pi = 0; pi < n * n; pi++) parent[pi] = pi;
+          var find = function (x) {
+            while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+          };
+          var edges = [];
+          for (var er = 0; er < n; er++) {
+            for (var ec = 0; ec < n; ec++) {
+              var ei = er * n + ec;
+              if (!tfree(ei)) continue;
+              if (ec + 1 < n && tfree(ei + 1)) edges.push(ei * 2);          // to the right
+              if (er + 1 < n && tfree(ei + n)) edges.push(ei * 2 + 1);      // downwards
             }
           }
-          for (var key in bestEdge) {
-            if (!Object.prototype.hasOwnProperty.call(bestEdge, key)) continue;
-            var be = bestEdge[key], bf = be >> 1;
-            if (be & 1) vEdge[bf] = 1; else hEdge[bf] = 1;
+          var rnd = rngFrom(o.seed || symbolSeed(sym, 0));
+          for (var sh = edges.length - 1; sh > 0; sh--) {
+            var j = Math.floor(rnd() * (sh + 1));
+            var tmp = edges[sh]; edges[sh] = edges[j]; edges[j] = tmp;
+          }
+          var rejected = [];
+          for (var e2 = 0; e2 < edges.length; e2++) {
+            var from = edges[e2] >> 1, down = edges[e2] & 1;
+            var to = down ? from + n : from + 1;
+            var ra = find(from), rb = find(to);
+            if (ra === rb) { rejected.push(edges[e2]); continue; }           // would close a loop
+            parent[ra] = rb;
+            if (down) vEdge[from] = 1; else hEdge[from] = 1;
+          }
+
+          /* The loops variant puts exactly one of the rejected edges back per
+             connected group, namely the one whose loop encloses the most area.
+             Every rejected edge closes exactly one loop (the tree path between
+             its ends plus itself), so the area is the shoelace of that path.
+
+             The floor is hard: a loop around a plain 2x2 block encloses exactly
+             one square module and does not count as a loop worth drawing. A group
+             that has nothing bigger to offer keeps its tree and stays open. */
+          if (o.module === 'loops' && rejected.length) {
+            var up = new Int32Array(n * n).fill(-1), depth = new Int32Array(n * n);
+            var stack = [], seen = new Uint8Array(n * n);
+            for (var sr = 0; sr < n * n; sr++) {
+              if (!tfree(sr) || seen[sr]) continue;
+              seen[sr] = 1; up[sr] = -1; depth[sr] = 0; stack.push(sr);
+              while (stack.length) {
+                var cur = stack.pop();
+                var nbs = [
+                  hEdge[cur] ? cur + 1 : -1,
+                  (cur % n > 0 && hEdge[cur - 1]) ? cur - 1 : -1,
+                  vEdge[cur] ? cur + n : -1,
+                  (cur >= n && vEdge[cur - n]) ? cur - n : -1
+                ];
+                for (var nb = 0; nb < 4; nb++) {
+                  var nx = nbs[nb];
+                  if (nx < 0 || seen[nx]) continue;
+                  seen[nx] = 1; up[nx] = cur; depth[nx] = depth[cur] + 1; stack.push(nx);
+                }
+              }
+            }
+            var xy = function (i) { return [i % n + 0.5, Math.floor(i / n) + 0.5]; };
+            var bestEdge = {}, bestArea = {};
+            for (var rj = 0; rj < rejected.length; rj++) {
+              var ra2 = rejected[rj] >> 1, dn = rejected[rj] & 1;
+              var rb2 = dn ? ra2 + n : ra2 + 1;
+              // walk both ends up to their common ancestor, collecting the polygon
+              var left = [], right = [], x1 = ra2, x2 = rb2;
+              while (depth[x1] > depth[x2]) { left.push(x1); x1 = up[x1]; }
+              while (depth[x2] > depth[x1]) { right.push(x2); x2 = up[x2]; }
+              while (x1 !== x2) { left.push(x1); right.push(x2); x1 = up[x1]; x2 = up[x2]; }
+              left.push(x1);
+              var poly = left.concat(right.reverse());
+              var area2 = 0;
+              for (var pv = 0; pv < poly.length; pv++) {
+                var p1 = xy(poly[pv]), p2 = xy(poly[(pv + 1) % poly.length]);
+                area2 += p1[0] * p2[1] - p2[0] * p1[1];
+              }
+              var area = Math.abs(area2) / 2;
+              var root = find(ra2);
+              if (area > 1.0001 && area > (bestArea[root] || 0)) {
+                bestArea[root] = area;
+                bestEdge[root] = rejected[rj];
+              }
+            }
+            for (var key in bestEdge) {
+              if (!Object.prototype.hasOwnProperty.call(bestEdge, key)) continue;
+              var be = bestEdge[key], bf = be >> 1;
+              if (be & 1) vEdge[bf] = 1; else hEdge[bf] = 1;
+            }
           }
         }
         // straight chains of chosen edges become one capsule, for the same
@@ -1616,7 +1765,7 @@
       buildGeo: buildGeo, buildTel: buildTel, buildUrl: buildUrl, buildPayload: buildPayload,
       MODULE_STYLES: MODULE_STYLES, STYLE_LOOK: STYLE_LOOK, STYLE_GEO: STYLE_GEO,
       styleOpts: styleOpts, moduleShapes: moduleShapes, shapePath: shapePath,
-      symbolSeed: symbolSeed,
+      symbolSeed: symbolSeed, JAMO: JAMO, JAMO_MAX: JAMO_MAX, findJamo: findJamo,
       pointInShape: pointInShape,
       svgPathData: svgPathData, toSvg: toSvg, luminance: luminance, contrastRatio: contrastRatio
     };
@@ -1677,17 +1826,17 @@
 
     const MOD_STYLE_LABEL = {
       square: 'Squares', rounded: 'Rounded', dots: 'Dots', capsule: 'Capsules',
-      tangle: 'Tangle', loops: 'Loops'
+      tangle: 'Tangle', loops: 'Loops', hangul: 'Hangul'
     };
 
-    /* The six shapes are picked by their picture, not by their name: six labels
+    /* The seven shapes are picked by their picture, not by their name: seven labels
        in one segmented control fit a 380px column only as "Capsul...", and the
        word tells you less than the thing does anyway.
 
        The icons are drawn by the very moduleShapes the exporter uses, on a 5x5
        stand-in symbol, so an icon cannot show a shape the downloaded file does
        not have. The pattern is a hollow 4x4 ring with a stem and one loose
-       module, which is the smallest thing that separates all six: the ring
+       module, which is the smallest thing that separates all seven: the ring
        gives capsules their four runs, the loose module gives dots and tangle
        their single dot, and the ring encloses four modules, which is over the
        area floor, so `loops` closes it where `tangle` leaves it broken. The
@@ -1722,11 +1871,13 @@
       capsule: { px: 2, tail: 1.75,
         note: 'Runs become one capsule, lone modules become dots; it takes blur better than squares and gives up a little earlier when the resolution runs out.' },
       dots: { px: 2, tail: 1.75,
-        note: 'The most fragile of the six: an isolated dot covers 58% of its module, so noise averages it away first.' },
+        note: 'The most fragile shape here: an isolated dot covers 58% of its module, so noise averages it away first.' },
       tangle: { px: 2, tail: 1.75,
         note: 'Neighbouring modules are joined at random, but never so that a loop closes: every group of modules ends up a tree.' },
       loops: { px: 2, tail: 1.75,
-        note: 'The tangle, plus the one leftover connection per group that encloses the most area. Measures exactly like the tangle.' }
+        note: 'The tangle, plus the one leftover connection per group that encloses the most area. Measures exactly like the tangle.' },
+      hangul: { px: 2, tail: 1.75,
+        note: 'Dots, except in the few places where the modules happen to spell a Korean letter, which are joined into one. Nothing is planted, the letters are found, so a symbol carries a handful or none. Measures exactly like plain dots, closed ㅁ included.' }
     };
 
     // largest canvas dimension browsers still allocate; past it a canvas is blank
