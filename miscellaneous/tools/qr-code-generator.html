@@ -1,0 +1,2508 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QR Code Generator - No Account, Transparent Background, Real Error Correction - alber.me</title>
+  <meta name="description" content="Generate QR codes in your browser: free foreground and background colours, transparency by default, PNG and SVG export. The error-correction slider shows what it actually buys you, module by module. No account, no upload, no redirect service.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/qr-code-generator.html">
+  <meta property="og:title" content="QR Code Generator - no account, transparent background, real error correction">
+  <meta property="og:description" content="Generate QR codes in your browser: free colours, transparency by default, PNG and SVG export, and an error-correction slider that shows what it actually buys you.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/qr-code-generator.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+
+  <style>
+    /* Symbol colours live here rather than in JS so every skin can restyle them
+       and readPalette() can pick them up on a live theme switch. They are the
+       DEFAULT only: once the user picks a colour, the app stops consulting them
+       (see the fg/bg state comment in the app block). */
+    html                     { --qr-fg: #e2e8f0; --qr-bg: #0f172a; }
+    html[data-theme="light"] { --qr-fg: #0f172a; --qr-bg: #ffffff; }
+    html[data-skin="grey"]   { --qr-fg: #ffffff; --qr-bg: #2a2e33; }
+
+    /* Overlay colours. The grey skin gets a greyscale set rather than desaturated
+       hues, because its whole principle is telling surfaces apart by outline. */
+    html {
+      --qr-ov-data: #38bdf8; --qr-ov-ec: #fb923c; --qr-ov-fn: #64748b; --qr-ov-rem: #475569;
+      --qr-ov-b0: #38bdf8; --qr-ov-b1: #f472b6; --qr-ov-b2: #a3e635;
+      --qr-ov-b3: #fbbf24; --qr-ov-b4: #a78bfa;
+    }
+    html[data-theme="light"] {
+      --qr-ov-data: #0284c7; --qr-ov-ec: #c2410c; --qr-ov-fn: #94a3b8; --qr-ov-rem: #cbd5e1;
+      --qr-ov-b0: #0284c7; --qr-ov-b1: #be185d; --qr-ov-b2: #4d7c0f;
+      --qr-ov-b3: #b45309; --qr-ov-b4: #6d28d9;
+    }
+    html[data-skin="grey"] {
+      --qr-ov-data: #f4f4f5; --qr-ov-ec: #a1a1aa; --qr-ov-fn: #52525b; --qr-ov-rem: #3f3f46;
+      --qr-ov-b0: #fafafa; --qr-ov-b1: #d4d4d8; --qr-ov-b2: #a1a1aa;
+      --qr-ov-b3: #71717a; --qr-ov-b4: #52525b;
+    }
+
+    .qr-layout{display:grid;grid-template-columns:380px minmax(0,1fr);gap:1.4rem;align-items:start}
+    @media (max-width:1000px){.qr-layout{grid-template-columns:1fr}}
+
+    /* The preview sits on a checkerboard so a transparent background reads as
+       transparent instead of as "the tool rendered nothing". Pico's very first
+       rule is background-repeat:no-repeat, hence the explicit repeat. */
+    .qr-stage{display:flex;justify-content:center;align-items:center;padding:18px;
+      border:1px solid var(--tool-border);border-radius:8px;box-shadow:var(--tool-panel-shadow);
+      background-color:var(--tool-surface);
+      background-image:linear-gradient(45deg,var(--tool-hairline) 25%,transparent 25%,transparent 75%,var(--tool-hairline) 75%),
+                       linear-gradient(45deg,var(--tool-hairline) 25%,transparent 25%,transparent 75%,var(--tool-hairline) 75%);
+      background-size:16px 16px;background-position:0 0,8px 8px;background-repeat:repeat}
+    .qr-stage canvas{display:block;max-width:100%;height:auto;image-rendering:pixelated;cursor:crosshair}
+    .qr-stage canvas.plain{cursor:default}
+
+    .qr-field{display:block;margin-bottom:.5rem;font-size:.82em;color:var(--tool-label)}
+    .qr-field > span{display:block;margin-bottom:.15rem}
+    .qr-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 .6rem}
+    .qr-grid .wide{grid-column:1 / -1}
+    input.qr-in,select.qr-in,textarea.qr-in{--pico-form-element-spacing-vertical:.4rem;
+      --pico-form-element-spacing-horizontal:.6rem;font-size:.85rem;margin-bottom:.35rem}
+    textarea.qr-in{min-height:5.2rem;resize:vertical}
+
+    /* Pico styles [type=range] at 0,1,0, so a bare class ties with it and loses
+       the coin flip. Element-prefixed selectors here and everywhere below. */
+    input.qr-range{margin:.2rem 0 .1rem}
+    .qr-ticks{display:flex;justify-content:space-between;font-size:.72em;color:var(--tool-note);
+      font-variant-numeric:tabular-nums}
+    .qr-ticks b{font-weight:600;color:var(--tool-text)}
+
+    .qr-row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+    .qr-row.seg-row{gap:0}
+    /* Deliberate chip row: these gapped lang-seg buttons are separate actions,
+       not one control, so the central adjacency rule's border removal has to be
+       undone. Only the style is killed there, the colour is already right. */
+    .qr-chips{display:flex;gap:.35rem;flex-wrap:wrap}
+    .qr-chips .lang-seg{border-right-width:1px;border-right-style:solid;border-radius:6px}
+    .qr-chips .lang-seg{font-size:.75rem;padding:.2rem .55rem}
+
+    /* One joined segmented control, the six module shapes. No gap and no
+       overlap: the central adjacency rule in custom.css already drops the right
+       border of every segment that has a neighbour, so each seam is exactly one
+       line. The .seg-row 1px overlap was tried here and is wrong for THIS row,
+       because flex:1 hands out fractional widths and two borders landing on the
+       same fractional pixel render as a smeared double line.
+
+       Six segments fit a 380px column only if they share the width, hence
+       flex:1 with min-width:0. And every box in the row is pinned to the same
+       height rather than left to stretch, because the reroll's content is an
+       emoji: its line box comes from whichever font the system substitutes, so
+       the row height would be a property of the reader's machine. */
+    .seg-row{display:flex;min-width:0}
+    .qr-shape-row{display:flex;gap:.4rem;align-items:center}
+    .qr-seg{flex:1 1 auto}
+    .qr-seg .lang-seg,.qr-reroll{height:40px;display:flex;align-items:center;
+      justify-content:center;padding:.2rem .15rem}
+    .qr-seg .lang-seg{flex:1 1 0;min-width:0}
+    /* Pico gives an svg no dimensions of its own, and a viewBox alone makes it
+       300x150 in most browsers. */
+    .qr-shape-icon{display:block;width:30px;height:30px;max-width:100%}
+    /* The reroll is a separate action, not a seventh shape, so it stands apart.
+       Its previous sibling is a div, so the adjacency rule rounds it on its own
+       and it needs no patch. */
+    .qr-reroll{flex:0 0 auto;width:40px;font-size:1.05rem;line-height:1}
+
+    /* The round "i" and its floating explanation, the same pattern as
+       leverage-ruin: static prose that would otherwise sit under every control
+       and push the thing the reader is looking at off the screen. */
+    .qr-anchor{position:relative;display:inline-block;font-weight:400}
+    .qr-info{display:inline-flex;align-items:center;justify-content:center;
+      width:15px;height:15px;margin:0 0 0 5px;padding:0;vertical-align:-2px;
+      border:1px solid var(--tool-faint);border-radius:50%;background:none;color:var(--tool-label);
+      font-size:10.5px;line-height:1;font-weight:700;cursor:pointer}
+    .qr-info:hover,.qr-info[aria-expanded="true"]{border-color:var(--tool-sig-info);
+      color:var(--tool-sig-info);background:none}
+    .qr-pop{position:absolute;z-index:40;top:calc(100% + 8px);left:50%;
+      width:min(420px,calc(100vw - 28px));max-height:min(58vh,460px);overflow-y:auto;
+      background:var(--tool-surface);border:1px solid var(--tool-border);border-radius:8px;
+      box-shadow:var(--tool-panel-shadow);padding:12px 34px 12px 14px;font-size:12.5px;
+      line-height:1.7;color:var(--tool-label);font-weight:400;text-align:left;cursor:auto}
+    .qr-pop p{margin:0 0 .6rem}
+    .qr-pop p:last-child{margin-bottom:0}
+    .qr-pop::before{content:"";position:absolute;top:-5px;left:var(--arrow,50%);width:8px;height:8px;
+      margin-left:-4px;background:var(--tool-surface);border-left:1px solid var(--tool-border);
+      border-top:1px solid var(--tool-border);transform:rotate(45deg)}
+    .qr-popclose{position:absolute;top:5px;right:5px;width:24px;height:24px;
+      display:inline-flex;align-items:center;justify-content:center;margin:0;padding:0;
+      border:none;border-radius:5px;background:none;color:var(--tool-note);
+      font-size:17px;line-height:1;cursor:pointer}
+    .qr-popclose:hover{background:var(--tool-hairline);color:var(--tool-text)}
+
+    /* The parameter sections collapse. Everything but the content itself is
+       optional reading, and the error-correction block in particular was three
+       screens of card for people who only wanted a code. The look is ctl-adv,
+       the site's control-section disclosure, not .fold: these hold controls.
+
+       The chevron is a float in Pico (turned to float:left by ctl-adv), and a
+       float is not a line start: as soon as the header wraps, which a title
+       plus its aside does in a 380px column, the chevron drops BELOW the text.
+       So this is a flex box instead, with the marker ordered to the front.
+
+       And it stays ONE line. Letting it wrap was tried and is worse than it
+       sounds: the aside is the longest part, so it took the break, and the "i"
+       behind it ended up alone on the second line looking like a bullet point.
+       Only the aside may shrink, and it shrinks into an ellipsis; the title and
+       the "i" never move. */
+    .ctl-card > details.ctl-sec > summary{display:flex;flex-wrap:nowrap;align-items:center;gap:0 .45rem}
+    .ctl-card > details.ctl-sec > summary::after{float:none;order:-1;flex:0 0 auto;
+      margin-inline-start:0;margin-inline-end:0}
+    .qr-sec-t{flex:0 0 auto;white-space:nowrap}
+    .ctl-card > details.ctl-sec > summary .ctl-sec-h-sub{flex:0 1 auto;min-width:0;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ctl-card > details.ctl-sec > summary .qr-anchor{flex:0 0 auto}
+    .ctl-card > details.ctl-sec > summary .qr-info{margin-left:0}
+
+    input.qr-color{--pico-form-element-spacing-vertical:.15rem;--pico-form-element-spacing-horizontal:.15rem;
+      width:44px;height:32px;padding:2px;margin:0;cursor:pointer}
+    .qr-swatch-row{display:flex;gap:.5rem;align-items:center;margin-bottom:.3rem}
+    .qr-hex{font-family:var(--pico-font-family-monospace,monospace);font-size:.78rem;color:var(--tool-note);
+      font-variant-numeric:tabular-nums}
+
+    .qr-stats{display:flex;flex-wrap:wrap;gap:.15rem 1.1rem;margin:.7rem 0 .4rem;font-size:.8rem;
+      color:var(--tool-label)}
+    .qr-stats b{color:var(--tool-text);font-weight:600;font-variant-numeric:tabular-nums}
+    .qr-verdict{font-size:.85rem;margin:.4rem 0;padding:.5rem .7rem;border-radius:7px;
+      border:1px solid var(--tool-border);background:var(--tool-panel);color:var(--tool-text)}
+    .qr-verdict.ok{border-color:var(--tool-ok-border);color:var(--tool-ok-text);background:var(--tool-ok-bg)}
+    .qr-verdict.warn{border-color:var(--tool-warn-border);color:var(--tool-warn-text);background:var(--tool-warn-bg)}
+    .qr-verdict.bad{border-color:var(--tool-danger-border);color:var(--tool-danger-text);background:var(--tool-danger-bg)}
+    .qr-note{font-size:.76rem;color:var(--tool-note);margin:.3rem 0}
+    /* A chip that sits inside a sentence rather than in a row of its own. */
+    .qr-inline-seg{padding:.05rem .4rem;vertical-align:baseline}
+    .qr-faint{font-size:.72rem;color:var(--tool-faint);margin:.25rem 0}
+
+    .qr-legend{display:flex;flex-wrap:wrap;gap:.3rem .9rem;font-size:.76rem;color:var(--tool-label);margin:.4rem 0}
+    .qr-legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px;
+      vertical-align:-1px;border:1px solid var(--tool-hairline)}
+    .qr-hover{font-size:.76rem;color:var(--tool-note);min-height:1.2em;margin:.2rem 0;
+      font-variant-numeric:tabular-nums}
+
+    .qr-actions{display:flex;gap:.5rem;flex-wrap:wrap;margin:.6rem 0 .3rem}
+    .qr-actions button{width:auto;margin:0;padding:.35rem .9rem;font-size:.82rem}
+
+    /* The export block closes the right column and has to read as one unit
+       without becoming a second bordered panel beside the stage. Hairline
+       above it, the same separator the ctl-card puts between its sections. */
+    .qr-export{margin-top:1.1rem;padding-top:.8rem;border-top:1px solid var(--tool-hairline)}
+    .qr-anat{margin:.7rem 0 .2rem}
+  </style>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "QR Code Generator",
+    "description": "Generates QR codes entirely in the browser with free foreground and background colours, transparency by default, PNG and SVG export, and an error-correction slider that shows which modules carry data and which carry redundancy.",
+    "url": "https://alber.me/miscellaneous/tools/qr-code-generator.html",
+    "applicationCategory": "UtilityApplication",
+    "inLanguage": "en",
+    "author": {
+      "@type": "Person",
+      "@id": "https://alber.me/alexander/#person",
+      "name": "Alexander Alber",
+      "url": "https://alber.me/alexander/"
+    },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#other" id="nav-cat">Everything Else</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">QR Code Generator</h1>
+        <p style="color:var(--tool-label);max-width:70ch">A QR code generator that wants nothing from you. No account, no upload, no shortener sitting between the code and its destination. The encoder is written into this page, so the symbol on screen is built from your text and nothing else.</p>
+        <ul style="color:var(--tool-label);max-width:70ch">
+          <li>Free foreground and background colours, with a transparent background as the default, exported as PNG or SVG.</li>
+          <li>The error-correction slider is the interesting control, so the tool shows what it does: which modules carry your data and which carry redundancy.</li>
+          <li>Cover part of the symbol and the tool counts damaged codewords against the actual correction budget, instead of quoting the usual marketing percentage.</li>
+          <li>Six module shapes, from plain squares to a tangle that joins neighbouring modules at random without ever closing a loop. Each carries the resolution it costs, measured against an independent decoder rather than asserted.</li>
+          <li>Presets for WiFi credentials, contact cards, email, SMS, geo coordinates and phone numbers.</li>
+        </ul>
+      </div>
+    </div>
+  </main>
+
+  <script id="qrcore">
+  /* QR-CORE-START -- pure logic, no DOM, no markup; also evaluated by the Node
+     test suite, which pulls this block out of the HTML by its id. Everything
+     here follows ISO/IEC 18004. The parts that are silently wrong when done
+     differently are flagged at the code: the timing-column hop in
+     placementOrder, the short-block guard in interleave, and the two different
+     orderings of the four error-correction levels. */
+  var QRC = (function () {
+    'use strict';
+
+    /* ---------------------------------------------------------------- tables */
+
+    var ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
+
+    /* Two orderings of the same four levels, and confusing them produces a
+       symbol that looks perfect and decodes as garbage: EC_SPEC is indexed
+       L,M,Q,H = 0,1,2,3, while the format field encodes L=1, M=0, Q=3, H=2. */
+    var ECL = ['L', 'M', 'Q', 'H'];
+    var ECL_FORMAT_BITS = { L: 1, M: 0, Q: 3, H: 2 };
+
+    /* Per version and level: [error-correction codewords per block, block count].
+       Everything else (data codewords, group split) is derived in blockLayout,
+       so there is nothing here that can disagree with itself. */
+    var EC_SPEC = [
+      null,
+      [[7, 1], [10, 1], [13, 1], [17, 1]],
+      [[10, 1], [16, 1], [22, 1], [28, 1]],
+      [[15, 1], [26, 1], [18, 2], [22, 2]],
+      [[20, 1], [18, 2], [26, 2], [16, 4]],
+      [[26, 1], [24, 2], [18, 4], [22, 4]],
+      [[18, 2], [16, 4], [24, 4], [28, 4]],
+      [[20, 2], [18, 4], [18, 6], [26, 5]],
+      [[24, 2], [22, 4], [22, 6], [26, 6]],
+      [[30, 2], [22, 5], [20, 8], [24, 8]],
+      [[18, 4], [26, 5], [24, 8], [28, 8]],
+      [[20, 4], [30, 5], [28, 8], [24, 11]],
+      [[24, 4], [22, 8], [26, 10], [28, 11]],
+      [[26, 4], [22, 9], [24, 12], [22, 16]],
+      [[30, 4], [24, 9], [20, 16], [24, 16]],
+      [[22, 6], [24, 10], [30, 12], [24, 18]],
+      [[24, 6], [28, 10], [24, 17], [30, 16]],
+      [[28, 6], [28, 11], [28, 16], [28, 19]],
+      [[30, 6], [26, 13], [28, 18], [28, 21]],
+      [[28, 7], [26, 14], [26, 21], [26, 25]],
+      [[28, 8], [26, 16], [30, 20], [28, 25]],
+      [[28, 8], [26, 17], [28, 23], [30, 25]],
+      [[28, 9], [28, 17], [30, 23], [24, 34]],
+      [[30, 9], [28, 18], [30, 25], [30, 30]],
+      [[30, 10], [28, 20], [30, 27], [30, 32]],
+      [[26, 12], [28, 21], [30, 29], [30, 35]],
+      [[28, 12], [28, 23], [28, 34], [30, 37]],
+      [[30, 12], [28, 25], [30, 34], [30, 40]],
+      [[30, 13], [28, 26], [30, 35], [30, 42]],
+      [[30, 14], [28, 28], [30, 38], [30, 45]],
+      [[30, 15], [28, 29], [30, 40], [30, 48]],
+      [[30, 16], [28, 31], [30, 43], [30, 51]],
+      [[30, 17], [28, 33], [30, 45], [30, 54]],
+      [[30, 18], [28, 35], [30, 48], [30, 57]],
+      [[30, 19], [28, 37], [30, 51], [30, 60]],
+      [[30, 19], [28, 38], [30, 53], [30, 63]],
+      [[30, 20], [28, 40], [30, 56], [30, 66]],
+      [[30, 21], [28, 43], [30, 59], [30, 70]],
+      [[30, 22], [28, 45], [30, 62], [30, 74]],
+      [[30, 24], [28, 47], [30, 65], [30, 77]],
+      [[30, 25], [28, 49], [30, 70], [30, 81]]
+    ];
+
+    /* Alignment pattern centre coordinates per version. Not cross-checkable by
+       eye, but the test asserts that the free-module count these produce equals
+       TOTAL_CODEWORDS below, which a wrong coordinate always breaks. */
+    var ALIGN_POS = [
+      null, [],
+      [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+      [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50], [6, 30, 54], [6, 32, 58], [6, 34, 62],
+      [6, 26, 46, 66], [6, 26, 48, 70], [6, 26, 50, 74], [6, 30, 54, 78], [6, 30, 56, 82],
+      [6, 30, 58, 86], [6, 34, 62, 90],
+      [6, 28, 50, 72, 94], [6, 26, 50, 74, 98], [6, 30, 54, 78, 102], [6, 28, 54, 80, 106],
+      [6, 32, 58, 84, 110], [6, 30, 58, 86, 114], [6, 34, 62, 90, 118],
+      [6, 26, 50, 74, 98, 122], [6, 30, 54, 78, 102, 126], [6, 26, 52, 78, 104, 130],
+      [6, 30, 56, 82, 108, 134], [6, 34, 60, 86, 112, 138], [6, 30, 58, 86, 114, 142],
+      [6, 34, 62, 90, 118, 146],
+      [6, 30, 54, 78, 102, 126, 150], [6, 24, 50, 76, 102, 128, 154], [6, 28, 54, 80, 106, 132, 158],
+      [6, 32, 58, 84, 110, 136, 162], [6, 26, 54, 82, 110, 138, 166], [6, 30, 58, 86, 114, 142, 170]
+    ];
+
+    /* Kept as a cross-check against the geometry, not as an input: the test
+       asserts TOTAL_CODEWORDS[v] === floor(freeModules(v) / 8). */
+    var TOTAL_CODEWORDS = [
+      0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346, 404, 466, 532, 581, 655,
+      733, 815, 901, 991, 1085, 1156, 1258, 1364, 1474, 1588, 1706, 1828, 1921,
+      2051, 2185, 2323, 2465, 2611, 2761, 2876, 3034, 3196, 3362, 3532, 3706
+    ];
+
+    var MODE = { num: 0, alnum: 1, byte: 2 };
+    var MODE_IND = [1, 2, 4];
+    /* Character-count field width per mode, by version band 1-9 / 10-26 / 27-40. */
+    var CC_BITS = [[10, 9, 8], [12, 11, 16], [14, 13, 16]];
+
+    var FN_FREE = 0, FN_FINDER = 1, FN_SEPARATOR = 2, FN_TIMING = 3,
+        FN_ALIGN = 4, FN_FORMAT = 5, FN_VERSION = 6, FN_DARK = 7;
+    var FN_NAME = ['', 'finder', 'separator', 'timing', 'alignment', 'format', 'version', 'dark module'];
+
+    function sizeOf(version) { return 17 + 4 * version; }
+    function ccBits(mode, version) {
+      return CC_BITS[version <= 9 ? 0 : (version <= 26 ? 1 : 2)][mode];
+    }
+
+    /* ------------------------------------------------------------- GF(256) */
+
+    var GF_EXP = new Uint8Array(512), GF_LOG = new Uint8Array(256);
+    (function () {
+      var x = 1;
+      for (var i = 0; i < 255; i++) {
+        GF_EXP[i] = x;
+        GF_LOG[x] = i;
+        x <<= 1;
+        if (x & 0x100) x ^= 0x11D;          // the QR primitive polynomial
+      }
+      for (var j = 255; j < 512; j++) GF_EXP[j] = GF_EXP[j - 255];
+    })();
+
+    function gfMul(a, b) {
+      if (a === 0 || b === 0) return 0;
+      return GF_EXP[GF_LOG[a] + GF_LOG[b]];
+    }
+
+    var GEN_CACHE = {};
+    function rsGenerator(degree) {
+      if (GEN_CACHE[degree]) return GEN_CACHE[degree];
+      var g = new Uint8Array(degree + 1);
+      g[degree] = 1;                                    // start with the constant 1
+      var root = 1;
+      for (var i = 0; i < degree; i++) {
+        // multiply the polynomial by (x - alpha^i)
+        for (var j = 0; j < degree; j++) {
+          g[j] = gfMul(g[j], root) ^ g[j + 1];
+        }
+        g[degree] = gfMul(g[degree], root);
+        root = gfMul(root, 2);
+      }
+      GEN_CACHE[degree] = g;
+      return g;
+    }
+
+    function rsRemainder(data, degree) {
+      var gen = rsGenerator(degree);
+      var res = new Uint8Array(degree);
+      for (var i = 0; i < data.length; i++) {
+        var factor = data[i] ^ res[0];
+        res.copyWithin(0, 1);
+        res[degree - 1] = 0;
+        for (var j = 0; j < degree; j++) res[j] ^= gfMul(gen[j + 1], factor);
+      }
+      return res;
+    }
+
+    /* -------------------------------------------------------- segmentation */
+
+    function utf8Bytes(str) {
+      if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+      var out = [];
+      for (var i = 0; i < str.length; i++) {
+        var c = str.codePointAt(i);
+        if (c > 0xFFFF) i++;
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
+        else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+        else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+      return new Uint8Array(out);
+    }
+
+    function isNum(ch) { return ch.length === 1 && ch >= '0' && ch <= '9'; }
+    function isAlnum(ch) { return ch.length === 1 && ALNUM.indexOf(ch) >= 0; }
+    function charMode(ch) { return isNum(ch) ? 'num' : (isAlnum(ch) ? 'alnum' : 'byte'); }
+
+    function byteLen(ch) {
+      var c = ch.codePointAt(0);
+      return c < 0x80 ? 1 : (c < 0x800 ? 2 : (c < 0x10000 ? 3 : 4));
+    }
+
+    /* Optimal segmentation for a given version, by dynamic programming over the
+       three modes. Costs are in sixths of a bit, because numeric spends 10/3
+       bits and alphanumeric 11/2 bits per character; a segment's real length is
+       only integral once it closes, which is what the ceil6 calls express.
+       Greedy merging was the alternative and is routinely one segment worse. */
+    function ceil6(v) { return Math.ceil(v / 6) * 6; }
+
+    function optimalModes(chars, version) {
+      var head = [ (4 + ccBits(0, version)) * 6,
+                   (4 + ccBits(1, version)) * 6,
+                   (4 + ccBits(2, version)) * 6 ];
+      var INF = Infinity;
+      var cost = head.slice();
+      var back = [];
+      for (var i = 0; i < chars.length; i++) {
+        var ch = chars[i];
+        var add = [ isNum(ch) ? 20 : INF, isAlnum(ch) ? 33 : INF, 48 * byteLen(ch) ];
+        var next = [INF, INF, INF], from = [-1, -1, -1];
+        for (var m = 0; m < 3; m++) {
+          if (add[m] === INF) continue;
+          var best = cost[m] + add[m], bm = m;                  // continue this segment
+          for (var k = 0; k < 3; k++) {
+            if (k === m || cost[k] === INF) continue;
+            var alt = ceil6(cost[k]) + head[m] + add[m];        // close k, open m
+            if (alt < best) { best = alt; bm = k; }
+          }
+          next[m] = best; from[m] = bm;
+        }
+        cost = next; back.push(from);
+      }
+      var bestMode = 0, bestCost = INF;
+      for (var m2 = 0; m2 < 3; m2++) {
+        var c = ceil6(cost[m2]);
+        if (c < bestCost) { bestCost = c; bestMode = m2; }
+      }
+      // walk the back pointers to recover the mode of every character
+      var modes = new Array(chars.length);
+      var cur = bestMode;
+      for (var i2 = chars.length - 1; i2 >= 0; i2--) {
+        modes[i2] = cur;
+        cur = back[i2][cur];
+      }
+      return { modes: modes, bits: bestCost / 6 };
+    }
+
+    function segmentsFromModes(chars, modes) {
+      var segs = [], cur = null;
+      for (var i = 0; i < chars.length; i++) {
+        if (!cur || cur.mode !== modes[i]) {
+          cur = { mode: modes[i], text: '' };
+          segs.push(cur);
+        }
+        cur.text += chars[i];
+      }
+      segs.forEach(function (s) {
+        if (s.mode === MODE.byte) {
+          s.bytes = utf8Bytes(s.text);
+          s.count = s.bytes.length;
+        } else {
+          s.count = Array.from(s.text).length;
+        }
+      });
+      return segs;
+    }
+
+    /* forceMode lets the expert panel pin a mode; 'auto' runs the DP. */
+    function segment(text, forceMode, version) {
+      var chars = Array.from(text);
+      if (!chars.length) return [];
+      if (forceMode && forceMode !== 'auto') {
+        var m = MODE[forceMode];
+        for (var i = 0; i < chars.length; i++) {
+          if (m === MODE.num && !isNum(chars[i])) return null;
+          if (m === MODE.alnum && !isAlnum(chars[i])) return null;
+        }
+        return segmentsFromModes(chars, chars.map(function () { return m; }));
+      }
+      return segmentsFromModes(chars, optimalModes(chars, version || 1).modes);
+    }
+
+    function segmentBits(segs, version) {
+      var total = 0;
+      for (var i = 0; i < segs.length; i++) {
+        var s = segs[i];
+        total += 4 + ccBits(s.mode, version);
+        if (s.mode === MODE.num) {
+          total += 10 * Math.floor(s.count / 3) + [0, 4, 7][s.count % 3];
+        } else if (s.mode === MODE.alnum) {
+          total += 11 * Math.floor(s.count / 2) + 6 * (s.count % 2);
+        } else {
+          total += 8 * s.count;
+        }
+      }
+      return total;
+    }
+
+    /* --------------------------------------------------------- block layout */
+
+    function blockLayout(version, ecl) {
+      var spec = EC_SPEC[version][ECL.indexOf(ecl)];
+      var ecPerBlock = spec[0], numBlocks = spec[1];
+      var totalCodewords = TOTAL_CODEWORDS[version];
+      var totalData = totalCodewords - ecPerBlock * numBlocks;
+      var shortLen = Math.floor(totalData / numBlocks);
+      var longCount = totalData % numBlocks;               // group 2, one codeword longer
+      var blocks = [];
+      for (var b = 0; b < numBlocks; b++) {
+        blocks.push({
+          index: b,
+          dataLen: b < numBlocks - longCount ? shortLen : shortLen + 1,
+          ecLen: ecPerBlock
+        });
+      }
+      return {
+        version: version, ecl: ecl, ecPerBlock: ecPerBlock, numBlocks: numBlocks,
+        totalCodewords: totalCodewords, totalData: totalData,
+        shortLen: shortLen, longCount: longCount, blocks: blocks
+      };
+    }
+
+    function chooseVersion(text, ecl, minVersion, forceMode) {
+      var chars = Array.from(text);
+      for (var v = Math.max(1, minVersion || 1); v <= 40; v++) {
+        var segs = segment(text, forceMode, v);
+        if (segs === null) return { error: 'mode' };
+        var bits = segmentBits(segs, v);
+        var capacity = blockLayout(v, ecl).totalData * 8;
+        if (bits <= capacity) return { version: v, segments: segs, bits: bits, capacityBits: capacity };
+      }
+      return { error: 'capacity' };
+    }
+
+    /* ------------------------------------------------------------ bitstream */
+
+    function BitBuf() { this.bits = []; }
+    BitBuf.prototype.push = function (value, len) {
+      for (var i = len - 1; i >= 0; i--) this.bits.push((value >>> i) & 1);
+    };
+
+    function encodeSegments(segs, version, ecl) {
+      var layout = blockLayout(version, ecl);
+      var buf = new BitBuf();
+      for (var i = 0; i < segs.length; i++) {
+        var s = segs[i];
+        buf.push(MODE_IND[s.mode], 4);
+        buf.push(s.count, ccBits(s.mode, version));
+        if (s.mode === MODE.num) {
+          var digits = s.text;
+          for (var d = 0; d < digits.length; d += 3) {
+            var chunk = digits.substring(d, d + 3);
+            buf.push(parseInt(chunk, 10), chunk.length * 3 + 1);
+          }
+        } else if (s.mode === MODE.alnum) {
+          var chs = s.text;
+          for (var a = 0; a < chs.length; a += 2) {
+            if (a + 1 < chs.length) {
+              buf.push(ALNUM.indexOf(chs[a]) * 45 + ALNUM.indexOf(chs[a + 1]), 11);
+            } else {
+              buf.push(ALNUM.indexOf(chs[a]), 6);
+            }
+          }
+        } else {
+          for (var b = 0; b < s.bytes.length; b++) buf.push(s.bytes[b], 8);
+        }
+      }
+      var cap = layout.totalData * 8;
+      var terminator = Math.min(4, cap - buf.bits.length);
+      buf.push(0, terminator);
+      buf.push(0, (8 - buf.bits.length % 8) % 8);
+      var pads = [0xEC, 0x11], p = 0;
+      while (buf.bits.length < cap) { buf.push(pads[p], 8); p ^= 1; }
+
+      var out = new Uint8Array(layout.totalData);
+      for (var k = 0; k < buf.bits.length; k++) {
+        out[k >> 3] |= buf.bits[k] << (7 - (k & 7));
+      }
+      return out;
+    }
+
+    /* Interleaving is the point of the whole exercise: consecutive codewords in
+       the final stream belong to different blocks, so a blot spreads its damage
+       instead of destroying one block. roles[] is built here rather than
+       reconstructed later, because the overlay and the damage report have to
+       agree with the encoder by construction. */
+    function interleave(dataCodewords, version, ecl) {
+      var layout = blockLayout(version, ecl);
+      var dataBlocks = [], ecBlocks = [], pos = 0;
+      for (var b = 0; b < layout.numBlocks; b++) {
+        var len = layout.blocks[b].dataLen;
+        var chunk = dataCodewords.subarray(pos, pos + len);
+        pos += len;
+        dataBlocks.push(chunk);
+        ecBlocks.push(rsRemainder(chunk, layout.ecPerBlock));
+      }
+      var final = new Uint8Array(layout.totalCodewords);
+      var roles = new Array(layout.totalCodewords);
+      var out = 0;
+      var maxData = layout.shortLen + (layout.longCount > 0 ? 1 : 0);
+      for (var i = 0; i < maxData; i++) {
+        for (var bb = 0; bb < layout.numBlocks; bb++) {
+          // the guard only bites in the last round of a two-group version;
+          // without it every codeword after that point shifts by one
+          if (i >= layout.blocks[bb].dataLen) continue;
+          final[out] = dataBlocks[bb][i];
+          roles[out] = { kind: 'data', block: bb, indexInBlock: i };
+          out++;
+        }
+      }
+      for (var e = 0; e < layout.ecPerBlock; e++) {
+        for (var bc = 0; bc < layout.numBlocks; bc++) {
+          final[out] = ecBlocks[bc][e];
+          roles[out] = { kind: 'ec', block: bc, indexInBlock: e };
+          out++;
+        }
+      }
+      return { final: final, roles: roles, layout: layout, dataBlocks: dataBlocks, ecBlocks: ecBlocks };
+    }
+
+    /* ------------------------------------------------------------- geometry */
+
+    function functionMap(version) {
+      var n = sizeOf(version);
+      var tag = new Uint8Array(n * n);
+      var dark = new Uint8Array(n * n);
+      var corners = [[0, 0], [0, n - 7], [n - 7, 0]];
+      for (var c = 0; c < 3; c++) {
+        var r0 = corners[c][0], c0 = corners[c][1];
+        // the 8x8 footprint is finder plus separator; mark the ring first
+        for (var dr = -1; dr <= 7; dr++) {
+          for (var dc = -1; dc <= 7; dc++) {
+            var r = r0 + dr, cc = c0 + dc;
+            if (r < 0 || r >= n || cc < 0 || cc >= n) continue;
+            var inside = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6;
+            tag[r * n + cc] = inside ? FN_FINDER : FN_SEPARATOR;
+            if (inside) {
+              var on = dr === 0 || dr === 6 || dc === 0 || dc === 6 ||
+                       (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4);
+              dark[r * n + cc] = on ? 1 : 0;
+            }
+          }
+        }
+      }
+      for (var i = 8; i < n - 8; i++) {
+        tag[6 * n + i] = FN_TIMING; dark[6 * n + i] = (i % 2 === 0) ? 1 : 0;
+        tag[i * n + 6] = FN_TIMING; dark[i * n + 6] = (i % 2 === 0) ? 1 : 0;
+      }
+      var pos = ALIGN_POS[version];
+      for (var a = 0; a < pos.length; a++) {
+        for (var b = 0; b < pos.length; b++) {
+          var ar = pos[a], ac = pos[b];
+          // the three centres that would land on a finder do not exist
+          if ((ar <= 7 && ac <= 7) || (ar <= 7 && ac >= n - 8) || (ar >= n - 8 && ac <= 7)) continue;
+          for (var y = -2; y <= 2; y++) {
+            for (var x = -2; x <= 2; x++) {
+              var idx = (ar + y) * n + (ac + x);
+              tag[idx] = FN_ALIGN;
+              dark[idx] = (Math.max(Math.abs(y), Math.abs(x)) !== 1) ? 1 : 0;
+            }
+          }
+        }
+      }
+      // format information, both copies, reserved before anything is placed
+      var fmt = formatPositions(n);
+      for (var f = 0; f < fmt.length; f++) tag[fmt[f][0] * n + fmt[f][1]] = FN_FORMAT;
+      tag[(n - 8) * n + 8] = FN_DARK; dark[(n - 8) * n + 8] = 1;
+      if (version >= 7) {
+        var vp = versionPositions(n);
+        for (var vi = 0; vi < vp.length; vi++) tag[vp[vi][0] * n + vp[vi][1]] = FN_VERSION;
+      }
+      return { tag: tag, dark: dark, size: n };
+    }
+
+    /* Both copies of the 15 format modules, in bit order 0..14 (bit 0 = LSB).
+       Returned as [row, col] pairs; the second copy follows the first. */
+    function formatPositions(n) {
+      var p = [];
+      for (var i = 0; i <= 5; i++) p.push([8, i]);
+      p.push([8, 7]); p.push([8, 8]); p.push([7, 8]);
+      for (var j = 9; j <= 14; j++) p.push([14 - j, 8]);
+      for (var k = 0; k <= 7; k++) p.push([8, n - 1 - k]);
+      for (var m = 8; m <= 14; m++) p.push([n - 15 + m, 8]);
+      return p;
+    }
+
+    function versionPositions(n) {
+      var p = [];
+      for (var i = 0; i < 18; i++) {
+        var a = n - 11 + i % 3, b = Math.floor(i / 3);
+        p.push([b, a]); p.push([a, b]);
+      }
+      return p;
+    }
+
+    /* The zigzag. Three details that silently corrupt everything if changed:
+       the vertical timing column is hopped by setting right = 5 (so the next
+       pair is 3 and 1, not 4 and 3), the right module of each pair is filled
+       first, and the direction flips per column PAIR, not per column. */
+    function placementOrder(version) {
+      var n = sizeOf(version);
+      var fn = functionMap(version).tag;
+      var order = [];
+      var up = true;
+      for (var right = n - 1; right >= 1; right -= 2) {
+        if (right === 6) right = 5;
+        for (var v = 0; v < n; v++) {
+          var row = up ? n - 1 - v : v;
+          for (var c = 0; c < 2; c++) {
+            var col = right - c;
+            var idx = row * n + col;
+            if (fn[idx] !== FN_FREE) continue;
+            order.push(idx);
+          }
+        }
+        up = !up;
+      }
+      return Int32Array.from(order);
+    }
+
+    function maskBit(k, row, col) {
+      switch (k) {
+        case 0: return (row + col) % 2 === 0 ? 1 : 0;
+        case 1: return row % 2 === 0 ? 1 : 0;
+        case 2: return col % 3 === 0 ? 1 : 0;
+        case 3: return (row + col) % 3 === 0 ? 1 : 0;
+        case 4: return (Math.floor(row / 2) + Math.floor(col / 3)) % 2 === 0 ? 1 : 0;
+        case 5: return ((row * col) % 2 + (row * col) % 3) === 0 ? 1 : 0;
+        case 6: return (((row * col) % 2 + (row * col) % 3) % 2) === 0 ? 1 : 0;
+        case 7: return (((row + col) % 2 + (row * col) % 3) % 2) === 0 ? 1 : 0;
+      }
+      return 0;
+    }
+
+    function formatBits(ecl, mask) {
+      var data = (ECL_FORMAT_BITS[ecl] << 3) | mask;
+      var rem = data;
+      for (var i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+      return ((data << 10) | rem) ^ 0x5412;
+    }
+
+    function versionInfoBits(version) {
+      if (version < 7) return null;
+      var rem = version;
+      for (var i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1F25);
+      return (version << 12) | rem;
+    }
+
+    /* Penalty rules 1-4 of the spec, evaluated over the whole symbol including
+       the function patterns. Rule 3 is the plain pattern search for the two
+       finder-like sequences; modules outside the symbol are not treated as
+       light, which is the reading that keeps the score purely local. */
+    function penalty(modules, n) {
+      var n1 = 0, n2 = 0, n3 = 0, dark = 0;
+      var get = function (r, c) { return modules[r * n + c]; };
+      for (var i = 0; i < n * n; i++) if (modules[i]) dark++;
+      for (var line = 0; line < n; line++) {
+        var runH = 1, runV = 1;
+        for (var j = 1; j < n; j++) {
+          if (get(line, j) === get(line, j - 1)) runH++;
+          else { if (runH >= 5) n1 += 3 + (runH - 5); runH = 1; }
+          if (get(j, line) === get(j - 1, line)) runV++;
+          else { if (runV >= 5) n1 += 3 + (runV - 5); runV = 1; }
+        }
+        if (runH >= 5) n1 += 3 + (runH - 5);
+        if (runV >= 5) n1 += 3 + (runV - 5);
+      }
+      for (var r2 = 0; r2 < n - 1; r2++) {
+        for (var c2 = 0; c2 < n - 1; c2++) {
+          var v = get(r2, c2);
+          if (v === get(r2, c2 + 1) && v === get(r2 + 1, c2) && v === get(r2 + 1, c2 + 1)) n2 += 3;
+        }
+      }
+      var PAT_A = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+      var PAT_B = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+      var matchAt = function (line, i, pat) {
+        for (var k = 0; k < 11; k++) if (line[i + k] !== pat[k]) return false;
+        return true;
+      };
+      for (var r3 = 0; r3 < n; r3++) {
+        var row = [], col = [];
+        for (var i3 = 0; i3 < n; i3++) { row.push(get(r3, i3)); col.push(get(i3, r3)); }
+        for (var s = 0; s + 11 <= n; s++) {
+          if (matchAt(row, s, PAT_A) || matchAt(row, s, PAT_B)) n3 += 40;
+          if (matchAt(col, s, PAT_A) || matchAt(col, s, PAT_B)) n3 += 40;
+        }
+      }
+      var total = n * n;
+      var n4 = Math.floor(Math.abs(dark * 100 - total * 50) / (5 * total)) * 10;
+      return { n1: n1, n2: n2, n3: n3, n4: n4, total: n1 + n2 + n3 + n4, darkRatio: dark / total };
+    }
+
+    /* --------------------------------------------------------------- encode */
+
+    function drawFormat(modules, n, ecl, mask) {
+      var bits = formatBits(ecl, mask);
+      var p = formatPositions(n);
+      for (var i = 0; i < p.length; i++) {
+        var bit = (bits >>> (i % 15)) & 1;
+        modules[p[i][0] * n + p[i][1]] = bit;
+      }
+    }
+
+    function drawVersion(modules, n, version) {
+      var bits = versionInfoBits(version);
+      if (bits === null) return;
+      var p = versionPositions(n);
+      for (var i = 0; i < p.length; i++) {
+        var bit = (bits >>> Math.floor(i / 2)) & 1;
+        modules[p[i][0] * n + p[i][1]] = bit;
+      }
+    }
+
+    function encodeQR(text, opts) {
+      opts = opts || {};
+      var ecl = opts.ecl || 'M';
+      if (ECL.indexOf(ecl) < 0) return { error: 'ecl', message: 'unknown error-correction level' };
+      if (typeof text !== 'string' || text.length === 0) {
+        return { error: 'empty', message: 'nothing to encode' };
+      }
+      var pick = chooseVersion(text, ecl, opts.minVersion || 1, opts.mode || 'auto');
+      if (pick.error === 'capacity') {
+        return { error: 'capacity', message: 'too long for a QR code even at version 40' };
+      }
+      if (pick.error === 'mode') {
+        return { error: 'mode', message: 'the forced encoding mode cannot represent this text' };
+      }
+      var version = pick.version, n = sizeOf(version);
+      var data = encodeSegments(pick.segments, version, ecl);
+      var il = interleave(data, version, ecl);
+
+      var fm = functionMap(version);
+      var base = Uint8Array.from(fm.dark);
+      var cwIndex = new Int32Array(n * n).fill(-1);
+      var bitIndex = new Int32Array(n * n).fill(-1);
+      var order = placementOrder(version);
+      var dataBits = il.final.length * 8;
+      for (var k = 0; k < order.length; k++) {
+        var idx = order[k];
+        if (k < dataBits) {
+          base[idx] = (il.final[k >> 3] >>> (7 - (k & 7))) & 1;
+          cwIndex[idx] = k >> 3;
+          bitIndex[idx] = k & 7;
+        } else {
+          base[idx] = 0;               // remainder bits, structural padding only
+          cwIndex[idx] = -2;
+        }
+      }
+      drawVersion(base, n, version);
+
+      var chosen = -1, scores = [], bestScore = Infinity, bestModules = null, bestPenalty = null;
+      var forced = (opts.mask === undefined || opts.mask === 'auto') ? -1 : opts.mask | 0;
+      for (var m = 0; m < 8; m++) {
+        var cand = Uint8Array.from(base);
+        for (var i = 0; i < order.length; i++) {
+          var oi = order[i];
+          cand[oi] ^= maskBit(m, Math.floor(oi / n), oi % n);
+        }
+        drawFormat(cand, n, ecl, m);
+        var pen = penalty(cand, n);
+        scores.push(pen.total);
+        var better = forced >= 0 ? (m === forced) : (pen.total < bestScore);
+        if (better) {
+          bestScore = pen.total; chosen = m; bestModules = cand; bestPenalty = pen;
+        }
+      }
+
+      return {
+        version: version, size: n, ecl: ecl, mask: chosen,
+        modules: bestModules, fnTag: fm.tag, cwIndex: cwIndex, bitIndex: bitIndex,
+        roles: il.roles, layout: il.layout, final: il.final,
+        dataBlocks: il.dataBlocks, ecBlocks: il.ecBlocks,
+        segments: pick.segments, bitsUsed: pick.bits, capacityBits: pick.capacityBits,
+        maskScores: scores, penalty: bestPenalty, remainderBits: order.length - dataBits,
+        text: text
+      };
+    }
+
+    /* ------------------------------------------------------------- didactic */
+
+    function moduleInfo(sym, row, col) {
+      var idx = row * sym.size + col;
+      var tag = sym.fnTag[idx];
+      if (tag !== FN_FREE) return { kind: 'function', which: FN_NAME[tag] };
+      if (sym.cwIndex[idx] === -2) return { kind: 'remainder' };
+      var cw = sym.cwIndex[idx], role = sym.roles[cw];
+      return {
+        kind: role.kind, codeword: cw, block: role.block,
+        indexInBlock: role.indexInBlock, bit: sym.bitIndex[idx]
+      };
+    }
+
+    /* Reed-Solomon corrects floor(ec/2) errors of unknown position, or up to ec
+       erasures of known position. A camera thresholds every module to black or
+       white and hands the decoder no position information, so the halved figure
+       is the one that describes reality; the doubled one is reported separately
+       and labelled as the hypothetical it is. */
+    function correctionCapacity(layout) {
+      var worst = layout.blocks[0];
+      for (var i = 1; i < layout.blocks.length; i++) {
+        if (layout.blocks[i].dataLen > worst.dataLen) worst = layout.blocks[i];
+      }
+      var blockTotal = worst.dataLen + layout.ecPerBlock;
+      var errors = Math.floor(layout.ecPerBlock / 2);
+      return {
+        perBlockErrors: errors,
+        perBlockErasures: layout.ecPerBlock,
+        blockTotal: blockTotal,
+        fractionErrors: errors / blockTotal,
+        fractionErasures: layout.ecPerBlock / blockTotal
+      };
+    }
+
+    function damageReport(sym, occluded) {
+      var layout = sym.layout;
+      var sets = [], hits = { finder: 0, separator: 0, timing: 0, alignment: 0, format: 0, version: 0, dark: 0 };
+      var remainder = 0;
+      for (var b = 0; b < layout.numBlocks; b++) sets.push(new Set());
+      occluded.forEach(function (idx) {
+        var tag = sym.fnTag[idx];
+        if (tag !== FN_FREE) {
+          var name = FN_NAME[tag] === 'dark module' ? 'dark' : FN_NAME[tag];
+          hits[name]++;
+          return;
+        }
+        var cw = sym.cwIndex[idx];
+        if (cw === -2) { remainder++; return; }
+        sets[sym.roles[cw].block].add(cw);
+      });
+      var budget = Math.floor(layout.ecPerBlock / 2);
+      var perBlock = [], worst = 0;
+      for (var i = 0; i < layout.numBlocks; i++) {
+        var d = sets[i].size;
+        if (d > worst) worst = d;
+        perBlock.push({
+          block: i, dataLen: layout.blocks[i].dataLen, ecLen: layout.ecPerBlock,
+          damaged: d, budget: budget, over: d > budget
+        });
+      }
+      var verdict;
+      if (hits.finder > 0 || hits.separator > 0) verdict = 'unlocatable';
+      else if (hits.timing > 2) verdict = 'unlocatable';
+      else if (hits.format > 6) verdict = 'unlocatable';       // BCH(15,5) corrects 3 per copy
+      else if (hits.version > 6) verdict = 'unlocatable';
+      else if (worst > budget) verdict = 'fails';
+      else if (worst === budget && budget > 0) verdict = 'marginal';
+      else verdict = 'decodes';
+      return {
+        perBlock: perBlock, functionHits: hits, remainderHits: remainder,
+        worst: worst, budget: budget, headroom: budget - worst, verdict: verdict,
+        occludedModules: occluded.size
+      };
+    }
+
+    /* Centred square of side `side` modules, the logo case. */
+    function centrePatch(sym, side) {
+      var n = sym.size, set = new Set();
+      if (side <= 0) return set;
+      var start = Math.floor((n - side) / 2);
+      for (var r = start; r < start + side && r < n; r++) {
+        for (var c = start; c < start + side && c < n; c++) {
+          if (r >= 0 && c >= 0) set.add(r * n + c);
+        }
+      }
+      return set;
+    }
+
+    /* The headline number: the largest centred square that still leaves the
+       correction budget intact. Bisection, because damageReport is not free. */
+    function largestSafePatch(sym) {
+      var lo = 0, hi = sym.size;
+      while (lo < hi) {
+        var mid = Math.floor((lo + hi + 1) / 2);
+        var rep = damageReport(sym, centrePatch(sym, mid));
+        if (rep.verdict === 'decodes' || rep.verdict === 'marginal') lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
+    }
+
+    /* --------------------------------------------------------------- payload */
+
+    function esc(s) { return String(s == null ? '' : s).replace(/([\\;,:"])/g, '\\$1'); }
+
+    function buildWifi(f) {
+      f = f || {};
+      var auth = f.auth || 'WPA';
+      var out = 'WIFI:T:' + auth + ';S:' + esc(f.ssid) + ';';
+      if (auth !== 'nopass') out += 'P:' + esc(f.password) + ';';
+      if (f.hidden) out += 'H:true;';
+      return out + ';';
+    }
+
+    function buildVCard(f) {
+      f = f || {};
+      var L = ['BEGIN:VCARD', 'VERSION:3.0'];
+      var last = f.last || '', first = f.first || '';
+      L.push('N:' + last + ';' + first + ';;;');
+      L.push('FN:' + (first + ' ' + last).trim());
+      if (f.org) L.push('ORG:' + f.org);
+      if (f.title) L.push('TITLE:' + f.title);
+      if (f.tel) L.push('TEL;TYPE=CELL:' + f.tel);
+      if (f.email) L.push('EMAIL:' + f.email);
+      if (f.url) L.push('URL:' + f.url);
+      if (f.note) L.push('NOTE:' + f.note);
+      L.push('END:VCARD');
+      // CRLF and no line folding: folded lines are where vCard QR codes break
+      return L.join('\r\n') + '\r\n';
+    }
+
+    function buildMailto(f) {
+      f = f || {};
+      var q = [];
+      if (f.subject) q.push('subject=' + encodeURIComponent(f.subject));
+      if (f.body) q.push('body=' + encodeURIComponent(f.body));
+      return 'mailto:' + (f.to || '') + (q.length ? '?' + q.join('&') : '');
+    }
+
+    function buildSms(f) {
+      f = f || {};
+      return 'SMSTO:' + (f.number || '') + (f.body ? ':' + f.body : '');
+    }
+
+    function buildGeo(f) {
+      f = f || {};
+      var lat = Math.max(-90, Math.min(90, parseFloat(f.lat) || 0));
+      var lon = Math.max(-180, Math.min(180, parseFloat(f.lon) || 0));
+      var s = 'geo:' + lat.toFixed(6).replace(/\.?0+$/, '') + ',' + lon.toFixed(6).replace(/\.?0+$/, '');
+      if (f.zoom) s += '?z=' + (parseInt(f.zoom, 10) || 15);
+      return s;
+    }
+
+    function buildTel(f) { return 'tel:' + String((f && f.number) || '').replace(/[^\d+]/g, ''); }
+
+    function buildUrl(f) {
+      var v = String((f && f.url) || '').trim();
+      if (!v) return '';
+      return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(v) ? v : 'https://' + v;
+    }
+
+    function buildPayload(preset, fields) {
+      switch (preset) {
+        case 'url': return buildUrl(fields);
+        case 'wifi': return buildWifi(fields);
+        case 'vcard': return buildVCard(fields);
+        case 'mailto': return buildMailto(fields);
+        case 'sms': return buildSms(fields);
+        case 'geo': return buildGeo(fields);
+        case 'tel': return buildTel(fields);
+        default: return String((fields && fields.text) || '');
+      }
+    }
+
+    /* ------------------------------------------------------------ rendering */
+
+    /* Module styles are pure geometry. Every module keeps its position and its
+       polarity, so no codeword is damaged and the error correction has nothing
+       to do with this: styling fails, when it fails, in detection and
+       binarisation, which is a different failure mode from occlusion. How much
+       each style actually costs is measured, not guessed: the measurement lives
+       in notes/dev/, its result in STYLE_COST in the app block below.
+
+       One shape list feeds all three consumers (the SVG path, the canvas
+       preview and the Node rasteriser of that measurement), so there is no
+       second geometry that could drift away from the first. Shapes may overlap
+       (capsules cross), so the path is filled with the default non-zero rule
+       and the hole in a ring is cut by winding its inner outline backwards.
+       Even-odd would look identical until two capsules cross and then punch a
+       hole where they meet. */
+
+    var MODULE_STYLES = ['square', 'rounded', 'dots', 'capsule', 'tangle', 'loops'];
+
+    /* Corner radius as a fraction of a module, dot and capsule thickness
+       likewise, then the radii of the styled finder and alignment patterns in
+       modules. */
+    var STYLE_GEO = {
+      radius: 0.25, dot: 0.86, thick: 0.86, wall: 0.95,
+      ringR: 1.75, eyeR: 0.8, alignR: 1.4
+    };
+
+    /* How the finders and alignment patterns follow the modules. There is no
+       second switch for this on purpose: of the two possible answers only ever
+       one goes with a given module shape, and offering both was redundancy, not
+       freedom. `round` gives them corner radii; `thin` takes their walls down
+       from a full module to STYLE_GEO.wall, because a full-module wall next to
+       0.86-module strokes reads as a heavier line.
+
+       Two things about that wall, both measured and both costly to relearn.
+       It is thinned INWARDS only (see the geometry below), so the outer edges
+       stay on the module grid: pulling them in symmetrically makes a finder
+       6.86 modules wide instead of 7, a decoder derives its module size from
+       exactly that width, and the resulting 2% error drifts by more than a
+       module across a large symbol (jsQR then loses version 15 and up while
+       version 2 still reads). And it stops at 0.95, not at the 0.86 of the
+       strokes, because detection degrades monotonically with it: at 0.95 the
+       symbols survive blur and noise as well as with a full wall, at 0.86 a
+       gaussian blur of 0.35 module widths kills a quarter of them. The
+       remaining difference in weight is the price of being read. */
+    var STYLE_LOOK = {
+      square: { round: false, thin: false },
+      rounded: { round: true, thin: false },
+      dots: { round: true, thin: true },
+      capsule: { round: true, thin: true },
+      tangle: { round: true, thin: true },
+      loops: { round: true, thin: true }
+    };
+
+    function styleOpts(o) {
+      var m = o && MODULE_STYLES.indexOf(o.module) >= 0 ? o.module : 'square';
+      return { module: m, look: STYLE_LOOK[m], seed: (o && o.seed) || 0 };
+    }
+
+    /* Small deterministic PRNG plus a symbol hash, so the tangle style is random
+       but not different on every repaint: the same symbol always tangles the
+       same way, and the seed only changes when the user asks for it. Nothing
+       here may use Math.random, or the tests would have nothing to compare. */
+    function rngFrom(seed) {
+      var s = (seed >>> 0) || 0x9e3779b9;
+      return function () {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        return s / 4294967296;
+      };
+    }
+
+    function symbolSeed(sym, extra) {
+      var h = (2166136261 ^ sym.version * 131 ^ sym.mask * 17 ^ (extra || 0) * 2654435761) >>> 0;
+      for (var i = 0; i < sym.modules.length; i++) {
+        h = Math.imul(h ^ sym.modules[i], 16777619) >>> 0;
+      }
+      return h;
+    }
+
+    function darkAt(sym, r, c) {
+      return r >= 0 && c >= 0 && r < sym.size && c < sym.size && !!sym.modules[r * sym.size + c];
+    }
+
+    function rect(x, y, w, h, r) {
+      var a = typeof r === 'number' ? [r, r, r, r] : (r || [0, 0, 0, 0]);
+      var lim = Math.min(w, h) / 2;
+      return {
+        t: 'r', x: x, y: y, w: w, h: h,
+        r: [Math.min(a[0], lim), Math.min(a[1], lim), Math.min(a[2], lim), Math.min(a[3], lim)]
+      };
+    }
+
+    /* Every dark module as one shape, in module coordinates with the quiet zone
+       already added. Runs of plain squares are merged per row, which is not
+       cosmetic: a version 40 symbol has some 30k dark modules and renderers do
+       notice the difference between 30k subpaths and a few thousand. */
+    function moduleShapes(sym, quiet, opts) {
+      var o = styleOpts(opts), n = sym.size, q = quiet || 0, out = [];
+      var ringed = o.look.round;
+      /* Two masks, and the difference matters. `solid` is every module a
+         decoder needs as a massive block: the three finders and every alignment
+         pattern. Those are never dotted and never thinned. `owned` is what the
+         pattern pass below has already drawn as one whole shape, so the module
+         loop has to keep its hands off it. */
+      var solid = new Uint8Array(n * n);
+      var owned = new Uint8Array(n * n);
+
+      /* [top row, left column, side]: the three finders, then the alignment
+         grid. A real symbol is at least 21 modules across, so anything smaller
+         is the sample pattern the shape picker draws its icons from, and that
+         one has neither finders nor alignment patterns. Without the guard the
+         three 7x7 boxes would fold over each other and over the edges of a 5x5
+         grid and mark most of it solid. */
+      var boxes = n >= 21 ? [[0, 0, 7], [0, n - 7, 7], [n - 7, 0, 7]] : [];
+      var pos = ALIGN_POS[sym.version] || [];
+      for (var a = 0; a < pos.length; a++) {
+        for (var b = 0; b < pos.length; b++) {
+          var ar = pos[a], ac = pos[b];
+          // the three centres that would land on a finder do not exist
+          if ((ar <= 7 && ac <= 7) || (ar <= 7 && ac >= n - 8) || (ar >= n - 8 && ac <= 7)) continue;
+          boxes.push([ar - 2, ac - 2, 5]);
+        }
+      }
+
+      /* Drawn as two whole shapes rather than module by module, otherwise the
+         ring has notched corners. What is NOT allowed is breaking these into
+         separate dots: the finder carries the 1:1:3:1:1 ratio a decoder scans
+         for and the alignment pattern the solid 1:1:1 ring it builds the
+         perspective from. Dotting the alignment patterns costs every symbol
+         from version 2 upwards, at any resolution, measured. Rounding them
+         while they stay massive does not, also measured. */
+      for (var f = 0; f < boxes.length; f++) {
+        var r0 = boxes[f][0], c0 = boxes[f][1], sz = boxes[f][2];
+        for (var dr = 0; dr < sz; dr++) {
+          for (var dc = 0; dc < sz; dc++) {
+            solid[(r0 + dr) * n + c0 + dc] = 1;
+            if (ringed) owned[(r0 + dr) * n + c0 + dc] = 1;
+          }
+        }
+        if (!ringed) continue;
+        var big = sz === 7;
+        /* Thinned inwards only. The outer edge has to stay on the module grid,
+           because the width of this footprint is what a decoder derives the
+           module size from; pulling it in on both sides makes a finder 6.86
+           wide, the estimate 2% small, and the sampling grid drift by more than
+           a module across a large symbol (measured: jsQR loses version 15 and
+           up while version 2 still reads). Moving the inner edge outwards
+           thins the wall by exactly as much and touches no reference. */
+        var wall = o.look.thin ? STYLE_GEO.wall : 1;
+        var R = big ? STYLE_GEO.ringR : STYLE_GEO.alignR;
+        var hole = sz - 2 * wall;
+        // the alignment centre is one module, so it follows the dots; the
+        // finder eye is the "3" of the 1:1:3:1:1 and stays whole
+        var eye = big ? 3 : wall;
+        /* The inner radius is proportional, not concentric. Concentric would be
+           R minus the wall thickness, which is the clean parallel curve and
+           looks, on an alignment pattern, like a round outside around a square
+           hole. Proportional makes the ring a hair thicker in the corners,
+           which nobody sees, and both edges equally round, which everybody
+           does. */
+        out.push({
+          t: 'ring',
+          o: rect(q + c0, q + r0, sz, sz, R),
+          i: rect(q + c0 + wall, q + r0 + wall, hole, hole, R * hole / sz)
+        });
+        out.push(rect(q + c0 + (sz - eye) / 2, q + r0 + (sz - eye) / 2, eye, eye,
+                      big ? STYLE_GEO.eyeR : eye / 2));
+      }
+
+      /* The capsule style needs both directions at once, so it runs as its own
+         pass and hands the modules it drew to `owned`.
+
+         Two rules, both learned by looking at the result. A capsule runs from
+         the CENTRE of its first module to the centre of its last, like a stroke
+         with round caps, so its cap ends exactly where a crossing capsule ends
+         too; drawing it out to the module edge instead left the cap sticking
+         out over the band it meets. And every module joins in ONE direction
+         only, the longer of its two runs, ties going across. Joining both ways
+         turned a solid area into a mess of crossing pills, and this way it
+         becomes parallel bars. */
+      /* Tangle: like capsules, but the connections are drawn at random instead
+         of following the rows. Every pair of neighbouring dark modules is a
+         candidate edge, the candidates are shuffled, and an edge is taken
+         unless it would close a loop (Kruskal with a union-find). What comes
+         out is a spanning forest: every connected group of modules becomes one
+         tree, so between any two modules of a group there is exactly one path
+         and never a ring.
+
+         Nothing is added or removed by this. A connection lives entirely inside
+         the two dark modules it joins, so no light module is ever touched, and
+         the covered area sits between the capsule style and solid squares. */
+      if (o.module === 'tangle' || o.module === 'loops') {
+        var tth = STYLE_GEO.thick, thalf = tth / 2;
+        var tfree = function (i) { return !!sym.modules[i] && !solid[i]; };
+        var parent = new Int32Array(n * n);
+        for (var pi = 0; pi < n * n; pi++) parent[pi] = pi;
+        var find = function (x) {
+          while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+          return x;
+        };
+        var edges = [];
+        for (var er = 0; er < n; er++) {
+          for (var ec = 0; ec < n; ec++) {
+            var ei = er * n + ec;
+            if (!tfree(ei)) continue;
+            if (ec + 1 < n && tfree(ei + 1)) edges.push(ei * 2);          // to the right
+            if (er + 1 < n && tfree(ei + n)) edges.push(ei * 2 + 1);      // downwards
+          }
+        }
+        var rnd = rngFrom(o.seed || symbolSeed(sym, 0));
+        for (var sh = edges.length - 1; sh > 0; sh--) {
+          var j = Math.floor(rnd() * (sh + 1));
+          var tmp = edges[sh]; edges[sh] = edges[j]; edges[j] = tmp;
+        }
+        var hEdge = new Uint8Array(n * n), vEdge = new Uint8Array(n * n);
+        var rejected = [];
+        for (var e2 = 0; e2 < edges.length; e2++) {
+          var from = edges[e2] >> 1, down = edges[e2] & 1;
+          var to = down ? from + n : from + 1;
+          var ra = find(from), rb = find(to);
+          if (ra === rb) { rejected.push(edges[e2]); continue; }           // would close a loop
+          parent[ra] = rb;
+          if (down) vEdge[from] = 1; else hEdge[from] = 1;
+        }
+
+        /* The loops variant puts exactly one of the rejected edges back per
+           connected group, namely the one whose loop encloses the most area.
+           Every rejected edge closes exactly one loop (the tree path between
+           its ends plus itself), so the area is the shoelace of that path.
+
+           The floor is hard: a loop around a plain 2x2 block encloses exactly
+           one square module and does not count as a loop worth drawing. A group
+           that has nothing bigger to offer keeps its tree and stays open. */
+        if (o.module === 'loops' && rejected.length) {
+          var up = new Int32Array(n * n).fill(-1), depth = new Int32Array(n * n);
+          var stack = [], seen = new Uint8Array(n * n);
+          for (var sr = 0; sr < n * n; sr++) {
+            if (!tfree(sr) || seen[sr]) continue;
+            seen[sr] = 1; up[sr] = -1; depth[sr] = 0; stack.push(sr);
+            while (stack.length) {
+              var cur = stack.pop();
+              var nbs = [
+                hEdge[cur] ? cur + 1 : -1,
+                (cur % n > 0 && hEdge[cur - 1]) ? cur - 1 : -1,
+                vEdge[cur] ? cur + n : -1,
+                (cur >= n && vEdge[cur - n]) ? cur - n : -1
+              ];
+              for (var nb = 0; nb < 4; nb++) {
+                var nx = nbs[nb];
+                if (nx < 0 || seen[nx]) continue;
+                seen[nx] = 1; up[nx] = cur; depth[nx] = depth[cur] + 1; stack.push(nx);
+              }
+            }
+          }
+          var xy = function (i) { return [i % n + 0.5, Math.floor(i / n) + 0.5]; };
+          var bestEdge = {}, bestArea = {};
+          for (var rj = 0; rj < rejected.length; rj++) {
+            var ra2 = rejected[rj] >> 1, dn = rejected[rj] & 1;
+            var rb2 = dn ? ra2 + n : ra2 + 1;
+            // walk both ends up to their common ancestor, collecting the polygon
+            var left = [], right = [], x1 = ra2, x2 = rb2;
+            while (depth[x1] > depth[x2]) { left.push(x1); x1 = up[x1]; }
+            while (depth[x2] > depth[x1]) { right.push(x2); x2 = up[x2]; }
+            while (x1 !== x2) { left.push(x1); right.push(x2); x1 = up[x1]; x2 = up[x2]; }
+            left.push(x1);
+            var poly = left.concat(right.reverse());
+            var area2 = 0;
+            for (var pv = 0; pv < poly.length; pv++) {
+              var p1 = xy(poly[pv]), p2 = xy(poly[(pv + 1) % poly.length]);
+              area2 += p1[0] * p2[1] - p2[0] * p1[1];
+            }
+            var area = Math.abs(area2) / 2;
+            var root = find(ra2);
+            if (area > 1.0001 && area > (bestArea[root] || 0)) {
+              bestArea[root] = area;
+              bestEdge[root] = rejected[rj];
+            }
+          }
+          for (var key in bestEdge) {
+            if (!Object.prototype.hasOwnProperty.call(bestEdge, key)) continue;
+            var be = bestEdge[key], bf = be >> 1;
+            if (be & 1) vEdge[bf] = 1; else hEdge[bf] = 1;
+          }
+        }
+        // straight chains of chosen edges become one capsule, for the same
+        // reason the plain style merges runs: fewer subpaths
+        for (var mr = 0; mr < n; mr++) {
+          for (var mc = 0; mc < n; mc++) {
+            if (!hEdge[mr * n + mc] || (mc > 0 && hEdge[mr * n + mc - 1])) continue;
+            var hl = 0;
+            while (hEdge[mr * n + mc + hl]) hl++;
+            out.push(rect(q + mc + 0.5 - thalf, q + mr + 0.5 - thalf, hl + tth, tth, thalf));
+          }
+        }
+        for (var nc = 0; nc < n; nc++) {
+          for (var nr = 0; nr < n; nr++) {
+            if (!vEdge[nr * n + nc] || (nr > 0 && vEdge[(nr - 1) * n + nc])) continue;
+            var vl = 0;
+            while (vEdge[(nr + vl) * n + nc]) vl++;
+            out.push(rect(q + nc + 0.5 - thalf, q + nr + 0.5 - thalf, tth, vl + tth, thalf));
+          }
+        }
+        // a module nothing connects to is a dot, and every other module is
+        // already covered by the round cap of a capsule ending on its centre
+        for (var dr2 = 0; dr2 < n; dr2++) {
+          for (var dc2 = 0; dc2 < n; dc2++) {
+            var di = dr2 * n + dc2;
+            if (!tfree(di)) continue;
+            owned[di] = 1;
+            var joined = hEdge[di] || vEdge[di] || (dc2 > 0 && hEdge[di - 1]) || (dr2 > 0 && vEdge[di - n]);
+            if (!joined) out.push(rect(q + dc2 + 0.5 - thalf, q + dr2 + 0.5 - thalf, tth, tth, thalf));
+          }
+        }
+      }
+
+      if (o.module === 'capsule') {
+        var th = STYLE_GEO.thick, half = th / 2;
+        var free = function (i) { return !!sym.modules[i] && !solid[i]; };
+        var hLen = new Uint16Array(n * n), vLen = new Uint16Array(n * n);
+        var i2, k, len;
+        for (var hr = 0; hr < n; hr++) {
+          for (var hc = 0; hc < n; hc++) {
+            if (!free(hr * n + hc)) continue;
+            len = 0;
+            while (hc + len < n && free(hr * n + hc + len)) len++;
+            for (k = 0; k < len; k++) hLen[hr * n + hc + k] = len;
+            hc += len - 1;
+          }
+        }
+        for (var vc = 0; vc < n; vc++) {
+          for (var vr = 0; vr < n; vr++) {
+            if (!free(vr * n + vc)) continue;
+            len = 0;
+            while (vr + len < n && free((vr + len) * n + vc)) len++;
+            for (k = 0; k < len; k++) vLen[(vr + k) * n + vc] = len;
+            vr += len - 1;
+          }
+        }
+        var across = function (i) { return hLen[i] >= vLen[i]; };
+        var capsule = function (r1, c1, count, horizontal) {
+          if (count === 1) out.push(rect(q + c1 + 0.5 - half, q + r1 + 0.5 - half, th, th, half));
+          else if (horizontal) out.push(rect(q + c1 + 0.5 - half, q + r1 + 0.5 - half, count - 1 + th, th, half));
+          else out.push(rect(q + c1 + 0.5 - half, q + r1 + 0.5 - half, th, count - 1 + th, half));
+        };
+        for (var ar2 = 0; ar2 < n; ar2++) {
+          for (var ac2 = 0; ac2 < n; ac2++) {
+            i2 = ar2 * n + ac2;
+            if (!free(i2) || !across(i2)) continue;
+            len = 0;
+            while (ac2 + len < n && free(i2 + len) && across(i2 + len)) { owned[i2 + len] = 1; len++; }
+            capsule(ar2, ac2, len, true);
+            ac2 += len - 1;
+          }
+        }
+        for (var dc = 0; dc < n; dc++) {
+          for (var dr = 0; dr < n; dr++) {
+            i2 = dr * n + dc;
+            if (!free(i2) || across(i2)) continue;
+            len = 0;
+            while (dr + len < n && free(i2 + len * n) && !across(i2 + len * n)) { owned[i2 + len * n] = 1; len++; }
+            capsule(dr, dc, len, false);
+            dr += len - 1;
+          }
+        }
+      }
+
+      var squareAt = function (i) {
+        if (!sym.modules[i] || owned[i]) return false;
+        return o.module === 'square' || solid[i];
+      };
+
+      for (var r = 0; r < n; r++) {
+        var c = 0;
+        while (c < n) {
+          var idx = r * n + c;
+          if (!sym.modules[idx] || owned[idx]) { c++; continue; }
+          var style = solid[idx] ? 'square' : o.module;
+          if (style === 'dots') {
+            var d = STYLE_GEO.dot;
+            out.push(rect(q + c + (1 - d) / 2, q + r + (1 - d) / 2, d, d, d / 2));
+            c++;
+          } else if (style === 'rounded') {
+            /* A corner is rounded only where both of its edge neighbours are
+               light, so adjacent modules still merge into one blob and only the
+               outline of the blob gets radii. */
+            var g = STYLE_GEO.radius;
+            var up = darkAt(sym, r - 1, c), down = darkAt(sym, r + 1, c);
+            var left = darkAt(sym, r, c - 1), right = darkAt(sym, r, c + 1);
+            out.push(rect(q + c, q + r, 1, 1, [
+              !up && !left ? g : 0, !up && !right ? g : 0,
+              !down && !right ? g : 0, !down && !left ? g : 0
+            ]));
+            c++;
+          } else {
+            /* Merge only across modules that are squares too, otherwise a run
+               would swallow a dot or a ring next to an alignment pattern. */
+            var run = 0;
+            while (c + run < n && squareAt(r * n + c + run)) run++;
+            out.push(rect(q + c, q + r, run, 1, 0));
+            c += run;
+          }
+        }
+      }
+      return out;
+    }
+
+    function num(v) {
+      var s = (Math.round(v * 1000) / 1000).toString();
+      return s;
+    }
+
+    /* `back` walks the same outline the other way round. Under the non-zero
+       rule that is what turns a subpath into a hole instead of a second filled
+       shape, and it is the only reason the eye of a styled finder is white. */
+    function rectPath(b, back) {
+      var x = b.x, y = b.y, w = b.w, h = b.h, tl = b.r[0], tr = b.r[1], br = b.r[2], bl = b.r[3];
+      if (!tl && !tr && !br && !bl) {
+        return back
+          ? 'M' + num(x) + ' ' + num(y) + 'v' + num(h) + 'h' + num(w) + 'v-' + num(h) + 'z'
+          : 'M' + num(x) + ' ' + num(y) + 'h' + num(w) + 'v' + num(h) + 'h-' + num(w) + 'z';
+      }
+      var arc = function (rr, ex, ey) {
+        return 'A' + num(rr) + ' ' + num(rr) + ' 0 0 ' + (back ? '0' : '1') + ' ' + num(ex) + ' ' + num(ey);
+      };
+      var d = 'M' + num(x + tl) + ' ' + num(y);
+      if (back) {
+        if (tl) d += arc(tl, x, y + tl);
+        d += 'V' + num(y + h - bl); if (bl) d += arc(bl, x + bl, y + h);
+        d += 'H' + num(x + w - br); if (br) d += arc(br, x + w, y + h - br);
+        d += 'V' + num(y + tr); if (tr) d += arc(tr, x + w - tr, y);
+        d += 'H' + num(x + tl);
+      } else {
+        d += 'H' + num(x + w - tr); if (tr) d += arc(tr, x + w, y + tr);
+        d += 'V' + num(y + h - br); if (br) d += arc(br, x + w - br, y + h);
+        d += 'H' + num(x + bl); if (bl) d += arc(bl, x, y + h - bl);
+        d += 'V' + num(y + tl); if (tl) d += arc(tl, x + tl, y);
+      }
+      return d + 'Z';
+    }
+
+    function shapePath(s) {
+      return s.t === 'ring' ? rectPath(s.o) + rectPath(s.i, true) : rectPath(s);
+    }
+
+    function svgPathData(sym, quiet, opts) {
+      var shapes = moduleShapes(sym, quiet, opts), d = '';
+      for (var i = 0; i < shapes.length; i++) d += shapePath(shapes[i]);
+      return d;
+    }
+
+    /* Point test on the same shapes, so the rasteriser of the robustness
+       measurement measures the geometry that ships, not a second copy of it. */
+    function pointInRect(b, x, y) {
+      if (x < b.x || y < b.y || x > b.x + b.w || y > b.y + b.h) return false;
+      var cs = [
+        [b.x + b.r[0], b.y + b.r[0], b.r[0], x < b.x + b.r[0] && y < b.y + b.r[0]],
+        [b.x + b.w - b.r[1], b.y + b.r[1], b.r[1], x > b.x + b.w - b.r[1] && y < b.y + b.r[1]],
+        [b.x + b.w - b.r[2], b.y + b.h - b.r[2], b.r[2], x > b.x + b.w - b.r[2] && y > b.y + b.h - b.r[2]],
+        [b.x + b.r[3], b.y + b.h - b.r[3], b.r[3], x < b.x + b.r[3] && y > b.y + b.h - b.r[3]]
+      ];
+      for (var i = 0; i < 4; i++) {
+        var c = cs[i];
+        if (c[2] > 0 && c[3]) {
+          var dx = x - c[0], dy = y - c[1];
+          if (dx * dx + dy * dy > c[2] * c[2]) return false;
+        }
+      }
+      return true;
+    }
+
+    function pointInShape(s, x, y) {
+      if (s.t === 'ring') return pointInRect(s.o, x, y) && !pointInRect(s.i, x, y);
+      return pointInRect(s, x, y);
+    }
+
+    function toSvg(sym, o) {
+      o = o || {};
+      var q = o.quiet === undefined ? 4 : o.quiet;
+      var total = sym.size + 2 * q;
+      var fg = o.fg || '#000000';
+      var px = o.size || total * 8;
+      var st = styleOpts(o.style);
+      var plain = st.module === 'square';
+      var parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + total + ' ' + total +
+                   '" width="' + px + '" height="' + px + '"' +
+                   (plain ? ' shape-rendering="crispEdges"' : '') + '>'];
+      if (o.bgAlpha > 0) {
+        parts.push('<rect width="' + total + '" height="' + total + '" fill="' + (o.bg || '#ffffff') +
+                   '" fill-opacity="' + (Math.round(o.bgAlpha * 1000) / 1000) + '"/>');
+      }
+      parts.push('<path fill="' + fg + '" d="' + svgPathData(sym, q, st) + '"/>');
+      parts.push('</svg>');
+      return parts.join('');
+    }
+
+    /* Relative luminance and contrast, to catch the single most common way a
+       generated QR fails: not enough contrast, or inverted polarity. */
+    function luminance(hex) {
+      var h = String(hex).replace('#', '');
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      var v = [0, 2, 4].map(function (i) {
+        var c = parseInt(h.substr(i, 2), 16) / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+    }
+
+    function contrastRatio(a, b) {
+      var la = luminance(a), lb = luminance(b);
+      return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    }
+
+    return {
+      ALNUM: ALNUM, ECL: ECL, ECL_FORMAT_BITS: ECL_FORMAT_BITS, EC_SPEC: EC_SPEC,
+      ALIGN_POS: ALIGN_POS, TOTAL_CODEWORDS: TOTAL_CODEWORDS, MODE: MODE, CC_BITS: CC_BITS,
+      FN_FREE: FN_FREE, FN_NAME: FN_NAME,
+      sizeOf: sizeOf, ccBits: ccBits,
+      gfMul: gfMul, rsGenerator: rsGenerator, rsRemainder: rsRemainder,
+      utf8Bytes: utf8Bytes, charMode: charMode, segment: segment, segmentBits: segmentBits,
+      blockLayout: blockLayout, chooseVersion: chooseVersion, encodeSegments: encodeSegments,
+      interleave: interleave,
+      functionMap: functionMap, formatPositions: formatPositions, versionPositions: versionPositions,
+      placementOrder: placementOrder, maskBit: maskBit, penalty: penalty,
+      formatBits: formatBits, versionInfoBits: versionInfoBits,
+      encodeQR: encodeQR, moduleInfo: moduleInfo, correctionCapacity: correctionCapacity,
+      damageReport: damageReport, centrePatch: centrePatch, largestSafePatch: largestSafePatch,
+      buildWifi: buildWifi, buildVCard: buildVCard, buildMailto: buildMailto, buildSms: buildSms,
+      buildGeo: buildGeo, buildTel: buildTel, buildUrl: buildUrl, buildPayload: buildPayload,
+      MODULE_STYLES: MODULE_STYLES, STYLE_LOOK: STYLE_LOOK, STYLE_GEO: STYLE_GEO,
+      styleOpts: styleOpts, moduleShapes: moduleShapes, shapePath: shapePath,
+      symbolSeed: symbolSeed,
+      pointInShape: pointInShape,
+      svgPathData: svgPathData, toSvg: toSvg, luminance: luminance, contrastRatio: contrastRatio
+    };
+  })();
+  /* QR-CORE-END */
+  </script>
+
+  <script id="app">
+    const { useState, useMemo, useEffect, useRef, useCallback } = React;
+    const html = htm.bind(React.createElement);
+
+    /* Canvas cannot read var(), so the palette is baked into mutable bindings and
+       re-read on `themechange` (live theme switch, /assets/js/site-nav.js). The
+       listener touches COL and nothing else: a colour the user picked lives in
+       React state and no theme event can reach it. */
+    const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    const COL = {};
+    function readPalette() {
+      Object.assign(COL, {
+        fg: cssVar('--qr-fg'), bg: cssVar('--qr-bg'),
+        page: cssVar('--pico-background-color'),
+        data: cssVar('--qr-ov-data'), ec: cssVar('--qr-ov-ec'),
+        fn: cssVar('--qr-ov-fn'), rem: cssVar('--qr-ov-rem'),
+        blocks: [0, 1, 2, 3, 4].map((i) => cssVar('--qr-ov-b' + i)),
+        danger: cssVar('--tool-danger-text')
+      });
+    }
+    readPalette();
+
+    const ECLS = ['L', 'M', 'Q', 'H'];
+    const ECL_PCT = { L: '7%', M: '15%', Q: '25%', H: '30%' };
+
+    /* The eight payload kinds. As a tabstrip they wrapped to two rows and looked
+       like the most important control on the page, which they are not: the
+       payload kind is picked once and then never touched again. A select says
+       that, and gives room for a label that names the format. */
+    const PRESETS = [
+      { id: 'url', label: 'URL' },
+      { id: 'text', label: 'Plain text' },
+      { id: 'wifi', label: 'WiFi network' },
+      { id: 'vcard', label: 'Contact card (vCard)' },
+      { id: 'mailto', label: 'Email' },
+      { id: 'sms', label: 'SMS' },
+      { id: 'geo', label: 'Geo coordinates' },
+      { id: 'tel', label: 'Phone number' }
+    ];
+
+    const INITIAL_FIELDS = {
+      text: { text: 'Everything in this code was built in your browser.' },
+      url: { url: 'alber.me/miscellaneous/' },
+      wifi: { ssid: '', password: '', auth: 'WPA', hidden: false },
+      vcard: { first: '', last: '', org: '', title: '', tel: '', email: '', url: '', note: '' },
+      mailto: { to: '', subject: '', body: '' },
+      sms: { number: '', body: '' },
+      geo: { lat: '49.0134', lon: '12.1016', zoom: '' },
+      tel: { number: '' }
+    };
+
+    const MOD_STYLE_LABEL = {
+      square: 'Squares', rounded: 'Rounded', dots: 'Dots', capsule: 'Capsules',
+      tangle: 'Tangle', loops: 'Loops'
+    };
+
+    /* The six shapes are picked by their picture, not by their name: six labels
+       in one segmented control fit a 380px column only as "Capsul...", and the
+       word tells you less than the thing does anyway.
+
+       The icons are drawn by the very moduleShapes the exporter uses, on a 5x5
+       stand-in symbol, so an icon cannot show a shape the downloaded file does
+       not have. The pattern is a hollow 4x4 ring with a stem and one loose
+       module, which is the smallest thing that separates all six: the ring
+       gives capsules their four runs, the loose module gives dots and tangle
+       their single dot, and the ring encloses four modules, which is over the
+       area floor, so `loops` closes it where `tangle` leaves it broken. The
+       seed is fixed for the same reason it is fixed in the tool: an icon that
+       reshuffles on every render is noise. */
+    const SAMPLE_N = 5;
+    const SAMPLE_SYM = {
+      size: SAMPLE_N, version: 0,
+      modules: Uint8Array.from([
+        1, 1, 1, 1, 0,
+        1, 0, 0, 1, 0,
+        1, 0, 0, 1, 1,
+        1, 1, 1, 1, 0,
+        0, 0, 0, 0, 1
+      ])
+    };
+    const SAMPLE_PATH = {};
+    QRC.MODULE_STYLES.forEach((s) => {
+      SAMPLE_PATH[s] = QRC.svgPathData(SAMPLE_SYM, 0, { module: s, seed: 20260822 });
+    });
+
+    /* Measured, not guessed. notes/dev/qr-style-robustness.mjs renders every
+       style from the same geometry this page ships, degrades it (resolution,
+       blur, noise) and lets jsQR decide. `px` is the coarsest resolution in
+       pixels per module at which all 13 test symbols still decode, `tail` the
+       coarsest at which at least half of them do. Plain squares are 2 / 1.5. */
+    const STYLE_COST = {
+      square: { px: 2, tail: 1.5,
+        note: 'The reference every other style here is measured against.' },
+      rounded: { px: 2, tail: 1.5,
+        note: 'Free on all three axes, and marginally better under blur than sharp squares.' },
+      capsule: { px: 2, tail: 1.75,
+        note: 'Runs become one capsule, lone modules become dots; it takes blur better than squares and gives up a little earlier when the resolution runs out.' },
+      dots: { px: 2, tail: 1.75,
+        note: 'The most fragile of the six: an isolated dot covers 58% of its module, so noise averages it away first.' },
+      tangle: { px: 2, tail: 1.75,
+        note: 'Neighbouring modules are joined at random, but never so that a loop closes: every group of modules ends up a tree.' },
+      loops: { px: 2, tail: 1.75,
+        note: 'The tangle, plus the one leftover connection per group that encloses the most area. Measures exactly like the tangle.' }
+    };
+
+    // largest canvas dimension browsers still allocate; past it a canvas is blank
+    const MAX_PX = 16384;
+    /* The rungs the export offers. They are targets, not results: each one is
+       rounded down to a whole number of pixels per module for the symbol at
+       hand, and rungs that land on a scale another rung already produced drop
+       out. A small symbol therefore gets fewer rows than a large one. */
+    const SIZE_TARGETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+
+    const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32);
+
+    function Field({ label, info, children }) {
+      return html`<label className="qr-field"><span>${label}${info}</span>${children}<//>`;
+    }
+
+    /* The floating explanation behind every "i". It is centred on its anchor and
+       then nudged back inside the viewport, which matters in the narrow left
+       column. Closes on Escape or on a click anywhere else, except on an "i",
+       which does its own toggling, so two explanations never overlap. */
+    function Popover({ children, close }) {
+      const ref = useRef(null);
+      const [dx, setDx] = useState(0);
+
+      useEffect(() => {
+        const el = ref.current;
+        if (el) {
+          const r = el.getBoundingClientRect(), pad = 12;
+          let d = 0;
+          if (r.left < pad) d = pad - r.left;
+          else if (r.right > window.innerWidth - pad) d = window.innerWidth - pad - r.right;
+          if (d) setDx(Math.round(d));
+        }
+        const onKey = (e) => { if (e.key === 'Escape') close(); };
+        const onDown = (e) => {
+          const el2 = ref.current;
+          if (!el2 || el2.contains(e.target)) return;
+          const anchor = el2.parentElement;
+          if (anchor && anchor.contains(e.target) && e.target.closest && e.target.closest('.qr-info')) return;
+          close();
+        };
+        document.addEventListener('keydown', onKey);
+        document.addEventListener('mousedown', onDown);
+        return () => {
+          document.removeEventListener('keydown', onKey);
+          document.removeEventListener('mousedown', onDown);
+        };
+      }, []);
+
+      return html`
+        <div className="qr-pop" ref=${ref} role="tooltip"
+             style=${{ transform: 'translateX(calc(-50% + ' + dx + 'px))', '--arrow': 'calc(50% - ' + dx + 'px)' }}>
+          <button type="button" className="qr-popclose" onClick=${close} aria-label="close explanation">×</button>
+          ${children}
+        </div>`;
+    }
+
+    /* The round "i" itself. Several of these sit inside a <summary>, where a
+       plain click would toggle the section as well, hence the preventDefault on
+       the whole anchor rather than on the button alone: the popover's own
+       content is inside that summary too. */
+    function Info({ label, children }) {
+      const [open, setOpen] = useState(false);
+      const swallow = (e) => { e.preventDefault(); e.stopPropagation(); };
+      return html`
+        <span className="qr-anchor" onClick=${swallow}>
+          <button type="button" className="qr-info" aria-expanded=${open}
+                  aria-label=${(open ? 'hide' : 'show') + ' explanation of ' + label}
+                  onClick=${() => setOpen((o) => !o)}>i</button>
+          ${open && html`<${Popover} close=${() => setOpen(false)}>${children}<//>`}
+        </span>`;
+    }
+
+    function App() {
+      const [preset, setPreset] = useState('text');
+      const [fields, setFields] = useState(INITIAL_FIELDS);
+      const [eclIdx, setEclIdx] = useState(1);
+      const [fg, setFg] = useState(null);                       // null = follow the skin
+      const [bgColor, setBgColor] = useState(null);
+      const [bgAlpha, setBgAlpha] = useState(0);                // transparent by default
+      const [quiet, setQuiet] = useState(4);
+      const [sizeTarget, setSizeTarget] = useState(512);   // a rung, not a pixel count
+      const [anatomy, setAnatomy] = useState(false);
+      const [ovMode, setOvMode] = useState('role');
+      const [occMode, setOccMode] = useState('none');
+      const [patchPct, setPatchPct] = useState(18);
+      const [freeSet, setFreeSet] = useState(() => new Set());
+      const [maskOpt, setMaskOpt] = useState('auto');
+      const [minVersion, setMinVersion] = useState(1);
+      const [forceMode, setForceMode] = useState('auto');
+      const [hover, setHover] = useState(null);
+      const [copied, setCopied] = useState('');
+      const [modStyle, setModStyle] = useState('square');
+      const [tangleSeed, setTangleSeed] = useState(0);          // 0 = follow the symbol
+      const [, themeBump] = useState(0);
+
+      useEffect(() => {
+        const on = () => { readPalette(); themeBump((n) => n + 1); };
+        window.addEventListener('themechange', on);
+        return () => window.removeEventListener('themechange', on);
+      }, []);
+
+      const set = (key, value) => setFields((f) => ({ ...f, [preset]: { ...f[preset], [key]: value } }));
+      const f = fields[preset];
+      const ecl = ECLS[eclIdx];
+
+      const payload = useMemo(() => QRC.buildPayload(preset, f), [preset, f]);
+
+      const sym = useMemo(() => {
+        if (!payload) return { error: 'empty' };
+        return QRC.encodeQR(payload, {
+          ecl, minVersion, mode: forceMode,
+          mask: maskOpt === 'auto' ? 'auto' : parseInt(maskOpt, 10)
+        });
+      }, [payload, ecl, minVersion, forceMode, maskOpt]);
+
+      const ok = sym && !sym.error;
+
+      // the free-hand set is indexed by module, so it has to go when the symbol
+      // changes size underneath it
+      useEffect(() => { setFreeSet(new Set()); }, [ok ? sym.size : 0]);
+
+      const occluded = useMemo(() => {
+        if (!ok || !anatomy || occMode === 'none') return new Set();
+        if (occMode === 'patch') return QRC.centrePatch(sym, Math.round(sym.size * patchPct / 100));
+        return freeSet;
+      }, [ok, anatomy, occMode, patchPct, freeSet, sym]);
+
+      const damage = useMemo(
+        () => (ok && anatomy && occluded.size ? QRC.damageReport(sym, occluded) : null),
+        [ok, anatomy, occluded, sym]
+      );
+      const safePatch = useMemo(
+        () => (ok && anatomy ? QRC.largestSafePatch(sym) : 0),
+        [ok, anatomy, sym]
+      );
+
+      /* A colour the user picked lives in state and outranks the palette; null
+         means "follow the skin", which is what the theme listener above updates. */
+      const fgEff = fg || COL.fg;
+      const bgEff = bgColor || COL.bg;
+      const effectiveBg = bgAlpha > 0 ? bgEff : COL.page;
+      const contrast = QRC.contrastRatio(fgEff, effectiveBg);
+      const inverted = QRC.luminance(fgEff) > QRC.luminance(effectiveBg);
+
+      const style = useMemo(() => ({ module: modStyle, seed: tangleSeed }), [modStyle, tangleSeed]);
+      const cost = STYLE_COST[modStyle] || STYLE_COST.square;
+
+      const total = ok ? sym.size + 2 * quiet : 0;
+      /* Whole pixels per module or nothing, because a fractional scale puts
+         antialiased seams between the modules and scanners hate them. A free
+         pixel field therefore always ended in a snap, which is a number the
+         user did not type; the list offers the snapped sizes themselves, one
+         entry per whole scale the ladder can reach.
+
+         What is stored is the RUNG of that ladder, not the pixel count. The
+         symbol changes size under the choice whenever the version or the quiet
+         zone moves, and a stored pixel count would stop being a whole multiple
+         at exactly that moment. MAX_PX is the canvas dimension every browser
+         refuses to go past, and a canvas over it comes back blank, so the cap
+         simply removes the entries above it instead of warning about them. */
+      const maxScale = ok ? Math.max(1, Math.floor(MAX_PX / total)) : 1;
+      const scaleFor = (t) => Math.min(maxScale, Math.max(1, Math.floor(t / total)));
+      const exportScale = ok ? scaleFor(sizeTarget) : 1;
+      const exportPx = total * exportScale;
+      const sizeChoices = useMemo(() => {
+        if (!ok) return [];
+        const seen = new Set(), out = [];
+        SIZE_TARGETS.forEach((t) => {
+          const s = scaleFor(t);
+          if (seen.has(s)) return;
+          seen.add(s);
+          out.push({ target: t, scale: s, px: total * s });
+        });
+        return out;
+      }, [ok, total, maxScale]);
+      // every distinct scale appears once, so the stored rung always finds its row
+      const sizePick = sizeChoices.find((c) => c.scale === exportScale);
+      // the SVG carries the same width, and scales freely past it anyway
+      const svgPx = exportPx;
+
+      /* Integer scale, integer coordinates, no smoothing: fractional scaling puts
+         antialiased seams between modules and scanners hate them. The slider
+         therefore picks a target and the tool snaps, visibly. */
+      const paint = useCallback((canvas, scale, showOverlay) => {
+        if (!canvas || !ok) return;
+        const n = sym.size, t = n + 2 * quiet;
+        canvas.width = t * scale;
+        canvas.height = t * scale;
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (bgAlpha > 0) {
+          ctx.globalAlpha = bgAlpha;
+          ctx.fillStyle = bgEff;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.globalAlpha = 1;
+        }
+        /* The plain symbol is drawn as the one path the SVG export uses, so
+           there is no second geometry that could look different from the file
+           the user downloads. The anatomy overlay keeps its own module loop and
+           always draws squares: it explains what a module does, and a dot would
+           only make that harder to read. */
+        if (!showOverlay) {
+          ctx.save();
+          ctx.scale(scale, scale);
+          ctx.fillStyle = fgEff;
+          ctx.fill(new Path2D(QRC.svgPathData(sym, quiet, style)));
+          ctx.restore();
+          return;
+        }
+        for (let r = 0; r < n; r++) {
+          for (let c = 0; c < n; c++) {
+            const idx = r * n + c;
+            const dark = sym.modules[idx];
+            let colour = null, alpha = 1;
+            const info = QRC.moduleInfo(sym, r, c);
+            if (ovMode === 'function') {
+              colour = info.kind === 'function' ? COL.fn : (dark ? fgEff : null);
+              if (info.kind !== 'function' && !dark) continue;
+            } else if (ovMode === 'block' && (info.kind === 'data' || info.kind === 'ec')) {
+              colour = COL.blocks[info.block % COL.blocks.length];
+            } else if (info.kind === 'data') colour = COL.data;
+            else if (info.kind === 'ec') colour = COL.ec;
+            else if (info.kind === 'remainder') colour = COL.rem;
+            else colour = COL.fn;
+            // light modules keep the same hue at a fraction, so the block
+            // structure stays readable across the whole symbol
+            if (!dark) alpha = 0.22;
+            if (!colour) continue;
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = colour;
+            ctx.fillRect((quiet + c) * scale, (quiet + r) * scale, scale, scale);
+          }
+        }
+        ctx.globalAlpha = 1;
+        if (occluded.size) {
+          ctx.fillStyle = COL.danger;
+          ctx.globalAlpha = 0.55;
+          occluded.forEach((idx) => {
+            ctx.fillRect((quiet + idx % n) * scale, (quiet + Math.floor(idx / n)) * scale, scale, scale);
+          });
+          ctx.globalAlpha = 1;
+        }
+      }, [ok, sym, quiet, bgAlpha, bgEff, fgEff, ovMode, occluded, anatomy, style]);
+
+      const previewRef = useRef(null);
+      const previewScale = ok ? Math.max(2, Math.floor(440 / total)) : 2;
+      useEffect(() => { paint(previewRef.current, previewScale, anatomy); }, [paint, previewScale, anatomy]);
+
+      const renderExport = () => {
+        const cv = document.createElement('canvas');
+        paint(cv, exportScale, false);
+        return cv;
+      };
+
+      const fileName = (ext) => {
+        const bits = { wifi: slug(f.ssid), vcard: slug((f.first || '') + '-' + (f.last || '')), url: slug(f.url) };
+        const tail = bits[preset];
+        return 'qr-' + (preset === 'text' ? 'code' : preset) + (tail ? '-' + tail : '') + '.' + ext;
+      };
+
+      const saveBlob = (blob, name) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
+
+      const downloadPng = () => {
+        renderExport().toBlob((blob) => { if (blob) saveBlob(blob, fileName('png')); }, 'image/png');
+      };
+
+      const downloadSvg = () => {
+        const svg = QRC.toSvg(sym, { quiet, fg: fgEff, bg: bgEff, bgAlpha, size: svgPx, style });
+        saveBlob(new Blob([svg], { type: 'image/svg+xml' }), fileName('svg'));
+      };
+
+      const canCopy = typeof ClipboardItem !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.write);
+
+      /* Safari spends the user gesture on the await, so the ClipboardItem has to
+         be constructed synchronously with a Promise value. Firefox rejects
+         promise values outright, hence the awaited fallback. */
+      const copyPng = async () => {
+        const cv = renderExport();
+        const blobOf = () => new Promise((res) => cv.toBlob(res, 'image/png'));
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blobOf() })]);
+        } catch (e) {
+          try {
+            const blob = await blobOf();
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          } catch (e2) {
+            setCopied('Copy failed');
+            setTimeout(() => setCopied(''), 1800);
+            return;
+          }
+        }
+        setCopied('Copied');
+        setTimeout(() => setCopied(''), 1800);
+      };
+
+      const moduleAt = (ev) => {
+        const cv = previewRef.current;
+        if (!cv || !ok) return null;
+        const rect = cv.getBoundingClientRect();
+        const px = (ev.clientX - rect.left) / rect.width * total;
+        const py = (ev.clientY - rect.top) / rect.height * total;
+        const c = Math.floor(px) - quiet, r = Math.floor(py) - quiet;
+        if (r < 0 || c < 0 || r >= sym.size || c >= sym.size) return null;
+        return { r, c, idx: r * sym.size + c };
+      };
+
+      const onMove = (ev) => {
+        if (!anatomy) return;
+        const m = moduleAt(ev);
+        if (!m) { setHover(null); return; }
+        const info = QRC.moduleInfo(sym, m.r, m.c);
+        let txt;
+        if (info.kind === 'function') txt = 'row ' + m.r + ', column ' + m.c + ': ' + info.which + ' pattern, fixed by the spec';
+        else if (info.kind === 'remainder') txt = 'row ' + m.r + ', column ' + m.c + ': remainder bit, structural padding that carries nothing';
+        else txt = 'row ' + m.r + ', column ' + m.c + ': ' + (info.kind === 'data' ? 'data' : 'correction') +
+                   ' codeword ' + info.codeword + ', bit ' + info.bit + ', block ' + (info.block + 1);
+        setHover(txt);
+      };
+
+      const onClick = (ev) => {
+        if (!anatomy || occMode !== 'free') return;
+        const m = moduleAt(ev);
+        if (!m) return;
+        setFreeSet((s) => {
+          const next = new Set(s);
+          if (next.has(m.idx)) next.delete(m.idx); else next.add(m.idx);
+          return next;
+        });
+      };
+
+      const cap = ok ? QRC.correctionCapacity(sym.layout) : null;
+      const longest = ok ? Math.max(...sym.layout.blocks.map((b) => b.dataLen)) : 0;
+
+      const errorText = {
+        empty: 'Type something and the code appears.',
+        capacity: 'That is more than a QR code can hold, even at version 40 with the lowest error correction.',
+        mode: 'The forced encoding mode cannot represent this text. Switch it back to automatic.',
+        ecl: 'Unknown error-correction level.'
+      };
+
+      const modeName = ['numeric', 'alphanumeric', 'byte'];
+      const segSummary = ok
+        ? sym.segments.map((s) => s.count + ' in ' + modeName[s.mode]).join(', ')
+        : '';
+
+      return html`
+        <div className="container">
+          <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-emph)', marginBottom: 8 }}>QR Code Generator</h1>
+          <p style=${{ color: 'var(--tool-label)', maxWidth: '70ch', marginBottom: 10 }}>
+            Colours, transparency, module shapes with a measured price tag, and an
+            error-correction slider that shows what it buys you.
+            The encoder is part of this page, so nothing you type leaves the tab.
+          </p>
+          <p className="tool-shield">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            No account, no upload, no redirect service. The code points straight at your text.
+          </p>
+
+          <div className="qr-layout">
+            <div>
+              <div className="ctl-card">
+
+                <div className="ctl-sec">
+                  <${Field} label="What the code contains">
+                    <select className="qr-in" value=${preset} onChange=${(e) => setPreset(e.target.value)}>
+                      ${PRESETS.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}</option>`)}
+                    </select>
+                  <//>
+                  ${preset === 'text' && html`
+                    <${Field} label="Text">
+                      <textarea className="qr-in" value=${f.text} onInput=${(e) => set('text', e.target.value)}/>
+                    <//>`}
+                  ${preset === 'url' && html`
+                    <${Field} label="Address (https:// is added if you leave it out)">
+                      <input className="qr-in" type="text" value=${f.url} onInput=${(e) => set('url', e.target.value)}/>
+                    <//>`}
+                  ${preset === 'wifi' && html`
+                    <${React.Fragment}>
+                      <${Field} label="Network name (SSID)">
+                        <input className="qr-in" type="text" value=${f.ssid} onInput=${(e) => set('ssid', e.target.value)}/>
+                      <//>
+                      <div className="qr-grid">
+                        <${Field} label="Security">
+                          <select className="qr-in" value=${f.auth} onChange=${(e) => set('auth', e.target.value)}>
+                            <option value="WPA">WPA / WPA2 / WPA3</option>
+                            <option value="WEP">WEP</option>
+                            <option value="nopass">Open</option>
+                          </select>
+                        <//>
+                        <${Field} label="Password" info=${html`
+                          <${Info} label="the WiFi password">
+                            <p>A WiFi code carries the password in clear text. Anyone who photographs the sticker has the network, and unlike a written password it is copied in a second and from across the room.</p>
+                            <p>On the fridge this is convenient; on the guest room door it is a password on a wall.</p>
+                          <//>`}>
+                          <input className="qr-in" type="text" value=${f.password} disabled=${f.auth === 'nopass'}
+                                 onInput=${(e) => set('password', e.target.value)}/>
+                        <//>
+                      </div>
+                      <label className="qr-field" style=${{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <input type="checkbox" checked=${f.hidden} onChange=${(e) => set('hidden', e.target.checked)}
+                               style=${{ margin: 0 }}/>
+                        <span style=${{ margin: 0 }}>Hidden network</span>
+                      </label>
+                    <//>`}
+                  ${preset === 'vcard' && html`
+                    <${React.Fragment}>
+                      <div className="qr-grid">
+                        <${Field} label="First name"><input className="qr-in" type="text" value=${f.first} onInput=${(e) => set('first', e.target.value)}/><//>
+                        <${Field} label="Last name"><input className="qr-in" type="text" value=${f.last} onInput=${(e) => set('last', e.target.value)}/><//>
+                        <${Field} label="Organisation"><input className="qr-in" type="text" value=${f.org} onInput=${(e) => set('org', e.target.value)}/><//>
+                        <${Field} label="Role"><input className="qr-in" type="text" value=${f.title} onInput=${(e) => set('title', e.target.value)}/><//>
+                        <${Field} label="Phone"><input className="qr-in" type="text" value=${f.tel} onInput=${(e) => set('tel', e.target.value)}/><//>
+                        <${Field} label="Email"><input className="qr-in" type="text" value=${f.email} onInput=${(e) => set('email', e.target.value)}/><//>
+                      </div>
+                      <${Field} label="Website"><input className="qr-in" type="text" value=${f.url} onInput=${(e) => set('url', e.target.value)}/><//>
+                    <//>`}
+                  ${preset === 'mailto' && html`
+                    <${React.Fragment}>
+                      <${Field} label="To"><input className="qr-in" type="text" value=${f.to} onInput=${(e) => set('to', e.target.value)}/><//>
+                      <${Field} label="Subject"><input className="qr-in" type="text" value=${f.subject} onInput=${(e) => set('subject', e.target.value)}/><//>
+                      <${Field} label="Body"><textarea className="qr-in" value=${f.body} onInput=${(e) => set('body', e.target.value)}/><//>
+                    <//>`}
+                  ${preset === 'sms' && html`
+                    <${React.Fragment}>
+                      <${Field} label="Number"><input className="qr-in" type="text" value=${f.number} onInput=${(e) => set('number', e.target.value)}/><//>
+                      <${Field} label="Message"><textarea className="qr-in" value=${f.body} onInput=${(e) => set('body', e.target.value)}/><//>
+                    <//>`}
+                  ${preset === 'geo' && html`
+                    <div className="qr-grid">
+                      <${Field} label="Latitude"><input className="qr-in" type="text" value=${f.lat} onInput=${(e) => set('lat', e.target.value)}/><//>
+                      <${Field} label="Longitude"><input className="qr-in" type="text" value=${f.lon} onInput=${(e) => set('lon', e.target.value)}/><//>
+                      <${Field} label="Zoom (optional)"><input className="qr-in" type="text" value=${f.zoom} onInput=${(e) => set('zoom', e.target.value)}/><//>
+                    </div>`}
+                  ${preset === 'tel' && html`
+                    <${Field} label="Number"><input className="qr-in" type="text" value=${f.number} onInput=${(e) => set('number', e.target.value)}/><//>`}
+                  ${ok && html`<p className="qr-note">
+                    ${payload.length} characters, encoded as ${segSummary}.
+                  </p>`}
+                </div>
+
+                <details className="ctl-sec ctl-adv" open>
+                  <summary><span className="qr-sec-t">Module shape</span><span className="ctl-sec-h-sub">${MOD_STYLE_LABEL[modStyle]}</span>
+                    <${Info} label="what this shape costs">
+                      <p>Every style here still reads at ${cost.px} px per module.
+                        ${' '}<b>Half the test symbols survive down to ${cost.tail} px</b>${modStyle === 'square' ? '' : ', against ' + STYLE_COST.square.tail + ' px for plain squares'}.</p>
+                      <p>${cost.note}</p>
+                      <p>Those numbers are measured against an independent decoder, not asserted. The long version is at the bottom of the page.</p>
+                    <//>
+                  </summary>
+                  <div className="qr-shape-row">
+                    <div className="seg-row qr-seg" role="group" aria-label="Module shape">
+                      ${QRC.MODULE_STYLES.map((s) => html`
+                        <button key=${s} className=${'lang-seg' + (modStyle === s ? ' active' : '')}
+                                title=${MOD_STYLE_LABEL[s]} aria-label=${MOD_STYLE_LABEL[s]}
+                                aria-pressed=${modStyle === s} onClick=${() => setModStyle(s)}>
+                          <svg className="qr-shape-icon" viewBox=${'0 0 ' + SAMPLE_N + ' ' + SAMPLE_N} aria-hidden="true">
+                            <path fill="currentColor" d=${SAMPLE_PATH[s]}/>
+                          </svg>
+                        </button>`)}
+                    </div>
+                    ${(modStyle === 'tangle' || modStyle === 'loops') && html`
+                      <button className="lang-seg qr-reroll" title="Tangle again" aria-label="Tangle again"
+                              onClick=${() => setTangleSeed(Math.floor(Math.random() * 1e9) + 1)}>🔄</button>`}
+                  </div>
+                </details>
+
+                <details className="ctl-sec ctl-adv">
+                  <summary><span className="qr-sec-t">Error correction</span><span className="ctl-sec-h-sub">damage redundancy</span></summary>
+                  <input className="qr-range" type="range" min="0" max="3" step="1" value=${eclIdx}
+                         onInput=${(e) => setEclIdx(+e.target.value)}/>
+                  <div className="qr-ticks">
+                    ${ECLS.map((e) => html`<span key=${e}>${e === ecl ? html`<b>${e}</b>` : e}</span>`)}
+                  </div>
+                  ${ok && html`<p className="qr-note">
+                    ${sym.layout.numBlocks} ${sym.layout.numBlocks === 1 ? 'block' : 'blocks'} of up to ${longest} data
+                    plus ${sym.layout.ecPerBlock} correction codewords each. A block survives
+                    ${' '}<b>${cap.perBlockErrors} damaged codewords out of ${cap.blockTotal}</b>, so
+                    ${' '}${(cap.fractionErrors * 100).toFixed(1)}% of it.
+                  </p>`}
+                  <details className="fold fold-sm">
+                    <summary>Why that is not the ${ECL_PCT[ecl]} everyone quotes</summary>
+                    <div className="fold-body">
+                      <p>The familiar figure for level ${ecl} is ${ECL_PCT[ecl]}. It is a per-block number quoted as if it applied to the whole symbol, and it counts erasures rather than errors.</p>
+                      <p>Reed-Solomon corrects half as many errors of unknown position as erasures of known position. A camera thresholds every module to black or white and tells the decoder nothing about which ones it got wrong, so the halved figure is the one that describes reality. The generous reading would be ${ok ? cap.perBlockErasures : 0} codewords per block, and it is not what happens when you photograph a sticker.</p>
+                    </div>
+                  </details>
+                </details>
+
+                <details className="ctl-sec ctl-adv">
+                  <summary><span className="qr-sec-t">Colours</span><span className="ctl-sec-h-sub">${bgAlpha === 0 ? 'transparent background'
+                    : (bgAlpha === 1 ? 'opaque background' : Math.round(bgAlpha * 100) + '% background')}</span></summary>
+                  <div className="qr-swatch-row">
+                    <input className="qr-color" type="color" value=${fgEff} aria-label="Foreground colour"
+                           onInput=${(e) => setFg(e.target.value)}/>
+                    <span className="qr-hex">Foreground ${fg ? fgEff : '(following the skin)'}</span>
+                  </div>
+                  <div className="qr-swatch-row">
+                    <input className="qr-color" type="color" value=${bgEff} aria-label="Background colour"
+                           onInput=${(e) => { setBgColor(e.target.value); if (bgAlpha === 0) setBgAlpha(1); }}/>
+                    <span className="qr-hex">Background ${bgAlpha === 0 ? 'transparent' : (bgColor ? bgEff : '(following the skin)')}</span>
+                  </div>
+                  <${Field} label=${'Background opacity ' + Math.round(bgAlpha * 100) + '%'}>
+                    <input className="qr-range" type="range" min="0" max="100" step="1" value=${Math.round(bgAlpha * 100)}
+                           onInput=${(e) => setBgAlpha(+e.target.value / 100)}/>
+                  <//>
+                  <div className="qr-chips">
+                    <button className="lang-seg" onClick=${() => { setFg(null); setBgColor(null); setBgAlpha(0); }}>Follow the skin</button>
+                    <button className="lang-seg" onClick=${() => { setFg('#000000'); setBgColor('#ffffff'); setBgAlpha(1); }}>Black on white</button>
+                    <button className="lang-seg" onClick=${() => { setFg('#ffffff'); setBgColor('#000000'); setBgAlpha(1); }}>White on black</button>
+                    <button className="lang-seg" onClick=${() => setBgAlpha(0)}>Transparent</button>
+                  </div>
+                  ${bgAlpha < 1 && html`<p className="qr-note">
+                    A dark page behind a dark code is the usual way a transparent QR stops working.
+                  </p>`}
+                  ${(contrast < 3 || inverted) && html`<p className="qr-note" style=${{ color: 'var(--tool-warn-text)' }}>
+                    ${inverted ? 'Light modules on a dark background: some decoders handle inverted symbols, many do not. '
+                               : 'Contrast is only ' + contrast.toFixed(1) + ':1. '}
+                    Black on white is one click away.
+                  </p>`}
+                </details>
+
+                <details className="ctl-sec ctl-adv">
+                  <summary><span className="qr-sec-t">Quiet zone</span><span className="ctl-sec-h-sub">${quiet} modules</span>
+                    <${Info} label="the quiet zone">
+                      <p>The empty margin around the symbol. It is not decoration and not padding: a scanner needs a stretch of plain background to find the edge of the code at all, which is why the standard asks for four modules on every side.</p>
+                      <p>It is the cheapest thing to get wrong. A code pasted flush against coloured artwork, or cropped to its own outline, fails on exactly this while looking perfectly intact.</p>
+                      <p>The zone is part of the export, so a PNG with four modules of quiet zone already brings its own margin.</p>
+                    <//>
+                  </summary>
+                  <input className="qr-range" type="range" min="0" max="8" step="1" value=${quiet}
+                         onInput=${(e) => setQuiet(+e.target.value)}/>
+                  <div className="qr-ticks"><span>0</span><span>8</span></div>
+                  ${quiet < 4 && html`<p className="qr-note" style=${{ color: 'var(--tool-warn-text)' }}>
+                    The spec asks for 4. Many scanners cope with 2, some with none, none of them promise to.
+                  </p>`}
+                  <!-- A transparent margin is the one case where this slider
+                       moves and nothing appears to happen: it reserves the
+                       space without filling it, so the checkerboard behind the
+                       preview keeps looking the same. Saying so beats letting
+                       someone conclude the control is broken. -->
+                  ${bgAlpha < 1 && html`<p className="qr-note">
+                    The margin is ${bgAlpha === 0 ? 'transparent' : 'only ' + Math.round(bgAlpha * 100) + '% opaque'},
+                    so this reserves the space without filling it and whatever the code ends up on decides whether
+                    the margin is light enough to read. Hard to see here, easy on
+                    ${' '}<button className="lang-seg qr-inline-seg"
+                                  onClick=${() => { setFg('#000000'); setBgColor('#ffffff'); setBgAlpha(1); }}>black on white</button>.
+                  </p>`}
+                </details>
+
+                <details className="ctl-sec ctl-adv">
+                  <summary><span className="qr-sec-t">Expert</span><span className="ctl-sec-h-sub">mask, mode, minimum version</span></summary>
+                  <div className="qr-grid">
+                    <${Field} label="Mask pattern">
+                      <select className="qr-in" value=${maskOpt} onChange=${(e) => setMaskOpt(e.target.value)}>
+                        <option value="auto">Automatic${ok ? ' (picked ' + sym.mask + ')' : ''}</option>
+                        ${[0, 1, 2, 3, 4, 5, 6, 7].map((k) => html`
+                          <option key=${k} value=${String(k)}>${k}${ok ? ' - penalty ' + sym.maskScores[k] : ''}</option>`)}
+                      </select>
+                    <//>
+                    <${Field} label="Encoding mode" info=${html`
+                      <${Info} label="the encoding mode">
+                        <p>Byte mode is written as UTF-8 without an ECI header, which is what almost every generator does and what almost every reader assumes. Non-ASCII text is therefore a convention rather than a guarantee.</p>
+                        <p>Numeric and alphanumeric are cheaper per character but cannot represent everything; forcing one that does not fit leaves the symbol empty and says so.</p>
+                      <//>`}>
+                      <select className="qr-in" value=${forceMode} onChange=${(e) => setForceMode(e.target.value)}>
+                        <option value="auto">Automatic</option>
+                        <option value="num">Numeric</option>
+                        <option value="alnum">Alphanumeric</option>
+                        <option value="byte">Byte (UTF-8)</option>
+                      </select>
+                    <//>
+                  </div>
+                  <${Field} label=${'Minimum version ' + minVersion + ' (' + QRC.sizeOf(minVersion) + ' modules)'}>
+                    <input className="qr-range" type="range" min="1" max="40" step="1" value=${minVersion}
+                           onInput=${(e) => setMinVersion(+e.target.value)}/>
+                  <//>
+                </details>
+              </div>
+            </div>
+
+            <div>
+              ${!ok && html`<p className="qr-verdict">${errorText[sym.error] || 'Something went wrong.'}</p>`}
+              ${ok && html`
+                <${React.Fragment}>
+                  <!-- The anatomy view is a view of the symbol, not a setting on
+                       it, so it is a tabstrip over the stage rather than a switch
+                       among the parameters on the left. -->
+                  <div className="tabstrip" role="tablist" style=${{ marginBottom: 10 }}>
+                    ${[[false, 'Symbol'], [true, 'Anatomy']].map(([v, label]) => html`
+                      <button key=${label} role="tab" className=${anatomy === v ? 'active' : ''}
+                              aria-selected=${anatomy === v} onClick=${() => setAnatomy(v)}>${label}</button>`)}
+                  </div>
+
+                  <div className="qr-stage">
+                    <canvas ref=${previewRef} className=${anatomy ? '' : 'plain'}
+                            style=${{ width: Math.min(440, total * previewScale) + 'px' }}
+                            onMouseMove=${onMove} onMouseLeave=${() => setHover(null)} onClick=${onClick}/>
+                  </div>
+
+                  ${anatomy && html`
+                    <${React.Fragment}>
+                      <div className="qr-anat">
+                        <div className="qr-chips" style=${{ marginBottom: 8 }}>
+                          ${[['role', 'Data vs correction'], ['block', 'Blocks'], ['function', 'Fixed patterns']].map(([id, label]) => html`
+                            <button key=${id} className=${'lang-seg' + (ovMode === id ? ' active' : '')}
+                                    onClick=${() => setOvMode(id)}>${label}</button>`)}
+                        </div>
+                        <div className="qr-chips" style=${{ marginBottom: 8 }}>
+                          ${[['none', 'No damage'], ['patch', 'Centre patch'], ['free', 'Paint by hand']].map(([id, label]) => html`
+                            <button key=${id} className=${'lang-seg' + (occMode === id ? ' active' : '')}
+                                    onClick=${() => setOccMode(id)}>${label}</button>`)}
+                          ${occMode === 'free' && freeSet.size > 0 && html`
+                            <button className="lang-seg" onClick=${() => setFreeSet(new Set())}>Clear</button>`}
+                        </div>
+                        ${occMode === 'patch' && html`
+                          <${Field} label=${'Centre patch ' + patchPct + '% of the side'}>
+                            <input className="qr-range" type="range" min="0" max="45" step="1" value=${patchPct}
+                                   onInput=${(e) => setPatchPct(+e.target.value)}/>
+                          <//>`}
+                        ${occMode === 'free' && html`<p className="qr-faint">Click modules in the preview to cover them.</p>`}
+                        ${occMode === 'none' && html`<p className="qr-faint">
+                          Every module is coloured by what it actually does. Cover parts of the symbol to see what survives.
+                        </p>`}
+                      </div>
+
+                      <div className="qr-legend">
+                        ${ovMode === 'role' && html`<${React.Fragment}>
+                          <span><i style=${{ background: COL.data }}/>data codewords</span>
+                          <span><i style=${{ background: COL.ec }}/>correction codewords</span>
+                          <span><i style=${{ background: COL.rem }}/>remainder bits</span>
+                          <span><i style=${{ background: COL.fn }}/>fixed patterns</span>
+                        <//>`}
+                        ${ovMode === 'block' && html`<${React.Fragment}>
+                          ${COL.blocks.slice(0, Math.min(5, sym.layout.numBlocks)).map((c, i) => html`
+                            <span key=${i}><i style=${{ background: c }}/>block ${i + 1}${sym.layout.numBlocks > 5 && i === 4 ? ' and on' : ''}</span>`)}
+                        <//>`}
+                        ${ovMode === 'function' && html`<span><i style=${{ background: COL.fn }}/>finders, timing, alignment, format and version information</span>`}
+                        <${Info} label="what this view draws">
+                          <p>The anatomy view always draws plain squares, whatever module shape is selected. It explains what a module does, and a dot would only make that harder to read.</p>
+                          <p>Exports render the shape you picked, in both PNG and SVG, and never these colours.</p>
+                        <//>
+                      </div>
+                      <p className="qr-hover">${hover || 'Hover a module to see what it carries.'}</p>
+                    <//>`}
+
+                  <div className="qr-stats">
+                    <span>Version <b>${sym.version}</b></span>
+                    <span>Modules <b>${sym.size} x ${sym.size}</b></span>
+                    <span>Level <b>${sym.ecl}</b></span>
+                    <span>Blocks <b>${sym.layout.numBlocks}</b></span>
+                    <span>Data <b>${sym.layout.totalData}</b></span>
+                    <span>Correction <b>${sym.layout.ecPerBlock * sym.layout.numBlocks}</b></span>
+                    <span>Filled <b>${Math.round(sym.bitsUsed / sym.capacityBits * 100)}%</b></span>
+                  </div>
+
+                  ${anatomy && html`
+                    <${React.Fragment}>
+                      <p className="qr-note">
+                        The largest centred square that still leaves the correction budget intact is
+                        ${' '}<b>${safePatch} of ${sym.size} modules</b>, about ${Math.round(safePatch * safePatch / (sym.size * sym.size) * 100)}% of the area.
+                        That is the honest answer to the logo question, and it assumes every covered module reads wrong.
+                      </p>
+                      ${damage && html`
+                        <div className=${'qr-verdict ' + (damage.verdict === 'decodes' ? 'ok' : (damage.verdict === 'marginal' ? 'warn' : 'bad'))}>
+                          ${damage.verdict === 'unlocatable' && html`<span>
+                            The damage reaches a ${damage.functionHits.finder ? 'finder' : (damage.functionHits.timing ? 'timing' : 'format')} pattern.
+                            A scanner never establishes the grid, so the correction budget is beside the point.
+                          </span>`}
+                          ${damage.verdict !== 'unlocatable' && html`<span>
+                            Worst block: <b>${damage.worst} of ${damage.budget}</b> correctable codewords used${damage.verdict === 'fails' ? ', which is over budget' : ''}.
+                            ${' '}${damage.verdict === 'decodes' ? 'Still has margin.' : (damage.verdict === 'marginal' ? 'Exactly at the limit, with nothing left for print and camera.' : ' This symbol no longer decodes.')}
+                          </span>`}
+                          <${Info} label="what this verdict covers">
+                            <p>"Decodes" means the correction budget holds, not that your phone will manage: blur, glare, angle and print bleed are not modelled here.</p>
+                            <p>It is also a worst case in the other direction. Every covered module is counted as read wrong, while in practice some of them come back correct by luck.</p>
+                          <//>
+                        </div>`}
+                    <//>`}
+
+                  <div className="qr-export">
+                    <p className="ctl-sec-h">Export
+                      <${Info} label="the export sizes">
+                        <p>The list holds whole pixels per module and nothing else, because a fractional scale puts soft seams between the modules and scanners dislike them. A free pixel field would only have snapped your number to one of these anyway.</p>
+                        <p>Every entry is the finished file: ${total} modules across, including the quiet zone. The largest one is the biggest canvas browsers still allocate; the SVG carries the same width and scales freely past it.</p>
+                        <p>Exports always render the plain symbol, never the anatomy colours. Clipboards on Windows tend to flatten PNG transparency to black, so use the download when you need the alpha channel.</p>
+                      <//>
+                    </p>
+                    <${Field} label="Size">
+                      <select className="qr-in" value=${sizePick ? String(sizePick.target) : ''}
+                              onChange=${(e) => setSizeTarget(+e.target.value)}>
+                        ${sizeChoices.map((c) => html`
+                          <option key=${c.target} value=${String(c.target)}>
+                            ${c.px} x ${c.px} px, ${c.scale} px per module
+                          </option>`)}
+                      </select>
+                    <//>
+                    <div className="qr-actions">
+                      <button onClick=${downloadPng}>Download PNG</button>
+                      <button className="secondary" onClick=${downloadSvg}>Download SVG</button>
+                      <button className="secondary" onClick=${copyPng} disabled=${!canCopy}
+                              title=${canCopy ? 'Copy the PNG to the clipboard' : 'This browser does not offer image clipboard writes'}>
+                        ${copied || 'Copy PNG'}
+                      </button>
+                    </div>
+                  </div>
+                <//>`}
+            </div>
+          </div>
+
+          <div style=${{ maxWidth: '70ch', marginTop: 26 }}>
+            <details className="fold">
+              <summary>Why most QR generators want your email address</summary>
+              <div className="fold-body">
+                <p>Because the code they hand you usually does not contain your address. It contains theirs. The symbol encodes a short link on their domain, which redirects to your destination, which means they see every scan, can change the target later, and can also stop redirecting when the free tier ends or the company does. The industry calls this a dynamic QR code and sells it as a feature, which for tracking and for fixing a typo on 5000 printed flyers it genuinely is.</p>
+                <p>The trade is that a printed sticker now depends on someone else's server staying up for as long as the sticker exists. A code on a gravestone, a machine label or a book plate outlives most companies.</p>
+                <p>This tool cannot do dynamic codes even if you wanted one. It encodes what you typed, in this tab, with no request leaving the page. The consequence is the same one that makes it trustworthy: nothing is editable afterwards, so print it only once you are sure.</p>
+              </div>
+            </details>
+
+            <details className="fold">
+              <summary>How a QR code is built</summary>
+              <div className="fold-body">
+                <p>Your text is first split into segments and each segment is encoded in the cheapest of three modes: 3.33 bits per digit for numeric, 5.5 bits per character for the 45-character alphanumeric set, 8 bits per byte for everything else. The tool runs a small dynamic program over the three modes, which is why an address with a long number in it can end up as three segments rather than one.</p>
+                <p>The resulting bytes are padded to fill the chosen version exactly, split into blocks, and each block gets its own Reed-Solomon remainder appended. Then comes the part that is worth seeing: the blocks are interleaved, so consecutive codewords in the final stream belong to different blocks. Switch the preview to Anatomy and choose Blocks. A coffee stain that lands on one spot damages every block a little instead of destroying one block completely, and a little damage per block is exactly what error correction is good at.</p>
+                <p>Those codewords are then laid into the grid in a zigzag from the bottom right, skipping the finder squares, the timing lines and the alignment patterns. Finally one of eight mask patterns is XORed over the data area, chosen by scoring all eight against four penalty rules, because large uniform areas and accidental finder lookalikes are what confuse scanners.</p>
+              </div>
+            </details>
+
+            <details className="fold">
+              <summary>What the error-correction slider actually does</summary>
+              <div className="fold-body">
+                <p>Moving it right does not add a safety margin to the same symbol. It replaces data codewords with correction codewords, and when there is no longer room for your text, it grows the symbol to the next version. Level H on a long URL can easily cost you ten modules of side length, which at a fixed printed size means smaller modules, which is its own way of failing.</p>
+                <p>The number this tool reports is per block and counts errors, not erasures, because that is what a camera produces. It is a lower bound in one direction and an optimistic bound in another: covered modules sometimes read correctly by luck, while a symbol can also fail for reasons that have nothing to do with codewords.</p>
+                <p>If you are putting a logo in the middle, the useful number is the largest centred square that leaves the budget intact, which the anatomy view computes for your actual symbol rather than quoting a rule of thumb.</p>
+              </div>
+            </details>
+
+            <details className="fold">
+              <summary>Where the module-shape numbers come from, and what they are not</summary>
+              <div className="fold-body">
+                <p>Styling costs no error correction at all. Every module stays where it is and stays light or dark, so no codeword is damaged and the whole apparatus in the anatomy view has nothing to say about it. Styles fail in a different place: detection and binarisation.</p>
+                <p>So it was measured. Thirteen symbols across versions, levels and masks are rendered from exactly the geometry this page exports, then degraded (resolution, gaussian blur, gaussian noise) until an independent decoder gives up. All the styles offered here still decode at 2 px per module, which is why the number quoted for a style is the next one down: the point where the first half of the symbols has dropped out.</p>
+                <p>Two limits belong to the result. It is one decoder, and finder tolerance is precisely the part where implementations differ most. And synthetic blur is not a phone camera in a badly lit room. The numbers compare the styles with each other; they say nothing absolute about the checkout counter.</p>
+                <p>One thing the measurement settled outright, and it is the difference between rounded and dotted. The three corner patterns and the small alignment pattern near the bottom right stay massive under every style here: a decoder finds them by their solid ring, and dotted ones cost not tolerance but everything, at any resolution, from version 2 upwards. Rounding them while they stay massive is a different matter entirely and costs nothing the measurement can find, which is why they simply follow the module shape. There is no second switch for it: only one of the two answers ever goes with a given shape, so the choice would have been redundancy rather than freedom.</p>
+              </div>
+            </details>
+
+            <details className="fold">
+              <summary>Limits of this tool</summary>
+              <div className="fold-body">
+                <p>The encoder covers numeric, alphanumeric and byte mode. It does not do kanji mode, ECI headers, structured append across several symbols, or Micro QR. Byte mode is UTF-8 without an ECI declaration, the near-universal convention, which means non-ASCII text works with almost every reader and is not guaranteed by the standard.</p>
+                <p>The damage model counts codewords against the Reed-Solomon budget and checks whether the finders, timing lines and format information survive. It does not simulate a scanner. Print the thing and scan it.</p>
+              </div>
+            </details>
+          </div>
+        </div>`;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
