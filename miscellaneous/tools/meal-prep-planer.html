@@ -603,6 +603,38 @@ function batchKomponenten(rezept) {
   });
 }
 
+// Optionale Komponenten eines Rezepts, in Datensatz-Reihenfolge. Diese
+// Reihenfolge ist zugleich die Bit-Reihenfolge der Addon-Maske im Plan-Code
+// (Bit j = die j-te optionale Komponente ist abgewaehlt). Sie haengt also am
+// Datensatz, was der Code ueber die datenVersion mitfuehrt.
+function optionaleKomponenten(rezept) {
+  return (rezept.komponenten || []).filter(function (k) { return !!k.optional; });
+}
+
+// Zutatennamen, die ausschliesslich in den abgewaehlten optionalen Komponenten
+// vorkommen und deshalb nicht eingekauft werden muessen. Was auch in einer
+// festen oder einer weiterhin gewaehlten optionalen Komponente steckt, bleibt
+// stehen: das Öl des abgewaehlten Hacks braucht das Ofengemuese trotzdem.
+// Verglichen wird ueber den exakten Zutatennamen, so wie ihn die Komponente
+// nennt (Schema: komponenten[].zutaten sind Namen aus rezept.zutaten).
+function abgewaehlteZutaten(rezept, maske) {
+  const m = maske | 0;
+  if (!m) return new Set();
+  const opt = optionaleKomponenten(rezept);
+  const aus = opt.filter(function (k, j) { return (m >> j) & 1; });
+  if (aus.length === 0) return new Set();
+  const behalten = new Set();
+  for (const k of (rezept.komponenten || [])) {
+    if (aus.indexOf(k) !== -1) continue;
+    for (const z of (k.zutaten || [])) behalten.add(z);
+  }
+  const raus = new Set();
+  for (const k of aus) {
+    for (const z of (k.zutaten || [])) if (!behalten.has(z)) raus.add(z);
+  }
+  return raus;
+}
+
 // Kuerzeste Haltbarkeit ueber nicht-optionale, nicht-fresh Komponenten.
 // Infinity, wenn es keine solche Komponente gibt (dann existiert keine Lagergrenze).
 function minHaltbarkeit(rezept) {
@@ -1132,7 +1164,11 @@ function schedule(tasks) {
 // einkaufsliste
 // ---------------------------------------------------------------------------
 
-function einkaufsliste(daten, slots, zuweisung, vorrat, vorratAktiv) {
+// addonsAus: optionales Array parallel zu slots, je Slot eine Bitmaske ueber die
+// optionalen Komponenten des zugewiesenen Rezepts (Bit j = j-te optionale
+// Komponente abgewaehlt). Fehlt es, ist alles gewaehlt, und die Liste ist die
+// von vorher.
+function einkaufsliste(daten, slots, zuweisung, vorrat, vorratAktiv, addonsAus) {
   const rezepte = daten.rezepte;
   // Sammeln: Key name+einheit, Reihenfolge = erstes Auftreten.
   const map = new Map(); // key -> { name, einheit, menge: number|null, kategorie }
@@ -1143,9 +1179,11 @@ function einkaufsliste(daten, slots, zuweisung, vorrat, vorratAktiv) {
     const rezept = rezepte.find(function (r) { return r.idx === idx; });
     if (!rezept) continue;
     const faktor = slots[s].portionen / rezept.portionen;
+    const raus = abgewaehlteZutaten(rezept, (addonsAus && addonsAus[s]) || 0);
 
     for (const z of (rezept.zutaten || [])) {
       if (z.kategorie === 'basis') continue;
+      if (raus.has(z.name)) continue;
       const key = z.name + '\u0000' + z.einheit;
       if (!map.has(key)) {
         map.set(key, { name: z.name, einheit: z.einheit, menge: null, kategorie: z.kategorie });
@@ -1241,7 +1279,12 @@ function wochenzuordnung(daten, slots, zuweisung, chips) {
 //   Pro Slot 3 Bytes:
 //     Byte A: Bits 0-2 tag (0..6), Bits 3-5 portionen-1 (0..7), Bits 6-7 esser
 //             (0 = beide, 1 = F, 2 = A)
-//     Byte B: Bit 0 art (0 = vorgekocht, 1 = frisch), Bit 1 mitnahme
+//     Byte B: Bit 0 art (0 = vorgekocht, 1 = frisch), Bit 1 mitnahme,
+//             Bits 2-5 Addon-Maske (Bit j = die j-te optionale Komponente des
+//             zugewiesenen Rezepts ist abgewaehlt, also hoechstens vier je
+//             Rezept; der Datensatz hat aktuell hoechstens zwei). Alte Codes
+//             haben hier Nullen, was "alle Addons dabei" heisst und damit dem
+//             Verhalten vor der Wahlmoeglichkeit entspricht.
 //     Byte C: zuweisung rezeptIdx (0..254), 255 = null
 //   Letztes Byte: Pruefsumme = XOR aller vorherigen Bytes.
 // Danach Crockford-Base32 (MSB-first, letzte Gruppe mit Nullbits aufgefuellt),
@@ -1285,8 +1328,9 @@ function encodePlan(state, datenVersion) {
   for (let i = 0; i < slots.length; i++) {
     const s = slots[i];
     const esserIdx = ESSER_WERTE.indexOf(s.esser);
+    const maske = (state.addonsAus && state.addonsAus[i]) || 0;
     bytes.push((s.tag & 7) | (((s.portionen - 1) & 7) << 3) | ((esserIdx & 3) << 6));
-    bytes.push((s.art === 'frisch' ? 1 : 0) | (s.mitnahme ? 2 : 0));
+    bytes.push((s.art === 'frisch' ? 1 : 0) | (s.mitnahme ? 2 : 0) | ((maske & 15) << 2));
     const z = state.zuweisung[i];
     bytes.push(z === null || z === undefined ? 255 : z & 255);
   }
@@ -1333,9 +1377,10 @@ function decodePlan(code) {
     throw new Error('Code stammt von einer neueren Version des Tools');
   }
 
-  const slots = [], zuweisung = [];
+  const slots = [], zuweisung = [], addonsAus = [];
   for (let i = 0; i < n; i++) {
     const a = bytes[3 + 3 * i], b = bytes[4 + 3 * i], c = bytes[5 + 3 * i];
+    addonsAus.push((b >> 2) & 15);
     slots.push({
       tag: a & 7,
       portionen: ((a >> 3) & 7) + 1,
@@ -1349,7 +1394,12 @@ function decodePlan(code) {
   return {
     formatVersion: formatVersion,
     datenVersion: datenVersion,
-    state: { slots: slots, zuweisung: zuweisung, vorratAktiv: (bytes[1] & 1) !== 0 }
+    state: {
+      slots: slots,
+      zuweisung: zuweisung,
+      addonsAus: addonsAus,
+      vorratAktiv: (bytes[1] & 1) !== 0
+    }
   };
 }
 
@@ -1362,6 +1412,8 @@ globalThis.VP = {
   AUSRICHTUNGEN: AUSRICHTUNGEN,
   WENIGER_ARTEN: WENIGER_ARTEN,
   ausrichtungPasst: ausrichtungPasst,
+  optionaleKomponenten: optionaleKomponenten,
+  abgewaehlteZutaten: abgewaehlteZutaten,
   wenigerTrifft: wenigerTrifft,
   mulberry32: mulberry32,
   sampleIndex: sampleIndex,
@@ -1567,14 +1619,19 @@ globalThis.VP = {
 
     const GESPEICHERT = ladeStandard();
 
-    // Slots bleiben nach Tag sortiert; die drei parallelen Arrays wandern mit.
-    function sortiere(slots, zuweisung, pins) {
+    // Slots bleiben nach Tag sortiert; die vier parallelen Arrays wandern mit.
+    // addonsAus ist je Slot eine Bitmaske ueber die optionalen Komponenten des
+    // zugewiesenen Rezepts; 0 heisst "alle Extras dabei" und ist der Standard.
+    // Wechselt die Zuweisung eines Slots, faellt seine Maske auf 0 zurueck, weil
+    // die Bits am Rezept haengen.
+    function sortiere(slots, zuweisung, pins, addonsAus) {
       const ord = slots.map(function (s, i) { return i; })
         .sort(function (a, b) { return slots[a].tag - slots[b].tag || a - b; });
       return {
         slots: ord.map(function (i) { return slots[i]; }),
         zuweisung: ord.map(function (i) { return zuweisung[i]; }),
-        pins: ord.map(function (i) { return pins[i]; })
+        pins: ord.map(function (i) { return pins[i]; }),
+        addonsAus: ord.map(function (i) { return (addonsAus && addonsAus[i]) || 0; })
       };
     }
 
@@ -1661,19 +1718,30 @@ globalThis.VP = {
 
     /* Geteilter Rezeptkoerper: Zutaten (auf die Portionen des Slots skaliert),
        je Komponente ihre Kurzanleitung, dann die Schritte am Esstag. Wird sowohl
-       von der Karten-Popover als auch von der Rezepte-Druckseite genutzt. */
-    function RezeptInhalt({ rezept, portionen }) {
+       von der Karten-Popover als auch von der Rezepte-Druckseite genutzt.
+       maske ist die Addon-Maske des Slots: abgewaehlte Extras verschwinden hier
+       samt ihren eigenen Zutaten, damit das Blatt zu dem passt, was eingekauft
+       wurde. Weggelassenes steht als Zeile darunter, statt spurlos zu fehlen. */
+    function RezeptInhalt({ rezept, portionen, maske }) {
       const r = rezept;
       const faktor = r.portionen ? portionen / r.portionen : 1;
+      const m = maske || 0;
+      const raus = VP.abgewaehlteZutaten(r, m);
+      const ausKomp = VP.optionaleKomponenten(r).filter(function (k, j) { return (m >> j) & 1; });
       return html`<${React.Fragment}>
         <p className="vp-anl-rz">Zutaten für ${portionen} Portionen</p>
         <ul className="vp-anl-ul">
-          ${(r.zutaten || []).map(function (z, j) {
-            const m = fmtMenge(z.menge === null ? null : z.menge * faktor, z.einheit);
-            return html`<li key=${j}>${z.name}${m ? ', ' + m : ''}</li>`;
+          ${(r.zutaten || []).filter(function (z) { return !raus.has(z.name); }).map(function (z, j) {
+            const m2 = fmtMenge(z.menge === null ? null : z.menge * faktor, z.einheit);
+            return html`<li key=${j}>${z.name}${m2 ? ', ' + m2 : ''}</li>`;
           })}
         </ul>
-        ${(r.komponenten || []).map(function (k) {
+        ${ausKomp.length > 0
+          ? html`<p className="vp-faint" style=${{ margin: '0 0 6px' }}>
+              Ohne ${ausKomp.map(function (k) { return k.label; }).join(', ')}: abgewählt, nicht eingekauft.
+            </p>`
+          : null}
+        ${(r.komponenten || []).filter(function (k) { return ausKomp.indexOf(k) === -1; }).map(function (k) {
           return html`<div key=${k.id}>
             <p className="vp-anl-rz">${k.label}</p>
             <ul className="vp-anl-ul">
@@ -1695,7 +1763,12 @@ globalThis.VP = {
 
       const [woche, setWoche] = useState(function () {
         const s = GESPEICHERT || STANDARD_SLOTS;
-        return { slots: s, zuweisung: s.map(function () { return null; }), pins: s.map(function () { return false; }) };
+        return {
+          slots: s,
+          zuweisung: s.map(function () { return null; }),
+          pins: s.map(function () { return false; }),
+          addonsAus: s.map(function () { return 0; })
+        };
       });
       const [chips, setChips] = useState(ladeChips);
       const [haushalt, setHaushalt] = useState(ladeHaushalt);
@@ -1715,6 +1788,8 @@ globalThis.VP = {
       const [infoOffen, setInfoOffen] = useState(null);
 
       const slots = woche.slots, zuweisung = woche.zuweisung, pins = woche.pins;
+      // Eine aeltere gespeicherte Woche kennt das vierte Array noch nicht.
+      const addonsAus = woche.addonsAus || slots.map(function () { return 0; });
 
       // Daten laden.
       useEffect(function () {
@@ -1744,7 +1819,8 @@ globalThis.VP = {
           setWoche({
             slots: d.state.slots,
             zuweisung: d.state.zuweisung,
-            pins: d.state.slots.map(function () { return false; })
+            pins: d.state.slots.map(function () { return false; }),
+            addonsAus: d.state.addonsAus || d.state.slots.map(function () { return 0; })
           });
           setVorratAktiv(!!d.state.vorratAktiv);
           setPlanErzwungen(true);
@@ -1771,7 +1847,11 @@ globalThis.VP = {
           zuweisung: woche.zuweisung.map(function (z) {
             return z !== null && z !== undefined && !bekannt.has(z) ? null : z;
           }),
-          pins: woche.pins
+          pins: woche.pins,
+          // Die Maske gehoert zum Rezept: faellt die Zuweisung weg, faellt sie mit.
+          addonsAus: woche.zuweisung.map(function (z, i) {
+            return z !== null && z !== undefined && !bekannt.has(z) ? 0 : addonsAus[i];
+          })
         });
         setCodeFehler('Der Plan enthielt Gerichte, die es im aktuellen Datensatz nicht mehr gibt. Die betroffenen Slots sind wieder frei.');
       }, [daten, woche]);
@@ -1871,7 +1951,7 @@ globalThis.VP = {
           tasks: pt.tasks,
           vortag: pt.vortag,
           sched: VP.schedule(pt.tasks),
-          liste: VP.einkaufsliste(daten, slots, zuweisung, vorratEffektiv, vorratAktiv),
+          liste: VP.einkaufsliste(daten, slots, zuweisung, vorratEffektiv, vorratAktiv, addonsAus),
           zuord: VP.wochenzuordnung(daten, slots, zuweisung, chips)
         };
       }, [daten, woche, chips, vorratEffektiv, vorratAktiv, haushalt]);
@@ -1891,7 +1971,12 @@ globalThis.VP = {
 
         const zeilen = new Map();
         gerichte.forEach(function (g, sp) {
+          // Abgewaehlte Extras stehen nicht in der Matrix: sie werden weder
+          // gekocht noch eingekauft, ein leerer Kreis dafuer waere gelogen.
+          const ausKomp = VP.optionaleKomponenten(g.rezept)
+            .filter(function (k, j) { return (addonsAus[g.slotIdx] >> j) & 1; });
           for (const k of (g.rezept.komponenten || [])) {
+            if (ausKomp.indexOf(k) !== -1) continue;
             if (!zeilen.has(k.id)) {
               zeilen.set(k.id, {
                 id: k.id, label: k.label, typ: k.typ, labels: [],
@@ -1933,7 +2018,7 @@ globalThis.VP = {
       const planCode = useMemo(function () {
         if (!daten) return '';
         try {
-          return VP.encodePlan({ slots: slots, zuweisung: zuweisung, vorratAktiv: vorratAktiv }, daten.version || 1);
+          return VP.encodePlan({ slots: slots, zuweisung: zuweisung, addonsAus: addonsAus, vorratAktiv: vorratAktiv }, daten.version || 1);
         } catch (e) { return ''; }
       }, [daten, woche, vorratAktiv]);
 
@@ -1981,35 +2066,35 @@ globalThis.VP = {
       /* ---- Slot-Bearbeitung ---------------------------------------------- */
       const setzeSlot = function (i, patch) {
         const s = slots.map(function (x, j) { return j === i ? Object.assign({}, x, patch) : x; });
-        setWoche(sortiere(s, zuweisung, pins));
+        setWoche(sortiere(s, zuweisung, pins, addonsAus));
       };
       const entferneSlot = function (i) {
         const keep = function (arr) { return arr.filter(function (x, j) { return j !== i; }); };
-        setWoche({ slots: keep(slots), zuweisung: keep(zuweisung), pins: keep(pins) });
+        setWoche({ slots: keep(slots), zuweisung: keep(zuweisung), pins: keep(pins), addonsAus: keep(addonsAus) });
       };
       const neuerSlot = function (tag) {
         if (slots.length >= MAX_SLOTS) return;
         const s = slots.concat([{ tag: tag, portionen: 2, esser: 'beide', art: 'vorgekocht', mitnahme: false }]);
-        setWoche(sortiere(s, zuweisung.concat([null]), pins.concat([false])));
+        setWoche(sortiere(s, zuweisung.concat([null]), pins.concat([false]), addonsAus.concat([0])));
       };
       // Tagesvorlage: die Slots dieses Tages auf alle spaeteren Tage kopieren.
       // Deren bisherige Slots verschwinden mitsamt Zuweisung und Pin.
       const uebertrageTag = function (t) {
         const vorlage = slots.filter(function (s) { return s.tag === t; });
         if (!vorlage.length) return;
-        const nSlots = [], nZu = [], nPins = [];
+        const nSlots = [], nZu = [], nPins = [], nAdd = [];
         slots.forEach(function (s, i) {
           if (s.tag > t) return;
-          nSlots.push(s); nZu.push(zuweisung[i]); nPins.push(pins[i]);
+          nSlots.push(s); nZu.push(zuweisung[i]); nPins.push(pins[i]); nAdd.push(addonsAus[i]);
         });
         for (let d = t + 1; d <= 6; d++) {
           for (const v of vorlage) {
             if (nSlots.length >= MAX_SLOTS) break;
-            nSlots.push(Object.assign({}, v, { tag: d })); nZu.push(null); nPins.push(false);
+            nSlots.push(Object.assign({}, v, { tag: d })); nZu.push(null); nPins.push(false); nAdd.push(0);
           }
         }
         setUmsortiert(false);
-        setWoche(sortiere(nSlots, nZu, nPins));
+        setWoche(sortiere(nSlots, nZu, nPins, nAdd));
       };
       const speichereStandard = function () {
         try {
@@ -2038,7 +2123,14 @@ globalThis.VP = {
           }
         }
         setUmsortiert(getauscht);
-        setWoche({ slots: slots, zuweisung: neu, pins: pins });
+        setWoche({
+          slots: slots,
+          zuweisung: neu,
+          pins: pins,
+          // Nur wo dasselbe Rezept liegen bleibt (Pins, Zufallstreffer), bleibt
+          // die Extra-Wahl gueltig; sonst ist sie ein Rest vom Vorgaenger.
+          addonsAus: neu.map(function (v, i) { return v === zuweisung[i] ? addonsAus[i] : 0; })
+        });
       };
       const streiche = function (i) {
         const idx = zuweisung[i];
@@ -2046,13 +2138,22 @@ globalThis.VP = {
         zu[i] = null;
         const p = pins.slice();
         p[i] = false;
-        setWoche({ slots: slots, zuweisung: zu, pins: p });
+        const a = addonsAus.slice();
+        a[i] = 0;
+        setWoche({ slots: slots, zuweisung: zu, pins: p, addonsAus: a });
         if (idx !== null && idx !== undefined && gesperrt.indexOf(idx) === -1) setGesperrt(gesperrt.concat([idx]));
       };
       const togglePin = function (i) {
         const p = pins.slice();
         p[i] = !p[i];
-        setWoche({ slots: slots, zuweisung: zuweisung, pins: p });
+        setWoche({ slots: slots, zuweisung: zuweisung, pins: p, addonsAus: addonsAus });
+      };
+      // Ein Extra (optionale Komponente) an- oder abwaehlen. j ist der Index in
+      // VP.optionaleKomponenten(rezept), also genau das Bit im Plan-Code.
+      const toggleAddon = function (i, j) {
+        const a = addonsAus.slice();
+        a[i] = (a[i] || 0) ^ (1 << j);
+        setWoche({ slots: slots, zuweisung: zuweisung, pins: pins, addonsAus: a });
       };
 
       /* ---- Plan-Code einloesen -------------------------------------------- */
@@ -2063,7 +2164,8 @@ globalThis.VP = {
           setWoche({
             slots: d.state.slots,
             zuweisung: d.state.zuweisung,
-            pins: d.state.slots.map(function () { return false; })
+            pins: d.state.slots.map(function () { return false; }),
+            addonsAus: d.state.addonsAus || d.state.slots.map(function () { return 0; })
           });
           setVorratAktiv(!!d.state.vorratAktiv);
           setPlanErzwungen(true);
@@ -2357,6 +2459,11 @@ globalThis.VP = {
           for (const k of (o.komponenten || [])) if (!k.optional) andere.add(k.id);
         });
         const geteilt = eigene.filter(function (k) { return andere.has(k.id); });
+        // Extras: die optionalen Komponenten des Gerichts. Ihre Reihenfolge ist
+        // die Bit-Reihenfolge im Plan-Code, deshalb kommt sie aus dem Kern.
+        const extras = VP.optionaleKomponenten(r).map(function (k, j) {
+          return { komp: k, bit: j, an: !((addonsAus[i] >> j) & 1) };
+        });
         return html`
           <div className="vp-card" key=${i}>
             <h4>
@@ -2374,6 +2481,25 @@ globalThis.VP = {
                   })}
                 </div>`
               : html`<span className="vp-faint">Keine Komponente mit einem anderen Gericht gemeinsam.</span>`}
+            <!-- Extras sind die optionalen Komponenten des Rezepts (Toppings,
+                 Bohnen, das andockbare Hack). Bis hierher standen ihre Zutaten
+                 ungefragt auf dem Einkaufszettel; jetzt entscheidet der Nutzer
+                 je Gericht. Angewaehlt ist der Auslieferungszustand, damit ein
+                 alter Plan-Code dieselbe Liste ergibt wie vorher. -->
+            ${extras.length > 0
+              ? html`<div className="vp-chips" style=${{ alignItems: 'center' }}>
+                  <span className="vp-note">Extras</span>
+                  ${extras.map(function (e) {
+                    return html`<button key=${e.komp.id}
+                      className=${'lang-seg vp-mini' + (e.an ? ' active' : '')}
+                      aria-pressed=${e.an ? 'true' : 'false'}
+                      title=${e.an
+                        ? e.komp.label + ' ist dabei und steht auf dem Einkaufszettel. Klicken zum Abwählen.'
+                        : e.komp.label + ' ist abgewählt und wird nicht eingekauft. Klicken zum Anwählen.'}
+                      onClick=${function () { toggleAddon(i, e.bit); }}>${e.an ? '' : 'ohne '}${e.komp.label}</button>`;
+                  })}
+                </div>`
+              : null}
             ${r.url ? html`<a className="vp-note" href=${r.url} target="_blank" rel="noopener">Quelle</a>` : html`
               <!-- Eigenrezepte haben keine Quelle zum Nachlesen; stattdessen
                    schwebt das ganze Rezept ueber der Karte (Popover-Pattern aus
@@ -2385,7 +2511,7 @@ globalThis.VP = {
                 <${InfoKnopf} offen=${infoOffen === i} label=${r.name}
                   umschalten=${function () { setInfoOffen(infoOffen === i ? null : i); }} />
                 ${infoOffen === i ? html`<${Popover} schliessen=${function () { setInfoOffen(null); }}>
-                  <${RezeptInhalt} rezept=${r} portionen=${s.portionen} />
+                  <${RezeptInhalt} rezept=${r} portionen=${s.portionen} maske=${addonsAus[i]} />
                 <//>` : null}
               </span>`}
             <div style=${{ display: 'flex', gap: 6, marginTop: 2 }}>
@@ -2430,7 +2556,13 @@ globalThis.VP = {
             zeilen.push('GF: ' + r.gfSwaps.map(function (g) { return g.zutat + ' durch ' + g.ersatz + ' ersetzen'; }).join(', ') + '.');
           }
           for (const g of (r.gewuerzErsatz || [])) zeilen.push(g.mischung + ': ' + g.ersatz + '.');
+          // Abgewaehlte Extras: eine Zeile, dann nichts weiter. Ihre Aufwaerm-
+          // und Nussnotizen betreffen etwas, das gar nicht im Kuehlschrank steht.
+          const ausKomp = VP.optionaleKomponenten(r)
+            .filter(function (k, j) { return (addonsAus[i] >> j) & 1; });
+          for (const k of ausKomp) zeilen.push(k.label + ': abgewählt, nicht eingekauft.');
           for (const k of (r.komponenten || [])) {
+            if (ausKomp.indexOf(k) !== -1) continue;
             const nussig = (k.zutaten || []).some(istNuss);
             if (k.optional && nussig) {
               // Wer am Tisch sitzt und Nuesse meidet, entscheidet ueber die Notiz.
@@ -2778,7 +2910,7 @@ globalThis.VP = {
                         <h3 style=${{ fontSize: 14, color: 'var(--tool-emph)', margin: '0 0 6px' }}>
                           ${TAGE_KURZ[e.z.tag]} · ${e.r.name} · ${e.s.portionen} Portionen
                         </h3>
-                        <${RezeptInhalt} rezept=${e.r} portionen=${e.s.portionen} />
+                        <${RezeptInhalt} rezept=${e.r} portionen=${e.s.portionen} maske=${addonsAus[e.z.slotIdx]} />
                       </div>`;
                     })}
                   </div>
