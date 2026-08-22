@@ -19,6 +19,7 @@
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
   <script src="/assets/js/bgremove-core.js"></script>
+  <script src="/assets/js/dino-core.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -124,6 +125,15 @@
     .bg-warn { margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: var(--tool-warn-bg);
       border: 1px solid var(--tool-warn-border); color: var(--tool-warn-text); font-size: .72rem; line-height: 1.5; }
     .bg-status { font-size: .7rem; color: var(--tool-note); }
+
+    /* Download bar for the 15 MB model. Nothing here is spent before the user
+       asks for it, so the bar only ever exists after a click. */
+    .bg-prog { height: 5px; border-radius: 3px; background: var(--tool-hairline); overflow: hidden; margin: 8px 0 4px; }
+    .bg-prog span { display: block; height: 100%; background: var(--tool-sig-info); transition: width .15s linear; }
+    .bg-dino { margin-top: 8px; }
+    /* The two brush colours, echoed by the legend next to the counts: green is
+       the object, blue the background, same blue the sampling brush uses. */
+    .bg-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
   </style>
 </head>
 <body>
@@ -154,10 +164,549 @@
           <li>Continuous removes only the background that hangs together with the image border, Global removes the colour across the whole image.</li>
           <li>Tolerance, feathering and a speck filter handle JPEG noise and scanner dust.</li>
           <li>Soft edges use fractional transparency and unmix the edge pixels, which keeps thin hair and soft shadows without a white halo.</li>
+          <li>Object (AI) is the mode for backgrounds colour cannot handle: mark the object and the background with a brush and a vision model decides what belongs to the subject, so a textured background, a background colour that also appears inside the subject, or a background the flood fill cannot reach stop being obstacles. The model is 15 MB, downloaded only when you ask for it, and it runs in your browser like everything else here.</li>
         </ul>
       </div>
     </div>
   </main>
+
+  <script id="dinobg">
+    /* The semantic path of the background remover: DINOv3 patch features decide
+       WHAT the object is, bgremove-core decides where exactly its edge runs.
+       Pure functions, no DOM, no React.
+
+       Every line here is a port of notes/dev/bgstudy-dino-lib.mjs, the library
+       the DINO trimap study measured with, and notes/dev/bgstudy-guided.mjs for
+       the guided filter. That is not a coincidence to be kept up by hand: the
+       study's numbers (29/30 instead of 10/30, full-image MAE 0.256 -> 0.043)
+       only describe this tool as long as the two compute the same alpha, and a
+       Node test in the private repo pulls this block out and holds it against
+       the study library on identical inputs. Change the maths here and the test
+       fails, which is the intended alarm.
+
+       Two traps, both silent:
+       - The worker hands back RAW model tokens. The study normalizes every
+         patch vector to unit length before any cosine is taken, so
+         normalizeFeatures is mandatory, not cosmetic.
+       - The image goes into the model LETTERBOXED on grey 114, not squashed to
+         a square the way patch-similarity does it. Squashing measures something
+         else, and it costs exactly where thin structures live. */
+    (function () {
+      const S = 512, PATCH = 16, GRID = S / PATCH, NPATCH = GRID * GRID;
+      const PAD = 114;                  // the letterbox grey the study padded with
+
+      /* Frozen before the first measurement, and deliberately still here: a
+         generous "this is object" leaves background standing, which the user
+         sees and paints away, while a strict one deletes the subject outright.
+         The slider below moves along the measured optimum curve from here. */
+      const DEFAULTS = { lo: 0.35, hi: 0.65, sigmaR: 25, brushR: 26 };
+      const THRESHOLD_END = { lo: 0.48, hi: 0.84 };
+
+      /* Winner of the parameter grid in the study (results/guided-run.json),
+         picked on full-image MAE, not on band MAE. bandRadius is the width of
+         the strip around the mask's own edge the filter may touch at all. */
+      const GUIDED = { radius: 64, epsilon: 1e-6, bandRadius: 16 };
+
+      /* Where the picture lands inside the 512 square. The caller draws it at
+         exactly these coordinates, so the patch grid and the drawn pixels agree
+         by construction. */
+      function letterboxGeom(w, h) {
+        const scale = Math.min(S / w, S / h);
+        const cw = Math.round(w * scale), ch = Math.round(h * scale);
+        return { ox: Math.floor((S - cw) / 2), oy: Math.floor((S - ch) / 2), cw: cw, ch: ch };
+      }
+
+      // Per-patch L2 normalization, so a cosine is a dot product from here on.
+      function normalizeFeatures(data, dim) {
+        const n = Math.floor(data.length / dim);
+        const f = new Float32Array(n * dim);
+        for (let i = 0; i < n; i++) {
+          const o = i * dim;
+          let nn = 0;
+          for (let k = 0; k < dim; k++) { const v = data[o + k]; nn += v * v; }
+          nn = Math.sqrt(nn) || 1;
+          for (let k = 0; k < dim; k++) f[o + k] = data[o + k] / nn;
+        }
+        return f;
+      }
+
+      /* Brush discs to patch indices of the 32x32 grid. pts are in the pixel
+         space of (w, h); the stride of 3 is the study's, and it matters: it is
+         what makes a click and a long drag cost the same order of work. */
+      function patchDisk(pts, radius, geom, w, h) {
+        const toPatch = (x, y) => {
+          const px = geom.ox + (x / w) * geom.cw, py = geom.oy + (y / h) * geom.ch;
+          return Math.min(GRID - 1, Math.floor(py / PATCH)) * GRID +
+                 Math.min(GRID - 1, Math.floor(px / PATCH));
+        };
+        const set = new Set();
+        for (const p of pts) {
+          const cx = p[0], cy = p[1];
+          for (let dy = -radius; dy <= radius; dy += 3) {
+            for (let dx = -radius; dx <= radius; dx += 3) {
+              if (dx * dx + dy * dy > radius * radius) continue;
+              const x = cx + dx, y = cy + dy;
+              if (x < 0 || y < 0 || x >= w || y >= h) continue;
+              set.add(toPatch(x, y));
+            }
+          }
+        }
+        return Array.from(set);
+      }
+
+      function centroid(f, idxs, dim) {
+        const c = new Float64Array(dim);
+        for (const i of idxs) for (let k = 0; k < dim; k++) c[k] += f[i * dim + k];
+        let nn = 0;
+        for (let k = 0; k < dim; k++) { c[k] /= idxs.length; nn += c[k] * c[k]; }
+        nn = Math.sqrt(nn) || 1;
+        for (let k = 0; k < dim; k++) c[k] /= nn;
+        return c;
+      }
+
+      function cosTo(f, i, c, dim) {
+        let d = 0;
+        for (let k = 0; k < dim; k++) d += f[i * dim + k] * c[k];
+        return d;
+      }
+
+      /* ONE centroid per class, over every query of that class. A drag along
+         the inside of the contour is therefore the same operation as a click,
+         only with more queries in the average, and that placement is where the
+         study's biggest single win came from. Keeping the queries apart and
+         weighting them by distance was measured as arm A8 and is worse than
+         this in four of six shape classes, so it is not an option here. */
+      function priorDiff(f, dim, fgIdx, bgIdx) {
+        const diff = new Float32Array(NPATCH);
+        const cF = centroid(f, fgIdx, dim), cB = centroid(f, bgIdx, dim);
+        for (let i = 0; i < NPATCH; i++) diff[i] = cosTo(f, i, cF, dim) - cosTo(f, i, cB, dim);
+        return diff;
+      }
+
+      /* The 32x32 grid covers the padded square; the upsampler needs one that
+         covers the picture, so the content area is resampled bilinearly out. */
+      function cropGrid(score, geom) {
+        const GW = Math.max(2, Math.round(geom.cw / PATCH));
+        const GH = Math.max(2, Math.round(geom.ch / PATCH));
+        const out = new Float32Array(GW * GH);
+        for (let y = 0; y < GH; y++) {
+          const py = geom.oy + ((y + 0.5) / GH) * geom.ch;
+          const fy = py / PATCH - 0.5;
+          const y0 = Math.max(0, Math.min(GRID - 1, Math.floor(fy))), ty = fy - Math.floor(fy);
+          const y1 = Math.min(GRID - 1, y0 + 1);
+          for (let x = 0; x < GW; x++) {
+            const px = geom.ox + ((x + 0.5) / GW) * geom.cw;
+            const fx = px / PATCH - 0.5;
+            const x0 = Math.max(0, Math.min(GRID - 1, Math.floor(fx))), tx = fx - Math.floor(fx);
+            const x1 = Math.min(GRID - 1, x0 + 1);
+            const a = score[y0 * GRID + x0] * (1 - tx) + score[y0 * GRID + x1] * tx;
+            const b = score[y1 * GRID + x0] * (1 - tx) + score[y1 * GRID + x1] * tx;
+            out[y * GW + x] = a * (1 - ty) + b * ty;
+          }
+        }
+        return { grid: out, GW: GW, GH: GH };
+      }
+
+      /* Joint bilateral upsampling, identical in arithmetic to
+         DinoCore.bilateralUpsample but without materializing the weight field.
+         The field is what the similarity tool needs, because it redraws the
+         same map on every pointer frame; here the map is computed once, and 32
+         bytes per pixel is nothing on a preview and 800 MB on the export of a
+         24 megapixel photograph.
+
+         The order of operations is copied, not merely equivalent: four weights,
+         normalized by their sum, then one four-term dot product in the same
+         sequence. Floating point addition is not associative, so a "cleaner"
+         loop here would drift away from the study by a few last bits, and the
+         test that holds this block against it would be measuring my rewrite
+         rather than the port. */
+      function upsampleStreaming(coarse, gw, gh, guideLuma, w, h, sigmaR) {
+        const inv2s2 = 1 / (2 * sigmaR * sigmaR);
+        const cg = DinoCore.coarseGuide(guideLuma, w, h, gw, gh);
+        const out = new Float32Array(w * h);
+        const cl = (v, hi) => (v < 0 ? 0 : v > hi ? hi : v);
+        const idx4 = [0, 0, 0, 0], ws4 = [0, 0, 0, 0], wt4 = [0, 0, 0, 0];
+        /* Float32, because the field path stores its weights in a Float32Array
+           and the rounding that happens there is part of the number the study
+           measured. A plain array here is right to seven digits and wrong in
+           the last two bits, which is exactly the kind of drift that makes a
+           port "basically the same" instead of the same. */
+        const wg4 = new Float32Array(4);
+        for (let y = 0; y < h; y++) {
+          const fy = ((y + 0.5) / h) * gh - 0.5;
+          const y0 = Math.floor(fy), ty = fy - y0;
+          for (let x = 0; x < w; x++) {
+            const fx = ((x + 0.5) / w) * gw - 0.5;
+            const x0 = Math.floor(fx), tx = fx - x0;
+            const gi = guideLuma[y * w + x];
+            let wsum = 0;
+            for (let dy = 0; dy < 2; dy++) {
+              const wy = dy === 0 ? 1 - ty : ty;
+              const yy = cl(y0 + dy, gh - 1);
+              for (let dx = 0; dx < 2; dx++) {
+                const k = dy * 2 + dx;
+                const ws = wy * (dx === 0 ? 1 - tx : tx);
+                const c = yy * gw + cl(x0 + dx, gw - 1);
+                const dI = gi - cg[c];
+                const wt = ws * Math.exp(-dI * dI * inv2s2);
+                idx4[k] = c;
+                ws4[k] = ws;
+                wt4[k] = wt;
+                wsum += wt;
+              }
+            }
+            // Every range weight underflowed: fall back to plain bilinear.
+            if (wsum > 1e-12) {
+              for (let k = 0; k < 4; k++) wg4[k] = wt4[k] / wsum;
+            } else {
+              for (let k = 0; k < 4; k++) wg4[k] = ws4[k];
+            }
+            out[y * w + x] = wg4[0] * coarse[idx4[0]] + wg4[1] * coarse[idx4[1]] +
+                             wg4[2] * coarse[idx4[2]] + wg4[3] * coarse[idx4[3]];
+          }
+        }
+        return out;
+      }
+
+      /* Patch scores to a full-resolution soft map. The scale is the 90th
+         percentile of the absolute differences rather than a fixed temperature,
+         and the upsampling is joint bilateral with the image's own luma as the
+         guide, which is what pulls the coarse 16 px grid onto the real edge. */
+      function softFromDiff(diff, geom, img, opts) {
+        const o = opts || {};
+        const w = img.width, h = img.height;
+        const absSorted = Array.from(diff, Math.abs).sort((a, b) => a - b);
+        const T = Math.max(1e-4, absSorted[Math.floor(0.9 * (NPATCH - 1))]);
+        const score = new Float32Array(NPATCH);
+        for (let i = 0; i < NPATCH; i++) score[i] = Math.max(0, Math.min(1, 0.5 + diff[i] / (2 * T)));
+        const g = cropGrid(score, geom);
+        const luma = DinoCore.lumaOf(img.data, w, h);
+        return upsampleStreaming(g.grid, g.GW, g.GH, luma, w, h,
+                                 o.sigmaR == null ? DEFAULTS.sigmaR : o.sigmaR);
+      }
+
+      function samplesFromMask(img, mask, stride) {
+        const out = [];
+        for (let i = 0; i < mask.length; i += stride) {
+          if (!mask[i]) continue;
+          const k = i * 4;
+          out.push([img.data[k], img.data[k + 1], img.data[k + 2]]);
+        }
+        return out;
+      }
+
+      /* The two thresholds cut the soft map into safe background, safe
+         foreground and an undecided band. Only the band is left to the colour
+         engine, and its background model is sampled from the safe background
+         region instead of from the image border. This is the whole trick: the
+         flood fill's topology is REPLACED by the semantic prior, not helped
+         along by it, which is why a hole in the middle of the subject or a
+         background that never touches the border stops being unsolvable. */
+      function applyThresholds(img, dinoSoft, opts) {
+        const o = opts || {};
+        const lo = o.lo == null ? DEFAULTS.lo : o.lo;
+        const hi = o.hi == null ? DEFAULTS.hi : o.hi;
+        const w = img.width, h = img.height, n = w * h;
+
+        const safeBG = new Uint8Array(n), safeFG = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+          if (dinoSoft[i] < lo) safeBG[i] = 1;
+          else if (dinoSoft[i] > hi) safeFG[i] = 1;
+        }
+
+        const bgSamples = samplesFromMask(img, safeBG, 37);
+        const bgModel = bgSamples.length > 8 ? BgCore.buildBgModel(bgSamples) : null;
+
+        const res = BgCore.removeBackground(img, {
+          mode: 'global',
+          tolerance: o.tolerance,
+          softEdges: o.softEdges,
+          bgModel: bgModel,
+          expand: o.expand,
+          smooth: o.smooth,
+          feather: o.feather,
+          despeckle: o.despeckle
+        });
+
+        const alpha = new Float32Array(n);
+        let bandPx = 0;
+        for (let i = 0; i < n; i++) {
+          alpha[i] = safeBG[i] ? 0 : safeFG[i] ? 1 : res.data[i * 4 + 3] / 255;
+          if (!safeBG[i] && !safeFG[i]) bandPx++;
+        }
+        return { alpha: alpha, color: res.data, safeFG: safeFG, safeBG: safeBG,
+                 bgModel: bgModel, bandPx: bandPx, width: w, height: h };
+      }
+
+      /* Alpha from the prior, colours from the engine, but only where the
+         engine's own alpha survived.
+
+         Soft edges unmix a border pixel by dividing its colour by that alpha,
+         which is right for a pixel that really is half background and wrong for
+         everything else. In the safe zones the prior overrules the alpha and
+         the division stays behind in the colour: at a high tolerance the engine
+         calls most of the subject half transparent, every one of those pixels
+         gets divided by a small number, and the subject comes out psychedelic.
+         The study could not see this, because it compared alpha maps and never
+         looked at a colour. */
+      function composite(img, r, alpha) {
+        const w = r.width, h = r.height;
+        const out = new Uint8ClampedArray(w * h * 4);
+        for (let i = 0; i < w * h; i++) {
+          const k = i * 4;
+          const src = (r.safeFG[i] || r.safeBG[i]) ? img.data : r.color;
+          out[k] = src[k]; out[k + 1] = src[k + 1]; out[k + 2] = src[k + 2];
+          out[k + 3] = Math.round(255 * alpha[i]);
+        }
+        return { width: w, height: h, data: out };
+      }
+
+      /* One slider along the curve the threshold sweep measured. The two ends
+         have different strengths and neither wins both: low keeps holes and
+         closed surfaces safe, high buys a finer edge on fur and blur and pays
+         for it with topology (on three of the study's photographs the high end
+         destroyed the subject outright). Extrapolating past either end would be
+         inventing numbers nobody measured, so the range stops where the data
+         stops. */
+      function thresholdsFor(t) {
+        const u = Math.max(0, Math.min(1, t));
+        return { lo: DEFAULTS.lo + u * (THRESHOLD_END.lo - DEFAULTS.lo),
+                 hi: DEFAULTS.hi + u * (THRESHOLD_END.hi - DEFAULTS.hi) };
+      }
+
+      /* ------------------------------------------------------------------ *
+       * Edge refinement: a guided filter in a band, and no matting solver.
+       *
+       * The solver route is closed by measurement, not by taste: a linear
+       * matting solver rebuilt in JavaScript and validated against PyMatting
+       * needs 246 s for a 1.3 Mpx photograph, a hundred times the model
+       * inference it was supposed to complement. The guided filter (He et al.
+       * 2013, same author) solves the same local linear model without a system
+       * of equations and reaches the solver's gradient error in 0.33 s.
+       * ------------------------------------------------------------------ */
+
+      // Exact squared Euclidean distance transform, Felzenszwalb and
+      // Huttenlocher 2012: two 1D passes, linear in the number of pixels, so
+      // the band costs the same at radius 16 as at radius 64.
+      function edt1d(f, n, d, v, z) {
+        let k = 0;
+        v[0] = 0; z[0] = -1e20; z[1] = 1e20;
+        for (let q = 1; q < n; q++) {
+          let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+          while (s <= z[k]) {
+            k--;
+            s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+          }
+          k++; v[k] = q; z[k] = s; z[k + 1] = 1e20;
+        }
+        k = 0;
+        for (let q = 0; q < n; q++) {
+          while (z[k + 1] < q) k++;
+          d[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+        }
+      }
+
+      function edtSq(seed, w, h) {
+        const INF = 1e20;
+        const g = new Float64Array(w * h);
+        for (let i = 0; i < g.length; i++) g[i] = seed[i] ? 0 : INF;
+        const m = Math.max(w, h);
+        const f = new Float64Array(m), d = new Float64Array(m);
+        const v = new Int32Array(m), z = new Float64Array(m + 1);
+        for (let x = 0; x < w; x++) {
+          for (let y = 0; y < h; y++) f[y] = g[y * w + x];
+          edt1d(f, h, d, v, z);
+          for (let y = 0; y < h; y++) g[y * w + x] = d[y];
+        }
+        for (let y = 0; y < h; y++) {
+          const row = y * w;
+          for (let x = 0; x < w; x++) f[x] = g[row + x];
+          edt1d(f, w, d, v, z);
+          for (let x = 0; x < w; x++) g[row + x] = d[x];
+        }
+        return g;
+      }
+
+      /* Trimap around the mask's OWN edge: 0 background, 1 band, 2 foreground.
+         Seeds are everything the mask already calls a transition plus the edge
+         of its hard decision, because a mask that jumps from 0 to 1 without
+         intermediate values would otherwise seed nothing and get no band. */
+      function trimapFromAlpha(alpha, w, h, radius) {
+        const n = w * h;
+        const seed = new Uint8Array(n);
+        const fg = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+          fg[i] = alpha[i] >= 0.5 ? 1 : 0;
+          if (alpha[i] > 0.02 && alpha[i] < 0.98) seed[i] = 1;
+        }
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const i = y * w + x;
+            let mn = 1, mx = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              const yy = y + dy;
+              if (yy < 0 || yy >= h) continue;
+              for (let dx = -1; dx <= 1; dx++) {
+                const xx = x + dx;
+                if (xx < 0 || xx >= w) continue;
+                const v = fg[yy * w + xx];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+              }
+            }
+            if (mx && !mn) seed[i] = 1;
+          }
+        }
+        const dist = edtSq(seed, w, h);
+        const r2 = radius * radius;
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) out[i] = dist[i] <= r2 ? 1 : (fg[i] ? 2 : 0);
+        return out;
+      }
+
+      // Box filter, mode 'same', separable, running sums. Divided by the actual
+      // window count per pixel, which is what makes the border behave.
+      function boxSame(src, h, w, ch, r, dst) {
+        const tmp = new Float64Array(h * w * ch);
+        for (let c = 0; c < ch; c++) {
+          for (let y = 0; y < h; y++) {
+            let s = 0, lo = 0, hi = -1;
+            const row = y * w;
+            for (let x = 0; x < w; x++) {
+              const wl = Math.max(0, x - r), wh = Math.min(w - 1, x + r);
+              while (hi < wh) { hi++; s += src[(row + hi) * ch + c]; }
+              while (lo < wl) { s -= src[(row + lo) * ch + c]; lo++; }
+              tmp[(row + x) * ch + c] = s;
+            }
+          }
+          for (let x = 0; x < w; x++) {
+            let s = 0, lo = 0, hi = -1;
+            for (let y = 0; y < h; y++) {
+              const wl = Math.max(0, y - r), wh = Math.min(h - 1, y + r);
+              while (hi < wh) { hi++; s += tmp[(hi * w + x) * ch + c]; }
+              while (lo < wl) { s -= tmp[(lo * w + x) * ch + c]; lo++; }
+              dst[(y * w + x) * ch + c] = s;
+            }
+          }
+        }
+        return dst;
+      }
+
+      function inv3sym(a, b, c, d, e, f, out, o) {
+        const A = d * f - e * e, B = c * e - b * f, C = b * e - c * d;
+        let det = a * A + b * B + c * C;
+        if (Math.abs(det) < 1e-300) det = det < 0 ? -1e-300 : 1e-300;
+        const inv = 1 / det;
+        out[o] = A * inv; out[o + 1] = B * inv; out[o + 2] = C * inv;
+        out[o + 3] = (a * f - c * c) * inv; out[o + 4] = (b * c - a * e) * inv;
+        out[o + 5] = (a * d - b * b) * inv;
+      }
+
+      /* Guided filter with colour guidance, He et al. 2013, algorithm 2.
+           a_k = (Sigma_k + eps*U)^-1 (mean(I*p)_k - mean(I)_k mean(p)_k)
+           b_k = mean(p)_k - a_k . mean(I)_k
+           q_i = mean(a)_i . I_i + mean(b)_i */
+      function guidedFilter(img, p, h, w, r, eps) {
+        const n = h * w;
+        const ones = new Float64Array(n).fill(1);
+        const N = boxSame(ones, h, w, 1, r, new Float64Array(n));
+
+        const mI = boxSame(img, h, w, 3, r, new Float64Array(n * 3));
+        const mp = boxSame(p, h, w, 1, r, new Float64Array(n));
+        for (let i = 0; i < n; i++) {
+          const k = N[i];
+          mI[i * 3] /= k; mI[i * 3 + 1] /= k; mI[i * 3 + 2] /= k;
+          mp[i] /= k;
+        }
+
+        const prod6 = new Float64Array(n * 6), prod3 = new Float64Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          const t = i * 3, o = i * 6;
+          const R = img[t], G = img[t + 1], B = img[t + 2], pv = p[i];
+          prod6[o] = R * R; prod6[o + 1] = R * G; prod6[o + 2] = R * B;
+          prod6[o + 3] = G * G; prod6[o + 4] = G * B; prod6[o + 5] = B * B;
+          prod3[t] = R * pv; prod3[t + 1] = G * pv; prod3[t + 2] = B * pv;
+        }
+        const corrI = boxSame(prod6, h, w, 6, r, new Float64Array(n * 6));
+        const corrIp = boxSame(prod3, h, w, 3, r, new Float64Array(n * 3));
+
+        const a = new Float64Array(n * 3), b = new Float64Array(n);
+        const V = new Float64Array(6);
+        for (let i = 0; i < n; i++) {
+          const t = i * 3, o = i * 6, k = N[i];
+          const mR = mI[t], mG = mI[t + 1], mB = mI[t + 2], mpv = mp[i];
+          const sRR = corrI[o] / k - mR * mR + eps;
+          const sRG = corrI[o + 1] / k - mR * mG;
+          const sRB = corrI[o + 2] / k - mR * mB;
+          const sGG = corrI[o + 3] / k - mG * mG + eps;
+          const sGB = corrI[o + 4] / k - mG * mB;
+          const sBB = corrI[o + 5] / k - mB * mB + eps;
+          inv3sym(sRR, sRG, sRB, sGG, sGB, sBB, V, 0);
+          const cR = corrIp[t] / k - mR * mpv;
+          const cG = corrIp[t + 1] / k - mG * mpv;
+          const cB = corrIp[t + 2] / k - mB * mpv;
+          const aR = V[0] * cR + V[1] * cG + V[2] * cB;
+          const aG = V[1] * cR + V[3] * cG + V[4] * cB;
+          const aB = V[2] * cR + V[4] * cG + V[5] * cB;
+          a[t] = aR; a[t + 1] = aG; a[t + 2] = aB;
+          b[i] = mpv - (aR * mR + aG * mG + aB * mB);
+        }
+
+        const ma = boxSame(a, h, w, 3, r, new Float64Array(n * 3));
+        const mb = boxSame(b, h, w, 1, r, new Float64Array(n));
+        const q = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          const t = i * 3, k = N[i];
+          q[i] = Math.min(1, Math.max(0,
+            (ma[t] / k) * img[t] + (ma[t + 1] / k) * img[t + 1] + (ma[t + 2] / k) * img[t + 2]
+            + mb[i] / k));
+        }
+        return q;
+      }
+
+      /* The band is part of the arm, not cosmetics: without it the filter
+         smears the safe zones as well and comes out worse than no filter at
+         all. Measured, not assumed. */
+      function refine(rgba, alpha, w, h, opts) {
+        const o = opts || {};
+        const r = o.radius == null ? GUIDED.radius : o.radius;
+        const eps = o.epsilon == null ? GUIDED.epsilon : o.epsilon;
+        const bandR = o.bandRadius == null ? GUIDED.bandRadius : o.bandRadius;
+        const n = w * h;
+        const img = new Float64Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          const k = i * 4, t = i * 3;
+          img[t] = rgba[k] / 255; img[t + 1] = rgba[k + 1] / 255; img[t + 2] = rgba[k + 2] / 255;
+        }
+        const tri = trimapFromAlpha(alpha, w, h, bandR);
+        const q = guidedFilter(img, alpha, h, w, r, eps);
+        const out = new Float32Array(n);
+        for (let i = 0; i < n; i++) out[i] = tri[i] === 0 ? 0 : tri[i] === 2 ? 1 : q[i];
+        return out;
+      }
+
+      globalThis.DinoBg = {
+        S: S, PATCH: PATCH, GRID: GRID, NPATCH: NPATCH, PAD: PAD,
+        DEFAULTS: DEFAULTS, THRESHOLD_END: THRESHOLD_END, GUIDED: GUIDED,
+        letterboxGeom: letterboxGeom,
+        normalizeFeatures: normalizeFeatures,
+        patchDisk: patchDisk,
+        centroid: centroid,
+        cosTo: cosTo,
+        priorDiff: priorDiff,
+        cropGrid: cropGrid,
+        upsampleStreaming: upsampleStreaming,
+        softFromDiff: softFromDiff,
+        applyThresholds: applyThresholds,
+        composite: composite,
+        thresholdsFor: thresholdsFor,
+        edtSq: edtSq,
+        trimapFromAlpha: trimapFromAlpha,
+        guidedFilter: guidedFilter,
+        refine: refine
+      };
+    })();
+  </script>
 
   <script id="app">
     // Markup is htm, not JSX: backticks tagged with `html`, ${...} for values,
@@ -169,10 +718,30 @@
     const MAX_SAMPLES = 20000;
     const DEFAULTS = { tolerance: 0.12, expand: 0, smooth: 0, feather: 0, despeckle: 0 };
 
+    /* The AI mode. The worker and the model file are shared with the patch
+       similarity tool, so a visitor who has used that one pays nothing here. */
+    const WORKER_URL = '/assets/js/dino/dino-worker.js';
+    const FG_PAINT = 'rgba(74, 222, 128, 0.35)';
+    const BG_PAINT = 'rgba(56, 189, 248, 0.35)';
+    const FG_DOT = 'rgb(74, 222, 128)';
+    const BG_DOT = 'rgb(56, 189, 248)';
+
+    /* The guided filter keeps about three dozen float64 planes alive at once
+       (the window covariances alone are six), so it costs roughly 280 bytes per
+       pixel while it runs. That is fine for the preview, which is capped at 1.6
+       megapixels anyway, and it is a crashed tab for the full 24 megapixels of a
+       phone photograph. Above this limit the export leaves the filter out and
+       says so, which is the honest version of the trade. */
+    const REFINE_LIMIT = 2500000;
+
     /* One short text per control, shown in a floating box behind a round "i".
        Keyed by the same id the popover state uses. */
     const INFO = {
-      bg: 'Auto reads the colour from a border strip of the image. Pick takes the colour of the pixel you click in the preview. Sample lets you paint over the background with a brush and builds a small colour model from what you painted, so a background made of several shades still counts as one background.',
+      bg: 'Auto reads the colour from a border strip of the image. Pick takes the colour of the pixel you click in the preview. Sample lets you paint over the background with a brush and builds a small colour model from what you painted, so a background made of several shades still counts as one background. Object (AI) is the only one that does not work on colour at all: a vision model looks at the picture, you mark what the object is and what it is not, and the colour engine is then left with nothing but the exact position of the edge.',
+      dinomode: 'Colour alone fails on three things: a textured background, a background colour that also appears inside the subject, and a background the flood fill cannot reach from the border. All three are questions about what the picture shows, so this mode answers them with a vision model (DINOv3, 15 MB, downloaded once and run in this tab). It replaces the flood fill, it does not assist it. Two limits worth knowing before you start: half-transparent things come out as a silhouette, so a wine bottle loses its glass, and the model separates classes rather than individuals, so two marks on one person can bring every person in the picture with them.',
+      dinobrush: 'Mark the object with a click or a stroke, and the background the same way. A stroke wins on subjects with several parts, holes or difficult edges, since it asks the model at more places along the shape. A click wins where the object touches its surroundings or is see-through, because a stroke there collects the ground or whatever is behind the glass and hands it in as part of the object. Both go into one average per class, so the two are the same operation, not two engines.',
+      dinothresh: 'Where the model has to be sure before a pixel counts as decided. Towards the right the edge gets finer on fur and blur, towards the left holes and closed surfaces stay safer. Neither end wins both, which is why this is a slider and not a better default. The range stops where the measurements stopped: left is the tested default, right is the best setting a threshold sweep found.',
+      dinorefine: 'Runs a guided filter along the mask edge, which sharpens the cut against the picture itself. On composed images this is a clear win. On ordinary photographs it is a trade: the edge gets visibly cleaner, and any background that stayed behind turns into a haze instead of a hard patch. Off by default for that reason.',
       mode: 'Continuous removes only background that hangs together with the image border, so an enclosed area of the same colour inside the subject survives. Global removes the colour wherever in the image it appears.',
       tolerance: 'How far a pixel may differ from the background colour and still count as background.',
       despeckle: 'Drops leftover fragments smaller than this area, for JPEG noise and scanner dust. It runs on the raw mask, before any of the edge steps below.',
@@ -325,17 +894,42 @@
       const [sampleCount, setSampleCount] = useState(0);
       const [bgModel, setBgModel] = useState(null);
       const [openInfo, setOpenInfo] = useState(null);
+      /* The AI mode. `feats` and `dinoSoft` both carry the image object they
+         were computed for, so a stale result from a picture that has been
+         replaced in the meantime is one identity check away, and the worker is
+         free to answer whenever it likes. */
+      const [dinoClass, setDinoClass] = useState('fg');
+      const [dinoPts, setDinoPts] = useState({ fg: [], bg: [] });
+      const [dinoBrush, setDinoBrush] = useState(26);
+      const [dinoT, setDinoT] = useState(0);
+      const [dinoRefine, setDinoRefine] = useState(false);
+      const [feats, setFeats] = useState(null);         // { f, dim, geom, img }
+      const [dinoSoft, setDinoSoft] = useState(null);   // { diff, soft, img }
+      const [modelState, setModelState] = useState('idle');  // idle | loading | ready | error
+      const [progress, setProgress] = useState(null);
+      const [dinoBusy, setDinoBusy] = useState(false);
 
       const canvasRef = useRef(null);
       const overlayRef = useRef(null);
       const fileRef = useRef(null);
       const samplesRef = useRef([]);
       const strokeRef = useRef(null);
+      const workerRef = useRef(null);
+      const pendingRef = useRef(new Map());
+      const idRef = useRef(0);
+      const extractingRef = useRef(false);
+      const imageRef = useRef(null);
+      const prevModeRef = useRef('auto');
 
       const core = typeof BgCore !== 'undefined' ? BgCore : null;
+      const dino = typeof DinoBg !== 'undefined' ? DinoBg : null;
+      const featsReady = !!feats && feats.img === image;
+      const softReady = !!dinoSoft && dinoSoft.img === image;
       const canCopy = typeof ClipboardItem !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.write);
       const activeBg = bgMode === 'pick' ? (picked || autoBg) : autoBg;
       const usingModel = bgMode === 'sample' && !!bgModel;
+      // In the AI mode no colour is picked at all, so there is nothing to show.
+      const hideSwatch = usingModel || bgMode === 'dino';
       const centers = usingModel && Array.isArray(bgModel.centersRgb) ? bgModel.centersRgb.slice(0, 8) : null;
 
       const options = useCallback(() => ({
@@ -373,7 +967,12 @@
           samplesRef.current = [];
           setSampleCount(0);
           setBgModel(null);
-          setImage({ name: file.name || '', full, preview, scale });
+          setDinoPts({ fg: [], bg: [] });
+          setDinoSoft(null);
+          setFeats(null);
+          const next = { name: file.name || '', full: full, preview: preview, scale: scale };
+          imageRef.current = next;
+          setImage(next);
           try { setAutoBg(core ? core.estimateBgColor(preview) : null); }
           catch (e) { setAutoBg(null); }
           setWorking(false);
@@ -399,10 +998,156 @@
         return () => document.removeEventListener('paste', onPaste);
       }, [loadFile]);
 
+      /* ---------------- the feature worker ---------------- */
+
+      const getWorker = useCallback(() => {
+        if (!workerRef.current) {
+          const w = new Worker(WORKER_URL, { type: 'module' });
+          w.onmessage = (ev) => {
+            const m = ev.data;
+            if (m.type === 'progress') { setProgress({ got: m.got, total: m.total }); return; }
+            setProgress(null);
+            const p = pendingRef.current.get(m.id);
+            if (!p) return;
+            pendingRef.current.delete(m.id);
+            if (m.type === 'error') p.reject(new Error(m.message));
+            else p.resolve(m);
+          };
+          w.onerror = () => {
+            setProgress(null);
+            setModelState('error');
+            extractingRef.current = false;
+            setError('The feature worker failed to start. A module worker and WebAssembly are both required.');
+          };
+          workerRef.current = w;
+        }
+        return workerRef.current;
+      }, []);
+
+      useEffect(() => () => {
+        if (workerRef.current) workerRef.current.terminate();
+      }, []);
+
+      /* The 15 MB model is never touched before this runs, and this runs only
+         from the button or from a later image once the model is already there.
+
+         The square handed to the model is LETTERBOXED on grey 114, not squashed
+         to fit. The sibling tool squashes, and copying its glue would silently
+         change what every measured number in the study refers to; the loss
+         shows up exactly on thin structures. */
+      const extract = useCallback(() => {
+        const img = imageRef.current;
+        if (!img || !dino || extractingRef.current) return;
+        extractingRef.current = true;
+        setModelState('loading');
+        setError('');
+
+        const S = dino.S;
+        const geom = dino.letterboxGeom(img.full.width, img.full.height);
+        const src = document.createElement('canvas');
+        src.width = img.full.width;
+        src.height = img.full.height;
+        src.getContext('2d').putImageData(img.full, 0, 0);
+        const cv = document.createElement('canvas');
+        cv.width = S;
+        cv.height = S;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.fillStyle = 'rgb(' + dino.PAD + ', ' + dino.PAD + ', ' + dino.PAD + ')';
+        ctx.fillRect(0, 0, S, S);
+        ctx.drawImage(src, geom.ox, geom.oy, geom.cw, geom.ch);
+        const rgba = ctx.getImageData(0, 0, S, S).data;
+
+        const id = ++idRef.current;
+        const done = new Promise((resolve, reject) => {
+          pendingRef.current.set(id, { resolve: resolve, reject: reject });
+        });
+        getWorker().postMessage({ type: 'extract', id: id, rgba: rgba, size: S }, [rgba.buffer]);
+
+        done.then((m) => {
+          extractingRef.current = false;
+          setProgress(null);
+          setModelState('ready');
+          if (imageRef.current !== img) return;   // picture was replaced meanwhile
+          setFeats({ f: dino.normalizeFeatures(m.data, m.dim), dim: m.dim, geom: geom, img: img });
+        }).catch((e) => {
+          extractingRef.current = false;
+          setProgress(null);
+          setModelState('error');
+          setError(e && e.message ? e.message : 'Feature extraction failed.');
+        });
+      }, [dino, getWorker]);
+
+      // A second image after the model is already in the worker needs no button.
+      useEffect(() => {
+        if (bgMode !== 'dino' || !image || featsReady) return;
+        if (modelState !== 'ready') return;
+        extract();
+      }, [bgMode, image, featsReady, modelState, extract]);
+
+      useEffect(() => { imageRef.current = image; }, [image]);
+
+      /* The expensive half of the AI path, and the only half that needs the
+         model: brush marks to patch queries, one centroid per class, one soft
+         map. It does not depend on the thresholds or the filter, so moving
+         those two controls costs a colour pass and nothing else. */
+      useEffect(() => {
+        if (bgMode !== 'dino' || !image || !dino || !featsReady) return;
+        if (!dinoPts.fg.length || !dinoPts.bg.length) { setDinoSoft(null); return; }
+        const id = setTimeout(() => {
+          try {
+            const pv = image.preview;
+            const fgIdx = dino.patchDisk(dinoPts.fg, dinoBrush, feats.geom, pv.width, pv.height);
+            const bgIdx = dino.patchDisk(dinoPts.bg, dinoBrush, feats.geom, pv.width, pv.height);
+            if (!fgIdx.length || !bgIdx.length) { setDinoSoft(null); return; }
+            const diff = dino.priorDiff(feats.f, feats.dim, fgIdx, bgIdx);
+            setDinoSoft({ diff: diff, soft: dino.softFromDiff(diff, feats.geom, pv, {}), img: image });
+            setError('');
+          } catch (e) {
+            setError(e && e.message ? e.message : 'The AI mask could not be computed.');
+          }
+        }, 60);
+        return () => clearTimeout(id);
+      }, [bgMode, image, dino, feats, featsReady, dinoPts, dinoBrush]);
+
+      /* Thresholds, colour engine and the optional edge filter. Split out so it
+         can be run again on the full image at export time from the same soft
+         map, without asking the model a second time. */
+      const dinoCompose = useCallback((buf, soft) => {
+        // The slider is a percentage of the way along the measured curve, kept
+        // in whole steps so the displayed number never turns into 0.35000000004.
+        const th = dino.thresholdsFor(dinoT / 100);
+        const o = options();
+        const r = dino.applyThresholds(buf, soft, {
+          lo: th.lo, hi: th.hi,
+          tolerance: o.tolerance, softEdges: o.softEdges,
+          expand: o.expand, smooth: o.smooth, feather: o.feather, despeckle: o.despeckle
+        });
+        const refining = dinoRefine && buf.width * buf.height <= REFINE_LIMIT;
+        const alpha = refining ? dino.refine(buf.data, r.alpha, buf.width, buf.height, {}) : r.alpha;
+        return dino.composite(buf, r, alpha);
+      }, [dino, dinoT, dinoRefine, options]);
+
       // Debounced preview recompute.
       useEffect(() => {
         if (!image) { setResult(null); return; }
         if (!core) { setError('The processing engine did not load.'); return; }
+        if (bgMode === 'dino') {
+          if (!dino || !softReady) { setResult(null); return; }
+          /* The guided filter is a third of a second on a preview-sized image,
+             which is long enough that the status has to be on screen before it
+             starts. Hence the two steps: flag, let the browser paint, work. */
+          setDinoBusy(true);
+          const id = setTimeout(() => {
+            try {
+              setResult(dinoCompose(image.preview, dinoSoft.soft));
+              setError('');
+            } catch (e) {
+              setError(e && e.message ? e.message : 'Processing failed.');
+            }
+            setDinoBusy(false);
+          }, 30);
+          return () => clearTimeout(id);
+        }
         const id = setTimeout(() => {
           try {
             setResult(core.removeBackground(image.preview, options()));
@@ -412,7 +1157,7 @@
           }
         }, 150);
         return () => clearTimeout(id);
-      }, [image, core, options]);
+      }, [image, core, options, bgMode, dino, dinoSoft, softReady, dinoCompose]);
 
       // Paint whatever the view asks for.
       useEffect(() => {
@@ -436,6 +1181,30 @@
           ov.height = image.preview.height;
         }
       }, [image]);
+
+      /* The AI marks live in state, so the overlay is redrawn from them rather
+         than kept as a painted trail. The sampling brush works the other way
+         round (it paints as it goes and keeps no points), which is why this
+         only touches the canvas when the AI mode is on one side of the switch
+         or the other. */
+      useEffect(() => {
+        const ov = overlayRef.current;
+        const wasDino = prevModeRef.current === 'dino';
+        prevModeRef.current = bgMode;
+        if (!ov || !image) return;
+        if (bgMode !== 'dino' && !wasDino) return;
+        const ctx = ov.getContext('2d');
+        ctx.clearRect(0, 0, ov.width, ov.height);
+        if (bgMode !== 'dino') return;
+        for (const cls of ['bg', 'fg']) {
+          ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
+          for (const p of dinoPts[cls]) {
+            ctx.beginPath();
+            ctx.arc(p[0], p[1], dinoBrush, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }, [bgMode, image, dinoPts, dinoBrush]);
 
       // One place for display pixels to image pixels. The canvas is laid out with
       // width:100% and height:auto, so the two axes share a factor, but they are
@@ -480,9 +1249,21 @@
         const ov = overlayRef.current;
         if (!ov) return;
         const ctx = ov.getContext('2d');
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.35)';
+        ctx.fillStyle = BG_PAINT;
         ctx.beginPath();
         ctx.arc(dx * m.px, dy * m.py, brush * m.px, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // The AI marks are stored in preview pixels, which is the space the patch
+      // grid is addressed in and the space the overlay canvas is drawn in.
+      function paintMark(x, y, cls) {
+        const ov = overlayRef.current;
+        if (!ov) return;
+        const ctx = ov.getContext('2d');
+        ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
+        ctx.beginPath();
+        ctx.arc(x, y, dinoBrush, 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -494,6 +1275,14 @@
         if (bgMode === 'pick') {
           const i = pixelAt(m, dx, dy);
           setPicked([image.full.data[i], image.full.data[i + 1], image.full.data[i + 2]]);
+          return;
+        }
+        if (bgMode === 'dino') {
+          e.preventDefault();
+          if (e.target.setPointerCapture) { try { e.target.setPointerCapture(e.pointerId); } catch (x) {} }
+          const p = [dx * m.px, dy * m.py];
+          strokeRef.current = { x: dx, y: dy, dino: true, cls: dinoClass, pts: [p] };
+          paintMark(p[0], p[1], dinoClass);
           return;
         }
         if (bgMode !== 'sample') return;
@@ -511,14 +1300,24 @@
         if (!m) return;
         const dx = e.clientX - m.rect.left, dy = e.clientY - m.rect.top;
         const dist = Math.hypot(dx - stroke.x, dy - stroke.y);
-        const spacing = Math.max(2, brush * 0.5);
+        // Half a brush width apart, measured in the space the brush lives in:
+        // display pixels for the sampling brush, preview pixels for the AI one.
+        const spacing = stroke.dino
+          ? Math.max(2, (dinoBrush / (m.px || 1)) * 0.5)
+          : Math.max(2, brush * 0.5);
         const steps = Math.floor(dist / spacing);
         for (let s = 1; s <= steps; s++) {
           const t = s / steps;
           const ix = stroke.x + (dx - stroke.x) * t;
           const iy = stroke.y + (dy - stroke.y) * t;
-          stampSamples(m, ix, iy, stroke.buf);
-          paintStroke(m, ix, iy);
+          if (stroke.dino) {
+            const p = [ix * m.px, iy * m.py];
+            stroke.pts.push(p);
+            paintMark(p[0], p[1], stroke.cls);
+          } else {
+            stampSamples(m, ix, iy, stroke.buf);
+            paintStroke(m, ix, iy);
+          }
         }
         if (steps > 0) { stroke.x = dx; stroke.y = dy; }
       }
@@ -526,7 +1325,18 @@
       function onPointerUp() {
         const stroke = strokeRef.current;
         strokeRef.current = null;
-        if (!stroke || !stroke.buf.length) return;
+        if (!stroke) return;
+        if (stroke.dino) {
+          if (!stroke.pts.length) return;
+          const cls = stroke.cls, pts = stroke.pts;
+          setDinoPts((p) => {
+            const next = { fg: p.fg, bg: p.bg };
+            next[cls] = p[cls].concat(pts);
+            return next;
+          });
+          return;
+        }
+        if (!stroke.buf.length) return;
         let all = samplesRef.current.concat(stroke.buf);
         if (all.length > MAX_SAMPLES) {
           const keep = Math.ceil(all.length / MAX_SAMPLES);
@@ -552,11 +1362,23 @@
         if (ov) ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
       }
 
+      // The extracted features survive: they belong to the picture, not to the
+      // marks, and asking the model again would cost another two seconds.
+      function clearMarks() {
+        setDinoPts({ fg: [], bg: [] });
+        setDinoSoft(null);
+      }
+
       /* Reset puts every control back to its default and forgets the picked and
          sampled colours. The loaded image stays, since re-opening it is the one
          thing the button next to it already does. */
       function resetAll() {
         clearSamples();
+        clearMarks();
+        setDinoClass('fg');
+        setDinoBrush(26);
+        setDinoT(0);
+        setDinoRefine(false);
         setBgMode('auto');
         setPicked(null);
         setMode('edges');
@@ -582,8 +1404,22 @@
         <//>`;
       }
 
+      /* Export runs on the full image, and for the AI path that means the soft
+         map has to be upsampled a second time, at full resolution. The model is
+         not asked again: the patch differences are resolution-free, only the
+         guided upsampling that turns them into pixels is not. */
       function renderFull() {
-        const out = core.removeBackground(image.full, options());
+        let out;
+        if (bgMode === 'dino') {
+          if (!dino || !softReady) throw new Error('Mark the object and the background first.');
+          const full = image.full;
+          const soft = full === image.preview
+            ? dinoSoft.soft
+            : dino.softFromDiff(dinoSoft.diff, feats.geom, full, {});
+          out = dinoCompose(full, soft);
+        } else {
+          out = core.removeBackground(image.full, options());
+        }
         const cv = document.createElement('canvas');
         cv.width = out.width;
         cv.height = out.height;
@@ -660,6 +1496,7 @@
                   { value: 'result', label: 'Result' }
                 ]} />
                 ${working ? html`<span className="bg-status">Reading image...</span>` : null}
+                ${dinoBusy ? html`<span className="bg-status">Computing...</span>` : null}
                 ${image ? html`<span className="bg-status">${image.full.width} x ${image.full.height} px</span>` : null}
                 ${view === 'result' ? html`
                   <span className="bg-backdropseg">
@@ -688,7 +1525,7 @@
                       onPointerUp=${onPointerUp}
                       onPointerCancel=${onPointerUp}></canvas>
                     <canvas ref=${overlayRef} className="bg-overlay"
-                      style=${{ opacity: bgMode === 'sample' ? 1 : 0 }}></canvas>
+                      style=${{ opacity: bgMode === 'sample' || bgMode === 'dino' ? 1 : 0 }}></canvas>
                   </div>
                 ` : html`
                   <div className=${'bg-drop' + (dragOver ? ' over' : '')}
@@ -729,12 +1566,13 @@
               <div className="bg-group">
                 <div className="bg-glabel"><span className="bg-anchor">Background colour${info('bg', 'background colour')}</span></div>
                 <div className="bg-swatchrow">
-                  ${usingModel ? null : html`<span className="bg-swatch" style=${{ background: toCss(activeBg) }}></span>`}
-                  ${usingModel ? null : html`<span className="bg-hex">${activeBg ? toHex(activeBg) : 'no image'}</span>`}
+                  ${hideSwatch ? null : html`<span className="bg-swatch" style=${{ background: toCss(activeBg) }}></span>`}
+                  ${hideSwatch ? null : html`<span className="bg-hex">${activeBg ? toHex(activeBg) : 'no image'}</span>`}
                   <${Seg} value=${bgMode} onChange=${setBgMode} options=${[
                     { value: 'auto', label: 'Auto' },
                     { value: 'pick', label: 'Pick' },
-                    { value: 'sample', label: 'Sample' }
+                    { value: 'sample', label: 'Sample' },
+                    { value: 'dino', label: 'Object (AI)' }
                   ]} />
                 </div>
                 ${centers ? html`
@@ -754,15 +1592,94 @@
                       onClick=${clearSamples}>Clear samples</button>
                   </div>
                 ` : null}
+
+                ${bgMode === 'dino' ? html`
+                  <div className="bg-dino">
+                    <p className="bg-expl" style=${{ marginTop: 0 }}>
+                      <span className="bg-anchor">A vision model decides what the object is${info('dinomode', 'the AI mode')}</span>,
+                      the colour engine only decides where its edge runs.
+                    </p>
+
+                    ${!featsReady ? html`
+                      <button className="bg-btn" type="button" style=${{ marginTop: 8 }}
+                        disabled=${!image || !dino || modelState === 'loading'}
+                        onClick=${extract}>
+                        ${modelState === 'loading' ? 'Loading...' : 'Load the model (15 MB)'}
+                      </button>
+                    ` : null}
+                    ${progress && progress.total ? html`
+                      <${React.Fragment}>
+                        <div className="bg-prog">
+                          <span style=${{ width: Math.round(100 * progress.got / progress.total) + '%' }}></span>
+                        </div>
+                        <p className="bg-expl">Downloading the model, ${(progress.got / 1048576).toFixed(1)} of ${(progress.total / 1048576).toFixed(1)} MB. It is cached by the browser afterwards.</p>
+                      <//>
+                    ` : null}
+                    ${modelState === 'loading' && !progress ? html`
+                      <p className="bg-expl">Looking at the image. About two seconds.</p>
+                    ` : null}
+                    ${!featsReady && modelState === 'idle' ? html`
+                      <p className="bg-expl">Nothing is downloaded until you press this. The model then runs in this tab, like everything else here.</p>
+                    ` : null}
+
+                    ${featsReady ? html`
+                      <${React.Fragment}>
+                        <div className="bg-row" style=${{ marginTop: 10 }}>
+                          <span className="bg-val"><span className="bg-anchor">Brush${info('dinobrush', 'the two brushes')}</span></span>
+                          <${Seg} value=${dinoClass} onChange=${setDinoClass} options=${[
+                            { value: 'fg', label: 'Object' },
+                            { value: 'bg', label: 'Background' }
+                          ]} />
+                        </div>
+                        <${Slider} label="Brush size" value=${dinoBrush} min=${8} max=${48} step=${1} unit=" px"
+                          onChange=${setDinoBrush} />
+                        <div className="bg-row" style=${{ marginTop: 6 }}>
+                          <span className="bg-val">
+                            <span className="bg-dot" style=${{ background: FG_DOT }}></span>${dinoPts.fg.length} object
+                            <span className="bg-dot" style=${{ background: BG_DOT, marginLeft: 10 }}></span>${dinoPts.bg.length} background
+                          </span>
+                          <button className="bg-btn" type="button"
+                            disabled=${!dinoPts.fg.length && !dinoPts.bg.length}
+                            style=${{ padding: '.2rem .6rem', fontSize: '.72rem' }}
+                            onClick=${clearMarks}>Clear marks</button>
+                        </div>
+                        <p className="bg-expl">Click or drag on the image: one or two marks on the object, two on the background. A stroke along the inside of the outline is the stronger move, except where the object touches the ground or you can see through it.</p>
+                        <${Slider} label="Detail" value=${dinoT} min=${0} max=${100} step=${5} unit=" %"
+                          onChange=${setDinoT} info=${info('dinothresh', 'detail')} />
+                        <div style=${{ display: 'flex', alignItems: 'center', marginTop: 8 }}>
+                          <label className="bg-check">
+                            <input type="checkbox" checked=${dinoRefine}
+                              onChange=${(e) => setDinoRefine(e.target.checked)} />
+                            <span>Refine edges</span>
+                          </label>
+                          <span className="bg-anchor">${info('dinorefine', 'refine edges')}</span>
+                        </div>
+                        ${dinoRefine && image && image.full.width * image.full.height > REFINE_LIMIT ? html`
+                          <p className="bg-expl">This image is larger than 2.5 megapixels, so the filter runs in the preview but is left out of the export: at full resolution it needs more memory than a browser tab should be asked for.</p>
+                        ` : null}
+                        ${!softReady ? html`
+                          <p className="bg-expl">Both brushes are needed: the mask is the difference between what the object looks like and what the background looks like.</p>
+                        ` : null}
+                      <//>
+                    ` : null}
+                  </div>
+                ` : null}
               </div>
 
-              <div className="bg-group">
-                <div className="bg-glabel"><span className="bg-anchor">Mode${info('mode', 'mode')}</span></div>
-                <${Seg} value=${mode} onChange=${setMode} options=${[
-                  { value: 'edges', label: 'Continuous' },
-                  { value: 'global', label: 'Global' }
-                ]} />
-              </div>
+              ${bgMode === 'dino' ? html`
+                <div className="bg-group">
+                  <div className="bg-glabel">Mode</div>
+                  <p className="bg-expl" style=${{ marginTop: 0 }}>Continuous and Global do not apply here. The flood fill from the border is what the model replaces, which is exactly why a hole inside the subject or a background that never touches the border stops being a problem.</p>
+                </div>
+              ` : html`
+                <div className="bg-group">
+                  <div className="bg-glabel"><span className="bg-anchor">Mode${info('mode', 'mode')}</span></div>
+                  <${Seg} value=${mode} onChange=${setMode} options=${[
+                    { value: 'edges', label: 'Continuous' },
+                    { value: 'global', label: 'Global' }
+                  ]} />
+                </div>
+              `}
 
               <div className="bg-group">
                 <div className="bg-glabel">Matching</div>
