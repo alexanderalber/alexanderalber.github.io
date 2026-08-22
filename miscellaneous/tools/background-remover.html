@@ -919,7 +919,12 @@
       const idRef = useRef(0);
       const extractingRef = useRef(false);
       const imageRef = useRef(null);
-      const prevModeRef = useRef('auto');
+      /* The sampling brush paints and keeps no points, but the overlay has to
+         survive a trip through another mode, so the painted circles are kept
+         here as [x, y, r] in preview pixels. The samples themselves are bare
+         colour values with no position, so they cannot reconstruct the trail. */
+      const trailRef = useRef([]);
+      const exportRef = useRef(null);
 
       const core = typeof BgCore !== 'undefined' ? BgCore : null;
       const dino = typeof DinoBg !== 'undefined' ? DinoBg : null;
@@ -965,6 +970,7 @@
           setView('result');
           setResult(null);
           samplesRef.current = [];
+          trailRef.current = [];
           setSampleCount(0);
           setBgModel(null);
           setDinoPts({ fg: [], bg: [] });
@@ -1013,11 +1019,24 @@
             if (m.type === 'error') p.reject(new Error(m.message));
             else p.resolve(m);
           };
+          /* A worker that never starts (module workers or WebAssembly blocked,
+             or the script simply missing) would otherwise leave its callers
+             waiting forever: the pending promises are only ever settled from
+             onmessage. So reject them here, throw the dead worker away and let
+             the next attempt build a fresh one, because posting to this one
+             would hang again. */
           w.onerror = () => {
             setProgress(null);
             setModelState('error');
             extractingRef.current = false;
             setError('The feature worker failed to start. A module worker and WebAssembly are both required.');
+            const pending = pendingRef.current;
+            pending.forEach((p) => {
+              p.reject(new Error('The feature worker failed to start. A module worker and WebAssembly are both required.'));
+            });
+            pending.clear();
+            w.terminate();
+            if (workerRef.current === w) workerRef.current = null;
           };
           workerRef.current = w;
         }
@@ -1182,25 +1201,35 @@
         }
       }, [image]);
 
-      /* The AI marks live in state, so the overlay is redrawn from them rather
-         than kept as a painted trail. The sampling brush works the other way
-         round (it paints as it goes and keeps no points), which is why this
-         only touches the canvas when the AI mode is on one side of the switch
-         or the other. */
+      /* The overlay belongs to whichever mode is on, so it is always redrawn
+         from scratch out of state and refs: the AI marks from dinoPts, the
+         sampling trail from trailRef. Sample -> AI -> Sample used to wipe the
+         blue trail even though the samples and the colour model stayed alive.
+         The modes without an overlay clear it, which is invisible (their
+         opacity is 0) but keeps the canvas honest.
+         Nothing in the dependency list moves while a sampling stroke is being
+         drawn, so a live stroke is never wiped mid-gesture: dinoPts and
+         dinoBrush belong to the other mode, and bgMode is what one has to
+         change to get here in the first place. */
       useEffect(() => {
         const ov = overlayRef.current;
-        const wasDino = prevModeRef.current === 'dino';
-        prevModeRef.current = bgMode;
         if (!ov || !image) return;
-        if (bgMode !== 'dino' && !wasDino) return;
         const ctx = ov.getContext('2d');
         ctx.clearRect(0, 0, ov.width, ov.height);
-        if (bgMode !== 'dino') return;
-        for (const cls of ['bg', 'fg']) {
-          ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
-          for (const p of dinoPts[cls]) {
+        if (bgMode === 'dino') {
+          for (const cls of ['bg', 'fg']) {
+            ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
+            for (const p of dinoPts[cls]) {
+              ctx.beginPath();
+              ctx.arc(p[0], p[1], dinoBrush, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+        } else if (bgMode === 'sample') {
+          ctx.fillStyle = BG_PAINT;
+          for (const c of trailRef.current) {
             ctx.beginPath();
-            ctx.arc(p[0], p[1], dinoBrush, 0, Math.PI * 2);
+            ctx.arc(c[0], c[1], c[2], 0, Math.PI * 2);
             ctx.fill();
           }
         }
@@ -1249,9 +1278,11 @@
         const ov = overlayRef.current;
         if (!ov) return;
         const ctx = ov.getContext('2d');
+        const x = dx * m.px, y = dy * m.py, r = brush * m.px;
+        trailRef.current.push([x, y, r]);
         ctx.fillStyle = BG_PAINT;
         ctx.beginPath();
-        ctx.arc(dx * m.px, dy * m.py, brush * m.px, 0, Math.PI * 2);
+        ctx.arc(x, y, r, 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -1356,6 +1387,7 @@
 
       function clearSamples() {
         samplesRef.current = [];
+        trailRef.current = [];
         setSampleCount(0);
         setBgModel(null);
         const ov = overlayRef.current;
@@ -1409,6 +1441,18 @@
          not asked again: the patch differences are resolution-free, only the
          guided upsampling that turns them into pixels is not. */
       function renderFull() {
+        /* Download followed by Copy asked for the very same picture twice, and
+           at full resolution that is the guided upsampling plus a whole colour
+           pass for nothing. The cache key is every input the export reads: the
+           three heavy objects by identity, the rest as a string. Anything that
+           changes one of them simply misses on the next call, so there is no
+           invalidation to keep in sync. */
+        const key = JSON.stringify([bgMode, picked, mode, tolerance, softEdges,
+          expand, smooth, feather, despeckle, dinoT, dinoRefine]);
+        const hit = exportRef.current;
+        if (hit && hit.key === key && hit.image === image
+            && hit.bgModel === bgModel && hit.dinoSoft === dinoSoft) return hit.canvas;
+
         let out;
         if (bgMode === 'dino') {
           if (!dino || !softReady) throw new Error('Mark the object and the background first.');
@@ -1424,6 +1468,7 @@
         cv.width = out.width;
         cv.height = out.height;
         cv.getContext('2d').putImageData(toImageData(out), 0, 0);
+        exportRef.current = { key: key, image: image, bgModel: bgModel, dinoSoft: dinoSoft, canvas: cv };
         return cv;
       }
 
