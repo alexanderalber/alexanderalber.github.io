@@ -103,6 +103,14 @@
        system substitutes, so the row height would otherwise be a property of the
        reader's machine. */
     .seg-row{display:flex;min-width:0}
+    /* Der Zielquellen-Waehler des Motif-Reiters. Fuenf Knoepfe (Word, Draw,
+       Hangul, Snake, Image), waehrend .seg-row
+       absichtlich NICHT umbricht: die Ecken- und Nahtregeln in custom.css
+       haengen an der DOM-Nachbarschaft und koennen einen Zeilenumbruch nicht
+       sehen. Also duerfen die Knoepfe schrumpfen, statt die Spalte
+       aufzuschieben. */
+    .qr-srcseg .lang-seg{flex:1 1 0;min-width:0;padding-left:.35rem;padding-right:.35rem;
+      text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     /* The reroll is centred against the two rows rather than pinned to the top
        of the first one, where it read as a ninth shape that had fallen out. */
     .qr-shape-row{display:flex;gap:.4rem;align-items:center}
@@ -253,6 +261,28 @@
     .qr-mcell.off{background:var(--tool-hairline)}
     .qr-mcell.free{background:transparent;box-shadow:inset 0 0 0 1px var(--tool-hairline)}
     button.qr-mcell:hover{outline:1px solid var(--tool-sig-info);outline-offset:1px}
+    /* The drop zone of the halftone mode, in the site's shared shape for a
+       thing you throw a file at: dashed and open, the opposite affordance to
+       the solid frame everything that SHOWS something wears. */
+    .qr-drop{display:flex;flex-direction:column;align-items:center;gap:.35rem;
+      padding:1.1rem .8rem;margin:.2rem 0 .5rem;text-align:center;
+      border:2px dashed var(--pico-muted-border-color);border-radius:12px;
+      color:var(--tool-label);font-size:.8rem;cursor:pointer}
+    .qr-drop:hover,.qr-drop.loaded{border-color:var(--tool-border);color:var(--tool-text)}
+    .qr-drop input{display:none}
+    /* The emoji library. Bigger type than an ordinary chip, because the glyph
+       IS the label here and a 0.75rem heart is a smudge. Fixed square cells so
+       a colour emoji and a monochrome dingbat, which the system font draws at
+       quite different widths, still line up as a row. */
+    .qr-emoji .lang-seg{font-size:1.1rem;line-height:1;padding:.25rem 0;
+      min-width:2.1rem;text-align:center}
+    /* The rastered picture, drawn at module resolution: a frame, because it
+       shows something. One canvas rather than a few thousand cells of the
+       .qr-mgrid editor, which is fine for a 13x13 drawing and would be several
+       thousand DOM nodes here. */
+    .qr-imgprev{display:block;width:100%;max-width:260px;margin:.3rem 0 .4rem;
+      image-rendering:pixelated;border:1px solid var(--tool-border);border-radius:8px;
+      box-shadow:0 12px 28px rgba(0,0,0,.45)}
     .qr-tail{margin:.2rem 0 .6rem;font-size:.7rem;line-height:1.35;color:var(--tool-note);
       word-break:break-all;overflow-wrap:anywhere}
     .qr-tail code{font-size:inherit;color:inherit;background:none;padding:0}
@@ -1435,11 +1465,26 @@
        far bigger search effort, and the PERIOD then grows to fit the path
        instead of the path being cut to fit the period. SOLOMAX caps that,
        because a GIF stores every frame whole and its size grows linearly with
-       the period; 192 frames is about fifteen seconds at the default speed. */
+       the period; 288 frames is about twenty-three seconds at the default speed.
+
+       SOLOTRIES and SOLOBUDGET look small next to the 32 x 20000 they replaced,
+       and they are, because the solo walk changed shape underneath them. It no
+       longer draws its starts uniformly from the free modules (in a real symbol
+       the free graph is a hundred tiny islands next to one big component, so
+       most of those attempts were spent on an island) and it no longer orders
+       its neighbours by the straight-ahead rule. It takes the components in
+       descending size and orders neighbours by Warnsdorff, fewest onward
+       options first, which is the standard way to stop a self-avoiding walk
+       from sealing off the region it is standing in. Measured over eight
+       payloads, that is 1.11x the old length under the automatic mask and 1.08x
+       across the eight-mask sweep, at a twentieth of the backtracking budget;
+       a further 32x20000 on top of it bought nothing, and neither did rotation
+       or 2-opt, because the free graph is nearly a forest and there are almost
+       no chords to rotate on. */
     var SNAKE = {
       frames: 48, body: 5, per: 110, min: 3, max: 16,
       minPath: 7, low: 0.55, tries: 8, heroTries: 24, budget: 4000,
-      soloTries: 32, soloBudget: 20000, soloMax: 192
+      soloTries: 32, soloBudget: 3125, soloMax: 288
     };
 
     /* Where the snakes go, once per symbol. Every path is a SIMPLE walk over the
@@ -1537,6 +1582,141 @@
         return best;
       };
 
+      /* ---- the solo walk, which is a different search on the same graph ----
+         Solo has no looks to preserve (there is one snake, it cannot collide
+         with a second one and it is not competing for screen time), so it drops
+         the straight-ahead rule and takes the two levers that measured: order
+         the neighbours by Warnsdorff and start in the big components. See the
+         note above SNAKE for the numbers. */
+      var shuffleIn = function (a) {
+        for (var k = a.length - 1; k > 0; k--) {
+          var j = Math.floor(rnd() * (k + 1));
+          var t = a[k]; a[k] = a[j]; a[j] = t;
+        }
+        return a;
+      };
+
+      /* Connected components of the free dark modules, biggest first. Two uses:
+         a start is drawn from a component rather than from the whole field, and
+         a component with no more modules than the best path found so far cannot
+         beat it, which ends the search early on most symbols. */
+      var componentsOf = function () {
+        var mark = new Uint8Array(n * n), out = [];
+        for (var a = 0; a < free.length; a++) {
+          var s0 = free[a];
+          if (mark[s0]) continue;
+          var comp = [], st = [s0];
+          mark[s0] = 1;
+          while (st.length) {
+            var v = st.pop();
+            comp.push(v);
+            var vc = v % n, vr = (v - vc) / n;
+            if (vc + 1 < n && isFree[v + 1] && !mark[v + 1]) { mark[v + 1] = 1; st.push(v + 1); }
+            if (vc > 0 && isFree[v - 1] && !mark[v - 1]) { mark[v - 1] = 1; st.push(v - 1); }
+            if (vr + 1 < n && isFree[v + n] && !mark[v + n]) { mark[v + n] = 1; st.push(v + n); }
+            if (vr > 0 && isFree[v - n] && !mark[v - n]) { mark[v - n] = 1; st.push(v - n); }
+          }
+          out.push(comp);
+        }
+        out.sort(function (x, y) { return y.length - x.length; });
+        return out;
+      };
+
+      /* Warnsdorff: the neighbour with the fewest onward options is tried
+         FIRST, which is why it is sorted to the end here (the list is popped
+         from the back). Entering a near-dead-end last means leaving it behind
+         unvisited, and in a graph this sparse an abandoned module is usually a
+         module the path can never come back for. */
+      var warnOptions = function (i) {
+        var c = i % n, r = (i - c) / n, list = [];
+        var add = function (u) {
+          if (seen[u] === gen) return;
+          var uc = u % n, ur = (u - uc) / n, d = 0;
+          if (uc + 1 < n && isFree[u + 1] && seen[u + 1] !== gen) d++;
+          if (uc > 0 && isFree[u - 1] && seen[u - 1] !== gen) d++;
+          if (ur + 1 < n && isFree[u + n] && seen[u + n] !== gen) d++;
+          if (ur > 0 && isFree[u - n] && seen[u - n] !== gen) d++;
+          list.push({ u: u, d: d, r: rnd() });
+        };
+        if (c + 1 < n && isFree[i + 1]) add(i + 1);
+        if (c > 0 && isFree[i - 1]) add(i - 1);
+        if (r + 1 < n && isFree[i + n]) add(i + n);
+        if (r > 0 && isFree[i - n]) add(i - n);
+        list.sort(function (a, b) { return (b.d - a.d) || (a.r - b.r); });
+        var out = [];
+        for (var k = 0; k < list.length; k++) out.push(list[k].u);
+        return out;
+      };
+
+      var soloWalk = function (start, cap, budget) {
+        gen++;
+        var path = [start], stack = [warnOptions(start)], best = [start], steps = 0;
+        seen[start] = gen;
+        while (path.length) {
+          if (path.length > best.length) {
+            best = path.slice();
+            if (best.length >= cap) break;
+          }
+          var top = stack[stack.length - 1];
+          if (!top.length || steps >= budget) {
+            seen[path.pop()] = 0;
+            stack.pop();
+            continue;
+          }
+          steps++;
+          var nx = top.pop();
+          if (seen[nx] === gen) continue;
+          seen[nx] = gen;
+          path.push(nx);
+          stack.push(warnOptions(nx));
+        }
+        return best;
+      };
+
+      var soloSearch = function (cap) {
+        var comps = componentsOf();
+        var best = [], ci = 0, li = 0;
+        var list = comps.length ? shuffleIn(comps[0].slice()) : [];
+        for (var t = 0; t < SNAKE.soloTries; t++) {
+          var node = -1, limit = 0;
+          for (;;) {
+            if (li < list.length) { node = list[li++]; limit = comps[ci].length; break; }
+            if (++ci >= comps.length) break;
+            list = shuffleIn(comps[ci].slice());
+            li = 0;
+          }
+          if (node < 0 || limit <= best.length) break;
+          var w = soloWalk(node, cap, SNAKE.soloBudget);
+          if (w.length > best.length) best = w;
+          if (best.length >= cap) break;
+        }
+        return best;
+      };
+
+      /* A path handed in from outside, which is what the corridor crossover in
+         the qrplant block does: it steered the module pattern so that a long
+         corridor of dark modules exists, and it knows where that corridor runs.
+         Making the planner rediscover it by search would throw away most of it
+         (measured), so it is handed over instead. It is still checked here
+         rather than trusted, because a path that is not a simple walk over free
+         dark modules would draw strands across light ones. */
+      var usableGift = function (p) {
+        if (!p || p.length < SNAKE.minPath) return null;
+        gen++;
+        for (var i = 0; i < p.length; i++) {
+          var idx = p[i];
+          if (!(idx >= 0 && idx < n * n) || !isFree[idx] || seen[idx] === gen) return null;
+          seen[idx] = gen;
+          if (i > 0) {
+            var d = idx - p[i - 1];
+            if (d === 1 || d === -1) {
+              if (((idx / n) | 0) !== ((p[i - 1] / n) | 0)) return null;
+            } else if (d !== n && d !== -n) return null;
+          }
+        }
+        return p.slice(0, Math.min(p.length, soloPathCap()));
+      };
+
       for (var s = 0; s < count; s++) {
         var path = null;
         /* Snake 0 is the hero: it aims for the full period, deterministically,
@@ -1556,13 +1736,17 @@
            start that lands on a small island of dark modules returns a short
            path however hard it backtracks, and taking it left version 2 symbols
            with a stretch of the period where nothing moved at all. */
-        var tries = solo ? SNAKE.soloTries : hero ? SNAKE.heroTries : SNAKE.tries;
-        for (var attempt = 0; attempt < tries; attempt++) {
-          gen++;
-          var walk = walkFrom(free[Math.floor(rnd() * free.length)], target,
-            solo ? SNAKE.soloBudget : SNAKE.budget);
-          if (!path || walk.length > path.length) path = walk;
-          if (path.length >= target) break;
+        if (solo) {
+          path = usableGift(o.path) || soloSearch(target);
+          if (!path.length) path = null;
+        } else {
+          var tries = hero ? SNAKE.heroTries : SNAKE.tries;
+          for (var attempt = 0; attempt < tries; attempt++) {
+            gen++;
+            var walk = walkFrom(free[Math.floor(rnd() * free.length)], target, SNAKE.budget);
+            if (!path || walk.length > path.length) path = walk;
+            if (path.length >= target) break;
+          }
         }
         if (path && path.length < SNAKE.minPath) path = null;
         // a symbol whose free modules are all in tiny islands simply carries
@@ -1644,7 +1828,7 @@
 
     /* The longest path solo mode accepts. The body grows to half the path, so
        path plus half path minus one has to fit under the soloMax period; with
-       192 frames that is 128 path modules. Shared by the planner's target and
+       288 frames that is 192 path modules. Shared by the planner's target and
        the mask search's ceiling, which must agree or the search chases lengths
        the planner then refuses. */
     function soloPathCap() {
@@ -2572,7 +2756,7 @@
       buildGeo: buildGeo, buildTel: buildTel, buildUrl: buildUrl, buildPayload: buildPayload,
       MODULE_STYLES: MODULE_STYLES, STYLE_LOOK: STYLE_LOOK, STYLE_GEO: STYLE_GEO,
       styleOpts: styleOpts, moduleShapes: moduleShapes, shapePath: shapePath,
-      symbolSeed: symbolSeed, JAMO: JAMO, JAMO_MAX: JAMO_MAX, findJamo: findJamo,
+      symbolSeed: symbolSeed, rngFrom: rngFrom, JAMO: JAMO, JAMO_MAX: JAMO_MAX, findJamo: findJamo,
       patternBoxes: patternBoxes, solidMask: solidMask,
       SNAKE: SNAKE, snakePlan: snakePlan, snakeBody: snakeBody, snakeFrames: snakeFrames,
       snakeReach: snakeReach, snakeMaskSearch: snakeMaskSearch, soloPathCap: soloPathCap,
@@ -2788,6 +2972,389 @@
       return t;
     }
 
+    /* A small library for the draw mode, in the same '#' / '.' / '-' spelling
+       gridTarget reads. Two rules, and both are load-bearing rather than
+       decoration:
+
+       - Odd sizes only (7 and 9). An even grid has no centre column, so a
+         symmetric figure sits half a module off centre and every position the
+         search tries inherits that.
+       - A ring of free cells around the figure. The ring is what keeps the
+         weight down: a wish on every border cell is another equation for a
+         part of the picture nobody looks at, and the rank runs out long
+         before the free bits do. */
+    var GRID_PRESETS = [
+      { key: 'heart', label: 'Heart', rows: [
+        '-------',
+        '-.#.#.-',
+        '-#####-',
+        '-#####-',
+        '-.###.-',
+        '-..#..-',
+        '-------'
+      ] },
+      { key: 'arrow', label: 'Arrow', rows: [
+        '-------',
+        '-..#..-',
+        '-.###.-',
+        '-#####-',
+        '-..#..-',
+        '-..#..-',
+        '-------'
+      ] },
+      { key: 'house', label: 'House', rows: [
+        '-------',
+        '-..#..-',
+        '-.###.-',
+        '-#####-',
+        '-##.##-',
+        '-##.##-',
+        '-------'
+      ] },
+      { key: 'invader', label: 'Invader', rows: [
+        '---------',
+        '-.#...#.-',
+        '-..#.#..-',
+        '-.#####.-',
+        '-##.#.##-',
+        '-#######-',
+        '-#.#.#.#-',
+        '-..#.#..-',
+        '---------'
+      ] }
+    ];
+
+    /* Swap the two wishes and leave everything else alone. A free cell stays
+       free: it is the absence of a wish, and the opposite of no wish is still
+       no wish. */
+    function gridInvert(rows) {
+      var out = [], r, c, row, line, v;
+      for (r = 0; r < rows.length; r++) {
+        row = rows[r];
+        if (typeof row === 'string') {
+          line = '';
+          for (c = 0; c < row.length; c++) {
+            v = row.charAt(c);
+            line += v === '#' ? '.' : (v === '.' ? '#' : v);
+          }
+          out.push(line);
+        } else {
+          line = [];
+          for (c = 0; c < row.length; c++) {
+            v = row[c];
+            line.push(v === 1 ? 0 : (v === 0 ? 1 : v));
+          }
+          out.push(line);
+        }
+      }
+      return out;
+    }
+
+    /* ---------------------------------------------------------- hangul */
+
+    /* The third source of targets, next to the word face and the drawing grid.
+     *
+     * A Hangul syllable is not a letter, it is a block. Every code point from
+     * U+AC00 to U+D7A3 is (initial, medial, final) packed arithmetically as
+     * ((initial * 21) + medial) * 28 + final, so taking one apart is division,
+     * not a table, and putting it back together as a picture is a small set of
+     * layout rules that every Korean font follows: a vertical vowel stands to
+     * the right of the initial, a horizontal vowel sits under it, a compound
+     * vowel does both, and a final closes the block along the bottom.
+     *
+     * Where the core block already has a letter its bitmap is used verbatim
+     * (QRC.JAMO, the table the Hangul module STYLE matches against), so a
+     * planted letter is drawn the same way a found one is. That table stops at
+     * seventeen letters because that style may never put ink on a light module,
+     * which rules out every diagonal; a planted figure has no such limit, so
+     * the six missing consonants are defined here.
+     *
+     * Vowels are generated rather than tabulated because they have to STRETCH.
+     * A vertical vowel spans the full height of the block beside it, and that
+     * height depends on the initial (three modules for ㄱ, five for ㄹ) and on
+     * whether the medial is compound. Tabulating them would mean one table per
+     * height. */
+
+    function rep(ch, n) {
+      var s = '';
+      for (var i = 0; i < n; i++) s += ch;
+      return s;
+    }
+
+    var CORE_JAMO = (function () {
+      var m = {}, i;
+      for (i = 0; i < QRC.JAMO.length; i++) m[QRC.JAMO[i][0]] = QRC.JAMO[i][1];
+      return m;
+    })();
+
+    /* Row strings like everywhere else in this file, except that '-' means
+       "free" and is the one thing a glyph may leave to the code. Heights are
+       three or five modules and never four: a vowel stretched to four rows has
+       to put its two arms on adjacent rows, and ㅑ then reads as ㅐ.
+
+       Three of these are compromises and it is worth saying which. ㅇ is a
+       diamond rather than a square so that it is not the same figure as ㅁ.
+       ㅍ is a five-module-tall hollow box for the same reason, since at three
+       modules wide its two uprights have nowhere to stand but the corners. ㅅ,
+       ㅈ, ㅊ and ㅎ are exactly the letters the core table had to refuse, and
+       they come out with vertical legs instead of diagonal ones, because a
+       diagonal on a module grid is two squares meeting at a corner. */
+    var CONS = {
+      'ㄱ': CORE_JAMO.giyeok, 'ㄴ': CORE_JAMO.nieun, 'ㄷ': CORE_JAMO.digeut,
+      'ㄹ': CORE_JAMO.rieul, 'ㅁ': CORE_JAMO.mieum, 'ㅂ': CORE_JAMO.bieup,
+      'ㅋ': CORE_JAMO.kieuk, 'ㅌ': CORE_JAMO.tieut,
+      'ㅅ': ['.#.', '.#.', '#.#'],
+      'ㅇ': ['.#.', '#.#', '.#.'],
+      'ㅈ': ['###', '.#.', '#.#'],
+      'ㅊ': ['.#.', '###', '.#.', '.#.', '#.#'],
+      'ㅍ': ['###', '#.#', '#.#', '#.#', '###'],
+      'ㅎ': ['.#.', '###', '.#.', '#.#', '.#.']
+    };
+
+    var DOUBLE = { 'ㄲ': 'ㄱ', 'ㄸ': 'ㄷ', 'ㅃ': 'ㅂ', 'ㅆ': 'ㅅ', 'ㅉ': 'ㅈ' };
+    var CLUSTER = {
+      'ㄳ': 'ㄱㅅ', 'ㄵ': 'ㄴㅈ', 'ㄶ': 'ㄴㅎ', 'ㄺ': 'ㄹㄱ', 'ㄻ': 'ㄹㅁ', 'ㄼ': 'ㄹㅂ',
+      'ㄽ': 'ㄹㅅ', 'ㄾ': 'ㄹㅌ', 'ㄿ': 'ㄹㅍ', 'ㅀ': 'ㄹㅎ', 'ㅄ': 'ㅂㅅ'
+    };
+
+    var CHO = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ',
+               'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
+    var JONG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ',
+                'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ',
+                'ㅌ', 'ㅍ', 'ㅎ'];
+    var JUNG_CHARS = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ',
+                      'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ'];
+
+    /* `v` is the part that stands to the right, `h` the part that lies
+       underneath; a medial with both is compound. ㅔ is spelled as ㅐ and ㅖ as
+       ㅒ, because on a module grid they are the same figure: the difference
+       between them is which side the arm leaves the stem on, and the arm here
+       is one module long and has a second stem on its other end. The core
+       block already says so above its `ae` entry. */
+    var JUNG = [
+      { v: { side: 'L', branches: 1 } },                                     // ㅏ
+      { v: { side: 'L', branches: 1, tail: true } },                         // ㅐ
+      { v: { side: 'L', branches: 2 } },                                     // ㅑ
+      { v: { side: 'L', branches: 2, tail: true } },                         // ㅒ
+      { v: { side: 'R', branches: 1 } },                                     // ㅓ
+      { v: { side: 'L', branches: 1, tail: true } },                         // ㅔ
+      { v: { side: 'R', branches: 2 } },                                     // ㅕ
+      { v: { side: 'L', branches: 2, tail: true } },                         // ㅖ
+      { h: { stems: 1 } },                                                   // ㅗ
+      { h: { stems: 1 }, v: { side: 'L', branches: 1 } },                    // ㅘ
+      { h: { stems: 1 }, v: { side: 'L', branches: 1, tail: true } },        // ㅙ
+      { h: { stems: 1 }, v: {} },                                            // ㅚ
+      { h: { stems: 2 } },                                                   // ㅛ
+      { h: { stems: 1, down: true } },                                       // ㅜ
+      { h: { stems: 1, down: true }, v: { side: 'R', branches: 1 } },        // ㅝ
+      { h: { stems: 1, down: true }, v: { side: 'L', branches: 1, tail: true } }, // ㅞ
+      { h: { stems: 1, down: true }, v: {} },                                // ㅟ
+      { h: { stems: 2, down: true } },                                       // ㅠ
+      { h: { stems: 0 } },                                                   // ㅡ
+      { h: { stems: 0 }, v: {} },                                            // ㅢ
+      { v: {} }                                                              // ㅣ
+    ];
+
+    /* One arm sits in the middle. Two sit a third of the way in from each end,
+       which on three rows is the first and the last row (ㅑ is a stem with two
+       arms and there is nowhere else to put them) and on five rows the second
+       and the fourth. */
+    function branchAt(len, count) {
+      if (count === 1) return [len >> 1];
+      var b = Math.floor((len - 1) / 3);
+      return [b, len - 1 - b];
+    }
+
+    function vertVowel(spec, h) {
+      var w = spec.tail ? 3 : (spec.side ? 2 : 1);
+      var stem = spec.side === 'R' ? 1 : 0;    // ㅓ carries its arm on the left
+      var arm = spec.side === 'R' ? 0 : 1;
+      var br = spec.branches ? branchAt(h, spec.branches) : [];
+      var rows = [], r, c, line;
+      for (r = 0; r < h; r++) {
+        line = '';
+        for (c = 0; c < w; c++) {
+          line += (c === stem || (spec.tail && c === 2) ||
+                   (c === arm && br.indexOf(r) >= 0)) ? '#' : '.';
+        }
+        rows.push(line);
+      }
+      return rows;
+    }
+
+    function horizVowel(spec, w) {
+      if (!spec.stems) return [rep('#', w)];   // ㅡ, a bar and nothing else
+      var cols = branchAt(w, spec.stems), line = '', c;
+      for (c = 0; c < w; c++) line += cols.indexOf(c) >= 0 ? '#' : '.';
+      return spec.down ? [rep('#', w), line] : [line, rep('#', w)];
+    }
+
+    /* A doubled consonant is the letter twice with one free column between, a
+       cluster final is two different letters the same way. The shorter of the
+       two is padded with free rows rather than light ones: those rows are not
+       inside either letter's box, and a wish there is an equation for a corner
+       of the picture nobody reads. */
+    function dupGlyph(g) {
+      var out = [], i;
+      for (i = 0; i < g.length; i++) out.push(g[i] + '-' + g[i]);
+      return out;
+    }
+
+    function pairGlyph(a, b) {
+      var h = Math.max(a.length, b.length), aw = a[0].length, bw = b[0].length;
+      var out = [], i;
+      for (i = 0; i < h; i++) {
+        out.push((i < a.length ? a[i] : rep('-', aw)) + '-' +
+                 (i < b.length ? b[i] : rep('-', bw)));
+      }
+      return out;
+    }
+
+    function consGlyph(ch) {
+      if (CONS[ch]) return CONS[ch];
+      if (DOUBLE[ch]) return dupGlyph(CONS[DOUBLE[ch]]);
+      if (CLUSTER[ch]) return pairGlyph(CONS[CLUSTER[ch].charAt(0)], CONS[CLUSTER[ch].charAt(1)]);
+      return null;
+    }
+
+    /* Block arithmetic, straight out of the Unicode standard. Returns null for
+       anything that is not a modern precomposed syllable, which is how the
+       caller tells Hangul from the rest of a line of text. */
+    function hangulDecompose(ch) {
+      var code = typeof ch === 'number' ? ch : String(ch).charCodeAt(0);
+      if (!(code >= 0xAC00 && code <= 0xD7A3)) return null;
+      var idx = code - 0xAC00;
+      var initial = (idx / (21 * 28)) | 0;
+      var medial = ((idx % (21 * 28)) / 28) | 0;
+      var final = idx % 28;
+      return {
+        initial: initial, medial: medial, final: final,
+        initialJamo: CHO[initial], medialJamo: JUNG_CHARS[medial], finalJamo: JONG[final]
+      };
+    }
+
+    /* Row strings blitted into a canvas that starts out entirely free. That is
+       the whole free-cell rule, and it is the one decision this mode had to
+       make for itself: EXACTLY the bounding box of each jamo is a wish, and
+       every module outside one is free. The gap between initial and vowel, the
+       gap above the final, the padding beside a short cluster half and the
+       border around the block are therefore free, not light.
+     *
+     * It is not a matter of taste. A full syllable is dense, so the gap logic
+     * the word face uses (one free column between letters) does not carry, and
+     * the alternative was measured against a real address, all levels, all
+     * masks, every position:
+     *
+     *   글    free as built    27 wishes   error-free at version 4, 33 modules
+     *         border wished    59 wishes   error-free at version 5, 37 modules
+     *         nothing free     65 wishes   error-free at version 5, 37 modules
+     *   한글  free as built    61 wishes   error-free at version 10, 57 modules, 0.4 s
+     *         border wished   109 wishes   error-free at version 14, 73 modules, 1.3 s
+     *         nothing free    169 wishes   error-free at version 14, 73 modules, 1.3 s
+     *
+     * Pinned to the version the free version solves at, the same comparison
+     * says it in errors: 글 at version 4 is 0 of 27 against 1 of 65, and 한글 at
+     * version 10 is 0 of 61 against nothing at all, since 169 wishes exceed the
+     * rank at that size on every level and mask. The reserve moves with it,
+     * 32% of the worst block against 23%. So the free cells buy a smaller
+     * symbol, which is a BIGGER figure on the paper, which is the axis the
+     * Pareto front is about.
+     *
+     * A trench that comes out dark used to be the argument for wishing it
+     * light, and it is no longer one: the Figure style connects only the cells
+     * the target asked for as DARK, so a dark module in the trench is drawn as
+     * a loose dot with a moat around it and cannot glue two jamo together. */
+    function blit(dst, dw, rows, top, left) {
+      for (var r = 0; r < rows.length; r++) {
+        for (var c = 0; c < rows[r].length; c++) {
+          var v = rows[r].charAt(c);
+          if (v === '-') continue;
+          dst[(top + r) * dw + left + c] = v === '#' ? 1 : 0;
+        }
+      }
+    }
+
+    function hangulSyllable(ch) {
+      var d = hangulDecompose(ch);
+      if (!d) return null;
+      var L = consGlyph(d.initialJamo);
+      if (!L) return null;
+      var spec = JUNG[d.medial], Lw = L[0].length, Lh = L.length;
+      var parts = [{ rows: L, top: 0, left: 0 }], topW, topH, V, Hv;
+      if (spec.h && spec.v) {
+        // compound: the flat half under the initial, the upright half beside
+        // both of them and as tall as the two together
+        Hv = horizVowel(spec.h, Lw);
+        topH = Lh + 1 + Hv.length;
+        V = vertVowel(spec.v, topH);
+        parts.push({ rows: Hv, top: Lh + 1, left: 0 });
+        parts.push({ rows: V, top: 0, left: Lw + 1 });
+        topW = Lw + 1 + V[0].length;
+      } else if (spec.h) {
+        Hv = horizVowel(spec.h, Lw);
+        parts.push({ rows: Hv, top: Lh + 1, left: 0 });
+        topW = Lw;
+        topH = Lh + 1 + Hv.length;
+      } else {
+        V = vertVowel(spec.v, Lh);
+        parts.push({ rows: V, top: 0, left: Lw + 1 });
+        topW = Lw + 1 + V[0].length;
+        topH = Lh;
+      }
+      var T = d.final ? consGlyph(d.finalJamo) : null;
+      var w = T ? Math.max(topW, T[0].length) : topW;
+      var h = T ? topH + 1 + T.length : topH;
+      var cells = new Int8Array(w * h), i;
+      cells.fill(-1);
+      var offLeft = ((w - topW) / 2) | 0;
+      for (i = 0; i < parts.length; i++) blit(cells, w, parts[i].rows, parts[i].top, offLeft + parts[i].left);
+      if (T) blit(cells, w, T, topH + 1, ((w - T[0].length) / 2) | 0);
+      return { w: w, h: h, cells: cells, syllable: String(ch), parts: d };
+    }
+
+    /* Two free columns between blocks, one free module of border all round.
+       Two rather than one, because inside a block one free module is already
+       the trench between initial and vowel, and a word whose blocks stand no
+       further apart than the pieces inside them reads as one long block. Free
+       columns are free in the literal sense here: they add no equation, only
+       width, so the price is a slightly narrower choice of positions. */
+    var SYL_GAP = 2;
+
+    function hangulTarget(text, opts) {
+      opts = opts || {};
+      var chars = String(text || '').split(''), used = [], dropped = 0, i;
+      for (i = 0; i < chars.length; i++) {
+        var b = hangulSyllable(chars[i]);
+        if (b) used.push(b);
+        else if (chars[i].charCodeAt(0) > 32) dropped++;
+      }
+      if (!used.length) {
+        return { w: 0, h: 0, cells: new Int8Array(0), dropped: dropped, scale: 1, syllables: 0 };
+      }
+      var H = 0, W = 0;
+      for (i = 0; i < used.length; i++) {
+        if (used[i].h > H) H = used[i].h;
+        W += used[i].w;
+      }
+      W += (used.length - 1) * SYL_GAP;
+      var w = W + 2, h = H + 2;
+      var cells = new Int8Array(w * h);
+      cells.fill(-1);
+      var x = 1;
+      for (i = 0; i < used.length; i++) {
+        var s = used[i], y = 1 + (((H - s.h) / 2) | 0), r, c, v;
+        for (r = 0; r < s.h; r++) {
+          for (c = 0; c < s.w; c++) {
+            v = s.cells[r * s.w + c];
+            if (v >= 0) cells[(y + r) * w + x + c] = v;
+          }
+        }
+        x += s.w + SYL_GAP;
+      }
+      var t = { w: w, h: h, cells: cells, dropped: dropped, scale: 1, syllables: used.length };
+      return opts.scale > 1 ? scaleTarget(t, opts.scale) : t;
+    }
+
     function targetWeight(target) {
       var k = 0;
       for (var i = 0; i < target.cells.length; i++) if (target.cells[i] >= 0) k++;
@@ -3000,7 +3567,10 @@
        come from the same code path the rest of the tool uses. Only the cells the
        solver could not reach are touched afterwards. */
     function finish(P, sol, mask, place, target, allowErrors) {
-      var junk = junkFor(P, sol, mask);
+      /* The priority solver hands its answer over as one finished tail per
+         mask rather than as a pivot table, because it keeps its basis in plain
+         echelon form and resolves it once at the end. */
+      var junk = sol.junkByMask ? sol.junkByMask[mask] : junkFor(P, sol, mask);
       var text = P.prefixText + junkText(junk);
       var base = baseFor(P, mask);
       if (base.error || base.version !== P.version) return null;
@@ -3315,6 +3885,611 @@
           S.combos[S.ci].version !== v && S.best && S.best.exact && S.best.blocked === 0) S.done = true;
     }
 
+    /* ------------------------------------------------ the corridor crossover */
+
+    /* The other half of the tool, pointed at the animation instead of at a
+       letter. The snake mask search picks the best of eight patterns; this one
+       BUILDS the pattern. Same machinery as a planted figure, different wish:
+       not "these cells spell CAT" but "these cells are a long connected
+       corridor of dark modules", which is exactly what a solo snake crawls
+       along. The price is that the address grows a junk tail, so this is opt-in
+       and the button says so.
+
+       Three things decide how well it works, and only the first is obvious.
+
+       1. The tail is always the full one the version still swallows. The
+          ladder the figure search walks (full/96/64/...) is pointless here: a
+          shorter tail is strictly fewer free bits and therefore a strictly
+          shorter solvable corridor, and measured it only multiplied the run
+          time. The tail is what it is, which at the natural version end is
+          often only eight to twenty characters, so C is a few dozen bits and
+          not the "thousands" the idea promises.
+
+       2. Not every cell costs rank. Under a given mask a data module either
+          hangs on at least one tail bit (paid) or on none at all, and in the
+          second case it is already dark (free, and the corridor may walk it for
+          nothing) or already light (forbidden, and a wish on it is unsatisfiable
+          on the spot). Routing the corridor over the free cells and around the
+          forbidden ones is what makes it far longer than the rank alone allows.
+
+       3. Nothing is ever forced. A wish the elimination cannot satisfy is
+          dropped, not stamped into the symbol, so `forced` is zero, the error
+          budget is untouched and the reserve stays full. The corridor is cut
+          back to its longest solvable prefix instead, and since unsat only ever
+          grows with length, that prefix can be found by bisection.
+
+       Two corridor variants are tried per mask, one plain and one that prefers
+       the free cells; neither dominates the other, so both run as candidates in
+       one search rather than becoming a switch nobody could set. */
+
+    function cellClasses(P, mask) {
+      var NN = P.n * P.n, W = P.WORDS, cls = new Int8Array(NN);
+      for (var i = 0; i < NN; i++) {
+        if (P.sym0.cwIndex[i] < 0) { cls[i] = -2; continue; }
+        var movable = 0;
+        for (var k = 0; k < W; k++) if (P.rowBits[i * W + k]) { movable = 1; break; }
+        var dark = (P.raw[i] ^ QRC.maskBit(mask, (i / P.n) | 0, i % P.n)) & 1;
+        cls[i] = movable ? 1 : (dark ? 0 : -1);
+      }
+      return cls;
+    }
+
+    /* The board the corridor is routed on: every cell the solver can either
+       reach or already has dark, with the forbidden ones left out as walls. */
+    function corridorGraph(cls, n) {
+      var ok = new Uint8Array(n * n), nodes = [], i;
+      for (i = 0; i < n * n; i++) if (cls[i] === 0 || cls[i] === 1) { ok[i] = 1; nodes.push(i); }
+      var idx = new Int32Array(n * n).fill(-1);
+      for (i = 0; i < nodes.length; i++) idx[nodes[i]] = i;
+      var adj = nodes.map(function (v) {
+        var c = v % n, r = (v - c) / n, a = [];
+        if (c + 1 < n && ok[v + 1]) a.push(idx[v + 1]);
+        if (c > 0 && ok[v - 1]) a.push(idx[v - 1]);
+        if (r + 1 < n && ok[v + n]) a.push(idx[v + n]);
+        if (r > 0 && ok[v - n]) a.push(idx[v - n]);
+        return a;
+      });
+      return { nodes: nodes, idx: idx, adj: adj };
+    }
+
+    function corridorComponents(adj) {
+      var seen = new Uint8Array(adj.length), out = [];
+      for (var s = 0; s < adj.length; s++) {
+        if (seen[s]) continue;
+        var comp = [], st = [s];
+        seen[s] = 1;
+        while (st.length) {
+          var v = st.pop();
+          comp.push(v);
+          for (var k = 0; k < adj[v].length; k++) {
+            var u = adj[v][k];
+            if (!seen[u]) { seen[u] = 1; st.push(u); }
+          }
+        }
+        out.push(comp);
+      }
+      out.sort(function (a, b) { return b.length - a.length; });
+      return out;
+    }
+
+    function corridorShuffle(a, rnd) {
+      for (var k = a.length - 1; k > 0; k--) {
+        var j = Math.floor(rnd() * (k + 1));
+        var t = a[k]; a[k] = a[j]; a[j] = t;
+      }
+      return a;
+    }
+
+    /* The same Warnsdorff walk the solo planner uses, on the corridor board
+       rather than on the free dark modules: fewest onward options tried first,
+       which is sorted to the end because the list is popped from the back.
+       `prefer` is the optional cost function, and a cheaper cell is tried
+       first, so the corridor spends the rank it has on the cells that need it. */
+    function corridorWalk(adj, start, budget, rnd, cap, prefer) {
+      var onPath = new Uint8Array(adj.length);
+      var order = function (v) {
+        var nb = adj[v], list = [], k, j;
+        for (k = 0; k < nb.length; k++) {
+          var u = nb[k];
+          if (onPath[u]) continue;
+          var d = 0, nn = adj[u];
+          for (j = 0; j < nn.length; j++) if (!onPath[nn[j]]) d++;
+          list.push({ u: u, d: d, r: rnd(), c: prefer ? prefer(u) : 0, i: list.length });
+        }
+        list.sort(function (a, b) { return (b.d - a.d) || (a.r - b.r); });
+        if (prefer) {
+          for (k = 0; k < list.length; k++) list[k].i = k;
+          // costly first into the list means costly last out of it
+          list.sort(function (a, b) { return (b.c - a.c) || (a.i - b.i); });
+        }
+        var out = [];
+        for (k = 0; k < list.length; k++) out.push(list[k].u);
+        return out;
+      };
+      var path = [start], best = [start], steps = 0;
+      onPath[start] = 1;
+      var stack = [order(start)];
+      while (path.length) {
+        if (path.length > best.length) {
+          best = path.slice();
+          if (best.length >= cap) break;
+        }
+        var top = stack[stack.length - 1];
+        if (!top.length || steps >= budget) { onPath[path.pop()] = 0; stack.pop(); continue; }
+        steps++;
+        var nx = top.pop();
+        if (onPath[nx]) continue;
+        onPath[nx] = 1;
+        path.push(nx);
+        stack.push(order(nx));
+      }
+      return best;
+    }
+
+    var CORRIDOR = { tries: 8, budget: 60000 };
+
+    /* A prefix of a corridor is a corridor, and unsat never shrinks as wishes
+       are added, so the longest solvable length is found by bisection instead
+       of by solving once per length. Usually the first test already passes and
+       this costs a single elimination. */
+    function corridorPrefix(P, corridor, mask) {
+      var cache = {};
+      var test = function (L) {
+        if (L <= 0) return true;
+        if (cache[L] !== undefined) return cache[L];
+        var cells = [];
+        for (var i = 0; i < L; i++) cells.push({ idx: corridor[i], want: 1 });
+        cache[L] = solveAll(P, cells).unsat[mask] === 0;
+        return cache[L];
+      };
+      if (test(corridor.length)) return corridor.length;
+      var lo = 0, hi = corridor.length;
+      while (hi - lo > 1) {
+        var mid = (lo + hi) >> 1;
+        if (test(mid)) lo = mid; else hi = mid;
+      }
+      return lo;
+    }
+
+    function corridorFor(P, cg, cls, mask, cap, cheapFirst) {
+      var rnd = QRC.rngFrom(QRC.symbolSeed(P.sym0, 7) ^ (mask * 2654435761));
+      var prefer = cheapFirst ? function (u) { return cls[cg.nodes[u]] === 0 ? 0 : 1; } : null;
+      var comps = corridorComponents(cg.adj);
+      var starts = [], ci, k;
+      for (ci = 0; ci < comps.length && starts.length < CORRIDOR.tries; ci++) {
+        var pick = corridorShuffle(comps[ci].slice(), rnd);
+        for (k = 0; k < pick.length && starts.length < CORRIDOR.tries; k++) starts.push(pick[k]);
+      }
+      var best = [];
+      for (k = 0; k < starts.length; k++) {
+        var raw = corridorWalk(cg.adj, starts[k], CORRIDOR.budget, rnd, cap, prefer);
+        if (raw.length <= best.length) continue;
+        var corridor = [];
+        for (var i = 0; i < raw.length; i++) corridor.push(cg.nodes[raw[i]]);
+        var L = corridorPrefix(P, corridor, mask);
+        if (L > best.length) best = corridor.slice(0, L);
+        if (best.length >= cap) break;
+      }
+      return best;
+    }
+
+    /* The whole crossover, from a payload to a symbol plus the corridor the
+       planner should hand its snake. Synchronous: measured well under a second
+       even on a version 11 payload, because a corridor that solves in full
+       needs one elimination and the walk stops at the cap. */
+    function snakeCorridorSearch(payload, opts) {
+      var o = opts || {};
+      var prefix = payload + (o.separator || '');
+      var probe = QRC.encodeQR(prefix, { ecl: o.ecl, minVersion: o.minVersion || 1, mode: 'byte' });
+      if (probe.error) return null;
+      var version = probe.version;
+      var room = maxTail(version, o.ecl, QRC.utf8Bytes(prefix).length);
+      if (room <= 0) return null;
+      var P = prepare(prefix, version, o.ecl, room);
+      if (!P) return null;
+      var cap = o.cap || QRC.soloPathCap();
+      var best = null;
+      for (var mask = 0; mask < 8 && (!best || best.cells.length < cap); mask++) {
+        var cls = cellClasses(P, mask);
+        var cg = corridorGraph(cls, P.n);
+        if (!cg.nodes.length) continue;
+        for (var v = 0; v < 2; v++) {
+          var cells = corridorFor(P, cg, cls, mask, cap, v === 1);
+          if (!best || cells.length > best.cells.length) best = { mask: mask, cells: cells, cheap: v === 1 };
+          if (best.cells.length >= cap) break;
+        }
+      }
+      if (!best || best.cells.length < QRC.SNAKE.minPath) return null;
+      var wishes = best.cells.map(function (idx) { return { idx: idx, want: 1 }; });
+      var sol = solveAll(P, wishes);
+      var r = finish(P, sol, best.mask, { cells: wishes, blocked: 0, row: 0, col: 0 },
+        { w: P.n, h: P.n, cells: new Int8Array(0) }, false);
+      // nothing forced and nothing left wrong, or the corridor is not a corridor
+      if (!r || r.forced || r.wrong) return null;
+      /* Deliberately NOT the shape of a figure result: there is no target, no
+         position and no Pareto front here, and handing the app a `target` of
+         the whole symbol with no cells in it would draw an empty frame around
+         everything. `corridor` is the flag the app branches on. */
+      return {
+        corridor: true,
+        sym: r.sym, text: r.text, junk: r.junk, tail: P.tail, prefix: prefix,
+        mask: best.mask, version: version, ecl: o.ecl, cheap: best.cheap,
+        path: best.cells, len: best.cells.length, cap: cap,
+        added: r.text.length - payload.length, cost: r.cost, rank: sol.rank, C: P.C
+      };
+    }
+
+    /* ------------------------------------------------------------- halftone */
+
+    /* Russ Cox' QArt, generalised. Instead of a small figure with hard wishes,
+       EVERY data module of the symbol gets a wish (dark or light) plus a
+       WEIGHT, and the solver takes the wishes in order of weight.
+     *
+     * Why that order is not a heuristic. The sets of rows that can be satisfied
+     * together are exactly the independent sets of a matroid, namely the linear
+     * matroid of the GF(2) matrix, and greedy by descending weight is optimal
+     * on a matroid. So taking the wishes heaviest first, and dropping each one
+     * that turns out to be both linearly dependent and inconsistent, keeps the
+     * heaviest satisfiable picture there is. There is no position to search
+     * either: the picture IS the symbol, so one placement, one elimination.
+     *
+     * The mask stays inside that one elimination. Whether a row is dependent is
+     * a property of the LEFT side alone, and the mask is a constant XOR on the
+     * right, so all eight masks agree on which wishes become pivots and differ
+     * only in which of the dependent ones happen to come out right. Eight
+     * right-hand sides through one elimination, exactly as solveAll does it;
+     * doing them separately would be eight times the work for the same pivots.
+     *
+     * The elimination stops the moment the rank reaches the number of free
+     * bits. From there the tail is fully determined, so every remaining wish is
+     * answered by evaluating the linear map once rather than by reducing
+     * another row against the whole basis. That is the difference between a
+     * few hundred eliminations and a few thousand, and it is what keeps the
+     * whole thing inside a frame on a version 10 symbol. */
+
+    function bitParity(v) {
+      v ^= v >>> 16; v ^= v >>> 8; v ^= v >>> 4; v ^= v >>> 2; v ^= v >>> 1;
+      return v & 1;
+    }
+
+    function lowestBit(a, WORDS) {
+      for (var k = 0; k < WORDS; k++) {
+        if (a[k]) { var v = a[k] & -a[k]; return (k << 5) + (31 - Math.clz32(v)); }
+      }
+      return -1;
+    }
+
+    /* Area average down to an arbitrary rectangle. A box filter and not a
+       sample: a QR module is a whole area of the picture, and point sampling a
+       photograph at 40 by 40 turns fine detail into noise, which the weight
+       below would then treat as the most important thing in the image. */
+    function boxRect(gray, w, h, ow, oh) {
+      var out = new Float32Array(ow * oh), r, c, y, x;
+      for (r = 0; r < oh; r++) {
+        var y0 = Math.floor(r * h / oh), y1 = Math.max(y0 + 1, Math.floor((r + 1) * h / oh));
+        for (c = 0; c < ow; c++) {
+          var x0 = Math.floor(c * w / ow), x1 = Math.max(x0 + 1, Math.floor((c + 1) * w / ow));
+          var s = 0, k = 0;
+          for (y = y0; y < y1 && y < h; y++) {
+            for (x = x0; x < x1 && x < w; x++) { s += gray[y * w + x]; k++; }
+          }
+          out[r * ow + c] = k ? s / k : 255;
+        }
+      }
+      return out;
+    }
+
+    /* The square case, which is what the halftone mode wants: the picture is
+       rastered onto the whole symbol, and a symbol is square. */
+    function boxDown(gray, w, h, size) {
+      return boxRect(gray, w, h, size, size);
+    }
+
+    /* The wish is the threshold; the weight is how much the picture cares.
+       Two terms, both in 0..1, both deterministic, weighted equally because
+       nothing measured says otherwise:
+
+       - Confidence: how far the module is from the threshold. A module in the
+         middle of a black area is a stronger wish than a grey one that only
+         just fell on the dark side, and if something has to be wrong it should
+         be the grey one.
+       - Salience: how much the module's neighbourhood varies, as the range over
+         the eight neighbours. An edge is what makes a picture recognisable at
+         forty modules across; a flat field can afford to lose modules and still
+         read as a flat field. */
+    function imageTarget(gray, w, h, size, opts) {
+      opts = opts || {};
+      var thr = opts.threshold === undefined ? 128 : opts.threshold;
+      var m = boxDown(gray, w, h, size);
+      var cells = new Int8Array(size * size), weights = new Float32Array(size * size);
+      var span = Math.max(thr, 255 - thr) || 1, r, c, i, dr, dc;
+      for (r = 0; r < size; r++) {
+        for (c = 0; c < size; c++) {
+          i = r * size + c;
+          var v = m[i];
+          cells[i] = v < thr ? 1 : 0;
+          var lo = 255, hi = 0;
+          for (dr = -1; dr <= 1; dr++) {
+            for (dc = -1; dc <= 1; dc++) {
+              var rr = r + dr, cc = c + dc;
+              if (rr < 0 || cc < 0 || rr >= size || cc >= size) continue;
+              var u = m[rr * size + cc];
+              if (u < lo) lo = u;
+              if (u > hi) hi = u;
+            }
+          }
+          weights[i] = 0.5 * (Math.abs(v - thr) / span) + 0.5 * ((hi - lo) / 255);
+        }
+      }
+      return { w: size, h: size, cells: cells, weights: weights,
+               threshold: thr, mean: m, scale: 1, image: true };
+    }
+
+    /* The other reading of a picture, and the one that behaves like the word,
+       the drawing and the syllable: not the whole symbol as a halftone, but a
+       small FIGURE planted somewhere inside an otherwise ordinary code. A
+       picture over the whole code is a long shot, a picture over twenty modules
+       is the same problem the other three sources already solve.
+     *
+     * The ladder of heights is a search axis, not a setting. All of these go
+     * into the same search as separate targets, and the Pareto front then says
+     * what the size really cost. Three rules behind the numbers:
+     *
+     * - Odd heights only, and odd widths with them. An even figure has no
+       centre row, so a symmetric picture sits half a module off centre and
+       every position the sweep tries inherits that. The margin below is added
+       on both sides, so it cannot break the parity either.
+     * - The rungs are far apart (9, 13, 17, 21) because the cost is the SQUARE
+       of the side: 9 is about fifty wishes, which is a three-letter word, and
+       21 is about four hundred, which is already more equations than any tail
+       has bits. Rungs in between would mostly buy runtime.
+     * - A free ring around the figure, exactly as GRID_PRESETS has one. A wish
+       on the border is another equation for a part of the picture nobody looks
+       at, and it is also what stops the frame of the figure from fusing with
+       whatever dark modules happen to stand next to it. */
+    var FIG_HEIGHTS = [9, 13, 17, 21];
+    var FIG_MARGIN = 1;
+    /* The mid-grey band that becomes "do not care", in grey levels either side
+       of the threshold. A module whose average sits within a hair of the
+       threshold has no opinion: which side it falls on is decided by the
+       rastering and not by the picture, so insisting on it spends an equation
+       on a coin toss. 24 of 255 gives up roughly a fifth of the grey axis,
+       which on the intended input (a logo, an emoji, anything with hard edges)
+       is close to nothing, and on a photograph is exactly the modules that
+       would have been arbitrary. It is a constant and not a slider because it
+       has no interesting setting: at zero it buys noise, and wide enough to
+       matter it eats the picture. The threshold is where the reader's choice
+       belongs. */
+    var FIG_BAND = 24;
+
+    function imageFigureTargets(gray, w, h, opts) {
+      opts = opts || {};
+      var thr = opts.threshold === undefined ? 128 : opts.threshold;
+      var band = opts.band === undefined ? FIG_BAND : opts.band;
+      var margin = opts.margin === undefined ? FIG_MARGIN : opts.margin;
+      var heights = opts.heights && opts.heights.length ? opts.heights : FIG_HEIGHTS;
+      var out = [], i, r, c;
+      if (!w || !h) return out;
+      for (i = 0; i < heights.length; i++) {
+        var th = heights[i] | 0;
+        var ph = th - 2 * margin;
+        if (ph < 1) continue;
+        /* The width follows the aspect ratio of the source and is then pushed
+           to the nearer odd number, so the figure keeps its proportions to
+           within one module and still has a centre column. */
+        var exact = ph * w / h;
+        var pw = Math.round(exact);
+        if (pw % 2 === 0) pw += (exact >= pw ? 1 : -1);
+        if (pw < 1) pw = 1;
+        var m = boxRect(gray, w, h, pw, ph);
+        var tw = pw + 2 * margin, t = emptyTarget(tw, th);
+        for (r = 0; r < ph; r++) {
+          for (c = 0; c < pw; c++) {
+            var v = m[r * pw + c];
+            t.cells[(r + margin) * tw + (c + margin)] =
+              v < thr - band ? 1 : (v > thr + band ? 0 : -1);
+          }
+        }
+        t.scale = 1;
+        t.figH = th;
+        t.key = 'fig' + th;
+        t.label = th + ' modules';
+        t.threshold = thr;
+        t.band = band;
+        t.margin = margin;
+        out.push(t);
+      }
+      return out;
+    }
+
+    /* Only data modules are wishes. A finder, a timing line, an alignment
+       pattern or the format information is what it is, so those cells are
+       counted as blocked and left exactly as the encoder made them; wishing on
+       them would spend the picture's weight on modules no tail can move.
+       Sorted by weight, ties broken by index, because greedy needs an order
+       and the tool has to give the same answer twice. */
+    function imageCells(target, sym) {
+      var n = sym.size;
+      if (target.w !== n || target.h !== n) return null;
+      var cells = [], blocked = 0, i;
+      for (i = 0; i < n * n; i++) {
+        if (target.cells[i] < 0) continue;
+        if (sym.cwIndex[i] < 0) { blocked++; continue; }
+        cells.push({ idx: i, want: target.cells[i], weight: target.weights[i] });
+      }
+      cells.sort(function (a, b) { return (b.weight - a.weight) || (a.idx - b.idx); });
+      return { cells: cells, blocked: blocked, row: 0, col: 0 };
+    }
+
+    /* Greedy elimination in weight order. Rows are kept in echelon form but not
+       reduced upwards, so a new row costs one pass over the basis and the
+       solution comes out of a single back substitution at the end, in
+       decreasing pivot column: every other set bit of a basis row sits above
+       its own pivot, because the pivot is the row's lowest set bit at the
+       moment it is stored. */
+    function solvePriority(P, cells) {
+      var C = P.C, WORDS = P.WORDS, n = P.n, R = cells.length;
+      var pivAt = new Int32Array(C).fill(-1);
+      var basis = [], basisRv = [], basisCol = [], pivots = [];
+      var cur = new Uint32Array(WORDS);
+      var i, k, m, q, rank = 0, used = R;
+      for (i = 0; i < R; i++) {
+        var idx = cells[i].idx, off = idx * WORDS;
+        for (k = 0; k < WORDS; k++) cur[k] = P.rowBits[off + k];
+        var col = lowestBit(cur, WORDS);
+        // a module that no tail bit touches is frozen: nothing to gain, and
+        // whether it comes out right is decided by the payload alone
+        if (col < 0) continue;
+        var mrow = (idx / n) | 0, mcol = idx % n, mb = 0;
+        for (m = 0; m < 8; m++) if (QRC.maskBit(m, mrow, mcol)) mb |= (1 << m);
+        var rv = ((P.raw[idx] !== cells[i].want ? 255 : 0) ^ mb) & 255;
+        while (col >= 0 && pivAt[col] >= 0) {
+          var b = pivAt[col], br = basis[b];
+          for (k = 0; k < WORDS; k++) cur[k] ^= br[k];
+          rv ^= basisRv[b];
+          col = lowestBit(cur, WORDS);
+        }
+        if (col < 0) continue;      // dependent: it will be right or it will not
+        pivAt[col] = basis.length;
+        basis.push(Uint32Array.from(cur));
+        basisRv.push(rv);
+        basisCol.push(col);
+        // the wishes that were GRANTED, in the order greedy took them; every
+        // one of them comes out right under every mask, and the tests lean on
+        // exactly that
+        pivots.push(idx);
+        rank++;
+        if (rank >= C) { used = i + 1; break; }
+      }
+
+      var order = [];
+      for (i = 0; i < basis.length; i++) order.push(i);
+      order.sort(function (a, b) { return basisCol[b] - basisCol[a]; });
+
+      var X = [], junkByMask = [];
+      for (m = 0; m < 8; m++) {
+        var xm = new Uint32Array(WORDS);
+        for (k = 0; k < order.length; k++) {
+          var j = order[k], row = basis[j], p = 0;
+          for (q = 0; q < WORDS; q++) p ^= row[q] & xm[q];
+          if ((((basisRv[j] >>> m) & 1) ^ bitParity(p)) === 1) {
+            var pc = basisCol[j];
+            xm[pc >>> 5] |= (1 << (pc & 31));
+          }
+        }
+        X.push(xm);
+        var junk = Uint8Array.from(P.zero);
+        for (q = 0; q < C; q++) {
+          if (xm[q >>> 5] & (1 << (q & 31))) junk[(q / JUNK_BITS) | 0] ^= (1 << (q % JUNK_BITS));
+        }
+        junkByMask.push(junk);
+      }
+
+      /* With the tail decided, every wish is one dot product away from its
+         answer, so all eight masks are scored over all cells rather than only
+         over the ones the elimination happened to touch. */
+      var hit = new Uint32Array(8), hitW = new Float64Array(8);
+      for (m = 0; m < 8; m++) {
+        var xv = X[m], h = 0, hw = 0;
+        for (i = 0; i < R; i++) {
+          var ci = cells[i], ii = ci.idx, o2 = ii * WORDS, p2 = 0;
+          for (k = 0; k < WORDS; k++) p2 ^= P.rowBits[o2 + k] & xv[k];
+          var bit = (P.raw[ii] ^ bitParity(p2) ^
+            QRC.maskBit(m, (ii / n) | 0, ii % n)) & 1;
+          if (bit === ci.want) { h++; hw += ci.weight; }
+        }
+        hit[m] = h;
+        hitW[m] = hw;
+      }
+      return { rank: rank, C: C, used: used, R: R, junkByMask: junkByMask,
+               pivots: pivots, hit: hit, hitW: hitW };
+    }
+
+    /* How much of the correction budget the opt-in switch may spend, per block.
+       Half and not all of it: a symbol with nothing left over decodes on a flat
+       screen and fails on a printed sticker with a fingerprint on it, and the
+       whole point of showing the reserve is not to quietly sell it. */
+    var IMAGE = { budgetShare: 0.5 };
+
+    /* The optional second pass. Wishes the solver could not reach are written
+       over the top, heaviest first, as long as the worst block stays under its
+       share. Two modules in the same codeword cost that codeword once, which is
+       why an already broken codeword is free from then on: it is the same
+       reason a logo in the middle of a QR code works better than the total
+       percentages suggest. */
+    function spendBudget(r, place, share) {
+      var sym = r.sym, cap = QRC.correctionCapacity(sym.layout);
+      var allow = Math.floor(cap.perBlockErrors * share);
+      var perBlock = [], seen = {}, b, i;
+      for (b = 0; b < sym.layout.numBlocks; b++) perBlock.push(0);
+      var want = {};
+      for (i = 0; i < place.cells.length; i++) want[place.cells[i].idx] = place.cells[i].want;
+      var forced = [], wrong = [];
+      for (i = 0; i < r.wrongIdx.length; i++) {
+        var idx = r.wrongIdx[i], ci = sym.cwIndex[idx];
+        var role = ci >= 0 ? sym.roles[ci] : null;
+        if (!role) { wrong.push(idx); continue; }
+        if (!seen[ci]) {
+          if (perBlock[role.block] + 1 > allow) { wrong.push(idx); continue; }
+          seen[ci] = 1;
+          perBlock[role.block]++;
+        }
+        sym.modules[idx] = want[idx];
+        forced.push(idx);
+      }
+      r.forcedIdx = forced;
+      r.wrongIdx = wrong;
+      r.forced = forced.length;
+      r.wrong = wrong.length;
+      r.cost = errorCost(sym, forced);
+      sym.penalty = QRC.penalty(sym.modules, sym.size);
+      r.exact = r.forced === 0 && r.wrong === 0;
+      return r;
+    }
+
+    /* Payload plus picture to a finished symbol. Synchronous by measurement,
+       not by hope: the elimination stops at full rank, so the cost is set by
+       the number of free bits and not by the number of modules. */
+    function plantImage(payload, opts) {
+      var o = opts || {};
+      var prefix = payload + (o.separator || '');
+      var probe = QRC.encodeQR(prefix, { ecl: o.ecl, minVersion: o.minVersion || 1, mode: 'byte' });
+      if (probe.error) return null;
+      var version = probe.version;
+      var room = maxTail(version, o.ecl, QRC.utf8Bytes(prefix).length);
+      if (room <= 0) return null;
+      var P = prepare(prefix, version, o.ecl, room);
+      if (!P) return null;
+      var target = o.target && o.target.w === P.n ? o.target
+        : (o.gray ? imageTarget(o.gray, o.gw, o.gh, P.n, { threshold: o.threshold }) : null);
+      if (!target) return null;
+      var place = imageCells(target, P.sym0);
+      if (!place || !place.cells.length) return null;
+      var sol = solvePriority(P, place.cells);
+      var mask = 0, m;
+      for (m = 1; m < 8; m++) {
+        if (sol.hitW[m] > sol.hitW[mask] ||
+            (sol.hitW[m] === sol.hitW[mask] && sol.hit[m] > sol.hit[mask])) mask = m;
+      }
+      var r = finish(P, sol, mask, place, null, false);
+      if (!r) return null;
+      if (o.budget) spendBudget(r, place, o.budget === true ? IMAGE.budgetShare : o.budget);
+      /* Deliberately no `target` field: the app draws a frame around a planted
+         figure and joins its cells into a silhouette, and a figure the size of
+         the whole symbol would put a box around everything and glue the
+         picture to its own background. `image` is the flag the app branches on
+         and `raster` is the picture, under a name nothing else reads. */
+      return {
+        image: true, raster: target,
+        sym: r.sym, text: r.text, junk: r.junk, tail: P.tail, prefix: prefix,
+        version: version, ecl: o.ecl, mask: mask, rank: sol.rank, C: P.C,
+        cells: place.cells.length, blocked: place.blocked,
+        follow: place.cells.length - r.forced - r.wrong,
+        forced: r.forced, wrong: r.wrong, forcedIdx: r.forcedIdx, wrongIdx: r.wrongIdx,
+        cost: r.cost, added: r.text.length - payload.length, exact: r.exact
+      };
+    }
+
     function search(opts, budgetMs) {
       var S = searchInit(opts);
       while (!searchStep(S, budgetMs || 1e9)) { /* run to completion */ }
@@ -3325,11 +4500,22 @@
       FONTS: FONTS, FONT3: FONT3, FONT5: FONT5,
       JUNK_BASE: JUNK_BASE, JUNK_BITS: JUNK_BITS,
       emptyTarget: emptyTarget, textTarget: textTarget, gridTarget: gridTarget,
+      GRID_PRESETS: GRID_PRESETS, gridInvert: gridInvert,
+      hangulTarget: hangulTarget, hangulSyllable: hangulSyllable,
+      hangulDecompose: hangulDecompose, consGlyph: consGlyph,
+      HANGUL_CHO: CHO, HANGUL_JUNG: JUNG_CHARS, HANGUL_JONG: JONG, SYL_GAP: SYL_GAP,
       scaleTarget: scaleTarget, targetWeight: targetWeight, placeCells: placeCells,
       frontAdd: frontAdd, dominates: dominates, describe: describe, rebuild: rebuild,
       junkText: junkText, maxTail: maxTail, codewordsFor: codewordsFor,
       rawBits: rawBits, prepare: prepare, solveAll: solveAll, junkFor: junkFor,
       errorCost: errorCost, finish: finish, better: better, spotsFor: spotsFor,
+      cellClasses: cellClasses, corridorGraph: corridorGraph, corridorFor: corridorFor,
+      snakeCorridorSearch: snakeCorridorSearch, CORRIDOR: CORRIDOR,
+      boxDown: boxDown, boxRect: boxRect, imageTarget: imageTarget, imageCells: imageCells,
+      solvePriority: solvePriority, spendBudget: spendBudget, plantImage: plantImage,
+      imageFigureTargets: imageFigureTargets,
+      FIG_HEIGHTS: FIG_HEIGHTS, FIG_MARGIN: FIG_MARGIN, FIG_BAND: FIG_BAND,
+      IMAGE: IMAGE,
       searchInit: searchInit, searchStep: searchStep, search: search
     };
   })();
@@ -3563,10 +4749,13 @@
     /* 'solo' is one long snake: a single walk with a much bigger search
        budget, and the period grows to fit its path instead of the path being
        cut to fit 48 frames. It sits first because one is less than a few. */
+    // 'One long' sits first, so the default index is 2 and solo is 0. The
+    // corridor search switches to it by name rather than by a literal.
     const SNAKE_DENSITY = [
       { v: 'solo', label: 'One long' },
       { v: 0.5, label: 'Few' }, { v: 1, label: 'Some' }, { v: 2, label: 'Many' }
     ];
+    const SOLO_DENSITY = SNAKE_DENSITY.findIndex((d) => d.v === 'solo');
 
     /* Someone who has asked their system not to animate things gets a still
        symbol and a sentence saying why, rather than a shape that silently does
@@ -3669,6 +4858,84 @@
       if (preset === 'url' && payload.indexOf('#') >= 0) return '';   // already has a fragment
       return sep;
     };
+
+    /* The picture, read in this tab and nowhere else.
+     *
+     * It is reduced once, here, to a small square greyscale array, and
+     * everything downstream (the module raster, the weights, the preview, the
+     * solver) is plain arithmetic over that array. That is why the halftone
+     * mode is testable in Node at all: no canvas is involved past this
+     * function. Square because a QR symbol is square, and centre-cropped
+     * rather than letterboxed, since a border of flat white would spend a
+     * third of the modules on nothing. */
+    const IMG_SRC_N = 160;
+    function readImageFile(file, done, fail) {
+      if (!file || !/^image\//.test(file.type || '')) { fail('That does not look like an image file.'); return; }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      const give = (msg) => { URL.revokeObjectURL(url); fail(msg); };
+      img.onload = () => {
+        try {
+          const cv = document.createElement('canvas');
+          cv.width = IMG_SRC_N;
+          cv.height = IMG_SRC_N;
+          const cx = cv.getContext('2d');
+          // white underneath, so a transparent logo does not come out solid black
+          cx.fillStyle = '#ffffff';
+          cx.fillRect(0, 0, IMG_SRC_N, IMG_SRC_N);
+          const s = Math.min(img.naturalWidth || 1, img.naturalHeight || 1);
+          cx.drawImage(img, ((img.naturalWidth || 1) - s) / 2, ((img.naturalHeight || 1) - s) / 2,
+            s, s, 0, 0, IMG_SRC_N, IMG_SRC_N);
+          const d = cx.getImageData(0, 0, IMG_SRC_N, IMG_SRC_N).data;
+          const gray = new Uint8ClampedArray(IMG_SRC_N * IMG_SRC_N);
+          for (let i = 0; i < gray.length; i++) {
+            gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
+          }
+          URL.revokeObjectURL(url);
+          done({ name: file.name, w: IMG_SRC_N, h: IMG_SRC_N, gray });
+        } catch (err) {
+          give('The browser refused to read this image.');
+        }
+      };
+      img.onerror = () => give('The browser could not decode this image.');
+      img.src = url;
+    }
+
+    /* The second source of pictures, and the reason the image mode is worth
+       opening at all without a file to hand. An emoji is drawn by the system
+       font onto the same canvas an upload lands on and read back as the same
+       greyscale array, so everything downstream cannot tell the two apart.
+       Nothing is fetched and nothing is stored: the glyph comes from the font
+       the reader already has, which is also why it looks different on a Mac
+       than on Windows and why that does not matter here. At nine to twenty
+       modules the shape is all that survives anyway.
+     *
+     * Chosen for silhouette rather than for charm: each of these is a solid,
+     * roughly centred blob that still reads when it is nine modules tall.
+     * Faces with thin features (a wink, a tear) turn into a grey disc. */
+    const EMOJI_LIB = ['❤️', '★', '☺', '🐱', '🌸', '♫', '⚡', '☠', '☕', '🌙', '🔑', '✈'];
+    function emojiGray(ch) {
+      const cv = document.createElement('canvas');
+      cv.width = IMG_SRC_N;
+      cv.height = IMG_SRC_N;
+      const cx = cv.getContext('2d');
+      cx.fillStyle = '#ffffff';
+      cx.fillRect(0, 0, IMG_SRC_N, IMG_SRC_N);
+      cx.fillStyle = '#000000';
+      // serif, because the monochrome dingbats in the list (★ ☺ ☠) are drawn
+      // by the text font and come out heavier there than in a sans face; the
+      // colour emoji fonts ignore the family anyway
+      cx.font = '120px serif';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      cx.fillText(ch, IMG_SRC_N / 2, IMG_SRC_N / 2 + 4);
+      const d = cx.getImageData(0, 0, IMG_SRC_N, IMG_SRC_N).data;
+      const gray = new Uint8ClampedArray(IMG_SRC_N * IMG_SRC_N);
+      for (let i = 0; i < gray.length; i++) {
+        gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
+      }
+      return { name: ch, w: IMG_SRC_N, h: IMG_SRC_N, gray, emoji: ch };
+    }
 
     /* The three sizes the front is drawn between. Blowing a figure up is the
        obvious way to make it legible and mostly a trap: the equations grow with
@@ -3867,12 +5134,23 @@
       const [animFrame, setAnimFrame] = useState(0);
       const [gifBusy, setGifBusy] = useState('');
       const [snakeHunt, setSnakeHunt] = useState(null);    // last snake mask search
-      const [motifSrc, setMotifSrc] = useState('word');    // word | grid
+      const [motifSrc, setMotifSrc] = useState('word');    // word | grid | hangul | snake | image
       const [motifWord, setMotifWord] = useState('CAT');
       const [motifFont, setMotifFont] = useState('3x5');
       const [motifGaps, setMotifGaps] = useState(false);   // true = gaps are free
+      const [motifHangul, setMotifHangul] = useState('한글');
       const [motifGrid, setMotifGrid] = useState(() => blankGrid(7));
       const [motifBrush, setMotifBrush] = useState('#');
+      /* The two readings of a picture. False is the figure search, which is
+         the same machinery as Word and Draw and the default because it is the
+         one that usually succeeds; true is the whole-symbol halftone, which is
+         the spectacular one and the long shot. */
+      const [motifImgWhole, setMotifImgWhole] = useState(false);
+      // {name, w, h, gray}: the picture, greyscale, already square and small.
+      // It never leaves this object and never leaves the tab.
+      const [motifImage, setMotifImage] = useState(null);
+      const [motifThr, setMotifThr] = useState(128);       // light/dark split point
+      const [motifBudget, setMotifBudget] = useState(false);
       const [motifTail, setMotifTail] = useState(-1);      // -1 = fill the version
       const [motifErrors, setMotifErrors] = useState(true);
       const [motifFree, setMotifFree] = useState({ ecl: true, version: true, mask: true, place: true });
@@ -3939,8 +5217,9 @@
 
       const motifTarget = useMemo(() => {
         if (motifSrc === 'grid') return QRP.gridTarget(motifGrid);
+        if (motifSrc === 'hangul') return QRP.hangulTarget(motifHangul);
         return QRP.textTarget(motifWord, motifFont, { freeGaps: motifGaps });
-      }, [motifSrc, motifGrid, motifWord, motifFont, motifGaps]);
+      }, [motifSrc, motifGrid, motifWord, motifFont, motifGaps, motifHangul]);
       const motifWeight = useMemo(() => QRP.targetWeight(motifTarget), [motifTarget]);
 
       const motifSep = motifSeparator(preset, payload || '');
@@ -3989,18 +5268,170 @@
       useEffect(() => () => { if (fitRef.current) fitRef.current(); }, []);
       useEffect(() => { stopSearch(); }, [payload, stopSearch]);
 
+      /* A picture as a FIGURE: the ladder of sizes, all of which go into the
+         same search as separate targets. The ladder is a search axis exactly
+         like the three scales of a word, so nothing downstream has to know
+         that this figure came from a photograph. */
+      const imgFig = useMemo(() => (
+        motifSrc === 'image' && motifImage && motifImage.gray
+          ? QRP.imageFigureTargets(motifImage.gray, motifImage.w, motifImage.h,
+              { threshold: motifThr })
+          : []
+      ), [motifSrc, motifImage, motifThr]);
+      // the largest rung, which is what the preview shows and what the note counts
+      const imgFigBig = imgFig.length ? imgFig[imgFig.length - 1] : null;
+      const imgFigWeight = useMemo(
+        () => (imgFigBig ? QRP.targetWeight(imgFigBig) : 0), [imgFigBig]);
+      // what the figure search has to place, whichever source it came from
+      const searchWeight = motifSrc === 'image' ? imgFigWeight : motifWeight;
+
       /* The same figure at three sizes. They are searched together because the
          expensive part, the map from free bits to modules, is built per version
          and level and does not depend on the figure at all, so a second and
          third size are nearly free to try against a preparation that exists
          anyway. */
-      const motifVariants = useMemo(() => MOTIF_SCALES.map((s) => ({
-        key: s.key, label: s.label,
-        target: s.k === 1 ? motifTarget : QRP.scaleTarget(motifTarget, s.k)
-      })), [motifTarget]);
+      const motifVariants = useMemo(() => (
+        motifSrc === 'image'
+          ? imgFig.map((t) => ({ key: t.key, label: t.label, target: t }))
+          : MOTIF_SCALES.map((s) => ({
+            key: s.key, label: s.label,
+            target: s.k === 1 ? motifTarget : QRP.scaleTarget(motifTarget, s.k)
+          }))
+      ), [motifSrc, imgFig, motifTarget]);
+
+      /* The fourth target source is not a figure at all, so it does not go
+         through the position sweep, the Pareto front or the worker. It solves
+         once, for one symbol, and the whole thing is a fraction of a second, so
+         a setTimeout with a busy line is enough. It lives in this tab rather
+         than next to the animation controls for the same reason the junk tail
+         does: it changes what the code says, and everything that changes the
+         address belongs where the address is shown. */
+      const corridorMode = motifSrc === 'snake';
+
+      /* ------------------------------------------------------ halftone mode */
+
+      /* The fifth source is a picture over the WHOLE symbol, so it has no
+         position either, and unlike the corridor it has no search at all: one
+         elimination in weight order answers every module at once. What it does
+         need is the size of the symbol the solver will really build, which is
+         the payload plus its full tail and therefore often one version above
+         the plain one. Rastering against the plain symbol would show a preview
+         of a picture nobody ends up getting. */
+      const imageMode = motifSrc === 'image';
+      // the halftone half of the image mode; the other half is an ordinary
+      // figure search and shares everything with Word and Draw
+      const wholeMode = imageMode && motifImgWhole;
+      const imgPrefix = (payload || '') + (tailAllowed ? motifSep : '');
+      const imgSym = useMemo(() => {
+        if (!wholeMode || !payload || !tailAllowed) return null;
+        const p = QRC.encodeQR(imgPrefix, { ecl, minVersion, mode: 'byte' });
+        return p.error ? null : p;
+      }, [wholeMode, payload, imgPrefix, tailAllowed, ecl, minVersion]);
+      const imgTarget = useMemo(() => (
+        imgSym && motifImage && motifImage.gray
+          ? QRP.imageTarget(motifImage.gray, motifImage.w, motifImage.h, imgSym.size,
+              { threshold: motifThr })
+          : null
+      ), [imgSym, motifImage, motifThr]);
+      /* Only data modules carry a wish; the finders, the timing lines, the
+         alignment patterns and the format information are what they are. */
+      const imgWishes = useMemo(() => {
+        if (!imgSym) return 0;
+        let k = 0;
+        for (let i = 0; i < imgSym.size * imgSym.size; i++) if (imgSym.cwIndex[i] >= 0) k++;
+        return k;
+      }, [imgSym]);
+
+      const imgRef = useRef(null);
+      useEffect(() => {
+        const cv = imgRef.current;
+        if (!cv || !imgTarget || !cv.getContext) return;
+        const n = imgTarget.w, k = 4;
+        cv.width = n * k;
+        cv.height = n * k;
+        const cx = cv.getContext('2d');
+        if (!cx || !cx.fillRect) return;
+        cx.fillStyle = COL.bg;
+        cx.fillRect(0, 0, n * k, n * k);
+        cx.fillStyle = COL.fg;
+        for (let i = 0; i < n * n; i++) {
+          if (imgTarget.cells[i] === 1) cx.fillRect((i % n) * k, ((i / n) | 0) * k, k, k);
+        }
+      }, [imgTarget, COL.fg, COL.bg]);
+
+      const takeImage = (file) => readImageFile(file,
+        (img) => setMotifImage(img),
+        (msg) => setMotifImage({ error: msg }));
+
+      const startImage = () => {
+        if (!payload || !tailAllowed || !imgTarget) return;
+        stopSearch();
+        const startedFor = payload;
+        let cancelled = false;
+        fitRef.current = () => { cancelled = true; };
+        setMotifRun({ tried: 0, solved: 0, done: false, have: false, image: true });
+        setMotifFront(null);
+        setTimeout(() => {
+          if (cancelled) return;
+          const r = QRP.plantImage(startedFor, {
+            ecl, minVersion, separator: motifSep, target: imgTarget, budget: motifBudget
+          });
+          if (cancelled) return;
+          fitRef.current = null;
+          setMotifRun(null);
+          if (!r) { setMotif({ payload: startedFor, empty: true, image: true }); return; }
+          setMotif(Object.assign({}, r, { payload: startedFor }));
+          /* Plain squares, once per search. A halftone picture is made of large
+             connected areas of dark modules, and every other shape in this tool
+             pulls them apart again: dots turn a black field into a dotted grey
+             one, and Figure would join the picture to its own background. */
+          setModStyle('square');
+        }, 30);
+      };
+
+      const startCorridor = () => {
+        if (!payload || !tailAllowed) return;
+        stopSearch();
+        const startedFor = payload;
+        let cancelled = false;
+        fitRef.current = () => { cancelled = true; };
+        setMotifRun({ tried: 0, solved: 0, done: false, have: false, corridor: true });
+        setMotifFront(null);
+        setTimeout(() => {
+          if (cancelled) return;
+          /* The honest baseline for "up from": the best the eight masks give
+             without touching the address, planned with the very options the
+             page will use afterwards. Quoting the automatic mask instead would
+             flatter the result by counting a gain the free button already
+             offers.
+             Encoded as byte, not as the page's segmentation mode, because the
+             solver encodes byte and nothing else: on a payload that automatic
+             segmentation packs smaller, the two numbers would otherwise come
+             from symbols of different sizes, and the smaller one would flatter
+             the corridor for free. */
+          const base = QRC.snakeMaskSearch(startedFor, { ecl, minVersion, mode: 'byte' },
+            { seed: tangleSeed, density: 'solo' });
+          const r = QRP.snakeCorridorSearch(startedFor,
+            { ecl, minVersion, separator: motifSep });
+          if (cancelled) return;
+          fitRef.current = null;
+          setMotifRun(null);
+          if (!r) { setMotif({ payload: startedFor, empty: true, corridor: true }); return; }
+          setMotif(Object.assign({}, r, {
+            payload: startedFor, from: base.best ? base.best.len : 0
+          }));
+          /* One update per search, so the "once per search" guard the figure
+             search needs is not needed here: the shape and the density are set
+             exactly once, and a hand-picked shape afterwards survives. */
+          setModStyle('snake');
+          setDensityIdx(SOLO_DENSITY);
+        }, 30);
+      };
 
       const startSearch = () => {
-        if (!payload || !motifWeight) return;
+        if (wholeMode) { startImage(); return; }
+        if (corridorMode) { startCorridor(); return; }
+        if (!payload || !searchWeight) return;
         stopSearch();
         const opts = {
           prefix: motifPrefix,
@@ -4089,9 +5520,17 @@
          Without this each frame would replan, which is both slow and wrong: the
          plan is deterministic, so it would come out the same, but nothing in the
          signature says so and a future change could make the snakes jump. */
+      /* The corridor a planted Snake result carries is handed to the planner
+         rather than searched for again. The solver steered the module pattern
+         so that this exact corridor exists; making the planner rediscover it
+         loses most of its length (measured), and with it the guarantee the
+         result note prints. */
+      const gift = view === 'motif' && motifLive && motifLive.path ? motifLive.path : null;
       const plan = useMemo(
-        () => (ok && animated ? QRC.snakePlan(sym, QRC.solidMask(sym), { seed: tangleSeed, density }) : null),
-        [ok, animated, sym, tangleSeed, density]
+        () => (ok && animated
+          ? QRC.snakePlan(sym, QRC.solidMask(sym), { seed: tangleSeed, density, path: gift })
+          : null),
+        [ok, animated, sym, tangleSeed, density, gift]
       );
       /* The whole period as path strings, so the animation loop only picks an
          index. Rebuilding a path per frame is fine at version 4 and visibly not
@@ -4512,7 +5951,8 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
-            No account, no upload, no redirect service. The code points straight at your text.
+            No account, no upload, no redirect service. The code points straight at your text,
+            and a picture you drop in is read in this tab and never sent anywhere.
           </p>
 
           <div className="qr-layout">
@@ -4605,8 +6045,13 @@
                         <p>Solving it makes the letters ordinary data. Nothing is damaged, no error-correction budget is spent, and the result is a perfectly regular QR code that happens to have a word in it.</p>
                       <//>
                     </p>
-                    <div className="seg-row" role="group" aria-label="Kind of figure" style=${{ marginBottom: 8 }}>
-                      ${[['word', 'Word'], ['grid', 'Draw']].map(([id, label]) => html`
+                    <!-- Image is dark-launched: the whole mode (figure ladder,
+                         emoji library, whole-code halftone) and its tests stay
+                         in, but the button does not render until the mode has
+                         passed browser acceptance. Remove the filter to relight
+                         it; nothing else needs to change. -->
+                    <div className="seg-row qr-srcseg" role="group" aria-label="Kind of figure" style=${{ marginBottom: 8 }}>
+                      ${[['word', 'Word'], ['grid', 'Draw'], ['hangul', 'Hangul'], ['snake', 'Snake'], ['image', 'Image']].filter(([id]) => id !== 'image').map(([id, label]) => html`
                         <button key=${id} className=${'lang-seg' + (motifSrc === id ? ' active' : '')}
                                 aria-pressed=${motifSrc === id} onClick=${() => setMotifSrc(id)}>${label}</button>`)}
                     </div>
@@ -4643,6 +6088,24 @@
                         <${MotifCells} target=${motifTarget}/>
                       <//>`}
 
+                    ${motifSrc === 'hangul' && html`
+                      <${React.Fragment}>
+                        <${Field} label="Syllables" info=${html`
+                          <${Info} label="how a syllable is put together">
+                            <p>A Hangul syllable is a block, not a letter. Every code point from U+AC00 to U+D7A3 is an initial, a medial and an optional final packed as arithmetic, so taking one apart is a division rather than a lookup, and reassembling it is the layout every Korean font follows: an upright vowel to the right of the initial, a flat one underneath, a compound one doing both, and a final closing the block along the bottom.</p>
+                            <p>The consonants are the seventeen shapes this tool already looks for in unplanted codes, plus the six the finder has to refuse because a module grid cannot draw a diagonal. The vowels are generated rather than stored, because an upright vowel has to stretch to the height of whatever it stands beside.</p>
+                            <p>Only the bounding box of each jamo is a wish here. The trench between the pieces and the border around the block stay free, which is worth roughly one version of symbol size and, on two syllables, four.</p>
+                          <//>`}>
+                          <input className="qr-in" type="text" value=${motifHangul} maxLength="4"
+                                 placeholder="한글" onInput=${(e) => setMotifHangul(e.target.value)}/>
+                        <//>
+                        ${motifTarget.dropped > 0 && html`<p className="qr-note">
+                          ${motifTarget.dropped} character${motifTarget.dropped === 1 ? '' : 's'} ignored: this mode plants precomposed Hangul syllables and nothing else.
+                        </p>`}
+                        <${MotifCells} target=${motifTarget}/>
+                        <p className="qr-faint">A full syllable is dense, so it is expensive: two of them are around sixty wishes, which is a word of three Latin letters. The free cells are what keep it affordable, and a free cell that comes out dark is drawn as a loose dot rather than joined to the figure, so it cannot glue two jamo together.</p>
+                      <//>`}
+
                     ${motifSrc === 'grid' && html`
                       <${React.Fragment}>
                         <div className="qr-grid">
@@ -4660,11 +6123,156 @@
                             </div>
                           <//>
                         </div>
+                        <!-- The library sits under the size chooser because
+                             picking one replaces the grid, size included, so
+                             it belongs next to the thing it overrules and not
+                             next to Clear. -->
+                        <div className="qr-chips" style=${{ marginTop: 8 }}>
+                          ${QRP.GRID_PRESETS.map((p) => html`
+                            <button key=${p.key} className="lang-seg"
+                                    onClick=${() => setMotifGrid(p.rows.slice())}>${p.label}</button>`)}
+                        </div>
                         <${MotifCells} target=${motifTarget} onPaint=${paintGrid}/>
                         <div className="qr-chips" style=${{ marginTop: 6 }}>
+                          <button className="lang-seg" onClick=${() => setMotifGrid(QRP.gridInvert(motifGrid))}>Invert</button>
                           <button className="lang-seg" onClick=${() => setMotifGrid(blankGrid(motifGrid.length))}>Clear</button>
                         </div>
                         <p className="qr-faint">Light is a wish too, and costs the same as dark. Free cells cost nothing and take whatever the code gives them.</p>
+                        <p className="qr-faint">Invert swaps dark and light and leaves the free cells free. It is also the most expensive thing on this panel: a light figure needs a background that is dark on purpose, so every cell behind it becomes a wish, and the rank runs out well before the wishes do.</p>
+                      <//>`}
+
+                    ${imageMode && html`
+                      <${React.Fragment}>
+                        <!-- Two readings of the same picture, and they are not
+                             variants of one control: Figure plants a small
+                             shape and searches like Word does, Whole code
+                             solves the entire symbol once. -->
+                        <div className="seg-row" role="group" aria-label="What to do with the picture"
+                             style=${{ marginBottom: 8 }}>
+                          ${[[false, 'Figure'], [true, 'Whole code']].map(([v, label]) => html`
+                            <button key=${label} className=${'lang-seg' + (motifImgWhole === v ? ' active' : '')}
+                                    aria-pressed=${motifImgWhole === v}
+                                    onClick=${() => setMotifImgWhole(v)}>${label}</button>`)}
+                        </div>
+                        <p className="qr-faint" style=${{ marginTop: 0 }}>
+                          ${motifImgWhole
+                            ? 'Every data module of the symbol becomes a wish, and the picture decides which of them get satisfied first.'
+                            : 'The picture becomes a small figure, planted in an otherwise ordinary code. Four sizes are searched at once.'}
+                          ${' '}${motifImgWhole
+                            ? html`<${Info} label="how a picture is planted">
+                                <p>This is Russ Cox' QArt, generalised. The other modes wish for a few dozen cells; here every steerable module of the symbol wishes to be dark or light, which is thousands of equations against a few hundred free bits. Most of them cannot be granted, so the order matters, and the order is the picture's own: each module carries a weight made of how far it is from the threshold and how much its neighbourhood varies, which puts edges and confident blacks and whites first.</p>
+                                <p>Taking the wishes heaviest first and dropping every one that turns out to be linearly dependent and inconsistent is not a heuristic. The satisfiable sets are the independent sets of a matroid, and greedy by weight is optimal on a matroid, so this is the heaviest picture the tail can carry. There is nothing to search: the picture is the whole symbol, so there is one position and one elimination.</p>
+                                <p>What comes out is honest but not flattering: the solved modules follow the picture exactly, and the rest are a coin toss that agrees about half the time. A recognisable result is therefore a matter of a bold, high-contrast image and a large enough version, not of a better solver.</p>
+                              <//>`
+                            : html`<${Info} label="a picture as a figure">
+                                <p>A motif over the whole code is a long shot: it needs thousands of wishes granted out of a few hundred free bits, so most of the picture is left to chance. A motif over twenty modules is the problem the Word and Draw modes already solve exactly, and there the answer is usually an undamaged code with the shape really in it.</p>
+                                <p>So the picture is rastered down to a ladder of small sizes, ${QRP.FIG_HEIGHTS.join(', ')} modules tall, and all of them go into one search. The size is an axis like the version and the level, not a setting: the list of alternatives underneath says what each one cost in reserve, and the trade is real, because a taller figure needs a bigger symbol and a bigger symbol has smaller modules.</p>
+                                <p>Dark below the threshold, light above it, and a band of mid grey either side of it is left free. A module whose average lands within a hair of the threshold has no opinion: which way it falls is decided by the rastering rather than by the picture, and insisting on it spends an equation on a coin toss. A free ring around the figure is left for the same reason, and it also keeps the shape from fusing with whatever dark modules stand next to it.</p>
+                                <p>What survives at nine modules is the silhouette and nothing else. Bold and centred works, a photograph of a face does not.</p>
+                              <//>`}
+                        </p>
+                        ${!tailAllowed && html`<p className="qr-note">
+                          This payload kind has nowhere to put a tail without becoming a different payload,
+                          and without free bits there is nothing to steer. Try the URL or Text preset.
+                        </p>`}
+                        ${tailAllowed && html`
+                          <${React.Fragment}>
+                            <label className=${'qr-drop' + (motifImage && motifImage.gray ? ' loaded' : '')}
+                                   onDragOver=${(e) => e.preventDefault()}
+                                   onDrop=${(e) => {
+                                     e.preventDefault();
+                                     takeImage(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]);
+                                   }}>
+                              <input type="file" accept="image/*"
+                                     onChange=${(e) => takeImage(e.target.files && e.target.files[0])}/>
+                              <span>${motifImage && motifImage.name
+                                ? motifImage.name
+                                : 'Drop an image here, or click to choose one'}</span>
+                              <span className="qr-faint" style=${{ margin: 0 }}>
+                                Read in this tab. Nothing is uploaded.
+                              </span>
+                            </label>
+                            <!-- The library next to the drop zone, drawn by the
+                                 system font onto the same canvas an upload
+                                 lands on. No asset, no request. -->
+                            <div className="qr-chips qr-emoji" style=${{ marginTop: 8 }}>
+                              ${EMOJI_LIB.map((ch) => html`
+                                <button key=${ch} className="lang-seg" title=${'use ' + ch}
+                                        aria-label=${'use the emoji ' + ch}
+                                        onClick=${() => setMotifImage(emojiGray(ch))}>${ch}</button>`)}
+                            </div>
+                            <p className="qr-faint" style=${{ marginTop: 4 }}>
+                              Drawn by your system font, so it looks a little different on every machine.
+                              At this size only the silhouette survives anyway.
+                            </p>
+                            ${motifImage && motifImage.error && html`<p className="qr-note">${motifImage.error}</p>`}
+                            ${motifImgWhole && imgTarget && html`
+                              <${React.Fragment}>
+                                <canvas className="qr-imgprev" ref=${imgRef}
+                                        aria-label="the picture rastered onto the module grid"/>
+                                <${Field} label=${'Threshold ' + motifThr}>
+                                  <input className="qr-range" type="range" min="32" max="224" step="1"
+                                         value=${motifThr} onInput=${(e) => setMotifThr(+e.target.value)}/>
+                                <//>
+                                <p className="qr-faint" style=${{ marginTop: 0 }}>
+                                  Where light becomes dark. It moves the picture, not the code: a module that
+                                  ends up nearer the threshold is a weaker wish and is given up first.
+                                </p>
+                                <label className="qr-field" style=${{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+                                  <input type="checkbox" checked=${motifBudget} style=${{ margin: 0 }}
+                                         onChange=${(e) => setMotifBudget(e.target.checked)}/>
+                                  <span style=${{ margin: 0 }}>Also spend error correction on the strongest misses</span>
+                                </label>
+                                <p className="qr-faint">
+                                  Off by default. On, the heaviest modules the solver could not reach are written
+                                  over the top and paid for out of the Reed-Solomon budget, at most half of each
+                                  block, so the code keeps a reserve. Several misses inside one codeword cost that
+                                  codeword once, which is why the first few are much cheaper than the count suggests.
+                                </p>
+                                <p className="qr-faint">
+                                  A bigger symbol has more modules to steer and a longer tail to steer them with,
+                                  so the picture gets better with the version: raise <b>Minimum version</b> under
+                                  Expert below. It also gets slower, roughly with the cube of the side.
+                                </p>
+                              <//>`}
+                            ${!motifImgWhole && imgFigBig && html`
+                              <${React.Fragment}>
+                                <!-- The preview shows the LARGEST rung. The
+                                     smaller ones are the same picture with
+                                     fewer modules, so a stack of four grids
+                                     would say the same thing four times, and
+                                     the largest is the one where a threshold
+                                     that eats the shape is visible. -->
+                                <${MotifCells} target=${imgFigBig}/>
+                                <${Field} label=${'Threshold ' + motifThr}>
+                                  <input className="qr-range" type="range" min="32" max="224" step="1"
+                                         value=${motifThr} onInput=${(e) => setMotifThr(+e.target.value)}/>
+                                <//>
+                                <p className="qr-faint" style=${{ marginTop: 0 }}>
+                                  Where light becomes dark. Shown at the largest of the
+                                  ${' '}${imgFig.length} sizes; the smaller ones are the same picture with
+                                  fewer modules. Mid grey within ${QRP.FIG_BAND} levels of the threshold is
+                                  left free, and free costs nothing.
+                                </p>
+                              <//>`}
+                          <//>`}
+                      <//>`}
+
+                    ${corridorMode && html`
+                      <${React.Fragment}>
+                        <p className="qr-faint" style=${{ marginTop: 0 }}>
+                          The wish is not a letter but a road: one long connected run of dark modules
+                          for the animated Snake shape to crawl along.
+                          ${' '}<${Info} label="steering the pattern instead of picking it">
+                            <p>The Snake shape animates by joining dark modules that are already there, so how long a snake can get is decided by which modules the pattern happens to make dark and connected. The button under the animation controls picks the best of the eight mask patterns, which is three bits of choice.</p>
+                            <p>This mode builds the pattern instead. Every module is a linear function of the junk tail's bits, so the solver can be asked for a corridor rather than a figure: a long path of dark modules, routed around the cells no tail can reach. Measured on four addresses, the best of eight masks gave 59, 92, 101 and 135 modules of road, and the steered pattern gave 82, 130, 173 and 192.</p>
+                            <p>The price is the tail appended to your address: a few characters to a couple of dozen, depending on how much room your address leaves at its version. Measured over seven real addresses it was between three and thirteen, and the result below says exactly how many and prints what the code then encodes. The price is not error correction: a cell the solver cannot reach is dropped from the corridor rather than forced, so the budget comes out untouched and the reserve stays full.</p>
+                          <//>
+                        </p>
+                        ${!tailAllowed && html`<p className="qr-note">
+                          This payload kind has nowhere to put a tail without becoming a different payload,
+                          and without free bits there is no pattern to steer. Try the URL or Text preset.
+                        </p>`}
                       <//>`}
 
                     <!-- The action sits directly under the figure, not at the
@@ -4675,15 +6283,40 @@
                     <div className="qr-actions" style=${{ marginTop: 10 }}>
                       ${motifRun
                         ? html`<button className="tool-danger" onClick=${stopSearch}>Stop</button>`
-                        : html`<button onClick=${startSearch} disabled=${!ok || !motifWeight}>Search</button>`}
+                        : html`<button onClick=${startSearch} disabled=${!ok || (corridorMode ? !tailAllowed : (wholeMode ? !imgTarget : !searchWeight))}>Search</button>`}
                       ${motif && html`<button className="secondary" onClick=${() => { stopSearch(); setMotif(null); }}>Clear</button>`}
                     </div>
-                    <p className="qr-note">
-                      ${motifWeight} cells to satisfy, ${motifTarget.w} x ${motifTarget.h} modules.
-                      ${motifRun ? ' ' + motifRun.tried + ' placements tried' + (motifRun.version ? ' up to version ' + motifRun.version : '') + '.' : ''}
-                      ${motifRun && motifRun.score ? ' Best so far: ' + (motifRun.score.forced + motifRun.score.wrong) + ' of ' + motifRun.score.cells + ' missed.' : ''}
-                    </p>
+                    ${corridorMode
+                      ? html`<p className="qr-note">
+                          ${motifRun
+                            ? 'Solving for a corridor over all eight masks…'
+                            : 'One symbol per search: the corridor is the whole figure, so there is no position to sweep and no alternatives to weigh up.'}
+                        </p>`
+                      : (wholeMode
+                        ? html`<p className="qr-note">
+                            ${imgSym
+                              ? imgWishes + ' cells to satisfy, ' + imgSym.size + ' x ' + imgSym.size + ' modules.'
+                                + (motifRun ? ' Eliminating in weight order…'
+                                  : ' One elimination over all eight masks, no position to sweep.')
+                              : 'No free bits here, so there is nothing to steer.'}
+                          </p>`
+                        : (imageMode
+                          ? html`<p className="qr-note">
+                              ${imgFigBig
+                                ? imgFigWeight + ' cells to satisfy at the largest of ' + imgFig.length
+                                  + ' sizes, ' + imgFigBig.w + ' x ' + imgFigBig.h + ' modules.'
+                                : 'No picture yet: drop one on the left or pick an emoji.'}
+                              ${motifRun ? ' ' + motifRun.tried + ' placements tried' + (motifRun.version ? ' up to version ' + motifRun.version : '') + '.' : ''}
+                              ${motifRun && motifRun.score ? ' Best so far: ' + (motifRun.score.forced + motifRun.score.wrong) + ' of ' + motifRun.score.cells + ' missed.' : ''}
+                            </p>`
+                          : html`<p className="qr-note">
+                              ${motifWeight} cells to satisfy, ${motifTarget.w} x ${motifTarget.h} modules.
+                              ${motifRun ? ' ' + motifRun.tried + ' placements tried' + (motifRun.version ? ' up to version ' + motifRun.version : '') + '.' : ''}
+                              ${motifRun && motifRun.score ? ' Best so far: ' + (motifRun.score.forced + motifRun.score.wrong) + ' of ' + motifRun.score.cells + ' missed.' : ''}
+                            </p>`))}
 
+                    ${!corridorMode && !wholeMode && html`
+                      <${React.Fragment}>
                     <p className="ctl-sec-h" style=${{ marginTop: 12 }}>What the search may vary
                       <${Info} label="the free parameters">
                         <p>Four things can change without changing what the code says, and they were measured in this order of effect.</p>
@@ -4737,6 +6370,7 @@
                       <span style=${{ margin: 0 }}>Force unreachable modules as deliberate errors</span>
                     </label>
                     <p className="qr-faint">Off, an unreachable cell simply stays wrong. On, it is written anyway and paid for out of the Reed-Solomon budget, which is counted per block below.</p>
+                      <//>`}
 
                   </div>`}
 
@@ -4807,7 +6441,7 @@
                       <//>
                       ${plan && html`<p className="qr-note">${density === 'solo'
                         ? (plan.snakes.length
-                            ? 'One snake, ' + plan.body + ' modules long, crawling a path of ' + plan.snakes[0].path.length + '. The period grows to fit it, ' + plan.frames + ' frames here, and the GIF grows with it. How long the snake can get is decided by the mask; the button below tries all eight.'
+                            ? 'One snake, ' + plan.body + ' modules long, crawling a path of ' + plan.snakes[0].path.length + '. The period grows to fit it, ' + plan.frames + ' frames here, and the GIF grows with it. How long the snake can get is decided by the module pattern' + (gift ? ', and this one was steered to hold it.' : '; the button below tries all eight masks.')
                             : 'No room for a snake on this symbol.')
                         : plan.snakes.length + (plan.snakes.length === 1 ? ' snake' : ' snakes') + ' found room on this symbol. A snake needs a run of dark modules to crawl along, so a sparse code carries fewer than asked.'}</p>`}
                       ${huntable && html`
@@ -4824,6 +6458,11 @@
                         ${hunt.gain
                           ? 'Mask ' + hunt.mask + ': the longest snake now runs ' + hunt.len + ' of ' + hunt.ceiling + ' possible modules, up from ' + hunt.from + ' under mask ' + hunt.was + '. Applied as a fixed mask under Expert.'
                           : 'No mask beats what is on screen: ' + hunt.len + ' of ' + hunt.ceiling + ' possible modules is what this symbol offers.'}
+                      </p>`}
+                      ${density === 'solo' && view !== 'motif' && html`<p className="qr-faint">
+                        The mask is three bits of choice. For more road than that, the Motif tab has a
+                        Snake mode that steers the module pattern itself, at the price of a junk tail
+                        on your address.
                       </p>`}
                     </div>`}
                 </details>
@@ -5027,16 +6666,93 @@
                   ${view === 'motif' && html`
                     <${React.Fragment}>
                       ${!motifLive && html`<p className="qr-note">
-                        Pick a figure on the left and press Search. The tool then looks for a symbol that
-                        encodes the same payload and happens to contain that figure, by varying the
-                        error-correction level, the version, the mask, the position and the junk tail.
+                        ${corridorMode
+                          ? 'Press Search. The tool then looks for a junk tail whose symbol contains one long connected run of dark modules, and hands that run to the animated Snake shape.'
+                          : (wholeMode
+                            ? 'Drop a picture on the left and press Search. The tool then chooses a junk tail that makes as much of the symbol as possible agree with the picture, heaviest wish first.'
+                            : (imageMode
+                              ? 'Drop a picture on the left, or pick an emoji, and press Search. The tool then looks for a symbol that encodes the same payload and happens to contain that shape, at four sizes at once.'
+                              : 'Pick a figure on the left and press Search. The tool then looks for a symbol that encodes the same payload and happens to contain that figure, by varying the error-correction level, the version, the mask, the position and the junk tail.'))}
                       </p>`}
                       ${motifLive && motifLive.empty && html`<div className="qr-verdict bad">
-                        <span>Nothing found. Every version in range either cannot hold the payload or has no
-                        place where the figure fits clear of the fixed patterns. A shorter figure, the 3x5 face,
-                        or a longer junk tail are the three things that help.</span>
+                        <span>${motifLive.corridor
+                          ? 'Nothing found. This payload leaves no room for a tail at its version, so there are no free bits to steer the pattern with.'
+                          : (motifLive.image
+                            ? 'Nothing planted. This payload leaves no room for a tail at its version, so there are no free bits to steer the picture with.'
+                            : (imageMode
+                              ? 'Nothing found. Every version in range either cannot hold the payload or has no place where the picture fits clear of the fixed patterns. A bolder picture, a threshold that leaves more mid grey free, or a longer junk tail are the three things that help.'
+                              : 'Nothing found. Every version in range either cannot hold the payload or has no place where the figure fits clear of the fixed patterns. A shorter figure, the 3x5 face, or a longer junk tail are the three things that help.'))}</span>
                       </div>`}
-                      ${motifLive && !motifLive.empty && html`
+                      ${motifLive && motifLive.image && !motifLive.empty && html`
+                        <${React.Fragment}>
+                          <div className=${'qr-verdict ' + (!motifLive.cost.ok ? 'bad'
+                              : (motifLive.follow + motifLive.forced >= motifLive.cells * 0.6 ? 'ok' : 'warn'))}>
+                            <span>
+                              ${motifLive.follow + motifLive.forced} of ${motifLive.cells} modules follow the picture,
+                              ${' '}${motifLive.wrong} do not.
+                              ${motifLive.forced
+                                ? ' ' + motifLive.forced + ' of them were written over the top and paid for out of the correction budget; the worst block now uses ' + motifLive.cost.worst + ' of ' + motifLive.cost.capacity + ' correctable codewords' + (motifLive.cost.ok ? '.' : ', which is over budget: this symbol no longer decodes.')
+                                : ' Nothing was forced: the correction budget is untouched.'}
+                            </span>
+                            <${Info} label="what these numbers mean">
+                              <p><b>Rank</b> is the honest number. It is how many modules the tail could be steered to on purpose, and every one of them follows the picture exactly. The rest of the modules are whatever the encoding made them, and about half of those agree with the picture by chance, which is why the count of modules that follow is always much larger than the rank and means much less.</p>
+                              <p>The way to more rank is a longer tail, and the way to a longer tail is a higher version. Nothing else here changes it: the threshold decides which module wishes for what, not how many wishes can be granted.</p>
+                              <p><b>Reserve</b> is the share of the worst-hit block's codewords that may still go bad before the code stops decoding. Without the budget switch it is untouched, because a module the solver cannot reach is simply left wrong rather than written over.</p>
+                            <//>
+                          </div>
+                          <div className="qr-stats">
+                            <span>Modules <b>${motifLive.cells}</b></span>
+                            <span>Follow <b>${motifLive.follow + motifLive.forced}</b></span>
+                            <span>Solved <b>${motifLive.rank}</b></span>
+                            <span>Forced <b>${motifLive.forced}</b></span>
+                            <span>Free bits <b>${motifLive.C}</b></span>
+                            <span>Reserve <b>${motifLive.cost.capacity - motifLive.cost.worst} / ${motifLive.cost.capacity}</b></span>
+                            <span>Mask <b>${motifLive.mask}</b></span>
+                            <span>Tail <b>${motifLive.tail}</b></span>
+                          </div>
+                          <p className="qr-note">
+                            The address grew by ${motifLive.added} characters. The code now encodes:
+                          </p>
+                          <p className="qr-tail"><code>${motifLive.text}</code></p>
+                          <p className="qr-faint">
+                            The shape was switched to plain squares, which is the only one that lets a dark
+                            area read as a dark area. Squint, or step back: a halftone code is a picture at
+                            ${' '}${motifLive.sym.size} modules across and it is meant to be seen small.
+                          </p>
+                        <//>`}
+                      ${motifLive && motifLive.corridor && !motifLive.empty && html`
+                        <${React.Fragment}>
+                          <div className=${'qr-verdict ' + (motifLive.len > motifLive.from ? 'ok' : 'warn')}>
+                            <span>
+                              A corridor of ${motifLive.len} modules, up from ${motifLive.from} under the
+                              best of the eight masks${motifLive.len >= motifLive.cap ? ', which is the ceiling the period allows' : ''}.
+                              ${' '}Nothing was forced: the correction budget is untouched.
+                            </span>
+                            <${Info} label="what these numbers mean">
+                              <p>The corridor is the path the snake crawls, one module per frame, so its length is the animation. The comparison is against the longest path the best of the eight masks allows for the same address, which is what the button under the animation controls buys for free.</p>
+                              <p>Every cell of the corridor was solved rather than forced, so the Reed-Solomon budget is exactly as full as it would be without any of this. The reserve below says how much of the worst block may still go bad.</p>
+                            <//>
+                          </div>
+                          <div className="qr-stats">
+                            <span>Corridor <b>${motifLive.len}</b></span>
+                            <span>Was <b>${motifLive.from}</b></span>
+                            <span>Rank <b>${motifLive.rank}</b></span>
+                            <span>Free bits <b>${motifLive.C}</b></span>
+                            <span>Reserve <b>${motifLive.cost.capacity - motifLive.cost.worst} / ${motifLive.cost.capacity}</b></span>
+                            <span>Mask <b>${motifLive.mask}</b></span>
+                            <span>Tail <b>${motifLive.tail}</b></span>
+                          </div>
+                          <p className="qr-note">
+                            The address grew by ${motifLive.added} characters. The code now encodes:
+                          </p>
+                          <p className="qr-tail"><code>${motifLive.text}</code></p>
+                          <p className="qr-faint">
+                            The shape was switched to Snake and the density to One long, which is the only
+                            setting that draws the whole corridor. Speed and playback are under Module shape
+                            on the left; the Symbol tab shows the plain code again, without the corridor.
+                          </p>
+                        <//>`}
+                      ${motifLive && !motifLive.empty && !motifLive.corridor && !motifLive.image && html`
                         <${React.Fragment}>
                           <div className=${'qr-verdict ' + (!motifLive.cost.ok || motifLive.wrong ? 'bad'
                               : (motifLive.exact ? 'ok' : 'warn'))}>
@@ -5183,7 +6899,13 @@
                         </p>
                         <div className="qr-actions">
                           <button className="secondary" onClick=${downloadGif} disabled=${!!gifBusy}>
-                            ${gifBusy || 'Download GIF (' + gifPx + ' px)'}
+                            <!-- The frame count belongs on the button next to
+                                 the pixel size: a GIF stores every frame whole,
+                                 so the period is the other half of how big the
+                                 file gets, and a steered corridor can push it
+                                 from 48 frames to nearly 300. No byte estimate,
+                                 that would be a guess. -->
+                            ${gifBusy || 'Download GIF (' + gifPx + ' px, ' + frameCount + ' frames)'}
                           </button>
                           <button className="secondary" onClick=${downloadAnimSvg}>Download animated SVG</button>
                         </div>
@@ -5211,6 +6933,7 @@
                 <p>The consequence worth stating is the one about cameras. A phone does not see a frame, it sees an exposure, and an exposure lasting a thirtieth of a second across an animation running at twelve and a half frames a second will regularly straddle two of them. What it captures is a blend. But both frames agree that a dark module is dark and a light module is light, and they disagree only about the connectors in the gaps between module centres, which come out at half strength. So the blend decodes as well as either frame does. Checked rather than argued: six symbols from version 1 to version 16, all 48 frames of each, and all 48 blends of each including the pair that wraps around the end of the loop, written out as a GIF and read back with a decoder written by strangers. 288 frames, 288 blends, no failures, and the same again under a gaussian blur of a third of a module. The stranger matters more than the number. An earlier version of this check read the file back with a decoder written alongside the encoder, which agreed with it perfectly while no browser on earth could open the result.</p>
                 <p>The whole animation is one period, which is what makes the GIF possible: every snake's entire life, from the single module it grows out of to the single module it shrinks back into, fits inside the loop. The frame after the last is frame 0, exactly, so there is no seam. Normally that period is 48 frames, every snake is five modules long, and the paths are cut to fit the loop; the "One long" setting turns the deal around: a single snake, found with a much larger search budget, its body grown to half its path, and the period grown to fit its life, so it crawls the whole symbol once per loop. The GIF grows with the period, which is the price. Nothing about the code is random at scan time either, since the snakes are planned once from a hash of the symbol itself. The same text always produces the same animation, which is why the reroll button exists at all.</p>
                 <p>One choice the standard makes for you is worth taking back. Every QR code is XORed with one of eight masks, picked by a penalty score that was written to keep symbols scannable and knows nothing about snakes, and the mask decides how much connected room the free dark modules leave: on one short URL the longest plannable path was 20 modules under the automatic mask and 58 under the best one. The search button under the animation controls encodes the same text under all eight, plans the snakes for each, and keeps the winner. The code says exactly the same thing afterwards; only the snake has more road.</p>
+                <p>The Snake mode in the Motif tab stops choosing a pattern and starts building one, which is the two halves of this tool meeting. The mask is three bits of choice; the junk tail the solver appends is hundreds of bits, and every module is a linear equation over them, so it can be asked for a long connected corridor of dark modules instead of a letter. Measured on four addresses, the best of eight masks gave 59, 92, 101 and 135 modules of path, and the steered pattern gave 82, 130, 173 and 192, the last of them the ceiling the period allows. It costs a tail of padding on the end of your address: a few characters to a couple of dozen, depending on how much room your address leaves at its version, and between three and thirteen over the seven real addresses it was measured on. That is why it lives in the tab where the address changes and why the result prints what the code then encodes. What it does not cost is error correction: a wish the solver cannot satisfy is dropped rather than forced, so the budget comes out untouched.</p>
                 <p>None of this buys you anything. It is a QR code that wiggles.</p>
               </div>
             </details>
