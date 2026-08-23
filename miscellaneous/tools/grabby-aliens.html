@@ -80,6 +80,8 @@
     window.dispatchEvent(new Event('ga-three-ready'));
   </script>
 
+  <!-- shared isosurface extractor, same module soap-film-solids uses -->
+  <script src="/assets/js/marching-cubes.js"></script>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
@@ -555,7 +557,7 @@
     const DISPLAY_CAP = 20000;             // instance budget for bubbles incl. periodic ghosts
     const POINT_CAP = 8000;                // instance budget for the origin dots
     const GRID_N = 48;                     // sample points in the volume chart
-    const WALL_CAP = 400000;               // quads in the impingement mesh (~40 MB of buffers)
+    const WALL_CAP = 1200000;              // triangles in the impingement shells (~25 MB of buffers)
 
     /* ---------- palette -------------------------------------------------- */
     /* Canvas, SVG and three.js all bake colours in, so the palette is mutable
@@ -708,7 +710,7 @@
       const tField = performance.now();
       const field = buildField(civs, p.s, p.L, p.fieldRes);
       const tWall = performance.now();
-      const walls = buildWalls(field, civs, p.L, WALL_CAP);
+      const walls = buildWalls(field, civs, p.s, p.L, WALL_CAP);
       const tEnd = performance.now();
 
       Object.assign(model, {
@@ -731,10 +733,13 @@
         probeSeed: (mcSeed + 101) >>> 0,
         probeCount: Math.max(250, Math.min(2000, Math.round(600000 / Math.max(1, civs.length)))),
         field: field, walls: walls,
-        /* The interpolated field is only accurate to about a voxel near a
-           boundary, so the discard test gets that much slack, expressed as the
-           time a front needs to cross three quarters of a voxel. */
-        eps: 0.75 * (p.L / p.fieldRes) / p.s,
+        /* Slack on the discard test. Zero is the geometrically exact value: a
+           sphere fragment survives exactly while its own arrival is the first
+           one, and the frozen wall covers precisely the complement. The slack
+           only absorbs sampling error in the interpolated field, and it is kept
+           small because it is also the distance by which a growing sphere may
+           poke past the neighbour's wall. */
+        eps: 0.25 * (p.L / p.fieldRes) / p.s,
         fieldMs: Math.round(tWall - tField),
         wallMs: Math.round(tEnd - tWall),
         ms: Math.round(performance.now() - t0)
@@ -781,11 +786,20 @@
     function buildField(civs, s, L, res) {
       const N = res, h = L / N, invS = 1 / s, hl = L / 2;
       const tau = new Float32Array(N * N * N);
+      /* tau2, the second smallest arrival, is what turns the field into a
+         signed function per civilization: inside cell i the wall sits where
+         tau_i catches up with the runner-up, so f_i = tau_i - tau2 crosses zero
+         exactly on the wall and marching cubes can find it. */
+      const tau2 = new Float32Array(N * N * N);
       const owner = new Int32Array(N * N * N);
       tau.fill(Infinity);
+      tau2.fill(Infinity);
       owner.fill(-1);
       const M = civs ? civs.length : 0;
-      if (!M || !(s > 0)) return { res: N, tau: tau, owner: owner, U: 0, visits: 0 };
+      if (!M || !(s > 0)) {
+        return { res: N, tau: tau, tau2: tau2, owner: owner, bbox: new Int32Array(0),
+                 home: new Int32Array(0), U: 0, visits: 0 };
+      }
 
       const cx = new Float64Array(M), cy = new Float64Array(M), cz = new Float64Array(M), ct = new Float64Array(M);
       for (let j = 0; j < M; j++) { cx[j] = civs[j].x; cy[j] = civs[j].y; cz[j] = civs[j].z; ct[j] = civs[j].t; }
@@ -818,9 +832,14 @@
 
       const wrap = (i) => ((i % N) + N) % N;
       let visits = 0;
+      /* Three voxels of slack on top of the radius that first arrival needs.
+         tau2 has to be right in the shell around every wall, and the runner-up
+         there arrives up to a voxel or two after U; without the slack the
+         isosurface would snap to the grid again. */
+      const slack = 3 * h;
       for (let j = 0; j < M; j++) {
         const tj = ct[j];
-        const R = s * (U - tj);
+        const R = s * (U - tj) + slack;
         if (!(R >= 0)) continue;
         /* A range wider than the box would visit voxels twice, and the
            unwrapped offsets would stop being minimum-image; clamp it to exactly
@@ -856,15 +875,55 @@
               const d2 = dyz2 + dx * dx;
               if (d2 > R2) continue;
               const idx = yo + wrap(i);
-              if (tau[idx] <= tj) continue;          // already claimed for good
+              /* tau2, not tau: a civ born after the winner can still be the
+                 runner-up. Only a birth time past the runner-up settles both. */
+              if (tau2[idx] <= tj) continue;
               visits++;
               const tv = tj + Math.sqrt(d2) * invS;
-              if (tv < tau[idx]) { tau[idx] = tv; owner[idx] = j; }
+              if (tv < tau[idx]) { tau2[idx] = tau[idx]; tau[idx] = tv; owner[idx] = j; }
+              else if (tv < tau2[idx]) { tau2[idx] = tv; }
             }
           }
         }
       }
-      return { res: N, tau: tau, owner: owner, U: U, visits: visits };
+
+      /* Per-civ bounding box of the owned voxels, in UNWRAPPED index space
+         around the civ's own voxel. Additively weighted Voronoi cells are
+         star shaped about their site, so a cell is always one contiguous block
+         in those coordinates even when it straddles a box face, and the wall
+         extraction can then work on one small region per civilization instead
+         of the whole grid. */
+      const home = new Int32Array(M * 3);
+      for (let j = 0; j < M; j++) {
+        home[j * 3] = Math.floor(cx[j] / h);
+        home[j * 3 + 1] = Math.floor(cy[j] / h);
+        home[j * 3 + 2] = Math.floor(cz[j] / h);
+      }
+      const bbox = new Int32Array(M * 6);
+      for (let j = 0; j < M; j++) {
+        bbox[j * 6] = bbox[j * 6 + 2] = bbox[j * 6 + 4] = 1 << 29;
+        bbox[j * 6 + 1] = bbox[j * 6 + 3] = bbox[j * 6 + 5] = -(1 << 29);
+      }
+      const fold = (d) => (d > N / 2 ? d - N : (d < -N / 2 ? d + N : d));
+      for (let l = 0; l < N; l++) {
+        for (let k = 0; k < N; k++) {
+          for (let i = 0; i < N; i++) {
+            const j = owner[i + N * (k + N * l)];
+            if (j < 0) continue;
+            const ai = home[j * 3] + fold(i - home[j * 3]);
+            const ak = home[j * 3 + 1] + fold(k - home[j * 3 + 1]);
+            const al = home[j * 3 + 2] + fold(l - home[j * 3 + 2]);
+            const b = j * 6;
+            if (ai < bbox[b]) bbox[b] = ai;
+            if (ai > bbox[b + 1]) bbox[b + 1] = ai;
+            if (ak < bbox[b + 2]) bbox[b + 2] = ak;
+            if (ak > bbox[b + 3]) bbox[b + 3] = ak;
+            if (al < bbox[b + 4]) bbox[b + 4] = al;
+            if (al > bbox[b + 5]) bbox[b + 5] = al;
+          }
+        }
+      }
+      return { res: N, tau: tau, tau2: tau2, owner: owner, bbox: bbox, home: home, U: U, visits: visits };
     }
 
     /* Static wall mesh along the impingement surfaces. Once two fronts have met
@@ -874,97 +933,166 @@
        appears when the LATER of the two fronts gets there, hence wallTime as the
        max of the two arrival times. Voxel-faced and therefore slightly blocky,
        which is what the resolution control is for. */
-    function buildWalls(field, civs, L, maxQuads) {
-      const N = field.res, h = L / N, half = L / 2;
-      const tau = field.tau, owner = field.owner;
-      const dirs = [1, N, N * N];                    // +x, +y, +z neighbour strides
+    /* Periodic trilinear sample of a scalar grid, in simulation coordinates. */
+    function sampleGrid(g, N, L, x, y, z) {
+      const h = L / N;
+      const gx = x / h - 0.5, gy = y / h - 0.5, gz = z / h - 0.5;
+      const i0 = Math.floor(gx), k0 = Math.floor(gy), l0 = Math.floor(gz);
+      const fx = gx - i0, fy = gy - k0, fz = gz - l0;
+      const w = (i) => ((i % N) + N) % N;
+      const ia = w(i0), ib = w(i0 + 1), ka = w(k0), kb = w(k0 + 1), la = w(l0), lb = w(l0 + 1);
+      const at = (i, k, l) => g[i + N * (k + N * l)];
+      const c00 = at(ia, ka, la) * (1 - fx) + at(ib, ka, la) * fx;
+      const c10 = at(ia, kb, la) * (1 - fx) + at(ib, kb, la) * fx;
+      const c01 = at(ia, ka, lb) * (1 - fx) + at(ib, ka, lb) * fx;
+      const c11 = at(ia, kb, lb) * (1 - fx) + at(ib, kb, lb) * fx;
+      return (c00 * (1 - fy) + c10 * fy) * (1 - fz) + (c01 * (1 - fy) + c11 * fy) * fz;
+    }
 
-      let quads = 0;
-      const count = (i, k, l, idx) => {
-        const a = owner[idx];
-        if (a < 0) return;
-        for (let d = 0; d < 3; d++) {
-          const w = (d === 0 ? (i + 1 === N ? idx + 1 - N : idx + 1)
-                  : d === 1 ? (k + 1 === N ? idx + N - N * N : idx + N)
-                            : (l + 1 === N ? idx + N * N - N * N * N : idx + N * N));
-          if (owner[w] !== a && owner[w] >= 0) quads++;
-        }
+    /* Smooth wall shells, one closed surface per civilization.
+       Once two fronts have met they discard each other in the shader and the
+       interface would simply vanish, so the boundary itself has to be drawn.
+       The earlier version emitted the voxel faces between differing owners,
+       which is exact but reads as a staircase. This extracts an isosurface
+       instead:
+
+         f_i(p) = tau_i(p) - (owner(p) == i ? tau2(p) : tau(p))
+
+       with tau_i(p) = t_i + d(p, x_i)/s computed exactly per sample. Inside
+       cell i, f_i = tau - tau2 <= 0. Outside, f_i = tau_i - tau > 0, because
+       tau is the minimum and i did not win. On the wall tau_i = tau = tau2 and
+       f_i is zero, so the zero level set is precisely the wall of cell i, and
+       the sign is right by construction no matter how coarse the grid is; only
+       the position of the crossing depends on the resolution.
+
+       The shared marching-cubes module takes "below iso is inside" and winds
+       triangles outward from the inside, so each shell comes out facing away
+       from its own cell for free. The wall between i and j therefore becomes
+       two coincident surfaces, one per side, each carrying its own colour, and
+       front-face rendering shows whichever side the camera is on. That is what
+       makes the picture read: you only ever see the near cell's colour. */
+    function buildWalls(field, civs, s, L, maxTris) {
+      const N = field.res, h = L / N, half = L / 2, invS = 1 / s, hl = L / 2;
+      const tau = field.tau, tau2 = field.tau2, owner = field.owner;
+      const bbox = field.bbox, home = field.home;
+      const M = civs ? civs.length : 0;
+      const MARGIN = 2;
+      const empty = {
+        tris: 0, verts: 0, total: 0, capped: false, dropped: 0,
+        position: new Float32Array(0), wallTime: new Float32Array(0),
+        hue: new Uint8Array(0), index: new Uint32Array(0)
       };
-      for (let l = 0; l < N; l++) for (let k = 0; k < N; k++) for (let i = 0; i < N; i++) count(i, k, l, i + N * (k + N * l));
+      if (!M || !(s > 0) || !globalThis.MarchingCubes) return empty;
 
-      /* Indexed, four vertices per quad rather than six, so the cap can sit
-         high enough that a dense run still gets its whole mosaic: about 100
-         bytes per quad all told. */
-      const capped = quads > maxQuads;
-      const nq = capped ? maxQuads : quads;
-      const pos = new Float32Array(nq * 12);
-      const wt = new Float32Array(nq * 4);
-      const index = new Uint32Array(nq * 6);
-      const pairs = new Int32Array(nq * 2);
-      let q = 0;
+      const parts = [];
+      let totalTris = 0, totalVerts = 0, dropped = 0, capped = false, offered = 0;
+      const wrap = (i) => ((i % N) + N) % N;
+      let fbuf = null;
 
-      const emit = (corners, ida, idb, ja, jb) => {
-        if (q >= nq) return;
-        const p = q * 12, w = q * 4, base = q * 4;
-        const tw = Math.max(tau[ida], tau[idb]);
-        for (let v = 0; v < 4; v++) {
-          const cn = corners[v];
-          pos[p + v * 3] = cn[0] - half;
-          pos[p + v * 3 + 1] = cn[1] - half;
-          pos[p + v * 3 + 2] = cn[2] - half;
-          wt[w + v] = tw;
-        }
-        const o = q * 6;
-        index[o] = base; index[o + 1] = base + 1; index[o + 2] = base + 2;
-        index[o + 3] = base; index[o + 4] = base + 2; index[o + 5] = base + 3;
-        /* only the pair of owners is kept; the vertex colours are generated
-           from it on upload, so a theme switch can regenerate them without
-           touching the geometry. */
-        pairs[q * 2] = civs[ja].id;
-        pairs[q * 2 + 1] = civs[jb].id;
-        q++;
-      };
+      for (let j = 0; j < M && !capped; j++) {
+        const b = j * 6;
+        if (bbox[b] > bbox[b + 1]) continue;                   // owns no voxel
+        const span = (lo, hi) => {
+          let a = lo - MARGIN, z = hi + MARGIN;
+          if (z - a + 1 > N + 2 * MARGIN) z = a + N + 2 * MARGIN - 1;
+          return [a, z];
+        };
+        const [i0, i1] = span(bbox[b], bbox[b + 1]);
+        const [k0, k1] = span(bbox[b + 2], bbox[b + 3]);
+        const [l0, l1] = span(bbox[b + 4], bbox[b + 5]);
+        const nx = i1 - i0 + 1, ny = k1 - k0 + 1, nz = l1 - l0 + 1;
+        const need = nx * ny * nz;
+        if (!fbuf || fbuf.length < need) fbuf = new Float32Array(need);
 
-      for (let l = 0; l < N && q < nq; l++) {
-        for (let k = 0; k < N && q < nq; k++) {
-          for (let i = 0; i < N && q < nq; i++) {
-            const idx = i + N * (k + N * l);
-            const a = owner[idx];
-            if (a < 0) continue;
-            const x0 = i * h, x1 = x0 + h, y0 = k * h, y1 = y0 + h, z0 = l * h, z1 = z0 + h;
-
-            let w = i + 1 === N ? idx + 1 - N : idx + 1;
-            if (owner[w] >= 0 && owner[w] !== a) {
-              emit([[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], idx, w, a, owner[w]);
-            }
-            w = k + 1 === N ? idx + N - N * N : idx + N;
-            if (owner[w] >= 0 && owner[w] !== a) {
-              emit([[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]], idx, w, a, owner[w]);
-            }
-            w = l + 1 === N ? idx + N * N - N * N * N : idx + N * N;
-            if (owner[w] >= 0 && owner[w] !== a) {
-              emit([[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], idx, w, a, owner[w]);
+        const jx = civs[j].x, jy = civs[j].y, jz = civs[j].z, jt = civs[j].t;
+        let w = 0;
+        for (let l = l0; l <= l1; l++) {
+          const pz = (l + 0.5) * h;
+          let dz = pz - jz;
+          if (dz > hl) dz -= L; else if (dz < -hl) dz += L;
+          const dz2 = dz * dz;
+          const lw = wrap(l) * N * N;
+          for (let k = k0; k <= k1; k++) {
+            const py = (k + 0.5) * h;
+            let dy = py - jy;
+            if (dy > hl) dy -= L; else if (dy < -hl) dy += L;
+            const dyz2 = dz2 + dy * dy;
+            const kw = lw + wrap(k) * N;
+            for (let i = i0; i <= i1; i++) {
+              const px = (i + 0.5) * h;
+              let dx = px - jx;
+              if (dx > hl) dx -= L; else if (dx < -hl) dx += L;
+              const idx = kw + wrap(i);
+              const ti = jt + Math.sqrt(dyz2 + dx * dx) * invS;
+              const other = owner[idx] === j ? tau2[idx] : tau[idx];
+              /* an unknown runner-up means "deep inside", which is the same
+                 side of the surface, just further from it */
+              fbuf[w++] = isFinite(other) ? ti - other : -1e3;
             }
           }
         }
+
+        const mc = MarchingCubes.extract(fbuf.subarray(0, need), nx, ny, nz, {
+          origin: [(i0 + 0.5) * h, (k0 + 0.5) * h, (l0 + 0.5) * h], step: h
+        });
+        const nTri = mc.faces.length / 3;
+        offered += nTri;
+        if (!nTri) continue;
+        if (totalTris + nTri > maxTris) { capped = true; dropped = M - j; break; }
+        parts.push({ mc: mc, j: j });
+        totalTris += nTri;
+        totalVerts += mc.vertices.length / 3;
       }
-      return { quads: q, total: quads, capped: capped, position: pos, wallTime: wt, index: index, pairs: pairs };
+
+      const pos = new Float32Array(totalVerts * 3);
+      const wt = new Float32Array(totalVerts);
+      const hue = new Uint8Array(totalVerts);
+      const index = new Uint32Array(totalTris * 3);
+      let vo = 0, io = 0;
+      for (const part of parts) {
+        const v = part.mc.vertices, f = part.mc.faces;
+        const nv = v.length / 3;
+        const hu = ((civs[part.j].id % 12) + 12) % 12;
+        for (let i = 0; i < nv; i++) {
+          const x = v[i * 3], y = v[i * 3 + 1], z = v[i * 3 + 2];
+          pos[(vo + i) * 3] = x - half;
+          pos[(vo + i) * 3 + 1] = y - half;
+          pos[(vo + i) * 3 + 2] = z - half;
+          /* the wall exists once the second front gets there, and on the wall
+             tau equals tau2, so the interpolated first-arrival is the right
+             switch-on time */
+          wt[vo + i] = sampleGrid(tau, N, L, x, y, z);
+          hue[vo + i] = hu;
+        }
+        for (let i = 0; i < f.length; i++) index[io + i] = f[i] + vo;
+        vo += nv;
+        io += f.length;
+      }
+
+      return {
+        tris: totalTris, verts: totalVerts, total: offered, capped: capped, dropped: dropped,
+        position: pos, wallTime: wt, hue: hue, index: index
+      };
     }
 
-    /* Per-vertex wall colours: the two owners blended half and half. Rebuilt
-       rather than stored, so a live theme switch can re-tint the mosaic.
-       Bytes, not floats: every vertex of a quad carries the same colour, so
-       there is no gradient for the quantisation to band, and it saves three
-       quarters of the buffer. */
-    function wallColors(w) {
-      const out = new Uint8Array(w.quads * 12);
-      for (let q = 0; q < w.quads; q++) {
-        const ca = civColor(w.pairs[q * 2]).lin, cb = civColor(w.pairs[q * 2 + 1]).lin;
-        const r = Math.round(Math.min(1, (ca[0] + cb[0]) * 0.5) * 255);
-        const g = Math.round(Math.min(1, (ca[1] + cb[1]) * 0.5) * 255);
-        const b = Math.round(Math.min(1, (ca[2] + cb[2]) * 0.5) * 255);
-        const o = q * 12;
-        for (let v = 0; v < 4; v++) { out[o + v * 3] = r; out[o + v * 3 + 1] = g; out[o + v * 3 + 2] = b; }
+    /* Per-vertex wall colours: the owning civilization's colour, darkened, so a
+       seam reads as a seam against the bubble it belongs to. Rebuilt from the
+       hue index rather than stored, so a live theme switch can re-tint the
+       mosaic without touching the geometry. Bytes, not floats: a shell is one
+       flat colour, so there is no gradient for the quantisation to band. */
+    function wallColors(w, darken) {
+      const k = darken == null ? 0.62 : darken;
+      const lut = new Uint8Array(12 * 3);
+      for (let i = 0; i < 12; i++) {
+        const c = CIV_COLORS[i].lin;
+        lut[i * 3] = Math.round(Math.min(1, c[0] * k) * 255);
+        lut[i * 3 + 1] = Math.round(Math.min(1, c[1] * k) * 255);
+        lut[i * 3 + 2] = Math.round(Math.min(1, c[2] * k) * 255);
+      }
+      const out = new Uint8Array(w.verts * 3);
+      for (let i = 0; i < w.verts; i++) {
+        const o = w.hue[i] * 3;
+        out[i * 3] = lut[o]; out[i * 3 + 1] = lut[o + 1]; out[i * 3 + 2] = lut[o + 2];
       }
       return out;
     }
@@ -991,14 +1119,45 @@
       'vGaW = (modelMatrix * gaWorld).xyz;'
     ].join('\n');
 
-    /* Thin fresnel shell on a MeshBasicMaterial, cut along the impingement
-       surfaces. Three reasons for the hand written varyings: MeshBasic only
-       fills its own vNormal when an env map or skinning is on, instanceColor
-       never reaches the fragment stage unless vertexColors is set (which would
-       then also demand a per-vertex colour attribute the geometry does not
-       have), and the world position is needed to look the arrival field up.
+    /* Uniform declarations shared by both patched materials. */
+    const GA_UNIFORM_DECL = [
+      'uniform sampler3D uTau;', 'uniform float uL;', 'uniform float uTime;',
+      'uniform float uEps;', 'uniform float uHasField;', 'uniform float uSolid;',
+      'uniform float uCrop;', 'uniform float uR;', 'uniform float uShrink;'
+    ].join('\n');
 
-       The discard is the whole Johnson-Mehl correction. A fragment on civ i's
+    const GA_UNIFORM_NAMES = ['uTau', 'uL', 'uTime', 'uEps', 'uHasField', 'uSolid', 'uCrop', 'uR', 'uShrink'];
+    const bindUniforms = (shader, uni) => {
+      for (const n of GA_UNIFORM_NAMES) shader.uniforms[n] = uni[n];
+    };
+
+    /* The sphere of view. Everything outside the box's inscribed sphere is
+       simply not drawn, which is the crop the original animation uses and the
+       reason it reads at all: no corner geometry, no silhouette fighting the
+       frame. Applied per fragment rather than with a clipping plane because a
+       sphere is not a plane. */
+    const GA_CROP = 'if (uCrop > 0.5 && length(vGaW) > uR) discard;';
+
+    /* One fixed light in VIEW space, so the idle rotation turns the model under
+       a steady lamp instead of dragging the highlight around with it. Ambient
+       floor keeps the far side readable. */
+    const GA_LAMBERT =
+      'float gaLam = 0.32 + 0.68 * max(dot(normalize(vGaN), normalize(vec3(0.35, 0.62, 0.70))), 0.0);';
+
+    /* The cut faces. A crop sphere slicing an opaque bubble exposes its inside,
+       which without this reads as a hole. Painting back faces in a flat darker
+       version of the same colour fakes a filled cut exactly like the reference
+       animation's flat patches on the view sphere. */
+    const GA_BACKFACE = 'if (!gl_FrontFacing) gaLam = 0.55;';
+
+    /* Bubbles on a MeshBasicMaterial, cut along the impingement surfaces.
+       Three reasons for the hand written varyings: MeshBasic only fills its own
+       vNormal when an env map or skinning is on, instanceColor never reaches the
+       fragment stage unless vertexColors is set (which would then also demand a
+       per-vertex colour attribute the geometry does not have), and the world
+       position is needed for both the arrival-field lookup and the crop.
+
+       The tau discard is the Johnson-Mehl correction. A fragment on civ i's
        sphere surface at display time t is, by construction of the sphere radius
        s(t - t_i), a point that i reaches exactly at t. If the first-arrival
        field says someone got there meaningfully earlier, then i's front never
@@ -1006,60 +1165,93 @@
        fract(worldPos / L) with a repeating texture is what makes the periodic
        ghost images look up the right cell for free.
 
-       Per-instance depth sorting inside an InstancedMesh is impossible, so the
-       bubbles are drawn in birth order with depthWrite off. The thin shell hides
-       almost all of the resulting ordering artifacts; the rest is accepted. */
+       Two looks share the shader. Solid (the default) is opaque and shaded, and
+       the depth buffer sorts everything, which is the whole reason it looks
+       calm. X-ray keeps the old fresnel shell: per-instance depth sorting inside
+       an InstancedMesh is impossible, so those are drawn in birth order with
+       depthWrite off and the thin shell hides most of the ordering artifacts. */
     function makeShellPatch(uni) {
       return function (shader) {
-        shader.uniforms.uTau = uni.uTau;
-        shader.uniforms.uL = uni.uL;
-        shader.uniforms.uTime = uni.uTime;
-        shader.uniforms.uEps = uni.uEps;
-        shader.uniforms.uHasField = uni.uHasField;
+        bindUniforms(shader, uni);
         shader.vertexShader = shader.vertexShader
           .replace('#include <common>', '#include <common>\n' + GA_VARYINGS)
           .replace('#include <project_vertex>', '#include <project_vertex>\n' + GA_VERT_TAIL);
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS +
-            '\nuniform sampler3D uTau;\nuniform float uL;\nuniform float uTime;\nuniform float uEps;\nuniform float uHasField;')
+          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS + '\n' + GA_UNIFORM_DECL)
           .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
+            GA_CROP + '\n' +
             'if (uHasField > 0.5) {\n' +
             '  vec3 gaP = fract((vGaW + vec3(uL * 0.5)) / uL);\n' +
             '  if (texture(uTau, gaP).r < uTime - uEps) discard;\n' +
             '}\n' +
-            'float gaF = pow(1.0 - abs(dot(normalize(vGaN), normalize(vGaV))), 2.5);\n' +
-            'vec4 diffuseColor = vec4( diffuse * vGaC, opacity * mix(0.06, 0.5, gaF) );');
+            'vec4 diffuseColor;\n' +
+            'if (uSolid > 0.5) {\n' +
+            '  ' + GA_LAMBERT + '\n' +
+            '  ' + GA_BACKFACE + '\n' +
+            '  diffuseColor = vec4( diffuse * vGaC * gaLam, 1.0 );\n' +
+            '} else {\n' +
+            '  float gaF = pow(1.0 - abs(dot(normalize(vGaN), normalize(vGaV))), 2.5);\n' +
+            '  diffuseColor = vec4( diffuse * vGaC, opacity * mix(0.06, 0.5, gaF) );\n' +
+            '}');
       };
     }
 
-    /* The frozen walls. Same shared time uniform, one extra vertex attribute:
-       the wall does not exist before the later of its two fronts arrives. */
+    /* The frozen walls. Same uniforms, one extra vertex attribute: a wall does
+       not exist before the second of its two fronts arrives. Its own normals
+       come from the geometry, so the same lambert term applies.
+
+       uShrink is what keeps the picture clean. The wall between cells i and j is
+       two surfaces, i's shell and j's shell, and they are not merely close: near
+       that wall f_j = -f_i at every grid point, so marching cubes puts both
+       crossings at the identical interpolated position and the two are exactly
+       coincident. Opaque and coincident means z-fighting. Pulling every shell a
+       fraction of a voxel back into its own cell separates them by a distance
+       far below what any pixel can show, and the fight is gone. */
     function makeWallPatch(uni) {
       return function (shader) {
-        shader.uniforms.uTime = uni.uTime;
+        bindUniforms(shader, uni);
         shader.vertexShader = shader.vertexShader
-          .replace('#include <common>', '#include <common>\nattribute float wallTime;\nvarying float vGaWT;')
-          .replace('#include <project_vertex>', '#include <project_vertex>\nvGaWT = wallTime;');
+          .replace('#include <common>',
+            '#include <common>\nattribute float wallTime;\nvarying float vGaWT;\nvarying vec3 vGaN;\nvarying vec3 vGaW;\nuniform float uShrink;')
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed -= normal * uShrink;')
+          .replace('#include <project_vertex>',
+            '#include <project_vertex>\nvGaWT = wallTime;\nvGaN = normalize(normalMatrix * normal);\n' +
+            'vGaW = (modelMatrix * vec4(transformed, 1.0)).xyz;');
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying float vGaWT;')
+          .replace('#include <common>',
+            '#include <common>\nvarying float vGaWT;\nvarying vec3 vGaN;\nvarying vec3 vGaW;\n' + GA_UNIFORM_DECL)
           .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
-            'if (vGaWT > uTime) discard;\nvec4 diffuseColor = vec4( diffuse, opacity );');
+            'if (vGaWT > uTime) discard;\n' + GA_CROP + '\n' +
+            'vec4 diffuseColor;\n' +
+            'if (uSolid > 0.5) {\n' +
+            '  ' + GA_LAMBERT + '\n' +
+            '  ' + GA_BACKFACE + '\n' +
+            '  diffuseColor = vec4( diffuse * gaLam, 1.0 );\n' +
+            '} else {\n' +
+            '  diffuseColor = vec4( diffuse, opacity );\n' +
+            '}');
       };
     }
 
-    /* Same instanceColor problem, no shell: the origin dots stay opaque. */
-    function patchDots(shader) {
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vGaC;')
-        .replace('#include <project_vertex>',
-          '#include <project_vertex>\n#ifdef USE_INSTANCING_COLOR\n  vGaC = instanceColor;\n#else\n  vGaC = vec3(1.0);\n#endif');
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vGaC;')
-        .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
-          'vec4 diffuseColor = vec4( diffuse * vGaC, opacity );');
+    /* Same instanceColor problem, no shell: the origin dots stay opaque, and
+       they take the crop so that nothing floats outside the sphere of view. */
+    function makeDotPatch(uni) {
+      return function (shader) {
+        bindUniforms(shader, uni);
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <common>', '#include <common>\nvarying vec3 vGaC;\nvarying vec3 vGaW;')
+          .replace('#include <project_vertex>',
+            '#include <project_vertex>\n#ifdef USE_INSTANCING_COLOR\n  vGaC = instanceColor;\n#else\n  vGaC = vec3(1.0);\n#endif\n' +
+            'vec4 gaWorld = vec4(transformed, 1.0);\n#ifdef USE_INSTANCING\n  gaWorld = instanceMatrix * gaWorld;\n#endif\n' +
+            'vGaW = (modelMatrix * gaWorld).xyz;');
+        shader.fragmentShader = shader.fragmentShader
+          .replace('#include <common>', '#include <common>\nvarying vec3 vGaC;\nvarying vec3 vGaW;\n' + GA_UNIFORM_DECL)
+          .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
+            GA_CROP + '\nvec4 diffuseColor = vec4( diffuse * vGaC, opacity );');
+      };
     }
 
-    function Preview({ version, t, showObs, obs, highlight, visKey, visIds, onCapped }) {
+    function Preview({ version, t, showObs, obs, highlight, visKey, visIds, onCapped, solid, sphere }) {
       const hostRef = useRef(null);
       const stateRef = useRef(null);
       const rebuildRef = useRef(null);
@@ -1089,7 +1281,25 @@
           const controls = new window.GA_OrbitControls(camera, renderer.domElement);
           controls.target.set(0, 0, 0);
           controls.enableDamping = true;
+          /* Slow idle turn, because a still 3D box reads as a picture and a
+             turning one reads as a volume. It yields to the pointer at once and
+             comes back four seconds after the last drag. */
+          controls.autoRotate = true;
+          controls.autoRotateSpeed = 0.4;
           controls.update();
+          const onDragStart = () => {
+            const st = stateRef.current;
+            if (st && st.idle) { clearTimeout(st.idle); st.idle = 0; }
+            controls.autoRotate = false;
+          };
+          const onDragEnd = () => {
+            const st = stateRef.current;
+            if (!st) return;
+            if (st.idle) clearTimeout(st.idle);
+            st.idle = setTimeout(() => { controls.autoRotate = true; }, 4000);
+          };
+          controls.addEventListener('start', onDragStart);
+          controls.addEventListener('end', onDragEnd);
 
           const group = new THREE.Group();
           scene.add(group);
@@ -1123,26 +1333,43 @@
 
           const uni = {
             uTau: { value: dummy }, uL: { value: 1 }, uTime: { value: 0 },
-            uEps: { value: 0.5 }, uHasField: { value: 0 }
+            uEps: { value: 0.5 }, uHasField: { value: 0 },
+            uSolid: { value: 1 }, uCrop: { value: 1 }, uR: { value: 0.5 },
+            uShrink: { value: 0 }
           };
 
-          const shellMat = new THREE.MeshBasicMaterial({
-            color: 0xffffff, transparent: true, depthWrite: false, side: THREE.FrontSide
-          });
+          const shellMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
           shellMat.onBeforeCompile = makeShellPatch(uni);
           shellMat.clippingPlanes = planes;
 
-          const wallMat = new THREE.MeshBasicMaterial({
-            color: 0xffffff, vertexColors: true, transparent: true, opacity: 0.35,
-            depthWrite: false, side: THREE.DoubleSide
-          });
-          /* deliberately NOT clipped: the walls are built inside [0, L] anyway,
-             and the ones on the box faces sit exactly on a clipping plane,
-             where a rounding error would punch hairline gaps into the mosaic. */
+          /* The wall shells stay inside their own cells, but a cell that
+             straddles a box face is extracted as one block in unwrapped
+             coordinates, so part of it lands outside the box. The same six
+             planes that cut the ghost bubbles cut that off. */
+          const wallMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
           wallMat.onBeforeCompile = makeWallPatch(uni);
+          wallMat.clippingPlanes = planes;
 
           const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-          dotMat.onBeforeCompile = patchDots;
+          dotMat.onBeforeCompile = makeDotPatch(uni);
+
+          /* Solid is the default look and the reason it reads: opaque surfaces,
+             depth buffer on, no blending, so only the nearest surface is ever
+             visible. X-ray restores the translucent shells. */
+          const applyMode = (solid) => {
+            uni.uSolid.value = solid ? 1 : 0;
+            shellMat.transparent = !solid;
+            shellMat.depthWrite = true;
+            shellMat.side = solid ? THREE.DoubleSide : THREE.FrontSide;
+            shellMat.opacity = 1;
+            wallMat.transparent = !solid;
+            wallMat.depthWrite = true;
+            wallMat.opacity = solid ? 1 : 0.35;
+            wallMat.side = THREE.DoubleSide;
+            if (!solid) { shellMat.depthWrite = false; wallMat.depthWrite = false; }
+            shellMat.needsUpdate = true;
+            wallMat.needsUpdate = true;
+          };
 
           const shellGeo = new THREE.IcosahedronGeometry(1, 2);
           const dotGeo = new THREE.IcosahedronGeometry(1, 1);
@@ -1164,12 +1391,42 @@
           obsMesh.visible = false;
           group.add(obsMesh);
 
+          /* Graticule for the sphere of view: three parallels and four
+             meridians on the unit sphere, scaled to the crop radius. It stands
+             in for the box wireframe, which would only draw a frame around a
+             shape that no longer has corners. */
+          const gratPts = [];
+          const ring = (fn, steps) => {
+            let prev = null;
+            for (let a = 0; a <= steps; a++) {
+              const p = fn(a / steps * Math.PI * 2);
+              if (prev) gratPts.push(prev[0], prev[1], prev[2], p[0], p[1], p[2]);
+              prev = p;
+            }
+          };
+          for (const lat of [-Math.PI / 4, 0, Math.PI / 4]) {
+            const r = Math.cos(lat), y = Math.sin(lat);
+            ring((a) => [r * Math.cos(a), y, r * Math.sin(a)], 96);
+          }
+          for (let m = 0; m < 4; m++) {
+            const ang = m * Math.PI / 4;
+            ring((a) => [Math.cos(a) * Math.cos(ang), Math.sin(a), Math.cos(a) * Math.sin(ang)], 96);
+          }
+          const gratGeo = new THREE.BufferGeometry();
+          gratGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(gratPts), 3));
+          const gratMat = new THREE.LineBasicMaterial({
+            color: new THREE.Color().setStyle(COL.hairline || '#1a2a3a'), transparent: true, opacity: 0.75
+          });
+          const graticule = new THREE.LineSegments(gratGeo, gratMat);
+          group.add(graticule);
+
           stateRef.current = {
             THREE: THREE, renderer: renderer, scene: scene, camera: camera, controls: controls,
             group: group, boxLines: boxLines, planes: planes, bubbles: bubbles, dots: dots,
             obsMesh: obsMesh, obsMat: obsMat, shellMat: shellMat, dotMat: dotMat, wallMat: wallMat,
-            shellGeo: shellGeo, dotGeo: dotGeo, lastL: null,
-            uni: uni, dummy: dummy, tex: null, walls: null, builtVersion: -1
+            shellGeo: shellGeo, dotGeo: dotGeo, graticule: graticule, gratMat: gratMat,
+            lastL: null, lastMode: null, applyMode: applyMode,
+            uni: uni, dummy: dummy, tex: null, walls: null, builtVersion: -1, idle: 0
           };
 
           let raf;
@@ -1210,6 +1467,7 @@
           if (!st) return;
           st.boxLines.material.color.setStyle(COL.border || '#374656');
           st.obsMat.color.setStyle(COL.emph || '#e1e8f0');
+          st.gratMat.color.setStyle(COL.hairline || '#1a2a3a');
           st.themeDirty = true;                 // makes rebuild re-tint the walls too
           if (rebuildRef.current) rebuildRef.current();
         };
@@ -1223,9 +1481,12 @@
           if (st) {
             st.stop && st.stop();
             st.ro && st.ro.disconnect();
+            if (st.idle) { clearTimeout(st.idle); st.idle = 0; }
             st.controls.dispose();
             st.boxLines.geometry.dispose();
             st.boxLines.material.dispose();
+            st.graticule.geometry.dispose();
+            st.gratMat.dispose();
             st.obsMesh.geometry.dispose();
             st.obsMat.dispose();
             st.shellGeo.dispose();
@@ -1254,6 +1515,7 @@
 
         if (st.lastL !== L) {
           st.boxLines.scale.set(L, L, L);
+          st.graticule.scale.setScalar(half);
           for (let i = 0; i < st.planes.length; i++) st.planes[i].constant = half;
           st.camera.position.setLength(1.6 * L);
           st.camera.near = 0.02 * L;
@@ -1262,6 +1524,11 @@
           st.controls.update();
           st.lastL = L;
         }
+        st.uni.uR.value = half;
+        st.uni.uCrop.value = sphere ? 1 : 0;
+        st.boxLines.visible = !sphere;
+        st.graticule.visible = !!sphere;
+        if (st.lastMode !== solid) { st.applyMode(solid); st.lastMode = solid; }
 
         /* Upload the arrival field and rebuild the wall mesh once per model,
            not per displayed time. R16F is linearly filterable in core WebGL2,
@@ -1295,18 +1562,22 @@
           }
           st.uni.uL.value = L;
           st.uni.uEps.value = model.eps;
+          st.uni.uShrink.value = 0.15 * L / model.p.fieldRes;
 
           if (st.walls) { st.group.remove(st.walls); st.walls.geometry.dispose(); st.walls = null; }
           const w = model.walls;
-          if (w && w.quads > 0) {
+          if (w && w.tris > 0) {
             const geo = new THREE.BufferGeometry();
-            geo.setAttribute('position', new THREE.BufferAttribute(w.position.subarray(0, w.quads * 12), 3));
+            geo.setAttribute('position', new THREE.BufferAttribute(w.position, 3));
             geo.setAttribute('color', new THREE.BufferAttribute(wallColors(w), 3, true));
-            geo.setAttribute('wallTime', new THREE.BufferAttribute(w.wallTime.subarray(0, w.quads * 4), 1));
-            geo.setIndex(new THREE.BufferAttribute(w.index.subarray(0, w.quads * 6), 1));
+            geo.setAttribute('wallTime', new THREE.BufferAttribute(w.wallTime, 1));
+            geo.setIndex(new THREE.BufferAttribute(w.index, 1));
+            /* Smooth normals from the mesh itself. Each civ's shell is welded
+               within itself and separate from every other, so averaging over
+               shared vertices smooths a shell without bleeding across a seam. */
+            geo.computeVertexNormals();
             const mesh = new THREE.Mesh(geo, st.wallMat);
             mesh.frustumCulled = false;
-            mesh.renderOrder = -1;                 // behind the translucent shells
             st.group.add(mesh);
             st.walls = mesh;
           }
@@ -1377,7 +1648,7 @@
         }
 
         if (st.wasCapped !== capped) { st.wasCapped = capped; onCapped(capped); }
-      }, [version, t, showObs, obs, highlight, visKey, onCapped]);
+      }, [version, t, showObs, obs, highlight, visKey, onCapped, solid, sphere]);
 
       rebuildRef.current = rebuild;
       useEffect(() => { rebuild(); }, [rebuild]);
@@ -1588,6 +1859,8 @@
       const [obsMode, setObsMode] = useState('center');
       const [obsSeed, setObsSeed] = useState(1);
       const [highlight, setHighlight] = useState(true);
+      const [solid, setSolid] = useState(true);     // solid is the default look
+      const [sphere, setSphere] = useState(true);   // sphere of view, as in the original animation
       const [dispCapped, setDispCapped] = useState(false);
       const [, themeBump] = useState(0);
 
@@ -1730,7 +2003,19 @@
           </p>
 
           <${Preview} version=${version} t=${tq} showObs=${obsOn} obs=${obs}
-                      highlight=${highlight} visKey=${visKey} visIds=${visIds} onCapped=${onCapped} />
+                      highlight=${highlight} visKey=${visKey} visIds=${visIds} onCapped=${onCapped}
+                      solid=${solid} sphere=${sphere} />
+          <div className="ga-playrow" style=${{ marginTop: 8, marginBottom: 0 }}>
+            <span style=${{ fontSize: 12, color: 'var(--tool-label)' }}>View</span>
+            <${Seg} options=${[{ id: true, label: 'Solid' }, { id: false, label: 'X-ray' }]}
+                    value=${solid} onChange=${setSolid} />
+            <span style=${{ fontSize: 12, color: 'var(--tool-label)', marginLeft: 8 }}>Crop</span>
+            <${Seg} options=${[{ id: true, label: 'Sphere' }, { id: false, label: 'Cube' }]}
+                    value=${sphere} onChange=${setSphere} />
+            <span className="ga-note" style=${{ margin: 0 }}>
+              Drag to turn, scroll to zoom. The idle rotation resumes a few seconds after you let go.
+            </span>
+          </div>
           ${dispCapped && html`<p className="ga-note">
             Display capped at ${DISPLAY_CAP.toLocaleString('en-US')} spheres including periodic images.
             Later bubbles are missing from the 3D box; the statistics below are unaffected.
@@ -1827,12 +2112,12 @@
                       model.suppressed.toLocaleString('en-US') + ' suppressed, ' +
                       model.civs.length.toLocaleString('en-US') + ' surviving. Rebuilt in ' + model.ms +
                       ' ms, of which ' + model.fieldMs + ' ms for the arrival field and ' + model.wallMs +
-                      ' ms for ' + model.walls.quads.toLocaleString('en-US') + ' boundary quads.' : 'computing...'}
+                      ' ms for ' + model.walls.tris.toLocaleString('en-US') + ' wall triangles.' : 'computing...'}
                   </span>
                   ${model.ready && model.walls.capped && html`<span className="ga-sub">
-                    Boundary mesh capped at ${WALL_CAP.toLocaleString('en-US')} quads of
-                    ${model.walls.total.toLocaleString('en-US')}: part of the mosaic is missing. A coarser boundary
-                    field resolution fits.
+                    Wall mesh capped at ${WALL_CAP.toLocaleString('en-US')} triangles, so the last
+                    ${model.walls.dropped.toLocaleString('en-US')} civilizations have no drawn boundary. A coarser
+                    boundary field resolution fits.
                   </span>`}
                   ${model.ready && model.capped && html`<span className="ga-sub">
                     Candidate cap reached even at the truncated horizon: this sample is thinned and the simulated
