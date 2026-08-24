@@ -54,6 +54,7 @@
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/handoff.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -553,27 +554,11 @@
       return { blob: blob, size: blob.size };
     },
 
-    /* Picks up a heightmap the erosion simulator stored in IndexedDB
-       (?from=erosion) and deletes the entry. -> Promise<File|null>, never rejects. */
-    takeHandoff: function () {
-      return new Promise(function (resolve) {
-        var req = indexedDB.open('alber-handoff', 1);
-        req.onupgradeneeded = function () { req.result.createObjectStore('files'); };
-        req.onerror = function () { resolve(null); };
-        req.onsuccess = function () {
-          var db = req.result;
-          var tx = db.transaction('files', 'readwrite');
-          var store = tx.objectStore('files');
-          var get = store.get('eroded-heightmap');
-          get.onsuccess = function () { store.delete('eroded-heightmap'); };
-          tx.oncomplete = function () {
-            db.close();
-            var e = get.result;
-            resolve(e && e.blob ? new File([e.blob], e.name || 'eroded_terrain.png', { type: 'image/png' }) : null);
-          };
-          tx.onerror = function () { db.close(); resolve(null); };
-        };
-      });
+    /* Picks up a heightmap another tool stored in IndexedDB (via the shared
+       handoff module, ?from=...) and deletes the entry.
+       -> Promise<File|null>, never rejects. */
+    takeHandoff: function (key) {
+      return AlberHandoff.take(key);
     }
   };
   </script>
@@ -604,7 +589,7 @@
         heightHint: 'Highest point of the model, measured from the print bed. The terrain relief scales between base thickness and this value.',
         resolution: 'Mesh resolution',
         resFull: 'full',
-        resNth: (n) => `every ${n}. pixel`,
+        resNth: (n) => `every ${n}${n === 2 ? 'nd' : n === 3 ? 'rd' : 'th'} pixel`,
         dimples: 'Anti-warping dimples on the underside',
         dimplesHint: 'A sine pattern of shallow dimples on the bottom face. Reduces warping of large flat tiles on the print bed (fewer long uninterrupted extrusion lines in the first layers). Depth must be smaller than the base thickness.',
         dimpleDepth: 'Dimple depth (mm)',
@@ -644,7 +629,7 @@
           'Terrain tiles generated with https://alber.me/miscellaneous/tools/heightmap-to-stl.html',
           '',
           `Source image: ${p.file} (${p.srcW} x ${p.srcH} px, ${p.bitDepth} bit)`,
-          p.factor > 1 ? `Mesh resolution: every ${p.factor}. pixel (${p.W} x ${p.H} used)` : `Mesh resolution: full (${p.W} x ${p.H})`,
+          p.factor > 1 ? `Mesh resolution: every ${p.factor}${p.factor === 2 ? 'nd' : p.factor === 3 ? 'rd' : 'th'} pixel (${p.W} x ${p.H} used)` : `Mesh resolution: full (${p.W} x ${p.H})`,
           `Model: ${p.widthMM} x ${p.depthMM} mm, total height ${p.heightMM} mm, base thickness ${p.baseMM} mm`,
           `Tiles: ${p.tilesX} columns x ${p.tilesY} rows`,
           `Dimples: ${p.dimples ? `yes, depth ${p.dimpleDepth} mm, ${p.wavesX} x ${p.wavesY} waves per tile` : 'no'}`,
@@ -910,6 +895,19 @@
               if ((W - 1) < next.tilesX || (H - 1) < next.tilesY) continue;
               if (H2S.estimate(W, H, next.tilesX, next.tilesY).totalBytes <= WARN_BYTES / 2) { next.factor = f; break; }
             }
+            /* A terrain export from the Regensburg sun tool carries its scale
+               in the file name (..._{cols}x{rows}px_{cs}mpx_{lo}-{hi}m.png).
+               Preselect the total height true to scale for the chosen width;
+               heightMM includes the base, the relief itself is heightMM minus
+               baseMM. Exaggerating stays a knob, this only sets the default. */
+            const m = /_(\d+)x(\d+)px_([\d.]+)mpx_(\d+)-(\d+)m\.png$/i.exec(decoded.name || '');
+            if (m) {
+              const cs = parseFloat(m[3]), lo = parseInt(m[4], 10), hi = parseInt(m[5], 10);
+              const spanM = decoded.width * cs;
+              if (cs > 0 && hi > lo && spanM > 0) {
+                next.heightMM = round2(next.baseMM + (hi - lo) * next.widthMM / spanM);
+              }
+            }
             return next;
           });
         }).catch(e => {
@@ -918,10 +916,14 @@
         });
       }
 
-      /* heightmap handed over by the erosion simulator */
+      /* heightmap handed over by another tool (erosion simulator, and later
+         regensburg-sun); same pipeline as an uploaded file */
       useEffect(() => {
-        if (new URLSearchParams(location.search).get('from') !== 'erosion') return;
-        H2SApp.takeHandoff().then(f => {
+        const from = new URLSearchParams(location.search).get('from');
+        const key = from === 'erosion' ? 'eroded-heightmap'
+          : from === 'regensburg' ? 'heightmap' : null;
+        if (!key) return;
+        H2SApp.takeHandoff(key).then(f => {
           if (f) onFile(f);
           const url = new URL(location.href);
           url.searchParams.delete('from');
