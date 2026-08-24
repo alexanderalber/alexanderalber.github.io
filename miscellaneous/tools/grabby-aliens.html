@@ -614,6 +614,15 @@
         panel: cssVar('--tool-panel'), surface: cssVar('--tool-surface'),
         info: cssVar('--tool-sig-info'), warn: cssVar('--tool-sig-warn')
       });
+      /* The box wireframe and the sphere graticule are the only thing on screen
+         while the run is still empty, so they take a rung with real contrast
+         instead of the hairline they started on. Two skins share the label rung,
+         which is already a dark grey on light and a light grey on dark; grey
+         takes its frame rung, which is the white that skin is built around.
+         Grey is a dark-polarity skin, so this has to key on data-skin, not on
+         data-theme, which reads "dark" for both. */
+      const skin = document.documentElement.dataset.skin;
+      COL.grid = (skin === 'grey' ? COL.border : COL.label) || '#99a4af';
       buildCivColors();
     }
     readPalette();
@@ -733,13 +742,22 @@
         probeSeed: (mcSeed + 101) >>> 0,
         probeCount: Math.max(250, Math.min(2000, Math.round(600000 / Math.max(1, civs.length)))),
         field: field, walls: walls,
-        /* Slack on the discard test. Zero is the geometrically exact value: a
-           sphere fragment survives exactly while its own arrival is the first
-           one, and the frozen wall covers precisely the complement. The slack
-           only absorbs sampling error in the interpolated field, and it is kept
-           small because it is also the distance by which a growing sphere may
-           poke past the neighbour's wall. */
-        eps: 0.25 * (p.L / p.fieldRes) / p.s,
+        /* Slack on the discard test, in voxel-times (the time a front needs to
+           cross one voxel). Zero is the geometrically exact value, but the
+           sampled field is not exact where it matters most: tau is a minimum
+           over cones, so it is CONCAVE along every wall, and interpolating a
+           concave function undershoots. At a crease the undershoot reaches half
+           a voxel-time, which pulls the sampled arrival below the test
+           threshold and discards the sphere up to half a voxel BEFORE it has
+           reached anything. That is what produced black speckles along fresh
+           contacts. 0.45 all but cancels the worst case; the price is that
+           where the field is smooth a sphere may overshoot its wall by the same
+           0.45 of a voxel, which is a fraction of a pixel on screen.
+           The wall gets a bigger cushion still, so the two never leave a gap
+           between them. Showing a wall early is cheap: until the front actually
+           opens, the wall is a thin dark rim just ahead of it. */
+        eps: 0.45 * (p.L / p.fieldRes) / p.s,
+        epsWall: 1.5 * 0.45 * (p.L / p.fieldRes) / p.s,
         fieldMs: Math.round(tWall - tField),
         wallMs: Math.round(tEnd - tWall),
         ms: Math.round(performance.now() - t0)
@@ -1039,9 +1057,29 @@
         offered += nTri;
         if (!nTri) continue;
         if (totalTris + nTri > maxTris) { capped = true; dropped = M - j; break; }
-        parts.push({ mc: mc, j: j });
+        /* A cell straddling a box face is extracted as one unwrapped block, so
+           part of it lands outside [0, L). Clipping that away used to leave the
+           wall one-sided there: the partner cell still drew its own shell, this
+           one did not. Wrapping is the honest fix, and a triangle is the unit
+           that can be wrapped, because it is at most one voxel across and its
+           three corners therefore always agree on which image they belong to.
+           Only the triangles that actually move give up their shared vertices;
+           the rest of the shell stays welded, which keeps both the buffers and
+           the smooth normals. */
+        const vv = mc.vertices, ff = mc.faces;
+        const off = new Int8Array(nTri * 3);
+        let moved = 0;
+        for (let i = 0; i < nTri; i++) {
+          const a = ff[i * 3], b = ff[i * 3 + 1], c = ff[i * 3 + 2];
+          const ox = -Math.floor(((vv[a * 3] + vv[b * 3] + vv[c * 3]) / 3) / L);
+          const oy = -Math.floor(((vv[a * 3 + 1] + vv[b * 3 + 1] + vv[c * 3 + 1]) / 3) / L);
+          const oz = -Math.floor(((vv[a * 3 + 2] + vv[b * 3 + 2] + vv[c * 3 + 2]) / 3) / L);
+          off[i * 3] = ox; off[i * 3 + 1] = oy; off[i * 3 + 2] = oz;
+          if (ox || oy || oz) moved++;
+        }
+        parts.push({ mc: mc, j: j, off: off, moved: moved });
         totalTris += nTri;
-        totalVerts += mc.vertices.length / 3;
+        totalVerts += mc.vertices.length / 3 + moved * 3;
       }
 
       const pos = new Float32Array(totalVerts * 3);
@@ -1049,24 +1087,38 @@
       const hue = new Uint8Array(totalVerts);
       const index = new Uint32Array(totalTris * 3);
       let vo = 0, io = 0;
+      /* the wall exists once the second front gets there, and on the wall tau
+         equals tau2, so the interpolated first-arrival is the right switch-on
+         time for the vertex */
+      const put = (slot, x, y, z, hu) => {
+        pos[slot * 3] = x - half;
+        pos[slot * 3 + 1] = y - half;
+        pos[slot * 3 + 2] = z - half;
+        wt[slot] = sampleGrid(tau, N, L, x, y, z);
+        hue[slot] = hu;
+      };
       for (const part of parts) {
-        const v = part.mc.vertices, f = part.mc.faces;
-        const nv = v.length / 3;
+        const v = part.mc.vertices, f = part.mc.faces, off = part.off;
+        const nv = v.length / 3, nTri = f.length / 3;
         const hu = ((civs[part.j].id % 12) + 12) % 12;
-        for (let i = 0; i < nv; i++) {
-          const x = v[i * 3], y = v[i * 3 + 1], z = v[i * 3 + 2];
-          pos[(vo + i) * 3] = x - half;
-          pos[(vo + i) * 3 + 1] = y - half;
-          pos[(vo + i) * 3 + 2] = z - half;
-          /* the wall exists once the second front gets there, and on the wall
-             tau equals tau2, so the interpolated first-arrival is the right
-             switch-on time */
-          wt[vo + i] = sampleGrid(tau, N, L, x, y, z);
-          hue[vo + i] = hu;
+        for (let i = 0; i < nv; i++) put(vo + i, v[i * 3], v[i * 3 + 1], v[i * 3 + 2], hu);
+        let extra = vo + nv;
+        for (let i = 0; i < nTri; i++) {
+          const ox = off[i * 3], oy = off[i * 3 + 1], oz = off[i * 3 + 2];
+          if (!ox && !oy && !oz) {
+            index[io++] = f[i * 3] + vo;
+            index[io++] = f[i * 3 + 1] + vo;
+            index[io++] = f[i * 3 + 2] + vo;
+          } else {
+            for (let q = 0; q < 3; q++) {
+              const s2 = f[i * 3 + q];
+              put(extra, v[s2 * 3] + ox * L, v[s2 * 3 + 1] + oy * L, v[s2 * 3 + 2] + oz * L, hu);
+              index[io++] = extra;
+              extra++;
+            }
+          }
         }
-        for (let i = 0; i < f.length; i++) index[io + i] = f[i] + vo;
-        vo += nv;
-        io += f.length;
+        vo = extra;
       }
 
       return {
@@ -1123,10 +1175,12 @@
     const GA_UNIFORM_DECL = [
       'uniform sampler3D uTau;', 'uniform float uL;', 'uniform float uTime;',
       'uniform float uEps;', 'uniform float uHasField;', 'uniform float uSolid;',
-      'uniform float uCrop;', 'uniform float uR;', 'uniform float uShrink;'
+      'uniform float uCrop;', 'uniform float uR;', 'uniform float uShrink;',
+      'uniform float uEpsWall;'
     ].join('\n');
 
-    const GA_UNIFORM_NAMES = ['uTau', 'uL', 'uTime', 'uEps', 'uHasField', 'uSolid', 'uCrop', 'uR', 'uShrink'];
+    const GA_UNIFORM_NAMES = ['uTau', 'uL', 'uTime', 'uEps', 'uHasField', 'uSolid',
+                              'uCrop', 'uR', 'uShrink', 'uEpsWall'];
     const bindUniforms = (shader, uni) => {
       for (const n of GA_UNIFORM_NAMES) shader.uniforms[n] = uni[n];
     };
@@ -1147,8 +1201,13 @@
     /* The cut faces. A crop sphere slicing an opaque bubble exposes its inside,
        which without this reads as a hole. Painting back faces in a flat darker
        version of the same colour fakes a filled cut exactly like the reference
-       animation's flat patches on the view sphere. */
-    const GA_BACKFACE = 'if (!gl_FrontFacing) gaLam = 0.55;';
+       animation's flat patches on the view sphere.
+       The additive floor matters more than it looks: a wall is already the civ
+       colour at 0.62, and 0.55 of that in a dark hue lands close enough to the
+       dark skin's page colour to read as a hole rather than a cut. A small
+       constant in linear space keeps every cut face clearly above background
+       without lifting the lit surfaces at all. */
+    const GA_BACKFACE_FLOOR = 'vec3(0.035)';
 
     /* Bubbles on a MeshBasicMaterial, cut along the impingement surfaces.
        Three reasons for the hand written varyings: MeshBasic only fills its own
@@ -1174,21 +1233,27 @@
       return function (shader) {
         bindUniforms(shader, uni);
         shader.vertexShader = shader.vertexShader
-          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS)
-          .replace('#include <project_vertex>', '#include <project_vertex>\n' + GA_VERT_TAIL);
+          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS +
+            '\nattribute float aNoCut;\nvarying float vGaNC;')
+          .replace('#include <project_vertex>',
+            '#include <project_vertex>\n' + GA_VERT_TAIL + '\nvGaNC = aNoCut;');
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS + '\n' + GA_UNIFORM_DECL)
+          .replace('#include <common>', '#include <common>\n' + GA_VARYINGS +
+            '\nvarying float vGaNC;\n' + GA_UNIFORM_DECL)
           .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
             GA_CROP + '\n' +
-            'if (uHasField > 0.5) {\n' +
+            /* vGaNC exempts spheres smaller than the field can resolve, see the
+               instance rebuild for why they would otherwise vanish entirely. */
+            'if (uHasField > 0.5 && vGaNC < 0.5) {\n' +
             '  vec3 gaP = fract((vGaW + vec3(uL * 0.5)) / uL);\n' +
             '  if (texture(uTau, gaP).r < uTime - uEps) discard;\n' +
             '}\n' +
             'vec4 diffuseColor;\n' +
             'if (uSolid > 0.5) {\n' +
             '  ' + GA_LAMBERT + '\n' +
-            '  ' + GA_BACKFACE + '\n' +
-            '  diffuseColor = vec4( diffuse * vGaC * gaLam, 1.0 );\n' +
+            '  vec3 gaBase = diffuse * vGaC;\n' +
+            '  if (!gl_FrontFacing) { gaBase = gaBase * 0.55 + ' + GA_BACKFACE_FLOOR + '; gaLam = 1.0; }\n' +
+            '  diffuseColor = vec4( gaBase * gaLam, 1.0 );\n' +
             '} else {\n' +
             '  float gaF = pow(1.0 - abs(dot(normalize(vGaN), normalize(vGaV))), 2.5);\n' +
             '  diffuseColor = vec4( diffuse * vGaC, opacity * mix(0.06, 0.5, gaF) );\n' +
@@ -1220,15 +1285,27 @@
         shader.fragmentShader = shader.fragmentShader
           .replace('#include <common>',
             '#include <common>\nvarying float vGaWT;\nvarying vec3 vGaN;\nvarying vec3 vGaW;\n' + GA_UNIFORM_DECL)
+          /* uEpsWall, not a bare comparison. The sphere and the wall sample the
+             same arrival field through two different paths, and where a front
+             has just landed both are within an interpolation error of the
+             display time. With no cushion the sphere could already be gone while
+             the wall was still hidden, and the background showed through as
+             speckles. The wall reveal therefore leads the sphere discard by more
+             than either error, which costs only a thin darker rim just ahead of
+             an advancing front. */
           .replace('vec4 diffuseColor = vec4( diffuse, opacity );',
-            'if (vGaWT > uTime) discard;\n' + GA_CROP + '\n' +
-            'vec4 diffuseColor;\n' +
+            'if (vGaWT > uTime + uEpsWall) discard;\n' + GA_CROP + '\n' +
+            'vec4 diffuseColor = vec4( diffuse, opacity );')
+          /* Shading goes AFTER color_fragment, because that is where the civ
+             colour arrives from the vertex attribute. Doing it earlier would
+             put the back-face floor in before the multiply, and a dark hue
+             would scale it straight back down to the background. */
+          .replace('#include <color_fragment>',
+            '#include <color_fragment>\n' +
             'if (uSolid > 0.5) {\n' +
             '  ' + GA_LAMBERT + '\n' +
-            '  ' + GA_BACKFACE + '\n' +
-            '  diffuseColor = vec4( diffuse * gaLam, 1.0 );\n' +
-            '} else {\n' +
-            '  diffuseColor = vec4( diffuse, opacity );\n' +
+            '  if (!gl_FrontFacing) { diffuseColor.rgb = diffuseColor.rgb * 0.55 + ' + GA_BACKFACE_FLOOR + '; gaLam = 1.0; }\n' +
+            '  diffuseColor = vec4( diffuseColor.rgb * gaLam, 1.0 );\n' +
             '}');
       };
     }
@@ -1267,8 +1344,17 @@
             renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
           } catch (e) { setWebgl(false); return; }
           const host = hostRef.current;
+          /* The subject is a sphere, so it fits the SMALLER of the two canvas
+             dimensions: a wide short canvas wastes everything to the left and
+             right of it. Height therefore follows width towards square rather
+             than sitting under a fixed cap, bounded by a share of the window so
+             the controls below stay reachable without scrolling past a wall.
+             A 1200 px column on a 2160 px screen gives 900 px; a laptop gives
+             about 620; a phone stays at the 340 floor. */
+          const fitHeight = (w) => Math.max(340,
+            Math.min(Math.round(w * 0.75), Math.round((window.innerHeight || 800) * 0.78)));
           const wpx = host.clientWidth || 600;
-          const hpx = Math.max(340, Math.min(520, Math.round(wpx * 0.62)));
+          const hpx = fitHeight(wpx);
           renderer.setSize(wpx, hpx);
           renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
           renderer.localClippingEnabled = true;   // the periodic ghosts are cut at the box faces
@@ -1283,9 +1369,12 @@
           controls.enableDamping = true;
           /* Slow idle turn, because a still 3D box reads as a picture and a
              turning one reads as a volume. It yields to the pointer at once and
-             comes back four seconds after the last drag. */
+             comes back four seconds after the last drag. OrbitControls called
+             without a delta advances by 2pi/60/60 per frame times the speed, so
+             0.2 is about one revolution every five minutes: deliberately slow
+             enough that it takes a moment to notice it has started again. */
           controls.autoRotate = true;
-          controls.autoRotateSpeed = 0.4;
+          controls.autoRotateSpeed = 0.2;
           controls.update();
           const onDragStart = () => {
             const st = stateRef.current;
@@ -1308,7 +1397,7 @@
              planes are symmetric; simulation coordinates are shifted by L/2. */
           const boxLines = new THREE.LineSegments(
             new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-            new THREE.LineBasicMaterial({ color: new THREE.Color().setStyle(COL.border || '#374656') }));
+            new THREE.LineBasicMaterial({ color: new THREE.Color().setStyle(COL.grid) }));
           group.add(boxLines);
 
           const planes = [
@@ -1335,20 +1424,19 @@
             uTau: { value: dummy }, uL: { value: 1 }, uTime: { value: 0 },
             uEps: { value: 0.5 }, uHasField: { value: 0 },
             uSolid: { value: 1 }, uCrop: { value: 1 }, uR: { value: 0.5 },
-            uShrink: { value: 0 }
+            uShrink: { value: 0 }, uEpsWall: { value: 0 }
           };
 
           const shellMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
           shellMat.onBeforeCompile = makeShellPatch(uni);
           shellMat.clippingPlanes = planes;
 
-          /* The wall shells stay inside their own cells, but a cell that
-             straddles a box face is extracted as one block in unwrapped
-             coordinates, so part of it lands outside the box. The same six
-             planes that cut the ghost bubbles cut that off. */
+          /* No clipping planes here any more: a cell straddling a box face is
+             now wrapped triangle by triangle into the box during extraction, so
+             there is nothing outside to cut, and cutting it was what left those
+             walls visible from one side only. */
           const wallMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
           wallMat.onBeforeCompile = makeWallPatch(uni);
-          wallMat.clippingPlanes = planes;
 
           const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
           dotMat.onBeforeCompile = makeDotPatch(uni);
@@ -1373,6 +1461,10 @@
 
           const shellGeo = new THREE.IcosahedronGeometry(1, 2);
           const dotGeo = new THREE.IcosahedronGeometry(1, 1);
+          /* Per-instance exemption from the arrival-field cut, written by the
+             same per-time rebuild that writes the matrices. */
+          const noCut = new THREE.InstancedBufferAttribute(new Float32Array(DISPLAY_CAP), 1);
+          shellGeo.setAttribute('aNoCut', noCut);
 
           const bubbles = new THREE.InstancedMesh(shellGeo, shellMat, DISPLAY_CAP);
           bubbles.frustumCulled = false;
@@ -1415,7 +1507,7 @@
           const gratGeo = new THREE.BufferGeometry();
           gratGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(gratPts), 3));
           const gratMat = new THREE.LineBasicMaterial({
-            color: new THREE.Color().setStyle(COL.hairline || '#1a2a3a'), transparent: true, opacity: 0.75
+            color: new THREE.Color().setStyle(COL.grid), transparent: true, opacity: 0.9
           });
           const graticule = new THREE.LineSegments(gratGeo, gratMat);
           group.add(graticule);
@@ -1424,7 +1516,7 @@
             THREE: THREE, renderer: renderer, scene: scene, camera: camera, controls: controls,
             group: group, boxLines: boxLines, planes: planes, bubbles: bubbles, dots: dots,
             obsMesh: obsMesh, obsMat: obsMat, shellMat: shellMat, dotMat: dotMat, wallMat: wallMat,
-            shellGeo: shellGeo, dotGeo: dotGeo, graticule: graticule, gratMat: gratMat,
+            shellGeo: shellGeo, dotGeo: dotGeo, graticule: graticule, gratMat: gratMat, noCut: noCut,
             lastL: null, lastMode: null, applyMode: applyMode,
             uni: uni, dummy: dummy, tex: null, walls: null, builtVersion: -1, idle: 0
           };
@@ -1439,20 +1531,25 @@
           stateRef.current.stop = () => cancelAnimationFrame(raf);
 
           /* The box spans the content column, which narrows and widens with the
-             window; a canvas frozen at its init size distorts. */
-          const ro = new ResizeObserver(() => {
+             window; a canvas frozen at its init size distorts. The height also
+             depends on the window height, which the ResizeObserver cannot see,
+             so a window listener drives the same routine. */
+          const refit = () => {
             const st = stateRef.current;
             if (!st || !hostRef.current) return;
             const w2 = hostRef.current.clientWidth;
             if (!w2) return;
-            const h2 = Math.max(340, Math.min(520, Math.round(w2 * 0.62)));
+            const h2 = fitHeight(w2);
             hostRef.current.style.height = h2 + 'px';
             st.renderer.setSize(w2, h2);
             st.camera.aspect = w2 / h2;
             st.camera.updateProjectionMatrix();
-          });
+          };
+          const ro = new ResizeObserver(refit);
           ro.observe(host);
+          window.addEventListener('resize', refit);
           stateRef.current.ro = ro;
+          stateRef.current.refit = refit;
 
           if (rebuildRef.current) rebuildRef.current();
         }
@@ -1461,13 +1558,26 @@
         else window.addEventListener('ga-three-ready', init, { once: true });
 
         /* The render loop keeps running; a theme switch only has to repaint the
-           wireframe, the observer marker and the per-instance colours. */
+           wireframe, the graticule, the observer marker and the per-instance
+           colours.
+
+           readPalette() is called HERE and not left to the app's own listener,
+           which also calls it. Both listen on window, and this component is a
+           child, so its effect runs first and its listener is registered first
+           and therefore fires first: without this line every colour in the 3D
+           box was painted from the palette of the skin BEFORE the switch, one
+           step behind for as long as the page lived. It showed up as the
+           graticule coming back white after light and back to dark, because
+           white is roughly the light skin's hairline. Every init-time colour
+           here reads the same COL as this repaint, so first paint and every
+           later paint agree in all three skins. */
         const onTheme = () => {
           const st = stateRef.current;
           if (!st) return;
-          st.boxLines.material.color.setStyle(COL.border || '#374656');
+          readPalette();
+          st.boxLines.material.color.setStyle(COL.grid);
           st.obsMat.color.setStyle(COL.emph || '#e1e8f0');
-          st.gratMat.color.setStyle(COL.hairline || '#1a2a3a');
+          st.gratMat.color.setStyle(COL.grid);
           st.themeDirty = true;                 // makes rebuild re-tint the walls too
           if (rebuildRef.current) rebuildRef.current();
         };
@@ -1481,6 +1591,7 @@
           if (st) {
             st.stop && st.stop();
             st.ro && st.ro.disconnect();
+            if (st.refit) window.removeEventListener('resize', st.refit);
             if (st.idle) { clearTimeout(st.idle); st.idle = 0; }
             st.controls.dispose();
             st.boxLines.geometry.dispose();
@@ -1562,6 +1673,7 @@
           }
           st.uni.uL.value = L;
           st.uni.uEps.value = model.eps;
+          st.uni.uEpsWall.value = model.epsWall;
           st.uni.uShrink.value = 0.15 * L / model.p.fieldRes;
 
           if (st.walls) { st.group.remove(st.walls); st.walls.geometry.dispose(); st.walls = null; }
@@ -1593,12 +1705,23 @@
         const white = new THREE.Color(1, 1, 1);
         const hiSet = highlight && visIds ? new Set(visIds) : null;
         const dotR = 0.006 * L;
+        /* A civilization whose whole domain is smaller than a voxel is invisible
+           to the arrival field: no grid point ever carries its arrival, so the
+           field reports the big neighbour that swept past, its own sphere gets
+           discarded, and no wall was extracted for it either because it owns no
+           voxel. The result was a permanent black dot exactly where clusters of
+           late small civs sit. Below this radius the sphere is therefore exempt
+           from the cut. Overdrawing a neighbour by less than a voxel cannot be
+           seen; a missing sphere is a hole. The radius grows, so the flag is
+           per displayed time and rides along with the matrices. */
+        const noCutR = 1.5 * L / model.p.fieldRes;
         let bi = 0, di = 0, capped = false;
 
         for (let i = 0; i < civs.length && !capped; i++) {
           const c = civs[i];
           if (c.t > t) break;                                  // civs are time sorted
           const r = Math.max(1e-4, s * (t - c.t));
+          const nc = r < noCutR ? 1 : 0;
           const cc = civColor(c.id);
           col.setRGB(cc.rgb[0], cc.rgb[1], cc.rgb[2], THREE.SRGBColorSpace);
           if (hiSet && hiSet.has(c.id)) col.lerp(white, 0.5);
@@ -1628,6 +1751,7 @@
                 m.setPosition(cx - half, cy - half, cz - half);
                 st.bubbles.setMatrixAt(bi, m);
                 st.bubbles.setColorAt(bi, col);
+                st.noCut.array[bi] = nc;          // ghosts inherit the exemption
                 bi++;
               }
             }
@@ -1637,6 +1761,7 @@
         st.bubbles.count = bi;
         st.dots.count = di;
         st.bubbles.instanceMatrix.needsUpdate = true;
+        st.noCut.needsUpdate = true;
         st.dots.instanceMatrix.needsUpdate = true;
         if (st.bubbles.instanceColor) st.bubbles.instanceColor.needsUpdate = true;
         if (st.dots.instanceColor) st.dots.instanceColor.needsUpdate = true;
