@@ -18,6 +18,7 @@
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/handoff.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -3395,6 +3396,121 @@
       const w = (box[2] - box[0]) / view.mPerPx, h = (box[3] - box[1]) / view.mPerPx;
       ctx.rect(view.sx(box[0]), view.sy(box[3]), Math.max(0.75, w), Math.max(0.75, h));
     }
+
+    /* ---------- 16-Bit-Graustufen-PNG, für den Höhenkarten-Export ----------
+     *
+     * Wortgleiche Kopie von crc32/adler32/encodePNG16 aus
+     * miscellaneous/tools/erosion-simulator.html (dortiger Block "erocore",
+     * Stand dieser Änderung). Bewusst kopiert statt in ein geteiltes Modul
+     * gezogen: der erocore-Testnaht bleibt unangetastet, und
+     * notes/dev/sun-heightmap.test.mjs vergleicht beide Kopien byteweise
+     * (Drift-Guard) statt sich auf "sieht gleich aus" zu verlassen.
+     */
+    var CRC_TABLE = (function () {
+      var t = new Uint32Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c >>> 0;
+      }
+      return t;
+    })();
+
+    function crc32(bytes) {
+      var c = 0xFFFFFFFF;
+      for (var i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    function adler32(bytes) {
+      var a = 1, b = 0, i = 0, n = bytes.length;
+      while (i < n) {
+        var end = Math.min(i + 4096, n);
+        for (; i < end; i++) { a += bytes[i]; b += a; }
+        a %= 65521; b %= 65521;
+      }
+      return ((b << 16) | a) >>> 0;
+    }
+
+    /* ---------- 16 bit grayscale PNG encoder ----------
+       zlib stream with stored (uncompressed) deflate blocks; no pako needed. */
+    function encodePNG16(data, W, H, lo, hi) {
+      var stride = 1 + W * 2;
+      var raw = new Uint8Array(H * stride);
+      var scale = hi > lo ? 65535 / (hi - lo) : 0;
+      var p = 0;
+      for (var y = 0; y < H; y++) {
+        raw[p++] = 0;                       /* filter: none */
+        for (var x = 0; x < W; x++) {
+          var v = Math.round((data[y * W + x] - lo) * scale);
+          if (v < 0) v = 0; else if (v > 65535) v = 65535;
+          raw[p++] = v >>> 8; raw[p++] = v & 255;
+        }
+      }
+      var nBlocks = Math.ceil(raw.length / 65535);
+      var z = new Uint8Array(2 + raw.length + nBlocks * 5 + 4);
+      z[0] = 0x78; z[1] = 0x01;
+      var zp = 2, off = 0;
+      while (off < raw.length) {
+        var len = Math.min(65535, raw.length - off);
+        z[zp++] = (off + len >= raw.length) ? 1 : 0;   /* BFINAL, BTYPE=00 */
+        z[zp++] = len & 255; z[zp++] = len >>> 8;
+        z[zp++] = (~len) & 255; z[zp++] = ((~len) >>> 8) & 255;
+        z.set(raw.subarray(off, off + len), zp);
+        zp += len; off += len;
+      }
+      var ad = adler32(raw);
+      z[zp++] = (ad >>> 24) & 255; z[zp++] = (ad >>> 16) & 255;
+      z[zp++] = (ad >>> 8) & 255; z[zp++] = ad & 255;
+
+      function chunk(type, body) {
+        var out = new Uint8Array(8 + body.length + 4);
+        var dv = new DataView(out.buffer);
+        dv.setUint32(0, body.length);
+        for (var i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+        out.set(body, 8);
+        dv.setUint32(8 + body.length, crc32(out.subarray(4, 8 + body.length)));
+        return out;
+      }
+      var ihdr = new Uint8Array(13);
+      var dv = new DataView(ihdr.buffer);
+      dv.setUint32(0, W); dv.setUint32(4, H);
+      ihdr[8] = 16;                         /* bit depth */
+      ihdr[9] = 0;                          /* color type: grayscale */
+      var parts = [
+        new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+        chunk('IHDR', ihdr), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))
+      ];
+      var total = 0;
+      parts.forEach(function (q) { total += q.length; });
+      var out = new Uint8Array(total);
+      var o = 0;
+      parts.forEach(function (q) { out.set(q, o); o += q.length; });
+      return out;
+    }
+
+    /* Baut das PNG aus dem vorliegenden Höhenraster (Meter über NN, Zeile 0 =
+     * Norden, NaN = unbekannt). lo/hi sind die tatsächlichen Extremwerte der
+     * bekannten Zellen; unbekannte Zellen werden auf lo gesetzt (nicht auf 0),
+     * damit eine Lücke im Modell nicht als Tiefpunkt erscheint, der es nicht
+     * ist. Ist gar keine Zelle bekannt, gibt es kein sinnvolles lo/hi und die
+     * Funktion liefert null; die Oberfläche zeigt dann keinen Export an.
+     */
+    function buildHeightmapPng(heights, rows, cols) {
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < heights.length; i++) {
+        const v = heights[i];
+        if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+      }
+      if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+      const filled = new Float32Array(heights.length);
+      for (let i = 0; i < heights.length; i++) {
+        const v = heights[i];
+        filled[i] = Number.isFinite(v) ? v : lo;
+      }
+      const bytes = encodePNG16(filled, cols, rows, lo, hi);
+      return { bytes: bytes, lo: lo, hi: hi };
+    }
   </script>
 
   <script id="mapio">
@@ -3862,6 +3978,28 @@
           });
         },
 
+        /* Nur das Höhengitter, ohne Sweep: für den Heightmap-Export, wenn
+         * gerade keine frische Schattenkarte dasteht. Gleiche Quelle und
+         * gleicher Zuschnitt wie 'shadow', nur ohne Sonne, darum in Millisekunden
+         * statt Sekunden fertig, sobald die Kacheln da sind.
+         */
+        heights: function (req, onProgress) {
+          const report = onProgress || function () { };
+          let wLoad = 0;
+          return heightSource(req, (done, total) => {
+            wLoad = total > 0 ? 0.8 : 0;
+            if (total > 0) report(wLoad * done / total);
+          }).then(hs => {
+            const cs = req.cellsize;
+            const cols = Math.ceil((hs.e1 - hs.e0) / cs);
+            const rows = Math.ceil((hs.n1 - hs.n0) / cs);
+            const spec = { originE: hs.e0, originN: hs.n0, cellsize: cs, rows: rows, cols: cols };
+            const heights = assembleHeights(hm, spec, hs.src);
+            report(1);
+            return { heights: heights, rows: rows, cols: cols, cellsize: cs, spec: spec };
+          });
+        },
+
         /* Die Sonnenstundenkarte. Derselbe Ausschnitt wie die Schattenkarte,
          * aber ein Sweep je Zeitschritt statt einem einzigen: das ist die
          * teuerste Rechnung des Tools, sie dauert Sekunden statt Millisekunden
@@ -4158,6 +4296,16 @@
         }).catch(err => postMessage({ type: 'sunhours', token: msg.token, error: String(err) }));
         return;
       }
+      if (msg.type === 'heights') {
+        const tell = p => postMessage({ type: 'progress', token: msg.token, p: p });
+        WORKER_ENGINE.heights(msg, tell).then(r => {
+          postMessage({
+            type: 'heights', token: msg.token, heights: r.heights,
+            rows: r.rows, cols: r.cols, cellsize: r.cellsize, spec: r.spec
+          }, [r.heights.buffer]);
+        }).catch(err => postMessage({ type: 'heights', token: msg.token, error: String(err) }));
+        return;
+      }
       // Eigene Art und nicht ein Schalter in 'sunhours': der Klient hält je Art
       // genau eine Anfrage vor, und die beiden Wege sollen sich nicht
       // gegenseitig überholen. Wer an der Augenhöhe dreht, schickt eine
@@ -4289,6 +4437,15 @@
         pngHint:      'Das Kartenbild als PNG herunterladen, mit Datum, Uhrzeit und Quellenangabe im Bild.',
         scaleHint:    'Auflösung des Bildes, rund {w} Pixel breit. Die Karte wird dafür neu gezeichnet, Linien und Schrift werden also wirklich schärfer. Die Schatten- und Stundenfläche nicht: die liegt in ihrer gerechneten Rasterweite vor und wird nur größer gezogen.',
         pngSun:       'Sonne {a} / {e}',
+        // Die Höhenkarte ist kein Bild der Ansicht, sondern das gerechnete
+        // Gitter selbst: absolute Höhen, kein Verlauf, keine Beschriftung.
+        // Deshalb eine eigene Gruppe statt eines dritten Knopfs bei "Bild".
+        optHeightmap: 'Höhenkarte',
+        hmLabel:      'Höhenkarte (16-Bit-PNG)',
+        hmHint:       'Den aktuellen Kartenausschnitt als 16-Bit-Graustufen-PNG herunterladen: jede Zelle trägt ihre Höhe in Metern über NN, kodiert über die Spanne der bekannten Werte. Fehlende Kacheln werden dafür kurz nachgeladen.',
+        hmToStl:      'In Heightmap to STL öffnen',
+        hmToStlHint:  'Übergibt dieselbe Höhenkarte direkt an das Werkzeug Heightmap to STL, ohne Umweg über einen Download.',
+        hmNote:       '0..65535 entspricht {lo}..{hi} m, 1 Pixel = {cs} m.',
         animLabel:    'Film des Tages',
         animHint:     'Den ganzen Tag als Video: für jede Uhrzeit wird der Schatten gerechnet, danach läuft er ab. Das dauert -- ein Bild kostet so viel wie die Karte, die gerade dasteht, und es sind ein paar Dutzend. Der aktuelle Ausschnitt, die eingestellte Rasterweite und die eingestellte Lesart gelten dafür.',
         animStepHint: 'Abstand zwischen zwei Bildern. Der Film ist immer sechs Sekunden lang, egal wie fein gerechnet wird: zehn Minuten statt dreißig kaufen mehr Bilder je Sekunde, nicht mehr Film -- und dreifache Rechenzeit.',
@@ -4456,6 +4613,15 @@
         pngHint:      'Download the map as a PNG, with date, time and attribution burned into the image.',
         scaleHint:    'Resolution of the image, about {w} pixels wide. The map is redrawn for it, so lines and type really do get sharper. The shadow and hours layers do not: they exist at the cell size they were computed at and are only scaled up.',
         pngSun:       'sun {a} / {e}',
+        // The height map is not a picture of the view but the computed grid
+        // itself: absolute heights, no colour ramp, no labels. Hence its own
+        // group rather than a third button next to "Image".
+        optHeightmap: 'Height map',
+        hmLabel:      'Height map (16 bit PNG)',
+        hmHint:       'Download the current map extent as a 16 bit grayscale PNG: every cell carries its height in metres above sea level, encoded over the span of the known values. Missing tiles are fetched briefly for this.',
+        hmToStl:      'Open in Heightmap to STL',
+        hmToStlHint:  'Hands the same height map straight to the Heightmap to STL tool, without a detour through a download.',
+        hmNote:       '0..65535 maps to {lo}..{hi} m, 1 pixel = {cs} m.',
         animLabel:    'Film of the day',
         animHint:     'The whole day as a video: the shadow is computed for every time of day, then it plays. This takes a while -- one frame costs as much as the map you are looking at, and there are a few dozen of them. The current view, cell size and reading all apply to it.',
         animStepHint: 'Gap between two frames. The film always runs six seconds, however finely it is computed: ten minutes instead of thirty buys frames per second, not more film -- and three times the computing time.',
@@ -4819,8 +4985,8 @@
       let hm = null;
       let ymeta = null;
       let settled = false;
-      const queued = { shadow: null, point: null, sunhours: null, sunyear: null, upsample: null };
-      const busy = { shadow: false, point: false, sunhours: false, sunyear: false, upsample: false };
+      const queued = { shadow: null, point: null, sunhours: null, sunyear: null, upsample: null, heights: null };
+      const busy = { shadow: false, point: false, sunhours: false, sunyear: false, upsample: false, heights: false };
 
       function done(ok) { if (!settled) { settled = true; readyResolve(ok); } }
 
@@ -4836,7 +5002,7 @@
         if (worker) { try { worker.terminate(); } catch (e) { /* egal */ } worker = null; }
         inline = makeEngine(hm, ymeta);
         inline.loadHeavy().then(
-          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); pump('sunyear'); pump('upsample'); },
+          () => { done(true); pump('shadow'); pump('point'); pump('sunhours'); pump('sunyear'); pump('upsample'); pump('heights'); },
           err => { console.warn(err); done(false); }
         );
       }
@@ -7267,6 +7433,48 @@
         downloadCanvas(out, 'alber.me-' + stem + '-' + stamp + '.png');
       };
 
+      /* Die Höhenkarte des aktuellen Kartenausschnitts, nicht neu gerechnet:
+       * `shadow` trägt bereits das fertige Gitter (Meter über NN) aus dem
+       * zuletzt gerechneten Schattenwurf. Nur der ist geeignet, weil nur er
+       * absolute Höhen mitführt; Sonnenstunden- und Jahreskarte tragen Stunden.
+       * Ohne Ergebnis (noch nichts gerechnet, oder alles außerhalb bekannter
+       * Kacheln) bleibt es bei null, und die Knöpfe unten sind dann aus.
+       */
+      const heightmapPng = useMemo(
+        () => shadow ? buildHeightmapPng(shadow.heights, shadow.rows, shadow.cols) : null,
+        [shadow]
+      );
+
+      /* Der Export wartet nicht mehr auf eine gerechnete Schattenkarte: steht
+       * eine frische da, nimmt er ihr Gitter, sonst holt er sich die Höhen des
+       * Ausschnitts als eigene 'heights'-Anfrage ohne Sweep. Die ist in
+       * Millisekunden fertig, sobald die Kacheln geladen sind; hmBusy sperrt
+       * die Knöpfe nur für diese kurze Spanne.
+       */
+      const [hmBusy, setHmBusy] = useState(false);
+      const fetchHeightmap = () => {
+        if (shadow && !shadowStale && heightmapPng) {
+          return Promise.resolve({ png: heightmapPng, grid: shadow });
+        }
+        return model.client.ask('heights', {
+          e0: tilesNeeded.e0, n0: tilesNeeded.n0, e1: tilesNeeded.e1, n1: tilesNeeded.n1,
+          cellsize: csUsed
+        }).then(r => {
+          if (r.superseded || r.error) return null;
+          const png = buildHeightmapPng(r.heights, r.rows, r.cols);
+          return png ? { png: png, grid: r } : null;
+        });
+      };
+      const hmReady = !hmBusy && !!tilesNeeded && !!csUsed;
+
+      // Dateiname trägt Größe, Zellweite und die Meterspanne, auf die die
+      // 16 Bit verteilt wurden -- alles, was man braucht, um das Bild ohne
+      // Zusatzangaben wieder einzuordnen.
+      function heightmapFilename(hm, png) {
+        return 'regensburg_heightmap_' + hm.cols + 'x' + hm.rows + 'px_' + hm.cellsize + 'mpx_'
+          + Math.round(png.lo) + '-' + Math.round(png.hi) + 'm.png';
+      }
+
       // --------------------------------------------------------- Tagesfilm
 
       /* Der Tag als Film, und das ist der Ersatz für etwas Verlorenes.
@@ -7926,6 +8134,59 @@
                               onClick=${() => setPngScale(s)}>${s + '×'}<//>`)}
                   <//>
                 <//>
+              <//>
+              <!-- Eigene Gruppe statt eines dritten Knopfs bei "Bild": das
+                   Ergebnis ist kein Bild der Ansicht, sondern das gerechnete
+                   Höhengitter selbst. Die Knöpfe funktionieren auf jedem
+                   Reiter: liegt keine frische Schattenkarte vor, holen sie
+                   die Höhen als eigene Anfrage ohne Sweep. -->
+              <div>
+                <div className="rs-cap">${t.optHeightmap}<//>
+                <div style=${{ display: 'flex', gap: 8, marginTop: 4, flexWrap: 'wrap' }}>
+                  <div className="rs-map-group" style=${{ display: 'inline-flex' }}>
+                    <button className="lang-seg rs-solo" title=${t.hmHint}
+                            disabled=${!hmReady}
+                            onClick=${() => {
+                              setHmBusy(true);
+                              fetchHeightmap().then(res => {
+                                setHmBusy(false);
+                                if (!res) return;
+                                const blob = new Blob([res.png.bytes], { type: 'image/png' });
+                                downloadBlob(blob, heightmapFilename(res.grid, res.png));
+                              });
+                            }}>${t.hmLabel}<//>
+                  <//>
+                  <div className="rs-map-group" style=${{ display: 'inline-flex' }}>
+                    <button className="lang-seg rs-solo" title=${t.hmToStlHint}
+                            disabled=${!hmReady}
+                            onClick=${() => {
+                              const dest = '/miscellaneous/tools/heightmap-to-stl.html?from=regensburg'
+                                + (lang === 'de' ? '&lang=de' : '');
+                              setHmBusy(true);
+                              fetchHeightmap().then(res => {
+                                setHmBusy(false);
+                                if (!res) return;
+                                const name = heightmapFilename(res.grid, res.png);
+                                const blob = new Blob([res.png.bytes], { type: 'image/png' });
+                                /* Erst ablegen, dann weiterleiten; scheitert das
+                                   Ablegen, wird trotzdem gewechselt -- das
+                                   STL-Tool startet dann eben leer, wie ohne
+                                   Übergabe. */
+                                AlberHandoff.put('heightmap', blob, name).then(
+                                  () => { location.href = dest; },
+                                  () => { location.href = dest; }
+                                );
+                              });
+                            }}>${t.hmToStl}<//>
+                  <//>
+                <//>
+                ${heightmapPng && shadow && html`
+                  <p className="rs-note" style=${{ margin: '4px 0 0' }}>
+                    ${t.hmNote.replace('{lo}', String(Math.round(heightmapPng.lo)))
+                              .replace('{hi}', String(Math.round(heightmapPng.hi)))
+                              .replace('{cs}', String(shadow.cellsize))}
+                    ${' '}${t.srcData}
+                  <//>`}
               <//>
               <!-- Nur beim Schatten, denn nur der hat einen Verlauf über den
                    Tag; die Stundenkarten sind der Tag. -->

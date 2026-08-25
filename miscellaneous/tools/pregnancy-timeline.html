@@ -216,7 +216,7 @@
         todayLabel: 'Heute',
         eddLabel: 'ET',
         todayGALabel: 'Heute',
-        noteText: 'ℹ️ Zählung nach dt. Standard: SSW\u00a00+0\u00a0=\u00a01.\u00a0Tag der letzten Regelblutung. Manche Quellen nennen dies\u00a0„Woche\u00a01".',
+        noteText: 'ℹ️ Zählung nach dt. Standard: SSW\u00a00+0\u00a0=\u00a01.\u00a0Tag der letzten Regelblutung. Manche Quellen nennen dies\u00a0„Woche\u00a01“.',
         sourceText: 'Balkendicke\u00a0∝ Häufigkeit. Kurven: NICHD\u00a02013-18, Vermont\u00a0Oxford\u00a02020-22, Magnus\u00a02019\u00a0BMJ, Tong\u00a02008, Wilcox\u00a01988, Makrydimas\u00a02003.',
         notice: 'Diese Tools sind private Hobbyprojekte - nicht kommerziell, nicht ausgiebig getestet und ohne Gewähr. Nutzung gerne, auf eigene Verantwortung.',
         catLabel: 'Symptom-Kategorien',
@@ -245,6 +245,8 @@
         tipStart: 'Beginn SSW', tipPeak: 'Peak\u00a0 SSW', tipEnd: 'Ende\u00a0 SSW',
         calTitle: 'Kalender öffnen',
         ddPlaceholder: 'TT', mmPlaceholder: 'MM', yyyyPlaceholder: 'JJJJ',
+        saveDue: 'Termin für andere Tools merken',
+        dueSaved: 'Gespeichert',
         cats: {
           schmerz:    'Schmerzen',
           gi:         'Verdauung\u00a0/ Übelkeit',
@@ -254,7 +256,7 @@
           misc:       'Sonstige',
         },
         trimLabels: ['1.\u00a0Trimester', '2.\u00a0Trimester', '3.\u00a0Trimester'],
-        milestoneLabels: ['Herzschlag US', 'Embryo→Fötus', 'Viability', 'Reifgeburt', 'ET'],
+        milestoneLabels: ['Herzschlag US', 'Embryo→Fötus', 'Lebensfähigkeit', 'Reifgeburt', 'ET'],
         symptomNames: [
           'Frühes Bauchziehen', 'Kopfschmerzen', 'Mutterbandschmerzen', 'Rückenschmerzen',
           'Hyperemesis (selten)', 'Obstipation\u00a0/ Blähungen', 'Übelkeit\u00a0/ Erbrechen (NVP)',
@@ -302,6 +304,8 @@
         tipStart: 'Start GA', tipPeak: 'Peak\u00a0 GA', tipEnd: 'End\u00a0\u00a0 GA',
         calTitle: 'Open calendar',
         ddPlaceholder: 'DD', mmPlaceholder: 'MM', yyyyPlaceholder: 'YYYY',
+        saveDue: 'Save due date for other tools',
+        dueSaved: 'Saved',
         cats: {
           schmerz:    'Pain',
           gi:         'Nausea\u00a0/ Digestion',
@@ -343,6 +347,37 @@
     const sswToDate = (lmp, ssw) => addDays(lmp, Math.round(ssw * 7));
     const dateToSsw = (lmp, date) => daysDiff(lmp, date) / 7;
     const fmtSsw   = (ssw) => `${Math.floor(ssw)}+${Math.round((ssw - Math.floor(ssw)) * 7)}`;
+
+    // Geteilter Entbindungstermin (localStorage 'alber.duedate.v1'), bewusst pro
+    // Tool kopiert statt als Shared-Modul; wortgleich in allen fünf Eltern-Tools.
+    // Ignoriert wird ein Eintrag bei kaputtem JSON, v !== 1, due nicht
+    // YYYY-MM-DD oder savedAt älter als 15 Monate; mit rejectPastDue zusätzlich,
+    // wenn due mehr als 30 Tage zurückliegt. Datumsarithmetik in UTC.
+    const DUE_KEY = 'alber.duedate.v1';
+    const DUE_DAY_MS = 86400000;
+    const dueToUTC = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
+    function readDueHandoff(rejectPastDue) {
+      try {
+        const obj = JSON.parse(localStorage.getItem(DUE_KEY));
+        if (!obj || obj.v !== 1) return null;
+        if (typeof obj.due !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(obj.due)) return null;
+        const saved = Date.parse(obj.savedAt);
+        if (!Number.isFinite(saved) || Date.now() - saved > 456 * DUE_DAY_MS) return null;
+        if (rejectPastDue && dueToUTC(obj.due) < Date.now() - 30 * DUE_DAY_MS) return null;
+        return obj;
+      } catch (e) { return null; }
+    }
+    // Schreibseite desselben Handoffs: born bleibt heute immer null, Leser
+    // nehmen born ?? due.
+    function writeDueHandoff(due, source) {
+      try {
+        localStorage.setItem(DUE_KEY, JSON.stringify(
+          { v: 1, source, savedAt: new Date().toISOString(), due, born: null }));
+        return true;
+      } catch (e) { return false; }
+    }
+    // ET und LMP hängen über 280 Tage aneinander; beide Richtungen in UTC.
+    const utcISO = ms => new Date(ms).toISOString().slice(0, 10);
 
     const interpolate = (data, ssw) => {
       if (ssw <= data[0].week) return data[0].value;
@@ -574,6 +609,10 @@
       }, []);
 
       const [lmpStr,   setLmpStr]   = useState(() => {
+        // Ein gespeicherter Termin überschreibt den Platzhalter-Default direkt;
+        // ein eigener Übernehmen-Button war der Umweg, den niemand wollte.
+        const h = readDueHandoff(true);
+        if (h) return utcISO(dueToUTC(h.born ?? h.due) - 280 * DUE_DAY_MS);
         const d = new Date(); d.setDate(d.getDate() - 140); return d.toISOString().slice(0,10);
       });
       const [todayStr, setTodayStr] = useState(new Date().toISOString().slice(0,10));
@@ -683,6 +722,16 @@
       }, []);
       const toPx = (v) => PAD + v * scale;   // SVG-Koordinate → Pixel in der Karte
 
+      // Geteilter Termin: "Gespeichert" ist kein Timer-Feedback, sondern der
+      // abgeleitete Zustand "gespeicherter Termin == aktuell berechneter ET".
+      // Er fällt erst beim Umstellen der letzten Periode wieder zurück.
+      const [storedDue, setStoredDue] = useState(() => {
+        const h = readDueHandoff(false); return h ? (h.born ?? h.due) : null;
+      });
+      const etIso = /^\d{4}-\d{2}-\d{2}$/.test(lmpStr)
+        ? utcISO(dueToUTC(lmpStr) + 280 * DUE_DAY_MS) : null;
+      const dueSavedNow = !!etIso && storedDue === etIso;
+
       const lens = (s, cy) => {
         const sx = xOf(s.start), px = xOf(s.peak), ex = xOf(s.end);
         const h = (s.frequency / 100) * MAX_HALF;
@@ -753,6 +802,17 @@
                 paddingTop:12,borderTop:'1px solid var(--tool-hairline)'}}>
                 <span style=${{fontSize:13,color:'var(--tool-faint)'}}>
                   ${t.eddLabel}: <strong style=${{color:'var(--tool-label)'}}>${fmtDE(et)}</strong>
+                  ${etIso && html`
+                    <button type="button" className="no-print" disabled=${dueSavedNow}
+                      onClick=${() => {
+                        if (writeDueHandoff(etIso, 'pregnancy-timeline')) setStoredDue(etIso);
+                      }}
+                      style=${{marginLeft:8,marginBottom:0,width:'auto',fontSize:11,padding:'3px 8px',
+                               borderRadius:6,border:'1px solid var(--tool-hairline)',
+                               background:'var(--tool-subtle)',color:'var(--tool-label)',
+                               cursor:dueSavedNow?'default':'pointer'}}>
+                      ${dueSavedNow ? t.dueSaved : t.saveDue}
+                    </button>`}
                   <span className="no-print">
                      ·
                     ${t.todayGALabel}: <strong style=${{color:todayCol}}>SSW ${fmtSsw(todaySsw)}</strong>

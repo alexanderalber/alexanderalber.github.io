@@ -276,17 +276,19 @@
         noModel: '\u2190 Datum eingeben, um die Verteilung zu berechnen.',
         cardEdd: 'Modell-ET (Median)',
         cardMean: '\u00d8',
-        cardMode: 'Mode',
+        cardMode: 'Modus',
         cardSigma: n => `\u03c3\u00a0=\u00a0${n}\u00a0Tage`,
         cardWindow: '80\u00a0%-Fenster',
         cardWindowSub: n => `${n}\u00a0Tage breit (P10\u00a0–\u00a0P90)`,
         cardNaegele: 'Naegele-ET',
         naegeleIdentical: 'identisch',
         naegeleLater: d => `Modell +${d}d später`,
-        naegeleEarlier: d => `Modell ${d}d früher`,
+        naegeleEarlier: d => `Modell ${Math.abs(d)}d früher`,
         naegeleSub: 'LMP\u00a0+\u00a0280d, 28d-Zyklus',
         naegeleExact: 'exakt\u00a0\u2713\u2713',
         naegeleConception: 'Konzeptionsdatum bekannt',
+        saveDue: 'Termin f\u00fcr andere Tools merken',
+        dueSaved: 'Gespeichert',
         distLabel: 'Verteilung:',
         distNormal: 'Normalverteilung', distSkew: 'Skew-Normal\u00a0(empirisch)',
         viewLabel: 'Ansicht:',
@@ -349,10 +351,12 @@
         cardNaegele: 'Naegele EDD',
         naegeleIdentical: 'identical',
         naegeleLater: d => `Model +${d}d later`,
-        naegeleEarlier: d => `Model ${d}d earlier`,
+        naegeleEarlier: d => `Model ${Math.abs(d)}d earlier`,
         naegeleSub: 'LMP\u00a0+\u00a0280d, 28d cycle',
         naegeleExact: 'exact\u00a0\u2713\u2713',
         naegeleConception: 'Conception date known',
+        saveDue: 'Save due date for other tools',
+        dueSaved: 'Saved',
         distLabel: 'Distribution:',
         distNormal: 'Normal', distSkew: 'Skew-Normal\u00a0(empirical)',
         viewLabel: 'View:',
@@ -430,6 +434,38 @@
     const daysDiff = (a, b) => Math.round((b - a) / 86400000);
     const fmtShort = d => d.toLocaleDateString('de-DE', { day: '2-digit', month: 'short' });
     const fmtFull  = d => d.toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' });
+    // eddModel ist ein lokales Datum (12:00 Uhr), die Komponenten sind also die
+    // gemeinten; keine UTC-Konvertierung, die um Mitternacht kippen könnte.
+    const fmtISO = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+    // Geteilter Entbindungstermin (localStorage 'alber.duedate.v1'), bewusst pro
+    // Tool kopiert statt als Shared-Modul; wortgleich in allen fünf Eltern-Tools.
+    // Ignoriert wird ein Eintrag bei kaputtem JSON, v !== 1, due nicht
+    // YYYY-MM-DD oder savedAt älter als 15 Monate; mit rejectPastDue zusätzlich,
+    // wenn due mehr als 30 Tage zurückliegt. Datumsarithmetik in UTC.
+    const DUE_KEY = 'alber.duedate.v1';
+    const DUE_DAY_MS = 86400000;
+    const dueToUTC = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
+    function readDueHandoff(rejectPastDue) {
+      try {
+        const obj = JSON.parse(localStorage.getItem(DUE_KEY));
+        if (!obj || obj.v !== 1) return null;
+        if (typeof obj.due !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(obj.due)) return null;
+        const saved = Date.parse(obj.savedAt);
+        if (!Number.isFinite(saved) || Date.now() - saved > 456 * DUE_DAY_MS) return null;
+        if (rejectPastDue && dueToUTC(obj.due) < Date.now() - 30 * DUE_DAY_MS) return null;
+        return obj;
+      } catch (e) { return null; }
+    }
+    // Schreibseite desselben Handoffs: born bleibt heute immer null, Leser
+    // nehmen born ?? due.
+    function writeDueHandoff(due, source) {
+      try {
+        localStorage.setItem(DUE_KEY, JSON.stringify(
+          { v: 1, source, savedAt: new Date().toISOString(), due, born: null }));
+        return true;
+      } catch (e) { return false; }
+    }
 
     // ─── SKEW-NORMAL MATH ────────────────────────────────────────────────────
     // Empirical shape from Smith 2001 (KM, spontaneous onset, n=1514):
@@ -877,6 +913,12 @@
       const [tooltip,          setTooltip]          = useState(null);
       const [chartMode,        setChartMode]        = useState('pdf');
       const [distType,         setDistType]         = useState('skew');
+      // "Gespeichert" ist kein Timer-Feedback, sondern der abgeleitete Zustand
+      // "gespeicherter Termin == aktuell berechneter ET"; er fällt erst beim
+      // Umstellen der Eingaben wieder auf den Speichern-Text zurück.
+      const [storedDue,        setStoredDue]        = useState(() => {
+        const h = readDueHandoff(false); return h ? h.due : null;
+      });
       const svgRef = useRef(null);
 
       const model = useMemo(() => computeModel({
@@ -1040,6 +1082,17 @@
                       ${' · '}${t.cardMode} ${fmtShort(addDays(model.eddModel, model.modeDays))}
                     </div>
                     <div className="gt-sub">${t.cardSigma(model.sigma.toFixed(1))}</div>
+                    <button type="button" disabled=${storedDue === fmtISO(model.eddModel)}
+                      onClick=${() => {
+                        const iso = fmtISO(model.eddModel);
+                        if (writeDueHandoff(iso, 'geburtstermin-verteilung')) setStoredDue(iso);
+                      }}
+                      style=${{ marginTop: 8, marginBottom: 0, width: 'auto', fontSize: 11, padding: '3px 8px',
+                                borderRadius: 6, border: '1px solid var(--tool-hairline)',
+                                background: 'var(--tool-subtle)', color: 'var(--tool-label)',
+                                cursor: storedDue === fmtISO(model.eddModel) ? 'default' : 'pointer' }}>
+                      ${storedDue === fmtISO(model.eddModel) ? t.dueSaved : t.saveDue}
+                    </button>
                   </div>
 
                   <div className="gt-card">

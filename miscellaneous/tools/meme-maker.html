@@ -18,6 +18,7 @@
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
   <script src="/assets/js/canvas-text.js"></script>
+  <script src="/assets/js/handoff.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -198,7 +199,7 @@
         <h1 style="font-size:1.5rem;color:var(--tool-emph);margin-bottom:8px">Meme Maker</h1>
         <p style="color:var(--tool-label);max-width:70ch">Pick a layout, paste your own pictures into its slots with Ctrl+V, type the captions, and copy the finished image straight back to the clipboard. The tool supplies the structure; you supply the pictures.</p>
         <ul style="color:var(--tool-label);max-width:70ch;font-size:0.95rem">
-          <li>Nine layouts: the classic top and bottom caption, a white caption bar, a side by side comparison, two, four or any number of panels with the text beside the picture, and a plain grid.</li>
+          <li>Nine layouts: a single picture, the classic top and bottom caption, a white caption bar, a side by side comparison, a stacked pair, two, four or any number of panels with the text beside the picture, and a plain grid.</li>
           <li>Images go in by clipboard, drag and drop or file picker, and can be panned and zoomed inside their slot, so a portrait photo still fills a landscape panel.</li>
           <li>Anything extra goes on top as a free layer: another image, a caption, a speech bubble with a draggable tail, or a labelled arrow pointing at part of the picture.</li>
           <li>Per layer and whole image filters including a proper deep fry, resolution independent export as PNG or JPEG, and a copy to clipboard button.</li>
@@ -226,11 +227,11 @@
     var FORMATS = [
       { id: 'freeform',    group: 'classic', name: 'Single image',   hint: 'One picture, nothing else. Add captions as free layers.' },
       { id: 'top-bottom',  group: 'classic', name: 'Top and bottom', hint: 'The classic: heavy white caption above and below, right on the picture.' },
-      { id: 'caption-bar', group: 'classic', name: 'Caption bar',    hint: 'A white bar above the picture. The bar grows with the text.' },
+      { id: 'caption-bar', group: 'classic', name: 'Caption bar',    hint: 'A white bar above the picture. Its height has its own slider.' },
       { id: 'compare-2',   group: 'classic', name: 'Comparison',     hint: 'Two pictures side by side, each with a label underneath.' },
       { id: 'panel-2',     group: 'panel',   name: '2 panels',       hint: 'Two rows, picture left, text right.' },
       { id: 'panel-4',     group: 'panel',   name: '4 panels',       hint: 'Four rows, picture left, text right.' },
-      { id: 'panel-n',     group: 'panel',   name: 'N panels',       hint: 'As many rows as you want, picture left, text right.' },
+      { id: 'panel-n',     group: 'panel',   name: 'N panels',       hint: 'Two to eight rows, picture left, text right.' },
       { id: 'grid-2x2',    group: 'panel',   name: '2 by 2 grid',    hint: 'Four pictures, no text cells.' },
       { id: 'stack-2',     group: 'panel',   name: 'Stacked pair',   hint: 'Two pictures above each other, captions on top of each.' }
     ];
@@ -1381,6 +1382,18 @@
         return () => document.removeEventListener('paste', onPaste);
       }, [placeImage]);
 
+      /* image handed over by image-editor */
+      useEffect(() => {
+        const from = new URLSearchParams(location.search).get('from');
+        if (from !== 'editor') return;
+        window.AlberHandoff.take('image').then(f => {
+          if (f) placeImage(f);
+          const url = new URL(location.href);
+          url.searchParams.delete('from');
+          history.replaceState(null, '', url.href);
+        });
+      }, [placeImage]);
+
       useEffect(() => {
         function onKey(e) {
           const t = e.target;
@@ -1891,8 +1904,9 @@
         const next = MEME.layoutFormat(id, { imgAspect: primaryAspect, rows: doc.rows, capH: doc.capH, gap: doc.gap });
         const r = MEME.remapLayers(layout, next, doc.layers);
         setNotice(r.dropped
-          ? r.dropped + (r.dropped === 1 ? ' filled slot did' : ' filled slots did')
-            + ' not fit the new layout and was dropped. Ctrl+Z brings it back.'
+          ? r.dropped + (r.dropped === 1
+              ? ' filled slot did not fit the new layout and was dropped. Ctrl+Z brings it back.'
+              : ' filled slots did not fit the new layout and were dropped. Ctrl+Z brings them back.')
           : '');
         patch(d => {
           const remapped = MEME.remapLayers(layout, next, d.layers);
@@ -1927,8 +1941,20 @@
         const blob = await toBlobAsync(cv, exportType, exportType === 'image/png' ? undefined : 0.92);
         if (!blob) { setErr('Export failed.'); return; }
         if (dl && dl.url) URL.revokeObjectURL(dl.url);
-        setDl({ url: URL.createObjectURL(blob), size: blob.size,
+        setDl({ url: URL.createObjectURL(blob), size: blob.size, blob: blob,
                 name: 'meme-' + doc.format + '.' + (exportType === 'image/png' ? 'png' : 'jpg') });
+      }
+
+      /* hand the exported blob to image-editor; put() failing just means the
+         target starts empty, same as a fresh visit. */
+      function openInEditor(e) {
+        e.preventDefault();
+        const dest = e.currentTarget.href;
+        if (!dl || !dl.blob) { location.href = dest; return; }
+        window.AlberHandoff.put('image', dl.blob, dl.name).then(
+          () => { location.href = dest; },
+          () => { location.href = dest; }
+        );
       }
 
       async function doCopy() {
@@ -2343,6 +2369,7 @@
                   </div>
                   ${dl && html`<p className="mm-hint">
                     <a href=${dl.url} download=${dl.name}>Download ${dl.name}</a> (${Math.round(dl.size / 1024)} kB)
+                    ${' · '}<a href="/miscellaneous/tools/image-editor.html?from=meme" onClick=${openInEditor}>Open in Image Editor</a>
                   </p>`}
                   ${copied && html`<p className="mm-hint">${copied}</p>`}
                   <p className="mm-hint">Every layout is stored as fractions of the canvas, so the render is the same
