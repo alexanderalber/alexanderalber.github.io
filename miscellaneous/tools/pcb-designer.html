@@ -258,6 +258,13 @@
       font-size: 0.8rem; color: var(--tool-text); }
     .pcb-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%;
       background: var(--tool-faint); align-self: center; }
+    /* The island badge: the same ring and letter the canvas draws on a pad, so
+       the list and the board are read as one thing rather than two. The colour
+       is set inline because it belongs to the island and not to the skin. */
+    .pcb-isl { flex: 0 0 auto; align-self: center; width: 18px; height: 18px;
+      border-radius: 50%; border: 2px solid currentColor; display: inline-flex;
+      align-items: center; justify-content: center; font-size: 10px; font-weight: 700;
+      line-height: 1; }
     .pcb-findlist { display: flex; flex-direction: column; margin: 6px 0 0; }
     .pcb-find { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left;
       background: transparent; border: 0; border-radius: 6px; margin: 0; padding: 4px 6px;
@@ -2448,6 +2455,160 @@ var PCB = (function () {
     return L < 0 ? null : bundle.regions[L];
   }
 
+  /* ------------------------------------------------ offset (parallel copy) */
+
+  /* A parallel copy of a closed shape at a constant distance: the OFFSET of a
+     CAD drawing package. Everything here is deliberately RASTER, and that is
+     the design decision worth defending.
+
+     The analytic version pushes every segment along its normal, joins the ends
+     with arcs and then deletes the loops the pushed segments make wherever the
+     shape turns tighter than the distance. The first two steps are an
+     afternoon; the third is where implementations of this go wrong, because
+     the loops can nest and a wrong one removed silently produces a curve that
+     looks plausible and is not parallel. An offset by a constant distance is a
+     Minkowski sum with a disc, and a Minkowski sum with a disc is exactly a
+     morphological dilation, so filling the shape into a mask, thresholding the
+     exact distance field at the offset radius and tracing the result back gives
+     the same curve with the self-intersections already resolved. Every hard
+     case falls out for free: a notch narrower than twice the distance closes
+     up, an island smaller than the distance disappears, one ring can split into
+     two. Not a single special case is written down anywhere below.
+
+     Nothing here is new machinery: the fill is fillPolysPx from the derived
+     layer rasterizer, the distance field is the DRC's edtSq, the trace back is
+     the region pipeline's maskToPath. Both helpers are declared further down
+     the file and reached by hoisting, which is worth knowing when reading in
+     order.
+
+     The price is resolution, and the honest number is not the one the pixel
+     size suggests. Rounding the radius to whole pixels costs half a pixel,
+     0.0125mm at the full 40 px/mm, but that is the smaller half. The traced
+     ring runs along the CRACKS between pixels, so any boundary not at 0 or 90
+     degrees comes back as a staircase, and the curve fitted through it keeps
+     about a pixel and a half of it. Measured across circles, rectangles and
+     both directions: the distance holds to about 0.05mm. That is a third of
+     JLCPCB's minimum silkscreen feature and well under the registration
+     tolerance of the print itself, but it is not a machinist's number and
+     nothing here should pretend otherwise.
+
+     The result is also a fresh curve fit rather than the original anchors
+     moved, so a shape drawn with eight anchors comes back with a dozen or two.
+
+     CLOSED SHAPES ONLY. An open curve has no inside, so there is no mask to
+     grow. The parallel curve of an open path is a different operation with a
+     different answer, and this one refuses it rather than quietly closing the
+     shape and offsetting something the user did not draw. */
+  var OFFSET_PX_PER_MM = 40;      // as the DRC: 0.025mm per pixel
+  var OFFSET_MIN_PX_PER_MM = 6;   // floor for a shape too big for the budget
+  var OFFSET_MAX_PX = 6e6;        // one Float64 distance field, about 48 MB
+  /* Ring simplification and curve fit, both LOOSER than the region pipeline's
+     1.0, and the direction is counter-intuitive enough to be worth the note:
+     measured on a circle offset by 2mm, 0.75 px produced 366 segments at 0.065mm
+     of error and 1.5 px produced 10 segments at 0.048mm. Tightening it made the
+     result both fatter and worse. The reason is that the boundary handed to the
+     tracer is a pixel staircase, and a tolerance under one pixel cannot
+     simplify a one-pixel step away, so every step survives into the fit and the
+     curve is forced through the quantization noise. Above one pixel the
+     staircase collapses and the fitter sees the shape instead. */
+  var OFFSET_TOL_PX = 1.5;
+  var OFFSET_MAX_ERR_PX = 1.5;
+
+  /* The full 40 px/mm until the raster would outgrow the budget, then whatever
+     fits. Board-sized artwork stays at 40; a shape the size of a whole large
+     board drops to about 25, which is still half the region pipeline's pixel. */
+  function offsetResolution(wMm, hMm) {
+    var k = Math.sqrt(OFFSET_MAX_PX / Math.max(1e-6, wMm * hMm));
+    if (k > OFFSET_PX_PER_MM) k = OFFSET_PX_PER_MM;
+    return Math.max(OFFSET_MIN_PX_PER_MM, k);
+  }
+
+  function shiftPolys(polys, dx, dy) {
+    return polys.map(function (poly) {
+      return poly.map(function (p) { return [p[0] + dx, p[1] + dy]; });
+    });
+  }
+
+  function pathClosed(path) {
+    if (!path || !path.length) return false;
+    for (var i = 0; i < path.length; i++) {
+      if (!path[i] || !path[i].length || !subClosed(path[i])) return false;
+    }
+    return true;
+  }
+
+  /* Positive distance grows the shape, negative shrinks it. The result is a
+     PATH, one subpath per ring the offset produced, and the caller decides
+     whether that becomes one object or several. `distMm` in the return value is
+     the distance actually realised after the rounding to whole pixels, so a
+     caller that cares can say so instead of repeating the number it asked for. */
+  function offsetPath(path, distMm, opts) {
+    opts = opts || {};
+    var tol = opts.tolMm == null ? FLAT_TOL : +opts.tolMm;
+    var d = +distMm;
+    if (!isFinite(d) || d === 0) throw new Error('offset needs a distance other than zero');
+    if (!pathClosed(path)) throw new Error('offset needs a closed shape');
+    var polys = flattenPath(path, tol);
+    if (!polys.length) throw new Error('offset needs a closed shape with an area');
+    var b = boundsOfPolys(polys);
+    if (!b || !(b.w > 0) || !(b.h > 0)) throw new Error('offset needs a closed shape with an area');
+
+    /* Air beyond the grown shape on every side, so the dilated mask never
+       reaches the crop border: a mask that touches the edge traces back as a
+       shape cut off by the crop rather than as a ring. */
+    var pad = (d > 0 ? d : 0) + 4 * tol + 0.1;
+    var wMm = b.w + 2 * pad, hMm = b.h + 2 * pad;
+    var k = offsetResolution(wMm, hMm);
+    /* Rounded rather than truncated, so the error is symmetric: at most half a
+       pixel either way instead of always falling short. */
+    var rPx = Math.round(Math.abs(d) * k);
+    if (rPx < 1) {
+      throw new Error('an offset of ' + Math.abs(d) +
+        ' mm is finer than a shape this size can be rastered at');
+    }
+    var w = Math.max(4, Math.ceil(wMm * k)), h = Math.max(4, Math.ceil(hMm * k));
+    var ox = b.minX - pad, oy = b.minY - pad;
+    /* fillPolysPx works in the board's own frame with the origin at the top
+       left of the raster, so the crop is expressed by moving the polygons
+       rather than by giving the fill an origin it does not have. */
+    var mask = new Uint8Array(w * h);
+    fillPolysPx(mask, w, h, shiftPolys(polys, -ox, -oy), k, 1);
+    var n = w * h, i;
+    var grown = new Uint8Array(n);
+    var r2 = rPx * rPx;
+    if (d > 0) {
+      /* edtSq measures the distance to the nearest ZERO pixel, so growing needs
+         it run on the INVERTED mask: what comes back is how far outside the
+         shape each pixel lies. */
+      var inv = new Uint8Array(n);
+      for (i = 0; i < n; i++) inv[i] = mask[i] ? 0 : 1;
+      var out = edtSq(inv, w, h);
+      for (i = 0; i < n; i++) grown[i] = (mask[i] || out[i] <= r2) ? 1 : 0;
+    } else {
+      var inn = edtSq(mask, w, h);
+      for (i = 0; i < n; i++) grown[i] = (mask[i] && inn[i] > r2) ? 1 : 0;
+    }
+
+    var any = false;
+    for (i = 0; i < n; i++) { if (grown[i]) { any = true; break; } }
+    /* The crop origin is a millimetre offset and therefore lands between
+       pixels. maskToPath takes it in pixels, and does the arithmetic in floats,
+       so a fractional origin is exact rather than snapped. */
+    var traced = any ? maskToPath(grown, w, h, ox * k, oy * k, k, {
+      regionSmooth: opts.smooth !== false,
+      regionTolPx: opts.regionTolPx == null ? OFFSET_TOL_PX : +opts.regionTolPx,
+      regionMaxErrPx: opts.regionMaxErrPx == null ? OFFSET_MAX_ERR_PX : +opts.regionMaxErrPx
+    }) : [];
+
+    return {
+      path: traced,
+      distMm: (d < 0 ? -1 : 1) * rPx / k,
+      pxPerMm: k,
+      rPx: rPx,
+      empty: !traced.length
+    };
+  }
+
   /* -------------------------------------------------- layer derivation */
 
   /* One area becomes one group: its outer rings and its hole rings kept apart.
@@ -2493,6 +2654,138 @@ var PCB = (function () {
 
   function nonEmpty(list) {
     return list.filter(function (e) { return e.polys.length > 0; });
+  }
+
+  /* groupEntries for a set of rings that is nested arbitrarily deep, which is
+     what a traced union delivers and what a per-area group never could.
+
+     groupEntries knows two levels: an area and its holes. A union of several
+     areas can nest further. On the owner's cat the rim around the outline is
+     one area, the two eyes are two more, and the eyes sit INSIDE the rim's
+     hole: outer, hole, island, three levels. Sorting those into outer and hole
+     by winding and emitting all outers before all holes puts the hole entry
+     last, and the hole covers the eyes, so the eyes were filled back in and the
+     LEDs stopped shining through them.
+
+     Depth by containment rather than by winding: how many of the other rings
+     contain this one. Even depth keeps the polarity, odd depth flips it, and
+     the entries go out shallowest first, which is the order the Gerber writer
+     and the canvas both replay. Containment is tested with the first vertex,
+     which is exact here because traced rings never touch. */
+  function depthEntries(polys, polarity) {
+    var flip = polarity === 'dark' ? 'clear' : 'dark';
+    var n = polys.length, depth = new Array(n), maxD = 0, i, j;
+    for (i = 0; i < n; i++) {
+      var p = polys[i][0], d = 0;
+      if (p) {
+        for (j = 0; j < n; j++) {
+          if (j !== i && pointInPolys([polys[j]], p[0], p[1])) d++;
+        }
+      }
+      depth[i] = d;
+      if (d > maxD) maxD = d;
+    }
+    var out = [];
+    for (var k = 0; k <= maxD; k++) {
+      var list = [];
+      for (i = 0; i < n; i++) if (depth[i] === k) list.push(polys[i]);
+      if (list.length) out.push(entry(list, k % 2 ? flip : polarity));
+    }
+    return out;
+  }
+
+  /* Several regions of one material as ONE shape, traced from the union of
+     their pixels instead of emitted region by region.
+
+     Region by region was wrong, and wrong in the worst way available: it read
+     as a wiring mistake by the user rather than as a fault of the tool. The
+     mechanism is groupEntries above. A hole gets its own entry in the opposite
+     polarity, which is exactly how a drawn trace keeps its copper: the stroke
+     is a barrier, so it is a hole in the window painted around it, and the dark
+     entry is what puts the trace back. But dark means dark and not "leave this
+     alone", so the same entry also restores copper that an EARLIER window had
+     legitimately taken away.
+
+     The owner's board is the case that found it. He had offset the outline
+     inward twice, which left a 0.4mm rim on the FRONT, and painted that rim
+     with FR4+mask. The rim's hole is the whole rest of the board, so its dark
+     entry put back every bit of copper the big back-side window had removed:
+     all eight pads on one plane, all three nets shorted against each other, and
+     nothing anywhere on the screen pointing at a rim on the other side.
+
+     Order does not fix it. Whichever of the two windows goes last restores the
+     other one's copper, and the same holds within one side, where the hole of
+     one region can enclose another region that is a window too. What is needed
+     is the union of the areas, and there is no polygon boolean library here.
+
+     Taking the union in the raster is exact for this purpose rather than a
+     compromise: the region polygons come out of that very label plane at that
+     very resolution anyway, through the same tracer with the same tolerances.
+     The only thing that changes is that the rings arrive as one nesting instead
+     of several, which is the same set of polygons in a different order.
+
+     specs is a list of {side, templates}. Returns the traced rings, or null when
+     a bundle has no label plane (keepLabels: false), so the caller can fall back
+     to the old per-region list rather than silently produce nothing. */
+  function unionPolys(bundles, specs, opts) {
+    opts = opts || {};
+    var w = 0, h = 0, k = 0, i, b;
+    for (i = 0; i < specs.length; i++) {
+      b = bundles[specs[i].side];
+      if (!b || !b.labels) return null;
+      if (!w) { w = b.width; h = b.height; k = b.pxPerMm; }
+      else if (b.width !== w || b.height !== h || b.pxPerMm !== k) return null;
+    }
+    if (!w || !h) return null;
+
+    var mask = new Uint8Array(w * h);
+    var minX = w, minY = h, maxX = -1, maxY = -1;
+    specs.forEach(function (spec) {
+      b = bundles[spec.side];
+      var want = {}, any = false;
+      b.regions.forEach(function (r) {
+        if (spec.templates.indexOf(r.template) >= 0) { want[r.labelId] = 1; any = true; }
+      });
+      if (!any) return;
+      var labels = b.labels;
+      var wants = function (L) { return L >= 0 && want[L] === 1; };
+      for (var y = 0; y < h; y++) {
+        var row = y * w;
+        for (var x = 0; x < w; x++) {
+          var idx = row + x, L = labels[idx], on;
+          if (L >= 0) on = want[L] === 1;
+          /* The same single pixel of dilation into the barriers vectorizeRegions
+             does per region, for the same reason: a contour is a line without
+             width, its raster stand-in eats a pixel row, and without this the
+             window would stop 0.05mm short of the line it was painted against. */
+          else {
+            on = (x > 0 && wants(labels[idx - 1])) ||
+              (x < w - 1 && wants(labels[idx + 1])) ||
+              (y > 0 && wants(labels[idx - w])) ||
+              (y < h - 1 && wants(labels[idx + w]));
+          }
+          if (!on) continue;
+          mask[idx] = 1;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    });
+    if (maxX < 0) return [];
+
+    /* Cropped to what is set, so a small window on a large board costs a small
+       trace, exactly as the per-region version did. */
+    var cw = maxX - minX + 1, ch = maxY - minY + 1, crop = mask;
+    if (cw !== w || ch !== h) {
+      crop = new Uint8Array(cw * ch);
+      for (var cy = 0; cy < ch; cy++) {
+        var src = (cy + minY) * w + minX, dst = cy * cw;
+        for (var cx = 0; cx < cw; cx++) crop[dst + cx] = mask[src + cx];
+      }
+    }
+    return flattenPath(maskToPath(crop, cw, ch, minX, minY, k, opts), opts.tolMm);
   }
 
   function templateGroups(bundle) {
@@ -2575,6 +2868,33 @@ var PCB = (function () {
     var fWindows = F.bare.concat(F.maskOnBare);
     var bWindows = B.bare.concat(B.maskOnBare);
 
+    /* Every list below that used to be a concat of per-region groups goes
+       through unionPolys instead; see the comment there for why. The concat is
+       kept as the fallback for a bundle without a label plane, which is what a
+       caller passing keepLabels: false gets.
+
+       One group cannot collide with anything, and the union of one region is
+       that region traced from the same pixels by the same tracer, so the trace
+       is skipped there. That is not only the cheap case, it is also the common
+       one, and it keeps a simple board's Gerber byte for byte what it was. */
+    var WIN = ['bare', 'maskOnBare'];
+    var spec = function (side, templates) { return { side: side, templates: templates }; };
+    var uni = function (specs, fallback, polarity) {
+      if (fallback.length > 1) {
+        var polys = unionPolys(bundles, specs, opts);
+        if (polys) return depthEntries(polys, polarity);
+      }
+      return groupEntries(fallback, polarity);
+    };
+    var fCuWin = uni([spec('front', WIN)], fWindows, 'clear');
+    var bCuWin = uni([spec('back', WIN), spec('front', WIN)],
+      bWindows.concat(fWindows), 'clear');
+    var fMaskOpen = uni([spec('front', ['bare', 'copper'])], F.bare.concat(F.copper), 'dark');
+    var bMaskOpen = uni([spec('back', ['bare', 'copper']), spec('front', ['bare'])],
+      B.bare.concat(B.copper).concat(F.bare), 'dark');
+    var fSilk = uni([spec('front', ['silk'])], F.silk, 'dark');
+    var bSilk = uni([spec('back', ['silk'])], B.silk, 'dark');
+
     /* Both sides' cutouts pooled into one list, because the mill does not know
        which side the seed was dropped on. Every entry made from it is CLEAR and
        comes last on its layer, so a cutout wins over anything drawn into the
@@ -2592,7 +2912,7 @@ var PCB = (function () {
     var board = groupEntries(outlineGroups, 'dark');
     var layers = {};
     layers['F.Cu'] = nonEmpty(board
-      .concat(groupEntries(fWindows, 'clear'))
+      .concat(fCuWin)
       .concat([entry(ring, 'dark'), entry(bore, 'clear')])
       .concat(cutClear));
     /* The pad entry comes BEFORE the window entries, unlike the plated rings
@@ -2603,7 +2923,7 @@ var PCB = (function () {
        see it. The connectivity check reports exactly that as pad-dead. */
     layers['B.Cu'] = nonEmpty(board
       .concat([entry(padCu, 'dark')])
-      .concat(groupEntries(bWindows.concat(fWindows), 'clear'))
+      .concat(bCuWin)
       .concat([entry(ring, 'dark'), entry(bore, 'clear')])
       .concat(cutClear));
     /* Mask layers are negative files: what is drawn is an OPENING, and a cutout
@@ -2614,13 +2934,13 @@ var PCB = (function () {
        are not in F.bare or F.copper to begin with; the clear entry at the end is
        there for the CROSS-SIDE case, where a window on one side would otherwise
        open the mask over the other side's cutout. */
-    layers['F.Mask'] = nonEmpty(groupEntries(F.bare.concat(F.copper), 'dark')
+    layers['F.Mask'] = nonEmpty(fMaskOpen
       .concat([entry(ringOpen, 'dark')]).concat(cutClear));
-    layers['B.Mask'] = nonEmpty(groupEntries(B.bare.concat(B.copper).concat(F.bare), 'dark')
+    layers['B.Mask'] = nonEmpty(bMaskOpen
       .concat([entry(padOpen, 'dark'), entry(ringOpen, 'dark')]).concat(cutClear));
     /* Silk is clipped for the same reason: legend ink printed onto a hole. */
-    layers['F.Silkscreen'] = nonEmpty(groupEntries(F.silk, 'dark').concat(cutClear));
-    layers['B.Silkscreen'] = nonEmpty(groupEntries(B.silk, 'dark').concat(cutClear));
+    layers['F.Silkscreen'] = nonEmpty(fSilk.concat(cutClear));
+    layers['B.Silkscreen'] = nonEmpty(bSilk.concat(cutClear));
     /* Edge.Cuts carries the profile AND every cutout ring: the outer ring of the
        board is where the router goes around it, a cutout ring is where it goes
        through it. Both are stroked, not filled.
@@ -2786,6 +3106,38 @@ var PCB = (function () {
     return f;
   }
 
+  /* Which pad sits on which piece of copper, kept rather than thrown away.
+     connectivity computes the labelling anyway; every finding it reports is a
+     statement ABOUT this map, and without it the user has to reconstruct the map
+     from the findings, including from the findings that are absent. That was the
+     expensive part of a real debugging session: "GND is split into two" plus the
+     absence of a second split line is the only evidence that two particular pads
+     share an island, and reading it that way takes a diagram on paper.
+
+     `of` is per pad key, -1 for a pad with no copper under it. `byLabel` is the
+     other direction, in document order. `order` lists only the labels that carry
+     a pad, again in document order, so `index` is a small dense ordinal the view
+     can turn into a colour without knowing anything about raster labels. Islands
+     with no pad on them are deliberately not in here: there is nothing to say
+     about them. */
+  function islandMap(info, labelOf) {
+    var of = {}, byLabel = {}, order = [], netsOn = {}, index = {};
+    info.pads.forEach(function (p) {
+      var L = labelOf[p.key];
+      of[p.key] = L == null ? -1 : L;
+      if (!(L >= 0)) return;
+      if (!byLabel[L]) { byLabel[L] = []; order.push(L); netsOn[L] = []; }
+      byLabel[L].push(p.key);
+      var net = p.role === 'sw' ? null : p.net;
+      if (net && netsOn[L].indexOf(net) < 0) netsOn[L].push(net);
+    });
+    order.forEach(function (L, i) { index[L] = i; });
+    return {
+      of: of, byLabel: byLabel, order: order, index: index,
+      nets: netsOn, count: order.length
+    };
+  }
+
   /* Is this net one piece of copper, and are the right nets apart?
      The whole check is one labelling of the back copper plus a lookup of the
      label under every pad centre. A pad is part of that copper (deriveLayers
@@ -2879,8 +3231,9 @@ var PCB = (function () {
        separates, and between them they have to cover both. Which pad takes
        which side is the user's business. */
     if (info.hasButton && info.hasBattery) {
+      var swLive = live(info.switchPads);
       var onBat = [], onVcc = [];
-      live(info.switchPads).forEach(function (k) {
+      swLive.forEach(function (k) {
         var L = labelOf[k], p = info.padByKey[k];
         var b = !!sets['BAT+'][L], v = !!sets.VCC[L];
         if (b) onBat.push(k);
@@ -2889,10 +3242,22 @@ var PCB = (function () {
       });
       /* Both pads on the same net: the switch is wired in parallel to one side
          instead of into the plus line. Not in the spec's list of codes, but it
-         is a distinct fault and calling it button-floating would be a lie. */
-      if (onBat.length && !onVcc.length) {
+         is a distinct fault and calling it button-floating would be a lie.
+
+         EVERY pad has to be on that net for the claim to hold, which is what
+         the length comparison is for. Testing only "some on this net and none
+         on the other" reported a two pad switch with ONE pad on VCC and the
+         other floating as "both button pads sit on VCC", next to the
+         button-floating finding for the very pad it had just counted in. Two
+         findings for one switch that contradicted each other in plain words,
+         and the wrong one named both pads in its refs, so clicking it zoomed to
+         a pad the sentence did not describe. A dead pad is excluded the same
+         way: a switch with one pad off the copper is a pad-dead case and
+         nothing can be said about how it bridges. */
+      var whole = swLive.length === info.switchPads.length;
+      if (whole && onBat.length === swLive.length && !onVcc.length) {
         findings.push(pushSided(info, onBat, 'BAT+'));
-      } else if (onVcc.length && !onBat.length) {
+      } else if (whole && onVcc.length === swLive.length && !onBat.length) {
         findings.push(pushSided(info, onVcc, 'VCC'));
       }
     }
@@ -2915,6 +3280,15 @@ var PCB = (function () {
       incomplete: incomplete,
       findings: findings,
       nets: netStatus,
+      islands: islandMap(info, labelOf),
+      /* The labelling itself, so the view can paint the islands instead of only
+         naming them. It is the array this function already walked, handed on
+         rather than computed a second time at another resolution, which is the
+         only way the picture and the findings cannot disagree. */
+      raster: {
+        width: ras.width, height: ras.height, pxPerMm: px,
+        labels: cc.labels, count: cc.count
+      },
       hasBattery: info.hasBattery, hasButton: info.hasButton, ledCount: info.ledCount
     };
   }
@@ -4672,6 +5046,8 @@ var PCB = (function () {
     vectorizeStrokes: vectorizeStrokes,
     regionsForSide: regionsForSide,
     regionAt: regionAt,
+    pathClosed: pathClosed,
+    offsetPath: offsetPath,
     deriveLayers: deriveLayers,
     derivedExtent: derivedExtent,
     gerberFile: gerberFile,
@@ -4751,10 +5127,51 @@ var PCB = (function () {
          board, not something the fab will ever print. */
       good: cssVar('--tool-sig-good') || '#4ade80',
       warn: cssVar('--tool-sig-warn') || '#facc15',
-      bad: cssVar('--tool-sig-bad') || '#f87171'
+      bad: cssVar('--tool-sig-bad') || '#f87171',
+      /* The grey skin distinguishes surfaces by outline and not by fill, and it
+         has no hue left to spend, so the island overlay has to know which skin
+         it is on rather than only which colours. */
+      grey: (function () {
+        try { return document.documentElement.getAttribute('data-skin') === 'grey'; }
+        catch (e) { return false; }
+      })()
     });
   }
   readPalette();
+
+  /* The island palette. Eight hues, cycled, and NOT theme colours on purpose:
+     they are drawn on top of the board render, so what they have to stand out
+     against is soldermask and copper, not a page surface. Same reasoning as the
+     fab colours and the colormaps elsewhere on the site, and the same rule
+     applies: the colour is the fast channel, never the only one. Every pad also
+     carries the island's LETTER, which survives the grey skin and colour
+     blindness alike, and in the grey skin the fill tint is dropped altogether
+     and the islands are drawn as outlines instead. */
+  const ISLAND_TINTS = [
+    '#38bdf8', '#f472b6', '#a3e635', '#fb923c',
+    '#c084fc', '#2dd4bf', '#facc15', '#f8fafc'
+  ];
+  function islandColor(i) {
+    if (COL.grey) return i % 2 ? COL.text : COL.bad;
+    return ISLAND_TINTS[((i % ISLAND_TINTS.length) + ISLAND_TINTS.length) % ISLAND_TINTS.length];
+  }
+  /* A, B, C ... and then A2, B2 rather than a second alphabet, because the
+     letter is read aloud next to a finding and "the pad on island B2" is still
+     one token. Boards with more than 26 pad-carrying islands do not exist here. */
+  function islandName(i) {
+    const round = Math.floor(i / 26);
+    return String.fromCharCode(65 + (i % 26)) + (round ? String(round + 1) : '');
+  }
+  function toRgb(col) {
+    const s = String(col || '').trim();
+    let m = /^#([0-9a-f]{3})$/i.exec(s);
+    if (m) return [0, 1, 2].map((i) => parseInt(m[1][i] + m[1][i], 16));
+    m = /^#([0-9a-f]{6})$/i.exec(s);
+    if (m) return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+    m = /^rgba?\(([^)]+)\)$/i.exec(s);
+    if (m) return m[1].split(',').slice(0, 3).map((v) => Math.round(parseFloat(v)) || 0);
+    return [255, 255, 255];
+  }
 
   /* The material colours themselves live in the core (PCB.fabColors), because
      they are a pure table and the tests read them there. Here only the labels
@@ -4817,6 +5234,57 @@ var PCB = (function () {
     const c = document.createElement('canvas');
     c.width = W; c.height = H;
     return c;
+  }
+
+  /* The copper islands as a picture. connectivity hands over the label plane it
+     labelled the pads against, so this is the same arithmetic the findings are
+     made of rather than a second opinion drawn next to them.
+
+     Only islands that carry a PAD get a colour. The rest of the copper is left
+     alone, and that is not a shortcut: an island with nothing on it is a piece
+     of metal with no electrical statement attached, and painting it would put
+     eleven colours on the screen of which three mean something.
+
+     The plane is 20 pixels per millimetre, which is 5 megapixels on a large
+     board and far more than a tint needs, so it is sampled down to a long side
+     of ISLAND_MAX. Fills are translucent, boundaries nearly opaque; in the grey
+     skin the fill drops to zero and the boundary carries it alone, which is what
+     that skin does everywhere: outline, not fill. */
+  const ISLAND_MAX = 1400;
+  function islandOverlay(conn) {
+    if (!conn || !conn.raster || !conn.raster.labels) return null;
+    const isl = conn.islands;
+    if (!isl || !isl.count) return null;
+    const R = conn.raster;
+    const step = Math.max(1, Math.ceil(Math.max(R.width, R.height) / ISLAND_MAX));
+    const w = Math.max(1, Math.floor(R.width / step));
+    const h = Math.max(1, Math.floor(R.height / step));
+    const rgb = {};
+    isl.order.forEach((L) => { rgb[L] = toRgb(islandColor(isl.index[L])); });
+    const at = (x, y) => {
+      if (x < 0 || y < 0 || x >= w || y >= h) return -1;
+      const L = R.labels[(y * step) * R.width + x * step];
+      return L >= 0 && rgb[L] ? L : -1;
+    };
+    const c = scratch(w, h);
+    const g = c.getContext('2d');
+    const img = g.createImageData(w, h);
+    const d = img.data;
+    const fillA = COL.grey ? 0 : 90;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const L = at(x, y);
+        if (L < 0) continue;
+        const edge = at(x - 1, y) !== L || at(x + 1, y) !== L ||
+          at(x, y - 1) !== L || at(x, y + 1) !== L;
+        if (!edge && !fillA) continue;
+        const col = rgb[L], i = (y * w + x) * 4;
+        d[i] = col[0]; d[i + 1] = col[1]; d[i + 2] = col[2];
+        d[i + 3] = edge ? 235 : fillA;
+      }
+    }
+    g.putImageData(img, 0, 0);
+    return { canvas: c, wMm: R.width / R.pxPerMm, hMm: R.height / R.pxPerMm };
   }
 
   function decodeViaImg(file) {
@@ -7132,6 +7600,7 @@ var PCB = (function () {
     const [onion, setOnion] = useState(true);
     const [strokeW, setStrokeW] = useState('1');
     const [strokeTpl, setStrokeTpl] = useState('copper');
+    const [offsetMm, setOffsetMm] = useState('1');
     const [snapDeg, setSnapDeg] = useState('free');
     const [snapMode, setSnapMode] = useState('off');
     /* The anchor the point editor is working on, and where the pointer last
@@ -7165,6 +7634,7 @@ var PCB = (function () {
     const [drcRes, setDrcRes] = useState(null);
     const [drcBusy, setDrcBusy] = useState(false);
     const [checkSide, setCheckSide] = useState('back');
+    const [showIslands, setShowIslands] = useState(true);
     const [markSel, setMarkSel] = useState(null);
     const [limDraft, setLimDraft] = useState(() => limitDraftOf('aisler'));
     const [restorePrompt, setRestorePrompt] = useState(null);
@@ -7191,6 +7661,16 @@ var PCB = (function () {
     const partSelRef = useRef(partSel);
     const checkSideRef = useRef(checkSide);
     const coalesceRef = useRef({ key: null, at: 0 });
+    /* The window keydown listener is registered ONCE, on stable callbacks, so
+       everything it touches has to come out of a ref or it is frozen at the
+       first render. Every piece of state it reads does; commitDraft did not,
+       and it reads strokeW and strokeTpl straight out of the closure. Ending a
+       stroke with Esc therefore committed the width and the material the tool
+       started with, 1 mm of copper, however the toolbar was set. Mirroring the
+       function rather than the two values is the version that stays fixed: the
+       next value commitDraft learns to read is covered without anyone
+       remembering this. */
+    const commitDraftRef = useRef(null);
     partSelRef.current = partSel;
     checkSideRef.current = checkSide;
     docRef.current = doc;
@@ -7203,6 +7683,7 @@ var PCB = (function () {
     toolRef.current = tool;
     tabRef.current = tab;
     ptSelRef.current = ptSel;
+    commitDraftRef.current = commitDraft;
 
     /* Read straight from the document, so every canvas, swatch and legend below
        follows a mask colour change on the config tab without its own state. */
@@ -7397,7 +7878,7 @@ var PCB = (function () {
           if (partSelRef.current) { e.preventDefault(); setPartSel(null); }
           const d = draftRef.current;
           if (d || dragRef.current || refDragRef.current || ptDragRef.current || ptSelRef.current) e.preventDefault();
-          if (d && (d.tool === 'polyline' || d.tool === 'stroke' || d.tool === 'pen') && d.pts.length >= 2) commitDraft(d, false);
+          if (d && (d.tool === 'polyline' || d.tool === 'stroke' || d.tool === 'pen') && d.pts.length >= 2) commitDraftRef.current(d, false);
           setDraft(null);
           setDrag(null);
           setRefDrag(null);
@@ -7728,6 +8209,66 @@ var PCB = (function () {
       props[o.id] = { role: 'outline' };
       runCmds([{ type: 'setObjectProps', props: props }]);
       setMsg('That contour is the board outline now. Everything outside it is void.');
+    }
+
+    /* The contour the offset button would work on, or null. Closed only, and a
+       contour only: a stroke already has a width, and offsetting its centreline
+       would quietly ignore the one number that makes it a stroke. */
+    function offsetSource(side) {
+      const id = sel.length === 1 ? sel[0] : null;
+      const o = id ? doc.objects.filter((x) => x.id === id)[0] : null;
+      if (!o || o.kind !== 'contour' || !PCB.pathClosed(o.path)) return null;
+      /* The same side guard the gesture handlers use: a front contour stays
+         selected while the back tab is open, and offsetting it from there would
+         put the copy on a tab the user is not looking at. */
+      if (side && o.side !== side) return null;
+      return o;
+    }
+
+    /* Behind the busy flag on purpose: a board-sized shape at 40 px/mm is a few
+       hundred milliseconds of distance transform, and a canvas that freezes
+       without saying anything reads as a crash rather than as work. */
+    function offsetSelection(side) {
+      const o = offsetSource(side);
+      if (!o) return;
+      const d = +offsetMm;
+      if (!isFinite(d) || d === 0) {
+        setErr('The offset needs a distance other than zero. Negative goes inwards.');
+        return;
+      }
+      setErr(null);
+      setBusy(true);
+      setTimeout(() => {
+        try {
+          const res = PCB.offsetPath(o.path, d);
+          if (res.empty) {
+            setErr('Nothing left: shrinking this shape by ' + Math.abs(d) +
+              ' mm takes more than the shape is wide.');
+          } else {
+            const ids = PCB.nextObjectIds(docRef.current, res.path.length);
+            const objs = res.path.map((segs, i) => ({
+              id: ids[i], side: o.side, kind: 'contour', role: null, path: [segs]
+            }));
+            runCmds([{ type: 'addObjects', objects: objs }]);
+            setSel(ids);
+            /* One ring one object, as everywhere else, so a shape whose offset
+               fell apart says so instead of hiding the pieces in one entry. */
+            const rings = ids.length === 1 ? 'One new contour'
+              : ids.length + ' new contours';
+            const realised = Math.abs(Math.abs(res.distMm) - Math.abs(d)) > 0.005
+              ? ' Rastered at ' + res.pxPerMm.toFixed(0) + ' px/mm, so the distance is ' +
+                Math.abs(res.distMm).toFixed(3) + ' mm rather than exactly ' + Math.abs(d) + '.'
+              : '';
+            setMsg(rings + ' ' + Math.abs(d) + ' mm ' + (d > 0 ? 'outside' : 'inside') +
+              ' the original, which is untouched.' + realised +
+              ' The strip between the two is an area of its own now: give it a material on the mat-' +
+              o.side + ' tab.');
+          }
+        } catch (e) {
+          setErr('Offset failed: ' + (e && e.message ? e.message : 'unknown error'));
+        }
+        setBusy(false);
+      }, 30);
     }
 
     /* ---- drawing ---- */
@@ -8428,6 +8969,12 @@ var PCB = (function () {
       return out;
     }, [conn, drcRes]);
 
+    /* Rebuilt when the connectivity result changes and when the skin changes,
+       because the tint colours and the grey skin's outline-only variant are
+       baked into the pixels. */
+    const islandPic = useMemo(() => (showIslands ? islandOverlay(conn) : null),
+      [conn, showIslands, themeTick]);
+
     function focusMark(kind, i, side, x, y) {
       setMarkSel({ kind: kind, i: i });
       if (side) setCheckSide(side);
@@ -8960,6 +9507,63 @@ var PCB = (function () {
       ctx.restore();
     }
 
+    /* The islands, and then a badge on every pad saying which one it is on.
+       Two pads with the same letter are connected; that is the entire message,
+       and it is the one thing the finding list cannot say, because it reports
+       what is wrong and the connections are what is there.
+
+       The letter is not decoration next to the colour. It is the channel that
+       survives the grey skin, a colour-blind reader and a black and white
+       screenshot, and the colour is the fast lookup on top of it. A pad with no
+       copper under it gets neither: it gets a cross, because it is not on any
+       island and saying "island A" about it would be a lie. */
+    function drawIslands(ctx, V, dpr) {
+      if (!islandPic) return;
+      const c = V.toPx(islandPic.wMm / 2, islandPic.hMm / 2);
+      const w = islandPic.wMm * V.k, h = islandPic.hMm * V.k;
+      ctx.save();
+      ctx.translate(c[0], c[1]);
+      if (V.mirror) ctx.scale(-1, 1);
+      ctx.drawImage(islandPic.canvas, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+
+    function drawIslandPads(ctx, V, dpr) {
+      if (!conn || !conn.islands) return;
+      const isl = conn.islands;
+      ctx.save();
+      ctx.font = 'bold ' + (11 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      padList.forEach((p) => {
+        const L = isl.of[p.key];
+        const q = V.toPx(p.cx, p.cy);
+        const r = 8 * dpr;
+        if (!(L >= 0)) {
+          ctx.strokeStyle = COL.bad;
+          ctx.lineWidth = 2 * dpr;
+          ctx.beginPath();
+          ctx.moveTo(q[0] - r, q[1] - r);
+          ctx.lineTo(q[0] + r, q[1] + r);
+          ctx.moveTo(q[0] + r, q[1] - r);
+          ctx.lineTo(q[0] - r, q[1] + r);
+          ctx.stroke();
+          return;
+        }
+        const col = islandColor(isl.index[L]);
+        ctx.beginPath();
+        ctx.arc(q[0], q[1], r, 0, Math.PI * 2);
+        ctx.fillStyle = COL.bg;
+        ctx.fill();
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2 * dpr;
+        ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.fillText(islandName(isl.index[L]), q[0], q[1] + 0.5 * dpr);
+      });
+      ctx.restore();
+    }
+
     /* A finding on the board: a ring with a crosshair, in the signal colour of
        its severity, and the selected one doubled and filled. Same picture as the
        snap hint on purpose, because it means the same thing here: this exact
@@ -9149,6 +9753,7 @@ var PCB = (function () {
       const ptAddr = ptObj && ptSel && ptSel.id === ptObj.id
         ? { sub: ptSel.sub, seg: ptSel.seg } : null;
       const ptMode = ptAddr ? PCB.anchorMode(ptObj.path, ptAddr) : null;
+      const offsetSrc = offsetSource(side);
       return html`<${React.Fragment}>
         ${lead('draw-' + side, 'What this tab is for', html`<${React.Fragment}>
           <p>Draw the lines that divide the board${mirror ? ', seen from the back: the view is mirrored, so what you draw here lands under your finger when you turn the real board over' : ''}.
@@ -9168,6 +9773,13 @@ var PCB = (function () {
             Snap decides where a point lands: on the 1 mm grid,
             on a nearby anchor, board corner or hole centre, or on both, and a nearby point always wins over the grid.
             Tangent handles are never snapped.</p>
+          <p>Offset makes a parallel copy of one closed contour at a constant distance, outwards for a positive number
+            and inwards for a negative one. That is how a shape gets an even band around it: offset the outline, then
+            paint the strip between the two on the material tab. Where the shape turns tighter than the distance, the
+            copy does what a real parallel curve does rather than crossing itself, so a narrow notch closes up, a thin
+            limb can vanish, and one ring can come back as two. The copy is a fresh curve rather than the original
+            anchors moved, and it is computed on a raster, so the distance holds to about five hundredths of a
+            millimetre: finer than a silkscreen can be printed, coarser than a drawing package would manage.</p>
         <//>`)}
         <div className="ctl-card" style=${{ marginBottom: 12 }}>
           <div className="ctl-sec">
@@ -9230,6 +9842,20 @@ var PCB = (function () {
             </div>
           </div>`}
           <div className="ctl-sec">
+            <p className="ctl-sec-h">Offset</p>
+            <div className="pcb-fields">
+              <${NumField} label="Distance (mm)" value=${offsetMm} step="0.1" width="5rem"
+                onChange=${setOffsetMm}
+                onCommit=${() => { if (!isFinite(+offsetMm) || +offsetMm === 0) setOffsetMm('1'); }} />
+              <button type="button" className="tool-btn" disabled=${busy || !offsetSrc}
+                title=${offsetSrc ? null
+    : 'Select exactly one closed contour. A stroke already has a width, and an open curve has no inside to measure from.'}
+                onClick=${() => offsetSelection(side)}>${ToolIcons.el('copy')}Offset copy</button>
+              <span className="pcb-note">A parallel copy of the selected contour, the same distance away all the way round.
+                Negative goes inwards. The original stays where it is.</span>
+            </div>
+          </div>
+          <div className="ctl-sec">
             <div className="pcb-row">
               <button type="button" className="tool-btn" disabled=${sel.length !== 1 || !doc.objects.some((o) => o.id === sel[0] && o.kind === 'contour')}
                 onClick=${useAsOutline}>Use as outline</button>
@@ -9282,10 +9908,15 @@ var PCB = (function () {
       const otherCuts = derived ? (derived.materials[side === 'front' ? 'back' : 'front'].cutout || []) : [];
       const showLegend = side === 'back' || otherCuts.length > 0;
       return html`<${React.Fragment}>
-        ${lead('mat-' + side, 'What this tab is for', html`<p>
-          Pick a material stack and click an area to give it that stack. Every area you do not touch is the board default:
-          copper under soldermask. Clicking with the default removes the seed point again${mirror ? '. The view is mirrored, as on the drawing tab' : ''}.
-        </p>`)}
+        ${lead('mat-' + side, 'What this tab is for', html`<${React.Fragment}>
+          <p>Pick a material stack and click an area to give it that stack. Every area you do not touch is the board default:
+            copper under soldermask. Clicking with the default removes the seed point again${mirror ? '. The view is mirrored, as on the drawing tab' : ''}.</p>
+          <p>All six templates are subtractive. A board starts as a continuous sheet of copper under mask, and the
+            templates take material away: Bare FR4 takes the copper and the mask, FR4 + mask takes only the copper,
+            FR4 + copper takes only the mask. None of them adds copper anywhere. That matters most for traces:
+            painting a line with FR4 + copper opens the mask over copper that was already there, it does not make a
+            conductor. A trace exists because the copper NEXT to it is gone.</p>
+        <//>`)}
         ${palette}
         <p className="pcb-note" style=${{ margin: '6px 0 12px' }}>${TPL_HINT[paint]}</p>
         <${BoardCanvas} bw=${bw} bh=${bh} mirror=${mirror} cursor="pointer" fill=${true}
@@ -9685,6 +10316,8 @@ var PCB = (function () {
       const dErr = dFind.filter((f) => f.severity === 'error');
       const dWarn = dFind.filter((f) => f.severity !== 'error');
       const fabLabel = FAB_NAME[doc.board.fab] || doc.board.fab;
+      const deadPads = conn && conn.islands
+        ? padList.map((p) => p.key).filter((k) => !(conn.islands.of[k] >= 0)) : [];
       /* A net with no pads at all is not a failure, it is an unfinished board,
          so it gets the neutral dot and the sentence says what is missing. */
       const netDot = (net) => {
@@ -9713,6 +10346,16 @@ var PCB = (function () {
           <p>The design checks ask whether a fab can make it: trace widths, copper spacing, copper to the board
             edge, silkscreen line widths, annular rings, drill diameters and drill to edge. Both fabs are
             documented profiles, and the numbers are editable below.</p>
+          <p>The thing worth knowing before reading any of it: a board starts as a continuous sheet of copper
+            under soldermask, on both sides. The templates take material away, they never add any. A stroke
+            painted with FR4 + copper opens the mask over copper that was already there; it does not create a
+            trace. What creates a trace is removing the copper AROUND it, with a window. So a board with
+            beautiful thick lines drawn on it and nothing else is one single piece of metal, and every net on it
+            is shorted to every other one.</p>
+          <p>The circuit being checked is fixed and derived from the parts: the LEDs sit in PARALLEL, GND is
+            every cathode plus the battery minus, VCC is every anode, the button sits between the battery plus
+            and VCC. Two LEDs in series would be reported as broken here, and would also not light up on a
+            CR2032.</p>
           <p>What is deliberately not checked: soldermask slivers, the minimum router radius and slot widths.
             Those need an analysis this tool does not do yet, and a green light here is not a promise about
             them.</p>
@@ -9721,6 +10364,10 @@ var PCB = (function () {
           <div>
             <div className="pcb-row" style=${{ marginBottom: 8 }}>
               <${Seg} value=${checkSide} onChange=${setCheckSide} options=${CHECK_SIDES} />
+              <label style=${{ fontSize: '0.8rem', margin: 0 }}>
+                <input type="checkbox" checked=${showIslands}
+                  onChange=${(e) => setShowIslands(e.target.checked)} /> Copper islands
+              </label>
               <span className="pcb-note">Markers sit where a finding is. Clicking a line below zooms to it.</span>
             </div>
             <${BoardCanvas} bw=${bw} bh=${bh} mirror=${checkSide === 'back'} fill=${true}
@@ -9728,6 +10375,10 @@ var PCB = (function () {
               draw=${(ctx, V, W, H, dpr) => {
                 drawFrame(ctx, V, dpr);
                 if (derived) renderSide(ctx, W, H, derived, checkSide, V, fab);
+                if (checkSide === 'back' && showIslands) {
+                  drawIslands(ctx, V, dpr);
+                  drawIslandPads(ctx, V, dpr);
+                }
                 drawMarks(ctx, V, dpr, checkSide);
               }} />
             ${viewBar}
@@ -9753,6 +10404,38 @@ var PCB = (function () {
                   ${todo.length ? html`<div className="pcb-findlist">
                     ${todo.map((f) => findRow('conn', findings.indexOf(f), f, connText(f), { color: 'var(--tool-faint)' }))}
                   </div>` : null}
+                <//>`}
+              </div>
+              <!-- Which pad sits on which piece of copper. The findings say what
+                   is wrong; this says what is CONNECTED, which is the thing that
+                   otherwise has to be inferred from a line that is missing. -->
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Copper islands</p>
+                ${!conn || !conn.islands ? html`<p className="pcb-note">Working it out.</p>`
+    : !conn.islands.count ? html`<p className="pcb-note">
+                  No pad sits on copper yet.</p>` : html`<${React.Fragment}>
+                  ${conn.islands.order.map((L) => {
+      const i = conn.islands.index[L];
+      const keys = conn.islands.byLabel[L];
+      const nets = conn.islands.nets[L];
+      const col = islandColor(i);
+      return html`<div key=${L} className="pcb-checkrow">
+                      <span className="pcb-isl" style=${{ color: col }}>${islandName(i)}</span>
+                      <span>
+                        ${nets.length > 1 ? html`<strong style=${{ color: 'var(--tool-sig-bad)' }}>
+                          ${nets.join(' and ')} on one piece of copper</strong>` : nets.length
+      ? html`<strong>${nets[0]}</strong>` : html`<strong>no net</strong>`}:
+                        ${' ' + keys.map(padName).join(', ')}.
+                      </span>
+                    </div>`;
+    })}
+                  ${deadPads.length ? html`<p className="pcb-note" style=${{ marginTop: 6 }}>
+                    On no island at all, marked with a cross: ${deadPads.map(padName).join(', ')}.
+                    There is no copper under those pads.</p>` : null}
+                  <p className="pcb-note" style=${{ marginTop: 6 }}>
+                    Two pads with the same letter are connected, whatever the list above says. The colour is the
+                    same statement in a hurry; in the grey skin only the outlines and the letters are left.
+                  </p>
                 <//>`}
               </div>
               <div className="ctl-sec">
