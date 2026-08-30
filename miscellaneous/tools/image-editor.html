@@ -5,10 +5,10 @@
   <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Image Editor - Crop, Draw, Text &amp; Corner-Pin Warp</title>
-  <meta name="description" content="A browser image editor: crop, scale, rotate, draw, add text and warp the four corners. Non-destructive operation stack with history. Runs entirely in your browser, nothing is uploaded.">
+  <meta name="description" content="A browser image editor: crop, scale, rotate, draw, add text, correct perspective and warp the four corners. Guide lines to line things up, and an aspect ratio estimated from the perspective itself. Non-destructive operation stack with history. Runs entirely in your browser, nothing is uploaded.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/image-editor.html">
   <meta property="og:title" content="Image Editor – crop, draw, text &amp; corner-pin warp">
-  <meta property="og:description" content="Crop, scale, rotate, draw, add text and warp the four corners. A non-destructive operation stack you can reorder and roll back. Runs entirely in your browser.">
+  <meta property="og:description" content="Crop, scale, rotate, draw, add text, pull a perspective straight and warp the four corners. A non-destructive operation stack you can reorder and roll back. Runs entirely in your browser.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/image-editor.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -69,6 +69,28 @@
     .ie-presets{display:flex;flex-wrap:wrap;gap:.3rem}
     .ie-meta{color:var(--pico-muted-color);font-size:.8em;margin:.2rem 0 1rem}
     .ie-meta b{color:var(--tool-text);font-weight:600}
+    /* One line of fixed height, directly above the perspective preview. Both values change
+       on every pointermove, so anything that could wrap would shift the preview down and up
+       while dragging. min-width:0 lets the values shrink instead of pushing the row wider,
+       "n/a" stands in for an estimate that is not available, so the row keeps its shape in
+       that case too. */
+    .ie-estimate{display:flex;align-items:baseline;gap:.3rem;font-size:.78rem;
+      margin:.1rem 0 .35rem;color:var(--tool-text);white-space:nowrap;height:1.4em;overflow:hidden}
+    .ie-estimate b{min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .ie-est-l{color:var(--pico-muted-color);font-size:.9em;flex:none}
+    .ie-est-l + b{margin-right:.25rem}
+    /* Fixed box, image centred inside it. The preview's own aspect ratio follows the quad
+       and therefore changes on every pointermove; without a fixed height the note, the
+       button and the fold below it would slide up and down throughout a drag. */
+    .ie-preview-box{height:180px;display:flex;align-items:center;justify-content:center;
+      border:1px solid var(--tool-border);border-radius:6px;overflow:hidden;
+      background-image:conic-gradient(var(--tool-hairline) 25%,transparent 0 50%,var(--tool-hairline) 0 75%,transparent 0);
+      background-size:12px 12px;background-color:var(--tool-subtle)}
+    .ie-preview{display:block;max-width:100%;max-height:100%;object-fit:contain}
+    .ie-guides{list-style:none;padding:0;margin:.3rem 0 0}
+    .ie-guides li{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:.4rem;font-size:.75rem;color:var(--pico-muted-color);padding:.15rem 0}
+    .ie-guides li span{white-space:nowrap}
+    .ie-guides li input[type=range]{margin:0;padding:0;height:1rem}
     .ie-history{display:flex;gap:.4rem;margin-bottom:.8rem}
     .ie-export button,.ie-export a[role=button]{width:100%;margin:0}
   </style>
@@ -84,7 +106,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Image Editor",
-    "description": "A browser image editor: crop, scale, rotate, draw, add text and warp the four corners, built on a non-destructive operation stack. Runs entirely in the browser.",
+    "description": "A browser image editor: crop, scale, rotate, draw, add text, correct perspective with a real homography and warp the four corners, built on a non-destructive operation stack. Runs entirely in the browser.",
     "url": "https://alber.me/miscellaneous/tools/image-editor.html",
     "applicationCategory": "MultimediaApplication",
     "inLanguage": "en",
@@ -125,7 +147,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Image Editor</h1>
-        <p style="color:var(--tool-label);max-width:70ch">Upload a photo, then crop, scale, rotate, draw, add text and warp its four corners. Every edit is a step on a non-destructive stack you can reorder and roll back &ndash; like a CAD history. Everything runs in your browser; your image never leaves your device.</p>
+        <p style="color:var(--tool-label);max-width:70ch">Upload a photo, then crop, scale, rotate, draw, add text, pull a slanted facade straight and warp its four corners. Every edit is a step on a non-destructive stack you can reorder and roll back &ndash; like a CAD history. Everything runs in your browser; your image never leaves your device.</p>
       </div>
     </div>
   </main>
@@ -184,6 +206,172 @@
       });
     }
 
+    /* ---------- projective (homography) geometry, used by the perspective op ----------
+       The corner warp above is a FORWARD BILINEAR map: it stretches the source rectangle
+       into the dragged quad, and straight lines through the interior do not stay straight.
+       That is fine for free distortion but wrong for pulling a perspective out of a photo,
+       where the whole point is that the facade's mullions have to end up straight.
+       The perspective op therefore uses a real 8-DOF homography, applied INVERSELY: for
+       each output pixel we ask which source pixel it came from. */
+
+    /* Gaussian elimination with partial pivoting; solves A x = b in place. null if singular. */
+    function solveN(A, b) {
+      var n = b.length, i, j, k;
+      var M = A.map(function (row, r) { return row.concat([b[r]]); });
+      for (i = 0; i < n; i++) {
+        var piv = i;
+        for (j = i + 1; j < n; j++) if (Math.abs(M[j][i]) > Math.abs(M[piv][i])) piv = j;
+        if (Math.abs(M[piv][i]) < 1e-12) return null;
+        var tmp = M[i]; M[i] = M[piv]; M[piv] = tmp;
+        for (j = i + 1; j < n; j++) {
+          var f = M[j][i] / M[i][i];
+          for (k = i; k <= n; k++) M[j][k] -= f * M[i][k];
+        }
+      }
+      var x = new Array(n);
+      for (i = n - 1; i >= 0; i--) {
+        var s = M[i][n];
+        for (j = i + 1; j < n; j++) s -= M[i][j] * x[j];
+        x[i] = s / M[i][i];
+      }
+      return x;
+    }
+
+    /* homography H (row-major 9) mapping the four src points onto the four dst points.
+       h22 is fixed to 1, which is safe here because no useful quad maps the origin to
+       infinity. Returns null if the four points are degenerate (three collinear). */
+    function homography(src, dst) {
+      var A = [], b = [];
+      for (var i = 0; i < 4; i++) {
+        var x = src[i].x, y = src[i].y, u = dst[i].x, v = dst[i].y;
+        A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+        A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+      }
+      var h = solveN(A, b);
+      if (!h) return null;
+      return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+    }
+
+    /* apply a homography to a point */
+    function applyH(H, x, y) {
+      var w = H[6] * x + H[7] * y + H[8];
+      if (Math.abs(w) < 1e-12) w = 1e-12;
+      return { x: (H[0] * x + H[1] * y + H[2]) / w, y: (H[3] * x + H[4] * y + H[5]) / w };
+    }
+
+    /* --- aspect ratio of the real-world rectangle behind a photographed quad ---
+       Standard result (Zhang & He 2003, the maths every document scanner uses):
+       the quad's two pairs of opposite edges meet in two vanishing points; those
+       encode the plane's orientation, and with the usual camera assumptions
+       (square pixels, no skew, principal point at the image centre) they determine
+       both the focal length and the rectangle's true width/height ratio.
+
+       corners = [TL, TR, BR, BL] in image pixels; (cx, cy) = image centre.
+       Returns null when the estimate is not usable. That is not a rare corner case:
+       the formula has a POLE. As a pair of opposite edges passes through parallel,
+       its vanishing point runs off to infinity, f^2 goes through +-infinity via a
+       sign flip, and the ratio the formula produces just left and right of that
+       point is arbitrarily large. Dragging a corner walks straight through it, so
+       an unguarded version flickers between a plausible value, null, and nonsense
+       from one frame to the next. Three guards, in order of how often they fire:
+
+         - f^2 <= 0: no centred pinhole camera explains this quad at all
+         - |f| outside [0.15, 4] image diagonals: mathematically a solution, but a
+           lens no one owns. This is what the pole actually looks like from close
+           up (f = 6900 px on an 800 px image), and it is the guard that matters
+         - the ratio itself outside [0.02, 50]
+
+       Callers must fall back to something else rather than pretend a number. */
+    function rectAspect(corners, cx, cy) {
+      // homogeneous coords relative to the principal point
+      var m = corners.map(function (p) { return [p.x - cx, p.y - cy, 1]; });
+      var p1 = m[0], p2 = m[1], p3 = m[3], p4 = m[2];   // TL, TR, BL, BR (Zhang's ordering)
+
+      // p4 = k2*p2 + k3*p3 - k2*k3*p1 in homogeneous coords: solve for k2, k3
+      var k2n = dot3(cross3(p1, p4), p3), k2d = dot3(cross3(p2, p4), p3);
+      var k3n = dot3(cross3(p1, p4), p2), k3d = dot3(cross3(p3, p4), p2);
+      if (Math.abs(k2d) < 1e-9 || Math.abs(k3d) < 1e-9) return null;
+      var k2 = k2n / k2d, k3 = k3n / k3d;
+
+      // a parallelogram gives k2 = k3 = 1: no perspective, hence no information
+      if (Math.abs(k2 - 1) < 1e-6 && Math.abs(k3 - 1) < 1e-6) return null;
+
+      // focal length squared from the orthogonality of the two vanishing directions
+      var fd = (k3 - 1) * p3[2] * (k2 - 1) * p2[2];
+      var f2;
+      if (Math.abs(fd) < 1e-9) {
+        f2 = null;                                   // one vanishing point at infinity
+      } else {
+        f2 = -((k3 * p3[0] - p1[0]) * (k2 * p2[0] - p1[0])
+             + (k3 * p3[1] - p1[1]) * (k2 * p2[1] - p1[1])) / fd;
+        if (!(f2 > 0)) return null;                  // no centred pinhole explains this quad
+      }
+
+      var num, den;
+      if (f2 == null) {
+        // one direction is fronto-parallel: the ratio reduces to the k-terms alone
+        num = k2 * k2 * ((k3 * p3[0] - p1[0]) * (k3 * p3[0] - p1[0]) + (k3 * p3[1] - p1[1]) * (k3 * p3[1] - p1[1]));
+        den = k3 * k3 * ((k2 * p2[0] - p1[0]) * (k2 * p2[0] - p1[0]) + (k2 * p2[1] - p1[1]) * (k2 * p2[1] - p1[1]));
+      } else {
+        num = (k2 * p2[0] - p1[0]) * (k2 * p2[0] - p1[0])
+            + (k2 * p2[1] - p1[1]) * (k2 * p2[1] - p1[1])
+            + (k2 * p2[2] - p1[2]) * (k2 * p2[2] - p1[2]) * f2;
+        den = (k3 * p3[0] - p1[0]) * (k3 * p3[0] - p1[0])
+            + (k3 * p3[1] - p1[1]) * (k3 * p3[1] - p1[1])
+            + (k3 * p3[2] - p1[2]) * (k3 * p3[2] - p1[2]) * f2;
+      }
+      if (!(den > 0) || !(num > 0)) return null;
+      // Reject implausible focal lengths. Near the pole the formula stays finite and
+      // keeps returning a ratio; only the implied camera gives it away.
+      if (f2 != null) {
+        var diag = 2 * Math.hypot(cx, cy);
+        var f = Math.sqrt(f2);
+        if (f < 0.15 * diag || f > 4 * diag) return null;
+      }
+      var ar = Math.sqrt(num / den);                 // width / height
+      if (!isFinite(ar) || ar <= 0) return null;
+      // an estimate beyond this is almost always a near-degenerate quad, not a real
+      // 60:1 rectangle, and blindly honouring it produces a multi-gigapixel canvas
+      if (ar < 0.02 || ar > 50) return null;
+      return ar;
+    }
+
+    function cross3(a, b) {
+      return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    }
+    function dot3(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+    /* mean side lengths of the quad, used to size the output when the aspect is known
+       but the absolute scale is not: keep roughly the source's pixel count. */
+    function quadMeanSides(c) {
+      var top = Math.hypot(c[1].x - c[0].x, c[1].y - c[0].y);
+      var bot = Math.hypot(c[2].x - c[3].x, c[2].y - c[3].y);
+      var lef = Math.hypot(c[3].x - c[0].x, c[3].y - c[0].y);
+      var rig = Math.hypot(c[2].x - c[1].x, c[2].y - c[1].y);
+      return { w: (top + bot) / 2, h: (lef + rig) / 2 };
+    }
+
+    /* Output size for a perspective op. `mode` is 'auto' (estimate from perspective),
+       'source' (keep the input image's ratio) or a positive number (explicit w/h).
+       The pixel count follows the quad's mean side lengths, so a small marked area
+       does not blow up into a huge canvas. Always returns integers >= 1. */
+    function perspectiveDims(op, w, h) {
+      var c = op.corners, ms = quadMeanSides(c);
+      var ar;
+      if (op.aspect === 'source') ar = w / h;
+      else if (typeof op.aspect === 'number' && op.aspect > 0) ar = op.aspect;
+      else {
+        ar = rectAspect(c, w / 2, h / 2);
+        if (ar == null) ar = ms.w / Math.max(1e-6, ms.h);   // fall back to the drawn shape
+      }
+      // preserve the quad's area: w*h = ms.w*ms.h, w/h = ar
+      var area = Math.max(1, ms.w * ms.h);
+      var ow = Math.sqrt(area * ar), oh = ow / ar;
+      var cap = 6000;                                  // keep the canvas allocatable
+      var s = Math.min(1, cap / Math.max(ow, oh));
+      return { w: Math.max(1, Math.round(ow * s)), h: Math.max(1, Math.round(oh * s)) };
+    }
+
     /* clamp an integer crop rect to the bounds of a w x h canvas */
     function clampRect(r, w, h) {
       var x = Math.max(0, Math.min(Math.round(r.x), w - 1));
@@ -199,7 +387,9 @@
       if (op.type === 'rotate') return (((op.quarter % 4) + 4) % 4) % 2 === 1 ? { w: h, h: w } : { w: w, h: h };
       if (op.type === 'crop') { var c = clampRect(op.rect, w, h); return { w: c.w, h: c.h }; }
       if (op.type === 'resize') return { w: Math.max(1, Math.round(op.w)), h: Math.max(1, Math.round(op.h)) };
-      return { w: w, h: h }; // flip, warp, stroke, text, pixelate all preserve dims
+      if (op.type === 'perspective') return perspectiveDims(op, w, h);
+      // guides are a viewing aid only: they never touch pixels and never change dims
+      return { w: w, h: h }; // flip, warp, stroke, text, pixelate, guides all preserve dims
     }
 
     /* dims of the stack after ops[0..upto] (inclusive); upto = -1 -> source dims */
@@ -214,6 +404,8 @@
     return {
       lerp: lerp, bilinearPoint: bilinearPoint, det3: det3, solve3: solve3,
       affineFromTriangle: affineFromTriangle, inflate: inflate,
+      solveN: solveN, homography: homography, applyH: applyH,
+      rectAspect: rectAspect, quadMeanSides: quadMeanSides, perspectiveDims: perspectiveDims,
       clampRect: clampRect, opDims: opDims, dimsUpTo: dimsUpTo
     };
   })();
@@ -313,6 +505,59 @@
           }
           return out;
         }
+        case 'perspective': {
+          // Inverse projective mapping, done per output pixel rather than through a mesh:
+          // a mesh of affine cells is exactly what makes the bilinear warp bend straight
+          // lines, and here straightness is the whole point. The source is read through
+          // one ImageData so we never touch the DOM per pixel.
+          const d = IMG.perspectiveDims(op, w, h);
+          const ow = d.w, oh = d.h;
+          const out = newCanvas(ow, oh);
+          const c = op.corners;
+          // H maps output (rectangle) -> input (the marked quad)
+          const H = IMG.homography(
+            [{ x: 0, y: 0 }, { x: ow, y: 0 }, { x: ow, y: oh }, { x: 0, y: oh }], c);
+          if (!H) return inC;                      // degenerate quad: leave the image alone
+          const sctx = inC.getContext('2d', { willReadFrequently: true });
+          const sd = sctx.getImageData(0, 0, w, h).data;
+          const octx = out.getContext('2d');
+          const od = octx.createImageData(ow, oh);
+          const dd = od.data;
+          const bilerp = !draft;                   // nearest neighbour while dragging
+          for (let y = 0; y < oh; y++) {
+            const yc = y + 0.5;
+            for (let x = 0; x < ow; x++) {
+              const xc = x + 0.5;
+              const wq = H[6] * xc + H[7] * yc + H[8];
+              const sx = (H[0] * xc + H[1] * yc + H[2]) / wq - 0.5;
+              const sy = (H[3] * xc + H[4] * yc + H[5]) / wq - 0.5;
+              const o = (y * ow + x) * 4;
+              if (sx < -1 || sy < -1 || sx > w || sy > h) continue;   // stays transparent
+              if (bilerp) {
+                const x0 = Math.floor(sx), y0 = Math.floor(sy);
+                const fx = sx - x0, fy = sy - y0;
+                for (let ch = 0; ch < 4; ch++) {
+                  let acc = 0;
+                  for (let j = 0; j < 2; j++) for (let i = 0; i < 2; i++) {
+                    const px = Math.min(w - 1, Math.max(0, x0 + i));
+                    const py = Math.min(h - 1, Math.max(0, y0 + j));
+                    acc += sd[(py * w + px) * 4 + ch]
+                         * (i ? fx : 1 - fx) * (j ? fy : 1 - fy);
+                  }
+                  dd[o + ch] = acc;
+                }
+              } else {
+                const px = Math.min(w - 1, Math.max(0, Math.round(sx)));
+                const py = Math.min(h - 1, Math.max(0, Math.round(sy)));
+                const s = (py * w + px) * 4;
+                dd[o] = sd[s]; dd[o + 1] = sd[s + 1]; dd[o + 2] = sd[s + 2]; dd[o + 3] = sd[s + 3];
+              }
+            }
+          }
+          octx.putImageData(od, 0, 0);
+          return out;
+        }
+        case 'guides': return inC;   // construction lines only, never rendered into pixels
         case 'overlay': {
           const out = cloneCanvas(inC); const ctx = out.getContext('2d');
           const img = op.img; if (!img) return out;
@@ -395,6 +640,7 @@
         if (op.corners) o.corners = op.corners.map(p => ({ x: p.x * q, y: p.y * q }));
         if (op.rect) o.rect = { x: op.rect.x * q, y: op.rect.y * q, w: op.rect.w * q, h: op.rect.h * q };
         if (op.paths) o.paths = op.paths.map(p => p.map(pt => ({ x: pt.x * q, y: pt.y * q })));
+        // guide lines are stored as fractions of the frame, so they need no scaling
         if (op.type === 'resize') { o.w = op.w * q; o.h = op.h * q; }
         if (op.type === 'text') {
           o.x = op.x * q; o.y = op.y * q; o.size = op.size * q;
@@ -430,7 +676,8 @@
     /* ---------- op factory / labels ---------- */
     const OP_LABEL = {
       rotate: 'Rotate', flip: 'Flip', crop: 'Crop', resize: 'Resize',
-      warp: 'Corner warp', stroke: 'Brush', text: 'Text', pixelate: 'Pixelate', overlay: 'Overlay image'
+      warp: 'Corner warp', stroke: 'Brush', text: 'Text', pixelate: 'Pixelate', overlay: 'Overlay image',
+      perspective: 'Perspective', guides: 'Guides'
     };
     // shallow-clone an op, deep-copying the mutable params we edit during a drag but
     // keeping any image (canvas) by reference (image ops are not JSON-serializable)
@@ -447,6 +694,7 @@
       if (op.corners) c.corners = op.corners.map(p => ({ ...p }));
       if (op.rect) c.rect = { ...op.rect };
       if (op.paths) c.paths = op.paths.map(p => p.map(q => ({ ...q })));
+      if (op.lines) c.lines = op.lines.map(l => ({ ...l }));
       if (op.outline) c.outline = { ...op.outline };
       if (op.shadow) c.shadow = { ...op.shadow };
       return c;
@@ -455,6 +703,8 @@
       if (op.type === 'rotate') return 'Rotate ' + ((((op.quarter % 4) + 4) % 4) * 90) + '°';
       if (op.type === 'flip') return 'Flip ' + (op.axis === 'h' ? 'horizontal' : 'vertical');
       if (op.type === 'resize') return 'Resize ' + Math.round(op.w) + '×' + Math.round(op.h);
+      if (op.type === 'guides') return 'Guides (' + (op.lines || []).length + ')';
+      if (op.type === 'perspective') return 'Perspective';
       if (op.type === 'text') return 'Text “' + String(op.text).split('\n')[0].slice(0, 12) + '”';
       return OP_LABEL[op.type] || op.type;
     }
@@ -464,6 +714,14 @@
         case 'crop': return { ...base, rect: { x: Math.round(w * .1), y: Math.round(h * .1), w: Math.round(w * .8), h: Math.round(h * .8) } };
         case 'resize': return { ...base, w: w, h: h, lock: true };
         case 'warp': return { ...base, corners: [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }] };
+        // start well inside the frame: the marked quad is a shape IN the image, not the
+        // image's own outline, so an inset default says what to do without a sentence
+        case 'perspective': return {
+          ...base, aspect: 'auto',
+          corners: [{ x: Math.round(w * .2), y: Math.round(h * .18) }, { x: Math.round(w * .8), y: Math.round(h * .12) },
+                    { x: Math.round(w * .85), y: Math.round(h * .88) }, { x: Math.round(w * .15), y: Math.round(h * .82) }]
+        };
+        case 'guides': return { ...base, lines: [] };
         case 'pixelate': return { ...base, rect: { x: Math.round(w * .3), y: Math.round(h * .3), w: Math.round(w * .4), h: Math.round(h * .4) }, block: Math.max(6, Math.round(Math.min(w, h) * .03)) };
         case 'stroke': return { ...base, size: Math.max(3, Math.round(h * .008)), color: '#ff3b30', opacity: 1, paths: [] };
         case 'text': return {
@@ -476,8 +734,11 @@
       }
     }
 
-    const HANDLE_OPS = { crop: 1, warp: 1, pixelate: 1, text: 1, stroke: 1, overlay: 1 };
+    const HANDLE_OPS = { crop: 1, warp: 1, pixelate: 1, text: 1, stroke: 1, overlay: 1, perspective: 1, guides: 1 };
     const WARP_OPS = { warp: 1, overlay: 1 };   // corner-handle ops that use the padded viewport
+    // perspective drags corners too, but INSIDE the frame (it marks a quad in the image
+    // rather than pushing the image outwards), so it gets no padded viewport
+    const QUAD_OPS = { warp: 1, overlay: 1, perspective: 1 };
 
     /* ============================================================ App ============================================================ */
     function App() {
@@ -489,6 +750,18 @@
       const [exp, setExp] = useState({ type: 'image/png', quality: 0.92 });
       const [dl, setDl] = useState(null);            // {url,name}
       const [warpMargin, setWarpMargin] = useState(0.25); // fixed safety margin around the image while warping
+      // Last usable auto aspect per perspective op. The estimate has a pole (see
+      // rectAspect): dragging a corner walks through the parallel case, where it goes
+      // null and then briefly returns a wild number. Recomputing the output size on
+      // every pointermove turns that into visible thrashing, so during a drag the size
+      // is held at the last good value and only re-derived on pointerup.
+      const aspectRef = useRef({});
+      // input canvas of the selected op, published by the render effect so the panel's
+      // perspective preview can draw from the same pixels the stage is showing
+      const [previewInput, setPreviewInput] = useState(null);
+      const previewRef = useRef(null);
+      const [guideAxis, setGuideAxis] = useState('v');    // axis a click on the canvas creates
+      const [snapOn, setSnapOn] = useState(true);         // corner handles snap to nearby guides
       const hist = useRef({ past: [], future: [] });
       const editRef = useRef({ key: null, t: 0 });   // coalesces bursts of slider edits into one undo step
       const rafRef = useRef(0);
@@ -628,6 +901,44 @@
         const padX = Math.round(inDims.w * warpMargin), padY = Math.round(inDims.h * warpMargin);
         return { x: -padX, y: -padY, w: inDims.w + 2 * padX, h: inDims.h + 2 * padY };
       })() : null;
+      /* Guide lines are drawn under every later op, not just their own, because their
+         whole purpose is to be a reference WHILE dragging something else. Only guides
+         from enabled ops before the selected one count, and only when no op in between
+         changed the frame's dimensions: after a crop or a rotate a fraction of the frame
+         no longer means the same place, and a line silently pointing at the wrong pixel
+         is worse than no line. */
+      const activeGuides = (() => {
+        if (!source || selIndex < 0 || !inDims) return [];
+        const out = [];
+        let dims = { w: source.w, h: source.h };
+        for (let i = 0; i < selIndex; i++) {
+          const op = effOps[i];
+          if (op.type === 'guides') {
+            if (op.enabled && dims.w === inDims.w && dims.h === inDims.h) {
+              (op.lines || []).forEach(L => out.push(L));
+            }
+          } else {
+            dims = IMG.opDims(op, dims.w, dims.h);
+          }
+        }
+        return out;
+      })();
+
+      /* pull a dragged corner onto a guide when it comes within a few pixels of one.
+         Each axis snaps independently, so a corner can land on a vertical and a
+         horizontal line at once, which is exactly the "get this element straight" case. */
+      function snapToGuides(p, draftOp, idx) {
+        if (!snapOn) return { x: p.x, y: p.y };
+        const own = draftOp.type === 'guides' ? [] : activeGuides;
+        const tol = 8 / (svgRef.current ? svgRef.current.getBoundingClientRect().width / ovBox.w : 1);
+        let x = p.x, y = p.y;
+        own.forEach(L => {
+          if (L.axis === 'v') { const gx = L.t * inDims.w; if (Math.abs(gx - p.x) < tol) x = gx; }
+          else { const gy = L.t * inDims.h; if (Math.abs(gy - p.y) < tol) y = gy; }
+        });
+        return { x, y };
+      }
+
       // coordinate box the overlay + pointer math work in
       const ovBox = (selOp && HANDLE_OPS[selOp.type] && inDims)
         ? (warpVp || { x: 0, y: 0, w: inDims.w, h: inDims.h }) : null;
@@ -659,7 +970,20 @@
           if (selIndex >= 0) {
             const op = opsForRender[selIndex];
             const input = selIndex > 0 ? states[selIndex - 1] : src.canvas;
-            display = op.type === 'crop' ? input : states[selIndex];
+            // crop and perspective both draw their handles in INPUT coordinates, so the
+            // stage has to show the input, not the result. For perspective that is not
+            // just bookkeeping: the result is a different size and a different frame on
+            // every pointermove, so showing it under a quad drawn in input coordinates
+            // makes the picture jump and shear from frame to frame while the quad sits
+            // still. The result gets its own small preview in the panel instead.
+            display = (op.type === 'crop' || op.type === 'perspective') ? input : states[selIndex];
+            // Only publish when the canvas identity actually changed. Without the guard
+            // this fires a render per frame during a drag (the proxy and the full-res
+            // canvas alternate), which is exactly the cost the drag path exists to avoid.
+            if (op.type === 'perspective' && previewRef.current !== input) {
+              previewRef.current = input;
+              setPreviewInput(input);
+            }
           } else {
             display = states.length ? states[states.length - 1] : src.canvas;
           }
@@ -758,14 +1082,32 @@
       }
       function beginDraft() {
         // start a live editing session cloned from the committed op
-        return cloneOp(ops.find(o => o.id === selId));
+        const d = cloneOp(ops.find(o => o.id === selId));
+        // freeze 'auto' for the duration of the drag: pin it to a concrete number so
+        // the output size cannot change under the pointer, and restore the mode on drop
+        if (d.type === 'perspective' && d.aspect === 'auto') {
+          const held = aspectRef.current[d.id];
+          const now = IMG.rectAspect(d.corners, inDims.w / 2, inDims.h / 2);
+          const use = now != null ? now : held;
+          if (use != null) { d._frozen = 'auto'; d.aspect = use; }
+        }
+        return d;
       }
       function setLive(draftOp) {
         setLiveOps(ops.map(o => o.id === selId ? draftOp : o));
       }
       function endDraft(draftOp) {
         setLiveOps(null);
-        commit(ops.map(o => o.id === selId ? draftOp : o), selId);
+        let final = draftOp;
+        if (final._frozen) {
+          // back to the mode the user picked, and remember the value we settled on so
+          // the next drag has something to hold even if it starts on the pole
+          const est = IMG.rectAspect(final.corners, inDims.w / 2, inDims.h / 2);
+          if (est != null) aspectRef.current[final.id] = est;
+          final = { ...final, aspect: final._frozen };
+          delete final._frozen;
+        }
+        commit(ops.map(o => o.id === selId ? final : o), selId);
       }
 
       // proxy of the source image reused for the whole drag; rebuilt when the image changes
@@ -789,12 +1131,28 @@
         // every branch below stores its session through this, so the proxy and the
         // (initially empty) prefix cache are attached no matter which mode is picked
         const sess = s => { dragRef.current = s && { ...s, proxySource: dragProxy(), prefix: null }; };
-        if (WARP_OPS[selOp.type]) {
+        if (QUAD_OPS[selOp.type]) {
           let idx = -1, best = hr;
           draft.corners.forEach((c, i) => { const dd = Math.hypot(c.x - p.x, c.y - p.y); if (dd < best) { best = dd; idx = i; } });
           if (idx >= 0) sess({ draft, mode: 'corner', idx });
           else if (pointInPoly(p, draft.corners)) sess({ draft, mode: 'moveQuad', start: { x: p.x, y: p.y }, orig: draft.corners.map(c => ({ ...c })) });
           else sess(null);
+        } else if (selOp.type === 'guides') {
+          // grab an existing line if the pointer is near it, otherwise drop a new one in
+          // the axis chosen in the panel. Positions are fractions of the frame so the
+          // lines survive a resize of the ops before them.
+          const lines = draft.lines || (draft.lines = []);
+          let hit = -1, bestD = 12 / p.scale;
+          lines.forEach((L, i) => {
+            const d = L.axis === 'v' ? Math.abs(L.t * inDims.w - p.x) : Math.abs(L.t * inDims.h - p.y);
+            if (d < bestD) { bestD = d; hit = i; }
+          });
+          if (hit < 0) {
+            lines.push({ axis: guideAxis, t: guideAxis === 'v' ? p.x / inDims.w : p.y / inDims.h });
+            hit = lines.length - 1;
+          }
+          sess({ draft, mode: 'guide', idx: hit });
+          setLive(draft);
         } else if (selOp.type === 'text') {
           sess({ draft, mode: 'move', off: { x: p.x - draft.x, y: p.y - draft.y } });
         } else if (selOp.type === 'stroke') {
@@ -817,7 +1175,11 @@
         // not been drawn yet, otherwise React reconciles several times per frame for nothing
         if (dr.pending && dr.mode !== 'draw') return;
         const p = evtPoint(e); const d = dr.draft;
-        if (dr.mode === 'corner') { d.corners[dr.idx] = { x: p.x, y: p.y }; }
+        if (dr.mode === 'corner') { d.corners[dr.idx] = snapToGuides(p, d, dr.idx); }
+        else if (dr.mode === 'guide') {
+          const L = d.lines[dr.idx];
+          L.t = Math.max(0, Math.min(1, L.axis === 'v' ? p.x / inDims.w : p.y / inDims.h));
+        }
         else if (dr.mode === 'moveQuad') {
           const dx = p.x - dr.start.x, dy = p.y - dr.start.y;
           d.corners = dr.orig.map(c => ({ x: c.x + dx, y: c.y + dy }));
@@ -924,6 +1286,23 @@
                         ${cs.map((c, i) => html`<rect key=${i} x=${c[0] - handleR} y=${c[1] - handleR} width=${handleR * 2} height=${handleR * 2} fill="#fff" stroke="#111" strokeWidth=${strokeW} />`)}
                       </g>`;
                     })()}
+                    <!-- guide lines: those inherited from earlier ops, plus this op's own -->
+                    ${(() => {
+                      const own = selOp.type === 'guides' ? (selOp.lines || []) : [];
+                      const inherited = selOp.type === 'guides' ? [] : activeGuides;
+                      const draw = (L, i, key, own) => {
+                        const col = own ? '#ffd54f' : 'rgba(255,213,79,0.5)';
+                        return L.axis === 'v'
+                          ? html`<line key=${key} x1=${L.t * inDims.w} y1=${0} x2=${L.t * inDims.w} y2=${inDims.h}
+                              stroke=${col} strokeWidth=${strokeW} strokeDasharray=${(handleR * 1.6) + ' ' + (handleR * 1.1)} />`
+                          : html`<line key=${key} x1=${0} y1=${L.t * inDims.h} x2=${inDims.w} y2=${L.t * inDims.h}
+                              stroke=${col} strokeWidth=${strokeW} strokeDasharray=${(handleR * 1.6) + ' ' + (handleR * 1.1)} />`;
+                      };
+                      return html`<g style=${{ pointerEvents: 'none' }}>
+                        ${inherited.map((L, i) => draw(L, i, 'g' + i, false))}
+                        ${own.map((L, i) => draw(L, i, 'o' + i, true))}
+                      </g>`;
+                    })()}
                     <!-- warp / overlay quad (with the base frame shown dashed) -->
                     ${WARP_OPS[selOp.type] && (() => {
                       const c = selOp.corners;
@@ -934,6 +1313,29 @@
                         ${c.map((p, i) => html`<circle key=${i} cx=${p.x} cy=${p.y} r=${handleR} fill="#4fc3f7" stroke="#04263a" strokeWidth=${strokeW} />`)}
                       </g>`;
                     })()}
+                    <!-- perspective: the quad marked IN the image that becomes the rectangle -->
+                    ${selOp.type === 'perspective' && (() => {
+                      const c = selOp.corners;
+                      const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+                      return html`<g>
+                        <polygon points=${c.map(p => p.x + ',' + p.y).join(' ')}
+                          fill="rgba(79,195,247,0.10)" stroke="#4fc3f7" strokeWidth=${strokeW} />
+                        <!-- the diagonals make it obvious when the quad is twisted -->
+                        <line x1=${c[0].x} y1=${c[0].y} x2=${c[2].x} y2=${c[2].y}
+                          stroke="rgba(79,195,247,0.4)" strokeWidth=${strokeW} />
+                        <line x1=${c[1].x} y1=${c[1].y} x2=${c[3].x} y2=${c[3].y}
+                          stroke="rgba(79,195,247,0.4)" strokeWidth=${strokeW} />
+                        ${c.map((p, i) => html`<circle key=${i} cx=${p.x} cy=${p.y} r=${handleR} fill="#4fc3f7" stroke="#04263a" strokeWidth=${strokeW} />`)}
+                      </g>`;
+                    })()}
+                    <!-- guides: a grab dot on each line so it is obvious they can be moved -->
+                    ${selOp.type === 'guides' && (selOp.lines || []).map((L, i) => (
+                      L.axis === 'v'
+                        ? html`<circle key=${'d' + i} cx=${L.t * inDims.w} cy=${inDims.h * 0.5} r=${handleR * 0.8}
+                            fill="#ffd54f" stroke="#3a2f04" strokeWidth=${strokeW} />`
+                        : html`<circle key=${'d' + i} cx=${inDims.w * 0.5} cy=${L.t * inDims.h} r=${handleR * 0.8}
+                            fill="#ffd54f" stroke="#3a2f04" strokeWidth=${strokeW} />`
+                    ))}
                     <!-- text anchor -->
                     ${selOp.type === 'text' && (
                       html`<g>
@@ -958,6 +1360,8 @@
                 <button className="ie-tool-btn" onClick=${() => addOp('text')}>Text</button>
                 <button className="ie-tool-btn" onClick=${() => addOp('pixelate')}>Pixelate</button>
                 <button className="ie-tool-btn" onClick=${() => addOp('warp')}>Corner warp</button>
+                <button className="ie-tool-btn" onClick=${() => addOp('perspective')}>Perspective</button>
+                <button className="ie-tool-btn" onClick=${() => addOp('guides')}>Guides</button>
                 <button className="ie-tool-btn" onClick=${() => overlayInput.current.click()}>Overlay image</button>
               </div>
 
@@ -987,7 +1391,10 @@
 
               ${selOp && html`<${OpControls} op=${selOp} inDims=${inDims}
                 onChange=${patch => { markBusy(); updateOp(selOp.id, patch); }}
-                warpMargin=${warpMargin} onMargin=${v => { markBusy(); setWarpMargin(v); }} />`}
+                warpMargin=${warpMargin} onMargin=${v => { markBusy(); setWarpMargin(v); }}
+                guideAxis=${guideAxis} onGuideAxis=${setGuideAxis}
+                snapOn=${snapOn} onSnap=${setSnapOn} hasGuides=${activeGuides.length}
+                previewInput=${selOp.type === 'perspective' ? previewInput : null} />`}
 
               <h3>Export</h3>
               <div className="ie-export">
@@ -1011,7 +1418,6 @@
                   : html`<a role="button" className="tool-btn" href=${dl.url} download=${dl.name}>${ToolIcons.el('download')}Download ${dl.name} (${(dl.size / 1024).toFixed(0)} KB)</a>`}
                 ${dl && html`<p className="ie-handoff-row" style=${{ fontSize: '.85rem', marginTop: '.5rem' }}>
                   Open in:${' '}
-                  <a href="/miscellaneous/tools/meme-maker.html?from=editor" onClick=${openIn}>Meme Maker</a>${' · '}
                   <a href="/miscellaneous/tools/color-grading.html?from=editor" onClick=${openIn}>Color Grading</a>${' · '}
                   <a href="/miscellaneous/tools/color-extractor.html?from=editor" onClick=${openIn}>Color Extractor</a>${' · '}
                   <a href="/miscellaneous/tools/pixel2vector.html?from=editor" onClick=${openIn}>Pixel to Vector</a>
@@ -1024,7 +1430,48 @@
     }
 
     /* ---------- contextual controls for the selected op ---------- */
-    function OpControls({ op, inDims, onChange, warpMargin, onMargin }) {
+    /* Small live preview of the perspective result, for the panel. While the quad is
+       being edited the stage shows the INPUT (the handles live in its coordinates), so
+       without this the result would only appear after deselecting the step. Rendered
+       from a downscaled copy of the input, which is cheap enough to redo on every
+       change and keeps the main canvas free of the per-frame reframing. */
+    function PerspectivePreview({ op, input, inDims }) {
+      const ref = useRef(null);
+      useEffect(() => {
+        const cv = ref.current;
+        if (!cv || !input) return;
+        // fit inside the fixed box rather than scaling the longest edge to a constant,
+        // so a wide and a tall result both stay inside it and neither is upscaled
+        const BOX_W = 280, BOX_H = 178;
+        const d = IMG.perspectiveDims(op, inDims.w, inDims.h);
+        const s = Math.min(1, BOX_W / d.w, BOX_H / d.h);
+        const pw = Math.max(1, Math.round(d.w * s)), ph = Math.max(1, Math.round(d.h * s));
+        if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, pw, ph);
+        // the same inverse map as the op, straight onto the small canvas
+        const H = IMG.homography(
+          [{ x: 0, y: 0 }, { x: pw, y: 0 }, { x: pw, y: ph }, { x: 0, y: ph }], op.corners);
+        if (!H) return;
+        const src = input.getContext('2d', { willReadFrequently: true })
+          .getImageData(0, 0, input.width, input.height).data;
+        const iw = input.width, ih = input.height;
+        const out = ctx.createImageData(pw, ph), od = out.data;
+        for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+          const xc = x + 0.5, yc = y + 0.5;
+          const wq = H[6] * xc + H[7] * yc + H[8];
+          const sx = Math.round((H[0] * xc + H[1] * yc + H[2]) / wq - 0.5);
+          const sy = Math.round((H[3] * xc + H[4] * yc + H[5]) / wq - 0.5);
+          if (sx < 0 || sy < 0 || sx >= iw || sy >= ih) continue;
+          const o = (y * pw + x) * 4, i = (sy * iw + sx) * 4;
+          od[o] = src[i]; od[o + 1] = src[i + 1]; od[o + 2] = src[i + 2]; od[o + 3] = src[i + 3];
+        }
+        ctx.putImageData(out, 0, 0);
+      });
+      return html`<div className="ie-preview-box"><canvas ref=${ref} className="ie-preview"></canvas></div>`;
+    }
+
+    function OpControls({ op, inDims, onChange, warpMargin, onMargin, guideAxis, onGuideAxis, snapOn, onSnap, hasGuides, previewInput }) {
       const title = opLabel(op);
       if (op.type === 'rotate' || op.type === 'flip') {
         return html`<div className="ie-controls"><h4>${title}</h4><p style=${{ fontSize: '.8rem', margin: 0, color: 'var(--pico-muted-color)' }}>No settings – this step has no handles.</p></div>`;
@@ -1129,9 +1576,105 @@
           <button className="tool-btn" style=${{ width: '100%' }} onClick=${straighten}>Straighten to rectangle</button>
         </div>`;
       }
+      if (op.type === 'guides') {
+        const lines = op.lines || [];
+        const nV = lines.filter(L => L.axis === 'v').length;
+        return html`<div className="ie-controls"><h4>Guides</h4>
+          <p style=${{ fontSize: '.78rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>
+            Construction lines only. They are never drawn into the image and never exported;
+            they stay visible while you edit the steps below this one, so you can line
+            elements up against them. Corner handles snap to them, which is the difference
+            between getting a window edge truly vertical and getting it nearly vertical.</p>
+          <div className="ie-field"><label>Click on the image adds a</label>
+            <div className="seg-row">
+              <button className=${'lang-seg' + (guideAxis === 'v' ? ' active' : '')} onClick=${() => onGuideAxis('v')}>Vertical</button>
+              <button className=${'lang-seg' + (guideAxis === 'h' ? ' active' : '')} onClick=${() => onGuideAxis('h')}>Horizontal</button>
+            </div>
+          </div>
+          <label className="ie-inline"><input type="checkbox" checked=${snapOn} onChange=${e => onSnap(e.target.checked)} /> Corner handles snap to guides</label>
+          <ul className="ie-guides">
+            ${lines.map((L, i) => html`<li key=${i}>
+              <span>${L.axis === 'v' ? 'Vertical' : 'Horizontal'} at ${(L.t * 100).toFixed(1)}%</span>
+              <input type="range" min="0" max="1" step="0.001" value=${L.t}
+                onChange=${e => { const nx = lines.map(g => ({ ...g })); nx[i].t = +e.target.value; onChange({ lines: nx }); }} />
+              <button className="ie-op-btn" title="Remove"
+                onClick=${() => onChange({ lines: lines.filter((_, j) => j !== i) })}>×</button>
+            </li>`)}
+          </ul>
+          ${!lines.length && html`<p style=${{ fontSize: '.78rem', margin: '.2rem 0 0', color: 'var(--pico-muted-color)' }}>No guides yet. Click on the image to place one.</p>`}
+          ${lines.length > 0 && html`<button className="tool-btn tool-btn-sm" style=${{ width: '100%', marginTop: '.4rem' }}
+            onClick=${() => onChange({ lines: [] })}>Clear all (${nV} vertical, ${lines.length - nV} horizontal)</button>`}
+        </div>`;
+      }
+      if (op.type === 'perspective') {
+        const est = IMG.rectAspect(op.corners, inDims.w / 2, inDims.h / 2);
+        const out = IMG.perspectiveDims(op, inDims.w, inDims.h);
+        const presets = [['Auto', 'auto'], ['Source', 'source'], ['1:1', 1], ['4:3', 4 / 3], ['3:2', 3 / 2], ['16:9', 16 / 9], ['A4', 297 / 210]];
+        const cur = op.aspect;
+        const same = v => (typeof v === 'number' && typeof cur === 'number') ? Math.abs(v - cur) < 1e-6 : v === cur;
+        return html`<div className="ie-controls"><h4>Perspective</h4>
+          <p style=${{ fontSize: '.78rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>
+            Drag the four handles onto a rectangle in reality: a facade, a window, a sheet
+            of paper.</p>
+          <div className="ie-field"><label>Output aspect ratio</label>
+            <div className="ie-presets">${presets.map(a => html`<button key=${String(a[1])}
+              className=${'tool-btn tool-btn-sm' + (same(a[1]) ? ' tool-btn-primary' : '')}
+              onClick=${() => onChange({ aspect: a[1] })}>${a[0]}</button>`)}</div>
+          </div>
+          <!-- One line, fixed height, never wrapping. Everything below it (in particular
+               the preview canvas) would otherwise jump up and down while dragging, because
+               this text changes length from frame to frame and switches to a whole other
+               sentence whenever the estimate is unavailable. The reasons live in the fold. -->
+          <p className="ie-estimate">
+            <span className="ie-est-l">Estimate</span>
+            <b>${est == null ? 'n/a' : est.toFixed(2) + ' : 1'}</b>
+            <span className="ie-est-l">Output</span>
+            <b>${out.w}×${out.h}</b>
+          </p>
+          ${previewInput && html`<${PerspectivePreview} op=${op} input=${previewInput} inDims=${inDims} />`}
+          <p style=${{ fontSize: '.72rem', margin: '.25rem 0 .5rem', color: 'var(--pico-muted-color)' }}>
+            The stage shows the original while you drag, because the handles sit in its
+            coordinates. This is the result.</p>
+          ${hasGuides > 0 && html`<p style=${{ fontSize: '.75rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>
+            ${hasGuides} guide${hasGuides === 1 ? '' : 's'} visible; handles snap to them.</p>`}
+          <button className="tool-btn" style=${{ width: '100%' }}
+            onClick=${() => onChange({ corners: [
+              { x: Math.round(inDims.w * .2), y: Math.round(inDims.h * .18) }, { x: Math.round(inDims.w * .8), y: Math.round(inDims.h * .12) },
+              { x: Math.round(inDims.w * .85), y: Math.round(inDims.h * .88) }, { x: Math.round(inDims.w * .15), y: Math.round(inDims.h * .82) }] })}>Reset quad</button>
+          <details className="fold fold-sm" style=${{ marginTop: '.6rem' }}>
+            <summary>How the quad and the estimate work</summary>
+            <div className="fold-body">
+              <p>The quad you mark becomes the whole output, with straight lines staying straight.
+              The handles frame the area you keep, so pulling one outwards brings in more of the
+              picture on that side, and the content appears to move the other way.</p>
+              <p>Straightening a perspective by eye leaves the aspect ratio undetermined. Once the
+              edges are vertical and horizontal, every stretched version of the result is equally
+              straight, so there is nothing in the picture to tell you which one is right. People
+              usually settle it by dragging until it looks plausible.</p>
+              <p>It is recoverable, though. The two pairs of opposite edges of your quad meet in two
+              vanishing points, and those fix the direction the surface faces. For an ordinary
+              camera, meaning square pixels and the lens roughly centred on the frame, that is
+              enough to pin down both the focal length and the rectangle's true width-to-height
+              ratio. Auto does exactly that.</p>
+              <p>It fails in one honest case, and the line above then reads "not available": when
+              your quad is close to a parallelogram, both vanishing points run off to infinity and
+              the view genuinely carries no information about the ratio. That happens with a nearly
+              straight-on shot, or a long lens. Auto falls back to the shape you drew; pick a ratio
+              yourself there, or use Source.</p>
+              <p>While you drag, the estimate holds its last value and is recomputed when you let
+              go. Near a parallelogram it is unstable, and recomputing it on every frame made the
+              output size jump about.</p>
+            </div>
+          </details>
+        </div>`;
+      }
       if (op.type === 'warp') {
         return html`<div className="ie-controls"><h4>${title}</h4>
           <p style=${{ fontSize: '.78rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>Drag the four corner handles. The image is stretched bilinearly to fit; the dashed rectangle is the base image.</p>
+          <p style=${{ fontSize: '.75rem', margin: '0 0 .5rem', color: 'var(--pico-muted-color)' }}>
+            For straightening a photographed perspective use <b>Perspective</b> instead: this
+            warp interpolates bilinearly, so oblique lines through the interior come out bent
+            even when all four corners sit exactly where you want them.</p>
           <div className="ie-field"><label>Working margin: ${Math.round(warpMargin * 100)}% per side</label>
             <input type="range" min="0" max="2" step="0.05" value=${warpMargin} onChange=${e => onMargin(+e.target.value)} /></div>
           <button className="tool-btn" style=${{ width: '100%' }}

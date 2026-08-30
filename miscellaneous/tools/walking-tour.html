@@ -1,0 +1,987 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>var PAGE_LANG=(function(){var p=new URLSearchParams(location.search).get('lang');if(p==='en'||p==='de')return p;try{return localStorage.getItem('lang')==='de'?'de':'en'}catch(e){return'en'}})();document.documentElement.lang=PAGE_LANG;</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Self-Guided Walking Tour</title>
+  <meta name="description" content="A self-guided walking tour that runs entirely in the browser: a site plan drawn from OpenStreetMap, a numbered route, and one commentary per stop written to be read while standing in front of the thing. Works offline once saved, and can show your position without sending it anywhere.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/walking-tour.html">
+  <meta property="og:title" content="Self-Guided Walking Tour">
+  <meta property="og:description" content="A site plan drawn from OpenStreetMap, a numbered route, and one commentary per stop, written to be read while standing in front of the thing.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/walking-tour.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* No width override on purpose. The tool renders into a plain .container
+       and therefore rides Pico's own steps, so header, main and footer stay
+       aligned at every viewport width without a single line of CSS. */
+
+    /* Two columns above 900px: the map stays put while the stop texts scroll
+       past it, which is the whole ergonomics of reading a tour on a phone in
+       one hand and a map in the other. Below that it collapses and the map
+       sticks to the top of the viewport instead. */
+    .wt-layout { display: grid; gap: 20px; grid-template-columns: 1fr; }
+    @media (min-width: 900px) {
+      .wt-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+      .wt-mapcol { position: sticky; top: 12px; }
+    }
+
+    /* The frame convention: anything that SHOWS something gets this border,
+       radius and shadow. It sits on the svg itself, not on a wrapper. */
+    .wt-map {
+      display: block; width: 100%; cursor: grab;
+      /* pan-y, not none: on a phone the map fills the width, and touch-action:
+         none would swallow the vertical swipe that scrolls the page, so the
+         stop texts below became unreachable. Vertical scroll therefore stays
+         with the page and a horizontal drag pans the map; for north-south
+         panning there are the zoom buttons, Fit route, and tapping a stop,
+         which centres on it. */
+      touch-action: pan-y;
+      border: 1px solid #334155; border-radius: 8px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, .45);
+      background: var(--pico-background-color);
+    }
+    .wt-map.dragging { cursor: grabbing; }
+    [data-skin="light"] .wt-map { border-color: var(--tool-border); box-shadow: 0 6px 18px rgba(0, 0, 0, .12); }
+    [data-skin="grey"] .wt-map { box-shadow: none; }
+
+    /* The route and the stop numbers take --pico-primary, the ONE accent that
+       custom.css already defines per theme and per section: steel blue in dark
+       miscellaneous, a darker blue in light, turquoise only in the grey skin,
+       where it is the single chromatic thing left. No local colour of any kind
+       here, and no hex.
+
+       What this replaced, in order: --tool-emph, which is the TITLE colour and
+       near white in dark, so the route vanished into the building outlines; and
+       then a hand-mixed turquoise per skin, which made every theme look like
+       the grey one.
+
+       Text ON the accent fill is --page-bg, not --pico-background-color: the
+       comment at the top of custom.css explains why (Pico redefines the latter
+       inside controls, which draws the label in the accent on the accent). */
+
+    /* Map layers. Everything is a CSS variable, which is the entire reason this
+       map is SVG and not canvas: the three skins need no JavaScript, no palette
+       table and no themechange listener. A canvas would need all three. */
+    .wt-green { fill: var(--tool-ok-bg); stroke: none; }
+    .wt-water { fill: var(--tool-info-bg); stroke: none; }
+    .wt-bldg { fill: var(--tool-panel); stroke: var(--tool-hairline); stroke-width: .4; }
+    .wt-path { fill: none; stroke: var(--tool-border); stroke-linecap: round; stroke-linejoin: round; }
+    .wt-wall { fill: none; stroke: var(--tool-label); stroke-width: 1.6; stroke-linecap: round; }
+    .wt-route { fill: none; stroke: var(--pico-primary); stroke-width: 3.2; stroke-linecap: round;
+      stroke-linejoin: round; opacity: .9; }
+
+    .wt-stop { cursor: pointer; }
+    .wt-stop circle { fill: var(--tool-surface); stroke: var(--pico-primary); stroke-width: 1.6; }
+    .wt-stop text { fill: var(--pico-primary); font-size: 8px; font-weight: 600;
+      text-anchor: middle; dominant-baseline: central; user-select: none; }
+    .wt-stop.active circle { fill: var(--pico-primary); stroke: var(--pico-primary); }
+    .wt-stop.active text { fill: var(--page-bg); }
+
+    /* The position dot must stay apart from the route it is standing on. In
+       the grey skin both the accent and sig-info are the same turquoise, since
+       that skin has exactly one chromatic colour, so hue alone cannot carry the
+       distinction: the dot is a filled disc with a page-coloured ring and a
+       translucent halo, the route is a bare line. That reads in all three. */
+    .wt-here { fill: var(--tool-sig-info); stroke: var(--page-bg); stroke-width: 2; }
+    .wt-heraccuracy { fill: var(--tool-sig-info); opacity: .13; stroke: none; }
+
+    /* Deliberate chip row of separate actions, so it opts out of the segmented
+       adjacency rules the way .rd-row and .qr-chips do. */
+    .wt-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0 0; }
+    .wt-row .lang-seg { border-radius: 4px; margin-left: 0; }
+
+    .wt-status { font-size: 12px; color: var(--tool-note); margin: 8px 0 0; }
+
+    .wt-card { border: 1px solid var(--tool-border); border-radius: 8px; padding: 12px 14px;
+      margin: 0 0 12px; background: color-mix(in srgb, var(--tool-panel) 55%, transparent);
+      scroll-margin-top: 16px; }
+    .wt-card.active { border-color: var(--pico-primary); }
+    .wt-head { display: flex; gap: 10px; align-items: baseline; }
+    .wt-num { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 11px;
+      border: 1.5px solid var(--pico-primary); color: var(--pico-primary);
+      font-size: 12px; font-weight: 600; display: grid; place-items: center; align-self: center; }
+    .wt-card.active .wt-num { background: var(--pico-primary); color: var(--page-bg); }
+    .wt-name { font-size: 1rem; font-weight: 600; color: var(--tool-emph); margin: 0; }
+    .wt-local { font-size: 12px; color: var(--tool-faint); margin: 1px 0 0; }
+    .wt-dates { font-size: 12px; color: var(--tool-note); margin: 6px 0 0; }
+    .wt-stand { font-size: 13px; color: var(--tool-label); font-style: italic; margin: 8px 0 0; }
+    .wt-text { font-size: 14.5px; color: var(--tool-text); margin: 8px 0 0; }
+    .wt-look { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--tool-label); }
+    .wt-next { font-size: 12.5px; color: var(--tool-note); margin: 10px 0 0;
+      border-top: 1px solid var(--tool-hairline); padding-top: 8px; }
+    .wt-dist { font-size: 12px; color: var(--tool-sig-info); margin: 6px 0 0; }
+    .wt-pending { font-size: 13px; color: var(--tool-faint); font-style: italic; margin: 8px 0 0; }
+    /* --tool-warn-text and --tool-warn-border, not --tool-warn-fg: that name
+       does not exist in custom.css, so the badge silently kept its fallback hex
+       in all three skins and followed none of them. */
+    .wt-flag { display: inline-block; font-size: 10.5px; text-transform: uppercase;
+      letter-spacing: .06em; color: var(--tool-warn-text);
+      border: 1px solid var(--tool-warn-border); border-radius: 3px;
+      padding: 0 5px; margin-left: 8px; vertical-align: 2px; }
+    .wt-src { font-size: 11.5px; color: var(--tool-faint); margin: 8px 0 0; }
+    .wt-src a { color: inherit; }
+
+    .wt-draft { border: 1px solid var(--tool-warn-border); background: var(--tool-warn-bg);
+      border-radius: 8px; padding: 10px 12px; margin: 0 0 16px; font-size: 13px;
+      color: var(--tool-warn-text); }
+
+    /* The page keeps the tool's name as its h1 so that <title>, og:title, the
+       JSON-LD name and the landing-page entry all read the same; the name of
+       the tour being walked is the h2 under it. */
+    .wt-tourtitle { font-size: 1.35rem; color: var(--tool-emph); margin: 6px 0 0; }
+    .wt-tourdub, .wt-toursub { color: var(--tool-label); margin: 2px 0 0; }
+
+    .wt-note { font-size: 11px; color: var(--tool-note); margin: 22px 0 0; }
+
+    /* Printing is the fallback for the case the service worker never ran, or
+       the phone is dead and there is a sheet of paper instead. Map once, large,
+       then the texts as a continuous read. */
+    @media print {
+      .no-print { display: none !important; }
+      .wt-layout { display: block; }
+      .wt-mapcol { position: static; break-inside: avoid; margin-bottom: 18px; }
+      .wt-map { box-shadow: none; border-color: #999; }
+      .wt-card { break-inside: avoid; border-color: #bbb; background: none; }
+      .wt-card.active { border-color: #bbb; }
+    }
+  </style>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#other" id="nav-cat">Everything Else</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" class="container" style="padding-top:var(--pico-spacing)">
+      <h1>Self-Guided Walking Tour</h1>
+      <p>A self-guided walking tour that runs entirely in your browser. The map is a site plan
+         drawn from OpenStreetMap data, the route is a real walking line, and each numbered stop
+         carries one text written to be read while you are standing in front of the thing rather
+         than at home before the trip.</p>
+      <p class="tool-shield">Your position is read on the device and never leaves it. There is no
+         server, no account and no analytics. Location is off until you switch it on.</p>
+    </div>
+  </main>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/icons.js"></script>
+
+  <script id="tourcore">
+/* Pure geometry for the walking tour. No DOM, no network, no React. This block
+   is the seam the Node tests use: notes/dev/tour.test.mjs pulls it out of this
+   file with a regex and evaluates it. Renaming the id, or moving any of this
+   into the app block, breaks the suite with an unhelpful "block found" failure.
+
+   Coordinates: everything downstream of project() is metres in a local tangent
+   plane around the tour's own centre, x east, y north. No UTM, no CRS. Over the
+   one or two kilometres a walking tour covers, the error is centimetres, and
+   unlike regensburg-sun (which hardcodes EPSG:25832 and is therefore valid only
+   in UTM zone 32) this works in any city on earth. */
+
+var TC = (function () {
+  'use strict';
+
+  var R_EARTH = 6371008.8;
+
+  /* Metres per degree of latitude and of longitude, evaluated ONCE at lat0.
+     Evaluating them at lat0 rather than per point is what makes this a plane
+     rather than a projection, and is why the whole thing is only valid over a
+     walk-sized area.
+
+     The series matter. The flat textbook pair (111320 * cos(lat), 110540) is
+     an equator approximation and is 0.6 percent short in the north-south
+     direction at 47 degrees, which is 13 m of drift over a two-kilometre
+     tour: enough to put a stop marker on the wrong side of a street. These
+     are the WGS84 series, good to well under a metre anywhere. */
+  function metresPerDegree(lat0) {
+    var p = lat0 * Math.PI / 180;
+    return [
+      111132.92 - 559.82 * Math.cos(2 * p) + 1.175 * Math.cos(4 * p) - 0.0023 * Math.cos(6 * p),
+      111412.84 * Math.cos(p) - 93.5 * Math.cos(3 * p) + 0.118 * Math.cos(5 * p)
+    ];
+  }
+
+  function project(lat, lon, lat0, lon0) {
+    var m = metresPerDegree(lat0);
+    return [(lon - lon0) * m[1], (lat - lat0) * m[0]];
+  }
+
+  function unproject(x, y, lat0, lon0) {
+    var m = metresPerDegree(lat0);
+    return [lat0 + y / m[0], lon0 + x / m[1]];
+  }
+
+  /* Inverse of encodeRing() in notes/dev/tour-geo.mjs: a prefix sum over
+     delta-encoded integers, scaled by unit. Returns a flat [x0,y0,x1,y1,...]
+     in metres. */
+  function decodeRing(a, unit) {
+    var n = a.length >> 1;
+    var out = new Array(n * 2);
+    var x = a[0], y = a[1];
+    out[0] = x * unit;
+    out[1] = y * unit;
+    for (var i = 1; i < n; i++) {
+      x += a[i * 2];
+      y += a[i * 2 + 1];
+      out[i * 2] = x * unit;
+      out[i * 2 + 1] = y * unit;
+    }
+    return out;
+  }
+
+  /* SVG path data from a flat metre ring. The y axis is negated here and only
+     here: the data is north-up, SVG user space grows downwards, and doing the
+     flip in the path string keeps the viewBox arithmetic in ordinary map
+     coordinates everywhere else. One decimal is 10 cm, which is finer than any
+     zoom level this tool offers and keeps the strings small. */
+  function ringPath(flat, close) {
+    if (!flat || flat.length < 4) return '';
+    var d = 'M' + flat[0].toFixed(1) + ' ' + (-flat[1]).toFixed(1);
+    for (var i = 2; i < flat.length; i += 2) {
+      d += 'L' + flat[i].toFixed(1) + ' ' + (-flat[i + 1]).toFixed(1);
+    }
+    return close ? d + 'Z' : d;
+  }
+
+  function haversine(a, b) {
+    var p = Math.PI / 180;
+    var dLat = (b[0] - a[0]) * p;
+    var dLon = (b[1] - a[1]) * p;
+    var s = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(a[0] * p) * Math.cos(b[0] * p) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R_EARTH * Math.asin(Math.min(1, Math.sqrt(s)));
+  }
+
+  function routeLength(route) {
+    var m = 0;
+    for (var i = 1; i < (route || []).length; i++) m += haversine(route[i - 1], route[i]);
+    return m;
+  }
+
+  /* Which stop am I closest to, and how far. Returns index -1 for an empty
+     list rather than throwing, because the caller is a render path. */
+  function nearestStop(pos, stops) {
+    var best = -1, bestD = Infinity;
+    for (var i = 0; i < (stops || []).length; i++) {
+      var c = stops[i] && stops[i].coord;
+      if (!c) continue;
+      var d = haversine(pos, c);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return { index: best, meters: best < 0 ? Infinity : bestD };
+  }
+
+  /* Bounding box of a list of [lat,lon] pairs, projected into the plane.
+     Returns [minX, minY, maxX, maxY] in metres. */
+  function bboxOf(coords, lat0, lon0) {
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (var i = 0; i < (coords || []).length; i++) {
+      var p = project(coords[i][0], coords[i][1], lat0, lon0);
+      if (p[0] < minX) minX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] > maxY) maxY = p[1];
+    }
+    if (!isFinite(minX)) return [-200, -200, 200, 200];
+    return [minX, minY, maxX, maxY];
+  }
+
+  /* Fit a box into a view of the given aspect (width / height), padded by a
+     fraction of the larger side. The aspect is honoured exactly so the SVG can
+     use preserveAspectRatio="meet" without ever letterboxing. */
+  function fitView(box, aspect, padFrac) {
+    var w = Math.max(1, box[2] - box[0]);
+    var h = Math.max(1, box[3] - box[1]);
+    var cx = (box[0] + box[2]) / 2;
+    var cy = (box[1] + box[3]) / 2;
+    var span = Math.max(w, h * aspect) * (1 + (padFrac == null ? 0.12 : padFrac));
+    return { cx: cx, cy: cy, span: span };
+  }
+
+  /* viewBox string for a view. Same y negation as ringPath. */
+  function viewBox(view, aspect) {
+    var w = view.span;
+    var h = w / aspect;
+    return (view.cx - w / 2) + ' ' + (-view.cy - h / 2) + ' ' + w + ' ' + h;
+  }
+
+  function clampView(view, box, minSpan, maxSpan) {
+    var span = Math.min(maxSpan, Math.max(minSpan, view.span));
+    return {
+      cx: Math.min(box[2] + span, Math.max(box[0] - span, view.cx)),
+      cy: Math.min(box[3] + span, Math.max(box[1] - span, view.cy)),
+      span: span
+    };
+  }
+
+  /* Interpolation between two views, for the glide when a stop is picked.
+     cx and cy move linearly, but the span moves GEOMETRICALLY: zoom is
+     multiplicative, and a linear span makes the first half of a zoom-in rush
+     and the second half crawl. The logarithmic path is what every map library
+     ends up using, for the same reason. */
+  function lerpView(a, b, t) {
+    return {
+      cx: a.cx + (b.cx - a.cx) * t,
+      cy: a.cy + (b.cy - a.cy) * t,
+      span: a.span * Math.pow(b.span / a.span, t)
+    };
+  }
+
+  // Cubic ease in and out. Starts and ends at rest, which is what makes the
+  // movement read as the map turning to look at something rather than jumping.
+  function easeInOut(t) {
+    const c = Math.min(1, Math.max(0, t));
+    return c < 0.5 ? 4 * c * c * c : 1 - Math.pow(-2 * c + 2, 3) / 2;
+  }
+
+  function formatDistance(m) {
+    if (!isFinite(m)) return '';
+    if (m < 950) return Math.round(m / 5) * 5 + ' m';
+    return (m / 1000).toFixed(1) + ' km';
+  }
+
+  return {
+    project: project,
+    unproject: unproject,
+    decodeRing: decodeRing,
+    ringPath: ringPath,
+    haversine: haversine,
+    routeLength: routeLength,
+    nearestStop: nearestStop,
+    bboxOf: bboxOf,
+    fitView: fitView,
+    viewBox: viewBox,
+    clampView: clampView,
+    lerpView: lerpView,
+    easeInOut: easeInOut,
+    formatDistance: formatDistance
+  };
+})();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = TC;
+  </script>
+
+  <script id="app">
+const html = htm.bind(React.createElement);
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+const TOUR_DIR = '/assets/files/tours/';
+const PATH_WIDTH = [3.4, 2.4, 1.6, 0.9];   // by class: big, medium, street, footway
+
+/* Everything the service worker needs for the tool to open with no network.
+   Kept here rather than in the worker so that adding a tour is one line in one
+   place; the worker still re-checks each path against its own allowlist. */
+function offlinePaths(slug) {
+  return [
+    '/miscellaneous/tools/walking-tour.html',
+    '/assets/js/react.production.min.js',
+    '/assets/js/react-dom.production.min.js',
+    '/assets/js/htm.js',
+    '/assets/js/icons.js',
+    '/assets/js/site-nav.js',
+    '/assets/css/pico.min.css',
+    '/assets/css/custom.css',
+    '/assets/img/favicon.svg',
+    TOUR_DIR + 'index.json',
+    TOUR_DIR + slug + '.json',
+    TOUR_DIR + slug + '.geo.json'
+  ];
+}
+
+function fetchJson(url) {
+  return fetch(url).then(function (r) {
+    if (!r.ok) throw new Error(url + ': HTTP ' + r.status);
+    return r.json();
+  });
+}
+
+function slugFromUrl() {
+  return new URLSearchParams(location.search).get('tour') || '';
+}
+
+/* ------------------------------------------------------------------ map */
+
+/* NOT called Map. The app block is a classic script, so a top-level function
+   declaration becomes a property of window, and `function Map` overwrites the
+   built-in Map constructor for the whole page. React-DOM then calls new Map()
+   and gets this component instead, which throws on the first render with a
+   stack that points here and explains nothing. Same trap waits for Set, Range,
+   Image, Text, Location, Event, Node and Selection. */
+function TourMap(props) {
+  const geo = props.geo;
+  const stops = props.stops;
+  const route = props.route;
+  const here = props.here;
+
+  const svgRef = useRef(null);
+  const dragRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+
+  const lat0 = geo.center[0];
+  const lon0 = geo.center[1];
+
+  // Aspect from the tour's own extent, clamped so a very long thin walk does
+  // not produce a letterbox nobody can read. Set on the CSS box as well, so
+  // preserveAspectRatio never has anything left to do.
+  const geom = useMemo(function () {
+    const unit = geo.unit;
+    const dec = function (r) { return TC.decodeRing(r, unit); };
+    const pack = function (arr, close) {
+      return (arr || []).map(function (r) { return TC.ringPath(dec(r), close); })
+        .filter(function (d) { return d; });
+    };
+    const paths = [[], [], [], []];
+    (geo.paths || []).forEach(function (p) {
+      const d = TC.ringPath(dec(p[1]), false);
+      if (d) paths[p[0]].push(d);
+    });
+    const stopPts = stops.map(function (s) { return TC.project(s.coord[0], s.coord[1], lat0, lon0); });
+    const routePts = (route || []).map(function (c) { return TC.project(c[0], c[1], lat0, lon0); });
+    const routeD = routePts.length > 1
+      ? 'M' + routePts.map(function (p) { return p[0].toFixed(1) + ' ' + (-p[1]).toFixed(1); }).join('L')
+      : '';
+    const box = TC.bboxOf((route && route.length > 1 ? route : stops.map(function (s) { return s.coord; })), lat0, lon0);
+    const w = Math.max(1, box[2] - box[0]);
+    const h = Math.max(1, box[3] - box[1]);
+    const aspect = Math.min(1.6, Math.max(0.62, w / h));
+    return {
+      green: pack(geo.green, true),
+      water: pack(geo.water, true),
+      bldg: pack(geo.buildings, true),
+      walls: pack(geo.walls, false),
+      paths: paths,
+      routeD: routeD,
+      stopPts: stopPts,
+      box: box,
+      aspect: aspect
+    };
+  }, [geo, stops, route, lat0, lon0]);
+
+  const [view, setView] = useState(function () { return TC.fitView(geom.box, geom.aspect, 0.14); });
+
+  // Refit when the tour changes. Deliberately keyed on the box, not on every
+  // render, so panning survives a re-render caused by a GPS tick.
+  useEffect(function () {
+    setView(TC.fitView(geom.box, geom.aspect, 0.14));
+  }, [geom.box[0], geom.box[1], geom.box[2], geom.box[3], geom.aspect]);
+
+  /* Declared BEFORE glideTo, not after: glideTo names limits in its dependency
+     array, useCallback evaluates that array during render, and a const declared
+     further down is still in its temporal dead zone at that moment. The browser
+     throws "Cannot access 'limits' before initialization" and the map never
+     renders. Order is load-bearing here. */
+  const limits = useMemo(function () {
+    const w = Math.max(1, geom.box[2] - geom.box[0]);
+    const h = Math.max(1, geom.box[3] - geom.box[1]);
+    return { min: 40, max: Math.max(w, h * geom.aspect) * 3 };
+  }, [geom]);
+
+  // A mirror of the current view that the animation can read without being
+  // rebuilt on every frame. Assigned during render on purpose: it is a mirror,
+  // never a source of truth, and nothing renders from it.
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const animRef = useRef(0);
+
+  const stopGlide = useCallback(function () {
+    if (animRef.current) { cancelAnimationFrame(animRef.current); animRef.current = 0; }
+  }, []);
+
+  /* Move the view over time instead of assigning it. Clicking a stop used to
+     teleport the map, which costs the reader the one thing a map is for:
+     knowing where the new place is relative to the old one. 420 ms is long
+     enough to follow and short enough not to feel like waiting.
+
+     prefers-reduced-motion is honoured with a plain jump. Motion sickness is a
+     real reason to turn animation off, and a map that slides is exactly the
+     kind of thing that setting exists for. */
+  const glideTo = useCallback(function (target) {
+    stopGlide();
+    const from = viewRef.current;
+    const to = TC.clampView(target, geom.box, limits.min, limits.max);
+    const still = Math.hypot(to.cx - from.cx, to.cy - from.cy) < 0.5
+      && Math.abs(Math.log(to.span / from.span)) < 0.01;
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (still || reduce) { setView(to); return; }
+    const t0 = performance.now();
+    const step = function (now) {
+      const t = Math.min(1, (now - t0) / 420);
+      setView(TC.lerpView(from, to, TC.easeInOut(t)));
+      animRef.current = t < 1 ? requestAnimationFrame(step) : 0;
+    };
+    animRef.current = requestAnimationFrame(step);
+  }, [geom, limits, stopGlide]);
+
+  useEffect(function () { return stopGlide; }, [stopGlide]);
+
+  /* Centre on the stop the user just picked. focus carries a sequence number
+     rather than being the bare index, so picking the SAME stop again after
+     panning away still brings the map back; with a bare index the effect would
+     not fire a second time. */
+  const focus = props.focus;
+  useEffect(function () {
+    if (!focus || focus.i == null || !geom.stopPts[focus.i]) return;
+    glideTo({
+      cx: geom.stopPts[focus.i][0],
+      cy: geom.stopPts[focus.i][1],
+      span: Math.min(viewRef.current.span, 320)
+    });
+  }, [focus]);
+
+  // Client pixels to map metres. The element aspect equals the viewBox aspect
+  // (see the inline aspectRatio below), so a single linear factor is exact.
+  const perPixel = useCallback(function () {
+    const el = svgRef.current;
+    if (!el) return 1;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 ? view.span / r.width : 1;
+  }, [view.span]);
+
+  /* Deliberately NOT wired up as React's onWheel. React attaches wheel through
+     its root delegation as a PASSIVE listener, so preventDefault() is ignored
+     and the console fills with "Unable to preventDefault inside passive event
+     listener invocation" while the page scrolls and the map zooms at the same
+     time. The only fix is a native listener with passive: false, added in the
+     effect below. */
+  const onWheel = useCallback(function (e) {
+    e.preventDefault();
+    stopGlide();
+    const el = svgRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const k = Math.exp(e.deltaY * 0.0015);
+    setView(function (v) {
+      const span = Math.min(limits.max, Math.max(limits.min, v.span * k));
+      // Keep the point under the cursor fixed: shift the centre by the change
+      // in scale times the cursor's offset from the centre.
+      const fx = (e.clientX - r.left) / r.width - 0.5;
+      const fy = (e.clientY - r.top) / r.height - 0.5;
+      const h = v.span / geom.aspect;
+      const hn = span / geom.aspect;
+      return TC.clampView({
+        cx: v.cx + fx * (v.span - span),
+        cy: v.cy - fy * (h - hn),
+        span: span
+      }, geom.box, limits.min, limits.max);
+    });
+  }, [geom, limits, stopGlide]);
+
+  useEffect(function () {
+    const el = svgRef.current;
+    if (!el) return;
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return function () { el.removeEventListener('wheel', onWheel); };
+  }, [onWheel]);
+
+  const onPointerDown = useCallback(function (e) {
+    const el = svgRef.current;
+    if (!el) return;
+    /* A pointerdown that lands on a stop marker must NOT capture the pointer.
+       Pointer capture retargets every following event, including the click, to
+       the capture element, so the marker's own onClick never fires and tapping
+       a stop silently does nothing while clicking its card works. Giving up the
+       ability to begin a pan exactly on top of a marker is the cheaper loss. */
+    if (e.target && e.target.closest && e.target.closest('.wt-stop')) return;
+    stopGlide();
+    el.setPointerCapture(e.pointerId);
+    dragRef.current = { x: e.clientX, y: e.clientY };
+    setDragging(true);
+  }, [stopGlide]);
+
+  const onPointerMove = useCallback(function (e) {
+    if (!dragRef.current) return;
+    const k = perPixel();
+    const dx = (e.clientX - dragRef.current.x) * k;
+    const dy = (e.clientY - dragRef.current.y) * k;
+    dragRef.current = { x: e.clientX, y: e.clientY };
+    setView(function (v) {
+      return TC.clampView({ cx: v.cx - dx, cy: v.cy + dy, span: v.span }, geom.box, limits.min, limits.max);
+    });
+  }, [perPixel, geom, limits]);
+
+  const onPointerUp = useCallback(function (e) {
+    dragRef.current = null;
+    setDragging(false);
+    const el = svgRef.current;
+    if (el && el.hasPointerCapture && el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+  }, []);
+
+  // The buttons glide too. A stepped zoom that teleports is as disorienting as
+  // a stepped pan, and the wheel already gives the immediate variant.
+  const zoom = useCallback(function (k) {
+    const v = viewRef.current;
+    glideTo({ cx: v.cx, cy: v.cy, span: v.span * k });
+  }, [glideTo]);
+
+  const herePt = here ? TC.project(here.lat, here.lon, lat0, lon0) : null;
+  const mPerPx = perPixel();
+  const stopR = Math.max(4.5, view.span / 42);
+
+  return html`
+    <div>
+      <svg ref=${svgRef}
+           className=${'wt-map' + (dragging ? ' dragging' : '')}
+           viewBox=${TC.viewBox(view, geom.aspect)}
+           preserveAspectRatio="xMidYMid meet"
+           style=${{ aspectRatio: String(geom.aspect) }}
+           role="img"
+           aria-label=${'Map of the route with ' + stops.length + ' stops'}
+           onPointerDown=${onPointerDown}
+           onPointerMove=${onPointerMove}
+           onPointerUp=${onPointerUp}
+           onPointerCancel=${onPointerUp}>
+        <g>
+          ${geom.green.map(function (d, i) { return html`<path key=${'g' + i} className="wt-green" d=${d}/>`; })}
+          ${geom.water.map(function (d, i) { return html`<path key=${'w' + i} className="wt-water" d=${d}/>`; })}
+          ${geom.paths.map(function (list, cls) {
+            return html`<g key=${'pc' + cls} className="wt-path" strokeWidth=${PATH_WIDTH[cls] * Math.max(0.5, view.span / 900)}>
+              ${list.map(function (d, i) { return html`<path key=${i} d=${d}/>`; })}
+            </g>`;
+          })}
+          ${geom.bldg.map(function (d, i) { return html`<path key=${'b' + i} className="wt-bldg" d=${d}/>`; })}
+          ${geom.walls.map(function (d, i) { return html`<path key=${'v' + i} className="wt-wall" d=${d}/>`; })}
+          ${geom.routeD ? html`<path className="wt-route" d=${geom.routeD}/>` : null}
+          ${herePt && here.accuracy ? html`
+            <circle className="wt-heraccuracy" cx=${herePt[0]} cy=${-herePt[1]}
+                    r=${Math.min(400, Math.max(6, here.accuracy))}/>` : null}
+          ${herePt ? html`<circle className="wt-here" cx=${herePt[0]} cy=${-herePt[1]} r=${stopR * 0.6}/>` : null}
+          ${geom.stopPts.map(function (p, i) {
+            return html`
+              <g key=${'s' + i}
+                 className=${'wt-stop' + (props.active === i ? ' active' : '')}
+                 transform=${'translate(' + p[0].toFixed(1) + ',' + (-p[1]).toFixed(1) + ')'}
+                 onClick=${function () { props.onPick(i); }}>
+                <circle r=${stopR}/>
+                <text style=${{ fontSize: (stopR * 1.05) + 'px' }}>${stops[i].n}</text>
+              </g>`;
+          })}
+        </g>
+      </svg>
+
+      <div className="wt-row no-print">
+        <button className="lang-seg" onClick=${function () { zoom(1 / 1.6); }} aria-label="Zoom in">+</button>
+        <button className="lang-seg" onClick=${function () { zoom(1.6); }} aria-label="Zoom out">-</button>
+        <button className="tool-btn tool-btn-sm"
+                onClick=${function () { glideTo(TC.fitView(geom.box, geom.aspect, 0.14)); }}>
+          ${ToolIcons.el('reset')} Fit route
+        </button>
+        ${props.children}
+      </div>
+      <p className="wt-status">Scale: about ${Math.round(mPerPx * 100)} m per 100 px. ${geo.attribution || ''}</p>
+    </div>`;
+}
+
+/* ----------------------------------------------------------------- stop */
+
+function Stop(props) {
+  const s = props.stop;
+  const hasText = s.text && String(s.text).trim().length > 0;
+  return html`
+    <article className=${'wt-card' + (props.active ? ' active' : '')}
+             ref=${props.innerRef}
+             onClick=${function () { props.onPick(props.index); }}>
+      <div className="wt-head">
+        <div className="wt-num">${s.n}</div>
+        <div>
+          <p className="wt-name">
+            ${s.name}
+            ${s.confidence === 'medium' ? html`<span className="wt-flag">disputed</span>` : null}
+          </p>
+          ${s.local_name && s.local_name !== s.name ? html`<p className="wt-local">${s.local_name}</p>` : null}
+        </div>
+      </div>
+      ${s.dates ? html`<p className="wt-dates">${s.dates}</p>` : null}
+      ${props.distance != null ? html`<p className="wt-dist">${TC.formatDistance(props.distance)} away</p>` : null}
+      ${s.stand_here ? html`<p className="wt-stand">${s.stand_here}</p>` : null}
+      ${hasText
+        ? html`<p className="wt-text">${s.text}</p>`
+        : html`<p className="wt-pending">Text pending research.</p>`}
+      ${s.look_for && s.look_for.length ? html`
+        <ul className="wt-look">
+          ${s.look_for.map(function (x, i) { return html`<li key=${i}>${x}</li>`; })}
+        </ul>` : null}
+      ${s.next ? html`<p className="wt-next">${s.next}</p>` : null}
+      ${s.sources && s.sources.length ? html`
+        <p className="wt-src">
+          Sources: ${s.sources.map(function (u, i) {
+            return html`<span key=${i}>${i > 0 ? ', ' : ''}<a href=${u} rel="noopener noreferrer" target="_blank">${i + 1}</a></span>`;
+          })}
+        </p>` : null}
+    </article>`;
+}
+
+/* ------------------------------------------------------------------ app */
+
+function App() {
+  const [index, setIndex] = useState(null);
+  const [slug, setSlug] = useState(slugFromUrl());
+  const [tour, setTour] = useState(null);
+  const [geo, setGeo] = useState(null);
+  const [error, setError] = useState('');
+  const [active, setActive] = useState(null);
+  const [focus, setFocus] = useState(null);
+  const [here, setHere] = useState(null);
+  const [geoError, setGeoError] = useState('');
+  const [cached, setCached] = useState(null);
+  const [swBusy, setSwBusy] = useState(false);
+
+  const cardRefs = useRef({});
+  const watchRef = useRef(null);
+
+  useEffect(function () {
+    let alive = true;
+    fetchJson(TOUR_DIR + 'index.json').then(function (ix) {
+      if (!alive) return;
+      setIndex(ix);
+      const list = ix.tours || [];
+      const wanted = slugFromUrl();
+      const found = list.filter(function (t) { return t.slug === wanted; })[0];
+      setSlug((found || list[0] || {}).slug || '');
+    }, function (e) { if (alive) setError(String(e.message || e)); });
+    return function () { alive = false; };
+  }, []);
+
+  useEffect(function () {
+    if (!slug) return;
+    let alive = true;
+    setTour(null);
+    setGeo(null);
+    setActive(null);
+    Promise.all([fetchJson(TOUR_DIR + slug + '.json'), fetchJson(TOUR_DIR + slug + '.geo.json')])
+      .then(function (res) {
+        if (!alive) return;
+        setTour(res[0]);
+        setGeo(res[1]);
+      }, function (e) { if (alive) setError(String(e.message || e)); });
+    return function () { alive = false; };
+  }, [slug]);
+
+  // Service worker: registered on load so it can control the page, but it caches
+  // nothing until the button below asks it to.
+  useEffect(function () {
+    if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+    const onMessage = function (e) {
+      const d = e.data || {};
+      if (d.type === 'cached') { setCached(d.count); setSwBusy(false); }
+      if (d.type === 'error') { setSwBusy(false); }
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    navigator.serviceWorker.register('/miscellaneous/tools/tour-sw.js',
+      { scope: '/miscellaneous/tools/walking-tour.html' })
+      .then(function () { return navigator.serviceWorker.ready; })
+      .then(function (reg) {
+        const t = reg.active || navigator.serviceWorker.controller;
+        if (t) t.postMessage({ type: 'status' });
+      })
+      .catch(function () { /* no offline support here, the rest still works */ });
+    return function () { navigator.serviceWorker.removeEventListener('message', onMessage); };
+  }, []);
+
+  const sendSw = useCallback(function (msg) {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.ready.then(function (reg) {
+      const t = navigator.serviceWorker.controller || reg.active;
+      if (t) { setSwBusy(true); t.postMessage(msg); }
+    });
+  }, []);
+
+  const toggleGps = useCallback(function () {
+    if (watchRef.current != null) {
+      navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
+      setHere(null);
+      return;
+    }
+    if (!navigator.geolocation) { setGeoError('This browser has no location API.'); return; }
+    setGeoError('');
+    watchRef.current = navigator.geolocation.watchPosition(function (p) {
+      setHere({ lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy });
+    }, function (err) {
+      setGeoError(err.code === 1 ? 'Location permission denied.' : 'Could not get a position.');
+      if (watchRef.current != null) { navigator.geolocation.clearWatch(watchRef.current); watchRef.current = null; }
+    }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+  }, []);
+
+  useEffect(function () {
+    return function () {
+      if (watchRef.current != null && navigator.geolocation) navigator.geolocation.clearWatch(watchRef.current);
+    };
+  }, []);
+
+  const stops = (tour && tour.stops) || [];
+
+  const near = useMemo(function () {
+    if (!here || !stops.length) return null;
+    return TC.nearestStop([here.lat, here.lon], stops);
+  }, [here, stops]);
+
+  const pick = useCallback(function (i) {
+    setActive(i);
+    // A sequence number, not the bare index: picking the SAME stop again after
+    // panning away has to bring the map back, and an unchanged index would not
+    // re-fire the effect in the map.
+    setFocus(function (f) { return { i: i, seq: (f ? f.seq : 0) + 1 }; });
+    const el = cardRefs.current[i];
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, []);
+
+  const switchTour = useCallback(function (s) {
+    const u = new URL(location.href);
+    u.searchParams.set('tour', s);
+    history.replaceState(null, '', u);
+    setSlug(s);
+  }, []);
+
+  if (error) {
+    return html`
+      <div>
+        <h1>Self-Guided Walking Tour</h1>
+        <p className="wt-pending">Could not load the tour data: ${error}</p>
+        <p className="wt-note">Tools that fetch data need a real server. Opening this file directly
+           from disk does not work.</p>
+      </div>`;
+  }
+
+  if (!tour || !geo) {
+    return html`
+      <div>
+        <h1>Self-Guided Walking Tour</h1>
+        <p className="wt-pending">Loading the tour...</p>
+      </div>`;
+  }
+
+  const km = (TC.routeLength(tour.route) / 1000);
+  const tourList = (index && index.tours) || [];
+
+  return html`
+    <div>
+      <h1>Self-Guided Walking Tour</h1>
+      <h2 className="wt-tourtitle">${tour.title}</h2>
+      ${tour.subtitle ? html`<p className="wt-toursub">${tour.subtitle}</p>` : null}
+      <p className="tool-shield">Your position is read on the device and never leaves it. There is no
+         server, no account and no analytics. Location is off until you switch it on.</p>
+
+      ${tour.draft ? html`
+        <p className="wt-draft">This tour is a draft. The stops, their coordinates and their Wikidata
+           identifiers come from OpenStreetMap and are real, but the commentary has not been
+           researched and checked yet.</p>` : null}
+
+      ${tourList.length > 1 ? html`
+        <div className="wt-row no-print">
+          ${tourList.map(function (t) {
+            return html`<button key=${t.slug}
+                                className=${'lang-seg' + (t.slug === slug ? ' active' : '')}
+                                onClick=${function () { switchTour(t.slug); }}>${t.city}</button>`;
+          })}
+        </div>` : null}
+
+      ${tour.intro ? html`<p className="wt-text" style=${{ maxWidth: '68ch' }}>${tour.intro}</p>` : null}
+
+      <p className="wt-status">
+        ${stops.length} stops
+        ${km > 0.05 ? ', about ' + km.toFixed(1) + ' km' : ''}
+        ${tour.practical && tour.practical.duration_min ? ', roughly ' + tour.practical.duration_min + ' minutes' : ''}.
+        ${tour.practical && tour.practical.start ? ' Starts at ' + tour.practical.start + '.' : ''}
+      </p>
+
+      <div className="wt-layout" style=${{ marginTop: 18 }}>
+        <div className="wt-mapcol">
+          <${TourMap} geo=${geo} stops=${stops} route=${tour.route} active=${active} focus=${focus}
+                  here=${here} onPick=${pick}>
+            <button className=${'tool-btn tool-btn-sm' + (here ? ' tool-btn-primary' : '')}
+                    onClick=${toggleGps}>
+              ${here ? 'Stop locating' : 'Show my position'}
+            </button>
+            ${cached != null ? html`
+              ${cached > 0
+                ? html`<button className="tool-danger tool-btn-sm" disabled=${swBusy}
+                               onClick=${function () { sendSw({ type: 'clear' }); }}>
+                    ${ToolIcons.el('remove')} Remove offline copy
+                  </button>`
+                : html`<button className="tool-btn tool-btn-sm" disabled=${swBusy}
+                               onClick=${function () { sendSw({ type: 'cache', paths: offlinePaths(slug) }); }}>
+                    ${ToolIcons.el('download')} Save for offline
+                  </button>`}` : null}
+          <//>
+          ${geoError ? html`<p className="wt-status">${geoError}</p>` : null}
+          ${near && near.index >= 0 ? html`
+            <p className="wt-status">Nearest stop: ${stops[near.index].n}. ${stops[near.index].name},
+               ${TC.formatDistance(near.meters)} away.</p>` : null}
+          ${cached > 0 ? html`
+            <p className="wt-status">Saved for offline use. ${cached} files stored on this device.</p>` : null}
+        </div>
+
+        <div>
+          ${stops.map(function (s, i) {
+            return html`<${Stop} key=${s.wikidata || i} stop=${s} index=${i}
+                                 active=${active === i}
+                                 distance=${here ? TC.haversine([here.lat, here.lon], s.coord) : null}
+                                 onPick=${pick}
+                                 innerRef=${function (el) { cardRefs.current[i] = el; }}/>`;
+          })}
+        </div>
+      </div>
+
+      ${tour.practical ? html`
+        <details className="fold no-print" style=${{ marginTop: 22 }}>
+          <summary>Practical notes</summary>
+          <div className="fold-body">
+            ${tour.practical.terrain ? html`<p>Terrain: ${tour.practical.terrain}</p>` : null}
+            ${tour.practical.best_time ? html`<p>Best time: ${tour.practical.best_time}</p>` : null}
+            ${tour.practical.start ? html`<p>Start: ${tour.practical.start}</p>` : null}
+            ${tour.practical.end ? html`<p>End: ${tour.practical.end}</p>` : null}
+            <p>Opening hours and ticket prices change and are deliberately not part of this tour.
+               Check them before you go.</p>
+          </div>
+        </details>` : null}
+
+      <p className="wt-note">
+        Base map: ${geo.attribution || 'OpenStreetMap contributors, ODbL'}. Geometry extracted from
+        OpenStreetMap and simplified for this drawing; it is a schematic site plan, not a survey.
+        ${tour.credits ? ' ' + tour.credits : ''}
+      </p>
+    </div>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App}/>`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Self-Guided Walking Tour",
+    "url": "https://alber.me/miscellaneous/tools/walking-tour.html",
+    "applicationCategory": "TravelApplication",
+    "operatingSystem": "Any modern browser",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" },
+    "description": "A self-guided walking tour in the browser: a site plan drawn from OpenStreetMap, a numbered route, and one commentary per stop written to be read on the spot. Runs offline once saved and never transmits the visitor's position.",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person" }
+  }
+  </script>
+</body>
+</html>

@@ -1,0 +1,1247 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <!-- No theme one-liner and no switcher: the arena fills the screen and only
+       exists dark, exactly as reaction-diffusion.html does, so a stored light
+       preference must not reach this page. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Cobra 6DOF - Spaceflight with a 3D Mouse</title>
+  <meta name="description" content="Fly a wireframe Cobra through a gridded box with a 3Dconnexion SpaceNavigator. A real rigid body: inertia tensor integrated from the mesh, Euler equations in the body frame, so a grazed wall leaves you tumbling about the unstable axis. Needs a 3D mouse and a Chromium browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/spaceship-6dof.html">
+  <meta property="og:title" content="Cobra 6DOF">
+  <meta property="og:description" content="A wireframe Cobra flown with a 3D mouse. Six degrees of freedom, a real inertia tensor, and a hull that tumbles the way an actual rigid body does.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/spaceship-6dof.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Full-screen canvas, so the Pico container, the site header and the site
+       footer are deliberately absent. Everything that would live in them goes
+       into the floating panel. */
+    html, body { height: 100%; }
+    body { margin: 0; overflow: hidden; background: #05070b; }
+    #root { position: fixed; inset: 0; }
+
+    .sd-stage { position: absolute; inset: 0; touch-action: none; cursor: crosshair; }
+    .sd-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+    .sd-back { position: absolute; top: 12px; left: 12px; z-index: 3;
+      font-size: 12.5px; color: var(--tool-label); text-decoration: none;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .sd-back:hover { color: var(--tool-text); border-color: var(--tool-faint); }
+
+    /* The readouts are written straight into these nodes from the animation
+       loop. Routing sixty numbers a second through React state would re-render
+       the whole panel for nothing. */
+    .sd-hud { position: absolute; bottom: 12px; left: 12px; z-index: 3;
+      pointer-events: none;
+      padding: 9px 14px; border-radius: 10px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    /* The one part of the HUD that is not a readout, so it is the one part that
+       takes the pointer back off the stage. A joined segmented control, no gap,
+       so the shared adjacency rules in custom.css round the outer corners and
+       nothing has to be restated here. */
+    .sd-hudtabs { margin-bottom: 8px; pointer-events: auto; }
+    .sd-hudtabs button { width: auto; font-size: 10px; padding: 2px 10px; }
+    .sd-grid { display: grid; grid-template-columns: auto auto; gap: 3px 14px;
+      font-size: 11.5px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      letter-spacing: .02em; }
+    .sd-grid b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .sd-grid b.hot { color: #fbbf24; }
+    .sd-legend { grid-column: 1 / -1; display: flex; gap: 11px; margin-top: 5px;
+      padding-top: 6px; border-top: 1px solid var(--tool-hairline); font-size: 10.5px; }
+
+    /* The raw-input page. One row per degree of freedom: which device axis
+       carries it, what that axis reads after shaping, and what the ship is
+       actually being told, because gain and inversion sit between the two and
+       an axis that reads fine while the ship does nothing is exactly the fault
+       this page has to be able to show. */
+    .sd-in { display: grid; grid-template-columns: auto 22px 44px 74px 46px;
+      gap: 4px 9px; align-items: center; font-size: 11px; color: var(--tool-note);
+      font-variant-numeric: tabular-nums; }
+    .sd-in i { font-style: normal; color: var(--tool-faint); font-size: 10px; }
+    .sd-in b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .sd-in b.live { color: #34d399; }
+    .sd-bar { position: relative; height: 6px; border-radius: 2px;
+      background: var(--tool-hairline); }
+    .sd-bar::before { content: ''; position: absolute; left: 50%; top: -1px; bottom: -1px;
+      width: 1px; background: var(--tool-faint); }
+    .sd-bar span { position: absolute; top: 0; bottom: 0; left: 50%; width: 0;
+      background: #38bdf8; border-radius: 2px; }
+    .sd-btnrow { grid-column: 1 / -1; display: flex; gap: 6px; margin-top: 5px;
+      padding-top: 6px; border-top: 1px solid var(--tool-hairline); font-size: 10px; }
+    .sd-lamp { padding: 1px 7px; border-radius: 3px; border: 1px solid var(--tool-hairline);
+      color: var(--tool-faint); letter-spacing: .04em; }
+    .sd-lamp.on { color: #05070b; background: #38bdf8; border-color: #38bdf8; }
+
+    .sd-msg { position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+      z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
+      font-size: 14px; color: var(--tool-text); letter-spacing: .03em;
+      text-shadow: 0 0 18px rgba(0,0,0,.95); }
+    .sd-msg small { display: block; margin-top: 7px; font-size: 11.5px;
+      color: var(--tool-note); letter-spacing: .01em; line-height: 1.6; }
+
+    .sd-panel { position: absolute; top: 12px; right: 12px; z-index: 4;
+      width: min(348px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+      overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid var(--tool-border); border-radius: 10px; padding: 12px 14px 14px;
+      background: color-mix(in srgb, var(--tool-panel) 88%, transparent); backdrop-filter: blur(10px);
+      box-shadow: var(--tool-panel-shadow); }
+    .sd-panel::-webkit-scrollbar { width: 8px; }
+    .sd-panel::-webkit-scrollbar-thumb { background: var(--tool-border); border-radius: 4px; }
+    .sd-toggle { position: absolute; top: 12px; right: 12px; z-index: 4;
+      font-size: 12.5px; color: var(--tool-text); cursor: pointer; width: auto; margin: 0;
+      padding: 6px 13px; border-radius: 999px; border: 1px solid var(--tool-border);
+      background: color-mix(in srgb, var(--tool-panel) 75%, transparent); backdrop-filter: blur(8px); }
+    .sd-toggle:hover { border-color: var(--tool-faint); }
+
+    .sd-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .sd-head h2 { font-size: 14px; color: var(--tool-text); margin: 0; font-weight: 600; flex: 1; }
+    .sd-x { background: none; border: none; color: var(--tool-note); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 4px; margin: 0; width: auto; }
+    .sd-x:hover { color: var(--tool-text); }
+
+    /* Accordion, the same shape reaction-diffusion uses and for the same reason:
+       ten sections of flight model do not fit down the side of a full-screen
+       arena on a laptop, and the collapsed header keeps showing its current
+       value, so folding one away hides the controls and not the setting. */
+    .sd-acc { border-top: 1px solid var(--tool-hairline); }
+    .sd-acc-h { display: flex; align-items: baseline; gap: 8px; width: 100%;
+      margin: 0; padding: 9px 2px; background: none; border: none; cursor: pointer;
+      font-size: 11px; color: var(--tool-note); letter-spacing: .06em; text-transform: uppercase;
+      text-align: left; }
+    .sd-acc-h:hover { color: var(--tool-text); }
+    .sd-acc-h.open { color: var(--tool-label); }
+    .sd-acc-s { margin-left: auto; font-size: 11px; color: var(--tool-faint);
+      text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
+    .sd-acc-c { margin-left: auto; font-size: 13px; line-height: 1; color: var(--tool-faint); flex: none; }
+    .sd-acc-s + .sd-acc-c { margin-left: 6px; }
+    .sd-acc-b { padding: 0 2px 12px; }
+
+    .sd-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline;
+      gap: 2px 8px; margin: 6px 0; }
+    .sd-row label { font-size: 11.5px; color: var(--tool-label); margin: 0; }
+    .sd-row output { font-size: 11.5px; color: var(--tool-text); text-align: right;
+      font-variant-numeric: tabular-nums; }
+    .sd-row input[type=range] { grid-column: 1 / -1; margin: 2px 0 0; }
+
+    .sd-derived { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+      font-size: 11px; color: var(--tool-note); font-variant-numeric: tabular-nums; margin: 7px 0 0; }
+    .sd-derived b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .sd-derived b.hot { color: #fbbf24; }
+
+    .sd-chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0 0; }
+    .sd-chips button { width: auto; margin: 0; }
+    .sd-note { font-size: 10.5px; color: var(--tool-faint); margin: 7px 0 0; line-height: 1.5; }
+    .sd-note kbd { font-size: 10px; padding: 1px 5px; background: none;
+      border: 1px solid var(--tool-hairline); border-radius: 3px; color: var(--tool-note); }
+    /* A deliberate chip row of separate actions, so it opts out of the
+       segmented-control adjacency rules in custom.css. */
+    .sd-chips .lang-seg { border-radius: 4px; margin-left: 0; }
+
+    /* Axis assignment. Which raw HID axis carries which gesture varies by
+       device and firmware, so it is a setting with a live readout next to it
+       rather than a constant somebody has to guess at. */
+    .sd-axis { display: grid; grid-template-columns: 46px 1fr auto 50px;
+      gap: 4px 6px; align-items: center; margin: 5px 0; font-size: 11px; }
+    .sd-axis label { color: var(--tool-label); margin: 0; }
+    .sd-axis select { margin: 0; font-size: 11px; padding: 2px 22px 2px 6px;
+      height: auto; background-position: right 4px center; }
+    .sd-axis button { width: auto; margin: 0; font-size: 10px; padding: 2px 7px; }
+    .sd-axis b { text-align: right; font-weight: 600; color: var(--tool-text);
+      font-variant-numeric: tabular-nums; }
+    .sd-axis b.live { color: #34d399; }
+  </style>
+
+  <script type="importmap">
+  { "imports": { "three": "/assets/js/three.module.min.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE = THREE;
+    window.__sdThreeReady = true;
+    window.dispatchEvent(new Event('sd-three-ready'));
+  </script>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/spacenav.js"></script>
+  <script src="/assets/js/sixdof.js"></script>
+  <script src="/assets/js/dust.js"></script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Cobra 6DOF",
+    "description": "A six-degree-of-freedom spacecraft flown with a 3Dconnexion SpaceNavigator over WebHID. The hull is a real rigid body: its inertia tensor is integrated over the mesh by tetrahedral decomposition and diagonalized onto its principal axes, and Euler's equations run in the body frame, so the hull tumbles about its intermediate axis and a grazed wall imparts torque rather than merely stopping it. The cap flies the RCS on all six axes and the right-hand button is the main engine. Thrust, torque, hull geometry, cap shaping and the second-order camera filter are all adjustable, with the resulting turn and traverse times shown in seconds, and the whole setup can be saved and exported as a file.",
+    "url": "https://alber.me/miscellaneous/tools/spaceship-6dof.html",
+    "applicationCategory": "GameApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript, WebGL and WebHID, so a Chromium-based browser, plus a 3D mouse for the intended controls"
+  }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+
+  <script id="app">
+const html = htm.bind(React.createElement);
+const { useState, useRef, useEffect, useMemo, useCallback } = React;
+const SD = SixDOF;
+
+/* Colours are literals rather than --tool-* reads because this page has no
+   theme switcher at all and only exists dark, exactly as reaction-diffusion
+   does. There is nothing for a readPalette() to react to. */
+const COL = {
+  space: 0x05070b,
+  arena: 0x1b3247, grid: 0x142534, ship: 0x7dd3fc,
+  target: 0xfbbf24, drop: 0x2a3f55, vel: 0x34d399, omega: 0xf472b6, angmom: 0xfbbf24
+};
+
+const DEF = {
+  hull: 'cobra', hullL: 100, hullW: 90, hullH: 44,
+  boxLen: 20,
+  aFwd: 8, aLat: 2.5,
+  aPitch: 0.15, aYaw: 0.13, aRoll: 0.9,
+  deadzone: 0, curve: 1, gain: 0.6,
+  restitution: 0.35, arriveSpeed: 3, seed: 1,
+  assist: false, pilotConv: true,
+  camMode: 'chase', camAim: true, hidden: true,
+  dust: true, dustCount: 6000, dustFar: 3.5,
+  dustSizeNear: 5, dustSizeFar: 2.5, dustOpNear: 1, dustOpFar: 0.3, dustEdge: 0.25,
+  camF0: 0.9, camZeta: 0.7071, camRoll: 0.25, camDist: 3.2, camUp: 0.6,
+  showVectors: false, hudPage: 'flight'
+};
+const DEF_INV = { fwd: -1, right: 1, up: -1, pitch: 1, yaw: -1, roll: 1 };
+const DEF_BIAS = { tx: 0, ty: 0, tz: 0, rx: 0, ry: 0, rz: 0 };
+const STORE = 'sd.cfg';
+
+/* Device axis to ship axis. The signs are a calibration knob, not a datasheet
+   fact, which is why every one of them is a button in the panel.
+
+   Which raw axis carries which gesture is a per-device fact that no datasheet
+   settles, and guessing it costs a round trip with the hardware every time. So
+   the assignment is a setting, next to a live readout of all six raw axes:
+   waggle the cap, watch which row moves, point the function at it. The labels
+   name the SHIP function, so they stay true whatever the device does. */
+const AXES = [
+  { key: 'fwd', label: 'Surge' },
+  { key: 'right', label: 'Slide' },
+  { key: 'up', label: 'Lift' },
+  { key: 'pitch', label: 'Pitch' },
+  { key: 'yaw', label: 'Yaw' },
+  { key: 'roll', label: 'Roll' }
+];
+const DEV_AXES = SD.DEV_AXES;
+const DEF_MAP = { fwd: 'ty', right: 'tx', up: 'tz', pitch: 'rx', yaw: 'rz', roll: 'ry' };
+const ZERO_CMD = { fwd: 0, right: 0, up: 0, pitch: 0, yaw: 0, roll: 0, main: 0 };
+
+/* Debug keys, not a fallback. Without a device the page is not the point, but
+   being able to move the hull from the keyboard is the only way to tell "the
+   simulation is broken" apart from "the 3D mouse is not talking".
+
+   Shift is the main engine, because on the cap that is a button and not an
+   axis, and a keyboard that put it on W would teach the wrong hand. */
+const KEYMAP = {
+  KeyW: ['fwd', 1], KeyS: ['fwd', -1], KeyA: ['right', -1], KeyD: ['right', 1],
+  KeyR: ['up', 1], KeyF: ['up', -1], KeyI: ['pitch', 1], KeyK: ['pitch', -1],
+  KeyJ: ['yaw', 1], KeyL: ['yaw', -1], KeyU: ['roll', -1], KeyO: ['roll', 1],
+  ShiftLeft: ['main', 1], ShiftRight: ['main', 1]
+};
+
+function fmt(x, d) { return Number.isFinite(x) ? x.toFixed(d == null ? 1 : d) : '-'; }
+
+function Slider(props) {
+  return html`<div className="sd-row">
+    <label>${props.label}</label>
+    <output>${fmt(props.value, props.digits)}${props.unit ? ' ' + props.unit : ''}</output>
+    <input type="range" min=${props.min} max=${props.max} step=${props.step} value=${props.value}
+      onInput=${(e) => props.onChange(parseFloat(e.target.value))} />
+  </div>`;
+}
+
+/* One section open at a time. The collapsed header keeps showing what is
+   inside it, so a folded section hides its controls and not its setting. */
+function Section({ id, title, summary, open, onToggle, children }) {
+  return html`<div className="sd-acc">
+    <button type="button" className=${'sd-acc-h' + (open ? ' open' : '')}
+      aria-expanded=${open} onClick=${() => onToggle(id)}>
+      <span>${title}</span>
+      ${!open && summary ? html`<span className="sd-acc-s">${summary}</span>` : null}
+      <span className="sd-acc-c">${open ? '−' : '+'}</span>
+    </button>
+    ${open ? html`<div className="sd-acc-b">${children}</div>` : null}
+  </div>`;
+}
+
+const DEFAULTS = { p: DEF, inv: DEF_INV, map: DEF_MAP, bias: DEF_BIAS };
+
+/* What was flown last time, or the defaults. A bad or foreign file in the
+   store must not take the page down, so anything unreadable is simply the
+   defaults again. */
+function loadStored() {
+  try {
+    const raw = localStorage.getItem(STORE);
+    if (!raw) return null;
+    return SD.readConfig(raw, DEFAULTS);
+  } catch (e) { return null; }
+}
+
+function App() {
+  const stored = useMemo(loadStored, []);
+  const [p, setP] = useState(() => (stored ? stored.p : DEF));
+  /* Signs calibrated against a real SpaceNavigator, not derived: pushing the
+     cap away has to be forward thrust, lifting it has to be up, and twisting
+     clockwise has to swing the nose to starboard. Three of the six raw axes
+     sign the other way round. */
+  const [inv, setInv] = useState(() => (stored ? stored.inv : DEF_INV));
+  const [map, setMap] = useState(() => (stored ? stored.map : DEF_MAP));
+  /* Measured resting offset of the knob, subtracted before shaping. Flown with
+     no deadzone, which is what a force mapping wants, this is what keeps a
+     rested ship from slowly sailing off: the simulation integrates, so two raw
+     counts of offset are not a small error but a permanent burn. */
+  const [bias, setBias] = useState(() => (stored ? stored.bias : DEF_BIAS));
+  const [panel, setPanel] = useState(true);
+  const [sec, setSec] = useState(() => {
+    try { return localStorage.getItem('sd.sec') || ''; } catch (e) { return ''; }
+  });
+  const [note, setNote] = useState('');
+  const [dev, setDev] = useState({ name: null, err: null, supported: !!(window.SpaceNav && SpaceNav.supported()) });
+  const [ready, setReady] = useState(!!window.__sdThreeReady);
+
+  const stageRef = useRef(null);
+  const hudRef = useRef({});
+  const navRef = useRef(null);
+  const glRef = useRef(null);
+  const keysRef = useRef({});
+  const lookRef = useRef({ yaw: 0, pitch: 0, dragging: false, orbitAz: Math.PI / 4, orbitEl: 0.615, orbitDist: 1.73 });
+  const cmdRef = useRef(ZERO_CMD);
+  const fileRef = useRef(null);
+  const killRef = useRef(false);
+  const resetRef = useRef(0);
+
+  /* Live mirror of the tuning state, so the animation loop reads the current
+     values without being torn down and rebuilt on every slider drag. */
+  const cfgRef = useRef(null);
+  /* One call gives the drawable wireframe AND the principal moments the
+     dynamics runs on, both in the same frame, so the picture and the physics
+     can never drift apart. */
+  const hull = useMemo(() => SD.buildHull(p.hull, p.hullL, p.hullW, p.hullH),
+    [p.hull, p.hullL, p.hullW, p.hullH]);
+  const I = hull.I;
+  const R = (p.boxLen * p.hullL) / 2;
+  cfgRef.current = { p, inv, map, bias, I, R, hull };
+
+  /* ---- derived numbers, the ones the sliders should be judged by -------- */
+  const der = useMemo(() => {
+    const cross = SD.bangBang(2 * R, p.aFwd);
+    const flip = [SD.bangBang(Math.PI, p.aPitch), SD.bangBang(Math.PI, p.aYaw)];
+    const roll = SD.bangBang(2 * Math.PI, p.aRoll);
+    const mn = Math.min(I[0], I[1], I[2]);
+    const mid = SD.intermediateAxis(I);
+    return {
+      cross, flipPitch: flip[0], flipYaw: flip[1], roll,
+      ratio: I.map((x) => x / mn), mid,
+      slow: Math.max(flip[0], flip[1]) > 0.6 * cross
+    };
+  }, [R, p.aFwd, p.aPitch, p.aYaw, p.aRoll, I]);
+
+  /* ---- 3D mouse -------------------------------------------------------- */
+  useEffect(() => {
+    if (!window.SpaceNav || !SpaceNav.supported()) return undefined;
+    const ctl = SpaceNav.create({
+      /* Shaping happens in the loop against the live sliders, so the controller
+         itself must not swallow anything. */
+      opts: { deadzone: 0, curve: 1 },
+      onStatus: (s) => setDev((d) => ({ ...d, name: s.connected, err: s.error }))
+      /* No onButtons: both buttons are held rather than clicked now, so the
+         loop polls buttons() and an edge callback would only be able to say
+         when a hold started, not that it is still going on. */
+    });
+    ctl.init();
+    navRef.current = ctl;
+    return () => { ctl.destroy(); navRef.current = null; };
+  }, []);
+
+  const connect = useCallback(() => {
+    if (navRef.current) navRef.current.connect();
+  }, []);
+
+  /* Everything the pilot tuned survives a reload without being asked to. The
+     export below is for carrying it somewhere else; this is for carrying on. */
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORE, JSON.stringify(SD.packConfig({ p, inv, map, bias })));
+    } catch (e) { /* private mode, or the quota; not worth a message */ }
+  }, [p, inv, map, bias]);
+  useEffect(() => {
+    try { localStorage.setItem('sd.sec', sec); } catch (e) { /* as above */ }
+  }, [sec]);
+
+  const toggleSec = useCallback((id) => setSec((s) => (s === id ? '' : id)), []);
+  /* Panel messages fade on their own, because an export confirmation that
+     stays on screen reads as a state the panel is in. */
+  const say = useCallback((m) => {
+    setNote(m);
+    window.setTimeout(() => setNote((n) => (n === m ? '' : n)), 2600);
+  }, []);
+
+  useEffect(() => {
+    if (ready) return undefined;
+    const on = () => setReady(true);
+    window.addEventListener('sd-three-ready', on, { once: true });
+    return () => window.removeEventListener('sd-three-ready', on);
+  }, [ready]);
+
+  /* ---- keyboard -------------------------------------------------------- */
+  useEffect(() => {
+    const down = (e) => {
+      if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+      if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
+      else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
+      else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
+      else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
+      else if (e.code === 'KeyP') setPanel((v) => !v);
+    };
+    const up = (e) => { delete keysRef.current[e.code]; };
+    const blur = () => { keysRef.current = {}; };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, []);
+
+  /* ---- the scene and the loop ------------------------------------------
+     Built once. Everything the sliders can change is read out of cfgRef each
+     frame, and only the arena and hull GEOMETRY is rebuilt, in the effect
+     below, because that is the one thing a uniform cannot express. */
+  useEffect(() => {
+    if (!ready || !stageRef.current) return undefined;
+    const THREE = window.THREE;
+    const host = stageRef.current;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setClearColor(0x05070b, 1);
+    host.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(55, 1, 1, 200000);
+
+    const mkLine = (color, n, width) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+      const m = new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: width || 1 });
+      const o = new THREE.LineSegments(g, m);
+      o.frustumCulled = false;
+      scene.add(o);
+      return o;
+    };
+
+    const arenaGrp = new THREE.Group();
+    scene.add(arenaGrp);
+    const shipGrp = new THREE.Group();
+    scene.add(shipGrp);
+    const targetGrp = new THREE.Group();
+    scene.add(targetGrp);
+    const dustGrp = new THREE.Group();
+    scene.add(dustGrp);
+
+    /* Three diagnostic vectors from the hull, drawn in world space: velocity,
+       the body rate w, and the angular momentum L. Under free rotation L must
+       stand perfectly still while w wanders around it. Watching that is the
+       fastest check that the dynamics are real. */
+    const vecs = mkLine(0xffffff, 6, 0.9);
+    vecs.material.vertexColors = true;
+    /* Instrumentation, not geometry: these three start at the centre of mass,
+       so with depth testing on, the hull that is now opaque would swallow the
+       inner half of every one of them. */
+    vecs.material.depthTest = false;
+    vecs.renderOrder = 2;
+    vecs.geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(18), 3));
+    const dropLine = mkLine(COL.drop, 4, 0.55);
+
+    const state = {
+      s: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] }, target: null,
+      L0: null, drift: 0, fuel: 0, burn: 0, hits: 0, scored: 0, t0: 0, msg: '', msgUntil: 0
+    };
+    const reset = () => {
+      const cfg = cfgRef.current;
+      state.s = { p: [0, 0, 0], v: [0, 0, 0], q: [1, 0, 0, 0], w: [0, 0, 0] };
+      state.cam = { q: [1, 0, 0, 0], w: [0, 0, 0] };
+      const rand = SD.rng(cfg.p.seed);
+      state.target = SD.pickTarget(rand, cfg.R, [0, 0, 0], cfg.R * 0.5);
+      state.rand = rand;
+      state.L0 = null; state.drift = 0; state.fuel = 0; state.burn = 0;
+      state.hits = 0; state.scored = 0;
+      state.t0 = performance.now();
+    };
+    reset();
+    let lastReset = resetRef.current;
+
+    const resize = () => {
+      const w = host.clientWidth || window.innerWidth;
+      const h = host.clientHeight || window.innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    /* Mouse: right button drags. In corner mode it orbits the fixed outside
+       camera around the arena centre, in chase mode it is free look around the
+       hull. Same gesture, and in both cases it never touches the ship. */
+    /* Left button, not right: the right one belongs to the browser, where a lot
+       of people have mouse gestures bound. Nothing here is worth taking it
+       away for, and suppressing the context menu to get it would break those
+       gestures on this page only, which is the most confusing kind of broken. */
+    const onDown = (e) => {
+      if (e.button === 0) { lookRef.current.dragging = true; e.preventDefault(); }
+      if (e.button === 1) { killRef.current = true; e.preventDefault(); }
+    };
+    const onUp = (e) => { if (e.button === 0) lookRef.current.dragging = false; };
+    const onMove = (e) => {
+      const L = lookRef.current;
+      if (!L.dragging) return;
+      const dx = e.movementX || 0, dy = e.movementY || 0;
+      if (cfgRef.current.p.camMode === 'corner') {
+        L.orbitAz -= dx * 0.005;
+        L.orbitEl = Math.max(-1.45, Math.min(1.45, L.orbitEl + dy * 0.005));
+      } else {
+        L.yaw -= dx * 0.004;
+        L.pitch = Math.max(-1.4, Math.min(1.4, L.pitch - dy * 0.004));
+      }
+    };
+    const onWheel = (e) => {
+      const L = lookRef.current;
+      const f = Math.exp(e.deltaY * 0.0012);
+      if (cfgRef.current.p.camMode === 'corner') L.orbitDist = Math.max(0.15, Math.min(4, L.orbitDist * f));
+      else L.chase = Math.max(1.2, Math.min(14, (L.chase || DEF.camDist) * f));
+      e.preventDefault();
+    };
+    host.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('mousemove', onMove);
+    host.addEventListener('wheel', onWheel, { passive: false });
+
+    const tmpQ = new THREE.Quaternion();
+    let last = 0, raf = 0;
+
+    const setSeg = (attr, colAttr, i, from, to, c) => {
+      const a = attr.array, k = i * 6;
+      a[k] = from[0]; a[k + 1] = from[1]; a[k + 2] = from[2];
+      a[k + 3] = to[0]; a[k + 4] = to[1]; a[k + 5] = to[2];
+      if (colAttr) {
+        const b = colAttr.array;
+        for (let j = 0; j < 2; j++) { b[k + j * 3] = c.r; b[k + j * 3 + 1] = c.g; b[k + j * 3 + 2] = c.b; }
+      }
+    };
+    const cVel = new THREE.Color(COL.vel), cOm = new THREE.Color(COL.omega), cL = new THREE.Color(COL.angmom);
+
+    const frame = (ts) => {
+      raf = requestAnimationFrame(frame);
+      const cfg = cfgRef.current;
+      const pp = cfg.p, II = cfg.I, RR = cfg.R;
+      const dt = last ? Math.min(0.05, (ts - last) / 1000) : 0;
+      last = ts;
+      if (resetRef.current !== lastReset) { lastReset = resetRef.current; reset(); }
+      if (!dt) { renderer.render(scene, camera); return; }
+
+      /* ---- input ---- */
+      const cmd = { fwd: 0, right: 0, up: 0, pitch: 0, yaw: 0, roll: 0, main: 0 };
+      const nav = navRef.current;
+      const raw = nav && nav.axes();
+      let n6 = null;
+      if (raw) {
+        n6 = SpaceNav.norm6(raw,
+          { deadzone: pp.deadzone, curve: pp.curve, bias: cfg.bias });
+        const conv = pp.pilotConv ? 1 : -1;
+        for (const a of AXES) cmd[a.key] = n6[cfg.map[a.key]] * cfg.inv[a.key] * conv * pp.gain;
+        /* The raw axes go straight to the panel so the assignment can be read
+           off the device instead of guessed at. */
+        for (const d of DEV_AXES) {
+          const el = hudRef.current['ax_' + d];
+          if (!el) continue;
+          const val = n6[d];
+          /* Three decimals, not two, because one raw count out of full scale is
+             0.003 and the question this column has to be able to answer is
+             whether a rested knob really sits at zero. At two decimals a
+             permanent small burn is indistinguishable from rest. */
+          el.textContent = val.toFixed(3);
+          el.className = Math.abs(val) > 0.02 ? 'live' : '';
+        }
+      }
+      /* Both buttons are HELD, not clicked. Right is the main engine, which is
+         the one control on this ship that is a switch and not a proportional
+         axis; left is rate damping for exactly as long as it is down, so the
+         assist is something you reach for on the way into a docking and let go
+         of again, rather than a mode you forget you are in. */
+      const btn = nav ? nav.buttons() : 0;
+      if (btn & 2) cmd.main = 1;
+      const holdDamp = !!(btn & 1);
+      for (const code in keysRef.current) {
+        const m = KEYMAP[code];
+        if (m) cmd[m[0]] = Math.max(-1, Math.min(1, cmd[m[0]] + m[1]));
+      }
+      for (const k in cmd) cmd[k] = Math.max(k === 'main' ? 0 : -1, Math.min(1, cmd[k]));
+      cmdRef.current = cmd;
+
+      const par = { aFwd: pp.aFwd, aLat: pp.aLat, aPitch: pp.aPitch, aYaw: pp.aYaw, aRoll: pp.aRoll, I: II };
+      const wr = SD.wrench(cmd, par);
+      let T = wr.T;
+      const killing = killRef.current;
+      if (killing || pp.assist || holdDamp) {
+        const d = SD.dampTorque(state.s.w, cmd, par, 2.5, killing);
+        T = [T[0] + d[0], T[1] + d[1], T[2] + d[2]];
+        if (killing && SD.len(state.s.w) < 2e-3) killRef.current = false;
+      }
+
+      /* Fixed 8 ms substeps: the tumble is an instability, so the step size has
+         to be decided by the physics and not by whatever the display managed. */
+      const nSub = Math.max(1, Math.ceil(dt / 0.008));
+      const h = dt / nSub;
+      for (let i = 0; i < nSub; i++) {
+        state.s = SD.rk4(state.s, wr.a, T, II, h);
+        const hit = SD.collide(state.s, cfg.hull.verts, RR, II, pp.restitution);
+        if (hit) {
+          state.s = hit.state;
+          if (hit.impact > 0.5) { state.hits++; state.msg = 'WALL ' + fmt(hit.impact, 1) + ' m/s'; state.msgUntil = ts + 1200; }
+        }
+      }
+      /* Two counters, because they are two systems: the RCS is what the cap
+         spends and the main engine is what the button spends, and mixing them
+         into one number would hide the trade the pilot is actually making. */
+      state.fuel += (Math.abs(cmd.fwd) + Math.abs(cmd.right) + Math.abs(cmd.up)
+        + Math.abs(cmd.pitch) + Math.abs(cmd.yaw) + Math.abs(cmd.roll)) * dt;
+      state.burn += cmd.main * dt;
+
+      /* Angular momentum drift, in degrees since the last reset. Under torque
+         it legitimately changes, so it is only meaningful while coasting; that
+         is exactly when it is worth watching. */
+      const Lv = SD.angMom(state.s, II);
+      const Lm = SD.len(Lv);
+      if (SD.len(T) < 1e-9 && Lm > 1e-6) {
+        if (!state.L0) state.L0 = SD.mul(Lv, 1 / Lm);
+        else {
+          const c = Math.max(-1, Math.min(1, SD.dot(state.L0, SD.mul(Lv, 1 / Lm))));
+          state.drift = Math.max(state.drift, Math.acos(c) * 180 / Math.PI);
+        }
+      } else state.L0 = null;
+
+      /* ---- target ---- */
+      const toT = SD.sub(state.target, state.s.p);
+      const range = SD.len(toT);
+      const speed = SD.len(state.s.v);
+      const closing = range > 1e-6 ? -SD.dot(state.s.v, SD.mul(toT, 1 / range)) : 0;
+      if (range < pp.hullL * 1.2) {
+        if (speed < pp.arriveSpeed) {
+          state.scored++;
+          state.target = SD.pickTarget(state.rand, RR, state.s.p, RR * 0.5);
+          state.msg = 'TARGET ' + state.scored; state.msgUntil = ts + 1200;
+        } else if (ts > state.msgUntil) {
+          state.msg = 'TOO FAST ' + fmt(speed, 1) + ' m/s'; state.msgUntil = ts + 600;
+        }
+      }
+
+      /* ---- scene ---- */
+      shipGrp.position.set(state.s.p[0], state.s.p[1], state.s.p[2]);
+      tmpQ.set(state.s.q[1], state.s.q[2], state.s.q[3], state.s.q[0]);
+      shipGrp.quaternion.copy(tmpQ);
+      targetGrp.position.set(state.target[0], state.target[1], state.target[2]);
+
+      const dl = dropLine.geometry.attributes.position;
+      setSeg(dl, null, 0, state.s.p, [state.s.p[0], -RR, state.s.p[2]]);
+      setSeg(dl, null, 1, state.target, [state.target[0], -RR, state.target[2]]);
+      dl.needsUpdate = true;
+
+      const va = vecs.geometry.attributes.position, ca = vecs.geometry.attributes.color;
+      if (pp.showVectors) {
+        const sv = pp.hullL * 0.03, sw = pp.hullL * 2.2, sl = pp.hullL * 2.6;
+        const wWorld = SD.qRot(state.s.q, state.s.w);
+        setSeg(va, ca, 0, state.s.p, SD.add(state.s.p, SD.mul(state.s.v, sv)), cVel);
+        setSeg(va, ca, 1, state.s.p, SD.add(state.s.p, SD.mul(wWorld, sw)), cOm);
+        /* L is drawn as a direction at fixed length, because its magnitude has
+           no legible unit. That means it has to be hidden outright when the
+           hull is barely turning, or a numerically arbitrary direction gets
+           drawn at full length and reads as a real measurement. */
+        const spin = SD.len(state.s.w) > 0.002 && Lm > 1e-9;
+        setSeg(va, ca, 2, state.s.p,
+          spin ? SD.add(state.s.p, SD.mul(Lv, sl / Lm)) : state.s.p, cL);
+      } else {
+        for (let i = 0; i < 3; i++) setSeg(va, ca, i, state.s.p, state.s.p, cVel);
+      }
+      va.needsUpdate = true; ca.needsUpdate = true;
+
+      /* ---- camera ---- */
+      const L = lookRef.current;
+      if (pp.camMode === 'corner') {
+        /* orbitDist is in arena half-sizes, so 1.73 is literally the corner of
+           the box: sqrt(3) R from the centre. */
+        const d = RR * L.orbitDist;
+        const ce = Math.cos(L.orbitEl);
+        camera.position.set(d * ce * Math.sin(L.orbitAz), d * Math.sin(L.orbitEl), d * ce * Math.cos(L.orbitAz));
+        camera.up.set(0, 1, 0);
+        camera.lookAt(pp.camAim ? shipGrp.position : new THREE.Vector3(0, 0, 0));
+        state.cam = { q: [1, 0, 0, 0], w: [0, 0, 0] };
+      } else {
+        state.cam = SD.camStep(state.cam, state.s.q, dt, pp.camF0, pp.camZeta, pp.camRoll);
+        if (!L.dragging) { L.yaw *= Math.exp(-dt / 0.12); L.pitch *= Math.exp(-dt / 0.12); }
+        const look = SD.qMul(SD.qFromRotVec([0, L.yaw, 0]), SD.qFromRotVec([L.pitch, 0, 0]));
+        const cq = SD.qMul(state.cam.q, look);
+        const off = SD.qRot(cq, [0, pp.camUp * pp.hullL, (L.chase || pp.camDist) * pp.hullL]);
+        camera.position.set(state.s.p[0] + off[0], state.s.p[1] + off[1], state.s.p[2] + off[2]);
+        camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
+      }
+
+      /* Hidden lines are the occluder mesh being visible or not, so the toggle
+         is one flag and the edge buffer never has to be rebuilt. */
+      const sh = glRef.current && glRef.current.ship;
+      if (sh) sh.solid.visible = pp.hidden;
+
+      /* ---- dust ----
+         Only in chase. From the corner camera the motes are between the eye and
+         the ship rather than streaming past it, so they carry no optic flow at
+         all and do nothing but fog up the one view that exists to be looked
+         through. */
+      const du = glRef.current && glRef.current.dust;
+      if (du) {
+        const dustOn = pp.dust && pp.camMode === 'chase';
+        du.obj.visible = dustOn;
+        if (dustOn) {
+          Dust.update(du, [camera.position.x, camera.position.y, camera.position.z], {
+            far: pp.dustFar * pp.hullL,
+            sizeNear: pp.dustSizeNear, sizeFar: pp.dustSizeFar,
+            opNear: pp.dustOpNear, opFar: pp.dustOpFar,
+            edge: pp.dustEdge, pix: renderer.getPixelRatio(),
+            half: [RR, RR, RR]
+          });
+        }
+      }
+
+      /* ---- HUD ---- */
+      const H = hudRef.current;
+      const set = (k, v, hot) => {
+        const el = H[k];
+        if (!el) return;
+        if (el.textContent !== v) el.textContent = v;
+        if (hot != null) el.className = hot ? 'hot' : '';
+      };
+      if (pp.hudPage === 'input') {
+        /* Two numbers per row on purpose. The left one is what the device
+           reports after bias and shaping, the right one what the ship is being
+           told, and gain, inversion and the pilot/CAD flip all sit between
+           them: a row that reads full scale while the ship does nothing is
+           exactly the fault this page exists to make visible. */
+        for (const a of AXES) {
+          const d = cfg.map[a.key];
+          set('in_' + a.key + '_d', d);
+          const rawv = n6 ? n6[d] : 0;
+          const el = H['in_' + a.key + '_r'];
+          if (el) {
+            el.textContent = rawv.toFixed(3);
+            el.className = Math.abs(rawv) > 0.02 ? 'live' : '';
+          }
+          set('in_' + a.key + '_v', cmd[a.key].toFixed(2));
+          const bar = H['in_' + a.key + '_b'];
+          if (bar) {
+            const v = Math.max(-1, Math.min(1, cmd[a.key]));
+            bar.style.left = (50 + Math.min(0, v) * 50) + '%';
+            bar.style.width = (Math.abs(v) * 50) + '%';
+          }
+        }
+        if (H.in_main) H.in_main.className = 'sd-lamp' + (cmd.main > 0 ? ' on' : '');
+        if (H.in_damp) H.in_damp.className = 'sd-lamp' + (holdDamp || pp.assist ? ' on' : '');
+      } else {
+        set('spd', fmt(speed, 1) + ' m/s');
+        set('rate', fmt(SD.len(state.s.w) * 180 / Math.PI, 1) + ' deg/s');
+        set('rng', fmt(range, 0) + ' m');
+        set('cls', fmt(closing, 1) + ' m/s', closing < 0);
+        set('fuel', fmt(state.fuel, 1));
+        set('burn', fmt(state.burn, 1), cmd.main > 0);
+        set('hit', String(state.hits), state.hits > 0);
+        set('tgt', String(state.scored));
+        set('drift', fmt(state.drift, 2) + ' deg', state.drift > 1);
+        set('time', fmt((ts - state.t0) / 1000, 0) + ' s');
+      }
+      if (H.msg) H.msg.textContent = ts < state.msgUntil ? state.msg : '';
+
+      renderer.render(scene, camera);
+    };
+    raf = requestAnimationFrame(frame);
+
+    glRef.current = { THREE, scene, arenaGrp, shipGrp, targetGrp, dustGrp, renderer };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('mousemove', onMove);
+      host.removeEventListener('mousedown', onDown);
+      host.removeEventListener('wheel', onWheel);
+      renderer.dispose();
+      if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
+      glRef.current = null;
+    };
+  }, [ready]);
+
+  /* ---- geometry, rebuilt only when a dimension actually changes --------- */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g) return undefined;
+    const THREE = g.THREE;
+    const wipe = (grp) => {
+      while (grp.children.length) {
+        const c = grp.children.pop();
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+      }
+    };
+    const edges = (geo, color, opacity) => new THREE.LineSegments(
+      new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: opacity == null ? 1 : opacity })
+    );
+
+    wipe(g.arenaGrp); wipe(g.shipGrp); wipe(g.targetGrp); wipe(g.dustGrp);
+
+    const box = edges(new THREE.BoxGeometry(2 * R, 2 * R, 2 * R), COL.arena);
+    g.arenaGrp.add(box);
+    /* A grid on all six walls, not just the floor. In free flight there is no
+       down, and one gridded plane leaves four of the six directions with no
+       scale at all: you cannot tell 200 m from 2 km when the only reference is
+       behind you. Six of them turn the box itself into the depth cue, which is
+       the entire reason this stage is a box and not an asteroid field. */
+    for (let axis = 0; axis < 3; axis++) {
+      for (let side = -1; side <= 1; side += 2) {
+        const grid = new THREE.GridHelper(2 * R, p.boxLen, COL.arena, COL.grid);
+        if (axis === 0) grid.rotation.z = Math.PI / 2;
+        else if (axis === 2) grid.rotation.x = Math.PI / 2;
+        grid.position.setComponent(axis, side * R);
+        grid.material.transparent = true;
+        grid.material.opacity = 0.5;
+        g.arenaGrp.add(grid);
+      }
+    }
+
+    /* Hull: the edge list straight out of buildHull, drawn in the principal
+       frame the dynamics uses, so the wireframe sits on its own centre of mass
+       by construction. EdgesGeometry is deliberately not involved: it would add
+       the triangulation diagonals of every non-planar quad, and the faceted
+       Elite read comes precisely from showing the polygon edges and nothing
+       else. */
+    const ep = new Float32Array(hull.edges.length * 6);
+    hull.edges.forEach((e, i) => {
+      const a = hull.verts[e[0]], b = hull.verts[e[1]];
+      ep[i * 6] = a[0]; ep[i * 6 + 1] = a[1]; ep[i * 6 + 2] = a[2];
+      ep[i * 6 + 3] = b[0]; ep[i * 6 + 4] = b[1]; ep[i * 6 + 5] = b[2];
+    });
+    const hg = new THREE.BufferGeometry();
+    hg.setAttribute('position', new THREE.BufferAttribute(ep, 3));
+    const lines = new THREE.LineSegments(hg, new THREE.LineBasicMaterial({ color: COL.ship }));
+    lines.frustumCulled = false;
+    g.shipGrp.add(lines);
+
+    /* Hidden line removal, the way Elite did it once it had the memory for it:
+       fill the faces in the background colour so they occlude the edges behind
+       them. The obvious cheaper route, dropping edges whose faces both point
+       away, is exact only on a CONVEX hull, and this one is not convex by 25 m
+       on a 100 m ship, so it left stray edges standing in mid air.
+
+       The fill is pushed a hair away from the camera with polygonOffset, or it
+       fights the very lines it is there to support. DoubleSide because the
+       occluder must not care about winding. */
+    const mp = new Float32Array(hull.verts.length * 3);
+    hull.verts.forEach((v, i) => { mp[i * 3] = v[0]; mp[i * 3 + 1] = v[1]; mp[i * 3 + 2] = v[2]; });
+    const mg = new THREE.BufferGeometry();
+    mg.setAttribute('position', new THREE.BufferAttribute(mp, 3));
+    mg.setIndex(hull.faces.flat());
+    const solid = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({
+      /* Built from components rather than from a hex literal: three.js runs hex
+         input through colour management, and the one thing this surface must be
+         is exactly the void it is standing in front of. */
+      color: new THREE.Color(0, 0, 0), side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: 1.5, polygonOffsetUnits: 1.5
+    }));
+    solid.frustumCulled = false;
+    solid.renderOrder = -1;
+    g.shipGrp.add(solid);
+    g.ship = { lines, solid };
+
+    /* Dust, from the shared module: the motes live on a repeating lattice that
+       is re-folded around the CAMERA every frame, so there is always something
+       close to the eye. The shader, the fold and the reasoning behind both
+       moved to assets/js/dust.js on 2026-08-30, when asteroid-corridor needed
+       the same field. */
+    g.dust = Dust.makeField(THREE, { count: p.dustCount });
+    g.dustGrp.add(g.dust.obj);
+
+    const tg = edges(new THREE.OctahedronGeometry(p.hullL * 0.55), COL.target, 0.9);
+    g.targetGrp.add(tg);
+    return undefined;
+  }, [ready, hull, p.boxLen, p.dustCount, R]);
+
+  const upd = (k) => (v) => setP((q) => ({ ...q, [k]: v }));
+  const flip = (k) => setInv((q) => ({ ...q, [k]: -q[k] }));
+
+  /* Sample the knob at rest and store it as the new zero. Pressing it while
+     holding the knob would calibrate the deflection in as the resting point,
+     which is why it says what it says. */
+  const biasSet = DEV_AXES.some((d) => bias[d]);
+  const zero = useCallback(() => {
+    const raw = navRef.current && navRef.current.axes();
+    setBias(raw && DEV_AXES.some((d) => raw[d]) ? raw : DEF_BIAS);
+  }, []);
+
+  /* ---- the config as a document ---------------------------------------
+     The point of this page is that you leave it with a setup rather than with
+     a high score, so the setup has to be something you can carry. */
+  const cfgText = useCallback(
+    () => JSON.stringify(SD.packConfig({ p, inv, map, bias }), null, 2), [p, inv, map, bias]);
+
+  const exportCfg = useCallback(() => {
+    const blob = new Blob([cfgText()], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cobra-6dof.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    say('Saved cobra-6dof.json');
+  }, [cfgText, say]);
+
+  const copyCfg = useCallback(() => {
+    const t = cfgText();
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(t).then(() => say('Config copied'),
+        () => say('Clipboard refused'));
+    } else say('No clipboard here');
+  }, [cfgText, say]);
+
+  const applyCfg = useCallback((raw) => {
+    const c = SD.readConfig(raw, DEFAULTS);
+    if (!c) { say('Not a Cobra 6DOF config'); return; }
+    setP(c.p); setInv(c.inv); setMap(c.map); setBias(c.bias);
+    say('Config loaded');
+  }, [say]);
+
+  const importCfg = useCallback((e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    f.text().then(applyCfg, () => say('Could not read that file'));
+  }, [applyCfg, say]);
+
+  const factory = useCallback(() => {
+    setP(DEF); setInv(DEF_INV); setMap(DEF_MAP); setBias(DEF_BIAS);
+    say('Back to defaults');
+  }, [say]);
+
+  const hudRow = (k, label) => html`<${React.Fragment}>
+    <span>${label}</span><b ref=${(el) => { hudRef.current[k] = el; }}>-</b>
+  <//>`;
+
+  const inRow = (a) => html`<${React.Fragment} key=${a.key}>
+    <span>${a.label}</span>
+    <i ref=${(el) => { hudRef.current['in_' + a.key + '_d'] = el; }}>${map[a.key]}</i>
+    <b ref=${(el) => { hudRef.current['in_' + a.key + '_r'] = el; }}>0.000</b>
+    <div className="sd-bar"><span ref=${(el) => { hudRef.current['in_' + a.key + '_b'] = el; }}></span></div>
+    <b ref=${(el) => { hudRef.current['in_' + a.key + '_v'] = el; }}>0.00</b>
+  <//>`;
+
+  return html`<${React.Fragment}>
+    <div className="sd-stage" ref=${stageRef}></div>
+    <a className="sd-back" href="/miscellaneous/#games">${'←'} Games</a>
+
+    <div className="sd-hud">
+      <div className="sd-hudtabs seg-row">
+        <button className=${'lang-seg' + (p.hudPage === 'flight' ? ' active' : '')}
+          onClick=${() => upd('hudPage')('flight')}>Flight</button>
+        <button className=${'lang-seg' + (p.hudPage === 'input' ? ' active' : '')}
+          onClick=${() => upd('hudPage')('input')}>Input</button>
+      </div>
+      ${p.hudPage === 'input' ? html`<div className="sd-in">
+        ${AXES.map(inRow)}
+        <div className="sd-btnrow">
+          <span className="sd-lamp" ref=${(el) => { hudRef.current.in_main = el; }}>MAIN R</span>
+          <span className="sd-lamp" ref=${(el) => { hudRef.current.in_damp = el; }}>DAMP L</span>
+        </div>
+      </div>` : html`<div className="sd-grid">
+        ${hudRow('spd', 'SPD')}
+        ${hudRow('rate', 'RATE')}
+        ${hudRow('rng', 'RANGE')}
+        ${hudRow('cls', 'CLOSING')}
+        ${hudRow('tgt', 'TARGETS')}
+        ${hudRow('hit', 'WALL HITS')}
+        ${hudRow('fuel', 'RCS-s')}
+        ${hudRow('burn', 'MAIN-s')}
+        ${hudRow('drift', 'L DRIFT')}
+        ${hudRow('time', 'TIME')}
+        ${p.showVectors ? html`<div className="sd-legend">
+          <span style=${{ color: '#34d399' }}>velocity</span>
+          <span style=${{ color: '#f472b6' }}>rate</span>
+          <span style=${{ color: '#fbbf24' }}>ang. momentum</span>
+        </div>` : null}
+      </div>`}
+    </div>
+
+    <div className="sd-msg">
+      <span ref=${(el) => { hudRef.current.msg = el; }}></span>
+      ${!dev.supported ? html`<small>No WebHID in this browser. Chromium only, and the
+        keyboard keys below still work.</small>` : null}
+      ${dev.supported && !dev.name ? html`<small>No 3D mouse attached.
+        ${dev.err ? 'Last error: ' + dev.err + '. ' : ''}Open the panel and connect. The
+        3DxWare driver must not be installed, it claims the device.</small>` : null}
+    </div>
+
+    ${!panel ? html`<button className="sd-toggle" onClick=${() => setPanel(true)}>Tuning</button>` : html`
+    <div className="sd-panel">
+      <div className="sd-head">
+        <h2>Flight model</h2>
+        <button className="sd-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
+      </div>
+
+      <div className="sd-chips">
+        <button className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
+          disabled=${!dev.supported}>${dev.name || 'Connect 3D mouse'}</button>
+        <button className="lang-seg" onClick=${() => { resetRef.current++; }}>Reset</button>
+        <button className=${'lang-seg' + (p.assist ? ' active' : '')}
+          onClick=${() => upd('assist')(!p.assist)}>Rate damping</button>
+      </div>
+      ${note ? html`<p className="sd-note">${note}</p>` : null}
+
+      <${Section} id="thrust" title="Thrust" open=${sec === 'thrust'} onToggle=${toggleSec}
+        summary=${fmt(p.aFwd, 1) + ' / ' + fmt(p.aLat, 1) + ' m/s2'}>
+        <${Slider} label="Main engine" unit="m/s2" digits=${1} min=${1} max=${30} step=${0.5}
+          value=${p.aFwd} onChange=${upd('aFwd')} />
+        <${Slider} label="RCS translation" unit="m/s2" digits=${2} min=${0.2} max=${10} step=${0.1}
+          value=${p.aLat} onChange=${upd('aLat')} />
+        <p className="sd-note">The cap flies the RCS on all six axes, fore and aft included. The
+          main engine is the right-hand button, full or nothing, because it is a different piece
+          of hardware and not the top end of the same one.</p>
+      <//>
+
+      <${Section} id="torque" title="Torque" open=${sec === 'torque'} onToggle=${toggleSec}
+        summary=${fmt(der.flipPitch, 1) + ' s to turn round'}>
+        <${Slider} label="Pitch" unit="rad/s2" digits=${3} min=${0.02} max=${1.5} step=${0.01}
+          value=${p.aPitch} onChange=${upd('aPitch')} />
+        <${Slider} label="Yaw" unit="rad/s2" digits=${3} min=${0.02} max=${1.5} step=${0.01}
+          value=${p.aYaw} onChange=${upd('aYaw')} />
+        <${Slider} label="Roll" unit="rad/s2" digits=${3} min=${0.02} max=${4} step=${0.01}
+          value=${p.aRoll} onChange=${upd('aRoll')} />
+        <div className="sd-derived">
+          <span>Cross the box</span><b>${fmt(der.cross, 0)} s</b>
+          <span>Pitch 180</span><b className=${der.slow ? 'hot' : ''}>${fmt(der.flipPitch, 1)} s</b>
+          <span>Yaw 180</span><b className=${der.slow ? 'hot' : ''}>${fmt(der.flipYaw, 1)} s</b>
+          <span>Roll 360</span><b>${fmt(der.roll, 1)} s</b>
+        </div>
+        <p className="sd-note">${der.slow
+          ? 'Turning around costs more than half a box crossing. Past this point "heavy" stops reading as weight and starts reading as broken.'
+          : 'Judge the sliders by these two times, not by the accelerations.'}</p>
+      <//>
+
+      <${Section} id="hull" title="Hull" open=${sec === 'hull'} onToggle=${toggleSec}
+        summary=${p.hull + ' ' + p.hullL + ' x ' + p.hullW + ' x ' + p.hullH}>
+        <div className="sd-chips">
+          <button className=${'lang-seg' + (p.hull === 'cobra' ? ' active' : '')}
+            onClick=${() => upd('hull')('cobra')}>Cobra</button>
+          <button className=${'lang-seg' + (p.hull === 'box' ? ' active' : '')}
+            onClick=${() => upd('hull')('box')}>Box</button>
+        </div>
+        <${Slider} label="Length" unit="m" digits=${0} min=${20} max=${300} step=${5}
+          value=${p.hullL} onChange=${upd('hullL')} />
+        <${Slider} label="Width" unit="m" digits=${0} min=${5} max=${120} step=${1}
+          value=${p.hullW} onChange=${upd('hullW')} />
+        <${Slider} label="Height" unit="m" digits=${0} min=${5} max=${120} step=${1}
+          value=${p.hullH} onChange=${upd('hullH')} />
+        <div className="sd-derived">
+          <span>Moments, pitch : yaw : roll</span><b>${der.ratio.map((x) => fmt(x, 1)).join(' : ')}</b>
+          <span>Unstable axis</span><b className=${der.mid == null ? 'hot' : ''}>
+            ${der.mid == null ? 'none' : ['pitch', 'yaw', 'roll'][der.mid]}</b>
+          <span>CoM aft of centre</span><b>${fmt(hull.centroid[2], 1)} m</b>
+          <span>Principal axis tilt</span><b>${fmt(hull.tilt * 180 / Math.PI, 2)} deg</b>
+        </div>
+        <p className="sd-note">${der.mid == null
+          ? 'Two moments are equal, so there is no intermediate axis and the hull cannot tumble. Change one dimension.'
+          : 'Moments come from integrating the real mesh, not from a bounding box, so the arrowhead rolls easily and yaws like a barn door. Mass cancels out everywhere, which is why there is no mass slider: only these ratios matter.'}</p>
+      <//>
+
+      <${Section} id="arena" title="Arena" open=${sec === 'arena'} onToggle=${toggleSec}
+        summary=${p.boxLen + ' hulls across'}>
+        <${Slider} label="Box" unit="hulls" digits=${0} min=${6} max=${60} step=${1}
+          value=${p.boxLen} onChange=${upd('boxLen')} />
+        <${Slider} label="Wall bounce" digits=${2} min=${0} max=${0.9} step=${0.05}
+          value=${p.restitution} onChange=${upd('restitution')} />
+        <${Slider} label="Arrival speed" unit="m/s" digits=${1} min=${0.5} max=${20} step=${0.5}
+          value=${p.arriveSpeed} onChange=${upd('arriveSpeed')} />
+      <//>
+
+      <${Section} id="mouse" title="3D mouse" open=${sec === 'mouse'} onToggle=${toggleSec}
+        summary=${dev.name ? 'gain ' + fmt(p.gain, 2) : 'not connected'}>
+        <${Slider} label="Deadzone" digits=${3} min=${0} max=${0.3} step=${0.005}
+          value=${p.deadzone} onChange=${upd('deadzone')} />
+        <${Slider} label="Response curve" digits=${2} min=${1} max=${3} step=${0.05}
+          value=${p.curve} onChange=${upd('curve')} />
+        <${Slider} label="Gain" digits=${2} min=${0.2} max=${1} step=${0.05}
+          value=${p.gain} onChange=${upd('gain')} />
+        <div className="sd-chips">
+          <button className=${'lang-seg' + (p.pilotConv ? ' active' : '')}
+            onClick=${() => upd('pilotConv')(!p.pilotConv)}>
+            ${p.pilotConv ? 'Pilot' : 'CAD'}</button>
+          <button className=${'lang-seg' + (biasSet ? ' active' : '')} onClick=${zero}
+            disabled=${!dev.name}>${biasSet ? 'Zeroed' : 'Zero the knob'}</button>
+          <button className="lang-seg" onClick=${() => setMap(DEF_MAP)}>Default axes</button>
+        </div>
+        <p className="sd-note">Pilot means the hull moves the way you push the knob, CAD means
+          the world does. The two are exactly inverted.</p>
+        <p className="sd-note">${p.deadzone > 0
+          ? 'A curve above 1 buys fine control near the centre and, because it works per axis, suppresses the crosstalk that makes a push twist slightly. It pays for that by bending the commanded direction towards the dominant axis.'
+          : 'Linear with no deadzone, which keeps the honest part of this device intact: the spring means your hand force is proportional to thrust, and a curve would break exactly that correspondence. Take your hand off and press Zero once, or a resting offset will integrate into a slow drift.'}</p>
+        <p className="sd-note">Buttons: hold the right one for the main engine, hold the left one
+          for rate damping. Both are held, not clicked, so an assist you reached for on the way
+          into a dock cannot be left switched on afterwards.</p>
+      <//>
+
+      <${Section} id="axes" title="Axis assignment" open=${sec === 'axes'} onToggle=${toggleSec}
+        summary=${AXES.map((a) => map[a.key]).join(' ')}>
+        ${AXES.map((a) => html`<div className="sd-axis" key=${a.key}>
+          <label>${a.label}</label>
+          <select value=${map[a.key]}
+            onChange=${(e) => setMap((q) => ({ ...q, [a.key]: e.target.value }))}>
+            ${DEV_AXES.map((d) => html`<option key=${d} value=${d}>${d}</option>`)}
+          </select>
+          <button className=${'lang-seg' + (inv[a.key] < 0 ? ' active' : '')}
+            onClick=${() => flip(a.key)} title="Invert">${inv[a.key] < 0 ? '-' : '+'}</button>
+          <b ref=${(el) => { hudRef.current['ax_' + map[a.key]] = el; }}>0.000</b>
+        </div>`)}
+        <p className="sd-note">Waggle the knob and watch which row lights up, then point the
+          function at that axis. Assignments and signs are per device, not per datasheet. The
+          Input page of the HUD shows the same six rows next to what the ship is being told.</p>
+      <//>
+
+      <${Section} id="view" title="View" open=${sec === 'view'} onToggle=${toggleSec}
+        summary=${p.camMode === 'chase' ? 'chase' : 'corner'}>
+        <div className="sd-chips">
+          <button className=${'lang-seg' + (p.camMode === 'chase' ? ' active' : '')}
+            onClick=${() => upd('camMode')('chase')}>Chase</button>
+          <button className=${'lang-seg' + (p.camMode === 'corner' ? ' active' : '')}
+            onClick=${() => upd('camMode')('corner')}>Corner</button>
+          <button className=${'lang-seg' + (p.showVectors ? ' active' : '')}
+            onClick=${() => upd('showVectors')(!p.showVectors)}>Vectors</button>
+          <button className=${'lang-seg' + (p.hidden ? ' active' : '')}
+            onClick=${() => upd('hidden')(!p.hidden)}>Hidden lines</button>
+          ${p.camMode === 'corner' ? html`<button className=${'lang-seg' + (p.camAim ? ' active' : '')}
+            onClick=${() => upd('camAim')(!p.camAim)}>Aim at ship</button>` : null}
+        </div>
+        ${p.camMode === 'chase' ? html`<${React.Fragment}>
+          <${Slider} label="Cutoff f0" unit="Hz" digits=${2} min=${0.2} max=${4} step=${0.05}
+            value=${p.camF0} onChange=${upd('camF0')} />
+          <${Slider} label="Damping zeta" digits=${3} min=${0.3} max=${1.5} step=${0.01}
+            value=${p.camZeta} onChange=${upd('camZeta')} />
+          <${Slider} label="Roll follow" digits=${2} min=${0} max=${1} step=${0.05}
+            value=${p.camRoll} onChange=${upd('camRoll')} />
+          <p className="sd-note">zeta 0.707 is Butterworth, 1.0 is critically damped. Roll follow
+            is the lever that actually decides comfort; the filter order does not, because a
+            tumble and a deliberate turn overlap in frequency.</p>
+        <//>` : html`<p className="sd-note">Fixed outside camera, so what you judge is the hull
+          and not the camera. Green is velocity, pink the body rate, amber the angular momentum.
+          While coasting the amber one must stand perfectly still.</p>`}
+      <//>
+
+      <${Section} id="dust" title="Dust" open=${sec === 'dust'} onToggle=${toggleSec}
+        summary=${p.camMode === 'corner' ? 'chase only'
+          : (p.dust ? p.dustCount + ' motes, ' + fmt(p.dustFar * p.hullL, 0) + ' m' : 'off')}>
+        <div className="sd-chips">
+          <button className=${'lang-seg' + (p.dust ? ' active' : '')}
+            onClick=${() => upd('dust')(!p.dust)}>Dust</button>
+        </div>
+        ${p.dust ? html`<${React.Fragment}>
+          <${Slider} label="Count" digits=${0} min=${0} max=${25000} step=${250}
+            value=${p.dustCount} onChange=${upd('dustCount')} />
+          <${Slider} label="Range" unit="hulls" digits=${1} min=${0.5} max=${10} step=${0.25}
+            value=${p.dustFar} onChange=${upd('dustFar')} />
+          <${Slider} label="Size at the eye" unit="px" digits=${1} min=${0.5} max=${8} step=${0.5}
+            value=${p.dustSizeNear} onChange=${upd('dustSizeNear')} />
+          <${Slider} label="Size at range" unit="px" digits=${1} min=${0.5} max=${8} step=${0.5}
+            value=${p.dustSizeFar} onChange=${upd('dustSizeFar')} />
+          <${Slider} label="Opacity at the eye" digits=${2} min=${0} max=${1} step=${0.05}
+            value=${p.dustOpNear} onChange=${upd('dustOpNear')} />
+          <${Slider} label="Opacity at range" digits=${2} min=${0} max=${1} step=${0.05}
+            value=${p.dustOpFar} onChange=${upd('dustOpFar')} />
+          <${Slider} label="Edge fade" unit="of range" digits=${2} min=${0} max=${0.6} step=${0.05}
+            value=${p.dustEdge} onChange=${upd('dustEdge')} />
+          <div className="sd-derived">
+            <span>Range</span><b>${fmt(p.dustFar * p.hullL, 0)} m</b>
+            <span>Edge fade starts</span><b>${fmt((1 - p.dustEdge) * p.dustFar * p.hullL, 0)} m</b>
+            <span>Motes per 100 m cube</span><b>${fmt(
+              Dust.density(p.dustCount, p.dustFar * p.hullL), 1)}</b>
+          </div>
+          <p className="sd-note">Speed is invisible in an empty room. Optic flow is your speed
+            divided by the distance to whatever you can see, so a wall a kilometre off moves
+            forty times slower than a mote twenty five metres away. Both ramps are linear from
+            the lens out to the range; nearer than the lens there is nothing to draw, so that
+            end needs no distance of its own.</p>
+          <p className="sd-note">${p.dustEdge > 0 || p.dustOpFar <= 0
+            ? 'The range is also where the lattice folds: a mote that arrives there still visible reappears on the other side in one frame. Edge fade is the smoothstep window that prevents it, taking the last part of the range down to nothing without touching the near end of the ramp, which is the part your eye actually reads speed off. At zero the window is gone and the far opacity above shows up as a twinkle at the edge.'
+            : 'Edge fade is off and the far opacity is not zero, so motes are still visible at the moment the lattice folds them to the other side. That is the twinkle at the edge of the field. A quarter of the range is enough to remove it.'}</p>
+        <//>` : null}
+        ${p.camMode === 'corner' ? html`<p className="sd-note">Drawn in chase only. From outside,
+          the motes hang between the eye and the ship instead of streaming past it, so they carry
+          no optic flow at all and only fog up the view.</p>` : null}
+      <//>
+
+      <${Section} id="cfg" title="Settings" open=${sec === 'cfg'} onToggle=${toggleSec}
+        summary=${'saved as you fly'}>
+        <div className="sd-chips">
+          <button className="lang-seg" onClick=${exportCfg}>Export JSON</button>
+          <button className="lang-seg" onClick=${copyCfg}>Copy</button>
+          <button className="lang-seg" onClick=${() => fileRef.current && fileRef.current.click()}>Import</button>
+          <button className="lang-seg" onClick=${factory}>Defaults</button>
+        </div>
+        <input ref=${fileRef} type="file" accept="application/json,.json"
+          onChange=${importCfg} style=${{ display: 'none' }} />
+        <p className="sd-note">Everything on this panel, the axis assignment and the measured
+          knob zero included, is kept in this browser and comes back on the next visit. The
+          export is the same document as a file: this page is the hangar, and what you leave it
+          with is a setup rather than a score.</p>
+      <//>
+
+      <${Section} id="keys" title="Controls" open=${sec === 'keys'} onToggle=${toggleSec}>
+        <p className="sd-note">
+          3D mouse: cap is RCS on all six axes, right button main engine, left button rate
+          damping while held.
+          <br/>Left mouse drags the view, middle click kills rotation, wheel zooms. The right
+          button is left alone for the browser.
+          <br/>Debug keys, not a substitute for the device:
+          <kbd>W</kbd><kbd>S</kbd> surge, <kbd>A</kbd><kbd>D</kbd> slide,
+          <kbd>R</kbd><kbd>F</kbd> lift, <kbd>I</kbd><kbd>K</kbd> pitch,
+          <kbd>J</kbd><kbd>L</kbd> yaw, <kbd>U</kbd><kbd>O</kbd> roll,
+          <kbd>Shift</kbd> main engine.
+          <br/><kbd>Space</kbd> kill rotation, <kbd>X</kbd> damping,
+          <kbd>P</kbd> panel, <kbd>Backspace</kbd> reset.
+        </p>
+      <//>
+    </div>`}
+  <//>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>

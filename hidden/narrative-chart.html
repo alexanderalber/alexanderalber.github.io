@@ -4,13 +4,9 @@
   <meta charset="utf-8">
   <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
   <title>Narrative Chart - xkcd Storyline Diagram of a Novel</title>
   <meta name="description" content="Drop in an English novel as EPUB, MOBI, AZW3 or plain text and get an xkcd-style narrative chart: one line per character, lines bundled together while they share a scene and parting when they separate. Everything runs in your browser; the book is never uploaded.">
-  <link rel="canonical" href="https://alber.me/miscellaneous/tools/narrative-chart.html">
-  <meta property="og:title" content="Narrative Chart">
-  <meta property="og:description" content="An xkcd-style storyline diagram drawn from a novel you upload, in the browser.">
-  <meta property="og:url" content="https://alber.me/miscellaneous/tools/narrative-chart.html">
-  <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
   <link rel="stylesheet" href="/assets/css/custom.css">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
@@ -89,32 +85,12 @@
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "WebApplication",
-    "name": "Narrative Chart",
-    "description": "Generates an xkcd-style narrative chart from an English novel: characters are found heuristically, scenes become the time axis, and one line per character runs bundled with the characters it shares scenes with. Reads EPUB, MOBI, AZW3, HTML, Markdown and plain text entirely in the browser, with no upload.",
-    "url": "https://alber.me/miscellaneous/tools/narrative-chart.html",
-    "applicationCategory": "EducationalApplication",
-    "inLanguage": "en",
-    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
-    "copyrightHolder": [
-      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
-      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
-    ],
-    "isAccessibleForFree": true,
-    "browserRequirements": "Requires JavaScript"
-  }
-  </script>
 </head>
 <body>
   <header class="container">
     <nav>
       <ul class="site-crumbs">
         <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
-        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
-        <li><a href="/miscellaneous/#books" id="nav-cat">Books</a></li>
       </ul>
       <ul>
         <li class="theme-switcher">
@@ -140,7 +116,7 @@
      The e-book readers, lifted out of miscellaneous/tools/ebook-converter.html
      (its <script id="ebookcore"> block) by notes/dev/extract-reader.mjs, which
      keeps whatever the reader entry points reach and drops every writer.
-     Kept 119 declarations.
+     Kept 133 declarations.
 
      To re-sync after the converter changes: run the script again and commit
      the diff. Never patch this block in place, or the next run silently
@@ -184,6 +160,98 @@
       } catch (e) {
         return { text: new TextDecoder('windows-1252').decode(bytes), encoding: 'windows-1252' };
       }
+    }
+
+    // XML 1.0 forbids the C0 controls outright, tab, newline and carriage
+    // return excepted, and forbids them as character references too, so no
+    // amount of escaping downstream saves them: an EPUB or a DOCX carrying one
+    // is a file the reader refuses to open, reported as damaged rather than as
+    // containing a stray byte. They therefore have to go before the text
+    // becomes markup, not while it is being serialized.
+    //
+    // The case this is really about is the form feed, U+000C, the page break
+    // every Project Gutenberg text is full of, which is why the input side
+    // rather than only the writers gets the treatment.
+    // U+000C and U+0085 become a newline because that is what they mean;
+    // everything else is dropped, since a lone BEL or SOH in a book is debris
+    // from an earlier conversion and has no rendering worth preserving.
+    // Written as escapes on purpose: spelled literally these are invisible in
+    // an editor and turn the file itself into something git calls binary.
+    // The set is the XML 1.0 "Char" production read backwards, plus the two
+    // noncharacters at the end of the BMP. Surrogates are deliberately absent:
+    // a lone one is a different problem with a different fix, and a well-formed
+    // pair must survive.
+    var XML_ILLEGAL_SRC = '[\\u0000-\\u0008\\u000B\\u000E-\\u001F\\u007F-\\u0084\\u0086-\\u009F\\uFFFE\\uFFFF]';
+
+    var NEWLINE_LIKE_RE = /[\u000C\u0085]/g;   // form feed, NEL
+
+    function stripXmlIllegal(s) {
+      return String(s).replace(NEWLINE_LIKE_RE, '\n')
+        .replace(new RegExp(XML_ILLEGAL_SRC, 'g'), '');
+    }
+
+    // Counts what stripXmlIllegal would DROP, so the form feed, which is only
+    // rewritten, is not reported as something lost.
+    function countXmlIllegal(s) {
+      const m = String(s).match(new RegExp(XML_ILLEGAL_SRC, 'g'));
+      return m ? m.length : 0;
+    }
+
+    // decodeText plus the C0 cleanup, for the readers whose input is a bare
+    // text file and can therefore contain anything at all. Reported rather than
+    // done quietly, because a file losing characters is worth a line in the log
+    // even when the characters were unprintable.
+    function decodeTextClean(bytes, log, what) {
+      const dec = decodeText(bytes);
+      const dropped = countXmlIllegal(dec.text);
+      const text = stripXmlIllegal(dec.text);
+      if (dropped && log) {
+        log.warn(dropped + ' control character' + (dropped === 1 ? '' : 's')
+          + ' removed from the ' + what + ': XML forbids them, so they cannot go into EPUB or DOCX.');
+      }
+      return { text: text, encoding: dec.encoding };
+    }
+
+    // Decode a file out of an EPUB. Same guessing as decodeText, but an XML
+    // declaration or an HTML meta charset gets the first word, because inside a
+    // ZIP there is no filename and no HTTP header to fall back on and the
+    // document is the only thing that says what it is. EPUB 3 mandates UTF-8,
+    // so most of the time the declaration agrees with the guess and this
+    // changes nothing; it earns its keep on the EPUB 2 files and on the output
+    // of converters that write windows-1252 and say so.
+    //
+    // The sniff reads the first 1024 bytes as latin1 rather than as UTF-8,
+    // because at this point the encoding is precisely what is not yet known and
+    // a non-strict UTF-8 decode would turn a stray high byte into U+FFFD.
+    // Any encoding worth declaring puts its declaration in ASCII regardless.
+    const XML_DECL_RE = /^<\?xml[^>]*?\bencoding\s*=\s*["']([\w.:-]+)["']/i;
+
+    const META_CHARSET_RE = /<meta[^>]+charset\s*=\s*["']?\s*([\w.:-]+)/i;
+
+    function declaredEncoding(bytes) {
+      let head = '';
+      const n = Math.min(bytes.length, 1024);
+      for (let i = 0; i < n; i++) head += String.fromCharCode(bytes[i]);
+      const m = XML_DECL_RE.exec(head) || META_CHARSET_RE.exec(head);
+      return m ? m[1].toLowerCase() : '';
+    }
+
+    function decodeEpubFile(bytes) {
+      if (!bytes) return '';
+      // A BOM outranks a declaration: it is the one claim that cannot be a
+      // leftover from an earlier conversion, and decodeText already handles it.
+      const bom = bytes.length >= 2 && ((bytes[0] === 0xFF && bytes[1] === 0xFE)
+        || (bytes[0] === 0xFE && bytes[1] === 0xFF)
+        || (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF));
+      const label = bom ? '' : declaredEncoding(bytes);
+      if (label && !/^utf-?8$/.test(label)) {
+        try {
+          // fatal, so that a declaration contradicted by the bytes falls
+          // through to the guess instead of quietly producing U+FFFD.
+          return new TextDecoder(label, { fatal: true }).decode(bytes);
+        } catch (e) { /* unknown label or bytes disagree: guess below */ }
+      }
+      return decodeText(bytes).text;
     }
 
     // A byte-per-character string, so that string indices equal byte offsets.
@@ -235,6 +303,24 @@
     }
 
     function mimeForPath(path) { return MIME_BY_EXT[extOf(path)] || 'application/octet-stream'; }
+
+    // ══ CRC32 + deflate ══════════════════════════════════════════════════════
+
+    const CRC_TABLE = (function () {
+      const t = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c >>> 0;
+      }
+      return t;
+    })();
+
+    function crc32(buf) {
+      let c = 0xFFFFFFFF;
+      for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
 
     // Push bytes through a (De)CompressionStream. The write side must not be
     // awaited before the read loop starts, or backpressure deadlocks on inputs
@@ -298,6 +384,7 @@
         if (dv.getUint32(p, true) !== SIG_CD) throw new Error('Damaged ZIP central directory.');
         const flags = dv.getUint16(p + 8, true);
         const method = dv.getUint16(p + 10, true);
+        const crcDeclared = dv.getUint32(p + 16, true);
         let compSize = dv.getUint32(p + 20, true);
         let uncompSize = dv.getUint32(p + 24, true);
         const nameLen = dv.getUint16(p + 28, true);
@@ -333,11 +420,33 @@
         const lNameLen = dv.getUint16(localOff + 26, true);
         const lExtraLen = dv.getUint16(localOff + 28, true);
         const dataOff = localOff + 30 + lNameLen + lExtraLen;
+        // subarray clamps, it does not throw, so a truncated archive silently
+        // hands back a short entry. Catching that here is the difference
+        // between an error message and raw ZIP bytes appearing mid-chapter.
+        if (dataOff + compSize > bytes.length) {
+          throw new Error('This archive is truncated: ' + name + ' ends past the end of the file.');
+        }
         const raw = bytes.subarray(dataOff, dataOff + compSize);
 
-        if (method === 0) files.set(name, raw.slice());
-        else if (method === 8) files.set(name, await inflateRaw(raw));
+        let data;
+        if (method === 0) data = raw.slice();
+        else if (method === 8) data = await inflateRaw(raw);
         else throw new Error('Unsupported ZIP compression method ' + method + ' in ' + name);
+
+        // The directory carries a length and a checksum, and until now neither
+        // was looked at. A flipped byte in a deflate stream stays inflatable and
+        // comes out as a plausible wrong word (the quick br_wn fox), which is
+        // the failure mode worth spending 30 lines of CRC table on. Both fields
+        // are optional in the sense that some writers leave them zero, so a
+        // zero is treated as "not stated" rather than as a claim.
+        if (uncompSize && data.length !== uncompSize) {
+          throw new Error('This archive is damaged: ' + name + ' is '
+            + data.length + ' bytes, but the directory says ' + uncompSize + '.');
+        }
+        if (crcDeclared && crc32(data) !== crcDeclared) {
+          throw new Error('This archive is damaged: the checksum of ' + name + ' does not match.');
+        }
+        files.set(name, data);
       }
       return files;
     }
@@ -370,10 +479,25 @@
       });
     }
 
+    // Strips the XML-illegal controls for the same reason escapeText does, and
+    // it has to be said in both places: this one writes the OPF, the NCX and
+    // the nav document, which take their strings straight from the metadata and
+    // never pass through the other escaper.
     function escapeXml(s) {
-      return String(s).replace(/[&<>"']/g, function (c) {
+      return stripXmlIllegal(s).replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c];
       });
+    }
+
+    // Titles get capped so a runaway heading cannot become the book's name, but
+    // a plain slice counts UTF-16 code units, and an emoji is two of them. Cut
+    // between the halves of a surrogate pair and the leftover half is not a
+    // character any more: the TextEncoder turns it into U+FFFD on the way out,
+    // so the title ends in a replacement glyph. One code unit shorter instead.
+    function clipText(s, max) {
+      if (s.length <= max) return s;
+      const code = s.charCodeAt(max - 1);
+      return s.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
     }
 
     // Attribute values may be double-quoted, single-quoted, unquoted (HTML4) or
@@ -447,12 +571,18 @@
       return root;
     }
 
+    // The C0 strip is here as well as in the readers, and deliberately so:
+    // the readers catch the common case early enough to report it, but text
+    // also arrives from EPUB and MOBI, whose own decoders never pass through
+    // decodeTextClean. Since a single stray byte costs the whole output file
+    // (XML forbids these characters and forbids escaping them), the serializer
+    // is the one place that must never let one past, however it got here.
     function escapeText(s) {
-      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return stripXmlIllegal(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
     function escapeAttr(s) {
-      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      return stripXmlIllegal(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
     }
 
     // Serialize back to well-formed XML. Entities were decoded during parsing and
@@ -634,7 +764,7 @@
       const h = /<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]\s*>/i.exec(html);
       if (h) {
         const t = decodeEntities(h[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
-        if (t) return t.slice(0, 120);
+        if (t) return clipText(t, 120);
       }
       return '';
     }
@@ -649,12 +779,12 @@
       if (files.has('META-INF/encryption.xml')) {
         throw new Error('This EPUB is encrypted and cannot be converted.');
       }
-      const rootfile = findOne(parseXML(decodeUtf8(containerRaw)), 'rootfile');
+      const rootfile = findOne(parseXML(decodeEpubFile(containerRaw)), 'rootfile');
       const opfPath = rootfile && rootfile.attrs['full-path'];
       if (!opfPath || !files.has(opfPath)) throw new Error('EPUB is damaged: the OPF package file is missing.');
 
       const opfDir = dirOf(opfPath);
-      const opf = parseXML(decodeUtf8(files.get(opfPath)));
+      const opf = parseXML(decodeEpubFile(files.get(opfPath)));
       const book = emptyBook();
 
       const metaNode = findOne(opf, 'metadata');
@@ -734,7 +864,7 @@
         const it = manifest[spineIds[i]];
         const raw = files.get(it.path);
         if (!raw) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
-        const doc = decodeUtf8(raw);
+        const doc = decodeEpubFile(raw);
         const secDir = dirOf(it.path);
 
         const css = [];
@@ -778,7 +908,7 @@
         if (/\bnav\b/.test(manifest[id].properties)) { navPath = manifest[id].path; break; }
       }
       if (navPath && files.has(navPath)) {
-        const doc = parseXML(decodeUtf8(files.get(navPath)));
+        const doc = parseXML(decodeEpubFile(files.get(navPath)));
         for (const nav of findAll(doc, 'nav')) {
           const type = nav.attrs['epub:type'] || nav.attrs.type || '';
           if (type && type.indexOf('toc') < 0) continue;
@@ -808,7 +938,7 @@
         }
       }
       if (ncxPath && files.has(ncxPath)) {
-        const doc = parseXML(decodeUtf8(files.get(ncxPath)));
+        const doc = parseXML(decodeEpubFile(files.get(ncxPath)));
         const map = findOne(doc, 'navMap'.toLowerCase());
         const out = [];
         const walk = function (node, level) {
@@ -855,7 +985,7 @@
     const HEADING_RE = /^(?:(?:chapter|kapitel|part|teil|book|buch|prologue|prolog|epilogue|epilog|section)\b.{0,60}|[IVXLC]{1,7}\.?|\d{1,3}\.?)$/i;
 
     function readTxt(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'text file');
       const book = emptyBook();
       const text = dec.text.replace(/\r\n?/g, '\n');
 
@@ -1003,7 +1133,7 @@
           const ln = localName(c.name);
           if (ln === 'header') {
             const h = firstHeadingNode(c);
-            if (h && !book.meta.title) book.meta.title = textOf(h).slice(0, 200);
+            if (h && !book.meta.title) book.meta.title = clipText(textOf(h), 200);
             if (!book.meta.author) {
               const p = kids(c, 'p')[0];
               const at = p ? textOf(p) : '';
@@ -1045,7 +1175,7 @@
       // A single leading top-level heading is the book's title, not a chapter.
       const h1s = headings.filter(function (c) { return headingLevel(c) === cutLv; });
       if (cutLv && h1s.length === 1 && headings[0] === h1s[0]) {
-        if (!book.meta.title) book.meta.title = textOf(h1s[0]).slice(0, 200);
+        if (!book.meta.title) book.meta.title = clipText(textOf(h1s[0]), 200);
         items = items.filter(function (c) { return c !== h1s[0]; });
         const firstEl = items.find(isElement);
         if (firstEl && localName(firstEl.name) === 'p') {
@@ -1078,12 +1208,12 @@
     }
 
     function readHtml(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'HTML file');
       const book = emptyBook();
       const tree = parseXML(dec.text);
 
       const titleTag = findOne(tree, 'title');
-      if (titleTag) { const t = textOf(titleTag); if (t) book.meta.title = t.slice(0, 200); }
+      if (titleTag) { const t = textOf(titleTag); if (t) book.meta.title = clipText(t, 200); }
       walkElements(tree, function (el) {
         if (localName(el.name) !== 'meta') return;
         const nm = (el.attrs.name || el.attrs.property || '').toLowerCase();
@@ -1110,7 +1240,7 @@
     }
 
     function readMarkdown(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'Markdown file');
       const book = emptyBook();
       let text = dec.text.replace(/\r\n?/g, '\n');
       text = stripFrontMatter(text, book);
@@ -1663,9 +1793,19 @@
         h.drmCount = h.headerLength >= 0xA0 ? u32(dv, M + 0x9C) : 0;
         h.firstContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB0, false) : 1;
         h.lastContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB2, false) : 0;
-        // Only meaningful when the header is long enough to contain the field.
-        // The flags proper are the low 16 bits of the word at 0xE0.
-        h.extraFlags = h.headerLength >= 0xE4 ? (u32(dv, M + 0xE0) & 0xFFFF) : 0;
+        // Extra Data Flags: the low 16 bits of the word at 0xE0. Gating this on
+        // headerLength >= 0xE4 was wrong and measured nonsense on roughly half
+        // of a 58-file sample: plenty of writers declare headerLength 232 (0xE8
+        // is not reached, 0xE4 is) or even 232 while record 0 is longer still,
+        // and carry the field anyway. What matters is whether the field lies
+        // inside record 0 at all. The value is then checked against arithmetic
+        // that cannot lie: strip the trailing bytes each flag set implies, sum
+        // what is left over the text records, and compare with textLength. If
+        // flags = 0 hits textLength and the declared flags do not, the declared
+        // value is noise and 0 wins. resolveExtraFlags() does that pass once the
+        // records are known; here we only record the raw candidate.
+        h.extraFlagsRaw = rec0.length >= M + 0xE4 ? (u32(dv, M + 0xE0) & 0xFFFF) : 0;
+        h.extraFlags = h.extraFlagsRaw;
         h.exth = (h.exthFlags & 0x40) ? parseExth(rec0, M + h.headerLength) : {};
         if (h.fullNameLength && h.fullNameOffset + h.fullNameLength <= rec0.length) {
           h.fullName = decodeMobiText(
@@ -1733,6 +1873,90 @@
         num += (rec[size - num - 1] & 0x3) + 1;
       }
       return num;
+    }
+
+    // The declared Extra Data Flags cannot be trusted on their own (see the note
+    // in parseMobiHeader), so they get checked against arithmetic. For a
+    // candidate flag set, subtract the trailing bytes it implies from every text
+    // record; for compression 1 the remainder is the text itself, so the sum has
+    // to be textLength. Compressed records give no such sum, so the check there
+    // is weaker: a trailing size that runs past the record, or a record that
+    // ends up empty, means the candidate is wrong.
+    //
+    // Only two candidates are ever considered: what the header says, and 0. The
+    // point is not to search the space, it is to notice that a writer left
+    // garbage in the field while producing records with no trailing bytes at all.
+    function extraFlagsScore(pdb, h, flags) {
+      let sum = 0;
+      let bad = 0;
+      let n = 0;
+      for (let i = 1; i <= h.textRecordCount; i++) {
+        const rec = pdb.records[i];
+        if (!rec || !rec.length) break;
+        n++;
+        let trail = 0;
+        try {
+          trail = flags ? trailingSize(rec, flags) : 0;
+        } catch (e) {
+          trail = rec.length + 1;
+        }
+        if (!(trail >= 0) || trail >= rec.length) { bad++; trail = 0; }
+        sum += rec.length - trail;
+      }
+      return { sum: sum, bad: bad, records: n };
+    }
+
+    function resolveExtraFlags(pdb, h) {
+      const declared = h.extraFlagsRaw || 0;
+      // Both directions are possible, and a declared 0 is NOT automatically the
+      // truth. Files exist that pad every text record with one overlap byte,
+      // which is exactly what flag bit 0 describes, while the header field says
+      // 0. Trusting the 0 leaves one stray byte per record sitting in the middle
+      // of the text: it lands inside words and inside tags ("filepos" becomes
+      // "file\0pos"), and after HTML parsing it surfaces as a space, so the book
+      // reads "revie ws" and "selectees f rom". The record arithmetic catches
+      // that, so it decides, and the declared value only breaks ties.
+      //
+      // The candidates are the declared value and 0. Bit 0 is the only one that
+      // can be wrong this way (the others describe index tables whose sizes are
+      // self-describing), so trying declared|1 as a third candidate is what
+      // recovers a file that declares 0 but pads anyway.
+      const candidates = [declared];
+      if (!(declared & 1)) candidates.push(declared | 1);
+      if (declared !== 0) candidates.push(0);
+
+      const scored = candidates.map(function (f) {
+        const s = extraFlagsScore(pdb, h, f);
+        s.flags = f;
+        return s;
+      });
+
+      if (h.compression === 1 && h.textLength) {
+        // Uncompressed: the sums are exact, so a candidate either hits
+        // textLength or it does not. Exactly one normally does.
+        const hits = scored.filter(function (s) { return s.sum === h.textLength && s.bad === 0; });
+        if (hits.length) {
+          const winner = hits[0];
+          h.extraFlags = winner.flags;
+          h.extraFlagsOverridden = winner.flags !== declared;
+          return h;
+        }
+        // Nothing fits: keep what the header says rather than invent a value.
+        h.extraFlags = declared;
+        return h;
+      }
+
+      // Compressed: there is no exact sum to check against, so the only signal
+      // is whether a candidate makes a record unreadable. Prefer the declared
+      // value while it is sound, because a wrong strip here is worse than a
+      // missing one: it would cut real compressed bytes off the record end.
+      const ok = scored.filter(function (s) { return s.bad === 0; });
+      const keep = ok.some(function (s) { return s.flags === declared; })
+        ? declared
+        : (ok.length ? ok[0].flags : declared);
+      h.extraFlags = keep;
+      h.extraFlagsOverridden = keep !== declared;
+      return h;
     }
 
     function decompressText(pdb, h, log) {
@@ -1938,7 +2162,7 @@
           const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
           if (!title) continue;
           distinct[m[1].slice(0, 8)] = 1;
-          links.push({ title: title.slice(0, 120), href: 'text/' + m[1], level: 0 });
+          links.push({ title: clipText(title, 120), href: 'text/' + m[1], level: 0 });
         }
         const n = Object.keys(distinct).length;
         if (n >= 3 && (!best || n > best.count)) best = { count: n, entries: links };
@@ -1953,7 +2177,7 @@
         const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
         if (!title) continue;
         entries.push({
-          title: title.slice(0, 120),
+          title: clipText(title, 120),
           href: 'text/' + s.id + '.xhtml',
           level: Math.min(parseInt(m[1].charAt(1), 10) - 1, 2),
         });
@@ -2323,7 +2547,7 @@
           }
           if (!label || !href) return;
           book.toc.push({
-            title: label.slice(0, 120),
+            title: clipText(label, 120),
             href: 'text/' + href,
             level: Math.min((e.tags[4] || [0])[0], 2),
           });
@@ -2349,7 +2573,7 @@
       const pdb = readPalmDB(bytes);
       const rec0 = pdb.records[0];
       if (!rec0 || rec0.length < 16) throw new Error('Damaged file: the header record is missing.');
-      const h = parseMobiHeader(rec0);
+      const h = resolveExtraFlags(pdb, parseMobiHeader(rec0));
 
       // Two independent signals. Either one means the content is protected, and
       // the conversion stops here.
@@ -2371,7 +2595,7 @@
       }
       if (boundary > 0 && boundary < pdb.records.length) {
         const inner = { type: pdb.type, creator: pdb.creator, records: pdb.records.slice(boundary) };
-        const ih = parseMobiHeader(inner.records[0]);
+        const ih = resolveExtraFlags(inner, parseMobiHeader(inner.records[0]));
         if (ih.hasMobi && ih.fileVersion >= 8) {
           log.info('Combined file: using the KF8 part (record ' + boundary + ' onwards).');
           // Record numbers in the KF8 header count from the KF8 part, and the DRM
@@ -2477,6 +2701,7 @@
       ATTR_RE: ATTR_RE,
       BLOCK_TAGS: BLOCK_TAGS,
       CONTAINER_UNWRAP: CONTAINER_UNWRAP,
+      CRC_TABLE: CRC_TABLE,
       ENDS_P: ENDS_P,
       EXTH_AUTHOR: EXTH_AUTHOR,
       EXT_BY_MIME: EXT_BY_MIME,
@@ -2484,8 +2709,10 @@
       HEAD_LV: HEAD_LV,
       INDEX_STOPPERS: INDEX_STOPPERS,
       MD_BLOCK_HTML: MD_BLOCK_HTML,
+      META_CHARSET_RE: META_CHARSET_RE,
       MIME_BY_EXT: MIME_BY_EXT,
       NAMED_ENTITIES: NAMED_ENTITIES,
+      NEWLINE_LIKE_RE: NEWLINE_LIKE_RE,
       POW2: POW2,
       RES_ATTR_RE: RES_ATTR_RE,
       SECTION_WRAP: SECTION_WRAP,
@@ -2498,6 +2725,8 @@
       U32: U32,
       UTF8: UTF8,
       VOID_TAGS: VOID_TAGS,
+      XML_DECL_RE: XML_DECL_RE,
+      XML_ILLEGAL_SRC: XML_ILLEGAL_SRC,
       addResource: addResource,
       applyTocTitles: applyTocTitles,
       baseOf: baseOf,
@@ -2506,11 +2735,17 @@
       buildMobiToc: buildMobiToc,
       buildSections: buildSections,
       bytesToBinaryString: bytesToBinaryString,
+      clipText: clipText,
       collectImages: collectImages,
       concatBytes: concatBytes,
+      countXmlIllegal: countXmlIllegal,
+      crc32: crc32,
+      declaredEncoding: declaredEncoding,
       decodeEntities: decodeEntities,
+      decodeEpubFile: decodeEpubFile,
       decodeMobiText: decodeMobiText,
       decodeText: decodeText,
+      decodeTextClean: decodeTextClean,
       decodeUtf8: decodeUtf8,
       decompressText: decompressText,
       dirOf: dirOf,
@@ -2523,6 +2758,7 @@
       escapeXml: escapeXml,
       extOf: extOf,
       exthText: exthText,
+      extraFlagsScore: extraFlagsScore,
       extractDataUris: extractDataUris,
       findAll: findAll,
       findIndexes: findIndexes,
@@ -2574,6 +2810,7 @@
       readMobiFile: readMobiFile,
       readPalmDB: readPalmDB,
       readTxt: readTxt,
+      resolveExtraFlags: resolveExtraFlags,
       resolvePath: resolvePath,
       rewriteLinks: rewriteLinks,
       sanitizeName: sanitizeName,
@@ -2584,6 +2821,7 @@
       sniffNotABook: sniffNotABook,
       splitFrag: splitFrag,
       stripFrontMatter: stripFrontMatter,
+      stripXmlIllegal: stripXmlIllegal,
       textNode: textNode,
       textOf: textOf,
       titleFromHtml: titleFromHtml,

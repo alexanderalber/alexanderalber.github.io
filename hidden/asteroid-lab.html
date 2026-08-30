@@ -1,0 +1,1428 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <!-- No theme one-liner and no switcher: the viewport fills the screen and only
+       exists dark, exactly as spaceship-6dof.html and reaction-diffusion.html do,
+       so a stored light preference must not reach this page. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Asteroid Lab - Procedural Rock Shapes</title>
+  <meta name="description" content="A contact sheet for procedurally generated asteroids. One displaced icosphere with Perlin noise and impact craters that have real raised rims, shown side by side under a colormap ramp shader, a hidden-line wireframe with a real silhouette, and combinations of the two. Same geometry, same camera, different renderings.">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Full-screen canvas, so the Pico container, the site header and the site
+       footer are deliberately absent. Everything that would live in them goes
+       into the floating panel. */
+    html, body { height: 100%; }
+    body { margin: 0; overflow: hidden; background: #05070b; }
+    #root { position: fixed; inset: 0; }
+
+    .al-stage { position: absolute; inset: 0; touch-action: none; cursor: grab; }
+    .al-stage:active { cursor: grabbing; }
+    .al-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+    /* Cell chrome for the scissor grid. The cells are drawn by one WebGL
+       context; this layer only puts a hairline and a caption over them, which
+       is why it passes every pointer event straight through to the canvas
+       below. Only the caption chip itself takes clicks, so dragging inside a
+       cell still orbits the shared camera. */
+    .al-cells { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+    .al-cell { position: absolute; box-shadow: inset 0 0 0 1px rgba(51,65,85,.55); }
+    .al-cap { position: absolute; left: 8px; top: 7px; pointer-events: auto;
+      font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
+      color: var(--tool-note); background: rgba(5,7,11,.55); backdrop-filter: blur(4px);
+      border: 1px solid rgba(51,65,85,.8); border-radius: 999px;
+      padding: 3px 9px; cursor: pointer; }
+    .al-cap:hover { color: var(--tool-text); border-color: var(--tool-faint); }
+
+    .al-back { position: absolute; top: 12px; left: 12px; z-index: 3;
+      font-size: 12.5px; color: var(--tool-label); text-decoration: none;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .al-back:hover { color: var(--tool-text); border-color: var(--tool-faint); }
+
+    .al-msg { position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+      z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
+      font-size: 14px; color: var(--tool-text); letter-spacing: .03em;
+      text-shadow: 0 0 18px rgba(0,0,0,.95); }
+
+    .al-panel { position: absolute; top: 12px; right: 12px; z-index: 4;
+      width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+      overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid var(--tool-border); border-radius: 10px; padding: 12px 14px 14px;
+      background: color-mix(in srgb, var(--tool-panel) 88%, transparent); backdrop-filter: blur(10px);
+      box-shadow: var(--tool-panel-shadow); }
+    .al-panel::-webkit-scrollbar { width: 8px; }
+    .al-panel::-webkit-scrollbar-thumb { background: var(--tool-border); border-radius: 4px; }
+    .al-toggle { position: absolute; top: 12px; right: 12px; z-index: 4;
+      font-size: 12.5px; color: var(--tool-text); cursor: pointer; width: auto; margin: 0;
+      padding: 6px 13px; border-radius: 999px; border: 1px solid var(--tool-border);
+      background: color-mix(in srgb, var(--tool-panel) 75%, transparent); backdrop-filter: blur(8px); }
+    .al-toggle:hover { border-color: var(--tool-faint); }
+
+    .al-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .al-head h2 { font-size: 14px; color: var(--tool-text); margin: 0; font-weight: 600; flex: 1; }
+    .al-x { background: none; border: none; color: var(--tool-note); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 4px; margin: 0; width: auto; }
+    .al-x:hover { color: var(--tool-text); }
+
+    /* Accordion, the same shape spaceship-6dof and reaction-diffusion use. The
+       collapsed header keeps showing its current value, so folding a section
+       away hides the controls and not the setting. */
+    .al-acc { border-top: 1px solid var(--tool-hairline); }
+    .al-acc-h { display: flex; align-items: baseline; gap: 8px; width: 100%;
+      margin: 0; padding: 9px 2px; background: none; border: none; cursor: pointer;
+      font-size: 11px; color: var(--tool-note); letter-spacing: .06em; text-transform: uppercase;
+      text-align: left; }
+    .al-acc-h:hover { color: var(--tool-text); }
+    .al-acc-h.open { color: var(--tool-label); }
+    .al-acc-s { margin-left: auto; font-size: 11px; color: var(--tool-faint);
+      text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
+    .al-acc-c { margin-left: auto; font-size: 13px; line-height: 1; color: var(--tool-faint); flex: none; }
+    .al-acc-s + .al-acc-c { margin-left: 6px; }
+    .al-acc-b { padding: 0 2px 12px; }
+
+    .al-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline;
+      gap: 2px 8px; margin: 6px 0; }
+    .al-row label { font-size: 11.5px; color: var(--tool-label); margin: 0; }
+    .al-row output { font-size: 11.5px; color: var(--tool-text); text-align: right;
+      font-variant-numeric: tabular-nums; }
+    .al-row input[type=range] { grid-column: 1 / -1; margin: 2px 0 0; }
+
+    /* Seed field and its shuffle button on one line. The field is Pico-shaped by
+       .tool-input-sm and therefore exactly as tall as the .tool-btn-sm next to
+       it, which is the whole reason those classes exist. */
+    .al-seed { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+    .al-seed label { font-size: 11.5px; color: var(--tool-label); margin: 0; flex: none; }
+    .al-seed input { flex: 1; min-width: 0; font-variant-numeric: tabular-nums; }
+    .al-seed button { flex: none; margin: 0; }
+
+    /* Joined segmented controls, each of which picks one setting out of a small
+       set. .seg-row does the overlap and the z-index centrally; nothing about
+       the segments themselves is restated here. */
+    .al-seg { margin: 8px 0 4px; }
+    .al-seg button { width: auto; margin: 0; }
+    .al-seg-l { font-size: 11.5px; color: var(--tool-label); display: block; margin: 8px 0 2px; }
+
+    /* A colormap has to be shown, not named: nobody knows what copper looks
+       like from the word. The swatch is the ramp itself, painted as a linear
+       gradient out of the same stops the shader samples. */
+    .al-ramps { display: grid; gap: 4px; margin: 6px 0 4px; }
+    .al-ramp { display: grid; grid-template-columns: 54px 1fr; align-items: center;
+      gap: 8px; width: 100%; margin: 0; padding: 3px 5px; cursor: pointer;
+      background: none; border: 1px solid transparent; border-radius: 5px;
+      font-size: 11px; color: var(--tool-label); text-align: left; }
+    .al-ramp:hover { border-color: var(--tool-border); color: var(--tool-text); }
+    .al-ramp.active { border-color: var(--pico-primary); color: var(--tool-text); }
+    .al-ramp i { display: block; height: 12px; border-radius: 3px;
+      border: 1px solid var(--tool-hairline); }
+
+    .al-derived { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+      font-size: 11px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      margin: 9px 0 0; padding-top: 8px; border-top: 1px solid var(--tool-hairline); }
+    .al-derived b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .al-derived b.hot { color: #fbbf24; }
+
+    .al-note { font-size: 10.5px; color: var(--tool-faint); margin: 8px 0 0; line-height: 1.5; }
+  </style>
+
+  <script type="importmap">
+  { "imports": { "three": "/assets/js/three.module.min.js" } }
+  </script>
+  <!-- OrbitControls is an ES module that imports from the bare specifier 'three',
+       so it cannot be a classic <script src> tag. It has to be imported here, in
+       the same module block, and put on window BEFORE the ready event fires, or
+       the app block finds THREE but no controls. -->
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from '/assets/js/OrbitControls.js';
+    window.THREE = THREE;
+    window.AL_OrbitControls = OrbitControls;
+    window.__alThreeReady = true;
+    window.dispatchEvent(new Event('al-three-ready'));
+  </script>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/asteroid.js"></script>
+  <script src="/assets/js/colorramps.js"></script>
+
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Lab policy rather than geometry, and pure for the same reason the geometry
+       module is: no DOM, no three.js, no React, so notes/dev/ can pull this block
+       out by id and evaluate it. The geometry itself lives in
+       /assets/js/asteroid.js, because that is what the corridor game will load
+       later; what only a comparison UI needs stays here. -->
+  <script id="alcore">
+const AsteroidLab = (function () {
+  'use strict';
+
+  /* The colormaps live in assets/js/colorramps.js since 2026-08-30, because
+     asteroid-corridor shades its rocks with the same five. They are re-exported
+     here under their old names, so every call site in this tool and in its
+     tests is untouched by the move. */
+  var RAMPS = ColorRamps.RAMPS;
+  var rampById = ColorRamps.rampById;
+  var rampTexels = ColorRamps.rampTexels;
+  var rampCss = ColorRamps.rampCss;
+
+  /* ---------------------------------------------------------------- *
+   * Styles
+   *
+   * A style is not a material any more, it is a COMBINATION: a base fill
+   * (the ramp shader, read continuously or quantised into bands) and a line
+   * pass over it (off, always, only in shadow, or in a contrasting colour
+   * taken from half a ramp away). That is what makes the last two entries
+   * possible at all, and it means the colormap is judged in every pane
+   * rather than in one.
+   *
+   * instanceable and extraPasses are what the later field view has to add
+   * up. A line pass is never instanceable: LineSegments has no instanced
+   * form, so a hundred rocks with lines are two hundred draw calls where the
+   * pure fills are one or two.
+   * ---------------------------------------------------------------- */
+  var STYLES = [
+    {
+      id: 'facet',
+      label: 'Facet',
+      note: 'The ramp read continuously, with the normal taken per triangle rather than per vertex. Every facet is its own plane, so the mesh is shown exactly as it is built rather than smoothed over.',
+      base: 'ramp', banded: false, flat: true, outline: false, wire: 'off',
+      instanceable: true, extraPasses: 0
+    },
+    {
+      id: 'toon',
+      label: 'Toon',
+      note: 'The same ramp quantised into a few bands, plus an outline drawn as an inverted hull. The outline width is a world-space offset, so a distant rock gets a thinner line rather than the same one.',
+      base: 'ramp', banded: true, flat: false, outline: true, wire: 'off',
+      instanceable: true, extraPasses: 1
+    },
+    {
+      id: 'wire',
+      label: 'Wire',
+      note: 'Every edge of the mesh, or only the silhouette, over a black fill that occludes the lines behind it. There is no threshold in between, because the bend angles of this body are one smooth distribution and a cut through it selects noise rather than features. The silhouette is recomputed every frame, since which edges are on it depends on where you are standing.',
+      base: 'none', banded: false, flat: true, outline: false, wire: 'always',
+      instanceable: false, extraPasses: 1
+    },
+    {
+      id: 'shadowwire',
+      label: 'Shadow wire',
+      note: 'The continuous ramp in the light and the wireframe in the dark, the lines appearing exactly where the surface stops catching the key. The lit side reads as a solid body and the unlit side as a diagram of one. The rule is about the interior lines only: in contour mode the outline is drawn whole, because half an outline is not a shape.',
+      base: 'ramp', banded: false, flat: true, outline: false, wire: 'shadow',
+      instanceable: false, extraPasses: 1
+    },
+    {
+      id: 'toonwire',
+      label: 'Toon wire',
+      note: 'Bands with the lines over them in a colour looked up half a ramp away from the band underneath, so a line on a dark band comes out light and a line on a light band comes out dark. It never sinks into its own background.',
+      base: 'ramp', banded: true, flat: false, outline: false, wire: 'contrast',
+      instanceable: false, extraPasses: 1
+    }
+  ];
+
+  function styleById(id) {
+    for (var i = 0; i < STYLES.length; i++) if (STYLES[i].id === id) return STYLES[i];
+    return null;
+  }
+
+  /* Draw calls for n rocks in one style, which is the number the field view
+     will put on its HUD. One call per pass when the style instances, one per
+     rock and pass when it does not. */
+  function drawCalls(style, n) {
+    var passes = 1 + style.extraPasses;
+    return style.instanceable ? passes : Math.max(1, Math.round(n)) * passes;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Grid
+   * ---------------------------------------------------------------- */
+
+  /* Split a length into `parts` integer pieces that add up to exactly the
+     length, the remainder going to the leading pieces. Exactness is the point:
+     a rounded-then-multiplied layout leaves a one-pixel seam between cells,
+     and the seam shows as a bright line because the scissor rect never clears
+     it. Each piece stays at least one pixel wide, which only matters on a
+     stage too small to tile at all, where a zero-width viewport would make
+     three.js divide by zero. */
+  function splitInt(total, parts) {
+    var out = [], base = Math.floor(total / parts), rem = total - base * parts, i;
+    for (i = 0; i < parts; i++) out.push(Math.max(1, base + (i < rem ? 1 : 0)));
+    return out;
+  }
+
+  /* Tile a stage of w by h into n cells, gaplessly and without overlap.
+   *
+   * The last row is NOT left with holes: n cells are spread over the rows as
+   * evenly as possible, so five cells are a row of three above a row of two
+   * rather than a row of three above two thirds of a row. Empty cells in a
+   * contact sheet read as a missing style rather than as a layout.
+   *
+   * Two coordinate systems come back on purpose. `x, y, w, h` is what
+   * setViewport and setScissor want, so y counts from the BOTTOM; `top` is
+   * the same cell in CSS coordinates for the caption layer over the canvas.
+   * Deriving one from the other at the call site is exactly the kind of
+   * off-by-one that is invisible until the grid is asymmetric. */
+  function gridLayout(w, h, n) {
+    /* Math.max(1, NaN) is NaN, so a non-finite size has to be caught before
+       the clamp and not by it. A zero-sized stage is normal: it is what the
+       first layout pass sees before the canvas has been measured. */
+    var px = function (v) { return isFinite(v) ? Math.max(1, Math.floor(v)) : 1; };
+    var W = px(w), H = px(h);
+    var N = isFinite(n) ? Math.max(1, Math.round(n)) : 1;
+    var cols = Math.ceil(Math.sqrt(N));
+    var rows = Math.ceil(N / cols);
+    var base = Math.floor(N / rows), rem = N - base * rows;
+    var heights = splitInt(H, rows);
+    var cells = [], top = 0, r, c;
+    for (r = 0; r < rows; r++) {
+      var inRow = base + (r < rem ? 1 : 0);
+      var widths = splitInt(W, inRow);
+      var x = 0;
+      for (c = 0; c < inRow; c++) {
+        cells.push({
+          x: x, y: H - top - heights[r], w: widths[c], h: heights[r],
+          top: top, row: r, col: c
+        });
+        x += widths[c];
+      }
+      top += heights[r];
+    }
+    return cells;
+  }
+
+  /* The pane counts the segmented control offers for a given number of
+     styles. A ladder rather than every integer: a row of six buttons is a
+     worse control than 1 / 2 / 4 / 6, and the counts in between produce the
+     same grids anyway. */
+  function gridChoices(nStyles) {
+    var ladder = [1, 2, 4, 6], out = [], i;
+    var n = Math.max(1, Math.round(nStyles));
+    for (i = 0; i < ladder.length; i++) if (ladder[i] < n) out.push(ladder[i]);
+    out.push(n);
+    return out;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Formatters and counts
+   * ---------------------------------------------------------------- */
+
+  /* The exact counts of a subdivided icosahedron, so the panel can state the
+     face count of a level before anything is built. This is one of the reasons
+     the icosphere route is the default at all: the number is known in advance,
+     which a marching-cubes surface can never promise. */
+  function faceCount(subdiv) {
+    var n = Math.max(0, Math.round(subdiv));
+    return 20 * Math.pow(4, n);
+  }
+  function vertCount(subdiv) {
+    var n = Math.max(0, Math.round(subdiv));
+    return 10 * Math.pow(4, n) + 2;
+  }
+
+  function groupInt(n) {
+    if (!isFinite(n)) return '-';
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  function fmtMs(ms) {
+    if (!isFinite(ms)) return '-';
+    return (ms < 10 ? ms.toFixed(2) : ms.toFixed(1)) + ' ms';
+  }
+
+  function fmtDeg(rad) {
+    if (!isFinite(rad)) return '-';
+    return Math.round(rad * 180 / Math.PI) + '°';
+  }
+
+  /* The line buffer, rebuilt in the frame that draws it.
+   *
+   * Two modes, and deliberately nothing between them. The first version kept an
+   * edge when its dihedral angle passed a threshold, the way EdgesGeometry does,
+   * and it looked wrong for a reason that can be measured: on this body the bend
+   * angles are one smooth distribution (seed 1, 7680 edges: median 10 degrees,
+   * p90 29, max 101), so a threshold anywhere inside it selects no feature at
+   * all, it cuts through noise. An edge is drawn and its neighbour is not, and
+   * nothing visible on the screen says why. Either every edge of the mesh, or
+   * only the ones that are edges from where you stand.
+   *
+   * The CONTOUR is the half that cannot be baked, because whether a place on
+   * the body is on it depends on where the eye is, and EdgesGeometry knows no
+   * viewer. It is not taken along mesh edges, and that is the whole point. An
+   * edge-based silhouette asks a yes-or-no question of each FACE, so a face that
+   * stands almost tangentially flips its answer as the rock turns and a whole
+   * chain of edges switches on at once. The contour cannot travel, it can only
+   * snap, which on a turntable is a line that pops.
+   *
+   * So the sign is taken per VERTEX against the smooth normal, giving a scalar
+   * field g = n . (eye - p) over the surface, and the contour is its zero set:
+   * in a triangle whose three vertices do not agree, the crossing points sit on
+   * the two edges that touch the odd vertex out, found by linear interpolation.
+   * The result is one short segment per straddled triangle, its ends sliding
+   * along the edges as the body turns rather than jumping between them. It is
+   * also the contour of the surface the shading already implies, so it lands
+   * where the eye expects it instead of on the nearest polygon boundary.
+   *
+   * The eye arrives in the rock's own frame, so the turntable rotation is
+   * already accounted for and nothing has to be transformed per vertex. */
+  function updateLines(src, eye, mode, out) {
+    const P = src.positions, N = src.normals;
+    const pos = out.positions, nor = out.normals;
+
+    if (mode === 'all') {
+      /* The unique edge list, or every interior edge would be drawn twice. */
+      const E = src.edges, ea = E.ea, eb = E.eb;
+      for (let e = 0; e < E.count; e++) {
+        const a3 = ea[e] * 3, b3 = eb[e] * 3, o = e * 6;
+        pos[o] = P[a3]; pos[o + 1] = P[a3 + 1]; pos[o + 2] = P[a3 + 2];
+        pos[o + 3] = P[b3]; pos[o + 4] = P[b3 + 1]; pos[o + 5] = P[b3 + 2];
+        nor[o] = N[a3]; nor[o + 1] = N[a3 + 1]; nor[o + 2] = N[a3 + 2];
+        nor[o + 3] = N[b3]; nor[o + 4] = N[b3 + 1]; nor[o + 5] = N[b3 + 2];
+      }
+      return E.count;
+    }
+
+    /* One dot product per vertex, not per face: a vertex is shared by six
+       triangles here, so this is the cheaper end as well as the smoother one. */
+    const idx = src.indices, g = out.g, V = P.length / 3;
+    for (let v = 0; v < V; v++) {
+      const i = v * 3;
+      g[v] = N[i] * (eye[0] - P[i])
+        + N[i + 1] * (eye[1] - P[i + 1])
+        + N[i + 2] * (eye[2] - P[i + 2]);
+    }
+
+    const F = idx.length / 3;
+    let n = 0;
+    for (let f = 0; f < F; f++) {
+      const a = idx[f * 3], b = idx[f * 3 + 1], c = idx[f * 3 + 2];
+      const ga = g[a], gb = g[b], gc = g[c];
+      const sa = ga > 0, sb = gb > 0, sc = gc > 0;
+      if (sa === sb && sb === sc) continue;
+      /* Exactly one vertex disagrees with the other two, and the contour cuts
+         the two edges that meet there. Which one it is decides the pair. */
+      let odd, u, w;
+      if (sa === sb) { odd = c; u = a; w = b; }
+      else if (sb === sc) { odd = a; u = b; w = c; }
+      else { odd = b; u = c; w = a; }
+      const o = n * 6;
+      crossPoint(P, N, g, odd, u, pos, nor, o);
+      crossPoint(P, N, g, odd, w, pos, nor, o + 3);
+      n++;
+    }
+    return n;
+  }
+
+  /* Where g changes sign between two vertices, plus the normal there, so the
+     line shader can light the contour exactly as the fill beneath it is lit.
+     The two g values have opposite signs, so the denominator cannot vanish. */
+  function crossPoint(P, N, g, a, b, pos, nor, o) {
+    const ga = g[a], t = ga / (ga - g[b]);
+    const i = a * 3, j = b * 3;
+    pos[o] = P[i] + (P[j] - P[i]) * t;
+    pos[o + 1] = P[i + 1] + (P[j + 1] - P[i + 1]) * t;
+    pos[o + 2] = P[i + 2] + (P[j + 2] - P[i + 2]) * t;
+    let nx = N[i] + (N[j] - N[i]) * t;
+    let ny = N[i + 1] + (N[j + 1] - N[i + 1]) * t;
+    let nz = N[i + 2] + (N[j + 2] - N[i + 2]) * t;
+    const L = Math.hypot(nx, ny, nz) || 1;
+    nor[o] = nx / L; nor[o + 1] = ny / L; nor[o + 2] = nz / L;
+  }
+
+  return {
+    RAMPS: RAMPS,
+    rampById: rampById,
+    rampTexels: rampTexels,
+    rampCss: rampCss,
+    STYLES: STYLES,
+    styleById: styleById,
+    drawCalls: drawCalls,
+    splitInt: splitInt,
+    gridLayout: gridLayout,
+    gridChoices: gridChoices,
+    faceCount: faceCount,
+    vertCount: vertCount,
+    groupInt: groupInt,
+    fmtMs: fmtMs,
+    fmtDeg: fmtDeg,
+    updateLines: updateLines
+  };
+})();
+if (typeof globalThis !== 'undefined') globalThis.AsteroidLab = AsteroidLab;
+  </script>
+
+  <script id="app">
+const html = htm.bind(React.createElement);
+const { useState, useRef, useEffect, useMemo, useCallback } = React;
+const A = Asteroid;
+const LAB = AsteroidLab;
+
+/* The one colour that is not in a colormap. This page has no theme switcher
+   and only exists dark, exactly as spaceship-6dof does, so there is nothing
+   for a readPalette() to react to. */
+const COL = { space: 0x05070b };
+
+const STYLE_IDS = LAB.STYLES.map((s) => s.id);
+
+/* Geometry parameters. Everything the module knows except radius, which does
+   nothing visible on a turntable that frames whatever it is given, and route,
+   which has only one value until the SDF route exists. */
+const DEF_P = {
+  seed: 1,
+  subdiv: 4,
+  aniso: A.DEFAULTS.aniso,
+  amp: A.DEFAULTS.amp,
+  freq: A.DEFAULTS.freq,
+  kind: A.DEFAULTS.kind,
+  octaves: A.DEFAULTS.octaves,
+  lacunarity: A.DEFAULTS.lacunarity,
+  gain: A.DEFAULTS.gain,
+  hybrid: A.DEFAULTS.hybrid,
+  warpAmp: A.DEFAULTS.warpAmp,
+  warpFreq: A.DEFAULTS.warpFreq,
+  count: A.DEFAULTS.count,
+  angMin: A.DEFAULTS.angMin,
+  angMax: A.DEFAULTS.angMax,
+  power: A.DEFAULTS.power,
+  depth: A.DEFAULTS.depth,
+  rimH: A.DEFAULTS.rimH,
+  rimW: A.DEFAULTS.rimW,
+  depthJitter: A.DEFAULTS.depthJitter
+};
+
+/* Style state: how many panes, in which order, which colormap, plus the knobs
+   of the passes that have any. None of these rebuild the rock. */
+const DEF_S = {
+  panes: 4,
+  order: STYLE_IDS.slice(),
+  ramp: 'neutral',
+  bands: 4,
+  outline: 0.012,    /* world units, so the line thins with distance */
+  wireLines: 'all'   /* 'all' every edge of the mesh, or 'silhouette' only */
+};
+
+/* Scene state: one key direction on a sphere, one weak hemisphere fill, and
+   the turntable speed. Shared by every pane, because a light that differed per
+   pane would make the comparison meaningless. */
+const DEF_SC = { azim: 38, elev: 32, keyI: 2.6, ambI: 0.32, spin: 0.22 };
+
+const R = A.RANGES;
+/* One scale for both crater-size thumbs, so the dual slider is a range on a
+   single axis. clampParams caps angMin at its own upper bound afterwards. */
+const ANG_LO = R.angMax[0], ANG_HI = R.angMax[1];
+
+const WIRE_MODE = { off: 0, always: 0, shadow: 1, contrast: 2 };
+
+/* How far the line pass is pulled towards the camera, in view-space units on a
+   body of radius one. The contour lies ON the surface, and at the outline it
+   lies exactly where the surface is edge-on to the eye, which is where a depth
+   buffer is at its least decisive: a fill triangle tilted almost parallel to
+   the view spans nearly its own length in depth, so it wins over the line in
+   patches and the outline comes out dashed. The fill already carries a
+   polygonOffset, but POLYGON_OFFSET_FILL is defined for polygons and does
+   nothing for LineSegments, so the bias has to sit in the line's own vertex
+   shader. Two hundredths is a fortieth of the body, invisible as a shift, and
+   a hundredth of the way to the far side, so the lines behind the rock stay
+   behind it. */
+const LINE_BIAS = 0.02;
+
+function fmt(x, d) { return Number.isFinite(x) ? x.toFixed(d == null ? 1 : d) : '-'; }
+
+/* ---- shaders ----------------------------------------------------------
+ *
+ * GLSL as string arrays in the house style rather than onBeforeCompile
+ * patches on stock materials: patching means string matching against
+ * three.js' own shader chunks and breaks on the next version bump, and none
+ * of these is longer than twenty lines.
+ *
+ * The whole lighting model is four lines and deliberately so. It is a key
+ * direction, a hemisphere term, and a SATURATING response 1 - exp(-x) rather
+ * than a clamp. The clamp is what one writes first and it is wrong here: at
+ * the default key of 2.6 everything past a normal-dot-light of 0.38 would
+ * flatten onto the top of the ramp, and the comparison between colormaps
+ * would become a comparison of two colours out of nine. The exponential
+ * never quite reaches the end, so the whole ramp stays in play at any
+ * intensity. */
+const LIGHT_GLSL = [
+  'uniform sampler2D uRamp;',
+  'uniform vec3 uLight;',
+  'uniform float uKey;',
+  'uniform float uAmb;',
+  'uniform float uBands;',
+  'float alShade(vec3 n, vec3 wn) {',
+  '  float d = max(0.0, dot(n, uLight)) * uKey;',
+  '  float h = (0.5 + 0.5 * wn.y) * uAmb;',
+  '  return clamp(1.0 - exp(-(d + h)), 0.0, 1.0);',
+  '}',
+  'float alBand(float s) {',
+  '  return uBands > 0.5 ? (floor(s * uBands) + 0.5) / uBands : s;',
+  '}'
+].join('\n');
+
+const RAMP_VS = [
+  'varying vec3 vViewPosition;',
+  'varying vec3 vNormalV;',
+  'varying vec3 vNormalW;',
+  'void main() {',
+  '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+  '  vViewPosition = -mv.xyz;',
+  '  vNormalV = normalMatrix * normal;',
+  '  vNormalW = mat3(modelMatrix) * normal;',
+  '  gl_Position = projectionMatrix * mv;',
+  '}'
+].join('\n');
+
+/* The flat normal is derived from the screen-space derivatives of the view
+   position, which is exactly what three's own flatShading does, down to the
+   sign convention of vViewPosition. That is why there is no toNonIndexed()
+   anywhere in this file: de-indexing would triple the memory and tear apart
+   the inverted-hull outline, which needs welded vertices to close up. */
+const RAMP_FS = [
+  'uniform float uFlat;',
+  LIGHT_GLSL,
+  'varying vec3 vViewPosition;',
+  'varying vec3 vNormalV;',
+  'varying vec3 vNormalW;',
+  'void main() {',
+  '  vec3 n = normalize(vNormalV);',
+  '  if (uFlat > 0.5) n = normalize(cross(dFdx(vViewPosition), dFdy(vViewPosition)));',
+  '  float s = alBand(alShade(n, normalize(vNormalW)));',
+  '  gl_FragColor = vec4(texture2D(uRamp, vec2(s, 0.5)).rgb, 1.0);',
+  '}'
+].join('\n');
+
+/* The inverted hull. The offset happens in VIEW space, not in clip space.
+   View space is a rigid transform of world space, so a constant offset there
+   is a constant offset in metres: a rock twice as far away gets an outline
+   half as wide on the screen. A clip-space offset would give every rock the
+   same pixel width, which is the comic-book look and the wrong one for a
+   receding corridor. */
+const OUTLINE_VS = [
+  'uniform float uWidth;',
+  'void main() {',
+  '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+  '  mv.xyz += normalize(normalMatrix * normal) * uWidth;',
+  '  gl_Position = projectionMatrix * mv;',
+  '}'
+].join('\n');
+
+const OUTLINE_FS = 'void main() { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); }';
+
+/* The line pass. It carries the surface normal of its endpoints, so it can
+   run the same lighting model as the fill underneath and decide per fragment
+   whether it belongs there.
+ *
+ *   mode 0  a plain colour, the pure wireframe
+ *   mode 1  drawn only where the fill is dark, so the lit side stays a solid
+ *           body and the unlit side turns into a diagram of one
+ *   mode 2  the ramp looked up half a ramp away from what is underneath, so
+ *           the line always has contrast against its own background
+ *
+ * Half a ramp rather than the far end: 1 - s would put a line on a middle
+ * band back onto the middle band and make it vanish exactly where the shading
+ * is most interesting. Wrapping by 0.5 has no fixed point. */
+const LINE_VS = [
+  'uniform float uBias;',
+  'varying vec3 vNormalV;',
+  'varying vec3 vNormalW;',
+  'void main() {',
+  '  vNormalV = normalMatrix * normal;',
+  '  vNormalW = mat3(modelMatrix) * normal;',
+  /* View space looks down -z, so adding moves towards the eye. The offset is
+     applied before the projection, so it is constant in DEPTH rather than in
+     the nonlinear z the buffer stores, and therefore the same everywhere on
+     the screen instead of collapsing to nothing near the far plane. */
+  '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+  '  mv.z += uBias;',
+  '  gl_Position = projectionMatrix * mv;',
+  '}'
+].join('\n');
+
+const LINE_FS = [
+  'uniform float uMode;',
+  'uniform float uCut;',
+  'uniform vec3 uColor;',
+  LIGHT_GLSL,
+  'varying vec3 vNormalV;',
+  'varying vec3 vNormalW;',
+  'void main() {',
+  '  vec3 n = normalize(vNormalV);',
+  '  float s = alShade(n, normalize(vNormalW));',
+  '  if (uMode > 1.5) {',
+  '    float b = alBand(s);',
+  '    float c = b < 0.5 ? b + 0.5 : b - 0.5;',
+  '    gl_FragColor = vec4(texture2D(uRamp, vec2(c, 0.5)).rgb, 1.0);',
+  '  } else {',
+  '    if (uMode > 0.5 && s > uCut) discard;',
+  '    gl_FragColor = vec4(uColor, 1.0);',
+  '  }',
+  '}'
+].join('\n');
+
+/* ---- small components ------------------------------------------------- */
+
+function Slider(props) {
+  return html`<div className="al-row">
+    <label>${props.label}</label>
+    <output>${props.text != null ? props.text : fmt(props.value, props.digits)}</output>
+    <input type="range" min=${props.min} max=${props.max} step=${props.step} value=${props.value}
+      onInput=${(e) => props.onChange(parseFloat(e.target.value))} />
+  </div>`;
+}
+
+/* Two thumbs on one axis for the two ends of one quantity, which is the
+   textbook case for the shared .dual-range. The markup is the block from
+   namenfinder.html; everything about how it looks lives in custom.css. */
+function DualRange({ label, lo, hi, min, max, step, fmtVal, onChange }) {
+  const pLo = ((lo - min) / (max - min)) * 100;
+  const pHi = ((hi - min) / (max - min)) * 100;
+  const near = pHi - pLo < 8;
+  return html`<div style=${{ margin: '10px 0 4px' }}>
+    <div className="al-row" style=${{ margin: 0 }}>
+      <label>${label}</label>
+      <output>${fmtVal(lo)} to ${fmtVal(hi)}</output>
+    </div>
+    <div className="dual-range" style=${{ margin: '2px 10px 0', '--dual-ring': 'var(--tool-surface)' }}>
+      <div className="dual-track">
+        <div className="dual-fill" style=${{ left: `${pLo}%`, right: `${100 - pHi}%` }} />
+      </div>
+      <input type="range" className="dual-thumb" min=${min} max=${max} step=${step} value=${lo}
+        onInput=${(e) => onChange(Math.min(parseFloat(e.target.value), hi - step), hi)}
+        style=${{ zIndex: near ? 5 : 3 }} />
+      <div className="dual-dot" style=${{ left: `${pLo}%`, zIndex: near ? 5 : 3 }} />
+      <input type="range" className="dual-thumb" min=${min} max=${max} step=${step} value=${hi}
+        onInput=${(e) => onChange(lo, Math.max(parseFloat(e.target.value), lo + step))}
+        style=${{ zIndex: 4 }} />
+      <div className="dual-dot" style=${{ left: `${pHi}%`, zIndex: 4 }} />
+    </div>
+  </div>`;
+}
+
+function SegRow({ label, options, value, onPick }) {
+  return html`<${React.Fragment}>
+    ${label ? html`<span className="al-seg-l">${label}</span>` : null}
+    <div className="al-seg seg-row">
+      ${options.map((o) => html`<button type="button" key=${String(o.value)}
+        className=${'lang-seg' + (o.value === value ? ' active' : '')}
+        onClick=${() => onPick(o.value)}>${o.label}</button>`)}
+    </div>
+  <//>`;
+}
+
+function RampPicker({ value, onPick }) {
+  return html`<div className="al-ramps">
+    ${LAB.RAMPS.map((r) => html`<button type="button" key=${r.id}
+      className=${'al-ramp' + (r.id === value ? ' active' : '')}
+      onClick=${() => onPick(r.id)}>
+      <span>${r.name}</span>
+      <i style=${{ background: LAB.rampCss(r.stops) }} />
+    </button>`)}
+  </div>`;
+}
+
+/* One section open at a time. The collapsed header keeps showing what is
+   inside it, so a folded section hides its controls and not its setting. */
+function Section({ id, title, summary, open, onToggle, children }) {
+  return html`<div className="al-acc">
+    <button type="button" className=${'al-acc-h' + (open ? ' open' : '')}
+      aria-expanded=${open} onClick=${() => onToggle(id)}>
+      <span>${title}</span>
+      ${!open && summary ? html`<span className="al-acc-s">${summary}</span>` : null}
+      <span className="al-acc-c">${open ? '−' : '+'}</span>
+    </button>
+    ${open ? html`<div className="al-acc-b">${children}</div>` : null}
+  </div>`;
+}
+
+/* ---- three.js helpers ------------------------------------------------- */
+
+function buildGeometry(THREE, res) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(res.positions, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(res.normals, 3));
+  g.setIndex(new THREE.BufferAttribute(res.indices, 1));
+  g.computeBoundingSphere();
+  return g;
+}
+
+function makeRampTexture(THREE, id) {
+  const r = LAB.rampById(id);
+  const tex = new THREE.DataTexture(LAB.rampTexels(r.stops, 256), 256, 1);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  tex.userData.ramp = id;
+  return tex;
+}
+
+
+/* One scene per style, because they need different objects, but the GEOMETRY
+   they draw is the same BufferGeometry instance and the camera is the same
+   camera. That identity is the entire value of the tool, so setGeometry hands
+   the same object to every view rather than each view building its own; a view
+   never disposes it, only what it derived from it.
+ *
+ * That holds for the two LAYERS inside a pane as well, and it did not at
+ * first: the line pass used to draw from a coarser rock of its own, so the
+ * lines in a combined style ran across facets they did not belong to and the
+ * pane read as two objects in the same place. One mesh, both layers. A
+ * wireframe of five thousand triangles is indeed a felt of lines, but the cure
+ * for that is the shape subdivision, which lowers it for every pane at once
+ * and leaves them comparable. */
+function makeView(THREE, id, sty) {
+  const style = LAB.styleById(id);
+  const scene = new THREE.Scene();
+  const group = new THREE.Group();
+  scene.add(group);
+
+  let ramp = makeRampTexture(THREE, sty.ramp);
+  const common = () => ({
+    uRamp: { value: ramp },
+    uLight: { value: new THREE.Vector3(0, 0, 1) },
+    uKey: { value: DEF_SC.keyI },
+    uAmb: { value: DEF_SC.ambI },
+    uBands: { value: style.banded ? sty.bands : 0 }
+  });
+
+  let mat = null, mesh = null, outMat = null, outline = null;
+  let lineMat = null, lines = null, occlMat = null, occl = null;
+
+  if (style.base === 'ramp') {
+    mat = new THREE.ShaderMaterial({
+      uniforms: Object.assign(common(), { uFlat: { value: style.flat ? 1 : 0 } }),
+      vertexShader: RAMP_VS,
+      fragmentShader: RAMP_FS
+    });
+    /* Where lines are drawn over the fill, the fill is pushed a hair away
+       from the camera or it fights the very lines it is there to support.
+       Same reason and the same numbers as the black occluder below. */
+    if (style.wire !== 'off') {
+      mat.polygonOffset = true;
+      mat.polygonOffsetFactor = 1.5;
+      mat.polygonOffsetUnits = 1.5;
+    }
+    mesh = new THREE.Mesh(new THREE.BufferGeometry(), mat);
+    group.add(mesh);
+  }
+
+  if (style.outline) {
+    outMat = new THREE.ShaderMaterial({
+      uniforms: { uWidth: { value: sty.outline } },
+      vertexShader: OUTLINE_VS,
+      fragmentShader: OUTLINE_FS,
+      side: THREE.BackSide
+    });
+    outline = new THREE.Mesh(new THREE.BufferGeometry(), outMat);
+    group.add(outline);
+  }
+
+  if (style.wire !== 'off') {
+    lineMat = new THREE.ShaderMaterial({
+      uniforms: Object.assign(common(), {
+        uMode: { value: WIRE_MODE[style.wire] },
+        uBias: { value: LINE_BIAS },
+        uCut: { value: 0.35 },
+        uColor: { value: new THREE.Color(0.85, 0.82, 0.78) }
+      }),
+      vertexShader: LINE_VS,
+      fragmentShader: LINE_FS
+    });
+    lines = new THREE.LineSegments(new THREE.BufferGeometry(), lineMat);
+    lines.frustumCulled = false;
+    group.add(lines);
+
+    if (style.base === 'none') {
+      /* Hidden-line removal the way Elite did it once it had the memory:
+         fill the faces in the background colour so they occlude the lines
+         behind them. The colour is built from components, not from a hex
+         literal: three.js runs hex input through colour management and this
+         surface must be exactly the void it stands in front of. */
+      occlMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0, 0, 0), side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: 1.5, polygonOffsetUnits: 1.5
+      });
+      occl = new THREE.Mesh(new THREE.BufferGeometry(), occlMat);
+      occl.renderOrder = -1;
+      group.add(occl);
+    }
+  }
+
+  /* Scratch buffers for the line pass, sized to the worst case of "every edge
+     survives" and then used with a drawRange. Reallocating them per frame
+     would hand the garbage collector a megabyte a second. */
+  let scratch = null, lineSrc = null;
+
+  function setGeometry(geo) {
+    if (mesh) mesh.geometry = geo;
+    if (outline) outline.geometry = geo;
+  }
+
+  function setWireSource(src, geo) {
+    lineSrc = src;
+    if (occl) occl.geometry = geo;
+    if (!lines) return;
+    /* The all-edges pass writes one segment per edge, the contour pass at most
+       one per triangle, and E = 3F/2 on a closed mesh, so the edge count is
+       the larger of the two and sizes the buffer on its own. */
+    const cap = src.edges.count;
+    const verts = src.positions.length / 3;
+    if (!scratch || scratch.cap < cap) {
+      scratch = {
+        cap: cap,
+        positions: new Float32Array(cap * 6),
+        normals: new Float32Array(cap * 6),
+        g: new Float32Array(verts)
+      };
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(scratch.positions, 3));
+      g.setAttribute('normal', new THREE.BufferAttribute(scratch.normals, 3));
+      const old = lines.geometry;
+      lines.geometry = g;
+      if (old) old.dispose();
+    } else if (scratch.g.length < verts) {
+      scratch.g = new Float32Array(verts);
+    }
+  }
+
+  function apply(s, scn) {
+    if (ramp.userData.ramp !== s.ramp) {
+      const old = ramp;
+      ramp = makeRampTexture(THREE, s.ramp);
+      if (mat) mat.uniforms.uRamp.value = ramp;
+      if (lineMat) lineMat.uniforms.uRamp.value = ramp;
+      old.dispose();
+    }
+    const bands = style.banded ? s.bands : 0;
+    if (mat) {
+      mat.uniforms.uBands.value = bands;
+      mat.uniforms.uKey.value = scn.keyI;
+      mat.uniforms.uAmb.value = scn.ambI;
+    }
+    if (lineMat) {
+      lineMat.uniforms.uBands.value = bands;
+      lineMat.uniforms.uKey.value = scn.keyI;
+      lineMat.uniforms.uAmb.value = scn.ambI;
+      /* The line colour is the bright end of the same colormap rather than a
+         constant: a wireframe in a colour that appears nowhere else would
+         decide the comparison between the maps on its own. */
+      const t = LAB.rampById(s.ramp).stops[7];
+      lineMat.uniforms.uColor.value.setRGB(t[0], t[1], t[2]);
+    }
+    if (outMat) outMat.uniforms.uWidth.value = s.outline;
+  }
+
+  /* Per frame, and only for a view that is about to be drawn. */
+  function frame(ctx) {
+    if (mat) mat.uniforms.uLight.value.copy(ctx.lightView);
+    if (lineMat) {
+      lineMat.uniforms.uLight.value.copy(ctx.lightView);
+      /* "Lines in shadow" is a statement about the INTERIOR structure of the
+         rock, not about its outline. Applied to the contour it eats exactly
+         the half of the outline that faces the key, and the body loses its
+         shape on its lit side, which is the side one was looking at. So in
+         contour mode the shadow rule is off and the line is drawn whole. */
+      if (style.wire === 'shadow') {
+        lineMat.uniforms.uMode.value = ctx.lines === 'all' ? WIRE_MODE.shadow : WIRE_MODE.always;
+      }
+    }
+    if (!lines || !lineSrc || !scratch) return 0;
+    const n = LAB.updateLines(lineSrc, ctx.eyeLocal, ctx.lines, scratch);
+    const g = lines.geometry;
+    g.attributes.position.needsUpdate = true;
+    g.attributes.normal.needsUpdate = true;
+    g.setDrawRange(0, n * 2);
+    return n;
+  }
+
+  function dispose() {
+    if (lines && lines.geometry) lines.geometry.dispose();
+    if (mat) mat.dispose();
+    if (outMat) outMat.dispose();
+    if (lineMat) lineMat.dispose();
+    if (occlMat) occlMat.dispose();
+    if (ramp) ramp.dispose();
+  }
+
+  return { id, style, scene, group, setGeometry, setWireSource, apply, frame, dispose };
+}
+
+function App() {
+  const [ready, setReady] = useState(() => !!(typeof window !== 'undefined' && window.__alThreeReady));
+  const [p, setP] = useState(DEF_P);
+  const [sty, setSty] = useState(DEF_S);
+  const [scn, setScn] = useState(DEF_SC);
+  const [sec, setSec] = useState('shape');
+  const [panel, setPanel] = useState(true);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  const [stats, setStats] = useState({ tris: 0, verts: 0, ms: 0, rMin: 0, rMax: 0, edges: 0 });
+  const [err, setErr] = useState('');
+
+  const stageRef = useRef(null);
+  const sceneRef = useRef(null);
+  const cellsRef = useRef([]);
+  const panesRef = useRef(DEF_S.panes);
+  const orderRef = useRef(DEF_S.order);
+  const spinRef = useRef(DEF_SC.spin);
+  const wireRef = useRef(DEF_S.wireLines);
+  const lightRef = useRef({ azim: DEF_SC.azim, elev: DEF_SC.elev });
+  const backRef = useRef(DEF_S.panes);   /* pane count to return to from a solo pane */
+
+  const upd = useCallback((k) => (v) => setP((q) => ({ ...q, [k]: v })), []);
+  const updS = useCallback((k) => (v) => setSty((q) => ({ ...q, [k]: v })), []);
+  const updSc = useCallback((k) => (v) => setScn((q) => ({ ...q, [k]: v })), []);
+  const toggleSec = useCallback((id) => setSec((s) => (s === id ? '' : id)), []);
+  const shuffle = useCallback(() => {
+    setP((q) => ({ ...q, seed: Math.floor(Math.random() * 1000000) }));
+  }, []);
+
+  /* Bring a style to the front of the order. The panes show the first `panes`
+     entries of the order, so this is what a caption click does: at more than
+     one pane it goes solo on that style, at one pane it returns to the grid
+     it came from. */
+  const focusStyle = useCallback((id) => {
+    setSty((q) => {
+      const order = [id].concat(q.order.filter((x) => x !== id));
+      if (q.panes === 1) return { ...q, order, panes: backRef.current };
+      backRef.current = q.panes;
+      return { ...q, order, panes: 1 };
+    });
+  }, []);
+
+  useEffect(() => {
+    if (ready) return undefined;
+    const on = () => setReady(true);
+    window.addEventListener('al-three-ready', on, { once: true });
+    return () => window.removeEventListener('al-three-ready', on);
+  }, [ready]);
+
+  const visible = useMemo(
+    () => sty.order.filter((id) => LAB.styleById(id)).slice(0, sty.panes),
+    [sty.order, sty.panes]
+  );
+  const cells = useMemo(
+    () => (size.w > 0 && size.h > 0 ? LAB.gridLayout(size.w, size.h, visible.length) : []),
+    [size.w, size.h, visible.length]
+  );
+  const anyWire = useMemo(
+    () => visible.some((id) => LAB.styleById(id).wire !== 'off'),
+    [visible]
+  );
+
+  /* Refs the render loop reads, kept in step with the state that the panel
+     writes. The loop must not close over state, or it would need rebuilding
+     on every slider tick. */
+  useEffect(() => { cellsRef.current = cells; }, [cells]);
+  useEffect(() => { orderRef.current = visible; panesRef.current = visible.length; }, [visible]);
+  useEffect(() => { spinRef.current = scn.spin; }, [scn.spin]);
+  useEffect(() => { wireRef.current = sty.wireLines; }, [sty.wireLines]);
+  useEffect(() => { lightRef.current = { azim: scn.azim, elev: scn.elev }; }, [scn.azim, scn.elev]);
+
+  /* ---- the scene and the loop ------------------------------------------
+     Built once. Every mesh starts with an empty geometry and the rebuild
+     effect below swaps a real one in, so the parameters never touch this
+     effect and moving a slider does not tear the renderer down and build it
+     again. */
+  useEffect(() => {
+    if (!ready || !stageRef.current) return undefined;
+    const THREE = window.THREE;
+    const OrbitControls = window.AL_OrbitControls;
+    const host = stageRef.current;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setClearColor(COL.space, 1);
+    /* One context, one canvas, n viewports. The obvious alternative, one
+       canvas per style, fails on two counts: browsers cap live WebGL contexts
+       at eight to sixteen and silently kill the oldest, and contexts share no
+       resources, so the same rock would be uploaded once per pane and the
+       claim that all panes draw the same mesh would stop being true. */
+    renderer.setScissorTest(true);
+    host.appendChild(renderer.domElement);
+
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
+    camera.position.set(2.1, 1.25, 2.6);
+
+    const views = STYLE_IDS.map((id) => makeView(THREE, id, DEF_S));
+    const byId = {};
+    views.forEach((v) => { byId[v.id] = v; });
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enablePan = false;
+    controls.minDistance = 1.4;
+    controls.maxDistance = 14;
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    const resize = () => {
+      const w = host.clientWidth || window.innerWidth;
+      const h = host.clientHeight || window.innerHeight;
+      renderer.setSize(w, h, false);
+      /* Lay the grid out here as well as in the component. The state round
+         trip costs a frame, and on the very first one there would otherwise
+         be no cells at all and the screen would stay black until React caught
+         up. */
+      cellsRef.current = LAB.gridLayout(w, h, panesRef.current);
+      setSize({ w, h });
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    const lightWorld = new THREE.Vector3();
+    const lightView = new THREE.Vector3();
+    const eyeWorld = new THREE.Vector3();
+    const eyeLocalV = new THREE.Vector3();
+    const eyeLocal = [0, 0, 0];
+    const ctx = { lightView: lightView, eyeLocal: eyeLocal, lines: 'all' };
+    const S = { THREE, renderer, camera, views, byId, controls, geo: null, lines: 0 };
+
+    /* The rock spins, not the camera. Orbiting the camera around a world-fixed
+       light would leave the terminator painted on the same spot of the surface
+       and only change which side is visible; turning the body under a fixed
+       light is what sweeps the shading across every facet, which is the entire
+       point of looking at it. Every pane turns by the same angle, so the panes
+       stay comparable frame by frame. */
+    let raf = 0, last = 0, ang = 0;
+    const frame = (ts) => {
+      raf = requestAnimationFrame(frame);
+      const dt = last ? Math.min(0.1, (ts - last) / 1000) : 0;
+      last = ts;
+      ang += dt * spinRef.current;
+      views.forEach((v) => { v.group.rotation.y = ang; });
+      controls.update();
+
+      const L = lightRef.current;
+      const a = L.azim * Math.PI / 180, e = L.elev * Math.PI / 180;
+      lightWorld.set(Math.cos(e) * Math.sin(a), Math.sin(e), Math.cos(e) * Math.cos(a));
+      /* The shader wants the light in VIEW space, because that is where its
+         normal lives. transformDirection ignores the translation, which is
+         what a direction wants. */
+      lightView.copy(lightWorld).transformDirection(camera.matrixWorldInverse);
+
+      camera.getWorldPosition(eyeWorld);
+      ctx.lines = wireRef.current;
+
+      const cs = cellsRef.current, ids = orderRef.current;
+      let lineCount = 0;
+      for (let i = 0; i < cs.length && i < ids.length; i++) {
+        const c = cs[i], v = byId[ids[i]];
+        if (!v) continue;
+        /* The eye in the ROCK's frame, so the silhouette test needs no
+           per-vertex transform at all: the turntable rotation is already in
+           the inverse world matrix. */
+        v.group.updateWorldMatrix(true, false);
+        eyeLocalV.copy(eyeWorld);
+        v.group.worldToLocal(eyeLocalV);
+        eyeLocal[0] = eyeLocalV.x; eyeLocal[1] = eyeLocalV.y; eyeLocal[2] = eyeLocalV.z;
+        lineCount += v.frame(ctx);
+        /* Aspect per cell, or a tall pane squashes the rock. The camera is
+           shared, so this is set inside the loop rather than once outside. */
+        camera.aspect = c.w / c.h;
+        camera.updateProjectionMatrix();
+        renderer.setViewport(c.x, c.y, c.w, c.h);
+        renderer.setScissor(c.x, c.y, c.w, c.h);
+        renderer.render(v.scene, camera);
+      }
+      S.lines = lineCount;
+    };
+
+    sceneRef.current = S;
+    raf = requestAnimationFrame(frame);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+      controls.dispose();
+      views.forEach((v) => v.dispose());
+      if (S.geo) S.geo.dispose();
+      renderer.dispose();
+      if (renderer.domElement.parentNode === host) host.removeChild(renderer.domElement);
+      sceneRef.current = null;
+    };
+  }, [ready]);
+
+  /* ---- the rebuild -----------------------------------------------------
+     Route "ico" at subdivision 4 is a couple of milliseconds, so this runs
+     synchronously on every input with no debounce, and the measured time is on
+     the panel so it is visible when a level stops being cheap. The old
+     geometry is disposed on the way out: without that, dragging a slider leaks
+     one buffer set per tick straight into the GPU.
+
+     The wire source is built here too. At the main subdivision it IS the main
+     mesh, arrays and all; below it, a second and coarser rock from the same
+     parameters. Its edge table is computed once here rather than per frame;
+     only the silhouette test inside it is per frame, and that is the part that
+     genuinely cannot be cached. */
+  useEffect(() => {
+    const S = sceneRef.current;
+    if (!S) return;
+    let res;
+    try {
+      res = A.buildAsteroid({ route: 'ico', ...p });
+    } catch (e) {
+      setErr(String((e && e.message) || e));
+      return;
+    }
+    const geo = buildGeometry(S.THREE, res);
+    const edges = A.edgeTable(res.positions, res.indices);
+    const src = {
+      positions: res.positions,
+      normals: res.normals,
+      indices: res.indices,
+      edges: edges
+    };
+
+    const oldGeo = S.geo;
+    S.geo = geo;
+    S.views.forEach((v) => { v.setGeometry(geo); v.setWireSource(src, geo); });
+    if (oldGeo) oldGeo.dispose();
+
+    setErr('');
+    setStats({
+      tris: res.tris,
+      verts: res.positions.length / 3,
+      ms: res.ms,
+      rMin: res.rMin,
+      rMax: res.rMax,
+      edges: edges.count
+    });
+  }, [ready, p.seed, p.subdiv, p.aniso, p.amp, p.freq, p.kind, p.octaves,
+      p.lacunarity, p.gain, p.hybrid, p.warpAmp, p.warpFreq, p.count, p.angMin, p.angMax,
+      p.power, p.depth, p.rimH, p.rimW, p.depthJitter]);
+
+  /* Style and scene are pure material and light state, so they get their own
+     effect and never touch the geometry. That separation is what makes the
+     panes honest: no setting outside the Shape, Noise and Craters sections can
+     change the mesh, and nothing in them can change only one pane. */
+  useEffect(() => {
+    const S = sceneRef.current;
+    if (!S) return;
+    S.views.forEach((v) => v.apply(sty, scn));
+  }, [ready, sty.ramp, sty.bands, sty.outline, scn.keyI, scn.ambI]);
+
+  const shapeSummary = LAB.groupInt(LAB.faceCount(p.subdiv)) + ' tris, seed ' + p.seed;
+  const noiseSummary = p.kind + ', ' + p.octaves + ' oct' + (p.warpAmp > 0 ? ', warped' : '');
+  const craterSummary = p.count + ' craters, ' + LAB.fmtDeg(p.angMin) + ' to ' + LAB.fmtDeg(p.angMax);
+  const styleSummary = LAB.rampById(sty.ramp).name + ', ' + visible.length + ' panes';
+  const sceneSummary = 'key ' + fmt(scn.keyI, 1) + ', fill ' + fmt(scn.ambI, 2);
+  const front = LAB.styleById(sty.order[0]);
+
+  return html`<${React.Fragment}>
+    <div className="al-stage" ref=${stageRef}></div>
+
+    <div className="al-cells">
+      ${cells.map((c, i) => {
+        const s = LAB.styleById(visible[i]);
+        if (!s) return null;
+        return html`<div key=${s.id} className="al-cell"
+          style=${{ left: c.x, top: c.top, width: c.w, height: c.h }}>
+          <button type="button" className="al-cap" onClick=${() => focusStyle(s.id)}
+            title=${sty.panes === 1 ? 'Back to the grid' : 'Show this one alone'}>${s.label}</button>
+        </div>`;
+      })}
+    </div>
+
+    <a className="al-back" href="/">${'←'} alber.me</a>
+
+    ${!ready ? html`<div className="al-msg">Loading three.js<//>` : null}
+    ${err ? html`<div className="al-msg">${err}<//>` : null}
+
+    ${!panel ? html`<button className="al-toggle" onClick=${() => setPanel(true)}>Controls</button>` : html`
+    <div className="al-panel">
+      <div className="al-head">
+        <h2>Asteroid</h2>
+        <button className="al-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
+      </div>
+
+      <${Section} id="shape" title="Shape" summary=${shapeSummary}
+        open=${sec === 'shape'} onToggle=${toggleSec}>
+
+        <div className="al-seed">
+          <label htmlFor="al-seed-in">Seed</label>
+          <input id="al-seed-in" className="tool-input tool-input-sm" type="number"
+            min=${R.seed[0]} max=${R.seed[1]} step="1" value=${p.seed}
+            onInput=${(e) => {
+              const v = parseInt(e.target.value, 10);
+              upd('seed')(Number.isFinite(v) ? v : 0);
+            }} />
+          <button type="button" className="tool-btn tool-btn-sm" onClick=${shuffle}>Shuffle</button>
+        </div>
+
+        <${Slider} label="Subdivision" value=${p.subdiv}
+          min=${R.subdiv[0]} max=${5} step=${1}
+          text=${p.subdiv + ' (' + LAB.groupInt(LAB.faceCount(p.subdiv)) + ' tris)'}
+          onChange=${(v) => upd('subdiv')(Math.round(v))} />
+
+        <${Slider} label="Anisotropy" value=${p.aniso}
+          min=${R.aniso[0]} max=${R.aniso[1]} step=${0.02} digits=${2}
+          onChange=${upd('aniso')} />
+
+        <p className="al-note">The rock is a subdivided icosphere pushed around by seeded Perlin
+          noise and then cratered. Anisotropy stretches the three axes against each other and
+          keeps their product at one, so it changes the shape and not the size. This route is a
+          star-shaped surface: no overhangs, no caves, no crater deeper than the local radius.</p>
+      <//>
+
+      <${Section} id="noise" title="Noise" summary=${noiseSummary}
+        open=${sec === 'noise'} onToggle=${toggleSec}>
+
+        <${SegRow} label="Basis" value=${p.kind}
+          options=${A.NOISE_KINDS.map((k) => ({ value: k, label: k === 'fbm' ? 'fBm' : (k === 'ridged' ? 'Ridged' : 'Hybrid') }))}
+          onPick=${upd('kind')} />
+
+        <${Slider} label="Amplitude" value=${p.amp}
+          min=${R.amp[0]} max=${R.amp[1]} step=${0.005} digits=${3}
+          onChange=${upd('amp')} />
+        <${Slider} label="Frequency" value=${p.freq}
+          min=${R.freq[0]} max=${R.freq[1]} step=${0.05} digits=${2}
+          onChange=${upd('freq')} />
+        <${Slider} label="Octaves" value=${p.octaves}
+          min=${R.octaves[0]} max=${R.octaves[1]} step=${1} text=${String(p.octaves)}
+          onChange=${(v) => upd('octaves')(Math.round(v))} />
+        ${p.kind === 'hybrid' ? html`<${Slider} label="Ridge mix" value=${p.hybrid}
+          min=${R.hybrid[0]} max=${R.hybrid[1]} step=${0.02} digits=${2}
+          onChange=${upd('hybrid')} />` : null}
+
+        <${Slider} label="Domain warp" value=${p.warpAmp}
+          min=${R.warpAmp[0]} max=${R.warpAmp[1]} step=${0.02} digits=${2}
+          onChange=${upd('warpAmp')} />
+        ${p.warpAmp > 0 ? html`<${Slider} label="Warp frequency" value=${p.warpFreq}
+          min=${R.warpFreq[0]} max=${R.warpFreq[1]} step=${0.05} digits=${2}
+          onChange=${upd('warpFreq')} />` : null}
+
+        <${Slider} label="Lacunarity" value=${p.lacunarity}
+          min=${R.lacunarity[0]} max=${R.lacunarity[1]} step=${0.01} digits=${2}
+          onChange=${upd('lacunarity')} />
+        <${Slider} label="Gain" value=${p.gain}
+          min=${R.gain[0]} max=${R.gain[1]} step=${0.01} digits=${2}
+          onChange=${upd('gain')} />
+
+        <p className="al-note">Plain fBm gives potatoes and only potatoes; ridged noise is where the
+          sharp fracture edges come from. The sum is normalised by the amplitude actually applied,
+          so the amplitude slider means the same thing at three octaves as at six. Domain warp is
+          the single biggest win against the blob impression and costs three times the noise, which
+          is why it is off by default.</p>
+      <//>
+
+      <${Section} id="craters" title="Craters" summary=${craterSummary}
+        open=${sec === 'craters'} onToggle=${toggleSec}>
+
+        <${Slider} label="Count" value=${p.count}
+          min=${R.count[0]} max=${80} step=${1} text=${String(p.count)}
+          onChange=${(v) => upd('count')(Math.round(v))} />
+
+        <${DualRange} label="Size" lo=${p.angMin} hi=${p.angMax}
+          min=${ANG_LO} max=${ANG_HI} step=${0.005} fmtVal=${LAB.fmtDeg}
+          onChange=${(lo, hi) => setP((q) => ({ ...q, angMin: Math.min(lo, R.angMin[1]), angMax: hi }))} />
+
+        <${Slider} label="Size skew" value=${p.power}
+          min=${R.power[0]} max=${R.power[1]} step=${0.05} digits=${2}
+          onChange=${upd('power')} />
+        <${Slider} label="Depth" value=${p.depth}
+          min=${R.depth[0]} max=${R.depth[1]} step=${0.002} digits=${3}
+          onChange=${upd('depth')} />
+        <${Slider} label="Rim height" value=${p.rimH}
+          min=${R.rimH[0]} max=${R.rimH[1]} step=${0.002} digits=${3}
+          onChange=${upd('rimH')} />
+        <${Slider} label="Rim width" value=${p.rimW}
+          min=${R.rimW[0]} max=${R.rimW[1]} step=${0.01} digits=${2}
+          onChange=${upd('rimW')} />
+
+        <p className="al-note">Every crater is a paraboloid bowl with a raised rim, because a bowl
+          on its own reads as a dent rather than an impact. Sizes follow a power law, many small
+          and few large, which is why real asteroids are not golf balls. The rims are the part
+          that undersamples first: at subdivision 4 a rim narrower than about 1.8 degrees is
+          thinner than one triangle and disappears, so raising the lower end of the size range is
+          what buys them back rather than widening them.</p>
+      <//>
+
+      <${Section} id="style" title="Styles" summary=${styleSummary}
+        open=${sec === 'style'} onToggle=${toggleSec}>
+
+        <${RampPicker} value=${sty.ramp} onPick=${updS('ramp')} />
+
+        <${SegRow} label="Panes" value=${sty.panes}
+          options=${LAB.gridChoices(STYLE_IDS.length).map((n) => ({ value: n, label: String(n) }))}
+          onPick=${(n) => { if (n > 1) backRef.current = n; updS('panes')(n); }} />
+
+        <${SegRow} label="First pane" value=${sty.order[0]}
+          options=${LAB.STYLES.map((s) => ({ value: s.id, label: s.label }))}
+          onPick=${(id) => setSty((q) => ({ ...q, order: [id].concat(q.order.filter((x) => x !== id)) }))} />
+
+        <${Slider} label="Bands" value=${sty.bands}
+          min=${2} max=${8} step=${1} text=${String(sty.bands)}
+          onChange=${(v) => updS('bands')(Math.round(v))} />
+        <${Slider} label="Outline width" value=${sty.outline}
+          min=${0} max=${0.05} step=${0.001} digits=${3}
+          onChange=${updS('outline')} />
+
+        ${anyWire ? html`<${React.Fragment}>
+          <${SegRow} label="Lines" value=${sty.wireLines}
+            options=${[{ value: 'all', label: 'All edges' },
+                       { value: 'silhouette', label: 'Silhouette' }]}
+            onPick=${updS('wireLines')} />
+        <//>` : null}
+
+        <p className="al-note">${front ? front.note : ''}</p>
+        <p className="al-note">Every pane draws the same buffer geometry under the same camera, so
+          a difference on the screen is a difference in the rendering, without exception: the lines
+          come off the same mesh as the shading under them, at the same subdivision. Every edge of
+          five thousand triangles is a felt of lines, so the Elite reading lives on the shape
+          subdivision, which lowers it for all panes at once and keeps them comparable. Click a
+          caption to show a style alone, click it again to come back.</p>
+      <//>
+
+      <${Section} id="scene" title="Scene" summary=${sceneSummary}
+        open=${sec === 'scene'} onToggle=${toggleSec}>
+
+        <${Slider} label="Key azimuth" value=${scn.azim}
+          min=${-180} max=${180} step=${1} text=${Math.round(scn.azim) + '°'}
+          onChange=${updSc('azim')} />
+        <${Slider} label="Key elevation" value=${scn.elev}
+          min=${-85} max=${85} step=${1} text=${Math.round(scn.elev) + '°'}
+          onChange=${updSc('elev')} />
+        <${Slider} label="Key intensity" value=${scn.keyI}
+          min=${0} max=${6} step=${0.05} digits=${2}
+          onChange=${updSc('keyI')} />
+        <${Slider} label="Fill intensity" value=${scn.ambI}
+          min=${0} max=${1.5} step=${0.01} digits=${2}
+          onChange=${updSc('ambI')} />
+        <${Slider} label="Spin" value=${scn.spin}
+          min=${0} max=${1.2} step=${0.01} digits=${2}
+          onChange=${updSc('spin')} />
+
+        <p className="al-note">One key direction and one weak hemisphere fill, shared by every
+          pane and evaluated in the shader rather than by a light object. The response saturates
+          instead of clamping, so turning the key up brightens the rock without ever pinning the
+          top of the colormap, and the whole ramp stays in play.</p>
+      <//>
+
+      <div className="al-derived">
+        <span>Triangles</span><b>${LAB.groupInt(stats.tris)}</b>
+        <span>Vertices</span><b>${LAB.groupInt(stats.verts)}</b>
+        <span>Radius</span><b>${fmt(stats.rMin, 2) + ' to ' + fmt(stats.rMax, 2)}</b>
+        <span>Wire edges</span><b>${LAB.groupInt(stats.edges)}</b>
+        <span>Build time</span><b className=${stats.ms > 25 ? 'hot' : ''}>${LAB.fmtMs(stats.ms)}</b>
+      </div>
+
+      <p className="al-note">Drag to orbit, wheel to zoom. Each kind of randomness has its own
+        stream, so raising the crater count adds craters and leaves the shape underneath exactly
+        where it was. The four colormaps are bone, gray, pink and copper, sampled out of
+        matplotlib rather than approximated.</p>
+    </div>`}
+  <//>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>
