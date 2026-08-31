@@ -9522,11 +9522,18 @@ var PCB = (function () {
     { k: 'trace', label: 'trace', title: 'Turn the reference image into dividing contours' },
     { k: 'drawFront', label: 'draw-front', title: 'Draw dividing lines on the front' },
     { k: 'matFront', label: 'mat-front', title: 'Paint the front areas with materials' },
+    /* The key stays 'parts' (it is in the keyboard handler, the tab dispatch and
+       every reference to this tab); only the label is the shop's name.
+
+       It sits directly after mat-front because that is the order of the work
+       now: draw the front, paint the front, place the parts, done. Since the
+       tool works the back copper out for itself, draw-back and mat-back are no
+       longer a step everyone takes, they are what you reach for when you want a
+       graphic on the back as well. So they moved behind the parts rather than
+       in front of them. */
+    { k: 'parts', label: 'blinky-parts', title: 'Place the LEDs, the battery holder and the button' },
     { k: 'drawBack', label: 'draw-back', title: 'Draw dividing lines on the back' },
     { k: 'matBack', label: 'mat-back', title: 'Paint the back areas with materials' },
-    /* The key stays 'parts' (it is in the keyboard handler, the tab dispatch and
-       every reference to this tab); only the label is the shop's name. */
-    { k: 'parts', label: 'blinky-parts', title: 'Place the LEDs, the battery holder and the button' },
     { k: 'drill', label: 'drill', title: 'Holes' },
     { k: 'check', label: 'check', title: 'Connectivity of the circuit and manufacturing checks' },
     { k: 'three', label: '3d-viz', title: 'The board as a lit three dimensional object, with the LEDs shining through it' },
@@ -9927,20 +9934,39 @@ var PCB = (function () {
     /* regionsForSide floods a 2.7 megapixel raster per side, so it runs 200ms
        after the last command and not once per keystroke. Until it returns, the
        tabs keep showing the previous bundle and say so. */
+    /* What the area pass actually READS: the dividing lines, the seed points and
+       the board rectangle. Not the parts, not the holes, not the reference
+       image. Hanging the effect on the whole document made a part drag rerun
+       two 2.7 megapixel floods per pointer frame for a result that cannot
+       differ, which is most of why the parts tab felt like treacle. Keyed on a
+       cheap identity rather than on a deep compare: the command engine gives
+       back a new array only when it changed one. */
+    const regionKey = [doc.objects, doc.seeds, doc.board.widthMm, doc.board.heightMm];
+
     useEffect(() => {
       const id = setTimeout(() => {
         try {
-          const front = PCB.regionsForSide(doc, 'front', {});
-          const back = PCB.regionsForSide(doc, 'back', {});
-          setBundles({ front: front, back: back, doc: doc });
+          const d = docRef.current;
+          const front = PCB.regionsForSide(d, 'front', {});
+          const back = PCB.regionsForSide(d, 'back', {});
+          /* `key` records WHICH region input this bundle was built from, not
+             the whole document. Comparing the document would call the bundle
+             stale after a part moved, which is wrong twice over: the areas did
+             not change, and the derivation downstream has to use the CURRENT
+             document, or the pads would lag a frame behind the copper. */
+          setBundles({ front: front, back: back, key: d.objects, seedKey: d.seeds });
         } catch (e) {
           setErr('The area pass failed: ' + (e && e.message ? e.message : 'unknown error'));
         }
       }, 200);
       return () => clearTimeout(id);
-    }, [doc]);
+      /* eslint-disable-next-line react-hooks/exhaustive-deps */
+    }, regionKey);
 
-    const stale = !bundles || bundles.doc !== doc;
+    /* Stale means "the AREAS are one edit behind", which is the only thing the
+       bundle carries. Moving a part does not make it stale, because the areas
+       do not depend on the parts; drawing a line does. */
+    const stale = !bundles || bundles.key !== doc.objects || bundles.seedKey !== doc.seeds;
 
     /* The PLAIN derivation: a solid back plane, exactly what this tool produced
        before the solver existed. The solver reads its copper mask, and it is
@@ -9950,11 +9976,11 @@ var PCB = (function () {
     const baseDerived = useMemo(() => {
       if (!bundles) return null;
       try {
-        return PCB.deriveLayers(bundles.doc, { regions: { front: bundles.front, back: bundles.back } });
+        return PCB.deriveLayers(doc, { regions: { front: bundles.front, back: bundles.back } });
       } catch (e) {
         return null;
       }
-    }, [bundles]);
+    }, [bundles, doc]);
 
     /* ---- the back copper solver ----
 
@@ -9977,44 +10003,68 @@ var PCB = (function () {
     useEffect(() => {
       if (!bundles || !baseDerived || !autoCopper) { setPartition(null); return undefined; }
       let cancelled = false;
-      setSolving(true);
-      /* Two frames of slack before the work starts, so the "working" line is
-         painted before the main thread is taken. One rAF is not enough: the
-         first only schedules the paint. No worker, because the core block has
-         to stay evaluable for the tests and this file has no worker plumbing. */
-      const go = () => requestAnimationFrame(() => {
+      let raf = 0;
+      /* Its own debounce, and a much longer one than the region flood's 200 ms.
+
+         The reason is a gesture: dragging a part fires one setParts per pointer
+         frame, so the document changes thirty times a second, and each change
+         would otherwise queue a second of copper solving whose result is stale
+         before it is painted. The tool became unusable on the parts tab exactly
+         that way. 600 ms is comfortably longer than the gap between two frames
+         of a drag and short enough not to feel like waiting after a click.
+
+         The flag goes up only when the timer fires, so the status line says
+         "working" while it IS working and not during the whole drag. */
+      const id = setTimeout(() => {
         if (cancelled) return;
-        try {
-          const p = PCB.solvePartition(bundles.doc, { derived: baseDerived });
-          if (!cancelled) setPartition({ sol: p, doc: bundles.doc });
-        } catch (e) {
-          if (!cancelled) {
-            setPartition(null);
-            setErr('The copper solver failed: ' + (e && e.message ? e.message : 'unknown error'));
+        setSolving(true);
+        /* Two frames of slack before the work starts, so the "working" line is
+           painted before the main thread is taken. One rAF is not enough: the
+           first only schedules the paint. No worker, because the core block has
+           to stay evaluable for the tests and this file has no worker
+           plumbing. */
+        raf = requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (cancelled) return;
+          try {
+            const p = PCB.solvePartition(docRef.current, { derived: baseDerived });
+            if (!cancelled) setPartition({ sol: p, doc: docRef.current });
+          } catch (e) {
+            if (!cancelled) {
+              setPartition(null);
+              setErr('The copper solver failed: ' + (e && e.message ? e.message : 'unknown error'));
+            }
           }
-        }
-        if (!cancelled) setSolving(false);
-      });
-      const id = requestAnimationFrame(go);
-      return () => { cancelled = true; cancelAnimationFrame(id); setSolving(false); };
-    }, [bundles, baseDerived, autoCopper]);
+          if (!cancelled) setSolving(false);
+        }));
+      }, 600);
+      return () => {
+        cancelled = true;
+        clearTimeout(id);
+        if (raf) cancelAnimationFrame(raf);
+        setSolving(false);
+      };
+    }, [baseDerived, autoCopper]);
 
     /* The derivation everything downstream sees. Falls back to the plain one
        while the solve runs, so the preview never goes blank. */
     const derived = useMemo(() => {
       if (!baseDerived) return null;
-      if (!partition || partition.doc !== (bundles && bundles.doc)) return baseDerived;
+      if (!partition || partition.doc !== doc) return baseDerived;
       try {
-        return PCB.deriveLayers(bundles.doc, {
+        return PCB.deriveLayers(doc, {
           regions: { front: bundles.front, back: bundles.back },
           partition: partition.sol
         });
       } catch (e) {
         return baseDerived;
       }
-    }, [baseDerived, partition, bundles]);
+    }, [baseDerived, partition, bundles, doc]);
 
-    const solution = (partition && bundles && partition.doc === bundles.doc) ? partition.sol : null;
+    /* The solve belongs to the document it was made from. After any edit it is
+       one step behind, and everything downstream then shows the plain plane and
+       says so rather than a picture of the copper for a board that no longer
+       exists. */
+    const solution = (partition && partition.doc === doc) ? partition.sol : null;
 
     const lineMap = useMemo(() => {
       const m = {};
@@ -10190,7 +10240,7 @@ var PCB = (function () {
       if (tab !== 'check' || !derived || !bundles) { return undefined; }
       const id = setTimeout(() => {
         try {
-          setConn(PCB.connectivity(bundles.doc, { derived: derived }));
+          setConn(PCB.connectivity(doc, { derived: derived }));
         } catch (e) {
           setConn(null);
           setErr('The connectivity check failed: ' + (e && e.message ? e.message : 'unknown error'));
@@ -11140,7 +11190,7 @@ var PCB = (function () {
          one moment it is no longer needed. */
       requestAnimationFrame(() => setTimeout(() => {
         try {
-          setDrcRes(PCB.drc(bundles.doc, limitsFromDraft(limDraft), { derived: derived }));
+          setDrcRes(PCB.drc(doc, limitsFromDraft(limDraft), { derived: derived }));
           setErr('');
         } catch (e) {
           setErr('The design checks failed: ' + (e && e.message ? e.message : 'unknown error'));
@@ -11275,7 +11325,7 @@ var PCB = (function () {
     function exportGerber() {
       if (!derived) { setErr('The area pass is still running. One moment.'); return; }
       try {
-        const files = PCB.exportFileSet(bundles.doc, {
+        const files = PCB.exportFileSet(doc, {
           project: 'pcb-art', date: isoStamp(),
           derived: derived, regions: { front: bundles.front, back: bundles.back }
         });
@@ -11294,7 +11344,7 @@ var PCB = (function () {
     function exportKicad() {
       if (!derived) { setErr('The area pass is still running. One moment.'); return; }
       try {
-        const files = PCB.kicadFileSet(bundles.doc, {
+        const files = PCB.kicadFileSet(doc, {
           project: 'pcb-art', date: isoStamp(),
           derived: derived, regions: { front: bundles.front, back: bundles.back }
         });
@@ -13180,8 +13230,12 @@ var PCB = (function () {
           <ol className="pcb-steps">
             <li>Set the board size on config, then load a picture on image and place it over the board.</li>
             <li>trace turns the picture into dividing contours, and the largest one becomes the board outline.</li>
-            <li>Draw whatever the trace did not catch on draw-front and draw-back, then click the areas on mat-front and
-              mat-back to say what each one is made of, and download the Gerber zip on export.</li>
+            <li>Draw whatever the trace did not catch on draw-front, then click the areas on mat-front to say
+              what each one is made of.</li>
+            <li>Place the LEDs, the cell holder and the button on blinky-parts. The back copper is worked out
+              from where you put them, so there is nothing to wire, and check says whether it came out right.</li>
+            <li>draw-back and mat-back are for a graphic on the back as well, which most boards do not need.
+              Download the Gerber zip on export.</li>
           </ol>
           <p>The model is a colouring book. Contours and strokes only divide the board into areas; they carry no material
             themselves. Every area is copper under soldermask by default, which is what a printed circuit board already is,
