@@ -87,6 +87,10 @@
     .ffd-stats b { color: var(--tool-text); font-weight: 600; font-variant-numeric: tabular-nums; }
 
     .ffd-wave { font-size: 12px; color: var(--tool-label); line-height: 1.7; }
+    /* Der Hinweis auf gefressene Gebaeude. Danger-Farbe, weil er eine Folge
+       meldet und keine Einstellung. */
+    .ffd-scarnote { margin: 8px 0 0; font-size: 12px; line-height: 1.55;
+      color: var(--tool-danger-text); }
     .ffd-wave b { color: var(--tool-text); font-weight: 600; }
     .ffd-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px;
       vertical-align: 0; background: var(--dot); }
@@ -338,8 +342,19 @@
        quadratic defence closely enough to stay interesting without turning the
        finale into a wall of health.
 
-       This is still an untuned game and nobody has played it to the end. What
-       the numbers are pinned to is the shape of the curve, not its exact
+       The flyer carries a further 70 percent on top of that, and it is the one
+       per type exception in the table. Measured on a built out corridor it
+       takes the MOST damage of all five, about 770 against the swarm's 180,
+       because ignoring the maze means flying straight over the densest cluster
+       of towers instead of around it. The thing that reads as its strength is
+       in fact its weakness, and without the correction its waves were the
+       easiest in the game. It is health rather than a behaviour change on
+       purpose: the flyer has to stay the degenerate case of the same solve.
+
+       This is still an untuned game. Played to wave 11 once, where damage was
+       taken only in waves 1, 7 and 11, and both close calls were breakers. So
+       the curve is roughly right and the spacing between its peaks is not.
+       What the numbers are pinned to is the shape of the curve, not its exact
        values. */
 
     var WAVE_PLAN = [
@@ -350,18 +365,18 @@
       [['runner', 16, 130], ['swarm', 12, 70]],
       [['breaker', 4, 430]],
       [['cautious', 12, 230], ['runner', 10, 200]],
-      [['flyer', 8, 245]],
+      [['flyer', 8, 415]],
       [['swarm', 24, 160], ['runner', 12, 320]],
       [['breaker', 6, 945], ['cautious', 10, 405]],
       [['runner', 20, 540]],
-      [['flyer', 12, 585], ['swarm', 20, 300]],
+      [['flyer', 12, 995], ['swarm', 20, 300]],
       [['cautious', 16, 860]],
       [['breaker', 8, 2115], ['runner', 16, 910]],
       [['swarm', 32, 570]],
-      [['flyer', 16, 1375], ['cautious', 14, 1470]],
+      [['flyer', 16, 2340], ['cautious', 14, 1470]],
       [['breaker', 10, 3900], ['swarm', 28, 850]],
       [['runner', 26, 2100], ['cautious', 18, 2160]],
-      [['flyer', 20, 2605], ['breaker', 10, 5925]],
+      [['flyer', 20, 4430], ['breaker', 10, 5925]],
       [['runner', 30, 3460], ['cautious', 20, 3460], ['breaker', 12, 7405], ['swarm', 36, 1585]]
     ];
 
@@ -431,6 +446,15 @@
         killed: 0,
         trace: new Float32Array(N),
         shells: [],               // mortar rounds in flight, see fireShell
+        /* Cells where a building was chewed away and nothing has been built
+           since. NOT cosmetic and therefore not in fx: a hole in the maze is
+           the most consequential thing a breaker does, and it does it silently.
+           Measured on a maze, one chewed wall cuts the next wave's expected
+           damage by about 60 percent and the route by a third, because the
+           whole detour behind it stops being a detour. The rubble effect lasts
+           0.7 seconds; the hole lasts until someone notices. This is what makes
+           it noticeable. */
+        scars: new Uint8Array(N),
         fx: [],                   // cosmetic only, see the effects section
         fxRand: splitmix32(((seed >>> 0) || 1) ^ 0x9e3779b9),
         history: [],              // build log, for undo
@@ -439,6 +463,15 @@
         solves: {}
       };
       return s;
+    }
+
+    /* How many holes are currently open. Counts only cells that are still
+       empty, so a rebuilt one drops out even if the flag was not cleared. */
+    function countScars(st) {
+      if (!st.scars) return 0;
+      var n = 0;
+      for (var i = 0; i < N; i++) if (st.scars[i] && st.towerAt[i] < 0) n++;
+      return n;
     }
 
     /* ---------- derived fields ---------- */
@@ -496,7 +529,7 @@
 
     /* ---------- the neighbourhood ----------
 
-       Eight neighbours, and the diagonal ones cost SQRT2 times as much.
+       Eight neighbours, and the diagonal ones cost DIAG_COST times as much.
 
        There is exactly one of these functions and five callers: the solve, the
        occupancy propagation, the step choice of a live unit, greedyPath and the
@@ -507,12 +540,14 @@
 
        Two rules make diagonals honest rather than an exploit.
 
-       The step is scaled by SQRT2, because the unit really does cross 1.41
-       cells and is therefore 1.41 times as long under fire. Without the factor
-       a diagonal costs the same as a straight step while covering more ground,
-       so every route degenerates into a staircase AND every tower delivers
-       about 30 percent less than the threat field promises. The mortar test
-       (29.9 against a stated 30) is the one that would catch it.
+       The step is scaled, and by two different numbers depending on who is
+       asking. The pathfinder pays DIAG_COST, the clock and the damage integral
+       use SQRT2, which is the distance actually covered; see the note at the
+       constants for why the two are not the same. Without any factor at all a
+       diagonal would cost the same as a straight step while covering more
+       ground, so every route would degenerate into a staircase AND every tower
+       would deliver about 30 percent less than the threat field promises. The
+       mortar test (29.9 against a stated 30) is the one that would catch it.
 
        A diagonal needs its whole 2x2 square free of buildings. Cutting the
        corner between two diagonally touching walls looks like walking through a
@@ -524,18 +559,40 @@
        more expensive. That is what the a tower is an expensive cell test
        asserts, and it keeps holding. */
 
+    /* Two different numbers for the diagonal, and keeping them apart matters.
+
+       SQRT2 is how far the unit actually travels, so it is what the clock and
+       the damage integral use: movement is geometric, a unit crossing to a
+       diagonal neighbour really does cover 1.414 cells and really is under fire
+       for that long.
+
+       DIAG_COST is what the PATHFINDER pays, and it is deliberately a little
+       higher. That gap is a game rule rather than geometry: at exactly SQRT2 a
+       diagonal is so much better than the two straight steps it replaces (1.414
+       against 2) that a staircase is never worth walking, and the eight
+       neighbourhood collapses to "always cut the corner". A 2.5 percent surtax
+       leaves the diagonal clearly preferred while giving a straight run along a
+       cheap corridor a chance to win, which is the decision the board is
+       supposed to be about.
+
+       If these two are ever collapsed back into one constant, routeTime and
+       expDamage start over-reporting by the size of the surtax, and the mortar
+       test (29.9 against a stated 30) is what will catch it. */
     var SQRT2 = Math.SQRT2;
+    var DIAG_COST = 1.45;
+
     /* dx, dy, and for a diagonal the two orthogonal cells that must be clear */
     var STEPS = [
       [-1, 0], [1, 0], [0, -1], [0, 1],
       [-1, -1], [1, -1], [-1, 1], [1, 1]
     ];
 
-    /* Fills nb with the neighbours of u that pass the corner rule and wt with
-       the cost multiplier of each step, and returns how many there were. The
-       caller supplies the arrays, because this runs per cell per tick and a
-       fresh array each time is the one allocation that would show. */
-    function neighbours(st, u, nb, wt) {
+    /* Fills nb with the neighbours of u that pass the corner rule, wt with the
+       COST multiplier of each step and, when given, len with its true LENGTH.
+       Returns how many there were. The caller supplies the arrays, because this
+       runs per cell per tick and a fresh array each time is the one allocation
+       that would show. */
+    function neighbours(st, u, nb, wt, len) {
       var x = u % GW, y = (u / GW) | 0, cnt = 0;
       for (var d = 0; d < 8; d++) {
         var nx = x + STEPS[d][0], ny = y + STEPS[d][1];
@@ -551,7 +608,8 @@
           if (st.towerAt[idx(nx, ny)] >= 0) continue;
         }
         nb[cnt] = idx(nx, ny);
-        wt[cnt] = d >= 4 ? SQRT2 : 1;
+        wt[cnt] = d >= 4 ? DIAG_COST : 1;
+        if (len) len[cnt] = d >= 4 ? SQRT2 : 1;
         cnt++;
       }
       return cnt;
@@ -723,17 +781,19 @@
       occ[SPAWN] = 1;
       dwell[SPAWN] = 1;
       var all = [0, 0, 0, 0, 0, 0, 0, 0], aw = [0, 0, 0, 0, 0, 0, 0, 0];
+      var al = [0, 0, 0, 0, 0, 0, 0, 0];
       var nb = [0, 0, 0, 0, 0, 0, 0, 0], w = [0, 0, 0, 0, 0, 0, 0, 0];
       var nw = [0, 0, 0, 0, 0, 0, 0, 0];
       for (var oi = 0; oi < N; oi++) {
         var u = arr[oi];
         if (occ[u] <= 0 || u === GOAL) continue;
         if (!isFinite(dist[u])) continue;
-        var na = neighbours(st, u, all, aw), cnt = 0, best = Infinity, d;
+        var na = neighbours(st, u, all, aw, al), cnt = 0, best = Infinity, d;
         for (d = 0; d < na; d++) {
           var v = all[d];
           if (!(dist[v] < dist[u])) continue;      // strictly downhill only
-          nb[cnt] = v; nw[cnt] = aw[d];
+          /* the LENGTH of the step, not its cost: dwell is wall-clock */
+          nb[cnt] = v; nw[cnt] = al[d];
           if (dist[v] < best) best = dist[v];
           cnt++;
         }
@@ -829,6 +889,7 @@
                  hp: def.hp, maxHp: def.hp, cd: 0, busy: 0, idle: 0 };
       st.towers.push(tw);
       st.towerAt[i] = st.towers.length - 1;
+      st.scars[i] = 0;              // the hole has been closed again
       st.gold -= def.cost;
       st.history.push({ act: 'build', cell: i, type: typeId, cost: def.cost });
       st.dirty = true;
@@ -1082,6 +1143,10 @@
           e.vx = 0; e.vy = 0;
           if (tw.hp <= 0) {
             fxPush(st, { kind: 'rubble', x: tw.x, y: tw.y, life: 0.7, s: st.fxRand() });
+            /* The scar outlives the rubble, because the hole outlives it too.
+               Only chewing leaves one: selling is a decision and does not need
+               to be flagged back at the player. */
+            st.scars[e.tgt] = 1;
             removeTowerAt(st, e.tgt);
             e.chew = 0;
           }
@@ -1522,7 +1587,7 @@
       TOWERS: TOWERS, TOWER_BY_ID: TOWER_BY_ID,
       ENEMIES: ENEMIES, ENEMY_BY_ID: ENEMY_BY_ID,
       WAVE_PLAN: WAVE_PLAN, RAMPS: RAMPS, RAMP_LIST: RAMP_LIST, RAMP_BY_ID: RAMP_BY_ID,
-      idx: idx, cx: cx, cy: cy, neighbours: neighbours, SQRT2: SQRT2,
+      idx: idx, cx: cx, cy: cy, neighbours: neighbours, countScars: countScars, SQRT2: SQRT2, DIAG_COST: DIAG_COST,
       makeState: makeState, slowField: slowField, dpsField: dpsField,
       ensureFields: ensureFields, solve: solve, occupancy: occupancy,
       greedyPath: greedyPath, routeTime: routeTime,
@@ -1671,7 +1736,8 @@
         return {
           gold: st.gold, coreHp: st.coreHp, coreMax: st.coreMax, wave: st.wave,
           phase: st.phase, alive: st.enemies.length, queued: st.queue.length,
-          leaked: st.leaked, killed: st.killed, towers: st.towers.length
+          leaked: st.leaked, killed: st.killed, towers: st.towers.length,
+          scars: C.countScars(st)
         };
       }
 
@@ -1887,6 +1953,15 @@
                     </div>`;
                   })}
                 </div>
+                <!-- The one thing a player can miss entirely and pay for two
+                     waves later, so it is stated in words next to the button
+                     that sends the next wave. -->
+                ${planning && hud.scars > 0 ? html`
+                  <p className="ffd-scarnote">
+                    ${hud.scars === 1 ? 'One building was' : hud.scars + ' buildings were'} chewed
+                    away last wave. The gaps are outlined on the board and the route is shorter
+                    through them.
+                  </p>` : null}
                 <div className="ffd-acts" style=${{ marginTop: 10 }}>
                   ${planning
                     ? html`<button className="tool-btn tool-btn-primary tool-btn-sm" onClick=${doStart}>
@@ -2298,6 +2373,27 @@
         g.stroke();
       }
 
+      /* --- holes chewed in the maze ---
+
+         A dashed outline where a building used to be, until something is built
+         there again. This is not decoration: a breaker that eats one wall cuts
+         the next wave's expected damage by about 60 percent, and until now the
+         only sign of it was 0.7 seconds of rubble. A player who missed that
+         moment met the consequence two waves later with nothing to connect it
+         to. Drawn under the towers, so a rebuilt cell covers its own scar even
+         before the array is cleared. */
+      if (st.scars) {
+        g.strokeStyle = withAlpha(COL.danger || '#f87171', 0.5);
+        g.lineWidth = Math.max(1, cs * 0.045);
+        g.setLineDash([cs * 0.12, cs * 0.1]);
+        for (let i = 0; i < C.N; i++) {
+          if (!st.scars[i] || st.towerAt[i] >= 0) continue;
+          const x = C.cx(i) * cs, y = C.cy(i) * cs, p = cs * 0.16;
+          g.strokeRect(x + p, y + p, cs - 2 * p, cs - 2 * p);
+        }
+        g.setLineDash([]);
+      }
+
       /* --- spawn and goal --- */
       markCell(g, C.SPAWN, cs, COL.info || '#38bdf8', 'in');
       markCell(g, C.GOAL, cs, COL.ok || '#34d399', 'out');
@@ -2335,30 +2431,39 @@
          there exactly while the damage is flowing. Drawn under the units, so a
          beam never covers the thing it is shooting at.
 
-         Grey and dashed, not a solid yellow bar. A bright continuous line is
-         the loudest thing on a board whose whole point is the field underneath
-         it, and it was reading as an energy weapon; dashes say "this one is
-         being worked on" without competing with the colours that carry data.
-         A tower with a rate of fire (the mortar) is excluded: it has a target
-         but no continuous damage, so a line from it would be a lie. */
+         Solid and coloured per tower, deliberately reading as a beam. It was
+         dashed grey for a while, on the argument that a bright line competes
+         with the field underneath it; the opposite turned out to be true. The
+         damage really is continuous, so a continuous line is the literal
+         picture of it, and the dashes suggested an intermittent thing that
+         nothing in the simulation does.
+
+         Gun blue and sniper red, because those are the only two towers that
+         work this way and the pair has to be told apart at a glance. Keyed on
+         the id and not on the range, so adding a sixth tower cannot silently
+         join the wrong side. A tower with a rate of fire (the mortar) is
+         excluded: it has a target but no continuous damage, so a line from it
+         would be a lie. */
       const byId = {};
       for (const e of st.enemies) byId[e.id] = e;
-      g.setLineDash([cs * 0.14, cs * 0.11]);
       for (const tw of st.towers) {
         const def = C.TOWER_BY_ID[tw.type];
         if (!def.dps || !def.range || def.rate || !tw.tgtId) continue;
         const e = byId[tw.tgtId];
         if (!e) continue;
-        const sniper = def.range > 5;
-        g.strokeStyle = withAlpha(COL.label || '#94a3b8', sniper ? 0.8 : 0.6);
-        g.lineWidth = sniper ? Math.max(1, cs * 0.04) : Math.max(1.4, cs * 0.075);
-        g.lineCap = 'butt';
+        const sniper = tw.type === 'sniper';
+        /* The sniper's line is thinner and more opaque, the gun's fatter and
+           softer: reach reads as a fine line, close work as a thick one. */
+        g.strokeStyle = withAlpha(sniper ? (COL.danger || '#f87171') : (COL.info || '#38bdf8'),
+                                  sniper ? 0.85 : 0.7);
+        g.lineWidth = sniper ? Math.max(1, cs * 0.045) : Math.max(1.6, cs * 0.085);
+        g.lineCap = 'round';
         g.beginPath();
         g.moveTo((tw.x + 0.5) * cs, (tw.y + 0.5) * cs);
         g.lineTo((e.x + 0.5) * cs, (e.y + 0.5) * cs);
         g.stroke();
+        g.lineCap = 'butt';
       }
-      g.setLineDash([]);
 
       /* --- shells in flight ---
 
