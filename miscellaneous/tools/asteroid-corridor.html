@@ -429,15 +429,21 @@ const DEF = {
   /* One drawing style per class of thing, because they answer different
      questions: the rocks are what you are avoiding, the hull is what you are
      flying, and the walls are the only thing telling you where you are. */
-  rockFill: 'ramp', rockWire: false, rockRamp: 'neutral',
+  /* The rocks default to the lab's "toon wire": the colormap quantised into
+     three bands with every edge of the mesh drawn over it in a contrasting
+     colour. Three bands and not four, because a rock in a corridor is seen
+     for a second and a half at a closing speed, and the fewer the bands the
+     faster the shape reads. */
+  rockFill: 'ramp', rockWire: 'toon', rockRamp: 'neutral',
   shipFill: 'occluder', shipWire: true, shipRamp: 'gray',
-  bands: 0,
+  bands: 3,
   wallGrid: true, wallCatch: true, wallOp: 0.5
 };
 const RAMP_IDS = CR.RAMPS.map((r) => r.id);
 const ENUMS = {
   camMode: ['chase', 'cockpit'],
   rockFill: ['solid', 'ramp', 'off'],
+  rockWire: ['off', 'plain', 'toon'],
   shipFill: ['occluder', 'solid', 'ramp', 'off'],
   rockRamp: RAMP_IDS, shipRamp: RAMP_IDS
 };
@@ -572,6 +578,80 @@ function rampMaterial(THREE, id, bands) {
      the first compiled one for both, because from its side the material looks
      identical. */
   mat.customProgramCacheKey = () => 'ramp:' + id + ':' + bands;
+  return mat;
+}
+
+/* The wireframe as a geometry that carries NORMALS.
+ *
+ * three's own WireframeGeometry copies the position attribute and nothing
+ * else, which is fine for a line in a constant colour and useless for a line
+ * that has to be lit. The toon wire is lit, because its whole trick is to
+ * read the shading of the surface underneath it and land half a colormap
+ * away from it, so each endpoint needs the normal it had on the mesh.
+ *
+ * Built once per rock shape rather than per frame: unlike the lab, this is
+ * every edge of the mesh and not the view-dependent contour, so nothing about
+ * it changes as the rock turns. The unique edge list comes from the shared
+ * module, or every interior edge would be drawn twice. */
+function wireGeometry(THREE, built) {
+  const E = AS.edgeTable(built.positions, built.indices);
+  const P = built.positions, N = built.normals;
+  const pos = new Float32Array(E.count * 6);
+  const nor = new Float32Array(E.count * 6);
+  for (let e = 0; e < E.count; e++) {
+    const a3 = E.ea[e] * 3, b3 = E.eb[e] * 3, o = e * 6;
+    pos[o] = P[a3]; pos[o + 1] = P[a3 + 1]; pos[o + 2] = P[a3 + 2];
+    pos[o + 3] = P[b3]; pos[o + 4] = P[b3 + 1]; pos[o + 5] = P[b3 + 2];
+    nor[o] = N[a3]; nor[o + 1] = N[a3 + 1]; nor[o + 2] = N[a3 + 2];
+    nor[o + 3] = N[b3]; nor[o + 4] = N[b3 + 1]; nor[o + 5] = N[b3 + 2];
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  return g;
+}
+
+/* The toon wire's line material: the lab's contrast mode, arrived at from the
+ * same side rampMaterial was.
+ *
+ * The line runs the identical lighting the fill under it runs, quantises it
+ * into the identical bands, and then looks the colormap up half a ramp away
+ * from the band it is standing on. A line on a dark band comes out light and
+ * a line on a light band comes out dark, so it never sinks into its own
+ * background, which is the entire reason to draw it at all.
+ *
+ * Half a ramp and not the far end: 1 - s puts a line on a middle band back
+ * onto the middle band and makes it vanish exactly where the shading is most
+ * interesting. Wrapping by 0.5 has no fixed point.
+ *
+ * The lines are NOT shadow receivers. A line is one pixel wide and the shadow
+ * map is not that precise, so a shadowed line breaks into dashes along the
+ * penumbra; the fill beneath it carries the shadow and the wire stays whole.
+ * That is why the lighting here is a Lambert material with shadows disabled
+ * rather than the same rampMaterial the fill uses. */
+function toonWireMaterial(THREE, id, bands) {
+  const NL = String.fromCharCode(10);
+  const tex = rampTexture(THREE, id);
+  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  mat.userData.tex = tex;
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uRamp = { value: tex };
+    sh.uniforms.uBands = { value: bands };
+    sh.uniforms.uGain = { value: 1 };
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>',
+        ['#include <common>', 'uniform sampler2D uRamp;',
+          'uniform float uBands;', 'uniform float uGain;'].join(NL))
+      .replace('#include <opaque_fragment>', [
+        'float rampL = clamp(dot(outgoingLight, vec3(0.2126, 0.7152, 0.0722)) * uGain, 0.0, 1.0);',
+        'if (uBands > 0.5) rampL = (floor(rampL * uBands) + 0.5) / uBands;',
+        'rampL = rampL < 0.5 ? rampL + 0.5 : rampL - 0.5;',
+        'outgoingLight = texture2D(uRamp, vec2(rampL, 0.5)).rgb;',
+        '#include <opaque_fragment>'
+      ].join(NL));
+    mat.userData.sh = sh;
+  };
+  mat.customProgramCacheKey = () => 'toonwire:' + id + ':' + bands;
   return mat;
 }
 
@@ -882,9 +962,19 @@ function App() {
       sun.intensity = pp.sunI;
       amb.intensity = pp.ambI;
       /* The ramp spans "unlit" to "as lit as this sun gets", so the map does
-         not saturate the moment the sun slider goes past one. */
+         not saturate the moment the sun slider goes past one.
+       *
+         The PI is not decoration. three's lighting is physically normalised:
+         a Lambert surface reflects irradiance times BRDF_Lambert, which is
+         1/PI, so a fully lit white facet under a sun of intensity 2.6 leaves
+         the shader at about 0.83 and not at 2.6. Dividing by the raw sum of
+         the intensities therefore darkened the whole rock by a factor of PI
+         and pushed every facet, lit side included, into the bottom band: the
+         bands were there in the material and invisible on the screen. The
+         sum is the irradiance on offer, so the reflected luminance to
+         normalise against is that sum over PI. */
       if (g.rampMats) {
-        const gain = 1 / Math.max(0.05, pp.sunI + pp.ambI);
+        const gain = Math.PI / Math.max(0.05, pp.sunI + pp.ambI);
         for (const m of g.rampMats) if (m.userData.sh) m.userData.sh.uniforms.uGain.value = gain;
       }
 
@@ -1104,11 +1194,19 @@ function App() {
          that is not visible is skipped in the shadow pass as well, so there is
          no such thing here as an invisible caster. */
       const fill = p.rockFill;
+      /* The toon wire is drawn under every fill, not only under the colormap.
+         Its colour is a lookup in the rock's colormap, which is selected
+         whether or not the FILL is currently reading it, so there is always
+         something to look up. Over a solid or black rock the lines are then
+         the banded map on their own, which is a coherent reading rather than
+         a broken one, and it beats a control that silently draws something
+         other than what it says. */
+      const wireMode = p.rockWire;
       let mat;
       if (fill === 'ramp') { mat = rampMaterial(THREE, p.rockRamp, p.bands); rampMats.push(mat); }
       else if (fill === 'solid') mat = new THREE.MeshStandardMaterial({ color: COL.rock, roughness: 0.95, metalness: 0 });
       else mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0, 0, 0) });
-      if (p.rockWire) {
+      if (wireMode !== 'off') {
         mat.polygonOffset = true; mat.polygonOffsetFactor = 1.5; mat.polygonOffsetUnits = 1.5;
       }
       const mesh = new THREE.Mesh(geo, mat);
@@ -1116,11 +1214,21 @@ function App() {
       mesh.receiveShadow = fill !== 'off';
       group.add(mesh);
 
-      if (p.rockWire) {
-        const wire = new THREE.LineSegments(
-          new THREE.WireframeGeometry(geo),
-          new THREE.LineBasicMaterial({ color: COL.rockWire, transparent: true, opacity: 0.7 })
-        );
+      if (wireMode !== 'off') {
+        let wgeo, wmat;
+        if (wireMode === 'toon') {
+          /* Its own geometry, because the lines have to carry the normals of
+             their endpoints and WireframeGeometry drops everything but the
+             position. Disposed with the rest of the group on the next
+             rebuild, along the same path as every other geometry here. */
+          wgeo = wireGeometry(THREE, built);
+          wmat = toonWireMaterial(THREE, p.rockRamp, p.bands);
+          rampMats.push(wmat);
+        } else {
+          wgeo = new THREE.WireframeGeometry(geo);
+          wmat = new THREE.LineBasicMaterial({ color: COL.rockWire, transparent: true, opacity: 0.7 });
+        }
+        const wire = new THREE.LineSegments(wgeo, wmat);
         group.add(wire);
       }
       return { rock, group, map: AS.radiusMap(built), rMax: built.rMax, quat: null };
@@ -1290,11 +1398,17 @@ function App() {
         <${Seg} label="Rocks" value=${p.rockFill} onChange=${upd('rockFill')}
           options=${[{ value: 'ramp', label: 'Colormap' }, { value: 'solid', label: 'Solid' },
             { value: 'off', label: 'Black' }]} />
-        <div className="co-chips">
-          <button className=${'lang-seg' + (p.rockWire ? ' active' : '')}
-            onClick=${() => upd('rockWire')(!p.rockWire)}>Rock wireframe</button>
-        </div>
-        ${p.rockFill === 'ramp' ? ramps('Rock colormap', p.rockRamp, upd('rockRamp')) : null}
+        <${Seg} label="Rock wireframe" value=${p.rockWire} onChange=${upd('rockWire')}
+          options=${[{ value: 'off', label: 'None' }, { value: 'plain', label: 'Plain' },
+            { value: 'toon', label: 'Toon' }]} />
+        ${p.rockWire === 'toon' ? html`<p className="co-note">The toon wire draws every edge of
+          the mesh in a colour looked up half a colormap away from the band underneath it, so a
+          line on a dark band comes out light and one on a light band comes out dark. It never
+          sinks into its own background. The lines are lit but take no shadow: a line is one pixel
+          wide and would break into dashes along a shadow edge. With the fill on anything but the
+          colormap the lines carry the map on their own.</p>` : null}
+        ${p.rockFill === 'ramp' || p.rockWire === 'toon'
+          ? ramps('Rock colormap', p.rockRamp, upd('rockRamp')) : null}
         <${Seg} label="Hull" value=${p.shipFill} onChange=${upd('shipFill')}
           options=${[{ value: 'occluder', label: 'Black' }, { value: 'ramp', label: 'Map' },
             { value: 'solid', label: 'Solid' }, { value: 'off', label: 'None' }]} />
@@ -1303,7 +1417,7 @@ function App() {
             onClick=${() => upd('shipWire')(!p.shipWire)}>Hull wireframe</button>
         </div>
         ${p.shipFill === 'ramp' ? ramps('Hull colormap', p.shipRamp, upd('shipRamp')) : null}
-        ${p.rockFill === 'ramp' || p.shipFill === 'ramp' ? html`<${React.Fragment}>
+        ${p.rockFill === 'ramp' || p.shipFill === 'ramp' || p.rockWire === 'toon' ? html`<${React.Fragment}>
           <${Slider} label="Bands" digits=${0} min=${0} max=${12} step=${1}
             value=${p.bands} onChange=${upd('bands')} />
           <p className="co-note">Zero reads the map continuously. Anything else quantises the
