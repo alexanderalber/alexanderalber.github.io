@@ -235,8 +235,17 @@
     .cmap-prog { margin-top: 8px; }
     .cmap-prog-track { height: 4px; border-radius: 2px; background: var(--tool-hairline);
       overflow: hidden; }
-    .cmap-prog-bar { height: 100%; background: var(--tool-sig-info);
-      transition: width .12s linear; }
+    /* NO width transition, and that is the fix rather than an omission.
+       Session 5e, reported from the browser: the text said "Subset 6 of 8"
+       while the bar stood at about a tenth. Both read the same object, so the
+       numbers were never in disagreement; the ANIMATION was. Each row of the
+       feasibility table blocks the main thread for a second or more, and a
+       transition started just before that block is frozen partway and painted
+       where it got to, so the bar showed a position between the old value and
+       the new one and then sat there. A progress bar next to a blocked thread
+       has to be exact at every paint, because every paint may be the last one
+       for a while. */
+    .cmap-prog-bar { height: 100%; background: var(--tool-sig-info); }
     .cmap-prog-txt { font-size: 11.5px; color: var(--tool-note); margin: 4px 0 0;
       font-variant-numeric: tabular-nums; }
 
@@ -250,7 +259,18 @@
       border-bottom: 1px solid var(--tool-hairline); vertical-align: middle; }
     .cmap-feas th { color: var(--tool-label); font-weight: 600; }
     .cmap-feas td.cmap-num { text-align: right; color: var(--tool-text); }
-    .cmap-feas tr.cmap-front td { background: color-mix(in srgb, var(--tool-sig-info) 8%, transparent); }
+    /* THE FRONT IS AN EDGE, THE HOVER IS A FILL, and they were both fills until
+       session 5e, which is why the owner reported rows that "stay hovered"
+       where the mouse had never been. The Pareto front was a background tint of
+       --tool-sig-info at 8% and the hover was --pico-card-background-color; in
+       the dark skins both amount to "this row is a shade lighter", so a
+       permanent state and a transient one were saying the same thing in the
+       same language. The front is a property of the DATA and has to survive the
+       mouse being elsewhere, so it keeps the stronger, static marker and gives
+       up the background it was sharing. Nothing else on the row marked it, so
+       it needed a marker of its own rather than simply losing one. */
+    .cmap-feas tr.cmap-front td:first-child {
+      box-shadow: inset 3px 0 0 var(--tool-sig-info); padding-left: 8px; }
     .cmap-feas tbody tr { cursor: pointer; }
     .cmap-feas tbody tr:hover td { background: var(--pico-card-background-color); }
     .cmap-feas .cmap-swatches { display: flex; gap: 3px; }
@@ -821,11 +841,38 @@ function seedToLch(hex) {
    'falling' is the mirror of 'rising', for the ColorBrewer direction. A ramp
    that runs light to dark wants its chroma where its dark end is, and writing
    that as rising plus a reversed lightRange changes what the light term
-   measures. It is a separate name because it is a separate design. */
+   measures. It is a separate name because it is a separate design.
+
+   'bowl' is the fourth shape and the mirror of 'hump': chroma high at both ends
+   and lowest in the middle. It was asked for by name in session 5e, as "a
+   reverse hump", for a case that comes up constantly once you look for it: the
+   user gives one dark colour and one light colour, so both of them sit at the
+   ENDS of the ramp, and every existing shape puts the chroma somewhere else.
+   'hump' puts the maximum in the middle where no anchor is, 'rising' and
+   'falling' serve one end and starve the other, and 'ends' does NOT solve it
+   even though it sounds as if it should: chromaEnds only lifts a floor under a
+   hump, so ends(u) = e + (1 - e) * 4u(1 - u) is still largest in the middle for
+   every e. Checked before this shape was written, because a fifth entry that
+   duplicates a fourth is worse than no entry.
+
+   What comes out of a bowl is a map that is colourful where the data is extreme
+   and near grey in between, which is a real and reasonable design and not just
+   an anchor-fitting trick: it is what a reader wants when the middle of the
+   range is "nothing to see here".
+
+   Named for the shape and not for the operation, matching hump, rising, falling
+   and ends. "reverse-hump" would be a hyphenated hybrid, and the naming rule
+   this repo argues for titles applies as well to a registry key that shows up
+   in the expert tab. */
 var CHROMA_SHAPES = {
   hump: function (u) { return 4 * u * (1 - u); },
   rising: function (u) { return u; },
   falling: function (u) { return 1 - u; },
+  /* 1 at both ends, 0 at u = 0.5. Exactly 1 - hump, so the two together cover
+     the profile at every u and chromaMax keeps meaning the same thing in both:
+     every shape in this registry has its maximum at 1, which is what lets the
+     gamut cap in buildRamp scale a comparable quantity. */
+  bowl: function (u) { return 1 - 4 * u * (1 - u); },
   ends: function (u, spec) {
     var e = spec && isFinite(spec.chromaEnds) ? spec.chromaEnds : 0;
     if (e < 0) e = 0;
@@ -842,6 +889,137 @@ function chromaProfile(spec, u) {
   if (!f) f = CHROMA_SHAPES.hump;
   var v = f(u, spec);
   return isFinite(v) && v > 0 ? v : 0;
+}
+
+/* ---------- the hue path ------------------------------------------------- */
+
+/* THE ANSWER TO A MODEL ERROR, AND THIS COMMENT IS THE ARGUMENT FOR IT.
+
+   All three families run a MONOTONE hue path with one or two degrees of
+   freedom: sequential is one arc, diverging is two arcs about hueSplit, cyclic
+   is the whole circle at constant speed. That is fine as long as the colours a
+   user asks for sit along an arc. It fails, and fails structurally, as soon as
+   they sit in two CLUSTERS with a gap between them, because a monotone arc that
+   visits both clusters has to cross the gap at the same speed it crosses the
+   clusters, so a good part of the ramp lands at hues nobody asked for.
+
+   MEASURED 2026-09-01 on four imported colours, #354c33 #c4531d #f6ba73
+   #546b3b, whose hues are 143, 43, 70 and 130, so two islands about 60 degrees
+   apart. The best worst-anchor distance the generator could reach was 0.0747
+   for sequential, 0.0795 for diverging and 0.0663 for cyclic, against a
+   PALETTE_HIT of 0.010 and a PALETTE_NEAR of 0.030.
+
+   That is not a weighting problem and it is worth being blunt about it, because
+   turning up the anchor weight is what anybody would try first. MEASURED the
+   same day on the diverging case at anchor weights 8, 64, 512 and 4096: 0.0802,
+   0.0796, 0.0811, 0.0806. At 4096 the anchor term is effectively the only term
+   in the energy and the answer does not move. The other four terms are not
+   competing with it; the shape simply cannot be made.
+
+   So the fix is a degree of freedom, not a weight. huePath is a list of
+   {u, h} support points which, when present, REPLACES the family's formula for
+   hue and nothing else: lightness, chroma, the family's knot count and
+   diverging's branch structure are untouched, because the hue path is SAMPLED
+   at the family's own knot positions rather than handed through as a knot list.
+   That is what makes it one optional field instead of three new scalars per
+   family, and it is what keeps every existing spec valid, since an absent field
+   means the old formula runs unchanged.
+
+   MEASURED 2026-09-01, the feasibility check that was run BEFORE any of this
+   was built: knots placed by hand on the four anchors bring the same case to
+   0.0218, inside PALETTE_NEAR. It does not reach PALETTE_HIT, and the reason is
+   structural rather than a shortfall: buildRamp reparametrises by arc length,
+   so after the pass the knots no longer sit at their own u. */
+
+/* Linear interpolation along a hue path, on the UNWRAPPED angle and with the
+   end values held rather than extrapolated.
+
+   Unwrapped because that is the convention makeCurve uses downstream, and two
+   different conventions on the same circular quantity would put a 360 degree
+   jump between the sampling and the interpolation that consumes it. Held
+   rather than extrapolated because extrapolating an angle has no preferred
+   direction: a path that says nothing beyond its last support point should say
+   nothing, not something invented from the last secant. */
+function huePathAt(path, u) {
+  var n = path.length;
+  var us = new Array(n), hs = new Array(n);
+  for (var i = 0; i < n; i++) { us[i] = path[i].u; hs[i] = path[i].h; }
+  var H = unwrapHues(hs);
+  if (u <= us[0]) return H[0];
+  if (u >= us[n - 1]) return H[n - 1];
+  for (var k = 1; k < n; k++) {
+    if (u <= us[k]) {
+      var span = us[k] - us[k - 1];
+      var f = span > 0 ? (u - us[k - 1]) / span : 0;
+      return H[k - 1] + (H[k] - H[k - 1]) * f;
+    }
+  }
+  return H[n - 1];
+}
+
+/* A usable path or null. One support point is not a path: it carries no more
+   information than hueStart already does, and letting it through would turn a
+   one-anchor case into a constant-hue ramp behind the user's back, which is
+   exactly the silent narrowing session 5e was told not to do. */
+function huePathOf(spec) {
+  var p = spec && spec.huePath;
+  if (!p || !p.length || p.length < 2) return null;
+  for (var i = 0; i < p.length; i++) {
+    if (!isFinite(p[i].u) || !isFinite(p[i].h)) return null;
+  }
+  return p;
+}
+
+/* The hue at u: the path if there is one, otherwise whatever the family's
+   formula worked out. Every family's knots() calls this instead of writing its
+   own hue expression, so a family cannot be forgotten when the field is set. */
+function hueAt(spec, u, formula) {
+  var p = huePathOf(spec);
+  return p ? huePathAt(p, u) : formula;
+}
+
+/* PALETTE_MAX support points at most, and derived from the anchors rather than
+   searched. The optimiser gets a start, not a wider space: an extra coordinate
+   in a derivative-free search is not free even when it provably cannot change
+   the energy, which the chromaEnds note in objective.js measured.
+
+   Sorted by lightness ascending, ties broken by hex. The sort is a contract
+   obligation, not tidiness: the support points come out of the anchor ORDER, so
+   without a fixed one the suggestions would move with the order the user
+   happened to paste their colours in. */
+function huePathFromAnchors(anchors) {
+  if (!anchors || anchors.length < 2) return null;
+  var list = anchors.slice().sort(function (a, b) {
+    var dL = a.lab[0] - b.lab[0];
+    if (dL !== 0) return dL;
+    var ah = a.hex || '', bh = b.hex || '';
+    return ah < bh ? -1 : ah > bh ? 1 : 0;
+  });
+  var L0 = list[0].lab[0], L1 = list[list.length - 1].lab[0];
+  /* All anchors at one lightness carry no ordering along the ramp at all, so
+     there is nothing to lay a path over and the formula stays. */
+  if (!(L1 - L0 > 1e-6)) return null;
+  var out = [];
+  for (var i = 0; i < list.length; i++) {
+    var lch = labToLch(list[i].lab[0], list[i].lab[1], list[i].lab[2]);
+    /* A near-neutral anchor has no meaningful hue: its own hue is whatever the
+       rounding of two tiny components says, and putting that in the path would
+       steer the whole ramp by noise. It contributes its lightness position to
+       nothing and is simply left out. */
+    if (lch[1] < 0.01) continue;
+    out.push({ u: (list[i].lab[0] - L0) / (L1 - L0), h: lch[2] });
+  }
+  if (out.length < 2) return null;
+  /* Two anchors at the same lightness would give two support points at the same
+     u, which is a vertical segment in a function of u. The later one wins,
+     deliberately and not by accident of the loop: with the sort above "later"
+     means the higher hex, so the choice is at least deterministic. */
+  var dedup = [out[0]];
+  for (var k = 1; k < out.length; k++) {
+    if (out[k].u - dedup[dedup.length - 1].u < 1e-9) dedup[dedup.length - 1] = out[k];
+    else dedup.push(out[k]);
+  }
+  return dedup.length >= 2 ? dedup : null;
 }
 
 /* ---------- family registry --------------------------------------------- */
@@ -876,7 +1054,7 @@ var FAMILIES = {
           u: u,
           L: L0 + (L1 - L0) * u,
           C: spec.chromaMax * chromaProfile(spec, u),
-          h: spec.hueStart + spec.hueDrift * u * (spec.hueDir || 1)
+          h: hueAt(spec, u, spec.hueStart + spec.hueDrift * u * (spec.hueDir || 1))
         });
       }
       return out;
@@ -950,7 +1128,19 @@ var FAMILIES = {
              the seam is C1 analytically and not by anybody's good luck. */
           L: Lmid + amp * Math.cos(2 * Math.PI * exc * u + ph),
           C: spec.chromaMax,
-          h: spec.hueStart + 360 * u * dir
+          /* A hue path on a CLOSED curve is the one place the sampling is not
+             just "read the path at u". makeCurve owns the wrap segment, so the
+             hue at u = 0 and the hue approached from u = 1 are joined by the
+             spline whatever they are, and a path that ends where it did not
+             start puts that whole difference into one segment. Sampled over
+             0..1 the path's two ends therefore ARE the seam, and the family's
+             promise that a cyclic map goes once round the circle becomes a
+             property of the path rather than of the formula. That is the point
+             of session 5e's step 5 and it is deliberately not patched over
+             here: a path that dwells between two hue islands and comes back is
+             a legitimate cyclic map, and one that does not close is a map whose
+             seam the user can see, which the diagnostics already report. */
+          h: hueAt(spec, u, spec.hueStart + 360 * u * dir)
         });
       }
       return out;
@@ -981,7 +1171,14 @@ function divergingBranchKnots(spec, side) {
          of a branch would put chroma into the one place the map promises there
          is none. chromaShape stays a sequential and cyclic control. */
       C: spec.chromaMax * u,
-      h: hue + (spec.hueDrift || 0) * u * dir
+      /* Under a hue path both branches read the SAME path, each over its own u
+         from the centre outwards, so hueSplit is inert. That is the price of
+         making the field a family-independent one, and it is the right price:
+         a split is a way of saying "the two arms go opposite ways", and a path
+         that already names the hues at every position has said something more
+         specific than that. The two arms still differ, because they run over
+         different lightness and therefore hit the path at different places. */
+      h: hueAt(spec, u, hue + (spec.hueDrift || 0) * u * dir)
     });
   }
   return out;
@@ -1014,6 +1211,16 @@ function specDefaults(family, seedHex) {
     hueDrift: 0,
     hueDir: 1,
     hueSplit: 180,
+    /* Null and not an empty list, matching `knots` above: both are overrides
+       that are absent by default, and one shape of absence is easier to test
+       for than two. */
+    huePath: null,
+    /* Freezes hueDrift in the search rather than changing what buildRamp does:
+       nothing in this file reads it, paramSpaceFor in objective.js does. It
+       lives in the spec anyway because the spec is what the optimiser and the
+       expert tab both hand around, and a search flag kept somewhere else would
+       have to be threaded through every call that already carries a spec. */
+    pinHue: 0,
     centerL: 0.92,
     centerPolarity: 'light',
     excursions: 2,
@@ -2269,13 +2476,40 @@ function writeParam(spec, key, v) {
    readout still works and the Optimise button simply returns the input. A later
    categorical family lands here by default, which is right, since its swatches
    are chosen rather than shaped. */
+/* SESSION 5e adds a second reason to drop an entry, and it is the same
+   mechanism for a different purpose.
+
+   `spec.pinHue` freezes hueDrift where it stands. It exists because of a
+   judgement call about a single anchor, and the judgement is the owner's: with
+   exactly one colour given, the anchor is hit by one entry of the ramp and the
+   rest of the curve is unconstrained by it, so the drift wanders. MEASURED
+   2026-09-01 over ten seeds, the drift of the suggested designs mostly lands
+   between -30 and +50 degrees with outliers to 114, and the anchor is hit every
+   time (0.0000 to 0.0021, against a PALETTE_HIT of 0.010). So the wandering is
+   not a fault: viridis drifts 216 degrees end to end and magma 205, and a drift
+   of zero makes a poorer map, not a better one, since it reduces the ramp to
+   lightness and saturation in one hue.
+
+   Both readings are defensible, which is exactly the case the repo says to
+   offer BOTH of rather than to decide quietly. So it is an axis: half the
+   designs hold the hue and half are free to drift, and the list shows the two
+   side by side. A pin and not a start value, because a start of zero is simply
+   moved away from by the first reflection, which would make the control a
+   placebo.
+
+   Dropping the coordinate rather than clamping its range is what the chromaEnds
+   note above already argues for at length: an inert dimension is not free in a
+   derivative-free search, and a clamped one is an inert dimension with extra
+   steps. */
 function paramSpaceFor(spec) {
   var s = PARAM_SPACE[spec && spec.family];
   if (!s) return [];
   var shape = spec && spec.chromaShape;
+  var pinHue = !!(spec && spec.pinHue);
   var out = [];
   for (var i = 0; i < s.length; i++) {
     if (s[i].shape && s[i].shape !== shape) continue;
+    if (pinHue && s[i].key === 'hueDrift') continue;
     out.push(s[i]);
   }
   return out;
@@ -3017,9 +3251,36 @@ function subsetCombos(family, o) {
   return combos.length ? combos : [null];
 }
 
+/* The combinations that produce DIFFERENT start specs for this subset, which
+   since session 5e is fewer than the axis product. The generator does the same
+   thing for the same reason (see suggestColormaps), and here it matters twice
+   over: the table runs one sweep per ROW, so a redundant combination is paid
+   for once per subset rather than once per run.
+
+   Deduplicated on the start spec rather than on the combination, so a future
+   pair of axes that happen to meet is caught without being listed anywhere.
+   evaluateSubsetOne is what resolves usePath and pinHue into a spec, so the
+   probe has to go through the same door: it is called with a throwaway option
+   object carrying only the combination, and what comes back out is compared.
+   That is one extra spec construction per combination, which is nothing beside
+   the optimisation it may save. */
+function dedupeCombos(anchors, idx, family, seedHex, combos) {
+  if (!combos || combos.length < 2) return combos;
+  var seen = {}, out = [];
+  for (var i = 0; i < combos.length; i++) {
+    if (!combos[i]) { out.push(combos[i]); continue; }
+    var probe = startSpecFor(anchors, idx, family, seedHex, combos[i]);
+    var k = JSON.stringify(probe);
+    if (seen[k]) continue;
+    seen[k] = 1;
+    out.push(combos[i]);
+  }
+  return out;
+}
+
 function evaluateSubset(anchors, idx, family, seedHex, opts) {
   var o = opts || {};
-  var combos = subsetCombos(family, o);
+  var combos = dedupeCombos(anchors, idx, family, seedHex, subsetCombos(family, o));
   if (combos.length > 1) {
     /* Sweep: run each discrete combination and keep the best worst-anchor
        distance. Ties break on cv, then on the enumeration order, so the result
@@ -3044,30 +3305,73 @@ function evaluateSubset(anchors, idx, family, seedHex, opts) {
   return r;
 }
 
-function evaluateSubsetOne(anchors, idx, family, seedHex, opts) {
-  var o = opts || {};
+/* The anchors of one subset, in the shape the energy terms want. `hex` comes
+   along for huePathFromAnchors, which breaks ties on it so the derived path
+   cannot depend on the order the anchors arrived in. */
+function subsetAnchors(anchors, idx) {
   var sub = [];
   for (var i = 0; i < idx.length; i++) {
-    sub.push({ lab: anchors[idx[i]].lab, weight: anchors[idx[i]].weight });
+    sub.push({
+      lab: anchors[idx[i]].lab,
+      weight: anchors[idx[i]].weight,
+      hex: anchors[idx[i]].hex
+    });
   }
-  /* The seed is the subset's own darkest colour unless the caller names one:
-     starting the search at a colour that is in the set is worth several dozen
-     evaluations, and the darkest is the one a sequential map wants at t = 0. */
-  var seed = seedHex;
-  if (!seed) {
-    var best = 0, bestL = Infinity;
-    for (i = 0; i < idx.length; i++) {
-      var L = anchors[idx[i]].lab[0];
-      if (L < bestL) { bestL = L; best = idx[i]; }
+  return sub;
+}
+
+/* The seed is the subset's own darkest colour unless the caller names one:
+   starting the search at a colour that is in the set is worth several dozen
+   evaluations, and the darkest is the one a sequential map wants at t = 0. */
+function subsetSeed(anchors, idx, seedHex) {
+  if (seedHex) return seedHex;
+  var best = 0, bestL = Infinity;
+  for (var i = 0; i < idx.length; i++) {
+    var L = anchors[idx[i]].lab[0];
+    if (L < bestL) { bestL = L; best = idx[i]; }
+  }
+  return anchors[best].hex || '#3b82f6';
+}
+
+/* The spec a run of this subset STARTS from, given a discrete assignment. It is
+   its own function because two callers need exactly this and needed it to agree:
+   evaluateSubsetOne, which then optimises it, and dedupeCombos, which only wants
+   to know whether two assignments lead to the same place. Inlining it in the
+   first and re-deriving it in the second is how the two would drift. */
+function startSpecFor(anchors, idx, family, seedHex, pinned) {
+  var sub = subsetAnchors(anchors, idx);
+  var base = specDefaults(family, subsetSeed(anchors, idx, seedHex));
+  if (pinned) {
+    for (var k in pinned) {
+      if (!Object.prototype.hasOwnProperty.call(pinned, k)) continue;
+      /* usePath is a SUGGEST_AXES flag and not a spec field, so it is resolved
+         here rather than copied. The path is derived from THIS SUBSET's
+         anchors, which is the whole point: the feasibility table asks what a
+         given subset can reach, and a path drawn through colours that are not
+         in the subset would answer a different question. See applyCombo in
+         suggest.js, which does the same translation for the generator. */
+      if (k === 'usePath') {
+        base.huePath = pinned[k] ? huePathFromAnchors(sub) : null;
+        continue;
+      }
+      base[k] = pinned[k];
     }
-    seed = anchors[best].hex || '#3b82f6';
+    /* Same two rules applyCombo applies, and for the same reasons: a pin means
+       no drift, and under a path the pin is a distinction without a
+       difference. Repeated rather than shared because palette.js is
+       concatenated BEFORE suggest.js and a forward call would be a second
+       backwards reference to guard. */
+    if (base.pinHue) base.hueDrift = 0;
+    if (base.huePath) base.pinHue = 0;
   }
-  var base = specDefaults(family, seed);
-  if (o.spec) {
-    for (var k in o.spec) {
-      if (Object.prototype.hasOwnProperty.call(o.spec, k)) base[k] = o.spec[k];
-    }
-  }
+  return base;
+}
+
+function evaluateSubsetOne(anchors, idx, family, seedHex, opts) {
+  var o = opts || {};
+  var i;
+  var sub = subsetAnchors(anchors, idx);
+  var base = startSpecFor(anchors, idx, family, seedHex, o.spec);
   var w = {};
   for (var j = 0; j < TERM_NAMES.length; j++) w[TERM_NAMES[j]] = DEFAULT_WEIGHTS[TERM_NAMES[j]];
   w.anchor = o.anchorWeight === undefined ? SUBSET_ANCHOR_WEIGHT : o.anchorWeight;
@@ -3432,18 +3736,62 @@ var SUGGEST_AXES = {
   sequential: {
     chromaShape: null,          /* null means Object.keys(CHROMA_SHAPES) */
     hueDir: [1, -1],
-    hueDrift: [0, 120]
+    hueDrift: [0, 120],
+    pinHue: [0, 1],
+    usePath: [0, 1]
   },
   diverging: {
     hueDir: [1, -1],
     centerPolarity: ['light', 'dark'],
-    hueSplit: [90, 180, 270]
+    hueSplit: [90, 180, 270],
+    usePath: [0, 1]
   },
   cyclic: {
     hueDir: [1, -1],
-    excursions: [1, 2, 3]
+    excursions: [1, 2, 3],
+    usePath: [0, 1]
   }
 };
+
+/* WHY usePath IS AN AXIS AND NOT SIMPLY SWITCHED ON.
+
+   huePath (families.js) exists because the parametric hue path cannot visit two
+   clusters of hues without spending the ramp between them; the measurement is
+   in the comment there. The obvious next step is to always hand the derived
+   path to the optimiser, and that is measurably wrong.
+
+   MEASURED 2026-09-01, best worst-anchor distance, with the path forced on
+   every candidate against the formula:
+
+       case                    family       formula   forced path
+       four, two islands       sequential    0.0747       0.0515
+                               diverging     0.0795       0.1013
+                               cyclic        0.0663       0.1047
+       three colours           sequential    0.0451       0.0075
+                               diverging     0.0897       0.1448
+       two, compatible         sequential    0.0020       0.0013
+                               cyclic        0.1218       0.1112
+
+   Sequential wants it, sometimes by a factor of six. Diverging and cyclic
+   mostly do not, for reasons that are structural rather than incidental: under
+   a path both diverging branches read the SAME hues, so hueSplit goes inert and
+   the map loses the one thing that made it diverging, and a path that does not
+   happen to close puts its whole end-to-end difference into a cyclic map's seam
+   segment. Forcing it also COLLAPSED THE LISTS, from six candidates to two or
+   three, because the designs stop differing in the field that was making them
+   different.
+
+   As an axis instead, the generator picks per case and the list says which:
+   measured on the same cases, six of six candidates carry the path where it
+   helps (four colours, sequential), none of six where it hurts (diverging), and
+   two of six where it is a wash. The best of the mixed list is never worse than
+   the best without the axis, which is the property that makes this safe to
+   enable everywhere rather than per family.
+
+   It doubles the enumeration and therefore roughly doubles the generator's
+   wall clock, which the owner's ruling of 2026-08-31 permits explicitly as long
+   as visible progress shows the page has not hung. The generator already
+   reports progress per combination. */
 
 /* Two of the values above, hueDrift and hueSplit, are CONTINUOUS fields that
    PARAM_SPACE already optimises, which looks at first like a category error.
@@ -3546,13 +3894,40 @@ function discreteCombos(family) {
   return out;
 }
 
-/* Apply a discrete assignment to a spec. Every key here is a real spec field,
-   which is what lets the result go straight into optimize. */
-function applyCombo(spec, combo) {
+/* Apply a discrete assignment to a spec. Every key here is a real spec field
+   except one, which is what lets the result go straight into optimize.
+
+   The exception is `usePath`, and it is an exception on purpose rather than by
+   omission. The axis is a CHOICE, "run this design over the hue path derived
+   from the anchors or over the family's formula", and its value therefore has
+   to be something a combo key can print and a test can read: a 0 or a 1, not
+   a list of support points whose String() is a row of [object Object]. The
+   path itself cannot live in SUGGEST_AXES either, because it is a function of
+   the anchors and the axes are a function of the family alone. So the axis
+   carries the flag, the caller passes the path, and this is where the two
+   meet. A spec never sees `usePath`; it only ever sees `huePath`. */
+function applyCombo(spec, combo, path) {
   var s = JSON.parse(JSON.stringify(spec));
   for (var k in combo) {
     if (!Object.prototype.hasOwnProperty.call(combo, k)) continue;
+    if (k === 'usePath') {
+      s.huePath = combo[k] && path ? path : null;
+      continue;
+    }
     s[k] = combo[k];
+  }
+  /* pinHue means "no drift", so it sets the value as well as freezing it.
+     Applied AFTER the loop and not inside it, because the hueDrift axis is
+     enumerated alongside and the object key order decides which of the two
+     writes last otherwise. A pin that a start value can overwrite depending on
+     property order is a pin that works on Tuesdays. */
+  if (s.pinHue) s.hueDrift = 0;
+  if (s.huePath) {
+    /* Under a hue path the drift does nothing anyway, so pinning it would be a
+       distinction with no difference and would only duplicate every design.
+       The thinning would remove the duplicates, but at the price of running
+       them first. */
+    s.pinHue = 0;
   }
   return s;
 }
@@ -3851,8 +4226,41 @@ function suggestColormaps(anchors, family, opts) {
     bgFloor: o.bgFloor === undefined ? base.bgFloor : o.bgFloor
   };
 
+  /* The hue path derived from the anchors, or null when there is nothing to
+     derive: fewer than two anchors, all of them at one lightness, or all of
+     them so close to neutral that their hues are rounding. With null the
+     usePath axis still enumerates, and both of its values produce the same
+     spec, so the pair is thinned back to one by the similarity pass rather
+     than by a special case here. A pinned spec.huePath from the caller wins,
+     because pinning a field is how the expert tab and the tests overrule the
+     generator everywhere else in this file. */
+  var path = base.huePath || huePathFromAnchors(list);
+
   var combos = discreteCombos(family);
   if (!combos.length) combos = [{}];
+
+  /* Drop combinations that produce a start spec another combination already
+     produces, BEFORE any of them is optimised. The thinning at the end would
+     remove the duplicate results anyway, but only after paying for them, and
+     with SUGGEST_MAX_EVAL at 150 each one is a real cost: on sequential a
+     quarter of the product is redundant, because pinHue forces hueDrift to
+     zero and the two values of the hueDrift axis then collapse into one.
+
+     Compared on the START SPEC and not on the combination, so it catches any
+     future pair of axes that happen to meet rather than only this one, and so
+     that a genuine new axis does not have to be listed anywhere here. The
+     surviving combination is the FIRST in enumeration order, which is fixed by
+     suggestAxesFor, so this cannot make the output depend on anything the
+     order did not already depend on. */
+  var seen = {}, uniq = [];
+  for (i = 0; i < combos.length; i++) {
+    var probe = JSON.stringify(applyCombo(base, combos[i], path));
+    if (seen[probe]) continue;
+    seen[probe] = 1;
+    uniq.push(combos[i]);
+  }
+  var redundant = combos.length - uniq.length;
+  combos = uniq;
   var raw = [];
   for (i = 0; i < combos.length; i++) {
     /* Progress, so a caller can show a counter rather than only a dimmed list.
@@ -3861,7 +4269,7 @@ function suggestColormaps(anchors, family, opts) {
        core stays free of timers and DOM: it just calls back, and whether that
        reaches a screen is the page's problem. */
     if (typeof o.onProgress === 'function') o.onProgress(i, combos.length);
-    var start = applyCombo(base, combos[i]);
+    var start = applyCombo(base, combos[i], path);
     var res = optimize(start, w, ctx, optOf(o));
     var spec = res.spec;
     var ramp = buildRamp(spec);
@@ -3999,6 +4407,10 @@ function suggestColormaps(anchors, family, opts) {
     designs: designs.length,
     shown: shown.length,
     generated: raw.length,
+    /* How many combinations were skipped as duplicate start specs. Reported
+       rather than swallowed: a caller comparing `generated` against the size of
+       the axis product would otherwise find a gap and no explanation for it. */
+    redundant: redundant,
     dropped: dropped,
     requested: want,
     separation: shown.length > 1 ? minPair : Infinity,
@@ -4217,6 +4629,10 @@ globalThis.CmapCore = {
   seedToLch: seedToLch,
   CHROMA_SHAPES: CHROMA_SHAPES,
   chromaProfile: chromaProfile,
+  huePathAt: huePathAt,
+  huePathOf: huePathOf,
+  hueAt: hueAt,
+  huePathFromAnchors: huePathFromAnchors,
   FAMILIES: FAMILIES,
   divergingBranchKnots: divergingBranchKnots,
   specDefaults: specDefaults,
@@ -4293,6 +4709,10 @@ globalThis.CmapCore = {
   rankSubsets: rankSubsets,
   SUBSET_ANCHOR_WEIGHT: SUBSET_ANCHOR_WEIGHT,
   subsetCombos: subsetCombos,
+  subsetAnchors: subsetAnchors,
+  subsetSeed: subsetSeed,
+  startSpecFor: startSpecFor,
+  dedupeCombos: dedupeCombos,
   evaluateSubsetOne: evaluateSubsetOne,
   evaluateSubset: evaluateSubset,
   PALETTE_HIT: PALETTE_HIT,
@@ -4457,7 +4877,7 @@ globalThis.CmapCore = {
     };
 
     const CHROMA_LABEL = {
-      hump: 'Hump', rising: 'Rising', falling: 'Falling', ends: 'Free ends'
+      hump: 'Hump', rising: 'Rising', falling: 'Falling', bowl: 'Bowl', ends: 'Free ends'
     };
 
     const familyIds = () => Object.keys(C.FAMILIES);
@@ -4825,7 +5245,11 @@ globalThis.CmapCore = {
        about 2.5e-3 of quantisation noise on a mean step of about 3.4e-3. The
        noise is three quarters the size of the signal and a plot of the raw rate
        is therefore mostly a plot of the rounding. Session 5b drew exactly that,
-       and the owner reasonably read the result as a bug.
+       and the owner reasonably read the result as a bug. Session 5e removed the
+       raw curve from the drawing for the same reason he gave then: a curve
+       nobody can read is not honesty, it is decoration. What survives of the
+       honesty is the paragraph in the popover, which still says in words that
+       the underlying rate is jagged and that viridis and magma are worse.
 
        It is not a bug, and the reference maps are the proof. MEASURED
        2026-08-31, range of the raw rate divided by its mean:
@@ -4881,15 +5305,28 @@ globalThis.CmapCore = {
        to 2.023 at 31). So the ceiling is not set by our own ramps at all: it is
        set by the maps that DO have fine structure, and there the cost is
        visible. hsv's residual runs 0.079 at 7, 0.114 at 15, 0.149 at 21, 0.210
-       at 31, magma's 0.260, 0.282, 0.295, 0.311. Fifteen is the widest window
-       at which those two are still only modestly above their plateau, and it is
-       twice as smooth as seven on the ramps this page actually draws (apparent
-       range over mean 0.241 to 0.184 on the featureless default). Wider would
-       start selling the smoothness of a map that does not have it.
+       at 31, magma's 0.260, 0.282, 0.295, 0.311.
 
-       The raw curve stays faint behind the heavy one at every width, which is
-       what keeps a wider window honest rather than merely calmer. */
-    const RATE_WINDOW = 15;
+       SESSION 5e, and this is why the number moved again. 5d stopped at 15 with
+       the argument that the raw curve stays faint behind the heavy one, so a
+       wider window was still honest because the scatter was on the page next to
+       it. The owner then called that faint curve showing off and asked for it to
+       go, which removes that argument entirely: nobody is comparing two curves
+       any more, so the only remaining question is whether the one curve left
+       still says something.
+
+       THIRTY-ONE, rerun 2026-09-01 with cmap-rate-window.mjs. At that width the
+       maps with genuine fine structure still carry most of it: magma's surviving
+       range over its mean is 1.095, hsv's 1.569, jet's 1.165, twilight's 0.511,
+       against 0.133 for our own featureless default. The feature test is
+       unchanged in kind and better in ratio: the lightGamma 2.2 ramp keeps 2.023
+       of its raw 2.507 while the lightGamma 1.0 ramp falls from 1.189 to 0.133,
+       a contrast of 15.2 against 11.2 at fifteen. Past 31 the useful maps start
+       paying: magma drops to 0.938 at 41 and 0.819 at 51, and its residual
+       climbs from 0.311 to 0.321 and 0.329, which is the smoother eating
+       structure that is really there. So 31 is the widest width at which the
+       chart is calm AND every reference map still shows its own shape. */
+    const RATE_WINDOW = 31;
 
     function movingAverage(data, win, closed) {
       const n = data.length, out = new Float64Array(n), h = (win - 1) / 2;
@@ -4965,7 +5402,7 @@ globalThis.CmapCore = {
           `}
           ${series.map((s, si) => html`
             <path key=${si} d=${path(s.data)} fill="none" stroke=${s.color}
-              strokeWidth=${s.faint ? 1 : 1.5} opacity=${s.faint ? 0.32 : 1} />
+              strokeWidth="1.5" />
           `)}
           <text x="2" y=${padT + 8} fill=${COL.note} fontSize="9">${fmt(hi, 2)}</text>
           <text x="2" y=${h - padB} fill=${COL.note} fontSize="9">${fmt(lo, 2)}</text>
@@ -5171,9 +5608,18 @@ globalThis.CmapCore = {
         return () => window.removeEventListener('themechange', on);
       }, []);
 
-      /* The generator run. It is 262 to 899 ms measured, which is long enough
-         that a synchronous call inside the click handler would freeze the input
-         while it ran and give no sign that anything was happening. So the state
+      /* The generator run. MEASURED 2026-09-01 on four imported colours, 614 ms
+         for cyclic, 1849 for diverging and 2032 for sequential, up from the 262
+         to 899 ms of session 5c: session 5e added two discrete axes, the hue
+         path and the pinned hue, and the enumeration is the generator's cost.
+         The duplicate start specs those axes create are skipped before they are
+         optimised (30 of sequential's 80 on that case, 50 of 80 with a single
+         anchor, where no hue path can be derived at all), which is why the
+         count the bar names is an upper bound and says so.
+
+         That is long enough that a synchronous call inside the click handler
+         would freeze the input while it ran and give no sign that anything was
+         happening. So the state
          goes busy first, and the work is deferred one frame plus a timeout, so
          the browser gets to paint the dimmed list before the main thread is
          taken. This is not a worker: a worker would need its own script block
@@ -5195,11 +5641,19 @@ globalThis.CmapCore = {
 
          Still deliberately NOT run on every keystroke. An import is a single
          deliberate act and does re-run (session 5c point 1); typing in a hex
-         field is not, and a 262 to 899 ms run per keypress would make the field
-         unusable. */
+         field is not, and a run of one to two seconds per keypress would make
+         the field unusable. */
       const run = useCallback((fam, list, opts) => {
         setBusy(true);
         setErr(null);
+        /* The raw axis product, deliberately, and this is the one place it is
+           the right number. The generator's own duplicate skip depends on the
+           hue path it derives from `list`, which this callback cannot cheaply
+           reproduce, and the bar here is indeterminate anyway: the run is one
+           synchronous call, so the count is a statement of how much work was
+           asked for and not a position. The caption says "up to" for exactly
+           that reason. The feasibility table, whose bar really does advance,
+           prints the deduplicated count instead. */
         setProg({ done: 0, total: C.discreteCombos(fam).length });
         const id = runId + 1;
         setRunId(id);
@@ -5518,12 +5972,72 @@ globalThis.CmapCore = {
         ];
       }, [ramp]);
 
-      /* The smoothed local rate, and the raw one to draw faintly behind it. The
-         window and the whole argument for it are at RATE_WINDOW above. */
+      /* The smoothed local rate, which since 5e is the only rate curve drawn.
+         The window and the whole argument for it are at RATE_WINDOW above. */
       const rateSmooth = useMemo(() => {
         if (!metrics) return null;
         return movingAverage(metrics.rate, RATE_WINDOW, closed);
       }, [metrics, closed]);
+
+      /* THE Y AXIS OF THE RATE CHART, WHICH IS A FIXED SCALE AND NOT AN
+         AUTOSCALE, and getting this wrong made every map look broken.
+
+         Reported from the browser in session 5e: a ramp whose steps are as even
+         as this tool ever gets, coefficient of variation 0.203 and labelled
+         "very even" in its own caption directly underneath, was drawn as a
+         violent sawtooth filling the full height of the frame. Nothing was
+         wrong with the numbers. The axis ran from 1.31 to 1.37, a span of 0.06
+         on a mean of about 1.34, so FOUR AND A HALF PERCENT of variation was
+         stretched over the whole plot. An autoscale always fills its frame,
+         which means it shows the SHAPE of the variation and destroys its SIZE,
+         and size is the entire question this chart is asked.
+
+         The fix has to be a scale that is fixed relative to the MEAN rather
+         than in absolute units, because the absolute rate is not comparable
+         between maps: it depends on how much OKLab ground the ramp covers, so
+         a constant like [0, 2] would flatten one map to a line and push the
+         next one off the top. Anchored at zero and running to twice the mean,
+         the dashed mean line sits exactly in the middle at every zoom, a flat
+         map looks flat, and a map with a genuine hump still shows it, since a
+         stretch running at twice the average rate reaches the top of the frame.
+
+         It EXPANDS but never contracts: if the curve does leave that window the
+         window grows to hold it, so a genuinely wild map is drawn honestly
+         rather than clipped. That is the one direction in which giving up the
+         fixed scale is the honest choice, and it is the direction an autoscale
+         never had. */
+      /* How many starts one row of the feasibility table really costs. NOT
+         discreteCombos(family).length, which is the raw axis product: since
+         session 5e evaluateSubset drops the combinations that lead to the same
+         start spec, and on sequential that is 50 of 80. Printing 80 next to a
+         run that does 50 is the kind of number that makes a reader distrust the
+         other numbers on the page, and it was the owner's first reaction to it.
+
+         Computed on the FIRST subset and reused for the whole table. The count
+         is a property of the axes and of what can be derived from a subset's
+         anchors, not of which anchors they are: measured on four colours it is
+         50 for a pair and 50 for a triple. If a later axis ever makes it vary
+         per row, this becomes a per row number and the caption has to move
+         inside the loop with it. */
+      const feasStarts = useMemo(() => {
+        const all = C.discreteCombos(family);
+        if (anchors.length < C.SUBSET_MIN) return all.length;
+        const idx = [];
+        for (let i = 0; i < Math.min(2, anchors.length); i++) idx.push(i);
+        try {
+          return C.dedupeCombos(anchors, idx, family, undefined, all).length;
+        } catch (e) { return all.length; }
+      }, [anchors, family]);
+
+      const rateDomain = useMemo(() => {
+        const data = rateSmooth || (metrics && metrics.rate);
+        if (!metrics || !data || !data.length) return null;
+        const mean = metrics.uni.mean * 255;
+        if (!(mean > 0)) return null;
+        let hi = mean * 2;
+        for (let i = 0; i < data.length; i++) if (data[i] > hi) hi = data[i];
+        return [0, hi];
+      }, [metrics, rateSmooth]);
 
       /* Session 5c point 8: the two test images are the same height. They sit
          in a two column grid of equal width and both are drawn with
@@ -5624,13 +6138,29 @@ globalThis.CmapCore = {
                     that visits four given colours and does NOT go round the
                     circle is a different curve shape, not a different setting of
                     this one, and it would stop being cyclic in the sense the
-                    family means. -->
+                    family means.
+
+                    SESSION 5e ASKED THE QUESTION AGAIN AND THE ANSWER HELD, so
+                    the note stays rather than being quietly deleted. 5e gave
+                    every family the option of a hue path with support points
+                    (huePath in families.js), which removes the "by
+                    construction" part of the argument above: a cyclic map CAN
+                    now dwell between two clusters of hues instead of crossing
+                    them at constant speed. It just does not help. REMEASURED
+                    2026-09-01 on the same pair, cyclic reaches 0.1112 with the
+                    path against 0.1218 without, while sequential reaches
+                    0.0013; on four colours on two hue islands the best cyclic
+                    candidate carries no path at all. The reason is that the
+                    family's promise is the whole circle, and a path that keeps
+                    that promise still has to spend most of its length at hues
+                    nobody asked for. The limit is the family, as the note says,
+                    and now for a measured reason rather than an assumed one. -->
                 ${family === 'cyclic' && anchors.length > 0 && html`
                   <p className="cmap-note" style=${{ marginTop: 6, color: 'var(--tool-text)' }}>
                     <b className="cmap-warn">A cyclic map goes once round the hue circle</b>, so it visits every hue whether
                     you asked for it or not. Your colours pull on where it starts and how it is
                     shaded, and no further. Measured: on a pair of colours a sequential map gets
-                    within 0.002 of them and a cyclic one stays 0.118 away, and turning the weight
+                    within 0.001 of them and a cyclic one stays 0.111 away, and turning the weight
                     up by a factor of 64 changes that by less than a thousandth. This is the shape
                     of the family, not a limit of the search.
                   </p>
@@ -5843,8 +6373,8 @@ globalThis.CmapCore = {
                       <div className="cmap-prog-bar" style=${{ width: '100%', opacity: 0.55 }} />
                     </div>
                     <p className="cmap-prog-txt">
-                      Optimising ${prog && prog.total ? prog.total : ''} designs. This takes about
-                      a second and the page has not frozen.
+                      Optimising up to ${prog && prog.total ? prog.total : ''} designs. This takes
+                      one to three seconds and the page has not frozen.
                     </p>
                   </div>
                 `}
@@ -5946,7 +6476,7 @@ globalThis.CmapCore = {
                     `}
                     <p className="cmap-cardsub">
                       Each row is really optimised, over all
-                      ${' ' + C.discreteCombos(family).length} hue and chroma starts.
+                      ${' ' + feasStarts} hue and chroma starts.
                       ${' '}Takes a few seconds.
                     </p>
                     <div className="cmap-row" style=${{ marginTop: 0, marginBottom: 10 }}>
@@ -5969,8 +6499,9 @@ globalThis.CmapCore = {
                             style=${{ width: (feasProg.total ? (100 * feasProg.done / feasProg.total) : 0) + '%' }} />
                         </div>
                         <p className="cmap-prog-txt">
-                          Subset ${feasProg.done} of ${feasProg.total}, each optimised over
-                          ${' ' + C.discreteCombos(family).length} starts.
+                          Subset ${Math.min(feasProg.done + 1, feasProg.total)} of ${feasProg.total},
+                          each optimised over
+                          ${' ' + feasStarts} starts.
                         </p>
                       </div>
                     `}
@@ -6063,8 +6594,9 @@ globalThis.CmapCore = {
                         ariaLabel="Chroma profile shape" />
                       <p className="cmap-note">
                         Where the chroma is allowed to sit. Hump runs out to neutral at both ends,
-                        rising and falling at one, and free ends keeps a fraction of the ceiling at
-                        both. That last one is why a saturated colour at BOTH ends of a sequential
+                        rising and falling at one, bowl is the hump upside down and is most
+                        colourful at both ends, and free ends keeps a fraction of the ceiling at
+                        both. Free ends is why a saturated colour at BOTH ends of a sequential
                         map is reachable at all: measured on one such pair, the best miss was
                         0.00815 with free ends against 0.02130 with a hump, and the calibrated hit
                         threshold is 0.010. The limit was the shape, not the family.
@@ -6189,6 +6721,15 @@ globalThis.CmapCore = {
                           the mean.
                         </p>
                         <p>
+                          <b>The scale runs from zero to twice the mean</b>, so the dashed line is
+                          always halfway up and a flat curve really is a flat map. That is
+                          deliberate rather than cosmetic: an axis fitted to the data always fills
+                          the frame, which shows the shape of the variation while hiding its size,
+                          and the size is the whole question here. A stretch running at double the
+                          average rate reaches the top. If the curve leaves that window the window
+                          grows to hold it, so nothing is ever clipped out of sight.
+                        </p>
+                        <p>
                           <b>The jaggedness is quantisation, not a fault in the map.</b> The rate
                           is a difference between neighbouring entries, the entries are 8-bit, and
                           the rounding noise is about three quarters the size of the mean step. A
@@ -6198,25 +6739,23 @@ globalThis.CmapCore = {
                           default ramp, which is the calmest of them.
                         </p>
                         <p>
-                          So the heavy line is a moving average over ${RATE_WINDOW} entries and the
-                          faint one behind it is the raw rate, because hiding the scatter would be
-                          as misleading as drawing only it. The window is measured rather than
-                          picked: the amount the smoother removes stops growing at about five
-                          entries, so by seven everything removable as noise is already gone, and
-                          out to fifteen the maps that carry real fine structure, magma and hsv,
-                          have lost only a little of it. A genuine rate feature survives at this
-                          width, checked on a ramp built to have one: it keeps 82% of its range
-                          while a ramp with no feature keeps 15% of its apparent one.
+                          So what is drawn is a moving average over ${RATE_WINDOW} entries, and the
+                          window is measured rather than picked: the amount the smoother removes
+                          stops growing at about five entries, so everything removable as noise is
+                          gone well before this width, and at ${RATE_WINDOW} the maps that carry
+                          real fine structure still show it. A genuine rate feature survives here,
+                          checked on a ramp built to have one: it keeps 81% of its range while a
+                          ramp with no feature keeps 11% of its apparent one.
                         </p>
                       <//>
                       <${LinePlot} w=${420} h=${120} title="Local rate"
                         yLabel="dE" refLine=${metrics.uni.mean * 255}
+                        domain=${rateDomain}
                         series=${[
-                          { data: Array.from(metrics.rate), color: COL.warn, faint: true },
                           { data: Array.from(rateSmooth || metrics.rate), color: COL.warn }
                         ]} />
                       <p className="cmap-cap">
-                        Heavy line smoothed over ${RATE_WINDOW} entries, raw rate faint behind it.
+                        Smoothed over ${RATE_WINDOW} entries.
                         As one number, the steps are ${evennessWord(metrics.uni.cv)} even: their
                         coefficient of variation is ${fmt(metrics.uni.cv, 3)}, against
                         ${' ' + fmt(CV_MARKS.uniform, 3)} for the least even of viridis, managua and
