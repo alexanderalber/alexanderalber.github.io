@@ -1,0 +1,1444 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <!-- No theme one-liner and no switcher: the corridor fills the screen and only
+       exists dark, exactly as spaceship-6dof.html and asteroid-lab.html do, so a
+       stored light preference must not reach this page. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Asteroid Corridor - Threading a Rock Field with a 3D Mouse</title>
+  <meta name="description" content="A long transparent corridor filled with slowly turning asteroids, flown with a 3Dconnexion SpaceNavigator. Real rigid-body flight: the rocks are collided against their drawn geometry rather than against bounding spheres, everything casts shadows on everything, and a spinning rock shoves you the way a moving wall does. Needs a 3D mouse and a Chromium browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/asteroid-corridor.html">
+  <meta property="og:title" content="Asteroid Corridor">
+  <meta property="og:description" content="Thread a wireframe Cobra through a corridor of turning asteroids. Contacts are taken against the real rock surface, craters and all, and the ship throws its shadow onto the rocks.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/asteroid-corridor.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Full-screen canvas, so the Pico container, the site header and the site
+       footer are deliberately absent, as in the two tools this one descends
+       from. Everything that would live in them goes into the floating panel. */
+    html, body { height: 100%; }
+    body { margin: 0; overflow: hidden; background: #05070b; }
+    #root { position: fixed; inset: 0; }
+
+    .co-stage { position: absolute; inset: 0; touch-action: none; cursor: crosshair; }
+    .co-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+    .co-back { position: absolute; top: 12px; left: 12px; z-index: 3;
+      font-size: 12.5px; color: var(--tool-label); text-decoration: none;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .co-back:hover { color: var(--tool-text); border-color: var(--tool-faint); }
+
+    /* The readouts are written straight into these nodes from the animation
+       loop. Routing sixty numbers a second through React state would re-render
+       the whole panel for nothing. */
+    .co-hud { position: absolute; bottom: 12px; left: 12px; z-index: 3;
+      pointer-events: none;
+      padding: 9px 14px; border-radius: 10px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .co-grid { display: grid; grid-template-columns: auto auto; gap: 3px 14px;
+      font-size: 11.5px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      letter-spacing: .02em; }
+    .co-grid b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .co-grid b.hot { color: #fbbf24; }
+
+    .co-msg { position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+      z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
+      font-size: 14px; color: var(--tool-text); letter-spacing: .03em;
+      text-shadow: 0 0 18px rgba(0,0,0,.95); }
+    .co-msg small { display: block; margin-top: 8px; font-size: 11.5px; color: var(--tool-note); }
+
+    .co-panel { position: absolute; top: 12px; right: 12px; z-index: 4;
+      width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+      overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid var(--tool-border); border-radius: 10px; padding: 12px 14px 14px;
+      background: color-mix(in srgb, var(--tool-panel) 88%, transparent); backdrop-filter: blur(10px);
+      box-shadow: var(--tool-panel-shadow); }
+    .co-panel::-webkit-scrollbar { width: 8px; }
+    .co-panel::-webkit-scrollbar-thumb { background: var(--tool-border); border-radius: 4px; }
+    .co-toggle { position: absolute; top: 12px; right: 12px; z-index: 4;
+      font-size: 12.5px; color: var(--tool-text); cursor: pointer; width: auto; margin: 0;
+      padding: 6px 13px; border-radius: 999px; border: 1px solid var(--tool-border);
+      background: color-mix(in srgb, var(--tool-panel) 75%, transparent); backdrop-filter: blur(8px); }
+    .co-toggle:hover { border-color: var(--tool-faint); }
+
+    .co-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .co-head h2 { font-size: 14px; color: var(--tool-text); margin: 0; font-weight: 600; flex: 1; }
+    .co-x { background: none; border: none; color: var(--tool-note); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 4px; margin: 0; width: auto; }
+    .co-x:hover { color: var(--tool-text); }
+
+    /* Accordion, the same shape spaceship-6dof and asteroid-lab use. The
+       collapsed header keeps showing its current value, so folding a section
+       away hides the controls and not the setting. */
+    .co-acc { border-top: 1px solid var(--tool-hairline); }
+    .co-acc-h { display: flex; align-items: baseline; gap: 8px; width: 100%;
+      margin: 0; padding: 9px 2px; background: none; border: none; cursor: pointer;
+      font-size: 11px; color: var(--tool-note); letter-spacing: .06em; text-transform: uppercase;
+      text-align: left; }
+    .co-acc-h:hover { color: var(--tool-text); }
+    .co-acc-h.open { color: var(--tool-label); }
+    .co-acc-s { margin-left: auto; font-size: 11px; color: var(--tool-faint);
+      text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
+    .co-acc-c { margin-left: auto; font-size: 13px; line-height: 1; color: var(--tool-faint); flex: none; }
+    .co-acc-s + .co-acc-c { margin-left: 6px; }
+    .co-acc-b { padding: 0 2px 12px; }
+
+    .co-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline;
+      gap: 2px 8px; margin: 6px 0; }
+    .co-row label { font-size: 11.5px; color: var(--tool-label); margin: 0; }
+    .co-row output { font-size: 11.5px; color: var(--tool-text); text-align: right;
+      font-variant-numeric: tabular-nums; }
+    .co-row input[type=range] { grid-column: 1 / -1; margin: 2px 0 0; }
+
+    /* Deliberate chip rows of separate actions, so they opt out of the shared
+       adjacency rounding the way .rd-row and .qr-chips do. */
+    .co-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 6px; }
+    .co-chips button { width: auto; margin: 0; border-radius: 4px; margin-left: 0; }
+    .co-seg { margin: 4px 0 4px; }
+    .co-seg button { width: auto; margin: 0; }
+    .co-seg-l { font-size: 11.5px; color: var(--tool-label); display: block; margin: 9px 0 2px; }
+
+    .co-derived { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+      font-size: 11px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      margin: 9px 0 0; padding-top: 8px; border-top: 1px solid var(--tool-hairline); }
+    .co-derived b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .co-derived b.hot { color: #fbbf24; }
+
+    .co-ramps { display: grid; gap: 4px; margin: 6px 0 4px; }
+    .co-ramp { display: grid; grid-template-columns: 54px 1fr; align-items: center;
+      gap: 8px; width: 100%; margin: 0; padding: 3px 5px; cursor: pointer;
+      background: none; border: 1px solid transparent; border-radius: 5px;
+      font-size: 11px; color: var(--tool-label); text-align: left; }
+    .co-ramp:hover { border-color: var(--tool-border); color: var(--tool-text); }
+    .co-ramp.active { border-color: var(--pico-primary); color: var(--tool-text); }
+    .co-ramp i { display: block; height: 12px; border-radius: 3px;
+      border: 1px solid var(--tool-hairline); }
+
+    .co-note { font-size: 10.5px; color: var(--tool-faint); margin: 8px 0 0; line-height: 1.5; }
+    .co-note kbd { font-size: 10px; }
+  </style>
+
+  <script type="importmap">
+  { "imports": { "three": "/assets/js/three.module.min.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE = THREE;
+    window.__coThreeReady = true;
+    window.dispatchEvent(new Event('co-three-ready'));
+  </script>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/spacenav.js"></script>
+  <script src="/assets/js/sixdof.js"></script>
+  <script src="/assets/js/dust.js"></script>
+  <script src="/assets/js/asteroid.js"></script>
+  <script src="/assets/js/colorramps.js"></script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Asteroid Corridor",
+    "description": "A sandbox for six-degree-of-freedom flight through a corridor of procedurally generated asteroids, flown with a 3Dconnexion SpaceNavigator over WebHID. The corridor is a long transparent box whose walls are nothing but a grid, and the rocks inside it stand still and turn. Flight is the same rigid body as in Cobra 6DOF: an inertia tensor integrated over the hull mesh, Euler's equations in the body frame, and impulse contacts that impart torque, so a grazed rock leaves the ship tumbling. The rocks are collided against their own drawn surface rather than against a bounding sphere: noise and craters displace every vertex along its own radius, which makes the body star-shaped and turns the question of whether a point is inside it into a single lookup. A turning rock is treated as a moving wall, so it shoves rather than holds. One fixed sun casts real shadow maps, rock onto rock and ship onto rock, and the transparent walls carry shadow catchers so the shadows have somewhere to land. Rocks, ship and walls each take their own drawing style. There is no clock and no score.",
+    "url": "https://alber.me/miscellaneous/tools/asteroid-corridor.html",
+    "applicationCategory": "GameApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript, WebGL and WebHID, so a Chromium-based browser, plus a 3D mouse for the intended controls"
+  }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- The pure half: the corridor itself, where the rocks go, how they turn,
+       what the hull can hit, which pairs of rocks can shadow one another and
+       where the shadow camera sits. No DOM, no three.js, no React, so
+       notes/dev/corridor.test.mjs pulls this block out by id and evaluates it,
+       on top of assets/js/sixdof.js and assets/js/asteroid.js. Moving any of it
+       into the app block breaks that seam. -->
+  <script id="cocore">
+var Corridor = (function () {
+  'use strict';
+
+  /* The corridor is a box, long in z, and the ship flies from the far end
+     towards -z, which is where the nose points in the hull frame the dynamics
+     uses. Both ends are closed: the owner picked a level of finite length over
+     an endless one, and that choice is what makes the rock positions fixed,
+     the seed reproducible and the shadow pair graph computable once. */
+  var DEF_LEVEL = {
+    seed: 1,
+    len: 5000,        /* metres along the corridor */
+    cross: 600,       /* the square cross section, edge length in metres */
+    count: 8,
+    size: 0.33,       /* rock DIAMETER as a fraction of the cross section */
+    spread: 0.45,     /* how far the diameters scatter around that */
+    spin: 0.09,       /* rad/s, the largest rate drawn */
+    clear: 1.6,       /* free space at the ends, in corridor cross sections */
+    /* How far a rock may hang out through a wall, as a fraction of its own
+       radius. The walls are a drawn boundary rather than a physical one for
+       the rocks (they are for the ship), and a field that stops politely short
+       of an invisible plane looks arranged. At 0 every rock is fully inside. */
+    stray: 0.7,
+    /* Daylight between two rock surfaces, in cross sections. This is the one
+       number that keeps a chaotic field flyable. */
+    gap: 0.4
+  };
+
+  function half(level) {
+    return [level.cross / 2, level.cross / 2, level.len / 2];
+  }
+
+  /* Where the ship starts: near the closed far end, on the axis, at rest and
+     pointing down the corridor. */
+  function startState(level) {
+    return {
+      p: [0, 0, level.len / 2 - level.cross * (level.clear * 0.5)],
+      v: [0, 0, 0], q: [1, 0, 0, 0], w: [0, 0, 0]
+    };
+  }
+
+  /* A rock turns at a constant rate about a fixed world axis. Its orientation
+     is therefore a closed form in t rather than an integrated state, which is
+     what keeps a level reproducible: reset the clock and the whole field is
+     back where it was, to the last bit. */
+  function spinQ(rock, t) {
+    var a = rock.axis, r = rock.rate * t;
+    return SixDOF.qMul(SixDOF.qFromRotVec([a[0] * r, a[1] * r, a[2] * r]), rock.q0);
+  }
+  function spinW(rock) {
+    return [rock.axis[0] * rock.rate, rock.axis[1] * rock.rate, rock.axis[2] * rock.rate];
+  }
+
+  /* A direction drawn uniformly on the sphere, via z = 2u - 1 and phi = 2 pi v.
+     Sampling the two angles uniformly instead would crowd the poles, and on a
+     spin axis that shows up as a field of rocks all turning much the same way. */
+  function dirFrom(rand) {
+    var z = rand() * 2 - 1, ph = rand() * Math.PI * 2;
+    var s = Math.sqrt(Math.max(0, 1 - z * z));
+    return [s * Math.cos(ph), s * Math.sin(ph), z];
+  }
+
+  /* Where the sun stands, as a unit vector from the corridor TOWARDS it.
+     Elevation is measured off the corridor axis plane and azimuth around it,
+     and both are kept shallow in the tool, because a light coming in across
+     the corridor throws every shadow straight out through the transparent
+     wall, where there is nothing for it to land on. */
+  function sunDir(az, el) {
+    var ce = Math.cos(el);
+    return [ce * Math.sin(az), Math.sin(el), ce * Math.cos(az)];
+  }
+
+  /* Place the rocks. Positions are fixed for the life of the level, which is
+     the whole point of a closed corridor: the pair graph, the reproducible
+     seed and the shadow camera all rest on it.
+
+     Rejection sampling with a minimum gap, not a lattice: a lattice through a
+     corridor is a set of clear lanes, and the entire ask here is threading
+     rather than dodging. Rocks may hang out through the walls, which is what
+     stops the field from looking arranged, but they keep a fixed amount of
+     daylight between each other, and the two ends stay clear so the ship
+     neither spawns inside a rock nor is walled in at once. */
+  function makeLevel(cfg) {
+    var L = {}, k;
+    for (k in DEF_LEVEL) L[k] = DEF_LEVEL[k];
+    if (cfg) for (k in DEF_LEVEL) if (cfg[k] != null && isFinite(cfg[k])) L[k] = cfg[k];
+    L.count = Math.max(0, Math.round(L.count));
+
+    var rand = SixDOF.rng(L.seed >>> 0);
+    var hx = L.cross / 2, hz = L.len / 2;
+    var clear = L.cross * L.clear;
+    var rocks = [];
+    var wanted = L.count, tries = 0;
+    while (rocks.length < wanted && tries < wanted * 400 + 400) {
+      tries++;
+      var f = 1 + (rand() * 2 - 1) * L.spread;
+      var r = L.cross * L.size * 0.5 * f;
+      if (!(r > 1)) continue;
+      var room = Math.max(0, hx - r * (1 - L.stray));
+      var p = [
+        (rand() * 2 - 1) * room,
+        (rand() * 2 - 1) * room,
+        (rand() * 2 - 1) * Math.max(0, hz - clear - r)
+      ];
+      var ok = true, i;
+      for (i = 0; i < rocks.length; i++) {
+        var o = rocks[i];
+        var dx = o.p[0] - p[0], dy = o.p[1] - p[1], dz = o.p[2] - p[2];
+        var need = o.r + r + L.cross * L.gap;
+        if (dx * dx + dy * dy + dz * dz < need * need) { ok = false; break; }
+      }
+      if (!ok) continue;
+      rocks.push({
+        p: p, r: r, seed: (rand() * 4294967296) >>> 0,
+        axis: dirFrom(rand), rate: (rand() * 2 - 1) * L.spin,
+        q0: SixDOF.qFromRotVec([rand() * 6.283, rand() * 6.283, rand() * 6.283])
+      });
+    }
+    L.rocks = rocks;
+    L.placed = rocks.length;
+    return L;
+  }
+
+  /* Which rocks can throw a shadow onto which.
+   *
+   * The sun is directional and fixed, so the shadow of a rock is a cylinder
+   * along the light. Project two centres onto the plane perpendicular to the
+   * light: they can only meet if those projected discs overlap and one of them
+   * is upstream of the other. With fixed positions this is computed once and
+   * stays true while they turn, because a bounding sphere does not turn with
+   * the rock.
+   *
+   * As an optimisation this is worth nothing: a shadow map costs per caster
+   * and per pixel, never per pair. The value is in knowing, before looking,
+   * whether the current sun angle produces any rock-on-rock shadows at all.
+   * Without that number one builds a feature that shows up for a second every
+   * few minutes and calls it done. */
+  function pairGraph(rocks, dir) {
+    var pairs = [], i, j;
+    for (i = 0; i < rocks.length; i++) {
+      for (j = 0; j < rocks.length; j++) {
+        if (i === j) continue;
+        var a = rocks[i], b = rocks[j];
+        var d = [b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2]];
+        /* dir points at the sun, so a receiver is at NEGATIVE projection: it
+           lies further along the light's travel. */
+        var t = d[0] * dir[0] + d[1] * dir[1] + d[2] * dir[2];
+        if (t >= 0) continue;
+        var px = d[0] - t * dir[0], py = d[1] - t * dir[1], pz = d[2] - t * dir[2];
+        var perp = Math.sqrt(px * px + py * py + pz * pz);
+        if (perp < a.r + b.r) pairs.push([i, j]);
+      }
+    }
+    return { pairs: pairs, count: pairs.length };
+  }
+
+  /* Where the shadow camera looks, snapped to whole texels.
+   *
+   * The camera is small and follows the ship, because in a corridor nothing
+   * further away than the immediate surroundings is ever visible, and cascades
+   * would need another three.js addon to buy something that is not needed. The
+   * price of following is that the texel grid slides underneath a scene that
+   * is standing still, and the shadow edges crawl. Snapping the centre to
+   * whole texels in the light's own frame removes that completely, and it is
+   * completely effective precisely because the rocks do not move.
+   *
+   * Returns the snapped centre plus the light basis, so the caller can place
+   * the light itself along the same axis. */
+  function shadowCam(center, dir, range, mapSize) {
+    var z = SixDOF.mul(dir, 1 / Math.max(1e-9, SixDOF.len(dir)));
+    /* Any vector not parallel to the light will do for the up hint. It is only
+       there to fix the roll of a square camera, and the corridor axis is the
+       one direction the sun is deliberately never parallel to. */
+    var up = Math.abs(z[1]) > 0.9 ? [0, 0, 1] : [0, 1, 0];
+    var x = SixDOF.cross(up, z);
+    x = SixDOF.mul(x, 1 / Math.max(1e-9, SixDOF.len(x)));
+    var y = SixDOF.cross(z, x);
+    var texel = 2 * range / Math.max(1, mapSize);
+    var cx = Math.round(SixDOF.dot(center, x) / texel) * texel;
+    var cy = Math.round(SixDOF.dot(center, y) / texel) * texel;
+    var cz = SixDOF.dot(center, z);
+    return {
+      center: [
+        x[0] * cx + y[0] * cy + z[0] * cz,
+        x[1] * cx + y[1] * cy + z[1] * cz,
+        x[2] * cx + y[2] * cy + z[2] * cz
+      ],
+      axis: [x, y, z], texel: texel
+    };
+  }
+
+  /* Distance from a point to the nearest rock SURFACE, using the bounding
+     radius rather than the radius map. The HUD wants a number every frame and
+     an honest lower bound is worth more there than an exact one: it reads
+     "closest rock", and it is allowed to be pessimistic by the lumpiness of
+     the rock. Negative means the point is inside the bounding sphere. */
+  function nearestGap(p, rocks) {
+    var best = Infinity, idx = -1;
+    for (var i = 0; i < rocks.length; i++) {
+      var d = rocks[i].p, dx = d[0] - p[0], dy = d[1] - p[1], dz = d[2] - p[2];
+      var g = Math.sqrt(dx * dx + dy * dy + dz * dz) - rocks[i].r;
+      if (g < best) { best = g; idx = i; }
+    }
+    return { gap: best, index: idx };
+  }
+
+  /* Progress down the corridor, 0 at the start end and 1 at the far one. */
+  function progress(level, p) {
+    var hz = level.len / 2;
+    var t = (hz - p[2]) / (2 * hz);
+    return t < 0 ? 0 : (t > 1 ? 1 : t);
+  }
+
+  return {
+    DEF_LEVEL: DEF_LEVEL, half: half, startState: startState,
+    spinQ: spinQ, spinW: spinW, dirFrom: dirFrom, sunDir: sunDir,
+    makeLevel: makeLevel, pairGraph: pairGraph, shadowCam: shadowCam,
+    nearestGap: nearestGap, progress: progress
+  };
+})();
+if (typeof globalThis !== 'undefined') globalThis.Corridor = Corridor;
+  </script>
+
+  <script id="app">
+const html = htm.bind(React.createElement);
+const { useState, useRef, useEffect, useMemo, useCallback } = React;
+const SD = SixDOF;
+const CO = Corridor;
+const AS = Asteroid;
+const CR = ColorRamps;
+
+/* Colours are literals rather than --tool-* reads because this page has no
+   theme switcher at all and only exists dark, exactly as spaceship-6dof does.
+   There is nothing for a readPalette() to react to. */
+const COL = {
+  space: 0x05070b, grid: 0x1b3247,
+  ship: 0x7dd3fc, shipFill: 0x64748b,
+  rock: 0x8c8477, rockWire: 0x6b7280, sun: 0xfff1d0
+};
+
+const DEF = {
+  hullL: 100, hullW: 90, hullH: 44,
+  aFwd: 8, aLat: 2.5,
+  aPitch: 0.15, aYaw: 0.13, aRoll: 0.9,
+  deadzone: 0, curve: 1, gain: 0.6,
+  restitution: 0.35,
+  assist: false,
+  camMode: 'chase',
+  camF0: 0.9, camZeta: 0.7071, camRoll: 0.25, camDist: 3.2, camUp: 0.6,
+  seed: 1, len: 5000, cross: 600, count: 8, size: 0.33, spread: 0.45,
+  stray: 0.7, spin: 0.09, subdiv: 4,
+  sunAz: 0.35, sunEl: 0.22, sunI: 2.6, ambI: 0.35,
+  dust: true, dustCount: 6000, dustFar: 3.5,
+  dustSizeNear: 5, dustSizeFar: 2.5, dustOpNear: 1, dustOpFar: 0.3, dustEdge: 0.25,
+  shadows: true, shadowRange: 900, shadowBias: 1.5, shadowSize: 2048,
+  /* One drawing style per class of thing, because they answer different
+     questions: the rocks are what you are avoiding, the hull is what you are
+     flying, and the walls are the only thing telling you where you are. */
+  rockFill: 'ramp', rockWire: false, rockRamp: 'neutral',
+  shipFill: 'occluder', shipWire: true, shipRamp: 'gray',
+  bands: 0,
+  wallGrid: true, wallCatch: true, wallOp: 0.5
+};
+const RAMP_IDS = CR.RAMPS.map((r) => r.id);
+const ENUMS = {
+  camMode: ['chase', 'cockpit'],
+  rockFill: ['solid', 'ramp', 'off'],
+  shipFill: ['occluder', 'solid', 'ramp', 'off'],
+  rockRamp: RAMP_IDS, shipRamp: RAMP_IDS
+};
+const DEF_INV = { fwd: -1, right: 1, up: -1, pitch: 1, yaw: -1, roll: 1 };
+const DEF_MAP = { fwd: 'ty', right: 'tx', up: 'tz', pitch: 'rx', yaw: 'rz', roll: 'ry' };
+const STORE = 'co.cfg';
+
+const AXES = [
+  { key: 'fwd', label: 'Surge' },
+  { key: 'right', label: 'Slide' },
+  { key: 'up', label: 'Lift' },
+  { key: 'pitch', label: 'Pitch' },
+  { key: 'yaw', label: 'Yaw' },
+  { key: 'roll', label: 'Roll' }
+];
+
+/* Debug keys, not a fallback. Without a device the page is not the point, but
+   being able to move the hull from the keyboard is the only way to tell "the
+   simulation is broken" apart from "the 3D mouse is not talking". */
+const KEYMAP = {
+  KeyW: ['fwd', 1], KeyS: ['fwd', -1], KeyA: ['right', -1], KeyD: ['right', 1],
+  KeyR: ['up', 1], KeyF: ['up', -1], KeyI: ['pitch', 1], KeyK: ['pitch', -1],
+  KeyJ: ['yaw', 1], KeyL: ['yaw', -1], KeyU: ['roll', -1], KeyO: ['roll', 1],
+  ShiftLeft: ['main', 1], ShiftRight: ['main', 1]
+};
+
+function fmt(x, d) { return Number.isFinite(x) ? x.toFixed(d == null ? 1 : d) : '-'; }
+
+function Slider(props) {
+  return html`<div className="co-row">
+    <label>${props.label}</label>
+    <output>${fmt(props.value, props.digits)}${props.unit ? ' ' + props.unit : ''}</output>
+    <input type="range" min=${props.min} max=${props.max} step=${props.step} value=${props.value}
+      onInput=${(e) => props.onChange(parseFloat(e.target.value))} />
+  </div>`;
+}
+
+/* A joined segmented control. Corners follow DOM adjacency centrally, so
+   nothing about the segments themselves is restated here. */
+function Seg({ label, value, options, onChange }) {
+  return html`<${React.Fragment}>
+    ${label ? html`<span className="co-seg-l">${label}</span>` : null}
+    <div className="co-seg seg-row">
+      ${options.map((o) => html`<button key=${o.value}
+        className=${'lang-seg' + (value === o.value ? ' active' : '')}
+        onClick=${() => onChange(o.value)}>${o.label}</button>`)}
+    </div>
+  <//>`;
+}
+
+function Section({ id, title, summary, open, onToggle, children }) {
+  return html`<div className="co-acc">
+    <button type="button" className=${'co-acc-h' + (open ? ' open' : '')}
+      aria-expanded=${open} onClick=${() => onToggle(id)}>
+      <span>${title}</span>
+      ${!open && summary ? html`<span className="co-acc-s">${summary}</span>` : null}
+      <span className="co-acc-c">${open ? '−' : '+'}</span>
+    </button>
+    ${open ? html`<div className="co-acc-b">${children}</div>` : null}
+  </div>`;
+}
+
+/* What was flown last time, or the defaults. A bad or foreign entry in the
+   store must not take the page down, so anything unreadable is the defaults
+   again. mergeConfig takes only keys the defaults already know, and only with
+   the type the default has: NaN in the state is permanent, because every later
+   step multiplies it forward and the ship never comes back. */
+function loadStored() {
+  try {
+    const raw = localStorage.getItem(STORE);
+    if (!raw) return DEF;
+    return SD.mergeConfig(DEF, JSON.parse(raw), ENUMS);
+  } catch (e) { return DEF; }
+}
+
+/* The colormap as a texture, the same 256 texels under a linear filter that
+   the lab builds. The banding does NOT come from the texture: the shading
+   value is quantised before the lookup, which gives exact bands whatever the
+   sampler does. */
+function rampTexture(THREE, id) {
+  const r = CR.rampById(id);
+  const tex = new THREE.DataTexture(CR.rampTexels(r.stops, 256), 256, 1);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  /* The stops are sRGB, which is the space they were sampled in, so three has
+     to be told or every map comes out washed out. */
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/* A lit material whose final colour is looked up in a colormap.
+ *
+ * This is the lab's ramp shader arrived at from the other side. There it is a
+ * ShaderMaterial that computes its own lambert term; here it has to receive a
+ * shadow map, and a hand-written shader does not unless the whole shadow
+ * plumbing is written into it. So the lighting is three's own, and only the
+ * last line is replaced: take the luminance of the light that came out, which
+ * already has the shadow in it, and read the colour off the ramp instead.
+ *
+ * The gain divides by the total light on offer, so the map spans the range
+ * from unlit to fully lit rather than saturating as soon as the sun slider
+ * goes past one. It is a uniform and not a constant because the sun is a
+ * slider and the material is not rebuilt for it. */
+function rampMaterial(THREE, id, bands) {
+  /* A newline in a shader is a newline, and a JS escape for it inside a
+     string that is itself inside an HTML script block is one backslash too
+     many to keep track of. */
+  const NL = String.fromCharCode(10);
+  const tex = rampTexture(THREE, id);
+  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  mat.userData.tex = tex;
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uRamp = { value: tex };
+    sh.uniforms.uBands = { value: bands };
+    sh.uniforms.uGain = { value: 1 };
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>',
+        ['#include <common>', 'uniform sampler2D uRamp;',
+          'uniform float uBands;', 'uniform float uGain;'].join(NL))
+      .replace('#include <opaque_fragment>', [
+        'float rampL = clamp(dot(outgoingLight, vec3(0.2126, 0.7152, 0.0722)) * uGain, 0.0, 1.0);',
+        'if (uBands > 0.5) rampL = (floor(rampL * uBands) + 0.5) / uBands;',
+        'outgoingLight = texture2D(uRamp, vec2(rampL, 0.5)).rgb;',
+        '#include <opaque_fragment>'
+      ].join(NL));
+    mat.userData.sh = sh;
+  };
+  /* Two ramps or two band counts are two programs. Without this three reuses
+     the first compiled one for both, because from its side the material looks
+     identical. */
+  mat.customProgramCacheKey = () => 'ramp:' + id + ':' + bands;
+  return mat;
+}
+
+function App() {
+  const [p, setP] = useState(loadStored);
+  const [panel, setPanel] = useState(true);
+  const [sec, setSec] = useState('');
+  const [dev, setDev] = useState({ name: null, err: null, supported: !!(window.SpaceNav && SpaceNav.supported()) });
+  const [ready, setReady] = useState(!!window.__coThreeReady);
+
+  const stageRef = useRef(null);
+  const hudRef = useRef({});
+  const navRef = useRef(null);
+  const glRef = useRef(null);
+  const keysRef = useRef({});
+  const lookRef = useRef({ yaw: 0, pitch: 0, dragging: false, chase: DEF.camDist });
+  const killRef = useRef(false);
+  const resetRef = useRef(0);
+
+  const hull = useMemo(() => SD.buildHull('cobra', p.hullL, p.hullW, p.hullH),
+    [p.hullL, p.hullW, p.hullH]);
+  const I = hull.I;
+  /* The level is geometry, not tuning: it is rebuilt only when one of the
+     generator inputs changes, and the loop reads it out of the ref. The sun is
+     deliberately NOT one of those inputs, or turning it would reshuffle the
+     field and throw the ship back to the start. */
+  const level = useMemo(() => CO.makeLevel({
+    seed: p.seed, len: p.len, cross: p.cross, count: p.count,
+    size: p.size, spread: p.spread, stray: p.stray, spin: p.spin
+  }), [p.seed, p.len, p.cross, p.count, p.size, p.spread, p.stray, p.spin]);
+
+  const cfgRef = useRef(null);
+  cfgRef.current = { p, I, hull, level };
+
+  const der = useMemo(() => {
+    const dir = CO.sunDir(p.sunAz * Math.PI, p.sunEl * Math.PI / 2);
+    return {
+      run: SD.bangBang(p.len, p.aFwd),
+      flip: SD.bangBang(Math.PI, p.aPitch),
+      rockD: p.cross * p.size,
+      pairs: CO.pairGraph(level.rocks, dir).count
+    };
+  }, [p.len, p.aFwd, p.aPitch, p.cross, p.size, p.sunAz, p.sunEl, level]);
+
+  /* ---- 3D mouse -------------------------------------------------------- */
+  useEffect(() => {
+    if (!window.SpaceNav || !SpaceNav.supported()) return undefined;
+    const ctl = SpaceNav.create({
+      opts: { deadzone: 0, curve: 1 },
+      onStatus: (s) => setDev((d) => ({ ...d, name: s.connected, err: s.error }))
+    });
+    ctl.init();
+    navRef.current = ctl;
+    return () => { ctl.destroy(); navRef.current = null; };
+  }, []);
+
+  const connect = useCallback(() => {
+    if (navRef.current) navRef.current.connect();
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORE, JSON.stringify(p)); } catch (e) { /* private mode */ }
+  }, [p]);
+
+  const toggleSec = useCallback((id) => setSec((s) => (s === id ? '' : id)), []);
+
+  useEffect(() => {
+    if (ready) return undefined;
+    const on = () => setReady(true);
+    window.addEventListener('co-three-ready', on, { once: true });
+    return () => window.removeEventListener('co-three-ready', on);
+  }, [ready]);
+
+  /* ---- keyboard -------------------------------------------------------- */
+  useEffect(() => {
+    const down = (e) => {
+      if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+      if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
+      else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
+      else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
+      else if (e.code === 'KeyC') setP((q) => ({ ...q, camMode: q.camMode === 'chase' ? 'cockpit' : 'chase' }));
+      else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
+      else if (e.code === 'KeyP') setPanel((v) => !v);
+    };
+    const up = (e) => { delete keysRef.current[e.code]; };
+    const blur = () => { keysRef.current = {}; };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, []);
+
+  /* ---- the scene and the loop ------------------------------------------
+     Built once. Everything the sliders can change is read out of cfgRef each
+     frame; the corridor, the rocks and the materials are rebuilt in the effect
+     below, because that is the one thing a uniform cannot express. */
+  useEffect(() => {
+    if (!ready || !stageRef.current) return undefined;
+    const THREE = window.THREE;
+    const host = stageRef.current;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setClearColor(COL.space, 1);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    host.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, 1, 1, 80000);
+
+    const wallGrp = new THREE.Group();
+    scene.add(wallGrp);
+    const rockGrp = new THREE.Group();
+    scene.add(rockGrp);
+    const shipGrp = new THREE.Group();
+    scene.add(shipGrp);
+    const dustGrp = new THREE.Group();
+    scene.add(dustGrp);
+
+    /* One fixed directional sun plus a little fill. The light's POSITION moves
+       with the ship every frame, which does not move the sun: for a
+       directional light the position only says where the shadow camera sits,
+       and the direction is what lights the scene. */
+    const sun = new THREE.DirectionalLight(0xfff3e0, DEF.sunI);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(DEF.shadowSize, DEF.shadowSize);
+    sun.shadow.bias = 0;
+    scene.add(sun);
+    scene.add(sun.target);
+    const amb = new THREE.HemisphereLight(0x2a3a52, 0x0a0d13, DEF.ambI);
+    scene.add(amb);
+
+    /* The sun as a thing you can see. Without it the light comes from nowhere
+       in particular and the two angle sliders are guesswork; with it they are
+       a direction you can point at. It is drawn far outside the corridor, does
+       not cast and is not lit. */
+    const sunBall = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 32, 16),
+      new THREE.MeshBasicMaterial({ color: COL.sun })
+    );
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 32, 16),
+      new THREE.MeshBasicMaterial({ color: COL.sun, transparent: true, opacity: 0.12, side: THREE.BackSide })
+    );
+    sunBall.frustumCulled = false;
+    halo.frustumCulled = false;
+    scene.add(sunBall);
+    scene.add(halo);
+
+    const state = {
+      s: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] }, t: 0,
+      hits: 0, worst: 0, t0: 0, msg: '', msgUntil: 0
+    };
+    const reset = () => {
+      const cfg = cfgRef.current;
+      state.s = CO.startState(cfg.level);
+      state.cam = { q: [1, 0, 0, 0], w: [0, 0, 0] };
+      state.t = 0; state.hits = 0; state.worst = 0;
+      state.t0 = performance.now();
+    };
+    reset();
+    let lastReset = resetRef.current;
+    let lastLevel = cfgRef.current.level;
+
+    const resize = () => {
+      const w = host.clientWidth || window.innerWidth;
+      const h = host.clientHeight || window.innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    /* Left button, not right: the right one belongs to the browser, where a lot
+       of people have mouse gestures bound. */
+    const onDown = (e) => {
+      if (e.button === 0) { lookRef.current.dragging = true; e.preventDefault(); }
+      if (e.button === 1) { killRef.current = true; e.preventDefault(); }
+    };
+    const onUp = (e) => { if (e.button === 0) lookRef.current.dragging = false; };
+    const onMove = (e) => {
+      const L = lookRef.current;
+      if (!L.dragging) return;
+      L.yaw -= (e.movementX || 0) * 0.004;
+      L.pitch = Math.max(-1.4, Math.min(1.4, L.pitch - (e.movementY || 0) * 0.004));
+    };
+    const onWheel = (e) => {
+      const L = lookRef.current;
+      L.chase = Math.max(1.2, Math.min(14, (L.chase || DEF.camDist) * Math.exp(e.deltaY * 0.0012)));
+      e.preventDefault();
+    };
+    host.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('mousemove', onMove);
+    host.addEventListener('wheel', onWheel, { passive: false });
+
+    let last = 0, raf = 0, lastMapSize = DEF.shadowSize;
+
+    const frame = (ts) => {
+      raf = requestAnimationFrame(frame);
+      const cfg = cfgRef.current;
+      const pp = cfg.p, II = cfg.I, lev = cfg.level;
+      const g = glRef.current;
+      const dt = last ? Math.min(0.05, (ts - last) / 1000) : 0;
+      last = ts;
+      if (resetRef.current !== lastReset || lev !== lastLevel) {
+        lastReset = resetRef.current; lastLevel = lev; reset();
+      }
+      if (!dt || !g || !g.rocks) { renderer.render(scene, camera); return; }
+      state.t += dt;
+
+      /* ---- input ---- */
+      const cmd = { fwd: 0, right: 0, up: 0, pitch: 0, yaw: 0, roll: 0, main: 0 };
+      const nav = navRef.current;
+      const raw = nav && nav.axes();
+      if (raw) {
+        const n6 = SpaceNav.norm6(raw, { deadzone: pp.deadzone, curve: pp.curve });
+        for (const a of AXES) cmd[a.key] = n6[DEF_MAP[a.key]] * DEF_INV[a.key] * pp.gain;
+      }
+      const btn = nav ? nav.buttons() : 0;
+      if (btn & 2) cmd.main = 1;
+      const holdDamp = !!(btn & 1);
+      for (const code in keysRef.current) {
+        const m = KEYMAP[code];
+        if (m) cmd[m[0]] = Math.max(-1, Math.min(1, cmd[m[0]] + m[1]));
+      }
+      for (const k in cmd) cmd[k] = Math.max(k === 'main' ? 0 : -1, Math.min(1, cmd[k]));
+
+      const par = { aFwd: pp.aFwd, aLat: pp.aLat, aPitch: pp.aPitch, aYaw: pp.aYaw, aRoll: pp.aRoll, I: II };
+      const wr = SD.wrench(cmd, par);
+      let T = wr.T;
+      const killing = killRef.current;
+      if (killing || pp.assist || holdDamp) {
+        const d = SD.dampTorque(state.s.w, cmd, par, 2.5, killing);
+        T = [T[0] + d[0], T[1] + d[1], T[2] + d[2]];
+        if (killing && SD.len(state.s.w) < 2e-3) killRef.current = false;
+      }
+
+      /* The rock bodies the contact query sees. Rebuilt per frame because the
+         orientation is a closed form in t, and handed the radius map as a
+         closure, which is how sixdof.js stays independent of asteroid.js.
+         Only the rocks within reach are asked at all, because the corridor is
+         long and the hull is not. */
+      const reach = pp.hullL * 1.2;
+      const bodies = [];
+      for (let i = 0; i < g.rocks.length; i++) {
+        const r = g.rocks[i], rk = r.rock, s = rk.r;
+        const q = CO.spinQ(rk, state.t);
+        r.quat = q;
+        const dx = rk.p[0] - state.s.p[0], dy = rk.p[1] - state.s.p[1], dz = rk.p[2] - state.s.p[2];
+        const bound = s * r.rMax + reach;
+        if (dx * dx + dy * dy + dz * dz > bound * bound) continue;
+        bodies.push({
+          p: rk.p, q: q, w: CO.spinW(rk), r: s * r.rMax,
+          contact: (pl) => {
+            const c = AS.contactAt(r.map, [pl[0] / s, pl[1] / s, pl[2] / s]);
+            return c ? { pen: c.pen * s, n: c.n } : null;
+          }
+        });
+      }
+
+      /* Fixed 8 ms substeps: the tumble is an instability, so the step size has
+         to be decided by the physics and not by whatever the display managed. */
+      const half = CO.half(lev);
+      const nSub = Math.max(1, Math.ceil(dt / 0.008));
+      const h = dt / nSub;
+      for (let i = 0; i < nSub; i++) {
+        state.s = SD.rk4(state.s, wr.a, T, II, h);
+        const cs = SD.contactsBox(state.s, cfg.hull.verts, half)
+          .concat(SD.contactsRocks(state.s, cfg.hull.verts, bodies));
+        const hit = SD.resolve(state.s, cs, II, pp.restitution);
+        if (hit) {
+          state.s = hit.state;
+          if (hit.impact > 0.5) {
+            state.hits++;
+            if (hit.impact > state.worst) state.worst = hit.impact;
+            state.msg = (hit.contact.rock == null ? 'WALL ' : 'ROCK ') + fmt(hit.impact, 1) + ' m/s';
+            state.msgUntil = ts + 1200;
+          }
+        }
+      }
+
+      /* ---- scene ---- */
+      shipGrp.position.set(state.s.p[0], state.s.p[1], state.s.p[2]);
+      shipGrp.quaternion.set(state.s.q[1], state.s.q[2], state.s.q[3], state.s.q[0]);
+      for (let i = 0; i < g.rocks.length; i++) {
+        const q = g.rocks[i].quat || CO.spinQ(g.rocks[i].rock, state.t);
+        g.rocks[i].group.quaternion.set(q[1], q[2], q[3], q[0]);
+      }
+
+      /* ---- the sun and its shadow camera ----
+         The light is fixed in DIRECTION and its shadow camera follows the
+         ship, snapped to whole texels so the texel grid does not slide under
+         a scene that is standing still. That snapping is completely effective
+         here, which it would not be if the rocks drifted. */
+      const dir = CO.sunDir(pp.sunAz * Math.PI, pp.sunEl * Math.PI / 2);
+      const skyDist = Math.max(lev.len, lev.cross) * 3;
+      sunBall.position.set(dir[0] * skyDist, dir[1] * skyDist, dir[2] * skyDist);
+      sunBall.scale.setScalar(skyDist * 0.035);
+      halo.position.copy(sunBall.position);
+      halo.scale.setScalar(skyDist * 0.075);
+      sun.intensity = pp.sunI;
+      amb.intensity = pp.ambI;
+      /* The ramp spans "unlit" to "as lit as this sun gets", so the map does
+         not saturate the moment the sun slider goes past one. */
+      if (g.rampMats) {
+        const gain = 1 / Math.max(0.05, pp.sunI + pp.ambI);
+        for (const m of g.rampMats) if (m.userData.sh) m.userData.sh.uniforms.uGain.value = gain;
+      }
+
+      if (lastMapSize !== pp.shadowSize) {
+        lastMapSize = pp.shadowSize;
+        sun.shadow.mapSize.set(pp.shadowSize, pp.shadowSize);
+        if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+      }
+      sun.castShadow = pp.shadows;
+      const range = pp.shadowRange;
+      const snap = CO.shadowCam(state.s.p, dir, range, pp.shadowSize);
+      const c = snap.center, lift = range * 3;
+      sun.target.position.set(c[0], c[1], c[2]);
+      sun.target.updateMatrixWorld();
+      sun.position.set(c[0] + dir[0] * lift, c[1] + dir[1] * lift, c[2] + dir[2] * lift);
+      const sc = sun.shadow.camera;
+      sc.left = -range; sc.right = range; sc.top = range; sc.bottom = -range;
+      sc.near = 1; sc.far = lift * 2;
+      sc.updateProjectionMatrix();
+      /* normalBias, not bias: on geometry this crumpled a constant depth
+         offset either leaves acne in the crater bowls or lifts the shadow off
+         the rim, and there is no single number that does neither. Offsetting
+         along the surface normal scales with the slope, which is where the
+         problem actually lives. */
+      sun.shadow.normalBias = pp.shadowBias;
+
+      /* ---- camera ---- */
+      const L = lookRef.current;
+      if (!L.dragging) { L.yaw *= Math.exp(-dt / 0.12); L.pitch *= Math.exp(-dt / 0.12); }
+      const look = SD.qMul(SD.qFromRotVec([0, L.yaw, 0]), SD.qFromRotVec([L.pitch, 0, 0]));
+      if (pp.camMode === 'cockpit') {
+        /* No filter in the cockpit: the eye is bolted to the hull, which is
+           the entire difference between the two views. The offset puts it just
+           behind the nose and a little above the centre of mass. */
+        const cq = SD.qMul(state.s.q, look);
+        const off = SD.qRot(state.s.q, [0, pp.hullH * 0.12, -pp.hullL * 0.22]);
+        camera.position.set(state.s.p[0] + off[0], state.s.p[1] + off[1], state.s.p[2] + off[2]);
+        camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
+      } else {
+        state.cam = SD.camStep(state.cam, state.s.q, dt, pp.camF0, pp.camZeta, pp.camRoll);
+        const cq = SD.qMul(state.cam.q, look);
+        const off = SD.qRot(cq, [0, pp.camUp * pp.hullL, (L.chase || pp.camDist) * pp.hullL]);
+        camera.position.set(state.s.p[0] + off[0], state.s.p[1] + off[1], state.s.p[2] + off[2]);
+        camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
+      }
+      shipGrp.visible = pp.camMode !== 'cockpit';
+
+      /* ---- dust ----
+         In both views here, unlike in the arena. The cockpit sits inside the
+         hull rather than out at a corner of the room, so the motes stream past
+         the eye in exactly the way they are meant to, and it is the view with
+         the least else in it to read speed off. */
+      const du = g.dust;
+      if (du) {
+        du.obj.visible = pp.dust;
+        if (pp.dust) {
+          Dust.update(du, [camera.position.x, camera.position.y, camera.position.z], {
+            far: pp.dustFar * pp.hullL,
+            sizeNear: pp.dustSizeNear, sizeFar: pp.dustSizeFar,
+            opNear: pp.dustOpNear, opFar: pp.dustOpFar,
+            edge: pp.dustEdge, pix: renderer.getPixelRatio(),
+            /* The room is the corridor, which is long in z: three half extents
+               and not one, or the motes would either stop at the walls in the
+               short directions or hang far outside the ends. */
+            half: half
+          });
+        }
+      }
+
+      /* ---- HUD ---- */
+      const H = hudRef.current;
+      const set = (k, v, hot) => {
+        const el = H[k];
+        if (!el) return;
+        if (el.textContent !== v) el.textContent = v;
+        const cn = hot ? 'hot' : '';
+        if (el.className !== cn) el.className = cn;
+      };
+      const near = CO.nearestGap(state.s.p, lev.rocks);
+      const gap = near.index < 0 ? Infinity : near.gap - pp.hullL / 2;
+      set('spd', fmt(SD.len(state.s.v), 1) + ' m/s');
+      set('rate', fmt(SD.len(state.s.w) * 180 / Math.PI, 1) + ' deg/s');
+      set('gap', near.index < 0 ? '-' : fmt(gap, 0) + ' m', gap < pp.hullL);
+      set('prog', fmt(CO.progress(lev, state.s.p) * 100, 0) + ' %');
+      set('hit', String(state.hits), state.hits > 0);
+      set('worst', state.worst ? fmt(state.worst, 1) + ' m/s' : '-');
+      set('time', fmt((ts - state.t0) / 1000, 0) + ' s');
+      if (H.msg) H.msg.textContent = ts < state.msgUntil ? state.msg : '';
+
+      renderer.render(scene, camera);
+    };
+    raf = requestAnimationFrame(frame);
+
+    glRef.current = { THREE, renderer, scene, camera, wallGrp, rockGrp, shipGrp, dustGrp, sun, rocks: null };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+      host.removeEventListener('mousedown', onDown);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('mousemove', onMove);
+      host.removeEventListener('wheel', onWheel);
+      renderer.dispose();
+      if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
+      glRef.current = null;
+    };
+  }, [ready]);
+
+  /* ---- geometry and materials: corridor, rocks, hull -------------------- */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g) return undefined;
+    const THREE = g.THREE;
+    const wipe = (grp) => {
+      grp.traverse((c) => {
+        if (c !== grp && c.geometry) c.geometry.dispose();
+        if (c !== grp && c.material) c.material.dispose();
+      });
+      while (grp.children.length) grp.remove(grp.children[grp.children.length - 1]);
+    };
+    wipe(g.wallGrp); wipe(g.rockGrp); wipe(g.shipGrp); wipe(g.dustGrp);
+    g.dust = Dust.makeField(THREE, { count: p.dustCount });
+    g.dustGrp.add(g.dust.obj);
+
+
+    const hx = p.cross / 2, hz = p.len / 2;
+
+    /* The four long walls and the two ends, as nothing but a grid. Transparent
+       walls are the point of the corridor: you have to be able to see the
+       rocks behind you and the ones you have not reached, and a solid tube
+       would leave the ship in a black pipe. The spacing is a quarter of the
+       cross section, so a square of grid is a fixed piece of corridor and
+       reads as a unit of distance rather than as decoration. */
+    if (p.wallGrid) {
+      const step = p.cross / 4;
+      const pts = [];
+      const seg = (a, b) => { pts.push(a[0], a[1], a[2], b[0], b[1], b[2]); };
+      const nz = Math.max(1, Math.round(p.len / step));
+      for (let i = 0; i <= nz; i++) {
+        const z = -hz + (2 * hz) * (i / nz);
+        seg([-hx, -hx, z], [hx, -hx, z]); seg([hx, -hx, z], [hx, hx, z]);
+        seg([hx, hx, z], [-hx, hx, z]); seg([-hx, hx, z], [-hx, -hx, z]);
+      }
+      const nc = Math.max(1, Math.round(p.cross / step));
+      for (let i = 0; i <= nc; i++) {
+        const u = -hx + (2 * hx) * (i / nc);
+        seg([u, -hx, -hz], [u, -hx, hz]); seg([u, hx, -hz], [u, hx, hz]);
+        seg([-hx, u, -hz], [-hx, u, hz]); seg([hx, u, -hz], [hx, u, hz]);
+        /* The two ends, so a closed corridor looks closed. */
+        for (const z of [-hz, hz]) { seg([u, -hx, z], [u, hx, z]); seg([-hx, u, z], [hx, u, z]); }
+      }
+      const wg = new THREE.BufferGeometry();
+      wg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
+      const walls = new THREE.LineSegments(wg, new THREE.LineBasicMaterial({
+        color: COL.grid, transparent: true, opacity: 0.55
+      }));
+      walls.frustumCulled = false;
+      g.wallGrp.add(walls);
+    }
+
+    /* THE SHADOW CATCHERS. This is the change that makes "everything casts a
+       shadow on everything" visible at all: the grid is a set of lines and
+       lines catch nothing, so without a surface just behind them almost every
+       shadow flies out through the transparent wall and lands on nothing.
+       ShadowMaterial draws the shadow and nothing else, so the wall stays as
+       see-through as it looks. */
+    if (p.wallCatch) {
+      const mat = new THREE.ShadowMaterial({ opacity: p.wallOp });
+      mat.side = THREE.DoubleSide;
+      /* No depth write. The catcher is a full-length transparent plane and so
+         is the grid, both centred on the middle of the corridor, so which of
+         the two three sorts first is a coin toss; when the catcher won it
+         wrote depth across the whole wall and the grid lines behind it
+         vanished. A shadow catcher has no business occluding anything. */
+      mat.depthWrite = false;
+      const inset = 0.5;
+      const place = (w, h, pos, rot) => {
+        const pl = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+        pl.position.set(pos[0], pos[1], pos[2]);
+        pl.rotation.set(rot[0], rot[1], rot[2]);
+        pl.receiveShadow = true;
+        pl.frustumCulled = false;
+        g.wallGrp.add(pl);
+      };
+      const HP = Math.PI / 2;
+      place(p.len, p.cross, [0, -hx + inset, 0], [-HP, 0, HP]);
+      place(p.len, p.cross, [0, hx - inset, 0], [HP, 0, HP]);
+      place(p.len, p.cross, [-hx + inset, 0, 0], [0, HP, 0]);
+      place(p.len, p.cross, [hx - inset, 0, 0], [0, -HP, 0]);
+      place(p.cross, p.cross, [0, 0, -hz + inset], [0, 0, 0]);
+      place(p.cross, p.cross, [0, 0, hz - inset], [0, Math.PI, 0]);
+    }
+
+    /* One built rock per level entry, at unit radius and scaled into place, so
+       the radius map is built once per shape and the same mesh can serve
+       several sizes. The contact query divides by that scale on the way in and
+       multiplies the depth on the way out, which is exact for a uniform
+       scale. */
+    /* Every ramp material built this frame, so the loop can keep their gain
+       in step with the sun slider without rebuilding them. */
+    const rampMats = [];
+    const rocks = level.rocks.map((rock) => {
+      const built = AS.buildAsteroid({ seed: rock.seed, subdiv: p.subdiv, radius: 1 });
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(built.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(built.normals, 3));
+      geo.setIndex(new THREE.BufferAttribute(built.indices, 1));
+
+      const group = new THREE.Group();
+      group.position.set(rock.p[0], rock.p[1], rock.p[2]);
+      group.scale.setScalar(rock.r);
+      g.rockGrp.add(group);
+
+      /* A rock always has a solid in it, even when the fill is off: with the
+         fill off it is the black occluder that makes a wireframe read as a
+         body, and either way it is the thing that casts the shadow. A mesh
+         that is not visible is skipped in the shadow pass as well, so there is
+         no such thing here as an invisible caster. */
+      const fill = p.rockFill;
+      let mat;
+      if (fill === 'ramp') { mat = rampMaterial(THREE, p.rockRamp, p.bands); rampMats.push(mat); }
+      else if (fill === 'solid') mat = new THREE.MeshStandardMaterial({ color: COL.rock, roughness: 0.95, metalness: 0 });
+      else mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0, 0, 0) });
+      if (p.rockWire) {
+        mat.polygonOffset = true; mat.polygonOffsetFactor = 1.5; mat.polygonOffsetUnits = 1.5;
+      }
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = fill !== 'off';
+      group.add(mesh);
+
+      if (p.rockWire) {
+        const wire = new THREE.LineSegments(
+          new THREE.WireframeGeometry(geo),
+          new THREE.LineBasicMaterial({ color: COL.rockWire, transparent: true, opacity: 0.7 })
+        );
+        group.add(wire);
+      }
+      return { rock, group, map: AS.radiusMap(built), rMax: built.rMax, quat: null };
+    });
+    g.rocks = rocks;
+
+    /* Hull: the edge list straight out of buildHull, drawn in the principal
+       frame the dynamics uses, so the wireframe sits on its own centre of mass
+       by construction. EdgesGeometry is deliberately not involved: it would
+       add the triangulation diagonals of every non-planar quad, and the
+       faceted Elite read comes precisely from showing the polygon edges and
+       nothing else. */
+    if (p.shipWire) {
+      const ep = new Float32Array(hull.edges.length * 6);
+      hull.edges.forEach((e, i) => {
+        const a = hull.verts[e[0]], b = hull.verts[e[1]];
+        ep[i * 6] = a[0]; ep[i * 6 + 1] = a[1]; ep[i * 6 + 2] = a[2];
+        ep[i * 6 + 3] = b[0]; ep[i * 6 + 4] = b[1]; ep[i * 6 + 5] = b[2];
+      });
+      const hg = new THREE.BufferGeometry();
+      hg.setAttribute('position', new THREE.BufferAttribute(ep, 3));
+      const lines = new THREE.LineSegments(hg, new THREE.LineBasicMaterial({ color: COL.ship }));
+      lines.frustumCulled = false;
+      g.shipGrp.add(lines);
+    }
+
+    /* The hull solid. In the Elite reading it is black and does nothing but
+       occlude the lines behind it, which is also exactly what makes the ship
+       throw a shadow: the shadow pass only cares about depth, so a black fill
+       casts the same shadow a lit one would. */
+    const mp = new Float32Array(hull.verts.length * 3);
+    hull.verts.forEach((v, i) => { mp[i * 3] = v[0]; mp[i * 3 + 1] = v[1]; mp[i * 3 + 2] = v[2]; });
+    const mg = new THREE.BufferGeometry();
+    mg.setAttribute('position', new THREE.BufferAttribute(mp, 3));
+    mg.setIndex(hull.faces.flat());
+    mg.computeVertexNormals();
+    const sf = p.shipFill;
+    let smat;
+    if (sf === 'ramp') { smat = rampMaterial(THREE, p.shipRamp, p.bands); rampMats.push(smat); }
+    else if (sf === 'solid') smat = new THREE.MeshStandardMaterial({ color: COL.shipFill, roughness: 0.7, metalness: 0.1 });
+    else smat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0, 0, 0), side: THREE.DoubleSide });
+    smat.polygonOffset = true; smat.polygonOffsetFactor = 1.5; smat.polygonOffsetUnits = 1.5;
+    const solid = new THREE.Mesh(mg, smat);
+    solid.castShadow = true;
+    solid.receiveShadow = sf === 'solid' || sf === 'ramp';
+    solid.frustumCulled = false;
+    solid.renderOrder = -1;
+    /* "Off" still casts. The alternative would be a ship that throws no shadow
+       at all in the one mode where you can see the most of the corridor, and
+       the shadow is the point of this step. */
+    solid.visible = sf !== 'off' || p.shadows;
+    if (sf === 'off') {
+      solid.material.colorWrite = false;
+      solid.material.depthWrite = false;
+    }
+    g.shipGrp.add(solid);
+    g.rampMats = rampMats;
+    return undefined;
+  }, [ready, hull, level, p.cross, p.len, p.subdiv, p.dustCount, p.rockFill, p.rockWire, p.rockRamp,
+    p.shipFill, p.shipWire, p.shipRamp, p.bands, p.wallGrid, p.wallCatch, p.wallOp, p.shadows]);
+
+  const upd = (k) => (v) => setP((q) => ({ ...q, [k]: v }));
+  /* A colormap has to be shown, not named: nobody knows what copper looks
+     like from the word, so the swatch is the ramp itself, painted from the
+     same stops the shader samples. */
+  const ramps = (label, value, onChange) => html`<${React.Fragment}>
+    <span className="co-seg-l">${label}</span>
+    <div className="co-ramps">
+      ${CR.RAMPS.map((r) => html`<button type="button" key=${r.id}
+        className=${'co-ramp' + (value === r.id ? ' active' : '')}
+        onClick=${() => onChange(r.id)}>
+        <span>${r.name}</span>
+        <i style=${{ background: CR.rampCss(r.stops) }} />
+      </button>`)}
+    </div>
+  <//>`;
+  const hudRow = (k, label) => html`<${React.Fragment} key=${k}>
+    <span>${label}</span>
+    <b ref=${(el) => { hudRef.current[k] = el; }}>-</b>
+  <//>`;
+
+  return html`<${React.Fragment}>
+    <div className="co-stage" ref=${stageRef}></div>
+    <a className="co-back" href="/miscellaneous/#games">${'←'} Games</a>
+
+    <div className="co-hud">
+      <div className="co-grid">
+        ${hudRow('spd', 'SPD')}
+        ${hudRow('rate', 'RATE')}
+        ${hudRow('gap', 'NEAREST')}
+        ${hudRow('prog', 'DOWN THE PIPE')}
+        ${hudRow('hit', 'CONTACTS')}
+        ${hudRow('worst', 'WORST')}
+        ${hudRow('time', 'TIME')}
+      </div>
+    </div>
+
+    <div className="co-msg">
+      <span ref=${(el) => { hudRef.current.msg = el; }}></span>
+      ${!dev.supported ? html`<small>No WebHID in this browser. Chromium only, and the
+        keyboard keys in the panel still work.</small>` : null}
+      ${dev.supported && !dev.name ? html`<small>No 3D mouse attached.
+        ${dev.err ? 'Last error: ' + dev.err + '. ' : ''}Open the panel and connect. The
+        3DxWare driver must not be installed, it claims the device.</small>` : null}
+    </div>
+
+    ${!panel ? html`<button className="co-toggle" onClick=${() => setPanel(true)}>Panel</button>` : html`
+    <div className="co-panel">
+      <div className="co-head">
+        <h2>Corridor</h2>
+        <button className="co-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
+      </div>
+
+      <div className="co-chips">
+        <button className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
+          disabled=${!dev.supported}>${dev.name || 'Connect 3D mouse'}</button>
+        <button className="lang-seg" onClick=${() => { resetRef.current++; }}>Reset</button>
+        <button className=${'lang-seg' + (p.assist ? ' active' : '')}
+          onClick=${() => upd('assist')(!p.assist)}>Rate damping</button>
+      </div>
+
+      <${Seg} label="View" value=${p.camMode} onChange=${upd('camMode')}
+        options=${[{ value: 'chase', label: 'Chase' }, { value: 'cockpit', label: 'Cockpit' }]} />
+      <p className="co-note">Chase runs the second-order camera filter from the Cobra, so the
+        view lags the hull and you can see what you are flying. The cockpit is bolted to the
+        hull: closer, and it costs you the ship as a reference for your own attitude.</p>
+
+      <${Section} id="field" title="The field" open=${sec === 'field'} onToggle=${toggleSec}
+        summary=${level.placed + ' rocks, ' + fmt(p.len / 1000, 1) + ' km'}>
+        <${Slider} label="Rocks" digits=${0} min=${0} max=${40} step=${1}
+          value=${p.count} onChange=${upd('count')} />
+        <${Slider} label="Seed" digits=${0} min=${1} max=${400} step=${1}
+          value=${p.seed} onChange=${upd('seed')} />
+        <${Slider} label="Length" unit="m" digits=${0} min=${1000} max=${20000} step=${500}
+          value=${p.len} onChange=${upd('len')} />
+        <${Slider} label="Cross section" unit="m" digits=${0} min=${200} max=${1500} step=${50}
+          value=${p.cross} onChange=${upd('cross')} />
+        <${Slider} label="Rock diameter" unit="of cross" digits=${2} min=${0.1} max=${0.6} step=${0.01}
+          value=${p.size} onChange=${upd('size')} />
+        <${Slider} label="Size scatter" digits=${2} min=${0} max=${0.8} step=${0.05}
+          value=${p.spread} onChange=${upd('spread')} />
+        <${Slider} label="Through the walls" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.stray} onChange=${upd('stray')} />
+        <${Slider} label="Spin" unit="rad/s" digits=${3} min=${0} max=${0.4} step=${0.005}
+          value=${p.spin} onChange=${upd('spin')} />
+        <${Slider} label="Mesh subdivision" digits=${0} min=${2} max=${5} step=${1}
+          value=${p.subdiv} onChange=${upd('subdiv')} />
+        <div className="co-derived">
+          <span>Placed</span><b className=${level.placed < p.count ? 'hot' : ''}>
+            ${level.placed} of ${p.count}</b>
+          <span>Rock diameter</span><b>${fmt(der.rockD, 0)} m</b>
+          <span>Hull lengths across</span><b>${fmt(p.cross / p.hullL, 1)}</b>
+          <span>Length of the run</span><b>${fmt(der.run, 0)} s</b>
+          <span>Shadowing pairs</span><b className=${der.pairs === 0 ? 'hot' : ''}>${der.pairs}</b>
+        </div>
+        <p className="co-note">Rocks are placed by rejection sampling with a fixed amount of
+          daylight between them, and they are allowed to hang out through the walls, because a
+          field that stops short of an invisible plane looks arranged. "Placed" says so when the
+          corridor ran out of room before the count did.</p>
+        <p className="co-note">${der.pairs === 0
+          ? 'At this sun angle no rock stands in another rock\'s light, so every shadow you see is thrown on a wall. Turn the sun until the count comes up: the pairs are counted from the projected discs perpendicular to the light, so it is exact rather than a guess.'
+          : 'That many ordered pairs of rocks can shadow one another at this sun angle, computed from the discs they project perpendicular to the light. It is not an optimisation, a shadow map costs per caster and not per pair: it is how you find a sun angle worth having.'}</p>
+      <//>
+
+      <${Section} id="styles" title="Drawing" open=${sec === 'styles'} onToggle=${toggleSec}
+        summary=${p.rockFill + ' rocks, ' + p.shipFill + ' hull'}>
+        <${Seg} label="Rocks" value=${p.rockFill} onChange=${upd('rockFill')}
+          options=${[{ value: 'ramp', label: 'Colormap' }, { value: 'solid', label: 'Solid' },
+            { value: 'off', label: 'Black' }]} />
+        <div className="co-chips">
+          <button className=${'lang-seg' + (p.rockWire ? ' active' : '')}
+            onClick=${() => upd('rockWire')(!p.rockWire)}>Rock wireframe</button>
+        </div>
+        ${p.rockFill === 'ramp' ? ramps('Rock colormap', p.rockRamp, upd('rockRamp')) : null}
+        <${Seg} label="Hull" value=${p.shipFill} onChange=${upd('shipFill')}
+          options=${[{ value: 'occluder', label: 'Black' }, { value: 'ramp', label: 'Map' },
+            { value: 'solid', label: 'Solid' }, { value: 'off', label: 'None' }]} />
+        <div className="co-chips">
+          <button className=${'lang-seg' + (p.shipWire ? ' active' : '')}
+            onClick=${() => upd('shipWire')(!p.shipWire)}>Hull wireframe</button>
+        </div>
+        ${p.shipFill === 'ramp' ? ramps('Hull colormap', p.shipRamp, upd('shipRamp')) : null}
+        ${p.rockFill === 'ramp' || p.shipFill === 'ramp' ? html`<${React.Fragment}>
+          <${Slider} label="Bands" digits=${0} min=${0} max=${12} step=${1}
+            value=${p.bands} onChange=${upd('bands')} />
+          <p className="co-note">Zero reads the map continuously. Anything else quantises the
+            shading BEFORE the lookup, which is what gives exact bands whatever the texture
+            filter does, and it is the toon reading of whichever map is selected.</p>
+        <//>` : null}
+        <span className="co-seg-l">Corridor</span>
+        <div className="co-chips">
+          <button className=${'lang-seg' + (p.wallGrid ? ' active' : '')}
+            onClick=${() => upd('wallGrid')(!p.wallGrid)}>Grid</button>
+          <button className=${'lang-seg' + (p.wallCatch ? ' active' : '')}
+            onClick=${() => upd('wallCatch')(!p.wallCatch)}>Shadow catcher</button>
+        </div>
+        <${Slider} label="Catcher strength" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.wallOp} onChange=${upd('wallOp')} />
+        <p className="co-note">Black is the Elite reading: a fill in the colour of space that
+          occludes the lines behind it, so a wireframe reads as a body. It still throws a shadow,
+          because the shadow pass only looks at depth. "None" leaves the hull out of the picture
+          entirely and keeps it in the shadow pass.</p>
+        <p className="co-note">The grid catches nothing, it is lines. The catcher is a surface
+          just behind it that draws the shadow falling on it and nothing else, which is what
+          gives the shadows somewhere to land in a corridor you can see through.</p>
+      <//>
+
+      <${Section} id="sun" title="Sun and shadows" open=${sec === 'sun'} onToggle=${toggleSec}
+        summary=${'az ' + fmt(p.sunAz * 180, 0) + ', el ' + fmt(p.sunEl * 90, 0) + ', ' + der.pairs + ' pairs'}>
+        <${Slider} label="Azimuth" unit="deg" digits=${0} min=${0} max=${2} step=${0.01}
+          value=${p.sunAz} onChange=${upd('sunAz')} />
+        <${Slider} label="Elevation" unit="deg" digits=${0} min=${0.02} max=${1} step=${0.01}
+          value=${p.sunEl} onChange=${upd('sunEl')} />
+        <${Slider} label="Sun" digits=${2} min=${0} max=${5} step=${0.1}
+          value=${p.sunI} onChange=${upd('sunI')} />
+        <${Slider} label="Fill light" digits=${2} min=${0} max=${2} step=${0.05}
+          value=${p.ambI} onChange=${upd('ambI')} />
+        <div className="co-chips">
+          <button className=${'lang-seg' + (p.shadows ? ' active' : '')}
+            onClick=${() => upd('shadows')(!p.shadows)}>Shadows</button>
+        </div>
+        <${Slider} label="Shadow range" unit="m" digits=${0} min=${200} max=${3000} step=${50}
+          value=${p.shadowRange} onChange=${upd('shadowRange')} />
+        <${Slider} label="Normal bias" unit="m" digits=${1} min=${0} max=${8} step=${0.1}
+          value=${p.shadowBias} onChange=${upd('shadowBias')} />
+        <${Slider} label="Shadow map" unit="px" digits=${0} min=${512} max=${4096} step=${512}
+          value=${p.shadowSize} onChange=${upd('shadowSize')} />
+        <div className="co-derived">
+          <span>Texel on the ground</span><b>${fmt(2 * p.shadowRange / p.shadowSize, 2)} m</b>
+          <span>Shadowing pairs</span><b className=${der.pairs === 0 ? 'hot' : ''}>${der.pairs}</b>
+        </div>
+        <p className="co-note">The sun stands outside the corridor, is drawn where it stands and
+          does not move. Shallow angles are the useful ones: a light coming in across the
+          corridor throws every shadow straight out through the transparent wall.</p>
+        <p className="co-note">The shadow camera is small and follows the ship, because in a
+          corridor you never see further than your surroundings. It snaps to whole texels, which
+          is what stops the shadow edges from crawling as you fly, and it is completely effective
+          here only because the rocks stand still. Range buys reach at the cost of the texel size
+          above; normal bias is the acne knob, and on cratered rock it is the one to reach for
+          rather than a constant depth offset.</p>
+      <//>
+
+      <${Section} id="dust" title="Dust" open=${sec === 'dust'} onToggle=${toggleSec}
+        summary=${p.dust ? p.dustCount + ' motes, ' + fmt(p.dustFar * p.hullL, 0) + ' m' : 'off'}>
+        <div className="co-chips">
+          <button className=${'lang-seg' + (p.dust ? ' active' : '')}
+            onClick=${() => upd('dust')(!p.dust)}>Dust</button>
+        </div>
+        <${Slider} label="Motes" digits=${0} min=${0} max=${20000} step=${500}
+          value=${p.dustCount} onChange=${upd('dustCount')} />
+        <${Slider} label="Range" unit="hulls" digits=${1} min=${0.5} max=${12} step=${0.1}
+          value=${p.dustFar} onChange=${upd('dustFar')} />
+        <${Slider} label="Size near" unit="px" digits=${1} min=${1} max=${10} step=${0.5}
+          value=${p.dustSizeNear} onChange=${upd('dustSizeNear')} />
+        <${Slider} label="Size far" unit="px" digits=${1} min=${0.5} max=${10} step=${0.5}
+          value=${p.dustSizeFar} onChange=${upd('dustSizeFar')} />
+        <${Slider} label="Opacity near" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.dustOpNear} onChange=${upd('dustOpNear')} />
+        <${Slider} label="Opacity far" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.dustOpFar} onChange=${upd('dustOpFar')} />
+        <${Slider} label="Edge fade" digits=${2} min=${0} max=${0.6} step=${0.05}
+          value=${p.dustEdge} onChange=${upd('dustEdge')} />
+        <div className="co-derived">
+          <span>Range</span><b>${fmt(p.dustFar * p.hullL, 0)} m</b>
+          <span>Motes per 100 m cube</span><b>${fmt(Dust.density(p.dustCount, p.dustFar * p.hullL), 1)}</b>
+          <span>Corridor is</span><b>${fmt(p.cross / (2 * p.dustFar * p.hullL), 1)} cells across</b>
+        </div>
+        <p className="co-note">Speed is invisible in an empty room, and a corridor you can see
+          through is close to one: the walls are a grid a long way off, and optic flow is your
+          speed divided by the distance to whatever you can see. The motes are the only thing
+          near enough to carry it.</p>
+        <p className="co-note">The range is also where the lattice folds, so a mote reaches zero
+          opacity exactly when it wraps to the other side and the fold can never pop. Motes
+          outside the corridor are not drawn at all, which is why a range wider than the cross
+          section costs count without adding anything you can see.</p>
+      <//>
+
+      <${Section} id="thrust" title="Thrust and torque" open=${sec === 'thrust'} onToggle=${toggleSec}
+        summary=${fmt(p.aFwd, 1) + ' m/s2, ' + fmt(der.flip, 1) + ' s to turn round'}>
+        <${Slider} label="Main engine" unit="m/s2" digits=${1} min=${1} max=${30} step=${0.5}
+          value=${p.aFwd} onChange=${upd('aFwd')} />
+        <${Slider} label="RCS translation" unit="m/s2" digits=${2} min=${0.2} max=${10} step=${0.1}
+          value=${p.aLat} onChange=${upd('aLat')} />
+        <${Slider} label="Pitch" unit="rad/s2" digits=${3} min=${0.02} max=${1.5} step=${0.01}
+          value=${p.aPitch} onChange=${upd('aPitch')} />
+        <${Slider} label="Yaw" unit="rad/s2" digits=${3} min=${0.02} max=${1.5} step=${0.01}
+          value=${p.aYaw} onChange=${upd('aYaw')} />
+        <${Slider} label="Roll" unit="rad/s2" digits=${3} min=${0.02} max=${4} step=${0.01}
+          value=${p.aRoll} onChange=${upd('aRoll')} />
+        <${Slider} label="Cap gain" digits=${2} min=${0.1} max=${1.5} step=${0.05}
+          value=${p.gain} onChange=${upd('gain')} />
+        <${Slider} label="Restitution" digits=${2} min=${0} max=${0.9} step=${0.05}
+          value=${p.restitution} onChange=${upd('restitution')} />
+        <p className="co-note">A contact is a real impulse at the point that touched, so a graze
+          on a corner leaves you tumbling and you have to catch yourself. That is the price of
+          brushing a rock, and it is deliberate.</p>
+      <//>
+
+      <${Section} id="keys" title="Controls" open=${sec === 'keys'} onToggle=${toggleSec}>
+        <p className="co-note">
+          3D mouse: cap is RCS on all six axes, right button main engine, left button rate
+          damping while held.
+          <br/>Left mouse drags the view, middle click kills rotation, wheel changes the chase
+          distance. The right button is left alone for the browser.
+          <br/>Debug keys, not a substitute for the device:
+          <kbd>W</kbd><kbd>S</kbd> surge, <kbd>A</kbd><kbd>D</kbd> slide,
+          <kbd>R</kbd><kbd>F</kbd> lift, <kbd>I</kbd><kbd>K</kbd> pitch,
+          <kbd>J</kbd><kbd>L</kbd> yaw, <kbd>U</kbd><kbd>O</kbd> roll,
+          <kbd>Shift</kbd> main engine.
+          <br/><kbd>Space</kbd> kill rotation, <kbd>X</kbd> damping, <kbd>C</kbd> view,
+          <kbd>P</kbd> panel, <kbd>Backspace</kbd> reset.
+        </p>
+      <//>
+    </div>`}
+  <//>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>

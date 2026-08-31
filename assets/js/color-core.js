@@ -75,19 +75,26 @@
       out[o + 2] = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
     }
 
-    /* Clamping is required, not optional: the sRGB gamut is not convex in OKLab,
-       so a centroid of valid colors can land just outside it. */
-    function oklabToRgb(L, a, b) {
+    /* Linear-light sRGB, deliberately UNCLAMPED. A channel below 0 or above 1
+       is the only way to tell that an OKLab point lies outside the sRGB gamut,
+       which is what gamut mapping has to decide. oklabToRgb clamps that signal
+       away, so it cannot answer the question and this exists next to it. */
+    function oklabToLinear(L, a, b) {
       var l_ = L + 0.3963377774 * a + 0.2158037573 * b;
       var m_ = L - 0.1055613458 * a - 0.0638541728 * b;
       var s_ = L - 0.0894841775 * a - 1.2914855480 * b;
       var l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
-      var lin = [
+      return [
          4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
         -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
         -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
       ];
-      return lin.map(function (v) {
+    }
+
+    /* Clamping is required, not optional: the sRGB gamut is not convex in OKLab,
+       so a centroid of valid colors can land just outside it. */
+    function oklabToRgb(L, a, b) {
+      return oklabToLinear(L, a, b).map(function (v) {
         var g = v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(Math.max(v, 0), 1 / 2.4) - 0.055;
         return Math.min(255, Math.max(0, Math.round(g * 255)));
       });
@@ -932,6 +939,7 @@
       lloyd: lloyd, rescueVivid: rescueVivid,
       buildClusters: buildClusters, representative: representative, labDist: labDist,
       refine: refine, reconcile: reconcile, flatness: flatness,
+      oklabToLinear: oklabToLinear,
       analyse: analyse, seedFor: seedFor, extract: extract, ladder: ladder,
       toCss: toCss, toJson: toJson,
       paletteLab: paletteLab, paletteRgb: paletteRgb, nearestIndex: nearestIndex, quantize: quantize,

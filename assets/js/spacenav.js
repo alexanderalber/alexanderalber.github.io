@@ -81,6 +81,24 @@ var SpaceNav = (function () {
     return { x: px, y: py, z: pz };
   }
 
+  /* All six axes shaped, -1..1 each, for a consumer that actually uses six
+     degrees of freedom. norm() deliberately describes the 2D pan/zoom mapping
+     and therefore folds tz with rz and drops the two tilt axes entirely; a 3D
+     tool needs the axes separate and needs all of them.
+
+     opts.bias is a per-axis resting offset, subtracted before shaping. It is
+     the honest alternative to widening the deadzone until the drift disappears:
+     a deadzone hides an offset by throwing away the small inputs with it, while
+     a measured bias removes exactly the offset and leaves the response linear
+     all the way down to zero. That matters for a consumer that INTEGRATES its
+     input, where a rested cap sitting two counts off does not look like a small
+     error, it looks like the thing slowly flying away by itself. */
+  function norm6(axes, opts) {
+    var a = axes || {}, b = (opts && opts.bias) || {};
+    var s = function (k) { return shape((a[k] || 0) - (b[k] || 0), opts); };
+    return { tx: s('tx'), ty: s('ty'), tz: s('tz'), rx: s('rx'), ry: s('ry'), rz: s('rz') };
+  }
+
   /* Is the cap deflected on ANY of the six axes? norm() cannot answer this: it
      describes the 2D mapping and ignores the two tilt axes on purpose, so a cap
      that is only tilted looks to it exactly like a cap at rest. That made the
@@ -136,8 +154,14 @@ var SpaceNav = (function () {
        opts                   shaping overrides passed to norm().
      Methods: init() (reopen a granted device, watch for unplug), connect()
      (permission prompt, needs a user gesture), disconnect(), destroy(),
-     connected(). An idle connected mouse costs one rAF tick per frame and
-     nothing else. */
+     connected(), axes(). An idle connected mouse costs one rAF tick per frame
+     and nothing else.
+
+     axes() exists because onFrame is GATED on awake(): the moment the cap
+     centres the callbacks stop, so a consumer that only caches what onFrame
+     delivered keeps steering with the last non-zero deflection forever. A tool
+     that runs its own simulation loop polls axes() instead and always sees the
+     current state, rest included. */
   function create(handlers) {
     var h = handlers || {};
     var st = null;       /* { device, axes, buttons, raf, last } while attached */
@@ -245,7 +269,18 @@ var SpaceNav = (function () {
       connect: connect,
       disconnect: disconnect,
       destroy: destroy,
-      connected: function () { return st ? (st.device.productName || 'SpaceNavigator') : null; }
+      connected: function () { return st ? (st.device.productName || 'SpaceNavigator') : null; },
+      /* Raw merged axis state, zero-filled, or null while detached. A copy, so
+         a caller cannot corrupt the controller's own state. */
+      axes: function () {
+        if (!st) return null;
+        var a = st.axes;
+        return {
+          tx: a.tx || 0, ty: a.ty || 0, tz: a.tz || 0,
+          rx: a.rx || 0, ry: a.ry || 0, rz: a.rz || 0
+        };
+      },
+      buttons: function () { return st ? st.buttons : 0; }
     };
   }
 
@@ -254,6 +289,7 @@ var SpaceNav = (function () {
     parseReport: parseReport,
     shape: shape,
     norm: norm,
+    norm6: norm6,
     awake: awake,
     panZoom: panZoom,
     supported: supported,

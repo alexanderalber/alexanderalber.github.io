@@ -1,0 +1,2275 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Field Defense - Tower Defense With the Cost Field Visible</title>
+  <meta name="description" content="A maze tower defense that shows the field the enemies actually walk on. Cost-to-go, threat coverage and the occupancy distribution are drawn under the board, every enemy type is one parameter set of a single cost function, and a tower is not a wall but an expensive cell. Runs entirely in your browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/flow-field-defense.html">
+  <meta property="og:title" content="Flow Field Defense - tower defense with the cost field visible">
+  <meta property="og:description" content="Maze tower defense in which the pathfinding is the visible object: cost-to-go, threat and occupancy as fields under the board, and a tower that is an expensive cell rather than a wall.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/flow-field-defense.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/icons.js"></script>
+  <style>
+    /* The board plus its side panel need more room than Pico's steps give, so
+       the header and footer are capped with the content (see CLAUDE.md, "A tool
+       with its own content width must cap the header and footer with it").
+       Inner width 1120 + 2 x 16px wrapper padding = 1152. */
+    header.container, body > footer.container { max-width: 1152px; padding-left: 16px; padding-right: 16px; }
+    .ffd-wrap { padding: 0 16px 16px; }
+    .ffd-inner { max-width: 1120px; margin: 0 auto; }
+    .ffd-cols { display: grid; grid-template-columns: minmax(0, 1fr) 358px; gap: 18px; align-items: start; }
+    @media (max-width: 1000px) { .ffd-cols { grid-template-columns: minmax(0, 1fr); } }
+
+    /* Frame convention for anything that shows something. The shadow sits on
+       the canvas itself, not on a wrapper. */
+    .ffd-board { display: block; width: 100%; height: auto; touch-action: none; cursor: crosshair;
+      border: 1px solid var(--tool-border); border-radius: 8px; box-shadow: var(--tool-panel-shadow);
+      background: var(--tool-surface); }
+
+    .ffd-hud { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: baseline;
+      margin: 0 2px 8px; font-size: 13px; color: var(--tool-label); }
+    .ffd-hud b { color: var(--tool-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .ffd-core { flex: 1 1 120px; min-width: 110px; height: 7px; border-radius: 4px;
+      background: var(--tool-hairline); overflow: hidden; }
+    .ffd-core i { display: block; height: 100%; background: var(--tool-ok-fg); transition: width .18s linear; }
+
+    /* The readout under the board is the point of the tool, so it keeps a fixed
+       height: if it collapsed when nothing is hovered, the board would jump on
+       every pointer move across its edge. */
+    .ffd-readout { min-height: 58px; margin: 8px 2px 0; font-size: 13px; color: var(--tool-note); line-height: 1.65; }
+    .ffd-delta { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+    .ffd-delta span { color: var(--tool-label); }
+    .ffd-delta b { color: var(--tool-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .ffd-up { color: var(--tool-ok-fg); }
+    .ffd-down { color: var(--tool-danger-fg); }
+
+    .ffd-shop { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 6px; }
+    .ffd-shop button { display: block; width: 100%; text-align: left; padding: 7px 9px; font-size: 12px;
+      line-height: 1.4; border-radius: 6px; border: 1px solid var(--tool-border);
+      background: transparent; color: var(--tool-text); cursor: pointer; margin: 0; }
+    .ffd-shop button:hover:not(:disabled) { border-color: var(--tool-label); }
+    .ffd-shop button.on { border-color: var(--tool-sig-info); background: var(--tool-hairline); }
+    .ffd-shop button:disabled { opacity: .45; cursor: not-allowed; }
+    .ffd-shop .ffd-nm { display: block; color: var(--tool-emph); font-weight: 600; }
+    .ffd-shop .ffd-pr { display: block; color: var(--tool-note); font-variant-numeric: tabular-nums; }
+
+    .ffd-stats { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; font-size: 12px;
+      color: var(--tool-label); }
+    .ffd-stats b { color: var(--tool-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .ffd-wave { font-size: 12px; color: var(--tool-label); line-height: 1.7; }
+    .ffd-wave b { color: var(--tool-text); font-weight: 600; }
+    .ffd-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px;
+      vertical-align: 0; background: var(--dot); }
+
+    .ffd-legend { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px;
+      color: var(--tool-note); }
+    .ffd-bar { flex: 1 1 auto; height: 8px; border-radius: 4px; border: 1px solid var(--tool-border);
+      background: var(--ramp); }
+
+    /* The field's own parameters. Column widths follow the content, which is
+       why this grid is per tool and not shared. */
+    .ffd-grid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 10px;
+      align-items: center; font-size: 12px; color: var(--tool-label); }
+    .ffd-grid > label { margin: 0; }
+    /* Pico's input rule is input:not([type=checkbox],...), and the attribute
+       selectors inside :not() count, so padding on a class never arrives. The
+       height comes from Pico's own variables instead (see CLAUDE.md). */
+    .ffd-sel { margin: 0; font-size: 12px;
+      --pico-form-element-spacing-vertical: 4px; --pico-form-element-spacing-horizontal: 8px; }
+    .ffd-slide { display: flex; align-items: center; gap: 9px; }
+    .ffd-slide input[type=range] { flex: 1 1 auto; margin: 0; }
+    .ffd-slide b { color: var(--tool-text); font-weight: 600; font-variant-numeric: tabular-nums;
+      min-width: 34px; text-align: right; }
+
+    .ffd-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .ffd-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--tool-label);
+      margin: 0; cursor: pointer; }
+    .ffd-check input { margin: 0; }
+    /* Deliberate chip row of separate actions, so it opts out of the segment
+       adjacency rounding (custom.css keys corners on DOM adjacency, which
+       cannot see a gap). */
+    .ffd-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+    .ffd-acts .tool-btn, .ffd-acts .tool-btn-sm { border-radius: 4px; margin-left: 0; }
+
+    .ffd-over { text-align: center; padding: 14px 10px; }
+    .ffd-over p { margin: 0 0 10px; color: var(--tool-text); }
+    .ffd-kbd { font-size: 11px; color: var(--tool-faint); line-height: 1.8; margin: 10px 2px 0; }
+    .ffd-kbd kbd { font-size: 10px; padding: 1px 5px; border: 1px solid var(--tool-border);
+      border-radius: 3px; background: var(--tool-hairline); color: var(--tool-note); }
+  </style>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Flow Field Defense",
+    "description": "A maze tower defense in which the pathfinding is the visible object. Enemies walk a cost field solved with Dijkstra over the grid; the cost-to-go, the threat coverage and the occupancy distribution can be drawn under the board. A tower is not a wall but a cell with a finite traversal cost, so sealing the map is a legitimate and expensive move rather than a forbidden one, and the five enemy types are five parameter sets of a single cost function.",
+    "url": "https://alber.me/miscellaneous/tools/flow-field-defense.html",
+    "applicationCategory": "GameApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#games" id="nav-cat">Games</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="ffd-wrap"><div class="ffd-inner">
+        <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Flow Field Defense</h1>
+        <p style="color:var(--tool-text);max-width:70ch">Every maze tower defense is a game about shaping a cost field, and none of them show you the field. This one draws it under the board. Build a tower and watch the whole landscape of walking times tilt, then watch the enemies follow the new gradient downhill.</p>
+        <ul style="color:var(--tool-note);max-width:70ch">
+          <li>A tower is not a wall but a cell with a finite traversal cost, so walling the goal in completely is a legitimate and expensive move rather than a forbidden one. The pathfinder decides whether going around or chewing through is cheaper, and you can see where it changes its mind.</li>
+          <li>Five enemy types are five parameter sets of one cost function: how much a second of walking is worth against a point of health, and how sharply the choice is made.</li>
+          <li>Hovering a build site prints the honest numbers. A longer detour through empty ground buys you nothing, and the readout says so.</li>
+          <li>The cost-to-go field is the first arrival time of a wave through the same medium, which makes this the same equation as the ripple tank.</li>
+        </ul>
+      </div></div>
+    </div>
+  </main>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Game core: plain JS, no DOM, no markup. Grid, cost fields, Dijkstra,
+       the softmax policy, the occupancy propagation and the fixed-step
+       simulation all live here so notes/dev/flow-field-defense.test.mjs can
+       pull the block out and evaluate it in Node.
+       ──────────────────────────────────────────────────────────────────── -->
+  <script id="ffdcore">
+  /* FFD-CORE-START -- pure logic, shared with the Node test suite */
+  var FFD = (function () {
+    'use strict';
+
+    /* ---------- board ---------- */
+
+    var GW = 24, GH = 16, N = GW * GH;
+    var SPAWN = 8 * GW + 0;        // left edge, centre row
+    var GOAL = 8 * GW + (GW - 1);  // right edge, same row
+
+    function idx(x, y) { return y * GW + x; }
+    function cx(i) { return i % GW; }
+    function cy(i) { return (i / GW) | 0; }
+
+    /* ---------- towers ----------
+
+       hp is what an attacker has to chew through, and it is therefore also the
+       numerator of the traversal cost of the cell. dps is the damage the tower
+       deals per second while it has a target; range is in cells, measured
+       centre to centre. slow raises the traversal time of every cell within
+       slowR, using the ripple tank's encoding: the stored number is a slowness
+       s = 1 - 1/n, so the time multiplier is 1/(1 - s).
+
+       These numbers are a first pass. Nobody has played twenty waves with them
+       yet, so treat them as a starting point rather than as balance. */
+
+    var TOWERS = [
+      { id: 'wall',   name: 'Wall',    key: '1', cost: 5,  hp: 140, dps: 0,  range: 0,   rate: 0,
+        blurb: 'No damage at all. The cheapest way to make a cell expensive.' },
+      { id: 'gun',    name: 'Gun',     key: '2', cost: 40, hp: 220, dps: 22, range: 2.6, rate: 0,
+        blurb: 'Continuous fire on one target. The baseline against which everything else is measured.' },
+      { id: 'slower', name: 'Slower',  key: '3', cost: 55, hp: 170, dps: 0,  range: 0,   rate: 0,
+        slow: 0.45, slowR: 2.2,
+        blurb: 'Raises the walking time around it. It edits the cost field directly, which also means enemies may route around it.' },
+      { id: 'mortar', name: 'Mortar',  key: '4', cost: 75, hp: 200, dps: 30, range: 4.4, rate: 0.7,
+        splash: 1.3, splashDmg: 43,
+        blurb: 'Slow shells with a blast radius. The round needs time to arrive and is aimed ahead of the target, so a unit that turns a corner in the meantime is missed. Its listed damage per second is what a single target sees on average, and the only tower for which that average is optimistic.' },
+      { id: 'sniper', name: 'Sniper',  key: '5', cost: 95, hp: 180, dps: 40, range: 6.8, rate: 0,
+        blurb: 'Long reach, high damage, no area effect. Pays off where the route is long and thin.' }
+    ];
+
+    var TOWER_BY_ID = {};
+    for (var ti = 0; ti < TOWERS.length; ti++) TOWER_BY_ID[TOWERS[ti].id] = TOWERS[ti];
+
+    /* ---------- enemies ----------
+
+       One cost function, five parameter sets:
+
+         traversal(c) = mul(c) / speed  +  (tower ? towerHp / dpsBuild : 0)
+         danger(c)    = coverage(c) * traversal(c)
+         cost(c)      = wt * traversal(c) + wd * danger(c)
+
+       wt prices a second of walking, wd prices a point of health. dpsBuild is
+       the damage the unit deals to a building it walks into, and therefore
+       decides how cheap a tower cell looks to it. tau is the softmax
+       temperature of the step choice, measured in mean cell costs: 0 takes only
+       the cheapest step, larger values also take steps that are merely close.
+
+       tau earns its place, but only on boards worth playing. Counted over every
+       branch point that carries mass: on an empty board, on a board of nothing
+       but guns and on a board of nothing but slowers, the downhill neighbours
+       of a cell tie exactly, every single time, so a temperature has nothing to
+       act on. Put walls in and the share of branch points offering a genuinely
+       worse alternative runs from nothing to 43 percent depending on the type
+       and the board, a few percent to twenty being the usual range. A first
+       measurement on the flat boards alone said the parameter was dead and very
+       nearly got it deleted. It is not dead; it is invisible until the board
+       has structure, which is exactly when a player is looking. */
+
+    var ENEMIES = [
+      { id: 'runner',   name: 'Runner',   speed: 2.2, wt: 1, wd: 0,   tau: 0,    dpsBuild: 12, dot: '#38bdf8',
+        blurb: 'Weighs only time. Walks straight through the guns if that is the fast way.' },
+      { id: 'cautious', name: 'Cautious', speed: 1.6, wt: 1, wd: 2.5, tau: 0,    dpsBuild: 10, dot: '#a78bfa',
+        blurb: 'Prices health at two and a half seconds per point, so it takes the long safe way around.' },
+      { id: 'breaker',  name: 'Breaker',  speed: 1.3, wt: 1, wd: 0.3, tau: 0,    dpsBuild: 60, dot: '#f97316',
+        blurb: 'Chews through buildings five times faster than the rest, which makes tower cells look cheap to it.' },
+      { id: 'swarm',    name: 'Swarm',    speed: 2.6, wt: 1, wd: 1.0, tau: 0.55, dpsBuild: 8,  dot: '#f472b6',
+        blurb: 'The only type that also takes steps that are merely close to cheapest, so in a maze it arrives spread out rather than in a line.' },
+      { id: 'flyer',    name: 'Flyer',    speed: 1.9, wt: 1, wd: 0,   tau: 0,    dpsBuild: 0,  fly: true, dot: '#facc15',
+        blurb: 'Ignores the grid entirely. Its cost field is the straight line, which is the degenerate case of the same solve.' }
+    ];
+
+    var ENEMY_BY_ID = {};
+    for (var ei = 0; ei < ENEMIES.length; ei++) ENEMY_BY_ID[ENEMIES[ei].id] = ENEMIES[ei];
+
+    /* ---------- waves ----------
+
+       [typeId, count, hp] per group; groups run one after the other. Beyond the
+       twentieth wave the last one repeats with health scaled geometrically,
+       which is a confession that the content ends there and the arithmetic does
+       not. */
+
+    var WAVE_PLAN = [
+      [['runner', 10, 55]],
+      [['runner', 14, 72]],
+      [['runner', 10, 95], ['swarm', 8, 48]],
+      [['cautious', 8, 125]],
+      [['runner', 16, 115], ['swarm', 12, 62]],
+      [['breaker', 4, 330]],
+      [['cautious', 12, 155], ['runner', 10, 135]],
+      [['flyer', 8, 145]],
+      [['swarm', 24, 82], ['runner', 12, 165]],
+      [['breaker', 6, 430], ['cautious', 10, 185]],
+      [['runner', 20, 215]],
+      [['flyer', 12, 205], ['swarm', 20, 105]],
+      [['cautious', 16, 265]],
+      [['breaker', 8, 570], ['runner', 16, 245]],
+      [['swarm', 32, 135]],
+      [['flyer', 16, 285], ['cautious', 14, 305]],
+      [['breaker', 10, 710], ['swarm', 28, 155]],
+      [['runner', 26, 335], ['cautious', 18, 345]],
+      [['flyer', 20, 365], ['breaker', 10, 830]],
+      [['runner', 30, 425], ['cautious', 20, 425], ['breaker', 12, 910], ['swarm', 36, 195]]
+    ];
+
+    var GAP = { runner: 0.5, cautious: 0.62, breaker: 1.1, swarm: 0.26, flyer: 0.55 };
+    var GROUP_PAUSE = 2.2;
+
+    var START_GOLD = 220, CORE_HP = 1000;
+    var MAX_SLOW = 0.86;   // a cell never becomes infinitely slow; keeps costs finite
+
+    function waveGroups(w) {
+      if (w <= WAVE_PLAN.length) return WAVE_PLAN[w - 1];
+      var base = WAVE_PLAN[WAVE_PLAN.length - 1];
+      var k = Math.pow(1.22, w - WAVE_PLAN.length);
+      var out = [];
+      for (var i = 0; i < base.length; i++) {
+        out.push([base[i][0], Math.round(base[i][1] * (1 + 0.06 * (w - WAVE_PLAN.length))), Math.round(base[i][2] * k)]);
+      }
+      return out;
+    }
+
+    /* Flattens a wave into a spawn schedule. Deterministic, no RNG. */
+    function waveSchedule(w) {
+      var groups = waveGroups(w), out = [], t = 0;
+      for (var g = 0; g < groups.length; g++) {
+        var type = groups[g][0], n = groups[g][1], hp = groups[g][2];
+        var gap = GAP[type] || 0.5;
+        for (var i = 0; i < n; i++) { out.push({ t: t, type: type, hp: hp }); t += gap; }
+        t += GROUP_PAUSE;
+      }
+      return out;
+    }
+
+    function waveBounty(w) { return 40 + 8 * w; }
+    function killBounty(maxHp) { return 2 + Math.round(maxHp * 0.075); }
+
+    /* ---------- PRNG ---------- */
+
+    function splitmix32(a) {
+      return function () {
+        a = (a + 0x9e3779b9) | 0;
+        var t = a ^ (a >>> 16); t = Math.imul(t, 0x21f0aaad);
+        t = t ^ (t >>> 15); t = Math.imul(t, 0x735a2d97);
+        return ((t = t ^ (t >>> 15)) >>> 0) / 4294967296;
+      };
+    }
+
+    /* ---------- state ---------- */
+
+    function makeState(seed) {
+      var s = {
+        seed: (seed >>> 0) || 1,
+        rand: splitmix32((seed >>> 0) || 1),
+        gold: START_GOLD,
+        coreHp: CORE_HP,
+        coreMax: CORE_HP,
+        wave: 1,
+        phase: 'plan',            // 'plan' | 'wave' | 'over'
+        towerAt: new Int32Array(N).fill(-1),
+        towers: [],
+        nextTowerId: 1,
+        slowTerrain: new Float32Array(N),
+        enemies: [],
+        nextEnemyId: 1,
+        queue: [],
+        waveT: 0,
+        leaked: 0,
+        killed: 0,
+        trace: new Float32Array(N),
+        shells: [],               // mortar rounds in flight, see fireShell
+        fx: [],                   // cosmetic only, see the effects section
+        fxRand: splitmix32(((seed >>> 0) || 1) ^ 0x9e3779b9),
+        history: [],              // build log, for undo
+        dirty: true,
+        fields: null,
+        solves: {}
+      };
+      return s;
+    }
+
+    /* ---------- derived fields ---------- */
+
+    /* Total slowness per cell: painted terrain plus every slower tower's
+       contribution, capped so the traversal cost stays finite. */
+    function slowField(st) {
+      var out = new Float32Array(N);
+      out.set(st.slowTerrain);
+      for (var k = 0; k < st.towers.length; k++) {
+        var tw = st.towers[k], def = TOWER_BY_ID[tw.type];
+        if (!def.slow) continue;
+        var r = def.slowR, r2 = r * r;
+        var x0 = Math.max(0, Math.floor(tw.x - r)), x1 = Math.min(GW - 1, Math.ceil(tw.x + r));
+        var y0 = Math.max(0, Math.floor(tw.y - r)), y1 = Math.min(GH - 1, Math.ceil(tw.y + r));
+        for (var y = y0; y <= y1; y++) for (var x = x0; x <= x1; x++) {
+          var dx = x - tw.x, dy = y - tw.y, d2 = dx * dx + dy * dy;
+          if (d2 > r2) continue;
+          var fall = 1 - Math.sqrt(d2) / r;          // linear falloff to the rim
+          out[idx(x, y)] += def.slow * fall;
+        }
+      }
+      for (var i = 0; i < N; i++) if (out[i] > MAX_SLOW) out[i] = MAX_SLOW;
+      return out;
+    }
+
+    /* Damage per second a unit standing in a cell would be taking, summed over
+       every tower that covers it. For the mortar this is its average output,
+       not its peak, which makes the number optimistic wherever shells overlap
+       and is the honest simplification to make. */
+    function dpsField(st) {
+      var out = new Float32Array(N);
+      for (var k = 0; k < st.towers.length; k++) {
+        var tw = st.towers[k], def = TOWER_BY_ID[tw.type];
+        if (!def.dps || !def.range) continue;
+        var r = def.range, r2 = r * r;
+        var x0 = Math.max(0, Math.floor(tw.x - r)), x1 = Math.min(GW - 1, Math.ceil(tw.x + r));
+        var y0 = Math.max(0, Math.floor(tw.y - r)), y1 = Math.min(GH - 1, Math.ceil(tw.y + r));
+        for (var y = y0; y <= y1; y++) for (var x = x0; x <= x1; x++) {
+          var dx = x - tw.x, dy = y - tw.y;
+          if (dx * dx + dy * dy > r2) continue;
+          out[idx(x, y)] += def.dps;
+        }
+      }
+      return out;
+    }
+
+    function ensureFields(st) {
+      if (!st.dirty && st.fields) return st.fields;
+      st.fields = { slow: slowField(st), dps: dpsField(st) };
+      st.solves = {};
+      st.dirty = false;
+      return st.fields;
+    }
+
+    /* ---------- the solve ----------
+
+       Node costs, not edge costs: the weight of stepping into v is cost(v).
+       Dijkstra runs backwards from the goal, so dist[i] is the total cost of
+       the cheapest route from i to the goal, the goal cell included.
+
+       Every cell is finite, including tower cells, which is the whole point:
+       there is no unreachable state and therefore no special case for a sealed
+       map. */
+
+    function heapPush(hk, hv, n, k, v) {
+      var i = n;
+      hk[i] = k; hv[i] = v;
+      while (i > 0) {
+        var p = (i - 1) >> 1;
+        if (hk[p] <= hk[i]) break;
+        var tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+        var tv = hv[p]; hv[p] = hv[i]; hv[i] = tv;
+        i = p;
+      }
+      return n + 1;
+    }
+
+    function heapPop(hk, hv, n) {
+      n--;
+      hk[0] = hk[n]; hv[0] = hv[n];
+      var i = 0;
+      for (;;) {
+        var l = 2 * i + 1, r = l + 1, m = i;
+        if (l < n && hk[l] < hk[m]) m = l;
+        if (r < n && hk[r] < hk[m]) m = r;
+        if (m === i) break;
+        var tk = hk[m]; hk[m] = hk[i]; hk[i] = tk;
+        var tv = hv[m]; hv[m] = hv[i]; hv[i] = tv;
+        i = m;
+      }
+      return n;
+    }
+
+    function solve(st, profId) {
+      /* ensureFields first, always. It is what clears the solve cache when a
+         tower was built or destroyed, so returning a cached solve before asking
+         it hands back the field of the previous board and nothing on screen
+         moves when the maze changes. */
+      var f = ensureFields(st);
+      if (st.solves[profId]) return st.solves[profId];
+      var prof = ENEMY_BY_ID[profId];
+      var trav = new Float64Array(N), danger = new Float64Array(N), cost = new Float64Array(N);
+      var dist = new Float64Array(N), i, x, y;
+
+      for (i = 0; i < N; i++) {
+        /* A flyer is over the terrain, not in it, so its medium is uniform and
+           neither the slowness nor the buildings reach it. That is the whole of
+           what makes it a different unit: same solve, trivial medium. */
+        var mul = prof.fly ? 1 : 1 / (1 - f.slow[i]);
+        var t = mul / prof.speed;
+        var k = st.towerAt[i];
+        if (k >= 0 && !prof.fly) t += st.towers[k].hp / Math.max(1e-6, prof.dpsBuild);
+        trav[i] = t;
+        danger[i] = f.dps[i] * t;
+        cost[i] = prof.wt * t + prof.wd * danger[i];
+      }
+
+      if (prof.fly) {
+        /* The straight line is the same solve with a uniform medium: no walls,
+           no buildings, so the field is just distance over speed. */
+        var gx = cx(GOAL), gy = cy(GOAL);
+        for (i = 0; i < N; i++) {
+          var ddx = cx(i) - gx, ddy = cy(i) - gy;
+          dist[i] = Math.sqrt(ddx * ddx + ddy * ddy) / prof.speed;
+        }
+      } else {
+        var hk = new Float64Array(N * 8), hv = new Int32Array(N * 8), hn = 0;
+        var done = new Uint8Array(N);
+        for (i = 0; i < N; i++) dist[i] = Infinity;
+        dist[GOAL] = cost[GOAL];
+        hn = heapPush(hk, hv, hn, dist[GOAL], GOAL);
+        while (hn > 0) {
+          var u = hv[0], du = hk[0];
+          hn = heapPop(hk, hv, hn);
+          if (done[u]) continue;
+          done[u] = 1;
+          x = cx(u); y = cy(u);
+          for (var d = 0; d < 4; d++) {
+            var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
+            var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
+            if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
+            var v = idx(nx, ny);
+            if (done[v]) continue;
+            var nd = du + cost[v];
+            if (nd < dist[v]) {
+              dist[v] = nd;
+              if (hn < hk.length) hn = heapPush(hk, hv, hn, nd, v);
+            }
+          }
+        }
+      }
+
+      var res = { prof: prof, trav: trav, danger: danger, cost: cost, dist: dist };
+      /* Mean cell cost, the unit tau is measured in. Cached because the per-unit
+         step choice needs it sixty times a second, and summing 384 cells per
+         unit per tick is the kind of waste that only shows once a wave is
+         thirty units wide. */
+      var csum = 0;
+      for (i = 0; i < N; i++) csum += cost[i];
+      res.scale = csum / N;
+      res.occ = occupancy(st, res);
+      var ed = 0;
+      for (i = 0; i < N; i++) ed += res.occ[i] * danger[i];
+      res.expDamage = ed;
+      res.routeTime = routeTime(st, res);
+      st.solves[profId] = res;
+      return res;
+    }
+
+    /* Expected number of visits per cell for one unit entering at the spawn.
+
+       Mass only ever moves strictly downhill in dist, so the transition graph
+       is acyclic and one pass in order of decreasing dist is exact. No Monte
+       Carlo, no iteration, no sampling error. Where the cheapest step is
+       unique the field degenerates into a single path, which is correct rather
+       than a special case. */
+    function occupancy(st, res) {
+      var occ = new Float32Array(N), i;
+      var prof = res.prof, dist = res.dist;
+
+      if (prof.fly) {
+        /* Flyers do not use the grid, but their occupancy has to mean the same
+           thing as everyone else's: expected visits, not time. A cell the line
+           crosses is visited exactly once. Accumulating time here instead would
+           make the damage integral count the dwell time twice, since the danger
+           term already carries it. */
+        var sx = cx(SPAWN), sy = cy(SPAWN), gx = cx(GOAL), gy = cy(GOAL);
+        var len = Math.sqrt((gx - sx) * (gx - sx) + (gy - sy) * (gy - sy));
+        var steps = Math.max(1, Math.ceil(len * 24));
+        for (var s = 0; s <= steps; s++) {
+          var a = s / steps;
+          var px = Math.round(sx + (gx - sx) * a), py = Math.round(sy + (gy - sy) * a);
+          occ[idx(px, py)] = 1;
+        }
+        return occ;
+      }
+
+      var order = new Int32Array(N);
+      for (i = 0; i < N; i++) order[i] = i;
+      var da = dist;
+      var arr = Array.prototype.slice.call(order);
+      arr.sort(function (a, b) { return db(da[b]) - db(da[a]); });
+
+      var T = prof.tau * res.scale;
+      occ[SPAWN] = 1;
+      var nb = [0, 0, 0, 0], w = [0, 0, 0, 0];
+      for (var oi = 0; oi < N; oi++) {
+        var u = arr[oi];
+        if (occ[u] <= 0 || u === GOAL) continue;
+        if (!isFinite(dist[u])) continue;
+        var x = cx(u), y = cy(u), cnt = 0, best = Infinity;
+        for (var d = 0; d < 4; d++) {
+          var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
+          var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
+          if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
+          var v = idx(nx, ny);
+          if (!(dist[v] < dist[u])) continue;      // strictly downhill only
+          nb[cnt] = v; if (dist[v] < best) best = dist[v];
+          cnt++;
+        }
+        if (!cnt) continue;
+        /* At T = 0 this is an even split over the steps that tie for cheapest.
+           Where a route has to make progress in both directions, every
+           staircase between here and there is equally good, so the mass fans
+           out; drawing one of them as the route would be a claim the arithmetic
+           does not support. Above zero, steps that are merely close get their
+           share too. chooseNext draws from exactly these weights, so the
+           picture and the units cannot disagree. */
+        var sum = 0, j;
+        for (j = 0; j < cnt; j++) {
+          w[j] = T > 0 ? Math.exp(-(dist[nb[j]] - best) / T) : (tieEq(dist[nb[j]], best) ? 1 : 0);
+          sum += w[j];
+        }
+        if (sum <= 0) { w[0] = 1; sum = 1; }
+        for (j = 0; j < cnt; j++) occ[nb[j]] += occ[u] * (w[j] / sum);
+      }
+      return occ;
+    }
+
+    /* Infinity sorts badly in a numeric comparator, so map it onto a large
+       finite value first. Unreachable cells cannot occur with finite tower
+       costs, but the sort must not depend on that staying true. */
+    function db(v) { return isFinite(v) ? v : 1e18; }
+
+    /* Ties have to be recognised identically in the field and in the units, or
+       the picture fans out over routes the units never take. Costs that tie are
+       computed by the same arithmetic and so are usually bit-identical, but a
+       relative epsilon costs nothing and removes the question. */
+    function tieEq(a, b) { return Math.abs(a - b) <= 1e-9 * (1 + Math.abs(b)); }
+
+    /* Expected wall-clock seconds from spawn to goal, integrating the
+       traversal time over the same occupancy distribution. */
+    function routeTime(st, res) {
+      var t = 0;
+      for (var i = 0; i < N; i++) t += res.occ[i] * res.trav[i];
+      return t;
+    }
+
+    /* One greedy path, for cases that want a single line. Where steps tie it
+       picks arbitrarily, so it is a sample from the fan and not the route. */
+    function greedyPath(res) {
+      var out = [SPAWN], cur = SPAWN, guard = 0;
+      while (cur !== GOAL && guard++ < N * 2) {
+        var x = cx(cur), y = cy(cur), best = -1, bd = res.dist[cur];
+        for (var d = 0; d < 4; d++) {
+          var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
+          var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
+          if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
+          var v = idx(nx, ny);
+          if (res.dist[v] < bd) { bd = res.dist[v]; best = v; }
+        }
+        if (best < 0) break;
+        cur = best; out.push(cur);
+      }
+      return out;
+    }
+
+    /* ---------- building ---------- */
+
+    function canBuild(st, i, typeId) {
+      if (i < 0 || i >= N) return 'off the board';
+      if (i === SPAWN) return 'the spawn stays clear';
+      if (i === GOAL) return 'the goal stays clear';
+      if (st.towerAt[i] >= 0) return 'occupied';
+      if (st.gold < TOWER_BY_ID[typeId].cost) return 'not enough gold';
+      for (var k = 0; k < st.enemies.length; k++) {
+        var e = st.enemies[k];
+        if (!e.fly && idx(Math.round(e.x), Math.round(e.y)) === i) return 'someone is standing there';
+      }
+      return null;
+    }
+
+    function build(st, i, typeId) {
+      if (canBuild(st, i, typeId)) return false;
+      var def = TOWER_BY_ID[typeId];
+      var tw = { id: st.nextTowerId++, type: typeId, x: cx(i), y: cy(i), cell: i,
+                 hp: def.hp, maxHp: def.hp, cd: 0, busy: 0, idle: 0 };
+      st.towers.push(tw);
+      st.towerAt[i] = st.towers.length - 1;
+      st.gold -= def.cost;
+      st.history.push({ act: 'build', cell: i, type: typeId, cost: def.cost });
+      st.dirty = true;
+      return true;
+    }
+
+    /* Selling refunds 60 percent, rounded down. The loss is deliberate: without
+       it, rebuilding the maze between every wave would be free. */
+    function sellValue(typeId, hp, maxHp) {
+      return Math.floor(TOWER_BY_ID[typeId].cost * 0.6 * (hp / maxHp));
+    }
+
+    function sell(st, i) {
+      var k = st.towerAt[i];
+      if (k < 0) return false;
+      var tw = st.towers[k];
+      st.gold += sellValue(tw.type, tw.hp, tw.maxHp);
+      removeTowerAt(st, i);
+      st.history.push({ act: 'sell', cell: i, type: tw.type });
+      return true;
+    }
+
+    /* towerAt holds indices into st.towers, so removing an element has to
+       reindex the tail. Splicing without this leaves every later tower pointing
+       one slot too far and the board silently desynchronises. */
+    function removeTowerAt(st, i) {
+      var k = st.towerAt[i];
+      if (k < 0) return;
+      st.towers.splice(k, 1);
+      st.towerAt[i] = -1;
+      for (var j = 0; j < N; j++) if (st.towerAt[j] > k) st.towerAt[j]--;
+      st.dirty = true;
+    }
+
+    function undo(st) {
+      for (var n = st.history.length - 1; n >= 0; n--) {
+        var h = st.history[n];
+        if (h.act !== 'build') continue;
+        if (st.towerAt[h.cell] < 0) { st.history.splice(n, 1); continue; }
+        var tw = st.towers[st.towerAt[h.cell]];
+        if (tw.hp < tw.maxHp) return false;     // it has been shot at, that is history now
+        st.gold += h.cost;
+        removeTowerAt(st, h.cell);
+        st.history.splice(n, 1);
+        return true;
+      }
+      return false;
+    }
+
+    /* What placing this tower would do to the route, in the units that matter.
+       One extra solve, which on a 24 x 16 board costs microseconds, so this can
+       run on every pointer move. */
+    function previewBuild(st, i, typeId, profId) {
+      if (canBuild(st, i, typeId)) return null;
+      var before = solve(st, profId);
+      var savedTowers = st.towers, savedAt = st.towerAt, savedDirty = st.dirty;
+      var savedFields = st.fields, savedSolves = st.solves, savedGold = st.gold;
+      var def = TOWER_BY_ID[typeId];
+      st.towers = savedTowers.slice();
+      st.towerAt = Int32Array.from(savedAt);
+      st.towers.push({ id: -1, type: typeId, x: cx(i), y: cy(i), cell: i,
+                       hp: def.hp, maxHp: def.hp, cd: 0, busy: 0, idle: 0 });
+      st.towerAt[i] = st.towers.length - 1;
+      st.dirty = true; st.fields = null; st.solves = {};
+      var after = solve(st, profId);
+      var out = {
+        dTime: after.routeTime - before.routeTime,
+        dDamage: after.expDamage - before.expDamage,
+        damage: after.expDamage,
+        time: after.routeTime
+      };
+      st.towers = savedTowers; st.towerAt = savedAt; st.dirty = savedDirty;
+      st.fields = savedFields; st.solves = savedSolves; st.gold = savedGold;
+      return out;
+    }
+
+    /* ---------- simulation ----------
+
+       Fixed step. Everything that consumes randomness draws from st.rand, so a
+       seed plus a sequence of build actions reproduces a run exactly. */
+
+    var TICK = 1 / 60;
+
+    function startWave(st) {
+      if (st.phase !== 'plan') return false;
+      st.queue = waveSchedule(st.wave);
+      st.waveT = 0;
+      st.leaked = 0;
+      st.killed = 0;
+      st.trace = new Float32Array(N);
+      st.shells = [];
+      st.fx = [];
+      for (var k = 0; k < st.towers.length; k++) { st.towers[k].busy = 0; st.towers[k].idle = 0; }
+      st.phase = 'wave';
+      return true;
+    }
+
+    function spawnEnemy(st, type, hp) {
+      var prof = ENEMY_BY_ID[type];
+      st.enemies.push({
+        id: st.nextEnemyId++, type: type, hp: hp, maxHp: hp,
+        x: cx(SPAWN), y: cy(SPAWN), tgt: -1, fly: !!prof.fly, chew: 0
+      });
+    }
+
+    /* One softmax draw over the strictly downhill neighbours of the cell the
+       unit is standing in. Same weights as the occupancy propagation, so what
+       the field shows and what the units do cannot drift apart. */
+    function chooseNext(st, e, res) {
+      var cur = idx(Math.round(e.x), Math.round(e.y));
+      if (cur === GOAL) return GOAL;
+      var dist = res.dist, x = cx(cur), y = cy(cur);
+      var nb = [], best = Infinity, d;
+      for (d = 0; d < 4; d++) {
+        var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
+        var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
+        if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
+        var v = idx(nx, ny);
+        if (!(dist[v] < dist[cur])) continue;
+        nb.push(v);
+        if (dist[v] < best) best = dist[v];
+      }
+      if (!nb.length) return -1;
+      /* Same weights as the occupancy propagation, drawn once. Picking the
+         first cheapest instead would make every unit walk the same arbitrary
+         staircase while the field promised a fan. */
+      var prof = ENEMY_BY_ID[e.type], T = prof.tau * res.scale, i;
+      var w = [], sum = 0;
+      for (i = 0; i < nb.length; i++) {
+        w[i] = T > 0 ? Math.exp(-(dist[nb[i]] - best) / T) : (tieEq(dist[nb[i]], best) ? 1 : 0);
+        sum += w[i];
+      }
+      if (sum <= 0) return nb[0];
+      var r = st.rand() * sum;
+      for (i = 0; i < nb.length; i++) { r -= w[i]; if (r <= 0) return nb[i]; }
+      return nb[nb.length - 1];
+    }
+
+    /* ---------- effects ----------
+
+       Everything in st.fx is cosmetic: the renderer reads it and nothing else
+       does. Two rules keep it that way. It never draws from st.rand, because
+       that stream decides which way a swarm unit turns at a fork, and a spark
+       taken from it would make the simulation depend on whether anyone is
+       watching; it gets its own generator seeded beside it. And it is capped,
+       because a tab that was in the background and resumes at four times speed
+       would otherwise queue thousands of sparks nobody will see. */
+
+    var FX_MAX = 260;
+
+    /* Ageing is its own function because the phase guard in step would freeze
+       it: the wave ends in the same tick as the last kill, and the sparks of
+       that kill would then hang in the air until the next wave clears them.
+       The caller drives it during the plan phase and while paused. */
+    function ageFx(st, dt) {
+      for (var i = st.fx.length - 1; i >= 0; i--) {
+        var o = st.fx[i];
+        o.t += dt;
+        if (o.t >= o.life) st.fx.splice(i, 1);
+      }
+    }
+
+    function fxPush(st, o) {
+      if (st.fx.length >= FX_MAX) st.fx.shift();
+      o.t = 0;
+      st.fx.push(o);
+      return o;
+    }
+
+    /* The mortar's shells travel, and the damage lands when they do. This is
+       the one effect that could not stay cosmetic: a round that deals its
+       damage at the moment it is fired cannot be drawn honestly, and drawing it
+       flying while the target died a second ago is exactly the sort of small
+       lie the rest of this tool spends its time avoiding.
+
+       The shell is aimed where the unit will be after the flight, not where it
+       is, so the average damage stays near what the threat field promises. One
+       round of correction is enough: the flight time depends on the distance to
+       the aim point, which depends on the flight time. A unit that turns a
+       corner in the meantime is missed, which is a property of a mortar rather
+       than a bug, and it is the reason the mortar is worth less against the
+       swarm than the threat field alone suggests. */
+
+    var SHELL_SPEED = 6.5;        // cells per second
+    var SHELL_MIN = 0.12;         // seconds, so a point blank shot is still visible
+
+    function fireShell(st, tw, def, e) {
+      var t = Math.max(SHELL_MIN, Math.hypot(e.x - tw.x, e.y - tw.y) / SHELL_SPEED);
+      var vx = e.vx || 0, vy = e.vy || 0;
+      t = Math.max(SHELL_MIN, Math.hypot(e.x + vx * t - tw.x, e.y + vy * t - tw.y) / SHELL_SPEED);
+      st.shells.push({ x0: tw.x, y0: tw.y, x: e.x + vx * t, y: e.y + vy * t,
+                       t: 0, dur: t, r: def.splash, dmg: def.splashDmg });
+      fxPush(st, { kind: 'muzzle', x: tw.x, y: tw.y,
+                   a: Math.atan2(e.y - tw.y, e.x - tw.x), life: 0.16 });
+    }
+
+    /* Shortest way from b to a, so a turret turns the near way round. */
+    function angDiff(a, b) {
+      var d = (a - b + Math.PI) % (2 * Math.PI);
+      if (d < 0) d += 2 * Math.PI;
+      return d - Math.PI;
+    }
+
+    function step(st) {
+      if (st.phase !== 'wave') return;
+      var dt = TICK, i, k;
+      st.waveT += dt;
+
+      while (st.queue.length && st.queue[0].t <= st.waveT) {
+        var q = st.queue.shift();
+        spawnEnemy(st, q.type, q.hp);
+      }
+
+      var f = ensureFields(st);
+
+      /* --- enemies --- */
+      for (i = st.enemies.length - 1; i >= 0; i--) {
+        var e = st.enemies[i];
+        var prof = ENEMY_BY_ID[e.type];
+        var res = solve(st, e.type);
+        var wasX = e.x, wasY = e.y;
+        /* How hard the unit is being hit right now, not that it was hit: the
+           guns deal damage continuously, so there is no event to flash on. */
+        e.hurt = e.hurt > 0 ? Math.max(0, e.hurt - dt * 2.6) : 0;
+
+        if (e.fly) {
+          var gx = cx(GOAL), gy = cy(GOAL);
+          var dx = gx - e.x, dy = gy - e.y, len = Math.hypot(dx, dy);
+          if (len < 0.05) { leak(st, e, i); continue; }
+          var stp = Math.min(len, prof.speed * dt);
+          e.x += dx / len * stp; e.y += dy / len * stp;
+          e.vx = (e.x - wasX) / dt; e.vy = (e.y - wasY) / dt;
+          st.trace[idx(Math.round(e.x), Math.round(e.y))] += dt;
+          continue;
+        }
+
+        var cur = idx(Math.round(e.x), Math.round(e.y));
+        st.trace[cur] += dt;
+        if (cur === GOAL) { leak(st, e, i); continue; }
+
+        if (e.tgt < 0 || st.towerAt[e.tgt] < 0 && e.chew > 0) e.chew = 0;
+        if (e.tgt < 0) e.tgt = chooseNext(st, e, res);
+        if (e.tgt < 0) continue;
+
+        var tk = st.towerAt[e.tgt];
+        if (tk >= 0) {
+          /* The cell is occupied, so the traversal cost of this cell is being
+             paid the way the field priced it: in damage to the building. */
+          var tw = st.towers[tk];
+          tw.hp -= prof.dpsBuild * dt;
+          e.chew = 1;
+          e.vx = 0; e.vy = 0;
+          if (tw.hp <= 0) {
+            fxPush(st, { kind: 'rubble', x: tw.x, y: tw.y, life: 0.7, s: st.fxRand() });
+            removeTowerAt(st, e.tgt);
+            e.chew = 0;
+          }
+          continue;
+        }
+
+        var tx = cx(e.tgt), ty = cy(e.tgt);
+        var mul = 1 / (1 - f.slow[e.tgt]);
+        var v = prof.speed / mul;
+        var ddx = tx - e.x, ddy = ty - e.y, dl = Math.hypot(ddx, ddy);
+        var mv = v * dt;
+        if (dl <= mv) {
+          e.x = tx; e.y = ty; e.tgt = -1;
+        } else {
+          e.x += ddx / dl * mv; e.y += ddy / dl * mv;
+        }
+        e.vx = (e.x - wasX) / dt; e.vy = (e.y - wasY) / dt;
+      }
+
+      /* --- shells in flight --- */
+      for (i = st.shells.length - 1; i >= 0; i--) {
+        var sh = st.shells[i];
+        sh.t += dt;
+        if (sh.t < sh.dur) continue;
+        splash(st, sh.x, sh.y, sh.r, sh.dmg);
+        fxPush(st, { kind: 'boom', x: sh.x, y: sh.y, r: sh.r, life: 0.44 });
+        st.shells.splice(i, 1);
+      }
+
+      /* --- towers --- */
+      for (k = 0; k < st.towers.length; k++) {
+        var tw2 = st.towers[k], def = TOWER_BY_ID[tw2.type];
+        if (!def.dps || !def.range) continue;
+        var target = pickTarget(st, tw2, def);
+        if (!target) { tw2.idle += dt; tw2.tgtId = 0; continue; }
+        tw2.busy += dt;
+        /* The turret turns towards its target rather than snapping to it. The
+           angle is part of the state and not of the drawing, because at four
+           times speed the renderer sees only every fourth tick and would jump. */
+        var ang = Math.atan2(target.y - tw2.y, target.x - tw2.x);
+        tw2.aim = tw2.aim == null ? ang : tw2.aim + angDiff(ang, tw2.aim) * Math.min(1, dt * 14);
+        tw2.tgtId = target.id;
+        if (def.rate) {
+          tw2.cd -= dt;
+          if (tw2.cd <= 0) {
+            tw2.cd += 1 / def.rate;
+            fireShell(st, tw2, def, target);
+          }
+        } else {
+          damage(st, target, def.dps * dt);
+        }
+      }
+
+      for (i = st.enemies.length - 1; i >= 0; i--) {
+        var dead = st.enemies[i];
+        if (dead.hp <= 0) {
+          st.gold += killBounty(dead.maxHp);
+          st.killed++;
+          fxPush(st, { kind: 'death', x: dead.x, y: dead.y, type: dead.type,
+                       life: 0.5, s: st.fxRand() });
+          st.enemies.splice(i, 1);
+        }
+      }
+
+      ageFx(st, dt);
+
+      /* A shell still in the air belongs to this wave, so the wave is not over
+         until it has landed. Without this the round would hang in the plan
+         phase, where nothing advances it, and detonate at the start of the
+         next wave. */
+      if (!st.queue.length && !st.enemies.length && !st.shells.length) endWave(st);
+      if (st.coreHp <= 0) { st.coreHp = 0; st.phase = 'over'; }
+    }
+
+    /* Furthest along the route, which is the standard and the only choice that
+       does not throw away damage already invested. */
+    function pickTarget(st, tw, def) {
+      var best = null, bd = Infinity, r2 = def.range * def.range;
+      for (var i = 0; i < st.enemies.length; i++) {
+        var e = st.enemies[i];
+        if (e.hp <= 0) continue;
+        var dx = e.x - tw.x, dy = e.y - tw.y;
+        if (dx * dx + dy * dy > r2) continue;
+        var res = st.solves[e.type] || solve(st, e.type);
+        var d = res.dist[idx(Math.round(e.x), Math.round(e.y))];
+        if (d < bd) { bd = d; best = e; }
+      }
+      return best;
+    }
+
+    function damage(st, e, amount) {
+      e.hp -= amount;
+      e.hurt = Math.min(1, (e.hurt || 0) + amount / Math.max(1, e.maxHp) * 7);
+    }
+
+    function splash(st, x, y, r, dmg) {
+      var r2 = r * r;
+      for (var i = 0; i < st.enemies.length; i++) {
+        var e = st.enemies[i];
+        var dx = e.x - x, dy = e.y - y;
+        if (dx * dx + dy * dy <= r2) damage(st, e, dmg);
+      }
+    }
+
+    /* A unit that arrives deals exactly the health it has left. That keeps the
+       pre-wave number and the damage taken in the same currency: if the field
+       says a runner loses 340 of its 500 health on the way, 160 is what the
+       core loses. */
+    function leak(st, e, i) {
+      st.coreHp -= e.hp;
+      st.leaked += e.hp;
+      fxPush(st, { kind: 'leak', x: cx(GOAL), y: cy(GOAL), hp: e.hp, life: 1.2 });
+      st.enemies.splice(i, 1);
+    }
+
+    function endWave(st) {
+      st.gold += waveBounty(st.wave);
+      st.wave++;
+      st.phase = 'plan';
+    }
+
+    /* ---------- ramps ----------
+
+       Sequential data wants a sequential map. Viridis, inferno and magma are
+       the nine-quantile samples of the matplotlib maps, taken from the tables
+       the ripple tank and the Regensburg sun tool already carry rather than
+       recalled from memory. Everything below them comes from
+       notes/dev/ffd-ramps.py, which reads matplotlib itself and prints the
+       sampling error it accepts: bone, summer, winter and twilight land within
+       1.3 of 255, pink within 8, which at the fill opacities used here is under
+       2 of 255 on screen.
+
+       The three cyclic maps at the end are the reason this list is longer than
+       one entry. A cyclic map has no ends, so laying it over the range several
+       times is seamless, and the number of repeats becomes a control: the field
+       is then drawn as bands of equal cost, which is the statement the contour
+       lines make, in a form that still reads from across the room. HSV is the
+       true hue wheel rather than matplotlib's table, because that table ends at
+       (1, 0, 0.094) instead of closing the circle, and the seam would come back
+       with every band. */
+
+    var RAMPS = {
+      viridis: [
+        [0.267, 0.005, 0.329], [0.279, 0.175, 0.483], [0.230, 0.322, 0.546],
+        [0.173, 0.449, 0.558], [0.128, 0.567, 0.551], [0.158, 0.684, 0.502],
+        [0.369, 0.789, 0.383], [0.678, 0.864, 0.190], [0.993, 0.906, 0.144]
+      ],
+      inferno: [
+        [0.001, 0.000, 0.014], [0.129, 0.047, 0.291], [0.342, 0.062, 0.429],
+        [0.541, 0.135, 0.415], [0.736, 0.216, 0.330], [0.894, 0.353, 0.194],
+        [0.978, 0.558, 0.035], [0.975, 0.798, 0.206], [0.988, 0.998, 0.645]
+      ],
+      magma: [
+        [0.001, 0.000, 0.014], [0.113, 0.065, 0.277], [0.317, 0.072, 0.485],
+        [0.513, 0.148, 0.508], [0.716, 0.215, 0.475], [0.904, 0.320, 0.388],
+        [0.987, 0.536, 0.382], [0.997, 0.770, 0.535], [0.987, 0.991, 0.750]
+      ],
+      bone: [
+        [0.0000, 0.0000, 0.0000], [0.1094, 0.1094, 0.1522], [0.2188, 0.2187, 0.3043],
+        [0.3281, 0.3314, 0.4531], [0.4375, 0.4818, 0.5625], [0.5469, 0.6322, 0.6719],
+        [0.6582, 0.7812, 0.7812], [0.8291, 0.8906, 0.8906], [1.0000, 1.0000, 1.0000]
+      ],
+      pink: [
+        [0.1178, 0.0000, 0.0000], [0.2489, 0.1441, 0.1441], [0.3319, 0.2040, 0.2040],
+        [0.3979, 0.2499, 0.2499], [0.4544, 0.2886, 0.2886], [0.5047, 0.3227, 0.3227],
+        [0.5503, 0.3535, 0.3535], [0.5925, 0.3818, 0.3818], [0.6319, 0.4082, 0.4082],
+        [0.6689, 0.4330, 0.4330], [0.7040, 0.4564, 0.4564], [0.7374, 0.4787, 0.4787],
+        [0.7638, 0.5085, 0.5000], [0.7773, 0.5538, 0.5204], [0.7906, 0.5958, 0.5400],
+        [0.8036, 0.6349, 0.5590], [0.8165, 0.6718, 0.5773], [0.8291, 0.7067, 0.5951],
+        [0.8416, 0.7401, 0.6124], [0.8539, 0.7719, 0.6291], [0.8660, 0.8025, 0.6455],
+        [0.8780, 0.8320, 0.6614], [0.8898, 0.8605, 0.6770], [0.9014, 0.8880, 0.6922],
+        [0.9129, 0.9129, 0.7107], [0.9242, 0.9242, 0.7530], [0.9354, 0.9354, 0.7930],
+        [0.9465, 0.9465, 0.8311], [0.9574, 0.9574, 0.8675], [0.9682, 0.9682, 0.9025],
+        [0.9789, 0.9789, 0.9361], [0.9895, 0.9895, 0.9686], [1.0000, 1.0000, 1.0000]
+      ],
+      summer: [
+        [0.0000, 0.5000, 0.4000], [0.1250, 0.5625, 0.4000], [0.2500, 0.6250, 0.4000],
+        [0.3750, 0.6875, 0.4000], [0.5000, 0.7500, 0.4000], [0.6250, 0.8125, 0.4000],
+        [0.7500, 0.8750, 0.4000], [0.8750, 0.9375, 0.4000], [1.0000, 1.0000, 0.4000]
+      ],
+      winter: [
+        [0.0000, 0.0000, 1.0000], [0.0000, 0.1250, 0.9375], [0.0000, 0.2500, 0.8750],
+        [0.0000, 0.3750, 0.8125], [0.0000, 0.5000, 0.7500], [0.0000, 0.6250, 0.6875],
+        [0.0000, 0.7500, 0.6250], [0.0000, 0.8750, 0.5625], [0.0000, 1.0000, 0.5000]
+      ],
+      twilight: [
+        [0.8858, 0.8500, 0.8880], [0.8407, 0.8427, 0.8654], [0.7629, 0.8076, 0.8307],
+        [0.6689, 0.7604, 0.7991], [0.5798, 0.7074, 0.7786], [0.5049, 0.6507, 0.7655],
+        [0.4467, 0.5907, 0.7555], [0.4066, 0.5273, 0.7450], [0.3838, 0.4603, 0.7307],
+        [0.3739, 0.3898, 0.7091], [0.3699, 0.3161, 0.6769], [0.3646, 0.2403, 0.6299],
+        [0.3508, 0.1665, 0.5621], [0.3200, 0.1073, 0.4686], [0.2711, 0.0759, 0.3626],
+        [0.2211, 0.0659, 0.2728], [0.1861, 0.0783, 0.2146], [0.2271, 0.0674, 0.2279],
+        [0.2928, 0.0752, 0.2582], [0.3724, 0.0920, 0.2898], [0.4545, 0.1165, 0.3098],
+        [0.5307, 0.1545, 0.3148], [0.5964, 0.2070, 0.3126], [0.6516, 0.2691, 0.3129],
+        [0.6974, 0.3372, 0.3218], [0.7341, 0.4096, 0.3444], [0.7619, 0.4851, 0.3853],
+        [0.7823, 0.5620, 0.4484], [0.7996, 0.6380, 0.5336], [0.8203, 0.7107, 0.6349],
+        [0.8475, 0.7768, 0.7413], [0.8723, 0.8287, 0.8335], [0.8857, 0.8500, 0.8857]
+      ],
+      twilightShifted: [
+        [0.1874, 0.0771, 0.2162], [0.2225, 0.0659, 0.2752], [0.2728, 0.0765, 0.3658],
+        [0.3213, 0.1088, 0.4718], [0.3514, 0.1687, 0.5646], [0.3649, 0.2427, 0.6316],
+        [0.3700, 0.3184, 0.6781], [0.3741, 0.3921, 0.7099], [0.3843, 0.4625, 0.7312],
+        [0.4076, 0.5293, 0.7454], [0.4482, 0.5926, 0.7558], [0.5070, 0.6525, 0.7659],
+        [0.5824, 0.7092, 0.7791], [0.6718, 0.7620, 0.7999], [0.7657, 0.8090, 0.8318],
+        [0.8426, 0.8435, 0.8664], [0.8857, 0.8500, 0.8868], [0.8729, 0.8300, 0.8357],
+        [0.8484, 0.7787, 0.7446], [0.8211, 0.7129, 0.6383], [0.8002, 0.6404, 0.5366],
+        [0.7828, 0.5644, 0.4508], [0.7627, 0.4875, 0.3870], [0.7352, 0.4119, 0.3454],
+        [0.6987, 0.3394, 0.3223], [0.6532, 0.2712, 0.3130], [0.5982, 0.2088, 0.3125],
+        [0.5329, 0.1559, 0.3148], [0.4570, 0.1174, 0.3102], [0.3750, 0.0926, 0.2907],
+        [0.2951, 0.0756, 0.2593], [0.2288, 0.0674, 0.2287], [0.1849, 0.0794, 0.2131]
+      ],
+      hsv: [
+        [1.0000, 0.0000, 0.0000], [1.0000, 0.5000, 0.0000], [1.0000, 1.0000, 0.0000],
+        [0.5000, 1.0000, 0.0000], [0.0000, 1.0000, 0.0000], [0.0000, 1.0000, 0.5000],
+        [0.0000, 1.0000, 1.0000], [0.0000, 0.5000, 1.0000], [0.0000, 0.0000, 1.0000],
+        [0.5000, 0.0000, 1.0000], [1.0000, 0.0000, 1.0000], [1.0000, 0.0000, 0.5000],
+        [1.0000, 0.0000, 0.0000]
+      ]
+    };
+
+    function rampAt(stops, t) {
+      if (!(t > 0)) t = 0; else if (t > 1) t = 1;
+      var p = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(p)), a = p - i;
+      var lo = stops[i], hi = stops[i + 1];
+      return [
+        Math.round(255 * (lo[0] + (hi[0] - lo[0]) * a)),
+        Math.round(255 * (lo[1] + (hi[1] - lo[1]) * a)),
+        Math.round(255 * (lo[2] + (hi[2] - lo[2]) * a))
+      ];
+    }
+
+    /* The order and the labels of the map picker, plus the one property that
+       changes what a map may be used for. */
+    var RAMP_LIST = [
+      { id: 'viridis', name: 'Viridis' },
+      { id: 'inferno', name: 'Inferno' },
+      { id: 'magma', name: 'Magma' },
+      { id: 'bone', name: 'Bone' },
+      { id: 'pink', name: 'Pink' },
+      { id: 'summer', name: 'Summer' },
+      { id: 'winter', name: 'Winter' },
+      { id: 'twilight', name: 'Twilight', cyclic: true },
+      { id: 'twilightShifted', name: 'Twilight shifted', cyclic: true },
+      { id: 'hsv', name: 'HSV wheel', cyclic: true }
+    ];
+
+    var RAMP_BY_ID = {};
+    for (var ri = 0; ri < RAMP_LIST.length; ri++) RAMP_BY_ID[RAMP_LIST[ri].id] = RAMP_LIST[ri];
+
+    function rampCyclic(id) { return !!(RAMP_BY_ID[id] && RAMP_BY_ID[id].cyclic); }
+
+    /* One colour of a named map, with the repeat count applied. Repeats only do
+       something on a cyclic map: on a sequential one every wrap would be a hard
+       edge from the light end back to the dark one, which reads as a boundary
+       in the data where there is none. The parameter is therefore ignored on
+       sequential maps rather than quietly turned into a sawtooth. */
+    function rampColor(id, t, reps) {
+      var stops = RAMPS[id] || RAMPS.viridis;
+      var u = t > 0 ? (t > 1 ? 1 : t) : 0;
+      if (rampCyclic(id)) {
+        var r = reps >= 1 ? Math.floor(reps) : 1;
+        u = (u * r) % 1;
+      }
+      return rampAt(stops, u);
+    }
+
+    function rampCss(id, steps, reps) {
+      var out = [], s = steps || 8;
+      /* A repeated map needs enough samples per band, or the CSS gradient
+         shows a coarser stripe than the board does. */
+      if (rampCyclic(id) && reps >= 1) s = Math.max(s, 8 * Math.floor(reps));
+      for (var i = 0; i <= s; i++) {
+        var c = rampColor(id, i / s, reps);
+        out.push('rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ') ' + (100 * i / s).toFixed(2) + '%');
+      }
+      return 'linear-gradient(90deg,' + out.join(',') + ')';
+    }
+
+    /* ---------- contours ----------
+
+       Marching squares over the lattice of cell CENTRES, which is where the
+       values live: a cell holds one number, so the corners of a marching square
+       are four cell centres and the square sits half a cell off the grid. The
+       lines stop half a cell short of the board edge, which is honest, because
+       nothing is known beyond the last centre.
+
+       Cells carrying a building are dropped from the lattice instead of being
+       contoured. A tower cell is a step in the field, not a slope: running
+       lines through it would pile a dozen levels into one cell and draw a
+       gradient that is really a wall. Breaking the lines there is also what a
+       map does with a building on it. */
+
+    /* The range a field is drawn over, and the reason it takes the same mask as
+       the contours: a tower cell carries the cost of chewing through the
+       building, which is worth several times the walk across the whole board.
+       Letting it set the top of the scale pushes every piece of open ground
+       into the dark end of the map, and the more you build the flatter the
+       field looks, which is the opposite of what the tool is for. Measured on a
+       board with a wall row and two towers: the runner's open ground spans 0.5
+       to 15.5, the same board including the buildings 0.5 to 27, and for the
+       cautious profile, which prices danger, 0.6 to 4210 with nine tenths of
+       all cells in the first tenth of the map. */
+    function fieldRange(vals, blocked) {
+      var lo = Infinity, hi = -Infinity, i, v;
+      for (i = 0; i < N; i++) {
+        if (blocked && blocked[i]) continue;
+        v = vals[i];
+        if (!isFinite(v)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      if (!(hi > lo)) { if (!isFinite(lo)) lo = 0; hi = lo + 1; }
+      return { lo: lo, hi: hi };
+    }
+
+    function isoLevels(vals, blocked, count) {
+      var n = count > 0 ? Math.floor(count) : 1, i;
+      var lo = Infinity, hi = -Infinity, v;
+      for (i = 0; i < N; i++) {
+        if (blocked && blocked[i]) continue;
+        v = vals[i];
+        if (!isFinite(v)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      var out = [];
+      if (!(hi > lo)) return out;
+      /* Half a step in from both ends: a level sitting exactly on the minimum
+         is a line of zero length, one on the maximum a line around everything. */
+      for (i = 0; i < n; i++) out.push(lo + (hi - lo) * (i + 0.5) / n);
+      return out;
+    }
+
+    /* Flat array of segments, four numbers each, in cell units: the centre of
+       cell (x, y) is at (x + 0.5, y + 0.5), so the caller multiplies by the
+       cell size and nothing here knows about pixels. */
+    function isoSegments(vals, level, blocked) {
+      var out = [], x, y;
+      for (y = 0; y + 1 < GH; y++) {
+        for (x = 0; x + 1 < GW; x++) {
+          var ia = idx(x, y), ib = idx(x + 1, y), ic = idx(x + 1, y + 1), id2 = idx(x, y + 1);
+          if (blocked && (blocked[ia] || blocked[ib] || blocked[ic] || blocked[id2])) continue;
+          var a = vals[ia], b = vals[ib], c = vals[ic], d = vals[id2];
+          if (!(isFinite(a) && isFinite(b) && isFinite(c) && isFinite(d))) continue;
+          var code = (a > level ? 8 : 0) | (b > level ? 4 : 0) | (c > level ? 2 : 0) | (d > level ? 1 : 0);
+          if (code === 0 || code === 15) continue;
+          var x0 = x + 0.5, y0 = y + 0.5;
+          var tx = x0 + (level - a) / (b - a), ty = y0;                 // top, a to b
+          var rx = x0 + 1, ry = y0 + (level - b) / (c - b);             // right, b to c
+          var bx = x0 + (level - d) / (c - d), by = y0 + 1;             // bottom, d to c
+          var lx = x0, ly = y0 + (level - a) / (d - a);                 // left, a to d
+          switch (code) {
+            case 1: case 14: out.push(lx, ly, bx, by); break;
+            case 2: case 13: out.push(bx, by, rx, ry); break;
+            case 3: case 12: out.push(lx, ly, rx, ry); break;
+            case 4: case 11: out.push(tx, ty, rx, ry); break;
+            case 6: case 9:  out.push(tx, ty, bx, by); break;
+            case 7: case 8:  out.push(lx, ly, tx, ty); break;
+            /* The two ambiguous cases. The mean of the four corners stands in
+               for the value at the centre of the square and decides whether the
+               two high corners belong to each other or to opposite sides. */
+            case 5:
+              if ((a + b + c + d) / 4 > level) { out.push(lx, ly, tx, ty, bx, by, rx, ry); }
+              else { out.push(lx, ly, bx, by, tx, ty, rx, ry); }
+              break;
+            case 10:
+              if ((a + b + c + d) / 4 > level) { out.push(tx, ty, rx, ry, lx, ly, bx, by); }
+              else { out.push(lx, ly, tx, ty, bx, by, rx, ry); }
+              break;
+          }
+        }
+      }
+      return out;
+    }
+
+    /* The cells a contour must not cross, as a flag per cell. */
+    function blockedCells(st) {
+      var m = new Uint8Array(N);
+      for (var i = 0; i < N; i++) if (st.towerAt[i] >= 0) m[i] = 1;
+      return m;
+    }
+
+    /* ---------- share link ----------
+
+       Layout only, plus the seed. Restoring a layout puts the run back at wave
+       one with whatever gold is left after paying for it, which is honest: the
+       maze is the shared object, the run is not. */
+
+    var TYPE_ORDER = ['wall', 'gun', 'slower', 'mortar', 'sniper'];
+
+    function encodeState(st) {
+      var parts = [];
+      for (var i = 0; i < N; i++) {
+        var k = st.towerAt[i];
+        if (k < 0) continue;
+        parts.push(TYPE_ORDER.indexOf(st.towers[k].type) + '.' + i);
+      }
+      return '#s=' + st.seed + '&b=' + parts.join('_');
+    }
+
+    function decodeState(hash) {
+      if (!hash) return null;
+      var q = {}, raw = String(hash).replace(/^#/, '').split('&');
+      for (var i = 0; i < raw.length; i++) {
+        var kv = raw[i].split('=');
+        if (kv.length === 2) q[kv[0]] = kv[1];
+      }
+      var seed = parseInt(q.s, 10);
+      if (!isFinite(seed) || seed <= 0) seed = 1;
+      var st = makeState(seed);
+      st.gold = START_GOLD;
+      if (q.b) {
+        var items = q.b.split('_');
+        for (i = 0; i < items.length; i++) {
+          var p = items[i].split('.');
+          if (p.length !== 2) continue;
+          var type = TYPE_ORDER[parseInt(p[0], 10)], cell = parseInt(p[1], 10);
+          if (!type || !isFinite(cell) || cell < 0 || cell >= N) continue;
+          if (cell === SPAWN || cell === GOAL || st.towerAt[cell] >= 0) continue;
+          st.gold = Math.max(st.gold, TOWER_BY_ID[type].cost);   // a shared maze is always placeable
+          build(st, cell, type);
+        }
+        st.gold = Math.max(0, START_GOLD - spent(st));
+      }
+      st.history = [];
+      return st;
+    }
+
+    function spent(st) {
+      var g = 0;
+      for (var i = 0; i < st.towers.length; i++) g += TOWER_BY_ID[st.towers[i].type].cost;
+      return g;
+    }
+
+    return {
+      GW: GW, GH: GH, N: N, SPAWN: SPAWN, GOAL: GOAL, TICK: TICK,
+      START_GOLD: START_GOLD, CORE_HP: CORE_HP, MAX_SLOW: MAX_SLOW,
+      TOWERS: TOWERS, TOWER_BY_ID: TOWER_BY_ID,
+      ENEMIES: ENEMIES, ENEMY_BY_ID: ENEMY_BY_ID,
+      WAVE_PLAN: WAVE_PLAN, RAMPS: RAMPS, RAMP_LIST: RAMP_LIST, RAMP_BY_ID: RAMP_BY_ID,
+      idx: idx, cx: cx, cy: cy,
+      makeState: makeState, slowField: slowField, dpsField: dpsField,
+      ensureFields: ensureFields, solve: solve, occupancy: occupancy,
+      greedyPath: greedyPath, routeTime: routeTime,
+      canBuild: canBuild, build: build, sell: sell, sellValue: sellValue,
+      removeTowerAt: removeTowerAt, undo: undo, previewBuild: previewBuild,
+      startWave: startWave, step: step, spawnEnemy: spawnEnemy, chooseNext: chooseNext,
+      fireShell: fireShell, angDiff: angDiff, ageFx: ageFx,
+      SHELL_SPEED: SHELL_SPEED, FX_MAX: FX_MAX,
+      waveGroups: waveGroups, waveSchedule: waveSchedule,
+      waveBounty: waveBounty, killBounty: killBounty,
+      rampAt: rampAt, rampCss: rampCss, rampColor: rampColor, rampCyclic: rampCyclic,
+      isoLevels: isoLevels, isoSegments: isoSegments, blockedCells: blockedCells,
+      fieldRange: fieldRange,
+      encodeState: encodeState, decodeState: decodeState, spent: spent,
+      splitmix32: splitmix32
+    };
+  })();
+  /* FFD-CORE-END */
+  </script>
+
+  <script id="app">
+    const html = htm.bind(React.createElement);
+    const { useState, useEffect, useRef, useCallback } = React;
+    const C = FFD;
+
+    /* Canvas cannot read CSS variables, so the palette is a mutable object that
+       is refilled on the themechange event site-nav.js fires. The render loop
+       reads COL every frame, so mutating in place is enough. */
+    const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    const COL = {};
+    function readPalette() {
+      Object.assign(COL, {
+        text: cssVar('--tool-text'), emph: cssVar('--tool-emph'), label: cssVar('--tool-label'),
+        note: cssVar('--tool-note'), faint: cssVar('--tool-faint'),
+        border: cssVar('--tool-border'), hairline: cssVar('--tool-hairline'),
+        surface: cssVar('--tool-surface'), panel: cssVar('--tool-panel'), ink: cssVar('--tool-ink'),
+        ok: cssVar('--tool-ok-fg'), warn: cssVar('--tool-warn-fg'),
+        danger: cssVar('--tool-danger-fg'), info: cssVar('--tool-sig-info')
+      });
+    }
+    readPalette();
+
+    const FIELDS = [
+      { id: 'none', name: 'Off' },
+      { id: 'cost', name: 'Cost to go', ramp: 'viridis',
+        note: 'Total cost of the cheapest route from each cell to the goal, for the selected profile. Bright is far.' },
+      { id: 'threat', name: 'Threat', ramp: 'inferno',
+        note: 'Damage per second a unit standing in the cell would take, summed over every tower covering it.' },
+      { id: 'occ', name: 'Occupancy', ramp: 'magma',
+        note: 'Where the units actually go: the probability mass of one unit pushed through the softmax policy.' }
+    ];
+    const FIELD_BY_ID = {};
+    FIELDS.forEach((f) => { FIELD_BY_ID[f.id] = f; });
+
+    const fmt1 = (v) => (Math.abs(v) < 0.05 ? '0.0' : v.toFixed(1));
+    const fmt0 = (v) => Math.round(v).toLocaleString('en-US');
+
+    /* The map in use for the field on screen. With the fill off there is still
+       a map to show in the legend, and cost is the one worth defaulting to. */
+    function rampFor(ui) {
+      const f = FIELD_BY_ID[ui.field];
+      if (!f || !f.ramp) return ui.ramps.cost;
+      return ui.ramps[ui.field] || f.ramp;
+    }
+
+    /* The spread of the field currently on screen, in its own unit, over the
+       same cells the fill and the contours use. */
+    function spanOf(st, ui, res) {
+      const vals = ui.field === 'threat' ? C.ensureFields(st).dps
+        : ui.field === 'occ' ? res.occ : res.dist;
+      const rg = C.fieldRange(vals, C.blockedCells(st));
+      return rg.hi - rg.lo;
+    }
+
+    /* Canvas wants an rgba() string, the palette hands over whatever custom.css
+       wrote. Parsed once per colour, because the contours ask per level. */
+    const rgbCache = {};
+    function withAlpha(css, a) {
+      let t = rgbCache[css];
+      if (!t) {
+        const s = String(css).trim();
+        let m = /^#([0-9a-f]{3})$/i.exec(s);
+        if (m) t = [0, 1, 2].map((i) => parseInt(m[1][i] + m[1][i], 16));
+        else if ((m = /^#([0-9a-f]{6})$/i.exec(s))) t = [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+        else if ((m = /^rgba?\(([^)]+)\)$/i.exec(s))) t = m[1].split(/[,\s/]+/).slice(0, 3).map((v) => Math.round(parseFloat(v)));
+        else t = [226, 232, 240];
+        rgbCache[css] = t;
+      }
+      return 'rgba(' + t[0] + ',' + t[1] + ',' + t[2] + ',' + a + ')';
+    }
+
+    function App() {
+      const stRef = useRef(null);
+      if (!stRef.current) {
+        stRef.current = (location.hash && C.decodeState(location.hash)) || C.makeState(1);
+      }
+
+      /* The map is remembered per field, not globally: each field arrives with
+         a default that suits it, and switching the view should not drag the
+         choice made for another one along. */
+      const [ui, setUi] = useState({
+        tool: 'gun', field: 'cost', prof: 'runner',
+        ramps: { cost: 'viridis', threat: 'inferno', occ: 'magma' },
+        reps: 3, fill: 0.3, arrows: true, iso: true, isoN: 18, trace: false, speed: 1
+      });
+      const [hud, setHud] = useState(readHud(stRef.current));
+      const [hover, setHover] = useState(null);
+      const [msg, setMsg] = useState('');
+      const [, themeBump] = useState(0);
+
+      const cvRef = useRef(null);
+      const tickRef = useRef(null);
+      const uiRef = useRef(ui);
+      uiRef.current = ui;
+      const hoverRef = useRef(null);
+      const runRef = useRef(false);
+
+      function readHud(st) {
+        return {
+          gold: st.gold, coreHp: st.coreHp, coreMax: st.coreMax, wave: st.wave,
+          phase: st.phase, alive: st.enemies.length, queued: st.queue.length,
+          leaked: st.leaked, killed: st.killed, towers: st.towers.length
+        };
+      }
+
+      useEffect(() => {
+        const on = () => { readPalette(); themeBump((n) => n + 1); };
+        window.addEventListener('themechange', on);
+        return () => window.removeEventListener('themechange', on);
+      }, []);
+
+      /* One rAF loop for the lifetime of the page. It only calls through a ref,
+         so its identity never changes when state does. */
+      useEffect(() => {
+        let alive = true;
+        let last = -1, acc = 0, lastHud = 0;
+        function frame(ts) {
+          if (!alive) return;
+          requestAnimationFrame(frame);
+          const dt = last < 0 ? 0.016 : Math.min(0.25, (ts - last) / 1000);
+          last = ts;
+          const fn = tickRef.current;
+          if (fn) {
+            acc = fn(dt, acc);
+            if (ts - lastHud > 180) { lastHud = ts; setHud(readHud(stRef.current)); }
+          }
+        }
+        const id = requestAnimationFrame(frame);
+        return () => { alive = false; cancelAnimationFrame(id); };
+      }, []);
+
+      tickRef.current = (dt, acc) => {
+        const st = stRef.current;
+        if (st.phase === 'wave' && runRef.current) {
+          acc += dt * uiRef.current.speed;
+          let guard = 0;
+          while (acc >= C.TICK && guard++ < 480) { C.step(st); acc -= C.TICK; }
+        } else {
+          acc = 0;
+          /* Not stepping, but the last blast still has to finish. step ages the
+             effects itself, so this branch is the only other one that may. */
+          if (st.fx.length) C.ageFx(st, dt);
+        }
+        draw(cvRef.current, st, uiRef.current, hoverRef.current);
+        return acc;
+      };
+
+      const bump = useCallback(() => {
+        setHud(readHud(stRef.current));
+        history.replaceState(null, '', C.encodeState(stRef.current));
+      }, []);
+
+      /* ---------- pointer ---------- */
+
+      function cellFromEvent(ev) {
+        const cv = cvRef.current;
+        if (!cv) return -1;
+        const r = cv.getBoundingClientRect();
+        const x = Math.floor((ev.clientX - r.left) / r.width * C.GW);
+        const y = Math.floor((ev.clientY - r.top) / r.height * C.GH);
+        if (x < 0 || y < 0 || x >= C.GW || y >= C.GH) return -1;
+        return C.idx(x, y);
+      }
+
+      function onMove(ev) {
+        const st = stRef.current, u = uiRef.current;
+        const cell = cellFromEvent(ev);
+        if (cell < 0) { hoverRef.current = null; setHover(null); return; }
+        if (hoverRef.current && hoverRef.current.cell === cell && hoverRef.current.tool === u.tool
+            && hoverRef.current.prof === u.prof) return;
+        let h = { cell, tool: u.tool, prof: u.prof, reason: null, preview: null, sellFor: null };
+        if (u.tool === 'sell') {
+          const k = st.towerAt[cell];
+          if (k >= 0) {
+            const tw = st.towers[k];
+            h.sellFor = C.sellValue(tw.type, tw.hp, tw.maxHp);
+            h.towerName = C.TOWER_BY_ID[tw.type].name;
+          } else h.reason = 'nothing to sell here';
+        } else {
+          h.reason = C.canBuild(st, cell, u.tool);
+          if (!h.reason) h.preview = C.previewBuild(st, cell, u.tool, u.prof);
+        }
+        hoverRef.current = h;
+        setHover(h);
+      }
+
+      function onDown(ev) {
+        if (ev.button !== undefined && ev.button !== 0) return;
+        ev.preventDefault();
+        const st = stRef.current, u = uiRef.current;
+        const cell = cellFromEvent(ev);
+        if (cell < 0) return;
+        if (u.tool === 'sell') {
+          if (!C.sell(st, cell)) setMsg('Nothing to sell there.');
+          else setMsg('');
+        } else {
+          const why = C.canBuild(st, cell, u.tool);
+          if (why) { setMsg('Cannot build: ' + why + '.'); return; }
+          C.build(st, cell, u.tool);
+          setMsg('');
+        }
+        hoverRef.current = null;
+        setHover(null);
+        bump();
+      }
+
+      /* ---------- keyboard ---------- */
+
+      useEffect(() => {
+        function onKey(ev) {
+          if (ev.target && /INPUT|TEXTAREA|SELECT/.test(ev.target.tagName)) return;
+          const st = stRef.current;
+          if (ev.key === ' ') {
+            ev.preventDefault();
+            if (st.phase === 'plan') { C.startWave(st); runRef.current = true; }
+            else if (st.phase === 'wave') runRef.current = !runRef.current;
+            bump();
+            return;
+          }
+          if (ev.key === 'Escape') { setUi((s) => ({ ...s, tool: 'none' })); return; }
+          if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'z') {
+            ev.preventDefault();
+            setMsg(C.undo(st) ? '' : 'Nothing to undo.');
+            hoverRef.current = null; setHover(null);
+            bump();
+            return;
+          }
+          const t = C.TOWERS.find((x) => x.key === ev.key);
+          if (t) setUi((s) => ({ ...s, tool: t.id }));
+        }
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [bump]);
+
+      /* ---------- actions ---------- */
+
+      const st = stRef.current;
+      const planning = hud.phase === 'plan';
+
+      function doStart() {
+        C.startWave(stRef.current);
+        runRef.current = true;
+        setMsg('');
+        bump();
+      }
+      function doPause() { runRef.current = !runRef.current; setHud(readHud(stRef.current)); }
+      function doReset() {
+        stRef.current = C.makeState((Math.floor(Date.now() / 1000) % 1000000) + 1);
+        runRef.current = false;
+        hoverRef.current = null; setHover(null); setMsg('');
+        bump();
+      }
+
+      const groups = C.waveGroups(hud.wave);
+      const active = FIELD_BY_ID[ui.field];
+      const prof = C.ENEMY_BY_ID[ui.prof];
+      const res = C.solve(st, ui.prof);
+      const rampId = rampFor(ui);
+      /* What one band of a repeated cyclic map is worth. Occupancy is left out
+         on purpose: its fill is eased with a square root, so its bands are not
+         equally spaced in probability and there is no single width to name. */
+      const bandNote = spanOf(st, ui, res) > 0 && ui.field !== 'occ'
+        ? fmt1(spanOf(st, ui, res) / Math.max(1, ui.reps)) + (ui.field === 'threat' ? ' DPS' : ' s')
+        : '';
+
+      return html`
+        <div className="ffd-wrap"><div className="ffd-inner">
+          <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-emph)', marginBottom: 6 }}>Flow Field Defense</h1>
+          <p style=${{ color: 'var(--tool-note)', maxWidth: '72ch', fontSize: 14, marginBottom: 14 }}>
+            Every maze tower defense is a game about shaping a cost field, and none of them show you the
+            field. This one draws it under the board. A tower here is not a wall but a cell with a finite
+            price, so the pathfinder, not a rule, decides whether going around or chewing through is cheaper.
+          </p>
+
+          <div className="ffd-cols">
+            <div>
+              <div className="ffd-hud">
+                <span>Wave <b>${hud.wave}</b></span>
+                <span>Gold <b>${fmt0(hud.gold)}</b></span>
+                <span>Core <b>${fmt0(hud.coreHp)}</b></span>
+                <div className="ffd-core"><i style=${{ width: (100 * Math.max(0, hud.coreHp) / hud.coreMax) + '%' }}></i></div>
+                ${hud.phase === 'wave' ? html`<span>On the board <b>${hud.alive}</b></span>` : null}
+              </div>
+
+              <canvas ref=${cvRef} className="ffd-board"
+                onPointerMove=${onMove}
+                onPointerDown=${onDown}
+                onPointerLeave=${() => { hoverRef.current = null; setHover(null); }}></canvas>
+
+              <div className="ffd-readout">
+                ${renderReadout(hover, ui, res, prof, msg)}
+              </div>
+
+              ${hud.phase === 'over' ? html`
+                <div className="ctl-card ffd-over">
+                  <p>The core is gone on wave ${hud.wave}. It held ${hud.wave - 1} waves.</p>
+                  <button className="tool-btn tool-btn-primary" onClick=${doReset}>
+                    ${ToolIcons.el('reset')} New board
+                  </button>
+                </div>` : null}
+            </div>
+
+            <div className="ctl-card">
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Build</p>
+                <div className="ffd-shop">
+                  ${C.TOWERS.map((t) => html`
+                    <button key=${t.id} type="button"
+                      className=${ui.tool === t.id ? 'on' : ''}
+                      disabled=${hud.gold < t.cost}
+                      title=${t.blurb}
+                      onClick=${() => setUi((s) => ({ ...s, tool: t.id }))}>
+                      <span className="ffd-nm">${t.name}</span>
+                      <span className="ffd-pr">${t.cost} gold</span>
+                    </button>`)}
+                  <button type="button" className=${ui.tool === 'sell' ? 'on' : ''}
+                    title="Refunds 60 percent of the build cost, scaled by remaining health."
+                    onClick=${() => setUi((s) => ({ ...s, tool: 'sell' }))}>
+                    <span className="ffd-nm">Sell</span>
+                    <span className="ffd-pr">60 percent</span>
+                  </button>
+                </div>
+                ${ui.tool !== 'none' && ui.tool !== 'sell' ? html`
+                  <p style=${{ margin: '8px 0 0', fontSize: 12, color: 'var(--tool-note)', lineHeight: 1.6 }}>
+                    ${C.TOWER_BY_ID[ui.tool].blurb}
+                  </p>` : null}
+              </div>
+
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Field</p>
+                <div className="tabstrip" role="tablist">
+                  ${FIELDS.map((f) => html`
+                    <button key=${f.id} role="tab" className=${ui.field === f.id ? 'active' : ''}
+                      onClick=${() => setUi((s) => ({ ...s, field: f.id }))}>${f.name}</button>`)}
+                </div>
+                ${active.ramp ? html`
+                  <div className="ffd-legend">
+                    <span>near</span>
+                    <span className="ffd-bar" style=${{ '--ramp': C.rampCss(rampId, 8, ui.reps) }}></span>
+                    <span>far</span>
+                  </div>` : null}
+                ${active.note ? html`
+                  <p style=${{ margin: '6px 0 0', fontSize: 12, color: 'var(--tool-note)', lineHeight: 1.6 }}>
+                    ${active.note}
+                  </p>` : null}
+                ${active.ramp ? html`
+                  <div className="ffd-grid" style=${{ marginTop: 10 }}>
+                    <label htmlFor="ffd-map">Colormap</label>
+                    <select id="ffd-map" className="ffd-sel" value=${rampId}
+                      onChange=${(e) => {
+                        const v = e.target.value;
+                        setUi((s) => ({ ...s, ramps: { ...s.ramps, [s.field]: v } }));
+                      }}>
+                      ${C.RAMP_LIST.map((r) => html`
+                        <option key=${r.id} value=${r.id}>${r.name}${r.cyclic ? ', cyclic' : ''}</option>`)}
+                    </select>
+                    <label htmlFor="ffd-fill">Fill</label>
+                    <div className="ffd-slide">
+                      <input id="ffd-fill" type="range" min="0" max="0.9" step="0.05" value=${ui.fill}
+                        onChange=${(e) => setUi((s) => ({ ...s, fill: +e.target.value }))}/>
+                      <b>${Math.round(ui.fill * 100)}%</b>
+                    </div>
+                    ${C.rampCyclic(rampId) ? html`
+                      <label htmlFor="ffd-reps">Repeats</label>
+                      <div className="ffd-slide">
+                        <input id="ffd-reps" type="range" min="1" max="10" step="1" value=${ui.reps}
+                          onChange=${(e) => setUi((s) => ({ ...s, reps: +e.target.value }))}/>
+                        <b>${ui.reps}</b>
+                      </div>` : null}
+                  </div>
+                  ${C.rampCyclic(rampId) ? html`
+                    <p style=${{ margin: '6px 0 0', fontSize: 12, color: 'var(--tool-note)', lineHeight: 1.6 }}>
+                      A cyclic map has no ends, so it can be laid over the range more than once without a
+                      seam.${bandNote ? ' One band is then ' + bandNote + ' wide, which is the same statement the contour lines make.' : ''}
+                    </p>` : null}` : null}
+              </div>
+
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Seen through the eyes of</p>
+                <div className="seg-row">
+                  ${C.ENEMIES.map((e) => html`
+                    <button key=${e.id} type="button"
+                      className=${'lang-seg' + (ui.prof === e.id ? ' active' : '')}
+                      onClick=${() => setUi((s) => ({ ...s, prof: e.id }))}>${e.name}</button>`)}
+                </div>
+                <p style=${{ margin: '8px 0 0', fontSize: 12, color: 'var(--tool-note)', lineHeight: 1.6 }}>
+                  ${prof.blurb}
+                </p>
+                <div className="ffd-stats" style=${{ marginTop: 8 }}>
+                  <span>Route, undisturbed</span><b>${fmt1(res.routeTime)} s</b>
+                  <span>Damage taken on the way</span><b>${fmt0(res.expDamage)} HP</b>
+                </div>
+                <div className="ffd-row" style=${{ marginTop: 8 }}>
+                  <label className="ffd-check">
+                    <input type="checkbox" checked=${ui.arrows}
+                      onChange=${(e) => setUi((s) => ({ ...s, arrows: e.target.checked }))}/> Flow arrows
+                  </label>
+                  <label className="ffd-check">
+                    <input type="checkbox" checked=${ui.iso}
+                      onChange=${(e) => setUi((s) => ({ ...s, iso: e.target.checked }))}/> Contour lines
+                  </label>
+                  <label className="ffd-check">
+                    <input type="checkbox" checked=${ui.trace}
+                      onChange=${(e) => setUi((s) => ({ ...s, trace: e.target.checked }))}/> Last wave, actual
+                  </label>
+                </div>
+                ${ui.iso ? html`
+                  <div className="ffd-grid" style=${{ marginTop: 8 }}>
+                    <label htmlFor="ffd-lines">Lines</label>
+                    <div className="ffd-slide">
+                      <input id="ffd-lines" type="range" min="4" max="40" step="2" value=${ui.isoN}
+                        onChange=${(e) => setUi((s) => ({ ...s, isoN: +e.target.value }))}/>
+                      <b>${ui.isoN}</b>
+                    </div>
+                  </div>
+                  <p style=${{ margin: '6px 0 0', fontSize: 12, color: 'var(--tool-note)', lineHeight: 1.6 }}>
+                    Contours of the field on screen, every fifth one heavier. On the cost field they are
+                    isochrones: a unit needs the same time to the goal from anywhere on one line, and where
+                    the lines crowd, the ground is expensive. They break at buildings, because a tower is a
+                    step in the field rather than a slope.
+                  </p>` : null}
+              </div>
+
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Wave ${hud.wave}</p>
+                <div className="ffd-wave">
+                  ${groups.map((g, i) => {
+                    const e = C.ENEMY_BY_ID[g[0]];
+                    return html`<div key=${i}>
+                      <span className="ffd-swatch" style=${{ '--dot': e.dot }}></span>
+                      <b>${g[1]}</b> ${e.name}, ${fmt0(g[2])} HP each
+                    </div>`;
+                  })}
+                </div>
+                <div className="ffd-acts" style=${{ marginTop: 10 }}>
+                  ${planning
+                    ? html`<button className="tool-btn tool-btn-primary tool-btn-sm" onClick=${doStart}>
+                        ${ToolIcons.el('play')} Send wave ${hud.wave}
+                      </button>`
+                    : html`<button className="tool-btn tool-btn-sm" onClick=${doPause}>
+                        ${ToolIcons.el(runRef.current ? 'pause' : 'play')} ${runRef.current ? 'Pause' : 'Resume'}
+                      </button>`}
+                  <div className="seg-row">
+                    ${[1, 2, 4].map((v) => html`
+                      <button key=${v} type="button"
+                        className=${'lang-seg' + (ui.speed === v ? ' active' : '')}
+                        onClick=${() => setUi((s) => ({ ...s, speed: v }))}>${v}x</button>`)}
+                  </div>
+                  <button className="tool-danger tool-btn-sm" onClick=${doReset}>
+                    ${ToolIcons.el('reset')} Reset
+                  </button>
+                </div>
+                <p className="ffd-kbd">
+                  <kbd>1</kbd> to <kbd>5</kbd> pick a tower, <kbd>Space</kbd> send or pause a wave,
+                  <kbd>Esc</kbd> put the tool down, <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo the last build.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <details className="fold" style=${{ marginTop: 20 }}>
+            <summary>Why the field looks like a ripple tank</summary>
+            <div className="fold-body">
+              <p>
+                Dijkstra on a grid with a cost per cell is the discrete eikonal equation. The cost-to-go
+                field drawn under the board is the first arrival time of a wave that leaves the goal and
+                travels through the same medium, and its contour lines are that wave's fronts. Turning on
+                the isochrones draws them.
+              </p>
+              <p>
+                That is also why the Slower bends routes the way a lens bends light. Fermat's principle
+                says light takes the path of least time, Snell's law is what that looks like at a boundary
+                between two speeds, and the pathfinder here is solving the same problem with the same
+                answer. A unit walking around a slow patch and a wavefront refracting are not an analogy
+                for each other. They are one calculation, drawn twice.
+              </p>
+              <p>
+                The <a href="/miscellaneous/tools/ripple-tank.html">ripple tank</a> stores its medium as a
+                slowness per cell, in the encoding this board reuses unchanged. It solves the wave equation
+                on the GPU and shows you the wave; this page solves for the arrival time directly and shows
+                you the field.
+              </p>
+            </div>
+          </details>
+
+          <details className="fold">
+            <summary>The one cost function, and what the numbers mean</summary>
+            <div className="fold-body">
+              <p>
+                Every cell has a traversal time. On open ground that is one over the walking speed, raised
+                by whatever slowness the terrain and the Slower towers put there. On a cell holding a
+                building it also includes the time to chew through it, which is the building's health
+                divided by the unit's damage against buildings. That is the whole reason a tower is not a
+                wall: the cost is high, not infinite, so sealing the goal in is a move with a price rather
+                than a move the game refuses.
+              </p>
+              <p>
+                On top of that sits the danger term, the damage per second covering the cell multiplied by
+                the time spent in it, which is the health a unit expects to lose there. The cost of a cell
+                is a weighted sum of the two, and the five unit types differ only in those weights, in how
+                fast they walk, in how fast they chew, and in one temperature that decides whether a step
+                that is merely close to cheapest is taken at all. Steps that tie exactly are split evenly
+                by everyone, which is why the field fans out wherever a route has to make progress in two
+                directions at once: all the staircases between here and there really are equally good, and
+                drawing one of them as the route would be a claim the arithmetic does not support.
+              </p>
+              <p>
+                The temperature is worth one honest note, because it nearly did not survive. On an empty
+                board, on a board holding nothing but guns, and on a board holding nothing but slowers, it
+                changes precisely nothing: every branch point there has downhill neighbours that tie
+                exactly, so there is no near miss for a temperature to reach. Measured on those boards
+                alone it looks like a dead parameter, and it was very nearly deleted as one. Put walls in
+                and branch points start offering a genuinely worse alternative, anywhere from none at all
+                to about 43 percent depending on the unit and the maze, a few percent to twenty being
+                usual. It is not a knob that does nothing. It is a knob that does nothing until the board
+                has structure, which is the only situation anyone plays in.
+              </p>
+              <p>
+                The two numbers next to the profile are computed by pushing one unit's worth of probability
+                mass through that policy and integrating along it: how long the route takes undisturbed,
+                and how much health it costs. Compare the second one to the wave's health per unit. If it
+                is smaller, the difference walks into your core.
+              </p>
+              <p style=${{ color: 'var(--tool-faint)', fontSize: 12 }}>
+                The tower and enemy numbers are a first pass and have not been played to twenty waves by
+                anyone. They sit in one table at the top of the game core, which is the honest place for
+                constants nobody has earned yet.
+              </p>
+            </div>
+          </details>
+
+          <p style=${{ marginTop: 14, fontSize: 11, color: 'var(--tool-faint)', lineHeight: 1.7, maxWidth: '72ch' }}>
+            Runs entirely in your browser, nothing is sent anywhere. The board layout and the seed live in
+            the address bar, so a maze can be shared by copying the link.
+          </p>
+        </div></div>
+      `;
+    }
+
+    function renderReadout(hover, ui, res, prof, msg) {
+      if (msg) return html`<span style=${{ color: 'var(--tool-warn-fg)' }}>${msg}</span>`;
+      if (!hover) {
+        return html`<span>
+          Hover a cell to see what building there would do to the route, measured for the
+          ${prof.name.toLowerCase()}. Detour length is not the point; the damage number is.
+        </span>`;
+      }
+      if (hover.sellFor !== null && hover.sellFor !== undefined) {
+        return html`<span>Sell the ${hover.towerName} here for <b>${hover.sellFor}</b> gold.</span>`;
+      }
+      if (hover.reason) return html`<span>Cannot build here: ${hover.reason}.</span>`;
+      if (!hover.preview) return html`<span></span>`;
+      const p = hover.preview;
+      const good = (v) => (v > 0.001 ? 'ffd-up' : v < -0.001 ? 'ffd-down' : '');
+      const sign = (v) => (v > 0 ? '+' : '');
+      return html`
+        <div className="ffd-delta">
+          <span>Route time <b className=${good(p.dTime)}>${sign(p.dTime)}${fmt1(p.dTime)} s</b></span>
+          <span>Damage on the way <b className=${good(p.dDamage)}>${sign(p.dDamage)}${fmt0(p.dDamage)} HP</b></span>
+          <span>New total <b>${fmt0(p.damage)} HP</b> over <b>${fmt1(p.time)} s</b></span>
+        </div>
+        <div style=${{ fontSize: 12, color: 'var(--tool-faint)', marginTop: 2 }}>
+          ${p.dDamage < 1 && p.dTime > 0.4
+            ? 'A longer walk that buys almost no damage. This is the trap the field is here to show.'
+            : 'For the ' + prof.name.toLowerCase() + '. Other profiles solve a different field.'}
+        </div>`;
+    }
+
+    /* ---------- rendering ----------
+
+       Everything is drawn in CSS pixels: the backing store is scaled by the
+       device pixel ratio once per frame and the cell size follows the element
+       width, so the board reflows with the column without any of the drawing
+       code knowing about it. */
+
+    function draw(cv, st, ui, hover) {
+      if (!cv) return;
+      const wrapW = cv.clientWidth || 720;
+      const cs = wrapW / C.GW;
+      const cssW = wrapW, cssH = cs * C.GH;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const pw = Math.max(1, Math.round(cssW * dpr)), ph = Math.max(1, Math.round(cssH * dpr));
+      if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
+      cv.style.height = cssH + 'px';
+
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, cssW, cssH);
+      g.fillStyle = COL.surface || '#0f172a';
+      g.fillRect(0, 0, cssW, cssH);
+
+      const res = C.solve(st, ui.prof);
+      const f = C.ensureFields(st);
+      const field = FIELD_BY_ID[ui.field];
+
+      /* The field the colour and the contour lines both read. With the fill
+         switched off the contours still have something to draw, and cost is the
+         one worth looking at, so that is the fallback. */
+      const shown = ui.field === 'threat' ? f.dps : ui.field === 'occ' ? res.occ : res.dist;
+      const rampId = rampFor(ui);
+
+      const blocked = C.blockedCells(st);
+
+      /* --- the scalar field --- */
+      if (field.ramp && ui.fill > 0.005) {
+        const rg = C.fieldRange(shown, blocked);
+        const alpha = ui.fill.toFixed(3);
+        for (let i = 0; i < C.N; i++) {
+          if (blocked[i]) continue;                        // a building gets its own body drawn on top
+          let t = (shown[i] - rg.lo) / (rg.hi - rg.lo);
+          if (!isFinite(t)) t = 1;
+          else if (t > 1) t = 1;
+          else if (t < 0) t = 0;
+          if (ui.field === 'occ') t = Math.sqrt(t);        // the mass is concentrated, so ease it out
+          const c = C.rampColor(rampId, t, ui.reps);
+          g.fillStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + alpha + ')';
+          g.fillRect(C.cx(i) * cs, C.cy(i) * cs, cs + 0.6, cs + 0.6);
+        }
+      }
+
+      /* --- the actual traffic of the last wave --- */
+      if (ui.trace) {
+        let hi = 0;
+        for (let i = 0; i < C.N; i++) if (st.trace[i] > hi) hi = st.trace[i];
+        if (hi > 0) {
+          for (let i = 0; i < C.N; i++) {
+            const t = st.trace[i] / hi;
+            if (t <= 0.005) continue;
+            g.fillStyle = 'rgba(248,250,252,' + (0.06 + 0.42 * Math.sqrt(t)).toFixed(3) + ')';
+            g.fillRect(C.cx(i) * cs, C.cy(i) * cs, cs, cs);
+          }
+        }
+      }
+
+      /* --- grid --- */
+      g.strokeStyle = COL.hairline || 'rgba(148,163,184,.18)';
+      g.lineWidth = 1;
+      g.beginPath();
+      for (let x = 0; x <= C.GW; x++) { g.moveTo(Math.round(x * cs) + 0.5, 0); g.lineTo(Math.round(x * cs) + 0.5, cssH); }
+      for (let y = 0; y <= C.GH; y++) { g.moveTo(0, Math.round(y * cs) + 0.5); g.lineTo(cssW, Math.round(y * cs) + 0.5); }
+      g.stroke();
+
+      /* --- contours: the wavefronts of the same solve ---
+
+         Every fifth line is drawn heavier, the way a topographic map marks its
+         index contours. The eye counts five far more reliably than it estimates
+         a spacing, and the density of the thin lines between them is the
+         gradient: where they crowd, the ground is expensive. */
+      if (ui.iso) {
+        const levels = C.isoLevels(shown, blocked, ui.isoN);
+        const base = COL.text || '#e2e8f0';
+        for (let k = 0; k < levels.length; k++) {
+          const segs = C.isoSegments(shown, levels[k], blocked);
+          if (!segs.length) continue;
+          const index = (k % 5) === 4;
+          g.strokeStyle = withAlpha(base, index ? 0.62 : 0.3);
+          g.lineWidth = index ? 1.6 : 0.9;
+          g.beginPath();
+          for (let j = 0; j < segs.length; j += 4) {
+            g.moveTo(segs[j] * cs, segs[j + 1] * cs);
+            g.lineTo(segs[j + 2] * cs, segs[j + 3] * cs);
+          }
+          g.stroke();
+        }
+      }
+
+      /* --- flow arrows --- */
+      if (ui.arrows && !prof_fly(ui.prof)) {
+        g.strokeStyle = 'rgba(226,232,240,.62)';
+        g.lineWidth = Math.max(1, cs * 0.055);
+        g.beginPath();
+        for (let y = 0; y < C.GH; y++) for (let x = 0; x < C.GW; x++) {
+          const i = C.idx(x, y);
+          if (st.towerAt[i] >= 0) continue;
+          let bx = 0, by = 0, bd = res.dist[i];
+          const nbs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+          for (const d of nbs) {
+            const nx = x + d[0], ny = y + d[1];
+            if (nx < 0 || ny < 0 || nx >= C.GW || ny >= C.GH) continue;
+            const v = res.dist[C.idx(nx, ny)];
+            if (v < bd) { bd = v; bx = d[0]; by = d[1]; }
+          }
+          if (!bx && !by) continue;
+          const px = (x + 0.5) * cs, py = (y + 0.5) * cs, L = cs * 0.3;
+          g.moveTo(px - bx * L, py - by * L);
+          g.lineTo(px + bx * L, py + by * L);
+          g.moveTo(px + bx * L, py + by * L);
+          g.lineTo(px + bx * L - (bx + by) * L * 0.45, py + by * L - (by - bx) * L * 0.45);
+          g.moveTo(px + bx * L, py + by * L);
+          g.lineTo(px + bx * L - (bx - by) * L * 0.45, py + by * L - (by + bx) * L * 0.45);
+        }
+        g.stroke();
+      }
+
+      /* --- spawn and goal --- */
+      markCell(g, C.SPAWN, cs, COL.info || '#38bdf8', 'in');
+      markCell(g, C.GOAL, cs, COL.ok || '#34d399', 'out');
+
+      /* --- towers --- */
+      for (const tw of st.towers) {
+        const def = C.TOWER_BY_ID[tw.type];
+        const x = tw.x * cs, y = tw.y * cs, pad = cs * 0.11;
+        g.fillStyle = COL.panel || '#1e293b';
+        g.strokeStyle = COL.label || '#94a3b8';
+        g.lineWidth = Math.max(1, cs * 0.05);
+        roundRect(g, x + pad, y + pad, cs - 2 * pad, cs - 2 * pad, cs * 0.16);
+        g.fill(); g.stroke();
+        g.fillStyle = COL.emph || '#e2e8f0';
+        g.font = '600 ' + Math.round(cs * 0.42) + 'px ui-sans-serif, system-ui, sans-serif';
+        g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillText(def.name[0], x + cs / 2, y + cs / 2 + cs * 0.02);
+        if (tw.hp < tw.maxHp) {
+          const w = (cs - 2 * pad) * Math.max(0, tw.hp / tw.maxHp);
+          g.fillStyle = COL.danger || '#f87171';
+          g.fillRect(x + pad, y + cs - pad - cs * 0.09, w, cs * 0.075);
+        }
+      }
+
+      /* --- build preview --- */
+      if (hover && hover.cell >= 0 && !hover.reason && hover.tool !== 'sell' && hover.tool !== 'none') {
+        const def = C.TOWER_BY_ID[hover.tool];
+        const x = C.cx(hover.cell) * cs, y = C.cy(hover.cell) * cs;
+        g.save();
+        g.globalAlpha = 0.55;
+        g.fillStyle = COL.info || '#38bdf8';
+        roundRect(g, x + cs * 0.11, y + cs * 0.11, cs * 0.78, cs * 0.78, cs * 0.16);
+        g.fill();
+        g.restore();
+        const r = def.range || def.slowR || 0;
+        if (r > 0) {
+          g.strokeStyle = def.range ? 'rgba(56,189,248,.75)' : 'rgba(250,204,21,.75)';
+          g.lineWidth = 1.4;
+          g.setLineDash([5, 4]);
+          g.beginPath();
+          g.arc(x + cs / 2, y + cs / 2, r * cs, 0, Math.PI * 2);
+          g.stroke();
+          g.setLineDash([]);
+        }
+      }
+
+      /* --- beams ---
+
+         The gun and the sniper deal damage continuously, so the honest picture
+         of them is a standing beam and not a stream of bullets: the line is
+         there exactly while the damage is flowing. Drawn under the units, so a
+         beam never covers the thing it is shooting at. */
+      const byId = {};
+      for (const e of st.enemies) byId[e.id] = e;
+      for (const tw of st.towers) {
+        const def = C.TOWER_BY_ID[tw.type];
+        if (!def.dps || !def.range || !tw.tgtId) continue;
+        const e = byId[tw.tgtId];
+        if (!e) continue;
+        const sniper = def.range > 5;
+        g.strokeStyle = withAlpha(COL.warn || '#fbbf24', sniper ? 0.85 : 0.5);
+        g.lineWidth = sniper ? Math.max(1, cs * 0.045) : Math.max(1.6, cs * 0.1);
+        g.lineCap = 'round';
+        g.beginPath();
+        g.moveTo((tw.x + 0.5) * cs, (tw.y + 0.5) * cs);
+        g.lineTo((e.x + 0.5) * cs, (e.y + 0.5) * cs);
+        g.stroke();
+        g.lineCap = 'butt';
+      }
+
+      /* --- shells in flight ---
+
+         The lift is drawn, the shadow is where the round actually is. Without
+         the shadow an arc over a flat board reads as a shell flying past the
+         target rather than over it. */
+      for (const sh of st.shells) {
+        const u = Math.min(1, sh.t / sh.dur);
+        const gx = (sh.x0 + (sh.x - sh.x0) * u + 0.5) * cs;
+        const gy = (sh.y0 + (sh.y - sh.y0) * u + 0.5) * cs;
+        const lift = 4 * u * (1 - u) * cs * (0.35 + 0.5 * sh.dur);
+        g.fillStyle = withAlpha(COL.ink || '#020617', 0.45);
+        g.beginPath(); g.ellipse(gx, gy, cs * 0.12, cs * 0.07, 0, 0, Math.PI * 2); g.fill();
+        g.fillStyle = COL.emph || '#e2e8f0';
+        g.beginPath(); g.arc(gx, gy - lift, cs * 0.11, 0, Math.PI * 2); g.fill();
+      }
+
+      /* --- enemies --- */
+      for (const e of st.enemies) {
+        const prof = C.ENEMY_BY_ID[e.type];
+        const px = (e.x + 0.5) * cs, py = (e.y + 0.5) * cs, r = cs * (e.fly ? 0.24 : 0.2);
+        const hurt = Math.min(1, e.hurt || 0);
+        /* A flyer has no contact with the board, and the only way to say that
+           in a top down view is a shadow offset from the body. */
+        if (e.fly) {
+          g.fillStyle = withAlpha(COL.ink || '#020617', 0.4);
+          g.beginPath(); g.arc(px + cs * 0.17, py + cs * 0.2, r * 0.85, 0, Math.PI * 2); g.fill();
+        }
+        g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2);
+        /* Losing health dims the body towards the board instead of only moving
+           a bar: the colour is the unit's own, so a mauled runner still reads
+           as a runner. */
+        g.globalAlpha = 0.45 + 0.55 * Math.max(0.08, e.hp / e.maxHp);
+        g.fillStyle = prof.dot; g.fill();
+        g.globalAlpha = 1;
+        if (hurt > 0.01) {
+          g.fillStyle = withAlpha('#f8fafc', 0.75 * hurt);
+          g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2); g.fill();
+        }
+        g.strokeStyle = 'rgba(15,23,42,.85)'; g.lineWidth = 1; g.stroke();
+        if (e.hp < e.maxHp) {
+          g.beginPath();
+          g.arc(px, py, r + cs * 0.09, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.max(0, e.hp / e.maxHp));
+          g.strokeStyle = COL.ok || '#34d399';
+          g.lineWidth = Math.max(1.2, cs * 0.055);
+          g.stroke();
+        }
+        if (e.chew) {
+          g.strokeStyle = COL.danger || '#f87171';
+          g.lineWidth = Math.max(1, cs * 0.05);
+          g.beginPath(); g.arc(px, py, r + cs * 0.16, 0, Math.PI * 2); g.stroke();
+        }
+      }
+
+      drawFx(g, st, cs);
+    }
+
+    /* Sparks, blasts and the number the core just lost. Nothing here is read
+       back by the simulation; the ageing happens in step so it keeps pace with
+       the speed multiplier rather than with the frame rate. */
+    function drawFx(g, st, cs) {
+      for (const o of st.fx) {
+        const u = Math.min(1, o.t / o.life), fade = 1 - u;
+        const px = (o.x + 0.5) * cs, py = (o.y + 0.5) * cs;
+        if (o.kind === 'muzzle') {
+          g.fillStyle = withAlpha(COL.warn || '#fbbf24', 0.9 * fade);
+          g.beginPath();
+          g.arc(px + Math.cos(o.a) * cs * 0.3, py + Math.sin(o.a) * cs * 0.3, cs * 0.16 * (0.6 + fade), 0, Math.PI * 2);
+          g.fill();
+        } else if (o.kind === 'boom') {
+          const rr = o.r * cs * (0.35 + 0.65 * u);
+          g.fillStyle = withAlpha(COL.warn || '#fbbf24', 0.3 * fade);
+          g.beginPath(); g.arc(px, py, rr, 0, Math.PI * 2); g.fill();
+          g.strokeStyle = withAlpha(COL.warn || '#fbbf24', 0.9 * fade);
+          g.lineWidth = Math.max(1.2, cs * 0.07 * fade);
+          g.beginPath(); g.arc(px, py, o.r * cs * (0.5 + 0.5 * u), 0, Math.PI * 2); g.stroke();
+        } else if (o.kind === 'death') {
+          const col = (C.ENEMY_BY_ID[o.type] || {}).dot || '#e2e8f0';
+          g.strokeStyle = withAlpha(col, 0.85 * fade);
+          g.lineWidth = Math.max(1, cs * 0.05);
+          g.beginPath();
+          for (let k = 0; k < 6; k++) {
+            const a = (k / 6 + o.s) * Math.PI * 2;
+            const r0 = cs * (0.16 + 0.5 * u), r1 = r0 + cs * 0.16 * fade;
+            g.moveTo(px + Math.cos(a) * r0, py + Math.sin(a) * r0);
+            g.lineTo(px + Math.cos(a) * r1, py + Math.sin(a) * r1);
+          }
+          g.stroke();
+        } else if (o.kind === 'rubble') {
+          g.fillStyle = withAlpha(COL.label || '#94a3b8', 0.8 * fade);
+          for (let k = 0; k < 5; k++) {
+            const a = (k / 5 + o.s) * Math.PI * 2, d = cs * (0.1 + 0.55 * u);
+            const w = cs * 0.11;
+            g.fillRect(px + Math.cos(a) * d - w / 2, py + Math.sin(a) * d - w / 2, w, w);
+          }
+        } else if (o.kind === 'leak') {
+          /* The core losing health is the most important thing that happens in
+             this game and used to happen invisibly. */
+          g.strokeStyle = withAlpha(COL.danger || '#f87171', 0.8 * fade);
+          g.lineWidth = Math.max(1.5, cs * 0.09 * fade);
+          g.beginPath(); g.arc(px, py, cs * (0.4 + 0.9 * u), 0, Math.PI * 2); g.stroke();
+          g.fillStyle = withAlpha(COL.danger || '#f87171', fade);
+          g.font = '700 ' + Math.round(cs * 0.42) + 'px ui-sans-serif, system-ui, sans-serif';
+          g.textAlign = 'center'; g.textBaseline = 'middle';
+          g.fillText('-' + Math.round(o.hp), px, py - cs * (0.3 + 1.1 * u));
+        }
+      }
+    }
+
+    function prof_fly(id) { return !!C.ENEMY_BY_ID[id].fly; }
+
+    function markCell(g, cell, cs, color, kind) {
+      const x = C.cx(cell) * cs, y = C.cy(cell) * cs;
+      g.strokeStyle = color;
+      g.lineWidth = Math.max(1.5, cs * 0.08);
+      g.strokeRect(x + cs * 0.1, y + cs * 0.1, cs * 0.8, cs * 0.8);
+      g.fillStyle = color;
+      g.font = '700 ' + Math.round(cs * 0.3) + 'px ui-sans-serif, system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(kind === 'in' ? 'IN' : 'OUT', x + cs / 2, y + cs / 2);
+    }
+
+    function roundRect(g, x, y, w, h, r) {
+      g.beginPath();
+      g.moveTo(x + r, y);
+      g.arcTo(x + w, y, x + w, y + h, r);
+      g.arcTo(x + w, y + h, x, y + h, r);
+      g.arcTo(x, y + h, x, y, r);
+      g.arcTo(x, y, x + w, y, r);
+      g.closePath();
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+
+  <footer class="container">
+    <small>&copy; 2026 Franziska and Alexander Alber &middot; feedback@alber.me &middot; <a href="/datenschutz.html">Privacy</a> &middot; <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>

@@ -264,6 +264,92 @@
       }
     }
 
+    // XML 1.0 forbids the C0 controls outright, tab, newline and carriage
+    // return excepted, and forbids them as character references too, so no
+    // amount of escaping downstream saves them: an EPUB or a DOCX carrying one
+    // is a file the reader refuses to open, reported as damaged rather than as
+    // containing a stray byte. They therefore have to go before the text
+    // becomes markup, not while it is being serialized.
+    //
+    // The case this is really about is the form feed, U+000C, the page break
+    // every Project Gutenberg text is full of, which is why the input side
+    // rather than only the writers gets the treatment.
+    // U+000C and U+0085 become a newline because that is what they mean;
+    // everything else is dropped, since a lone BEL or SOH in a book is debris
+    // from an earlier conversion and has no rendering worth preserving.
+    // Written as escapes on purpose: spelled literally these are invisible in
+    // an editor and turn the file itself into something git calls binary.
+    // The set is the XML 1.0 "Char" production read backwards, plus the two
+    // noncharacters at the end of the BMP. Surrogates are deliberately absent:
+    // a lone one is a different problem with a different fix, and a well-formed
+    // pair must survive.
+    var XML_ILLEGAL_SRC = '[\\u0000-\\u0008\\u000B\\u000E-\\u001F\\u007F-\\u0084\\u0086-\\u009F\\uFFFE\\uFFFF]';
+    var NEWLINE_LIKE_RE = /[\u000C\u0085]/g;   // form feed, NEL
+    function stripXmlIllegal(s) {
+      return String(s).replace(NEWLINE_LIKE_RE, '\n')
+        .replace(new RegExp(XML_ILLEGAL_SRC, 'g'), '');
+    }
+    // Counts what stripXmlIllegal would DROP, so the form feed, which is only
+    // rewritten, is not reported as something lost.
+    function countXmlIllegal(s) {
+      const m = String(s).match(new RegExp(XML_ILLEGAL_SRC, 'g'));
+      return m ? m.length : 0;
+    }
+
+    // decodeText plus the C0 cleanup, for the readers whose input is a bare
+    // text file and can therefore contain anything at all. Reported rather than
+    // done quietly, because a file losing characters is worth a line in the log
+    // even when the characters were unprintable.
+    function decodeTextClean(bytes, log, what) {
+      const dec = decodeText(bytes);
+      const dropped = countXmlIllegal(dec.text);
+      const text = stripXmlIllegal(dec.text);
+      if (dropped && log) {
+        log.warn(dropped + ' control character' + (dropped === 1 ? '' : 's')
+          + ' removed from the ' + what + ': XML forbids them, so they cannot go into EPUB or DOCX.');
+      }
+      return { text: text, encoding: dec.encoding };
+    }
+
+    // Decode a file out of an EPUB. Same guessing as decodeText, but an XML
+    // declaration or an HTML meta charset gets the first word, because inside a
+    // ZIP there is no filename and no HTTP header to fall back on and the
+    // document is the only thing that says what it is. EPUB 3 mandates UTF-8,
+    // so most of the time the declaration agrees with the guess and this
+    // changes nothing; it earns its keep on the EPUB 2 files and on the output
+    // of converters that write windows-1252 and say so.
+    //
+    // The sniff reads the first 1024 bytes as latin1 rather than as UTF-8,
+    // because at this point the encoding is precisely what is not yet known and
+    // a non-strict UTF-8 decode would turn a stray high byte into U+FFFD.
+    // Any encoding worth declaring puts its declaration in ASCII regardless.
+    const XML_DECL_RE = /^<\?xml[^>]*?\bencoding\s*=\s*["']([\w.:-]+)["']/i;
+    const META_CHARSET_RE = /<meta[^>]+charset\s*=\s*["']?\s*([\w.:-]+)/i;
+    function declaredEncoding(bytes) {
+      let head = '';
+      const n = Math.min(bytes.length, 1024);
+      for (let i = 0; i < n; i++) head += String.fromCharCode(bytes[i]);
+      const m = XML_DECL_RE.exec(head) || META_CHARSET_RE.exec(head);
+      return m ? m[1].toLowerCase() : '';
+    }
+    function decodeEpubFile(bytes) {
+      if (!bytes) return '';
+      // A BOM outranks a declaration: it is the one claim that cannot be a
+      // leftover from an earlier conversion, and decodeText already handles it.
+      const bom = bytes.length >= 2 && ((bytes[0] === 0xFF && bytes[1] === 0xFE)
+        || (bytes[0] === 0xFE && bytes[1] === 0xFF)
+        || (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF));
+      const label = bom ? '' : declaredEncoding(bytes);
+      if (label && !/^utf-?8$/.test(label)) {
+        try {
+          // fatal, so that a declaration contradicted by the bytes falls
+          // through to the guess instead of quietly producing U+FFFD.
+          return new TextDecoder(label, { fatal: true }).decode(bytes);
+        } catch (e) { /* unknown label or bytes disagree: guess below */ }
+      }
+      return decodeText(bytes).text;
+    }
+
     // A byte-per-character string, so that string indices equal byte offsets.
     // TextDecoder cannot do this: in the Encoding Standard both "latin1" and
     // "iso-8859-1" are aliases for windows-1252, which remaps 0x80..0x9F to
@@ -387,6 +473,7 @@
         if (dv.getUint32(p, true) !== SIG_CD) throw new Error('Damaged ZIP central directory.');
         const flags = dv.getUint16(p + 8, true);
         const method = dv.getUint16(p + 10, true);
+        const crcDeclared = dv.getUint32(p + 16, true);
         let compSize = dv.getUint32(p + 20, true);
         let uncompSize = dv.getUint32(p + 24, true);
         const nameLen = dv.getUint16(p + 28, true);
@@ -422,11 +509,33 @@
         const lNameLen = dv.getUint16(localOff + 26, true);
         const lExtraLen = dv.getUint16(localOff + 28, true);
         const dataOff = localOff + 30 + lNameLen + lExtraLen;
+        // subarray clamps, it does not throw, so a truncated archive silently
+        // hands back a short entry. Catching that here is the difference
+        // between an error message and raw ZIP bytes appearing mid-chapter.
+        if (dataOff + compSize > bytes.length) {
+          throw new Error('This archive is truncated: ' + name + ' ends past the end of the file.');
+        }
         const raw = bytes.subarray(dataOff, dataOff + compSize);
 
-        if (method === 0) files.set(name, raw.slice());
-        else if (method === 8) files.set(name, await inflateRaw(raw));
+        let data;
+        if (method === 0) data = raw.slice();
+        else if (method === 8) data = await inflateRaw(raw);
         else throw new Error('Unsupported ZIP compression method ' + method + ' in ' + name);
+
+        // The directory carries a length and a checksum, and until now neither
+        // was looked at. A flipped byte in a deflate stream stays inflatable and
+        // comes out as a plausible wrong word (the quick br_wn fox), which is
+        // the failure mode worth spending 30 lines of CRC table on. Both fields
+        // are optional in the sense that some writers leave them zero, so a
+        // zero is treated as "not stated" rather than as a claim.
+        if (uncompSize && data.length !== uncompSize) {
+          throw new Error('This archive is damaged: ' + name + ' is '
+            + data.length + ' bytes, but the directory says ' + uncompSize + '.');
+        }
+        if (crcDeclared && crc32(data) !== crcDeclared) {
+          throw new Error('This archive is damaged: the checksum of ' + name + ' does not match.');
+        }
+        files.set(name, data);
       }
       return files;
     }
@@ -539,10 +648,25 @@
       });
     }
 
+    // Strips the XML-illegal controls for the same reason escapeText does, and
+    // it has to be said in both places: this one writes the OPF, the NCX and
+    // the nav document, which take their strings straight from the metadata and
+    // never pass through the other escaper.
     function escapeXml(s) {
-      return String(s).replace(/[&<>"']/g, function (c) {
+      return stripXmlIllegal(s).replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c];
       });
+    }
+
+    // Titles get capped so a runaway heading cannot become the book's name, but
+    // a plain slice counts UTF-16 code units, and an emoji is two of them. Cut
+    // between the halves of a surrogate pair and the leftover half is not a
+    // character any more: the TextEncoder turns it into U+FFFD on the way out,
+    // so the title ends in a replacement glyph. One code unit shorter instead.
+    function clipText(s, max) {
+      if (s.length <= max) return s;
+      const code = s.charCodeAt(max - 1);
+      return s.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
     }
 
     // Attribute values may be double-quoted, single-quoted, unquoted (HTML4) or
@@ -615,11 +739,17 @@
       return root;
     }
 
+    // The C0 strip is here as well as in the readers, and deliberately so:
+    // the readers catch the common case early enough to report it, but text
+    // also arrives from EPUB and MOBI, whose own decoders never pass through
+    // decodeTextClean. Since a single stray byte costs the whole output file
+    // (XML forbids these characters and forbids escaping them), the serializer
+    // is the one place that must never let one past, however it got here.
     function escapeText(s) {
-      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return stripXmlIllegal(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
     function escapeAttr(s) {
-      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      return stripXmlIllegal(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
     }
 
     // Serialize back to well-formed XML. Entities were decoded during parsing and
@@ -789,7 +919,7 @@
       const h = /<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]\s*>/i.exec(html);
       if (h) {
         const t = decodeEntities(h[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
-        if (t) return t.slice(0, 120);
+        if (t) return clipText(t, 120);
       }
       return '';
     }
@@ -804,12 +934,12 @@
       if (files.has('META-INF/encryption.xml')) {
         throw new Error('This EPUB is encrypted and cannot be converted.');
       }
-      const rootfile = findOne(parseXML(decodeUtf8(containerRaw)), 'rootfile');
+      const rootfile = findOne(parseXML(decodeEpubFile(containerRaw)), 'rootfile');
       const opfPath = rootfile && rootfile.attrs['full-path'];
       if (!opfPath || !files.has(opfPath)) throw new Error('EPUB is damaged: the OPF package file is missing.');
 
       const opfDir = dirOf(opfPath);
-      const opf = parseXML(decodeUtf8(files.get(opfPath)));
+      const opf = parseXML(decodeEpubFile(files.get(opfPath)));
       const book = emptyBook();
 
       const metaNode = findOne(opf, 'metadata');
@@ -889,7 +1019,7 @@
         const it = manifest[spineIds[i]];
         const raw = files.get(it.path);
         if (!raw) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
-        const doc = decodeUtf8(raw);
+        const doc = decodeEpubFile(raw);
         const secDir = dirOf(it.path);
 
         const css = [];
@@ -933,7 +1063,7 @@
         if (/\bnav\b/.test(manifest[id].properties)) { navPath = manifest[id].path; break; }
       }
       if (navPath && files.has(navPath)) {
-        const doc = parseXML(decodeUtf8(files.get(navPath)));
+        const doc = parseXML(decodeEpubFile(files.get(navPath)));
         for (const nav of findAll(doc, 'nav')) {
           const type = nav.attrs['epub:type'] || nav.attrs.type || '';
           if (type && type.indexOf('toc') < 0) continue;
@@ -963,7 +1093,7 @@
         }
       }
       if (ncxPath && files.has(ncxPath)) {
-        const doc = parseXML(decodeUtf8(files.get(ncxPath)));
+        const doc = parseXML(decodeEpubFile(files.get(ncxPath)));
         const map = findOne(doc, 'navMap'.toLowerCase());
         const out = [];
         const walk = function (node, level) {
@@ -995,7 +1125,11 @@
         + '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="' + escapeXml(lang) + '" lang="' + escapeXml(lang) + '">\n'
         + '<head>\n  <meta charset="utf-8"/>\n  <title>' + escapeXml(title) + '</title>\n'
         + links
-        + '</head>\n<body>\n' + body + '\n</body>\n</html>\n';
+        // The body is already markup and goes in verbatim, which means it is the
+        // one string here that no escaper ever sees. Stripping is still safe on
+        // it, because the characters removed cannot legally occur anywhere in an
+        // XML document, inside a tag or outside one.
+        + '</head>\n<body>\n' + stripXmlIllegal(body) + '\n</body>\n</html>\n';
     }
 
     async function writeEpub(book) {
@@ -1068,7 +1202,13 @@
         };
         toc.forEach(function (t) {
           while (depth < t.level) {
-            // Open a nested list inside the still-unclosed <li> above.
+            // Open a nested list inside the still-unclosed <li> above. There may
+            // be no <li> above: a book whose headings start at <h2> with no <h1>
+            // gives a first entry at level 1, and reaching for out[-1] then threw
+            // and took the whole EPUB conversion with it. Nesting under nothing
+            // is not well-formed either, so the level is simply pulled down to
+            // where the list actually is.
+            if (!out.length) break;
             out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, '');
             depth++;
             out.push(pad(depth - 1) + '  <ol>');
@@ -1199,7 +1339,7 @@
     const HEADING_RE = /^(?:(?:chapter|kapitel|part|teil|book|buch|prologue|prolog|epilogue|epilog|section)\b.{0,60}|[IVXLC]{1,7}\.?|\d{1,3}\.?)$/i;
 
     function readTxt(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'text file');
       const book = emptyBook();
       const text = dec.text.replace(/\r\n?/g, '\n');
 
@@ -1340,7 +1480,7 @@
           const ln = localName(c.name);
           if (ln === 'header') {
             const h = firstHeadingNode(c);
-            if (h && !book.meta.title) book.meta.title = textOf(h).slice(0, 200);
+            if (h && !book.meta.title) book.meta.title = clipText(textOf(h), 200);
             if (!book.meta.author) {
               const p = kids(c, 'p')[0];
               const at = p ? textOf(p) : '';
@@ -1382,7 +1522,7 @@
       // A single leading top-level heading is the book's title, not a chapter.
       const h1s = headings.filter(function (c) { return headingLevel(c) === cutLv; });
       if (cutLv && h1s.length === 1 && headings[0] === h1s[0]) {
-        if (!book.meta.title) book.meta.title = textOf(h1s[0]).slice(0, 200);
+        if (!book.meta.title) book.meta.title = clipText(textOf(h1s[0]), 200);
         items = items.filter(function (c) { return c !== h1s[0]; });
         const firstEl = items.find(isElement);
         if (firstEl && localName(firstEl.name) === 'p') {
@@ -1415,12 +1555,12 @@
     }
 
     function readHtml(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'HTML file');
       const book = emptyBook();
       const tree = parseXML(dec.text);
 
       const titleTag = findOne(tree, 'title');
-      if (titleTag) { const t = textOf(titleTag); if (t) book.meta.title = t.slice(0, 200); }
+      if (titleTag) { const t = textOf(titleTag); if (t) book.meta.title = clipText(t, 200); }
       walkElements(tree, function (el) {
         if (localName(el.name) !== 'meta') return;
         const nm = (el.attrs.name || el.attrs.property || '').toLowerCase();
@@ -1447,7 +1587,7 @@
     }
 
     function readMarkdown(bytes, log) {
-      const dec = decodeText(bytes);
+      const dec = decodeTextClean(bytes, log, 'Markdown file');
       const book = emptyBook();
       let text = dec.text.replace(/\r\n?/g, '\n');
       text = stripFrontMatter(text, book);
@@ -1998,9 +2138,19 @@
         h.drmCount = h.headerLength >= 0xA0 ? u32(dv, M + 0x9C) : 0;
         h.firstContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB0, false) : 1;
         h.lastContentRecord = h.headerLength >= 0xB4 ? dv.getUint16(M + 0xB2, false) : 0;
-        // Only meaningful when the header is long enough to contain the field.
-        // The flags proper are the low 16 bits of the word at 0xE0.
-        h.extraFlags = h.headerLength >= 0xE4 ? (u32(dv, M + 0xE0) & 0xFFFF) : 0;
+        // Extra Data Flags: the low 16 bits of the word at 0xE0. Gating this on
+        // headerLength >= 0xE4 was wrong and measured nonsense on roughly half
+        // of a 58-file sample: plenty of writers declare headerLength 232 (0xE8
+        // is not reached, 0xE4 is) or even 232 while record 0 is longer still,
+        // and carry the field anyway. What matters is whether the field lies
+        // inside record 0 at all. The value is then checked against arithmetic
+        // that cannot lie: strip the trailing bytes each flag set implies, sum
+        // what is left over the text records, and compare with textLength. If
+        // flags = 0 hits textLength and the declared flags do not, the declared
+        // value is noise and 0 wins. resolveExtraFlags() does that pass once the
+        // records are known; here we only record the raw candidate.
+        h.extraFlagsRaw = rec0.length >= M + 0xE4 ? (u32(dv, M + 0xE0) & 0xFFFF) : 0;
+        h.extraFlags = h.extraFlagsRaw;
         h.exth = (h.exthFlags & 0x40) ? parseExth(rec0, M + h.headerLength) : {};
         if (h.fullNameLength && h.fullNameOffset + h.fullNameLength <= rec0.length) {
           h.fullName = decodeMobiText(
@@ -2068,6 +2218,90 @@
         num += (rec[size - num - 1] & 0x3) + 1;
       }
       return num;
+    }
+
+    // The declared Extra Data Flags cannot be trusted on their own (see the note
+    // in parseMobiHeader), so they get checked against arithmetic. For a
+    // candidate flag set, subtract the trailing bytes it implies from every text
+    // record; for compression 1 the remainder is the text itself, so the sum has
+    // to be textLength. Compressed records give no such sum, so the check there
+    // is weaker: a trailing size that runs past the record, or a record that
+    // ends up empty, means the candidate is wrong.
+    //
+    // Only two candidates are ever considered: what the header says, and 0. The
+    // point is not to search the space, it is to notice that a writer left
+    // garbage in the field while producing records with no trailing bytes at all.
+    function extraFlagsScore(pdb, h, flags) {
+      let sum = 0;
+      let bad = 0;
+      let n = 0;
+      for (let i = 1; i <= h.textRecordCount; i++) {
+        const rec = pdb.records[i];
+        if (!rec || !rec.length) break;
+        n++;
+        let trail = 0;
+        try {
+          trail = flags ? trailingSize(rec, flags) : 0;
+        } catch (e) {
+          trail = rec.length + 1;
+        }
+        if (!(trail >= 0) || trail >= rec.length) { bad++; trail = 0; }
+        sum += rec.length - trail;
+      }
+      return { sum: sum, bad: bad, records: n };
+    }
+
+    function resolveExtraFlags(pdb, h) {
+      const declared = h.extraFlagsRaw || 0;
+      // Both directions are possible, and a declared 0 is NOT automatically the
+      // truth. Files exist that pad every text record with one overlap byte,
+      // which is exactly what flag bit 0 describes, while the header field says
+      // 0. Trusting the 0 leaves one stray byte per record sitting in the middle
+      // of the text: it lands inside words and inside tags ("filepos" becomes
+      // "file\0pos"), and after HTML parsing it surfaces as a space, so the book
+      // reads "revie ws" and "selectees f rom". The record arithmetic catches
+      // that, so it decides, and the declared value only breaks ties.
+      //
+      // The candidates are the declared value and 0. Bit 0 is the only one that
+      // can be wrong this way (the others describe index tables whose sizes are
+      // self-describing), so trying declared|1 as a third candidate is what
+      // recovers a file that declares 0 but pads anyway.
+      const candidates = [declared];
+      if (!(declared & 1)) candidates.push(declared | 1);
+      if (declared !== 0) candidates.push(0);
+
+      const scored = candidates.map(function (f) {
+        const s = extraFlagsScore(pdb, h, f);
+        s.flags = f;
+        return s;
+      });
+
+      if (h.compression === 1 && h.textLength) {
+        // Uncompressed: the sums are exact, so a candidate either hits
+        // textLength or it does not. Exactly one normally does.
+        const hits = scored.filter(function (s) { return s.sum === h.textLength && s.bad === 0; });
+        if (hits.length) {
+          const winner = hits[0];
+          h.extraFlags = winner.flags;
+          h.extraFlagsOverridden = winner.flags !== declared;
+          return h;
+        }
+        // Nothing fits: keep what the header says rather than invent a value.
+        h.extraFlags = declared;
+        return h;
+      }
+
+      // Compressed: there is no exact sum to check against, so the only signal
+      // is whether a candidate makes a record unreadable. Prefer the declared
+      // value while it is sound, because a wrong strip here is worse than a
+      // missing one: it would cut real compressed bytes off the record end.
+      const ok = scored.filter(function (s) { return s.bad === 0; });
+      const keep = ok.some(function (s) { return s.flags === declared; })
+        ? declared
+        : (ok.length ? ok[0].flags : declared);
+      h.extraFlags = keep;
+      h.extraFlagsOverridden = keep !== declared;
+      return h;
     }
 
     function decompressText(pdb, h, log) {
@@ -2273,7 +2507,7 @@
           const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
           if (!title) continue;
           distinct[m[1].slice(0, 8)] = 1;
-          links.push({ title: title.slice(0, 120), href: 'text/' + m[1], level: 0 });
+          links.push({ title: clipText(title, 120), href: 'text/' + m[1], level: 0 });
         }
         const n = Object.keys(distinct).length;
         if (n >= 3 && (!best || n > best.count)) best = { count: n, entries: links };
@@ -2288,7 +2522,7 @@
         const title = decodeEntities(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
         if (!title) continue;
         entries.push({
-          title: title.slice(0, 120),
+          title: clipText(title, 120),
           href: 'text/' + s.id + '.xhtml',
           level: Math.min(parseInt(m[1].charAt(1), 10) - 1, 2),
         });
@@ -2658,7 +2892,7 @@
           }
           if (!label || !href) return;
           book.toc.push({
-            title: label.slice(0, 120),
+            title: clipText(label, 120),
             href: 'text/' + href,
             level: Math.min((e.tags[4] || [0])[0], 2),
           });
@@ -2684,7 +2918,7 @@
       const pdb = readPalmDB(bytes);
       const rec0 = pdb.records[0];
       if (!rec0 || rec0.length < 16) throw new Error('Damaged file: the header record is missing.');
-      const h = parseMobiHeader(rec0);
+      const h = resolveExtraFlags(pdb, parseMobiHeader(rec0));
 
       // Two independent signals. Either one means the content is protected, and
       // the conversion stops here.
@@ -2706,7 +2940,7 @@
       }
       if (boundary > 0 && boundary < pdb.records.length) {
         const inner = { type: pdb.type, creator: pdb.creator, records: pdb.records.slice(boundary) };
-        const ih = parseMobiHeader(inner.records[0]);
+        const ih = resolveExtraFlags(inner, parseMobiHeader(inner.records[0]));
         if (ih.hasMobi && ih.fileVersion >= 8) {
           log.info('Combined file: using the KF8 part (record ' + boundary + ' onwards).');
           // Record numbers in the KF8 header count from the KF8 part, and the DRM
@@ -2898,6 +3132,23 @@
           delete img.attrs.src;
           if (idx) img.attrs.recindex = String(idx).padStart(5, '0');
         }
+        // The EPUB cover convention is an <svg> wrapper around an <image> with an
+        // xlink:href, which MOBI has no notion of: it is neither an <img> nor a
+        // record reference, so it used to travel through untouched and the
+        // finished MOBI showed no cover at all. Converted here rather than in the
+        // repair, because this is the EPUB-to-MOBI path, where nothing MOBI-level
+        // has happened yet. Same target spelling as the repair uses.
+        for (const svg of findAll(root, 'svg')) {
+          const image = findOne(svg, 'image');
+          const href = image && (image.attrs['xlink:href'] || image.attrs.href || '');
+          const seg = href && /([^/]+)$/.exec(href.split('#')[0]);
+          let nm = seg ? seg[1] : '';
+          try { nm = decodeURIComponent(nm); } catch (e) { /* keep as-is */ }
+          const idx = imageIndex[nm];
+          svg.name = idx ? 'img' : 'span';
+          svg.attrs = idx ? { recindex: String(idx).padStart(5, '0') } : {};
+          svg.children = [];
+        }
         for (const a of findAll(root, 'a')) {
           const href = a.attrs.href;
           if (!href || isExternal(href)) continue;
@@ -2983,6 +3234,63 @@
       return { bytes: encodeUtf8(filled), imageNames: imageNames, imageIndex: imageIndex };
     }
 
+    // ══ safe record boundaries ═══════════════════════════════════════════════
+    // A MOBI text record is a fixed slice of the byte stream, and whether a
+    // reader may glue two of them back together before parsing hangs on bit 0 of
+    // the Extra Data Flags ("multibyte overlap"). With that bit set, a UTF-8
+    // sequence or a tag straddling the boundary is normal and harmless. Without
+    // it, every record has to stand on its own, and a boundary in the middle of
+    // a sequence or a tag is a real defect: the Kindle then shows replacement
+    // boxes and stops scrolling, or prints raw markup as body text.
+    //
+    // This writer sets the flags to 0, so it must cut where nothing is split.
+    // Cuts may only move EARLIER, never later: a record longer than the declared
+    // record_size produces blank pages, overprinted text and a book that opens
+    // only after several tries.
+    //
+    // Two things must not be cut through:
+    //   - a UTF-8 multibyte sequence (a continuation byte is 10xxxxxx)
+    //   - a tag, meaning any position between an unmatched '<' and its '>'
+    function safeCutPoint(bytes, from, limit) {
+      let cut = Math.min(limit, bytes.length);
+      if (cut >= bytes.length) return bytes.length;
+
+      // Back off a UTF-8 continuation byte. A sequence is at most 4 bytes, so at
+      // most 3 steps; more than that means the data is not valid UTF-8 and there
+      // is nothing sensible to preserve.
+      let guard = 0;
+      while (cut > from && (bytes[cut] & 0xC0) === 0x80 && guard < 4) { cut--; guard++; }
+
+      // Find the last '<' in [from, cut) that has no '>' after it before cut.
+      // If there is one, the cut sits inside a tag and has to move in front of it.
+      let open = -1;
+      for (let i = cut - 1; i >= from; i--) {
+        if (bytes[i] === 0x3E) break;        // '>' : the last tag closed, nothing open
+        if (bytes[i] === 0x3C) { open = i; break; } // '<'
+      }
+      if (open > from) cut = open;
+
+      // A pathological case (a "tag" longer than a whole record, or a run of
+      // continuation bytes) would push the cut back to `from` and make no
+      // progress. Then take the full slice and accept the split: an infinite
+      // loop is worse, and the caller must never emit a zero-length record.
+      if (cut <= from) return Math.min(limit, bytes.length);
+      return cut;
+    }
+
+    // Slices a byte stream into records of at most `size` bytes, cutting only at
+    // safe points. Returns the raw (uncompressed) slices.
+    function sliceTextRecords(bytes, size) {
+      const out = [];
+      let p = 0;
+      while (p < bytes.length) {
+        const end = safeCutPoint(bytes, p, p + size);
+        out.push(bytes.subarray(p, end));
+        p = end;
+      }
+      return out;
+    }
+
     function writeMobi(book) {
       const title = book.meta.title || 'Untitled';
       const lang = (book.meta.language || 'en').slice(0, 2).toLowerCase();
@@ -2990,10 +3298,21 @@
       const textBytes = markup.bytes;
 
       const RECSIZE = 4096;
-      const textRecs = [];
-      for (let p = 0; p < textBytes.length; p += RECSIZE) {
-        textRecs.push(palmdocCompress(textBytes.subarray(p, Math.min(p + RECSIZE, textBytes.length))));
-      }
+      // Extra Data Flags stay 0 below, so every record must parse on its own:
+      // cut only where neither a UTF-8 sequence nor a tag is split. Records get
+      // shorter this way, never longer than RECSIZE.
+      //
+      // Written uncompressed, and that is a deliberate retreat. This tool has a
+      // working PalmDOC compressor, and its output decompresses correctly here,
+      // with distances, lengths, opcode mix and compressed record sizes all
+      // inside the range the original files occupy. On a real Kindle it
+      // nevertheless produced reproducible errors, while the same text written
+      // uncompressed was flawless. The cause was never found, so the choice is
+      // between a file that is provably fine and one that is merely provably
+      // well-formed. The cost is size, roughly half again as much, which on a
+      // device with gigabytes of storage buys nothing worth the risk.
+      // palmdocCompress stays, tested, for whenever the reason turns up.
+      const textRecs = sliceTextRecords(textBytes, RECSIZE);
       if (!textRecs.length) textRecs.push(new Uint8Array(0));
 
       const imageRecs = markup.imageNames.map(function (n) { return book.resources.get(n).bytes; });
@@ -3024,7 +3343,7 @@
       const dv = new DataView(rec0.buffer);
 
       // PalmDOC header
-      dv.setUint16(0, 2, false);                    // compression: PalmDOC
+      dv.setUint16(0, 1, false);                    // compression: none, see above
       dv.setUint32(4, textBytes.length, false);     // uncompressed text length
       dv.setUint16(8, textRecs.length, false);
       dv.setUint16(10, RECSIZE, false);
@@ -3091,6 +3410,590 @@
       return h >>> 1; // keep it comfortably inside a signed 32-bit range
     }
 
+    // ══ MOBI diagnosis and repair ════════════════════════════════════════════
+    // These two work on the RAW file bytes, not on the parsed Book. Every defect
+    // they look at sits at record level and is gone the moment the file has been
+    // parsed: the reader glues the records together, so a boundary cut through a
+    // tag simply disappears into the markup. Diagnosing a parsed book would
+    // therefore always come back clean.
+    //
+    // The one criterion that separates broken from fine is bit 0 of the Extra
+    // Data Flags, "multibyte overlap". With it set (what kindlegen produces) a
+    // reader appends the overlap bytes at the end of a record to the next one,
+    // so tags and UTF-8 sequences may straddle boundaries and nothing is wrong.
+    // Without it, each record must parse on its own, and a split sequence or tag
+    // is a genuine defect: replacement boxes and a page that will not scroll, or
+    // raw markup printed as body text. Checked against a 58-file sample: the 52
+    // files carrying the bit were all fine, the 6 without it were all broken, no
+    // borderline case. The broken ones came from tools that implement the MOBI
+    // writer themselves instead of calling kindlegen.
+
+    const MOBI_REPAIR_CHECKS = ['boundaries', 'oversized', 'cover', 'header'];
+
+    function defaultRepairOpts() {
+      const o = {};
+      for (const k of MOBI_REPAIR_CHECKS) o[k] = true;
+      return o;
+    }
+
+    // Does the record end in the middle of a UTF-8 sequence? Returns the number
+    // of bytes of the truncated sequence that are present, or 0 when the record
+    // ends cleanly.
+    function danglingUtf8(rec) {
+      const n = rec.length;
+      for (let back = 1; back <= 4 && back <= n; back++) {
+        const b = rec[n - back];
+        if ((b & 0xC0) === 0x80) continue;  // continuation byte, keep walking back
+        let need = 0;
+        if ((b & 0x80) === 0) need = 1;
+        else if ((b & 0xE0) === 0xC0) need = 2;
+        else if ((b & 0xF0) === 0xE0) need = 3;
+        else if ((b & 0xF8) === 0xF0) need = 4;
+        else return 0; // not a lead byte at all: broken data, but not this defect
+        return back < need ? back : 0;
+      }
+      return 0;
+    }
+
+    // Does the record end with an unclosed '<'?
+    function danglingTag(rec) {
+      for (let i = rec.length - 1; i >= 0; i--) {
+        if (rec[i] === 0x3E) return false;
+        if (rec[i] === 0x3C) return true;
+      }
+      return false;
+    }
+
+    // The EPUB cover convention: an <svg> wrapper with an <image xlink:href> that
+    // points at a file path. MOBI has no such thing and shows nothing, so after
+    // an EPUB-to-MOBI conversion by a tool that did not translate it, the cover
+    // is simply missing. The MOBI spelling is <img recindex="NNNNN"/>.
+    const COVER_SVG_RE = /<svg\b[^>]*>[\s\S]{0,2000}?<\/svg>/gi;
+    const XLINK_HREF_RE = /(?:xlink:)?href\s*=\s*["']([^"']+)["']/i;
+    const VIEWBOX_RE = /viewBox\s*=\s*["']\s*[\d.+-]+\s+[\d.+-]+\s+([\d.]+)\s+([\d.]+)/i;
+
+    function findCoverSvgs(text) {
+      const out = [];
+      COVER_SVG_RE.lastIndex = 0;
+      let m;
+      while ((m = COVER_SVG_RE.exec(text)) !== null) {
+        const block = m[0];
+        const href = XLINK_HREF_RE.exec(block);
+        if (!href) continue;
+        // A recindex img inside means it was already translated.
+        if (/\brecindex\s*=/i.test(block)) continue;
+        const vb = VIEWBOX_RE.exec(block);
+        out.push({
+          at: m.index, length: block.length, href: href[1],
+          w: vb ? Math.round(parseFloat(vb[1])) : 0,
+          h: vb ? Math.round(parseFloat(vb[2])) : 0,
+        });
+      }
+      return out;
+    }
+
+    // Text records with the trailing bytes stripped, plus the decompressed text
+    // and the map back. Shared by diagnose and repair so they cannot disagree.
+    function mobiTextRecords(pdb, h) {
+      const recs = [];
+      for (let i = 1; i <= h.textRecordCount; i++) {
+        const rec = pdb.records[i];
+        if (!rec) break;
+        const trail = h.extraFlags ? trailingSize(rec, h.extraFlags) : 0;
+        recs.push({
+          index: i,
+          raw: rec,
+          body: rec.subarray(0, Math.max(0, rec.length - trail)),
+          trail: trail,
+        });
+      }
+      return recs;
+    }
+
+    function diagnoseMobi(bytes, opts) {
+      const o = Object.assign(defaultRepairOpts(), opts || {});
+      const out = {
+        isMobi: false, canRepair: false, problems: [], notes: [], info: {},
+      };
+      let pdb, h;
+      try {
+        pdb = readPalmDB(bytes);
+      } catch (e) {
+        out.notes.push('Not a MOBI file: ' + ((e && e.message) || e));
+        return out;
+      }
+      if (pdb.type !== 'BOOK' || pdb.creator !== 'MOBI') {
+        out.notes.push('Not a MOBI file: this is not a Palm database of type BOOKMOBI.');
+        return out;
+      }
+      const rec0 = pdb.records[0];
+      if (!rec0 || rec0.length < 16) {
+        out.notes.push('Not a MOBI file: the header record is missing.');
+        return out;
+      }
+      out.isMobi = true;
+      h = resolveExtraFlags(pdb, parseMobiHeader(rec0));
+      out.info = {
+        compression: h.compression,
+        textRecordCount: h.textRecordCount,
+        recordSize: h.textRecordSize,
+        records: pdb.records.length,
+        extraFlags: h.extraFlags,
+        declaredExtraFlags: h.extraFlagsRaw || 0,
+        // What a reader sees, which is the declared field: the UI copy about
+        // boundaries hangs on this, and so does the boundary check.
+        overlap: !!((h.extraFlagsRaw || 0) & 1),
+        effectiveOverlap: !!(h.extraFlags & 1),
+        fileVersion: h.fileVersion,
+      };
+      if (h.extraFlagsOverridden) {
+        out.notes.push('The Extra Data Flags field says ' + (h.extraFlagsRaw || 0)
+          + ', but the record lengths only add up with ' + h.extraFlags
+          + ', so this tool reads the file as ' + h.extraFlags + '. A reader that believes the '
+          + 'header instead sees ' + (h.extraFlagsRaw & 1 ? 'one byte too few' : 'one stray byte')
+          + ' at every record end.');
+      }
+
+      if (h.encryption !== 0 || (h.hasMobi && h.drmCount !== 0 && h.drmCount !== 0xFFFFFFFF)) {
+        out.encrypted = true;
+        out.notes.push('This file is encrypted. Nothing can be checked or repaired inside it.');
+        return out;
+      }
+      if (h.compression === 17480) {
+        out.huff = true;
+        out.notes.push('HUFF/CDIC compressed. The record structure is checked, but this tool '
+          + 'cannot write HUFF/CDIC back, so nothing inside the text can be repaired.');
+      } else if (h.compression !== 1 && h.compression !== 2) {
+        out.notes.push('Unknown compression type ' + h.compression + '. Diagnosis only.');
+      }
+
+      const recs = mobiTextRecords(pdb, h);
+      const recordSize = h.textRecordSize || 4096;
+      const problem = function (kind, title, detail, fixable) {
+        out.problems.push({ kind: kind, title: title, detail: detail, fixable: !!fixable });
+      };
+
+      // ---- header fields ---------------------------------------------------
+      if (o.header) {
+        const avail = pdb.records.length - 1;
+        if (h.textRecordCount > avail) {
+          problem('header', 'Text record count is too high',
+            'The header claims ' + h.textRecordCount + ' text records, but the file only has '
+            + avail + ' records after the header record. Readers run off the end of the file.',
+            true);
+        }
+        if (h.hasMobi && h.firstNonBookIndex !== 0xFFFFFFFF
+          && (h.firstNonBookIndex === 0 || h.firstNonBookIndex > pdb.records.length)) {
+          problem('header', 'firstNonBookIndex is out of range',
+            'It points at record ' + h.firstNonBookIndex + ' of ' + pdb.records.length + '.', true);
+        }
+        if (h.hasMobi && h.firstNonBookIndex === 0xFFFFFFFF) {
+          problem('header', 'firstNonBookIndex is unset',
+            'The field is 0xFFFFFFFF, so the file does not say where the non-text records begin. '
+            + 'Some readers then treat image records as text.', true);
+        }
+        if (h.hasMobi && h.firstImageIndex !== 0xFFFFFFFF && h.firstImageIndex !== 0
+          && h.firstImageIndex > pdb.records.length) {
+          problem('header', 'firstImageIndex is out of range',
+            'It points at record ' + h.firstImageIndex + ' of ' + pdb.records.length + '.', true);
+        }
+        if (h.hasMobi && h.lastContentRecord && h.lastContentRecord !== 0xFFFF
+          && h.lastContentRecord >= pdb.records.length) {
+          problem('header', 'lastContentRecord is out of range',
+            'It names record ' + h.lastContentRecord + ' of ' + pdb.records.length + '.', true);
+        }
+      }
+
+      // ---- oversized records ------------------------------------------------
+      // record_size describes the UNCOMPRESSED chunk each record stands for, so
+      // the raw record length is the wrong thing to measure: with the overlap
+      // bit set a record legitimately carries a few trailing bytes on top, and
+      // a compressed record is normally far below the limit anyway. What breaks
+      // a reader is a chunk that decodes to more than record_size bytes.
+      if (o.oversized) {
+        const decodedSize = function (r) {
+          if (h.compression === 1) return r.body.length;
+          if (h.compression === 2) {
+            try { return palmdocDecompress(r.body).length; } catch (e) { return 0; }
+          }
+          return 0; // HUFF/CDIC: not measurable without the tables, reported elsewhere
+        };
+        const big = recs
+          .map(function (r) { return { index: r.index, size: decodedSize(r) }; })
+          .filter(function (r) { return r.size > recordSize; });
+        if (big.length) {
+          problem('oversized', big.length + ' record' + (big.length === 1 ? ' is' : 's are')
+            + ' larger than record_size',
+            'The header declares ' + recordSize + ' bytes per record; record'
+            + (big.length === 1 ? ' ' : 's ')
+            + big.slice(0, 6).map(function (r) { return r.index; }).join(', ')
+            + (big.length > 6 ? ' and others' : '') + ' decode to more (up to '
+            + Math.max.apply(null, big.map(function (r) { return r.size; }))
+            + ' bytes). This shows up as blank pages, overprinted text, and a book that '
+            + 'only opens after several tries.',
+            !out.huff && !out.encrypted);
+        }
+      }
+
+      // ---- record boundaries -------------------------------------------------
+      // Keyed on the DECLARED flags, not on the corrected reading. A Kindle has
+      // no arithmetic pass: it believes the header field. So when the header
+      // says 0 while the records actually carry an overlap byte, the boundaries
+      // still have to stand on their own as far as the device is concerned, and
+      // a split tag is still a defect even though this tool can read the file.
+      if (o.boundaries) {
+        const declaredOverlap = (h.extraFlagsRaw || 0) & 1;
+        if (declaredOverlap) {
+          out.notes.push('The multibyte overlap bit is set, so tags and UTF-8 sequences may '
+            + 'run across record boundaries. That is normal and not a defect.');
+        } else if (out.huff || h.compression === 17480) {
+          out.notes.push('Record boundaries cannot be checked without decompressing, and this '
+            + 'file is HUFF/CDIC compressed.');
+        } else {
+          let cutUtf8 = 0, cutTag = 0;
+          const examples = [];
+          for (let k = 0; k < recs.length - 1; k++) {
+            let body;
+            try {
+              body = h.compression === 1 ? recs[k].body : palmdocDecompress(recs[k].body);
+            } catch (e) { continue; }
+            if (!body.length) continue;
+            if (danglingUtf8(body)) {
+              cutUtf8++;
+              if (examples.length < 4) examples.push('record ' + recs[k].index + ' (UTF-8)');
+            } else if (danglingTag(body)) {
+              cutTag++;
+              if (examples.length < 4) examples.push('record ' + recs[k].index + ' (tag)');
+            }
+          }
+          if (cutUtf8 || cutTag) {
+            const parts = [];
+            if (cutUtf8) parts.push(cutUtf8 + ' cut through a UTF-8 sequence');
+            if (cutTag) parts.push(cutTag + ' cut through an HTML tag');
+            problem('boundaries', (cutUtf8 + cutTag) + ' record boundar'
+              + ((cutUtf8 + cutTag) === 1 ? 'y is' : 'ies are') + ' unsafe',
+              'This file does not set the multibyte overlap bit, so every record has to parse '
+              + 'on its own, but ' + parts.join(' and ') + '. On a Kindle a cut UTF-8 sequence '
+              + 'shows a replacement box and the page stops scrolling; a cut tag prints raw '
+              + 'markup as body text and drops the lines around it. Examples: '
+              + examples.join(', ') + '.',
+              true);
+          }
+        }
+      }
+
+      // ---- cover reference ---------------------------------------------------
+      if (o.cover && !out.huff && !out.encrypted && (h.compression === 1 || h.compression === 2)) {
+        let text = null;
+        try {
+          text = decompressText(pdb, h, makeLog());
+        } catch (e) { text = null; }
+        if (text) {
+          const markup = decodeMobiText(text, h.textEncoding);
+          const svgs = findCoverSvgs(markup);
+          if (svgs.length) {
+            problem('cover', svgs.length + ' cover reference'
+              + (svgs.length === 1 ? '' : 's') + ' point' + (svgs.length === 1 ? 's' : '')
+              + ' at a file path',
+              'The markup wraps the cover in an <svg> with an xlink:href to "'
+              + svgs[0].href + '". That is the EPUB convention; MOBI addresses images as '
+              + '<img recindex="NNNNN"/> and shows nothing for a path, so the cover is missing.',
+              true);
+          }
+        } else {
+          out.notes.push('The text could not be decompressed, so the cover reference was not checked.');
+        }
+      }
+
+      out.canRepair = !out.encrypted && !out.huff
+        && out.problems.some(function (p) { return p.fixable; });
+      return out;
+    }
+
+    // ---- repair -------------------------------------------------------------
+
+    // Everything in the file except record 0 and the text records is copied
+    // verbatim; only the text records are re-cut and record 0's header fields are
+    // corrected. Rebuilding the Palm database from a record list is the only way
+    // to do that, because every record offset moves.
+    function buildPalmDB(orig, records) {
+      const headerLen = 78 + records.length * 8 + 2;
+      let total = headerLen;
+      for (const r of records) total += r.length;
+      const out = new Uint8Array(total);
+      // The first 78 bytes (name, dates, type/creator) carry nothing that a
+      // re-cut changes, so they are taken over unchanged.
+      out.set(orig.subarray(0, Math.min(78, orig.length)), 0);
+      const dv = new DataView(out.buffer);
+      dv.setUint16(76, records.length, false);
+      let at = headerLen;
+      records.forEach(function (r, i) {
+        const p = 78 + i * 8;
+        dv.setUint32(p, at, false);
+        dv.setUint32(p + 4, i * 2, false); // attributes (0) plus a 3-byte unique id
+        out.set(r, at);
+        at += r.length;
+      });
+      return out;
+    }
+
+    // Markup stripped down to the flowing text, for the assertion that the
+    // repair changed nothing a reader would see. Whitespace is collapsed because
+    // a re-cut may legitimately move a run of spaces across a boundary; the words
+    // themselves may not change.
+    function mobiPlainText(markup) {
+      return markup.replace(/<[^<>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function repairMobi(bytes, opts) {
+      const o = Object.assign(defaultRepairOpts(), opts || {});
+      const diag = diagnoseMobi(bytes, o);
+      const res = { bytes: bytes, fixes: [], skipped: [], changed: false, diagnosis: diag };
+      const skip = function (what, why) { res.skipped.push(what + ': ' + why); };
+
+      if (!diag.isMobi) { skip('Everything', 'this is not a MOBI file'); return res; }
+      if (diag.encrypted) { skip('Everything', 'the file is encrypted'); return res; }
+
+      const pdb = readPalmDB(bytes);
+      const rec0 = pdb.records[0].slice();
+      const h = resolveExtraFlags(pdb, parseMobiHeader(pdb.records[0]));
+      const dv = new DataView(rec0.buffer, rec0.byteOffset, rec0.byteLength);
+      const M = 16;
+      const recordSize = h.textRecordSize || 4096;
+
+      const wanted = function (kind) {
+        return o[kind] && diag.problems.some(function (p) { return p.kind === kind && p.fixable; });
+      };
+
+      // What the text records currently decode to. Everything below works on
+      // this, and the same string has to come back out at the end.
+      let markup = null;
+      let textAvailable = false;
+      if (!diag.huff && (h.compression === 1 || h.compression === 2)) {
+        try {
+          markup = decodeMobiText(decompressText(pdb, h, makeLog()), h.textEncoding);
+          textAvailable = true;
+        } catch (e) {
+          skip('Text repairs', 'the text could not be decompressed (' + ((e && e.message) || e) + ')');
+        }
+      } else if (diag.huff) {
+        skip('Text repairs', 'the file is HUFF/CDIC compressed and this tool cannot write that back');
+      }
+
+      const before = textAvailable ? mobiPlainText(markup) : '';
+      let markupChanged = false;
+
+      // ---- cover reference --------------------------------------------------
+      if (wanted('cover')) {
+        if (!textAvailable) {
+          skip('Cover reference', 'the text is not available');
+        } else {
+          const svgs = findCoverSvgs(markup);
+          // Which image records exist, and which recindex values the markup
+          // already uses. An unreferenced image is a candidate for the cover.
+          const first = h.firstImageIndex;
+          const images = [];
+          if (first && first !== 0xFFFFFFFF && first < pdb.records.length) {
+            for (let i = first; i < pdb.records.length; i++) {
+              const r = pdb.records[i];
+              if (!r || r.length < 16) continue;
+              const mime = sniffImageMime(r);
+              if (!mime) continue;
+              const dims = imageDims(r, mime);
+              images.push({ recindex: i - first + 1, mime: mime, w: dims ? dims.w : 0, h: dims ? dims.h : 0 });
+            }
+          }
+          const used = {};
+          let um;
+          const useRe = /recindex\s*=\s*["']?(\d+)/gi;
+          while ((um = useRe.exec(markup)) !== null) used[parseInt(um[1], 10)] = true;
+
+          const pick = function (svg) {
+            // Prefer the image whose pixel size matches the viewBox: that is what
+            // the EPUB wrapper was drawn around.
+            if (svg.w && svg.h) {
+              const exact = images.filter(function (im) { return im.w === svg.w && im.h === svg.h; });
+              if (exact.length) return exact[0];
+              // Same aspect ratio within one percent is still a confident match.
+              const ratio = svg.w / svg.h;
+              const near = images.filter(function (im) {
+                return im.w && im.h && Math.abs((im.w / im.h) - ratio) / ratio < 0.01;
+              });
+              if (near.length) return near[0];
+            }
+            const free = images.filter(function (im) { return !used[im.recindex]; });
+            return free.length ? free[0] : null;
+          };
+
+          if (!images.length) {
+            skip('Cover reference', 'the file has no image records to point at');
+          } else {
+            // Replace from the back so earlier offsets stay valid, and record the
+            // shift at each position for the filepos fixup below.
+            const shifts = [];
+            let done = 0;
+            for (let i = svgs.length - 1; i >= 0; i--) {
+              const svg = svgs[i];
+              const im = pick(svg);
+              if (!im) { skip('Cover reference at byte ' + svg.at, 'no matching image record'); continue; }
+              const repl = '<img recindex="' + String(im.recindex).padStart(5, '0') + '"/>';
+              const oldBlock = markup.slice(svg.at, svg.at + svg.length);
+              // filepos is a BYTE offset, so the shift has to be measured in
+              // bytes. The href inside the wrapper can be non-ASCII, so the two
+              // lengths are encoded rather than counted in characters.
+              const byteDelta = encodeUtf8(repl).length - encodeUtf8(oldBlock).length;
+              const byteAtOld = encodeUtf8(markup.slice(0, svg.at)).length;
+              markup = markup.slice(0, svg.at) + repl + markup.slice(svg.at + svg.length);
+              used[im.recindex] = true;
+              shifts.push({ at: svg.at, byteAt: byteAtOld, delta: byteDelta });
+              done++;
+            }
+            if (done) {
+              markupChanged = true;
+              // filepos is a byte offset into the uncompressed text, written with
+              // leading zeros. The values sitting in the markup still refer to
+              // the OLD text, so each one moves by the sum of the byte deltas of
+              // every replacement in front of it. The recorded byteAt values are
+              // old-text offsets as well, because the replacements ran from the
+              // back and nothing before a given one had moved yet when it was
+              // measured.
+              const cum = shifts.slice().sort(function (a, b) { return a.byteAt - b.byteAt; });
+              let running = 0;
+              for (const s of cum) { running += s.delta; s.after = running; }
+              markup = markup.replace(/(\bfilepos\s*=\s*["']?)(\d{1,10})/gi, function (all, pre, digits) {
+                const v = parseInt(digits, 10);
+                let d = 0;
+                for (const s of cum) { if (v > s.byteAt) d = s.after; }
+                return pre + String(Math.max(0, v + d)).padStart(digits.length, '0');
+              });
+              res.fixes.push('Replaced ' + done + ' SVG cover reference'
+                + (done === 1 ? '' : 's') + ' with <img recindex="…"/> and shifted the '
+                + 'filepos targets behind them.');
+            }
+          }
+        }
+      }
+
+      // ---- boundaries and oversized records ---------------------------------
+      const recutWanted = wanted('boundaries') || wanted('oversized');
+      let textRecs = null;
+      if (recutWanted || markupChanged) {
+        if (!textAvailable) {
+          if (recutWanted) skip('Record re-cut', 'the text is not available');
+        } else {
+          const textBytes = encodeUtf8(markup);
+          // The replacement records are written UNCOMPRESSED (PalmDOC
+          // compression type 1, the regular uncompressed mode). This is a
+          // deliberate decision, not an oversight: re-compressing with this
+          // tool's own PalmDOC compressor produced files that a real Paperwhite
+          // rendered wrongly, even though the output decompressed correctly here
+          // and its distances, lengths and opcodes all stayed within the range
+          // the original file used. The cause was never found. Uncompressed
+          // output ran without a single fault on the same device, and the size
+          // cost is not worth chasing an unexplained device bug.
+          const slices = sliceTextRecords(textBytes, recordSize);
+          textRecs = slices.map(function (s) { return s.slice(); });
+          dv.setUint16(0, 1, false);                        // compression: none
+          dv.setUint32(4, textBytes.length, false);         // uncompressed text length
+          dv.setUint16(8, textRecs.length, false);
+          dv.setUint16(10, recordSize, false);
+          if (h.hasMobi && rec0.length >= M + 0xE4) {
+            // No trailing bytes any more, so no overlap bit either. The records
+            // are cut so that nothing needs one.
+            dv.setUint32(M + 0xE0, 0, false);
+          }
+          if (wanted('boundaries')) {
+            res.fixes.push('Re-cut the text into ' + textRecs.length + ' records so that no '
+              + 'UTF-8 sequence and no tag is split, and wrote them uncompressed.');
+          } else if (wanted('oversized')) {
+            res.fixes.push('Re-cut the text into ' + textRecs.length + ' records of at most '
+              + recordSize + ' bytes, written uncompressed.');
+          } else {
+            res.fixes.push('Rewrote the text records after the cover fix ('
+              + textRecs.length + ' records, uncompressed).');
+          }
+        }
+      }
+
+      // Nothing to write? Then say so rather than emitting an identical file.
+      if (!textRecs && !wanted('header')) {
+        if (!res.fixes.length && !res.skipped.length) skip('Everything', 'nothing to repair');
+        return res;
+      }
+
+      // Assemble the record list. Without a re-cut the text records are copied.
+      const oldTextCount = Math.min(h.textRecordCount, Math.max(0, pdb.records.length - 1));
+      const tail = pdb.records.slice(1 + oldTextCount).map(function (r) { return r.slice(); });
+      const finalText = textRecs
+        || pdb.records.slice(1, 1 + oldTextCount).map(function (r) { return r.slice(); });
+      if (!finalText.length) finalText.push(new Uint8Array(0));
+
+      // ---- header fields ----------------------------------------------------
+      const recordCount = 1 + finalText.length + tail.length;
+      dv.setUint16(8, finalText.length, false);
+      if (wanted('header') || textRecs) {
+        const firstNonBook = 1 + finalText.length;
+        if (h.hasMobi) {
+          const oldFirstNonBook = h.firstNonBookIndex;
+          if (oldFirstNonBook === 0xFFFFFFFF || oldFirstNonBook === 0
+            || oldFirstNonBook > recordCount || textRecs) {
+            dv.setUint32(M + 0x40, firstNonBook, false);
+          }
+          const oldFirstImage = h.firstImageIndex;
+          if (oldFirstImage !== 0xFFFFFFFF
+            && (oldFirstImage === 0 || oldFirstImage > recordCount || textRecs)) {
+            // The image records keep their position relative to the end of the
+            // text, so the index moves with the new text record count.
+            const delta = finalText.length - oldTextCount;
+            const moved = oldFirstImage + delta;
+            dv.setUint32(M + 0x5C, moved > 0 && moved <= recordCount ? moved : firstNonBook, false);
+          }
+          if (rec0.length >= M + 0xB4) {
+            const oldLast = h.lastContentRecord;
+            if (!oldLast || oldLast === 0xFFFF || oldLast >= recordCount || textRecs) {
+              dv.setUint16(M + 0xB2, Math.max(1, recordCount - 2), false);
+            }
+          }
+        }
+        if (wanted('header')) {
+          res.fixes.push('Corrected the header fields: ' + finalText.length
+            + ' text records, first non-book record ' + firstNonBook
+            + ', last content record ' + Math.max(1, recordCount - 2) + '.');
+        }
+      }
+
+      const out = buildPalmDB(bytes, [rec0].concat(finalText, tail));
+
+      // ---- the assertion ----------------------------------------------------
+      // A repair that changes what the book says is worse than no repair, so the
+      // result is read back and its flowing text compared with the original's.
+      // Markup may differ (that is the point of the cover fix); the words may not.
+      if (textAvailable) {
+        let after = null;
+        try {
+          const p2 = readPalmDB(out);
+          const h2 = resolveExtraFlags(p2, parseMobiHeader(p2.records[0]));
+          after = mobiPlainText(decodeMobiText(decompressText(p2, h2, makeLog()), h2.textEncoding));
+        } catch (e) {
+          res.skipped.push('Everything: the repaired file did not read back ('
+            + ((e && e.message) || e) + '), so the original is returned unchanged.');
+          res.fixes = [];
+          return res;
+        }
+        if (after !== before) {
+          res.skipped.push('Everything: the repair would have changed the text of the book, '
+            + 'so it was discarded and the original is returned unchanged.');
+          res.fixes = [];
+          return res;
+        }
+      }
+
+      res.bytes = out;
+      res.changed = res.fixes.length > 0;
+      if (!res.changed) skip('Everything', 'nothing to repair');
+      return res;
+    }
+
     // ══ format detection ═════════════════════════════════════════════════════
 
     // Block-level tags are the giveaway for HTML masquerading with no extension.
@@ -3150,6 +4053,50 @@
       };
     }
 
+    // Repair a MOBI on the way into a conversion, and report what that was
+    // worth. Returns { bytes, notes }, with bytes unchanged when there was
+    // nothing to do.
+    //
+    // Only ONE of the four checks earns its place here, which is worth spelling
+    // out because the other three look like they should. Measured on the broken
+    // files: writeMobi rebuilds the whole file from the parsed book, cutting
+    // records at safe points and writing fresh header fields, so `boundaries`,
+    // `oversized` and `header` are already gone in the output whether or not a
+    // repair ran first. Repairing them before a conversion is work with no
+    // effect on the result.
+    //
+    // `cover` is different, and differently from what one would guess it is not
+    // a MOBI-only concern. The dead reference is an <svg> wrapper with an
+    // xlink:href to a file path that exists in no format, and it survives into
+    // the parsed book, so it reaches EPUB, the HTML reader and DOCX just as it
+    // reaches MOBI. Reading ELLC_10 and writing EPUB leaves the path in the
+    // XHTML; repairing first turns it into a real <img> at the same spot.
+    // Hence: repair for every target, but only the check that changes anything.
+    //
+    // The repair runs on the bytes rather than on the parsed book on purpose:
+    // that is the code path the owner verified on a real device, and it matches
+    // recindex values against the actual image records, which only exist at
+    // this level.
+    function repairForConversion(bytes, name) {
+      const out = { bytes: bytes, notes: [] };
+      if (sniff(bytes, name) !== 'mobi') return out;
+      let r;
+      try {
+        r = repairMobi(bytes, { boundaries: false, oversized: false, cover: true, header: false });
+      } catch (e) {
+        // A file too broken to repair is still a file worth trying to read.
+        return out;
+      }
+      if (!r || !r.changed || !r.bytes) return out;
+      out.bytes = r.bytes;
+      // The repaired bytes are an intermediate: read() consumes them and the
+      // writer decides the final layout, so the repair's own remarks about
+      // record counts and compression describe a file nobody ever sees. Only
+      // the note about what was actually mended belongs in a conversion report.
+      out.notes = r.fixes.filter(function (f) { return !/^Rewrote the text records/.test(f); });
+      return out;
+    }
+
     async function read(bytes, log, name) {
       const junk = sniffNotABook(bytes);
       if (junk) throw new Error(junk);
@@ -3186,11 +4133,30 @@
     // their fate: a mapping function keeps them (the Pandoc bundle does this),
     // null drops them like the TXT writer does.
 
+    // Two escapers, because Markdown has two kinds of marker. These are the
+    // inline ones, which act anywhere in a line; "<" is here because our own
+    // reader hands a run that looks like a tag straight to the XML parser, so
+    // a paragraph mentioning <div> would come back as a real div.
     function mdEscapeText(s) {
-      return s.replace(/([\\`*_\[\]])/g, '\\$1');
+      return s.replace(/([\\`*_\[\]<])/g, '\\$1');
     }
     function mdUnescape(s) {
-      return s.replace(/\\([\\`*_\[\]])/g, '$1');
+      return s.replace(/\\([\\`*_\[\]<])/g, '$1');
+    }
+
+    // And these only act at the start of a line: a paragraph beginning with
+    // "#", ">", "-", "+" or "1." is a heading, a quote or a list item when read
+    // back, which silently rewrites the book's structure. Escaping needs the
+    // line context that mdEscapeText does not have, so it happens once per
+    // emitted block instead, on every line of it (a "\" line break starts a
+    // new line too). The character to escape is the marker itself, except for
+    // the ordered-list forms, where it is the "." or ")" behind the digits.
+    function mdEscapeBlockStart(s) {
+      return s.split('\n').map(function (line) {
+        return line
+          .replace(/^(\s*)([#>+-])/, '$1\\$2')
+          .replace(/^(\s*\d{1,9})([.)])/, '$1\\$2');
+      }).join('\n');
     }
     function mdWrap(mark, inner) {
       const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(inner);
@@ -3300,7 +4266,7 @@
       let run = [];
       const flush = function () {
         const t = run.join('').replace(/^[\s\\]+|[\s\\]+$/g, '');
-        if (t) out.push(t);
+        if (t) out.push(mdEscapeBlockStart(t));
         run = [];
       };
       for (const ch of children) {
@@ -3316,7 +4282,7 @@
           if (t) out.push('#'.repeat(+n.charAt(1)) + ' ' + t);
         } else if (n === 'p' || n === 'figcaption' || n === 'dt' || n === 'dd') {
           const t = mdInline(ch.children, opts).trim();
-          if (t) out.push(t);
+          if (t) out.push(mdEscapeBlockStart(t));
         } else if (n === 'blockquote') {
           const inner = [];
           mdBlocks(ch.children, opts, inner);
@@ -5434,7 +6400,7 @@
           if (!title) continue;
           const id = attrValue(m[2], 'id');
           raw.push({
-            title: title.slice(0, 200),
+            title: clipText(title, 200),
             rank: rank,
             href: tocHref(sec.id, first ? '' : id),
             section: si,
@@ -5710,6 +6676,15 @@
         const entry = { name: item.name, path: item.path || item.name, ok: false, error: '', outName: '', outSize: 0, notes: [] };
         try {
           let bytes = new Uint8Array(await item.getBytes());
+          if (opts.repair) {
+            const rep = repairForConversion(bytes, item.name);
+            if (rep.notes.length) {
+              bytes = rep.bytes;
+              // Named per file, because a silent change to one book in a stack
+              // of eighty is a change nobody notices.
+              entry.notes.push('Repaired: ' + rep.notes.join(' '));
+            }
+          }
           let book = await read(bytes, log, item.name);
           bytes = null;
           if (textOps && opts.typography) {
@@ -5778,6 +6753,21 @@
       return { bytes: await zipWrite(entries), results: results, converted: okCount };
     }
 
+    // Shorten a filename for a button label. Library downloads carry their whole
+    // provenance in the name, and one of those stretched the download button
+    // across the full width of the page. Cut out of the MIDDLE, because both
+    // ends carry the information: the front says which book, and the extension
+    // says what the button will actually hand you, which is the entire question
+    // after a conversion. A tail of 12 covers ".reader.html", the longest one
+    // this tool produces.
+    function ellipsizeName(name, max) {
+      const s = String(name);
+      const cap = max || 34;
+      if (s.length <= cap) return s;
+      const tail = Math.min(12, Math.max(0, cap - 4));
+      return s.slice(0, cap - tail - 1) + '…' + s.slice(s.length - tail);
+    }
+
     return {
       formats: FORMATS,
       // pipeline
@@ -5789,7 +6779,10 @@
       deflateRaw: deflateRaw, inflateRaw: inflateRaw,
       parseXML: parseXML, findOne: findOne, findAll: findAll, textOf: textOf,
       decodeEntities: decodeEntities, escapeXml: escapeXml,
+      ellipsizeName: ellipsizeName, clipText: clipText,
       resolvePath: resolvePath, htmlToText: htmlToText, decodeText: decodeText,
+      decodeEpubFile: decodeEpubFile, declaredEncoding: declaredEncoding,
+      stripXmlIllegal: stripXmlIllegal, countXmlIllegal: countXmlIllegal,
       readEpub: readEpub, writeEpub: writeEpub, readTxt: readTxt, writeTxt: writeTxt,
       readHtml: readHtml, readMarkdown: readMarkdown, markdownToHtml: markdownToHtml,
       inlineMd: inlineMd, buildSections: buildSections,
@@ -5802,6 +6795,15 @@
       parseIndex: parseIndex, findIndexes: findIndexes,
       palmdocDecompress: palmdocDecompress, palmdocCompress: palmdocCompress,
       writeMobi: writeMobi, readMobiFile: readMobiFile,
+      // MOBI diagnosis and repair, on the raw file bytes
+      diagnoseMobi: diagnoseMobi, repairMobi: repairMobi,
+      repairChecks: MOBI_REPAIR_CHECKS, defaultRepairOpts: defaultRepairOpts,
+      repairForConversion: repairForConversion,
+      resolveExtraFlags: resolveExtraFlags, sliceTextRecords: sliceTextRecords,
+      safeCutPoint: safeCutPoint, trailingSize: trailingSize,
+      danglingUtf8: danglingUtf8, danglingTag: danglingTag,
+      findCoverSvgs: findCoverSvgs, mobiPlainText: mobiPlainText,
+      mobiTextRecords: mobiTextRecords, extraFlagsScore: extraFlagsScore,
       // book editing
       mapTextNodes: mapTextNodes, smartenHtml: smartenHtml,
       cleanTypography: cleanTypography, bookFind: bookFind, bookReplace: bookReplace,
@@ -6253,7 +7255,9 @@
 
     // ---- edit tools (accordion in the convert tab) -----------------------
 
-    function EditTools({ book, onBook }) {
+    // The ids match Core.repairChecks; the order here is the order in the UI,
+    // roughly by how badly the fault breaks a book.
+    function EditTools({ book, onBook, srcBytes }) {
       const [typoLang, setTypoLang] = useState('auto');
       const [typoMsg, setTypoMsg] = useState('');
       const [query, setQuery] = useState('');
@@ -6305,8 +7309,22 @@
       // Only the most recent action should be reporting; otherwise the panel
       // fills up with messages from things the user did minutes ago.
       const clearMessages = () => {
-        setTypoMsg(''); setSrMsg(null); setTocMsg(''); setCoverMsg('');
+        setTypoMsg(''); setSrMsg(null); setTocMsg(''); setCoverMsg(''); setRepairMsg('');
       };
+
+      // Runs as soon as a MOBI arrives and again whenever a check is toggled or
+      // a repair rewrites the bytes. A long book takes a few tens of ms, which
+      // is why it is memoised rather than recomputed on every render.
+      const diag = useMemo(
+        () => (srcBytes ? Core.diagnoseMobi(srcBytes, null) : null),
+        [srcBytes]);
+      // How many of the findings the conversion will actually deal with. All of
+      // them, normally: the only faults that survive are the ones in a file
+      // this tool cannot write back at all (HUFF/CDIC, encrypted), and those
+      // carry fixable: false.
+      const repairable = diag ? diag.problems.filter((p) => p.fixable).length : 0;
+      const repairStuck = !!diag && repairable < diag.problems.length;
+
 
       const runTypo = () => {
         clearMessages();
@@ -6345,7 +7363,12 @@
         });
       };
 
-      const clip = (s) => (s || '').replace(/\s+/g, ' ');
+      // With a length it also caps, via Core.clipText, so a label never ends on
+      // half an emoji the way a bare slice would.
+      const clip = (s, max) => {
+        const t = (s || '').replace(/\s+/g, ' ');
+        return max ? Core.clipText(t, max) : t;
+      };
       // Thin spaces as thousands separators: readable without picking a locale
       // convention (1,234 vs 1.234) that would be wrong for half the readers.
       const fmtChars = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
@@ -6700,7 +7723,7 @@
                       style=${{ marginLeft: e.level * 22 }}
                       onChange=${(ev) => editEntry(i, { title: ev.target.value })} />
                     <span className="ec-tocsec">
-                      ${si >= 0 ? clip(titles[si]).slice(0, 24) : 'missing section'}
+                      ${si >= 0 ? clip(titles[si], 24) : 'missing section'}
                     </span>
                     <button className="lang-seg" title="Move up"
                       disabled=${i === 0} onClick=${() => moveEntry(i, -1)}>↑</button>
@@ -6724,7 +7747,7 @@
               onChange=${(ev) => { if (ev.target.value !== '') addForSection(Number(ev.target.value)); }}>
               <option value="">Choose a section…</option>
               ${book.sections.map((s, i) => html`
-                <option key=${s.id} value=${i}>${(i + 1) + '. ' + clip(titles[i]).slice(0, 60)}</option>
+                <option key=${s.id} value=${i}>${(i + 1) + '. ' + clip(titles[i], 60)}</option>
               `)}
             </select>
           </div>
@@ -6794,7 +7817,7 @@
                 <ul className="ec-log ec-snips" style=${{ marginBottom: 0 }}>
                   ${found.snippets.map((s, i) => html`
                     <li key=${i}>
-                      <span style=${{ color: 'var(--tool-note)' }}>${clip(titles[s.section]).slice(0, 28) + ': '}</span>
+                      <span style=${{ color: 'var(--tool-note)' }}>${clip(titles[s.section], 28) + ': '}</span>
                       ${'…' + clip(s.before)}
                       <mark>${clip(s.match)}</mark>
                       ${clip(s.after) + '…'}
@@ -6835,6 +7858,91 @@
             <p style=${{ fontSize: 13, color: '#0fb5ad', marginBottom: 6 }}>${typoMsg}</p>
           `}
         </details>
+
+        <!--
+          Repair is hidden entirely for anything that is not a MOBI or AZW3,
+          rather than shown greyed out. Every check inside it is about the Palm
+          record layout, which no other input format has, so a disabled section
+          would be a permanent question ("what am I missing?") for the majority
+          of users, who arrive with an EPUB. The diagnosis result lives in the
+          summary, so the answer to "is it the file or is it my Kindle" is
+          readable without opening anything.
+        -->
+        ${srcBytes && diag && diag.isMobi && html`
+          <details className="ec-edit">
+            <summary>
+              Repair
+              <!--
+                Phrased as an outcome, not as a verdict on the file. By the time
+                this is read the cover is already mended and the rest goes when
+                the file is written, so "2 problems found" would be both gloomy
+                and out of date. A fault that genuinely cannot be repaired (HUFF
+                or encrypted) must not be counted among the promises, hence the
+                split.
+              -->
+              <span className="ec-editnote"
+                style=${{ color: repairStuck ? 'var(--tool-warn-text)' : 'var(--tool-ok-text)' }}>
+                ${diag.problems.length === 0
+                  ? 'nothing to repair'
+                  : repairable === 0
+                    ? (diag.problems.length === 1 ? '1 problem, not repairable'
+                        : diag.problems.length + ' problems, not repairable')
+                    : repairStuck
+                      ? repairable + ' of ' + diag.problems.length + ' will be repaired'
+                      : diag.problems.length + (diag.problems.length === 1
+                          ? ' problem will be repaired' : ' problems will be repaired')}
+              </span>
+            </summary>
+
+            <label style=${{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
+              Checks the record layout of this MOBI for the faults that make a Kindle show
+              replacement boxes, print raw markup as body text, or open a book only after
+              several tries. Whether a fault is a fault at all depends on one header bit:
+              with the multibyte overlap bit set, tags and characters may run across record
+              boundaries and nothing is wrong. This file
+              ${diag.info.overlap ? ' sets that bit.' : ' does not set it, so every record has to parse on its own.'}
+            </label>
+
+            ${diag.problems.length === 0 && html`
+              <p style=${{ fontSize: 13, color: 'var(--tool-ok-text)', marginBottom: 6 }}>
+                Nothing to repair. The record layout of this file is sound, so a Kindle that
+                will not read it is not failing on any of the faults checked here.
+              </p>
+            `}
+            ${diag.problems.length > 0 && html`
+              <ul style=${{ fontSize: 13, color: 'var(--tool-text)', marginBottom: 8, paddingLeft: 18 }}>
+                ${diag.problems.map((p, i) => html`
+                  <li key=${i} style=${{ marginBottom: 4 }}>
+                    <strong>${p.title}</strong>
+                    ${!p.fixable && html`<span style=${{ color: 'var(--tool-warn-text)' }}> (cannot be repaired)</span>`}
+                    <br/>
+                    <span style=${{ color: 'var(--tool-note)' }}>${p.detail}</span>
+                  </li>
+                `)}
+              </ul>
+            `}
+            ${diag.notes.length > 0 && html`
+              <ul style=${{ fontSize: 12, color: 'var(--tool-note)', marginBottom: 8, paddingLeft: 18 }}>
+                ${diag.notes.map((n, i) => html`<li key=${i}>${n}</li>`)}
+              </ul>
+            `}
+
+            <p style=${{ fontSize: 12, color: 'var(--tool-note)', margin: '0 0 6px' }}>
+              There is nothing to press. A cover pointing at a file path was already mended
+              when the book was read, which is why it is fixed in every output format and
+              not just in MOBI; cut records, oversized records and wrong header fields go
+              when the file is written, because it is rebuilt from scratch rather than
+              patched. The list above describes the file as it arrived.
+              ${repairStuck ? ' What is left is in a file this tool cannot write back.' : ''}
+            </p>
+            <p style=${{ fontSize: 12, color: 'var(--tool-note)', margin: '0 0 6px' }}>
+              MOBI is written uncompressed, which makes it larger and is deliberate:
+              re-compressing with this tool's own PalmDOC compressor produced output that a
+              Paperwhite rendered wrongly even though it decompressed correctly here, and
+              the cause was never found.
+            </p>
+          </details>
+        `}
         </div>
       `;
     }
@@ -6908,6 +8016,27 @@
               `)}
             </div>
           </details>
+
+          <details className="ec-edit">
+            <summary>
+              Repair
+              <span className="ec-editnote">${opts.repair ? 'runs on every file' : 'off'}</span>
+            </summary>
+            <label style=${{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
+              MOBI files whose cover is an EPUB style ${'<svg>'} pointing at a file path show
+              no cover, in any output format, because the path leads nowhere. This finds the
+              image the wrapper was drawn around and references it properly. Files that are
+              not MOBI, and MOBI files without the fault, pass through untouched, and every
+              file that was changed says so in its result line.
+            </label>
+            <div className="seg-row" style=${{ display: 'flex', flexWrap: 'wrap' }}>
+              ${[[true, 'On'], [false, 'Off']].map((o) => html`
+                <button key=${String(o[0])}
+                  className=${'lang-seg' + (!!opts.repair === o[0] ? ' active' : '')}
+                  onClick=${() => set('repair', o[0])}>${o[1]}</button>
+              `)}
+            </div>
+          </details>
         </div>
       `;
     }
@@ -6950,8 +8079,18 @@
       // null then, which is the whole memory strategy - only the file being
       // converted is ever parsed.
       const [batch, setBatch] = useState(null);
+      // The Repair section works on the raw file bytes, because every defect it
+      // looks at sits at record level and is gone once the file has been parsed.
+      // Only MOBI/AZW3 bytes are kept, and only for a single loaded file: batch
+      // mode holds one file at a time on purpose, and an EPUB would be dead
+      // weight here. State rather than a ref, because the section has to
+      // re-render when a file arrives or is repaired.
+      const [srcBytes, setSrcBytes] = useState(null);
       const [bopts, setBopts] = useState({
         query: '', replacement: '', regex: false, matchCase: false, wholeWord: true, typo: '',
+        // On by default: a broken cover is a defect, not a preference, and the
+        // single-file side mends it without asking too.
+        repair: true,
       });
       const inputRef = useRef(null);
 
@@ -6969,7 +8108,7 @@
 
       const reset = () => {
         setBook(null); setLog([]); setError(''); clearResult();
-        setFileName(''); setFileSize(0); setBatch(null);
+        setFileName(''); setFileSize(0); setBatch(null); setSrcBytes(null);
         // The tab row is only rendered once a book is loaded; whoever drops a
         // new file while on Preview must land on a tab that shows it.
         setTab('convert');
@@ -7014,7 +8153,25 @@
         setFileSize(file.size);
         const logger = Core.makeLog();
         file.arrayBuffer()
-          .then((buf) => Core.read(new Uint8Array(buf), logger, file.name))
+          .then((buf) => {
+            let bytes = new Uint8Array(buf);
+            // Repaired on the way in rather than on a button, so the preview,
+            // the edit panels and the conversion all work on the same, mended
+            // book. Only the cover reference is touched: everything else the
+            // diagnosis reports is rebuilt by the writer anyway. The ORIGINAL
+            // bytes stay in srcBytes, because the diagnosis below is meant to
+            // describe the file that arrived, not the one we made of it.
+            const orig = bytes;
+            const rep = Core.repairForConversion(bytes, file.name);
+            if (rep.notes.length) {
+              bytes = rep.bytes;
+              logger.info('Repaired on load: ' + rep.notes.join(' '));
+            }
+            // Kept before the read, because read() may refine mobi to azw3 and
+            // the sniff is what decides whether the bytes are worth holding.
+            setSrcBytes(Core.sniff(orig, file.name) === 'mobi' ? orig : null);
+            return Core.read(bytes, logger, file.name);
+          })
           .then((b) => {
             setBook(b);
             setLog(logger.lines.slice());
@@ -7057,6 +8214,7 @@
           getBytes: () => f.file.arrayBuffer().then((buf) => new Uint8Array(buf)),
         }));
         const opts = {
+          repair: !!bopts.repair,
           typography: bopts.typo || null,
           replace: bopts.query ? {
             query: bopts.query, replacement: bopts.replacement,
@@ -7251,8 +8409,8 @@
                 <p style=${{ marginTop: 14, marginBottom: 0, display: 'flex',
                     alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                   <a href=${result.url} download=${result.name} role="button"
-                    className="tool-btn tool-btn-primary">
-                    Download ${result.name}
+                    className="tool-btn tool-btn-primary" title=${result.name}>
+                    Download ${ellipsizeName(result.name)}
                   </a>
                   <span style=${{ color: 'var(--tool-note)', fontSize: 13 }}>
                     (${fmtSize(result.size)} · ${batch.files.filter((f) => f.status === 'done').length} of${' '}
@@ -7316,7 +8474,8 @@
                   inside the file, so it opens offline and requests nothing.
                 </p>
               `}
-              <${EditTools} book=${book} onBook=${(b) => { setBook(b); clearResult(); }} />
+              <${EditTools} book=${book} onBook=${(b) => { setBook(b); clearResult(); }}
+                srcBytes=${srcBytes} />
 
               <button className="tool-btn tool-btn-primary" onClick=${convert} disabled=${busy}>
                 Convert
@@ -7326,8 +8485,8 @@
                 <p style=${{ marginTop: 14, marginBottom: 0, display: 'flex',
                     alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                   <a href=${result.url} download=${result.name} role="button"
-                    className="tool-btn tool-btn-primary">
-                    Download ${result.name}
+                    className="tool-btn tool-btn-primary" title=${result.name}>
+                    Download ${ellipsizeName(result.name)}
                   </a>
                   <span style=${{ color: 'var(--tool-note)', fontSize: 13 }}>(${fmtSize(result.size)})</span>
                 </p>
