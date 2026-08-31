@@ -3179,6 +3179,56 @@ var PCB = (function () {
     var outlineGroups = [polysGroup(flattenPath(outlinePath(doc, tol), tol))];
     var outline = flatPolys(outlineGroups);
 
+    /* The copper pullback: a margin along the profile that carries no copper on
+       either side.
+
+       Every fab demands a distance between copper and the routed board edge,
+       because the router leaves a burr and copper right on the cut comes back
+       lifted or shorted to the next board on the panel. Nothing in this tool
+       used to keep that distance: an area with no window on it runs all the way
+       to its dividing line, and the outermost dividing line IS the board edge,
+       so a plain board reported a copper-to-edge violation along its whole
+       outline. The DRC has always said so; there was no way to act on it short
+       of painting a hairline window by hand around a traced cat.
+
+       So the derivation does it, on both sides and without asking. It is not a
+       design decision the user could sensibly make differently: below the fab's
+       number the board is rejected, and above it costs a fraction of a
+       millimetre of copper nobody sees.
+
+       Made as the ring between the profile and the profile shrunk by the
+       distance: CLEAR on the whole outline, then DARK again on the shrunk one,
+       so the two together erase nothing but the rim. It is a subtraction and
+       therefore cannot damage anything anyone drew on purpose. Where the user
+       already keeps the edge clear himself, which is the usual case on the
+       front when there is a silkscreen border, it removes copper that is not
+       there and changes nothing.
+
+       Mask and silkscreen are deliberately untouched. Silk running into the cut
+       comes out untidy; copper running into it comes back lifted or shorted to
+       the neighbouring board on the panel. Only one of the two is a defect, and
+       silk has its own rule on the check tab. */
+    var edgeMm = opts.copperEdgeMm != null ? +opts.copperEdgeMm
+      : (fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish).copperEdgeMm || 0);
+    var edgeClear = [];
+    if (edgeMm > 0) {
+      try {
+        var shrunk = offsetPath(outlinePath(doc, tol), -edgeMm, { tolMm: tol });
+        if (!shrunk.empty) {
+          edgeClear = groupEntries(
+            [{ outer: outline, holes: flattenPath(shrunk.path, tol) }], 'clear');
+          edgeClear.forEach(function (e) { e.role = 'edgekeep'; });
+        }
+      } catch (e) {
+        /* A shape too small or too thin to survive the shrink. Leaving the
+           margin off is the honest failure: the DRC still reports the edge
+           clearance, and a board that cannot hold a rim that thin has a problem
+           this entry would only hide. Never fatal, because the whole derivation
+           hangs off this call. */
+        edgeClear = [];
+      }
+    }
+
     var mats = { front: templateGroups(bundles.front), back: templateGroups(bundles.back) };
     var flat = {};
     SIDES.forEach(function (side) {
@@ -3256,6 +3306,7 @@ var PCB = (function () {
     var layers = {};
     layers['F.Cu'] = nonEmpty(board
       .concat(fCuWin)
+      .concat(edgeClear)
       .concat([entry(ring, 'dark', false, 'ring'), entry(bore, 'clear', false, 'bore')])
       .concat(cutClear));
     /* The pad entry comes BEFORE the window entries, unlike the plated rings
@@ -3279,6 +3330,7 @@ var PCB = (function () {
     layers['B.Cu'] = nonEmpty(board
       .concat([entry(padCu, 'dark', false, 'pad')])
       .concat(bCuWin)
+      .concat(edgeClear)
       .concat([entry(ring, 'dark', false, 'ring'), entry(bore, 'clear', false, 'bore')])
       .concat(etchEntries)
       .concat(cutClear));
