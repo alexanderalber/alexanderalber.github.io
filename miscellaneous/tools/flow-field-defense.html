@@ -252,16 +252,25 @@
        temperature of the step choice, measured in mean cell costs: 0 takes only
        the cheapest step, larger values also take steps that are merely close.
 
-       tau earns its place, but only on boards worth playing. Counted over every
-       branch point that carries mass: on an empty board, on a board of nothing
-       but guns and on a board of nothing but slowers, the downhill neighbours
-       of a cell tie exactly, every single time, so a temperature has nothing to
-       act on. Put walls in and the share of branch points offering a genuinely
-       worse alternative runs from nothing to 43 percent depending on the type
-       and the board, a few percent to twenty being the usual range. A first
-       measurement on the flat boards alone said the parameter was dead and very
-       nearly got it deleted. It is not dead; it is invisible until the board
-       has structure, which is exactly when a player is looking. */
+       tau has now been measured wrong in both directions, which is worth
+       recording because the second measurement quietly reversed the first.
+
+       On the four neighbour grid this started with, counted over every branch
+       point carrying mass: on an empty board, on a board of nothing but guns
+       and on a board of nothing but slowers, the downhill neighbours of a cell
+       tied exactly, every single time, so a temperature had nothing to act on.
+       That measurement very nearly got the parameter deleted; a
+       countermeasurement on mazes, where the share of branch points offering a
+       genuinely worse alternative ran up to 43 percent, brought it back.
+
+       Diagonals inverted it. SQRT2 is irrational and the cell costs are not, so
+       a straight step and a diagonal one essentially never tie: measured over
+       all five test boards and every type, 100 percent of branch points now
+       offer a genuinely worse step. The parameter went from invisible to always
+       active without anyone touching it, and the ties it used to share mass
+       over are the thing that disappeared. What it still buys is the whole
+       difference between the runner and the swarm, and it is now visible on an
+       empty board rather than only in a maze. */
 
     var ENEMIES = [
       { id: 'runner',   name: 'Runner',   speed: 2.2, wt: 1, wd: 0,   tau: 0,    dpsBuild: 12, dot: '#38bdf8',
@@ -438,11 +447,75 @@
       return st.fields;
     }
 
+    /* ---------- the neighbourhood ----------
+
+       Eight neighbours, and the diagonal ones cost SQRT2 times as much.
+
+       There is exactly one of these functions and five callers: the solve, the
+       occupancy propagation, the step choice of a live unit, greedyPath and the
+       arrows in the renderer. They used to carry a copy of the same four
+       direction loop each. That is the seam where the field and the units drift
+       apart silently: if the propagation offers a step the unit does not, the
+       picture promises a fan that nobody walks, and nothing throws.
+
+       Two rules make diagonals honest rather than an exploit.
+
+       The step is scaled by SQRT2, because the unit really does cross 1.41
+       cells and is therefore 1.41 times as long under fire. Without the factor
+       a diagonal costs the same as a straight step while covering more ground,
+       so every route degenerates into a staircase AND every tower delivers
+       about 30 percent less than the threat field promises. The mortar test
+       (29.9 against a stated 30) is the one that would catch it.
+
+       A diagonal needs its whole 2x2 square free of buildings. Cutting the
+       corner between two diagonally touching walls looks like walking through a
+       sealed seam, and a player who has just spent gold closing that seam is
+       entitled to believe it is closed. Note what this is NOT: it is not a
+       rule about where you may build, and a tower still never blocks anything.
+       The diagonal is refused, the two straight steps around it are not, so a
+       sealed board still has a finite route and it is still exactly one bite
+       more expensive. That is what the a tower is an expensive cell test
+       asserts, and it keeps holding. */
+
+    var SQRT2 = Math.SQRT2;
+    /* dx, dy, and for a diagonal the two orthogonal cells that must be clear */
+    var STEPS = [
+      [-1, 0], [1, 0], [0, -1], [0, 1],
+      [-1, -1], [1, -1], [-1, 1], [1, 1]
+    ];
+
+    /* Fills nb with the neighbours of u that pass the corner rule and wt with
+       the cost multiplier of each step, and returns how many there were. The
+       caller supplies the arrays, because this runs per cell per tick and a
+       fresh array each time is the one allocation that would show. */
+    function neighbours(st, u, nb, wt) {
+      var x = u % GW, y = (u / GW) | 0, cnt = 0;
+      for (var d = 0; d < 8; d++) {
+        var nx = x + STEPS[d][0], ny = y + STEPS[d][1];
+        if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
+        if (d >= 4) {
+          /* both orthogonal cells of the 2x2 square have to be free of
+             buildings, or this is a corner cut through a sealed seam */
+          if (st.towerAt[idx(nx, y)] >= 0) continue;
+          if (st.towerAt[idx(x, ny)] >= 0) continue;
+          /* and the diagonal target itself: stepping INTO a tower diagonally
+             would let a unit bite a wall from the corner, which no straight
+             step can reach */
+          if (st.towerAt[idx(nx, ny)] >= 0) continue;
+        }
+        nb[cnt] = idx(nx, ny);
+        wt[cnt] = d >= 4 ? SQRT2 : 1;
+        cnt++;
+      }
+      return cnt;
+    }
+
     /* ---------- the solve ----------
 
-       Node costs, not edge costs: the weight of stepping into v is cost(v).
-       Dijkstra runs backwards from the goal, so dist[i] is the total cost of
-       the cheapest route from i to the goal, the goal cell included.
+       Node costs, not edge costs: the weight of stepping into v is cost(v),
+       scaled by the length of the step. Dijkstra runs backwards from the goal,
+       so dist[i] is the total cost of the cheapest route from i to the goal,
+       the goal cell included.
 
        Every cell is finite, including tower cells, which is the whole point:
        there is no unreachable state and therefore no special case for a sealed
@@ -512,6 +585,7 @@
       } else {
         var hk = new Float64Array(N * 8), hv = new Int32Array(N * 8), hn = 0;
         var done = new Uint8Array(N);
+        var nb = [0, 0, 0, 0, 0, 0, 0, 0], wt = [0, 0, 0, 0, 0, 0, 0, 0];
         for (i = 0; i < N; i++) dist[i] = Infinity;
         dist[GOAL] = cost[GOAL];
         hn = heapPush(hk, hv, hn, dist[GOAL], GOAL);
@@ -520,14 +594,12 @@
           hn = heapPop(hk, hv, hn);
           if (done[u]) continue;
           done[u] = 1;
-          x = cx(u); y = cy(u);
-          for (var d = 0; d < 4; d++) {
-            var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
-            var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
-            if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
-            var v = idx(nx, ny);
+          var cnt = neighbours(st, u, nb, wt);
+          for (var d = 0; d < cnt; d++) {
+            var v = nb[d];
             if (done[v]) continue;
-            var nd = du + cost[v];
+            /* the cost of the cell, scaled by how far this step actually goes */
+            var nd = du + cost[v] * wt[d];
             if (nd < dist[v]) {
               dist[v] = nd;
               if (hn < hk.length) hn = heapPush(hk, hv, hn, nd, v);
@@ -545,8 +617,10 @@
       for (i = 0; i < N; i++) csum += cost[i];
       res.scale = csum / N;
       res.occ = occupancy(st, res);
-      var ed = 0;
-      for (i = 0; i < N; i++) ed += res.occ[i] * danger[i];
+      /* Damage is time under fire, so this integrates against dwell for the
+         same reason routeTime does. */
+      var ed = 0, dw = res.occ.dwell || res.occ;
+      for (i = 0; i < N; i++) ed += dw[i] * danger[i];
       res.expDamage = ed;
       res.routeTime = routeTime(st, res);
       st.solves[profId] = res;
@@ -563,6 +637,14 @@
     function occupancy(st, res) {
       var occ = new Float32Array(N), i;
       var prof = res.prof, dist = res.dist;
+      /* Expected cell WIDTHS crossed per cell, as opposed to occ, which counts
+         visits. The two differ only once diagonals exist, and they are hung off
+         the same object rather than returned as a pair so that the exported
+         signature of occupancy stays what it was. Everything that asks "how
+         long was the unit here" wants dwell; everything that asks "was it here"
+         wants occ, and the field on screen is the latter. */
+      var dwell = new Float32Array(N);
+      occ.dwell = dwell;
 
       if (prof.fly) {
         /* Flyers do not use the grid, but their occupancy has to mean the same
@@ -577,6 +659,7 @@
           var a = s / steps;
           var px = Math.round(sx + (gx - sx) * a), py = Math.round(sy + (gy - sy) * a);
           occ[idx(px, py)] = 1;
+          dwell[idx(px, py)] = 1;
         }
         return occ;
       }
@@ -588,37 +671,54 @@
       arr.sort(function (a, b) { return db(da[b]) - db(da[a]); });
 
       var T = prof.tau * res.scale;
+      /* The spawn cell is entered from outside the board, so no step arrives in
+         it. It is crossed once, at one cell width. */
       occ[SPAWN] = 1;
-      var nb = [0, 0, 0, 0], w = [0, 0, 0, 0];
+      dwell[SPAWN] = 1;
+      var all = [0, 0, 0, 0, 0, 0, 0, 0], aw = [0, 0, 0, 0, 0, 0, 0, 0];
+      var nb = [0, 0, 0, 0, 0, 0, 0, 0], w = [0, 0, 0, 0, 0, 0, 0, 0];
+      var nw = [0, 0, 0, 0, 0, 0, 0, 0];
       for (var oi = 0; oi < N; oi++) {
         var u = arr[oi];
         if (occ[u] <= 0 || u === GOAL) continue;
         if (!isFinite(dist[u])) continue;
-        var x = cx(u), y = cy(u), cnt = 0, best = Infinity;
-        for (var d = 0; d < 4; d++) {
-          var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
-          var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
-          if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
-          var v = idx(nx, ny);
+        var na = neighbours(st, u, all, aw), cnt = 0, best = Infinity, d;
+        for (d = 0; d < na; d++) {
+          var v = all[d];
           if (!(dist[v] < dist[u])) continue;      // strictly downhill only
-          nb[cnt] = v; if (dist[v] < best) best = dist[v];
+          nb[cnt] = v; nw[cnt] = aw[d];
+          if (dist[v] < best) best = dist[v];
           cnt++;
         }
         if (!cnt) continue;
         /* At T = 0 this is an even split over the steps that tie for cheapest.
-           Where a route has to make progress in both directions, every
-           staircase between here and there is equally good, so the mass fans
-           out; drawing one of them as the route would be a claim the arithmetic
-           does not support. Above zero, steps that are merely close get their
-           share too. chooseNext draws from exactly these weights, so the
-           picture and the units cannot disagree. */
+           Above zero, steps that are merely close get their share too.
+           chooseNext draws from exactly these weights, so the picture and the
+           units cannot disagree.
+
+           On the eight neighbourhood the ties are rarer than they were on four,
+           and that is the honest outcome rather than a loss: a diagonal at
+           SQRT2 beats the two straight steps of a staircase at 2, so where a
+           route has to make progress in both directions there IS now a single
+           best answer and the field says so. The fan survives where it is real,
+           which is against walls. */
         var sum = 0, j;
         for (j = 0; j < cnt; j++) {
           w[j] = T > 0 ? Math.exp(-(dist[nb[j]] - best) / T) : (tieEq(dist[nb[j]], best) ? 1 : 0);
           sum += w[j];
         }
         if (sum <= 0) { w[0] = 1; sum = 1; }
-        for (j = 0; j < cnt; j++) occ[nb[j]] += occ[u] * (w[j] / sum);
+        for (j = 0; j < cnt; j++) {
+          var share = occ[u] * (w[j] / sum);
+          occ[nb[j]] += share;
+          /* The length of the step that ARRIVES here, not of the cell. A cell
+             entered diagonally is crossed over 1.41 cell widths, so the unit
+             spends 1.41 times as long in it and takes 1.41 times the damage.
+             routeTime and expDamage integrate against this rather than against
+             occ, or both would read low by up to 30 percent on a diagonal
+             route while the threat field kept promising the higher number. */
+          dwell[nb[j]] += share * nw[j];
+        }
       }
       return occ;
     }
@@ -635,25 +735,24 @@
     function tieEq(a, b) { return Math.abs(a - b) <= 1e-9 * (1 + Math.abs(b)); }
 
     /* Expected wall-clock seconds from spawn to goal, integrating the
-       traversal time over the same occupancy distribution. */
+       traversal time over the dwell distribution rather than over occ: trav[i]
+       is the time to cross ONE cell width of i, and a cell entered diagonally
+       is crossed over 1.41 of them. */
     function routeTime(st, res) {
-      var t = 0;
-      for (var i = 0; i < N; i++) t += res.occ[i] * res.trav[i];
+      var t = 0, dw = res.occ.dwell || res.occ;
+      for (var i = 0; i < N; i++) t += dw[i] * res.trav[i];
       return t;
     }
 
     /* One greedy path, for cases that want a single line. Where steps tie it
        picks arbitrarily, so it is a sample from the fan and not the route. */
-    function greedyPath(res) {
+    function greedyPath(st, res) {
       var out = [SPAWN], cur = SPAWN, guard = 0;
+      var nb = [0, 0, 0, 0, 0, 0, 0, 0], wt = [0, 0, 0, 0, 0, 0, 0, 0];
       while (cur !== GOAL && guard++ < N * 2) {
-        var x = cx(cur), y = cy(cur), best = -1, bd = res.dist[cur];
-        for (var d = 0; d < 4; d++) {
-          var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
-          var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
-          if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
-          var v = idx(nx, ny);
-          if (res.dist[v] < bd) { bd = res.dist[v]; best = v; }
+        var cnt = neighbours(st, cur, nb, wt), best = -1, bd = res.dist[cur];
+        for (var d = 0; d < cnt; d++) {
+          if (res.dist[nb[d]] < bd) { bd = res.dist[nb[d]]; best = nb[d]; }
         }
         if (best < 0) break;
         cur = best; out.push(cur);
@@ -794,13 +893,12 @@
     function chooseNext(st, e, res) {
       var cur = idx(Math.round(e.x), Math.round(e.y));
       if (cur === GOAL) return GOAL;
-      var dist = res.dist, x = cx(cur), y = cy(cur);
+      var dist = res.dist;
+      var all = [0, 0, 0, 0, 0, 0, 0, 0], aw = [0, 0, 0, 0, 0, 0, 0, 0];
+      var na = neighbours(st, cur, all, aw);
       var nb = [], best = Infinity, d;
-      for (d = 0; d < 4; d++) {
-        var nx = x + (d === 0 ? -1 : d === 1 ? 1 : 0);
-        var ny = y + (d === 2 ? -1 : d === 3 ? 1 : 0);
-        if (nx < 0 || ny < 0 || nx >= GW || ny >= GH) continue;
-        var v = idx(nx, ny);
+      for (d = 0; d < na; d++) {
+        var v = all[d];
         if (!(dist[v] < dist[cur])) continue;
         nb.push(v);
         if (dist[v] < best) best = dist[v];
@@ -1377,7 +1475,7 @@
       TOWERS: TOWERS, TOWER_BY_ID: TOWER_BY_ID,
       ENEMIES: ENEMIES, ENEMY_BY_ID: ENEMY_BY_ID,
       WAVE_PLAN: WAVE_PLAN, RAMPS: RAMPS, RAMP_LIST: RAMP_LIST, RAMP_BY_ID: RAMP_BY_ID,
-      idx: idx, cx: cx, cy: cy,
+      idx: idx, cx: cx, cy: cy, neighbours: neighbours, SQRT2: SQRT2,
       makeState: makeState, slowField: slowField, dpsField: dpsField,
       ensureFields: ensureFields, solve: solve, occupancy: occupancy,
       greedyPath: greedyPath, routeTime: routeTime,
@@ -1899,6 +1997,15 @@
                 the isochrones draws them.
               </p>
               <p>
+                This is also the reason units move diagonally. The contour lines are drawn in continuous
+                space, so on open ground they run at whatever angle the field has, forty five degrees
+                included. For a while the units underneath them could only step in four directions, which
+                meant the picture was promising a route nobody could walk: the lines said go that way and
+                the pathfinder answered with a staircase. Eight neighbours are still not a continuum, and
+                a true wavefront would need one, but the gap between what is drawn and what is walked is
+                now small enough not to read as a contradiction.
+              </p>
+              <p>
                 That is also why the Slower bends routes the way a lens bends light. Fermat's principle
                 says light takes the path of least time, Snell's law is what that looks like at a boundary
                 between two speeds, and the pathfinder here is solving the same problem with the same
@@ -1930,21 +2037,34 @@
                 the time spent in it, which is the health a unit expects to lose there. The cost of a cell
                 is a weighted sum of the two, and the five unit types differ only in those weights, in how
                 fast they walk, in how fast they chew, and in one temperature that decides whether a step
-                that is merely close to cheapest is taken at all. Steps that tie exactly are split evenly
-                by everyone, which is why the field fans out wherever a route has to make progress in two
-                directions at once: all the staircases between here and there really are equally good, and
-                drawing one of them as the route would be a claim the arithmetic does not support.
+                that is merely close to cheapest is taken at all.
               </p>
               <p>
-                The temperature is worth one honest note, because it nearly did not survive. On an empty
-                board, on a board holding nothing but guns, and on a board holding nothing but slowers, it
-                changes precisely nothing: every branch point there has downhill neighbours that tie
-                exactly, so there is no near miss for a temperature to reach. Measured on those boards
-                alone it looks like a dead parameter, and it was very nearly deleted as one. Put walls in
-                and branch points start offering a genuinely worse alternative, anywhere from none at all
-                to about 43 percent depending on the unit and the maze, a few percent to twenty being
-                usual. It is not a knob that does nothing. It is a knob that does nothing until the board
-                has structure, which is the only situation anyone plays in.
+                Units move to any of the eight neighbouring cells, and a diagonal step costs the square
+                root of two, because that is how much further it actually goes. The factor is not a
+                detail: without it a diagonal would cover more ground for the same price, every route
+                would collapse into a staircase, and every tower would deliver about thirty percent less
+                than the threat field promises, since a unit that crosses a cell diagonally is under fire
+                for longer than the map says. A diagonal also needs its whole two by two square free of
+                buildings. Two walls that touch only at their corners look like a closed seam, and a
+                player who has just paid for that seam is entitled to have it hold. Note what this is not:
+                it is not a rule about where you may build. The diagonal is refused, the two straight
+                steps around it are not, so sealing the board in completely is still a legal move at the
+                same price as before.
+              </p>
+              <p>
+                The temperature is worth one honest note, because it has now been wrong in both
+                directions. On the four neighbour grid this tool started with, it changed precisely
+                nothing on an empty board, on a board of nothing but guns, or on a board of nothing but
+                slowers: every branch point there had downhill neighbours that tied exactly, so there was
+                no near miss for a temperature to reach. Measured on those boards alone it looked like a
+                dead parameter and was very nearly deleted as one; a countermeasurement on mazes brought
+                it back. Adding diagonals inverted the finding. The square root of two is irrational and
+                the cell costs are not, so a straight step and a diagonal one essentially never tie, and
+                every branch point on every board now offers a genuinely worse alternative. The parameter
+                went from invisible to always active without anyone touching it. What it buys is the
+                difference between a unit that walks one line and a swarm that arrives spread out, and
+                that difference is now visible on an empty board rather than only in a maze.
               </p>
               <p>
                 The two numbers next to the profile are computed by pushing one unit's worth of probability
@@ -2100,18 +2220,23 @@
         g.strokeStyle = 'rgba(226,232,240,.62)';
         g.lineWidth = Math.max(1, cs * 0.055);
         g.beginPath();
+        const arrNb = [0, 0, 0, 0, 0, 0, 0, 0], arrWt = [0, 0, 0, 0, 0, 0, 0, 0];
         for (let y = 0; y < C.GH; y++) for (let x = 0; x < C.GW; x++) {
           const i = C.idx(x, y);
           if (st.towerAt[i] >= 0) continue;
+          /* The same eight neighbours the units get, corner rule included, so
+             an arrow never points through a seam a unit may not cross. */
+          const cnt = C.neighbours(st, i, arrNb, arrWt);
           let bx = 0, by = 0, bd = res.dist[i];
-          const nbs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-          for (const d of nbs) {
-            const nx = x + d[0], ny = y + d[1];
-            if (nx < 0 || ny < 0 || nx >= C.GW || ny >= C.GH) continue;
-            const v = res.dist[C.idx(nx, ny)];
-            if (v < bd) { bd = v; bx = d[0]; by = d[1]; }
+          for (let d = 0; d < cnt; d++) {
+            const v = res.dist[arrNb[d]];
+            if (v < bd) { bd = v; bx = C.cx(arrNb[d]) - x; by = C.cy(arrNb[d]) - y; }
           }
           if (!bx && !by) continue;
+          /* Normalised, or a diagonal arrow comes out 1.41 times as long as a
+             straight one and the field looks like it has a speed. */
+          const inv = 1 / Math.hypot(bx, by);
+          bx *= inv; by *= inv;
           const px = (x + 0.5) * cs, py = (y + 0.5) * cs, L = cs * 0.3;
           g.moveTo(px - bx * L, py - by * L);
           g.lineTo(px + bx * L, py + by * L);
