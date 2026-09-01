@@ -2943,6 +2943,146 @@ var PCB = (function () {
     };
   }
 
+  /* The copper pullback: every strip of board that has to stay free of copper
+     because a router bit passes next to it, as PIXELS in a raster the caller
+     names.
+
+     Every fab demands a distance between copper and a routed edge, because the
+     bit leaves a burr and copper sitting on the cut comes back lifted or
+     shorted to the neighbouring board on the panel. Nothing in this tool used
+     to keep that distance: an area with no window on it runs all the way to its
+     dividing line, and the outermost dividing line IS the board edge, so a
+     plain board reported copper-to-edge along its whole outline. The DRC has
+     always said so; there was no way to act on it short of painting a hairline
+     window by hand around a traced cat. So the derivation does it, on both
+     sides and without asking. It is not a choice anyone could sensibly make
+     differently: below the fab's number the board is rejected, and above it it
+     costs a fraction of a millimetre of copper nobody sees.
+
+     Two contributions:
+
+       - along the profile, the board minus the board eroded by the distance;
+       - around every cutout, the cutout DILATED by the distance, its interior
+         included, because the interior carries no copper anyway and taking it
+         along saves a subtraction. Clipped back to the board, so a cutout on
+         the profile does not grow a margin out into the air.
+
+     PIXELS and not polygons, and that is the whole reason this function has the
+     shape it does. The rim is an annulus, and asking the tracer for an annulus
+     is asking for the one figure it cannot return as two rings: on a plain
+     rectangular board maskToPath came back with a single 52 point ring of the
+     right winding but bridged across itself, plus a stray blob in one corner,
+     and the polarity machinery downstream has no way to read that. Handing the
+     mask straight to unionPolys, in unionPolys's own raster, means the rim is
+     never traced on its own at all. It is unioned with the copper windows first
+     and the tracer sees one ordinary region with holes, which is what it is
+     good at.
+
+     Returns null when there is nothing to pull back, and throws nothing. */
+  function rimMaskPx(outer, cutRings, edgeMm, w, h, k) {
+    var d = +edgeMm;
+    if (!(d > 0) || !outer || !outer.length || !w || !h) return null;
+    var rPx = Math.ceil(d * k) + 1;
+    var n = w * h, i;
+
+    var board = new Uint8Array(n);
+    fillPolysPx(board, w, h, outer, k, 1);
+
+    /* edtSq measures to the nearest ZERO pixel, so run on the board mask itself
+       it gives the distance to the outside, which is the distance to the cut.
+       No inversion here; the inversion is what dilating needs.
+
+       openBorder, because the raster IS the board rectangle in the usual case
+       and a profile drawn on the board edge then has no background pixel beyond
+       it: without the flag every pixel measured as infinitely far from the cut
+       and the rim came out EMPTY, silently, on exactly the boards that need it
+       most. The dilation pass below must not set it, for the reason written at
+       edtSq: outside the raster is not a cutout.
+
+       rPx is rounded UP and then given one more pixel, and the asymmetry is
+       deliberate. This raster and the DRC's are different rasters sampled at
+       their own pixel centres: rounded to NEAREST the realised margin came out
+       about a pixel short and the DRC said so at the four corners of a
+       rectangular cutout, 0.271 mm against a limit of 0.3. Rounded up and no
+       more, it lands on 0.3000 mm exactly, which passes here and has nothing in
+       hand for whatever raster the fab's CAM uses. With the extra pixel the
+       measured clearance is 0.35 mm against a demand of 0.3, at 20 px/mm.
+
+       Short is the only direction that costs anything, because it is a rejected
+       board; 0.05 mm of extra rim is copper nobody can see. */
+    var inn = edtSq(board, w, h, true), r2 = rPx * rPx;
+    var rim = new Uint8Array(n);
+    var any = false;
+    for (i = 0; i < n; i++) {
+      if (board[i] && inn[i] <= r2) { rim[i] = 1; any = true; }
+    }
+
+    if (cutRings && cutRings.length) {
+      var cuts = new Uint8Array(n);
+      fillPolysPx(cuts, w, h, cutRings, k, 1);
+      var invCut = new Uint8Array(n);
+      for (i = 0; i < n; i++) invCut[i] = cuts[i] ? 0 : 1;
+      var outD = edtSq(invCut, w, h);
+      for (i = 0; i < n; i++) {
+        if (!board[i]) continue;
+        if (cuts[i] || outD[i] <= r2) { rim[i] = 1; any = true; }
+      }
+    }
+    return any ? rim : null;
+  }
+
+  /* One slot of memo in front of the rim mask, because the distance field over
+     it is the most expensive thing in the derivation and almost never the thing
+     that changed.
+
+     deriveLayers runs on every document change and the solver runs it twice per
+     solve. The rim depends on the profile and the cutouts alone, so paying for
+     it again because a part moved is a lot of nothing.
+
+     Keyed on the CONTENT of the two shapes, not on their identity. Identity was
+     the obvious first try and it is worthless here: every command clones the
+     whole document, so moving a part hands back a new outline object with the
+     same numbers in it, and the memo never hit once. So the key is a hash of the
+     outline polygons, the cutout rings and the raster, which is a few thousand
+     numbers against a multi-megapixel distance field.
+
+     One slot rather than a map: the app derives one document at a time, and a
+     map would keep a mask of every board opened this session alive. A miss costs
+     exactly what the call cost before the memo existed. */
+  var RIM_CACHE = null;
+
+  /* FNV-1a over the numbers, quantized to microns, which is a hundred times
+     finer than anything this tool draws. A collision would serve the rim of the
+     previous board, so the mixing is the real one rather than a sum. */
+  function hashNums(hash, arr) {
+    for (var i = 0; i < arr.length; i++) {
+      var v = Math.round(arr[i] * 1000) | 0;
+      for (var b = 0; b < 4; b++) {
+        hash ^= (v >>> (b * 8)) & 255;
+        hash = (hash * 16777619) >>> 0;
+      }
+    }
+    return hash;
+  }
+
+  function hashPolys(hash, polys) {
+    hash = hashNums(hash, [polys.length]);
+    for (var i = 0; i < polys.length; i++) {
+      hash = hashNums(hash, [polys[i].length]);
+      for (var j = 0; j < polys[i].length; j++) hash = hashNums(hash, polys[i][j]);
+    }
+    return hash;
+  }
+
+  function cachedRimMask(outer, cutRings, edgeMm, w, h, k) {
+    var rings = cutRings || [];
+    var key = hashPolys(hashPolys(hashNums(2166136261, [edgeMm, w, h, k]), outer), rings);
+    if (RIM_CACHE && RIM_CACHE.key === key) return RIM_CACHE.mask;
+    var mask = rimMaskPx(outer, rings, edgeMm, w, h, k);
+    RIM_CACHE = { key: key, mask: mask };
+    return mask;
+  }
+
   /* -------------------------------------------------- layer derivation */
 
   /* One area becomes one group: its outer rings and its hole rings kept apart.
@@ -3069,8 +3209,19 @@ var PCB = (function () {
 
      specs is a list of {side, templates}. Returns the traced rings, or null when
      a bundle has no label plane (keepLabels: false), so the caller can fall back
-     to the old per-region list rather than silently produce nothing. */
-  function unionPolys(bundles, specs, opts) {
+     to the old per-region list rather than silently produce nothing.
+
+     extra is a function that gets (mask, w, h, pxPerMm) and may set more pixels
+     in it, for a shape that removes copper without being a region at all. The
+     copper pullback along the routed edge is the only one, and it HAS to come in
+     here rather than as its own entry pair afterwards: an annulus is a clear
+     ring plus a dark ring, dark means dark and not "leave this alone", and
+     whichever of the two pairs goes last puts the other one's copper back.
+     Unioned into these pixels the rim is just more of the same window, with one
+     nesting and one polarity sequence, and nothing can restore it. Pixels rather
+     than polygons because the annulus cannot be traced on its own: see the note
+     at rimMaskPx. */
+  function unionPolys(bundles, specs, opts, extra) {
     opts = opts || {};
     var w = 0, h = 0, k = 0, i, b;
     for (i = 0; i < specs.length; i++) {
@@ -3116,6 +3267,20 @@ var PCB = (function () {
         }
       }
     });
+    if (extra) {
+      var before = new Uint8Array(mask);
+      extra(mask, w, h, k);
+      for (var ey = 0; ey < h; ey++) {
+        var erow = ey * w;
+        for (var ex = 0; ex < w; ex++) {
+          if (mask[erow + ex] === before[erow + ex]) continue;
+          if (ex < minX) minX = ex;
+          if (ex > maxX) maxX = ex;
+          if (ey < minY) minY = ey;
+          if (ey > maxY) maxY = ey;
+        }
+      }
+    }
     if (maxX < 0) return [];
 
     /* Cropped to what is set, so a small window on a large board costs a small
@@ -3179,55 +3344,11 @@ var PCB = (function () {
     var outlineGroups = [polysGroup(flattenPath(outlinePath(doc, tol), tol))];
     var outline = flatPolys(outlineGroups);
 
-    /* The copper pullback: a margin along the profile that carries no copper on
-       either side.
-
-       Every fab demands a distance between copper and the routed board edge,
-       because the router leaves a burr and copper right on the cut comes back
-       lifted or shorted to the next board on the panel. Nothing in this tool
-       used to keep that distance: an area with no window on it runs all the way
-       to its dividing line, and the outermost dividing line IS the board edge,
-       so a plain board reported a copper-to-edge violation along its whole
-       outline. The DRC has always said so; there was no way to act on it short
-       of painting a hairline window by hand around a traced cat.
-
-       So the derivation does it, on both sides and without asking. It is not a
-       design decision the user could sensibly make differently: below the fab's
-       number the board is rejected, and above it costs a fraction of a
-       millimetre of copper nobody sees.
-
-       Made as the ring between the profile and the profile shrunk by the
-       distance: CLEAR on the whole outline, then DARK again on the shrunk one,
-       so the two together erase nothing but the rim. It is a subtraction and
-       therefore cannot damage anything anyone drew on purpose. Where the user
-       already keeps the edge clear himself, which is the usual case on the
-       front when there is a silkscreen border, it removes copper that is not
-       there and changes nothing.
-
-       Mask and silkscreen are deliberately untouched. Silk running into the cut
-       comes out untidy; copper running into it comes back lifted or shorted to
-       the neighbouring board on the panel. Only one of the two is a defect, and
-       silk has its own rule on the check tab. */
+    /* The distance from copper to the routed edge is decided here, but the
+       geometry needs the cutouts, so the rim itself is built further down; this
+       is only the number. */
     var edgeMm = opts.copperEdgeMm != null ? +opts.copperEdgeMm
       : (fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish).copperEdgeMm || 0);
-    var edgeClear = [];
-    if (edgeMm > 0) {
-      try {
-        var shrunk = offsetPath(outlinePath(doc, tol), -edgeMm, { tolMm: tol });
-        if (!shrunk.empty) {
-          edgeClear = groupEntries(
-            [{ outer: outline, holes: flattenPath(shrunk.path, tol) }], 'clear');
-          edgeClear.forEach(function (e) { e.role = 'edgekeep'; });
-        }
-      } catch (e) {
-        /* A shape too small or too thin to survive the shrink. Leaving the
-           margin off is the honest failure: the DRC still reports the edge
-           clearance, and a board that cannot hold a rim that thin has a problem
-           this entry would only hide. Never fatal, because the whole derivation
-           hangs off this call. */
-        edgeClear = [];
-      }
-    }
 
     var mats = { front: templateGroups(bundles.front), back: templateGroups(bundles.back) };
     var flat = {};
@@ -3261,33 +3382,6 @@ var PCB = (function () {
     var fWindows = F.bare.concat(F.maskOnBare);
     var bWindows = B.bare.concat(B.maskOnBare);
 
-    /* Every list below that used to be a concat of per-region groups goes
-       through unionPolys instead; see the comment there for why. The concat is
-       kept as the fallback for a bundle without a label plane, which is what a
-       caller passing keepLabels: false gets.
-
-       One group cannot collide with anything, and the union of one region is
-       that region traced from the same pixels by the same tracer, so the trace
-       is skipped there. That is not only the cheap case, it is also the common
-       one, and it keeps a simple board's Gerber byte for byte what it was. */
-    var WIN = ['bare', 'maskOnBare'];
-    var spec = function (side, templates) { return { side: side, templates: templates }; };
-    var uni = function (specs, fallback, polarity) {
-      if (fallback.length > 1) {
-        var polys = unionPolys(bundles, specs, opts);
-        if (polys) return depthEntries(polys, polarity);
-      }
-      return groupEntries(fallback, polarity);
-    };
-    var fCuWin = uni([spec('front', WIN)], fWindows, 'clear');
-    var bCuWin = uni([spec('back', WIN), spec('front', WIN)],
-      bWindows.concat(fWindows), 'clear');
-    var fMaskOpen = uni([spec('front', ['bare', 'copper'])], F.bare.concat(F.copper), 'dark');
-    var bMaskOpen = uni([spec('back', ['bare', 'copper']), spec('front', ['bare'])],
-      B.bare.concat(B.copper).concat(F.bare), 'dark');
-    var fSilk = uni([spec('front', ['silk'])], F.silk, 'dark');
-    var bSilk = uni([spec('back', ['silk'])], B.silk, 'dark');
-
     /* Both sides' cutouts pooled into one list, because the mill does not know
        which side the seed was dropped on. Every entry made from it is CLEAR and
        comes last on its layer, so a cutout wins over anything drawn into the
@@ -3302,11 +3396,74 @@ var PCB = (function () {
        not come free. */
     var cutRings = flatPolys(cut);
 
+    /* The copper pullback, traced once and then handed to the copper window
+       union as if it were one more of the windows.
+
+       It cannot be its own entry pair. The rim is an annulus, the Gerber writer
+       emits one solid G36 region per polygon, so an annulus is a clear ring
+       followed by a dark ring, and a dark entry means dark rather than "leave
+       this alone". Whichever of the two pairs, rim or windows, is written last
+       puts the other one's copper back: after the windows the rim restores
+       every window, before them the windows restore the rim. The board that
+       showed it is the smallest one in the suite, 2 by 1.2 mm with a copper
+       trace 0.1 mm from the edge, where the rim removed the copper and the
+       window union handed it straight back.
+
+       So the rim goes into the union's raster with the windows and comes out of
+       the same trace: one nesting, one polarity sequence, and nothing left that
+       could restore it. Mask and silkscreen do NOT get it, deliberately: silk
+       running into the routed edge comes out untidy, copper running into it
+       comes back lifted or shorted to the neighbouring board on the panel, and
+       only one of the two is a defect. Silk has its own rule on the check tab.
+
+       Handed over as a function rather than as polygons, because the rim is
+       PIXELS: an annulus is the one figure the tracer cannot return as two
+       rings, and asking it for one came back as a single bridged ring plus a
+       stray blob in a corner. So it is painted into the union's own raster and
+       traced together with the windows, where it is an ordinary region with
+       holes. The note at rimMaskPx has the measurement.
+
+       Without a label plane (keepLabels: false) there is no union to join, and
+       then there is no rim either: appending it to the per-region fallback
+       would hit the very restore problem above. The DRC keeps reporting the
+       clearance in that case, which is the honest outcome. */
+    var rimPaint = edgeMm > 0 ? function (mask, mw, mh, mk) {
+      var rim = cachedRimMask(outline, cutRings, edgeMm, mw, mh, mk);
+      if (!rim) return;
+      for (var i = 0; i < rim.length; i++) if (rim[i]) mask[i] = 1;
+    } : null;
+
+    /* Every list below that used to be a concat of per-region groups goes
+       through unionPolys instead; see the comment there for why. The concat is
+       kept as the fallback for a bundle without a label plane, which is what a
+       caller passing keepLabels: false gets.
+
+       One group cannot collide with anything, and the union of one region is
+       that region traced from the same pixels by the same tracer, so the trace
+       is skipped there. That is not only the cheap case, it is also the common
+       one, and it keeps a simple board's Gerber byte for byte what it was. */
+    var WIN = ['bare', 'maskOnBare'];
+    var spec = function (side, templates) { return { side: side, templates: templates }; };
+    var uni = function (specs, fallback, polarity, extra) {
+      if (fallback.length > 1 || extra) {
+        var polys = unionPolys(bundles, specs, opts, extra);
+        if (polys) return depthEntries(polys, polarity);
+      }
+      return groupEntries(fallback, polarity);
+    };
+    var fCuWin = uni([spec('front', WIN)], fWindows, 'clear', rimPaint);
+    var bCuWin = uni([spec('back', WIN), spec('front', WIN)],
+      bWindows.concat(fWindows), 'clear', rimPaint);
+    var fMaskOpen = uni([spec('front', ['bare', 'copper'])], F.bare.concat(F.copper), 'dark');
+    var bMaskOpen = uni([spec('back', ['bare', 'copper']), spec('front', ['bare'])],
+      B.bare.concat(B.copper).concat(F.bare), 'dark');
+    var fSilk = uni([spec('front', ['silk'])], F.silk, 'dark');
+    var bSilk = uni([spec('back', ['silk'])], B.silk, 'dark');
+
     var board = groupEntries(outlineGroups, 'dark');
     var layers = {};
     layers['F.Cu'] = nonEmpty(board
       .concat(fCuWin)
-      .concat(edgeClear)
       .concat([entry(ring, 'dark', false, 'ring'), entry(bore, 'clear', false, 'bore')])
       .concat(cutClear));
     /* The pad entry comes BEFORE the window entries, unlike the plated rings
@@ -3330,7 +3487,6 @@ var PCB = (function () {
     layers['B.Cu'] = nonEmpty(board
       .concat([entry(padCu, 'dark', false, 'pad')])
       .concat(bCuWin)
-      .concat(edgeClear)
       .concat([entry(ring, 'dark', false, 'ring'), entry(bore, 'clear', false, 'bore')])
       .concat(etchEntries)
       .concat(cutClear));
