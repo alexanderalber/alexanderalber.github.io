@@ -3264,10 +3264,23 @@ var PCB = (function () {
        the whole point of the tool: a bare window painted on the FRONT takes the
        copper off the back at that spot, and if that eats a pad the user has to
        see it. The connectivity check reports exactly that as pad-dead. */
+    /* The back-copper solver, if it has run. ONE clear entry, the etch mask,
+       and it goes on last of the copper steps so it cuts through the pads and
+       the plated rings as well: the isolation channel between two nets is not
+       negotiable, and a pad the channel has to cross was in the wrong place.
+       The cutouts still come after it, because a hole beats everything.
+
+       THE INVARIANT: deriveLayers never calls the solver. The solver calls
+       deriveLayers WITHOUT opts.partition to get the plain copper mask, works
+       out these polygons, and the app then derives a second time with them.
+       Turning this into a call would make the two mutually recursive. */
+    var etchEntries = (opts.partition && opts.partition.etchPolys && opts.partition.etchPolys.length)
+      ? [entry(opts.partition.etchPolys, 'clear', false, 'etch')] : [];
     layers['B.Cu'] = nonEmpty(board
       .concat([entry(padCu, 'dark', false, 'pad')])
       .concat(bCuWin)
       .concat([entry(ring, 'dark', false, 'ring'), entry(bore, 'clear', false, 'bore')])
+      .concat(etchEntries)
       .concat(cutClear));
     /* Mask layers are negative files: what is drawn is an OPENING, and a cutout
        must therefore produce nothing here. Drawing it would tell the fab
@@ -4192,6 +4205,626 @@ var PCB = (function () {
       cur++;
     }
     return { owner: owner, dist: dist };
+  }
+
+  /* ------------------------------------------- back copper partition, stage 2
+
+     The solver proper. It answers one question: which of the three nets owns
+     each pixel of the back copper, and where does the mill have to run to keep
+     them apart.
+
+     THE LAYERING INVARIANT, and it is the reason there is no cycle here:
+     deriveLayers NEVER calls the solver; the solver calls deriveLayers. It
+     takes the plain derivation (a solid back plane) to get the copper mask,
+     works out the etch polygons, and hands them back for a SECOND derivation
+     that carries them as one clear entry. The app does both calls and passes
+     opts.regions through each time, so the expensive region flood runs once.
+
+     What the user gets out of it: he places the LEDs, which is the design
+     decision, and the tool wires the board. The back side stops being something
+     he draws traces on and becomes something the tool fills in, and almost all
+     the copper stays, because the only metal removed is the isolation channels
+     and the thermal reliefs. */
+
+  /* How much a corridor pays for hugging an obstacle. A route that grazes a
+     foreign pad at exactly the clearance is legal on paper and has no reserve
+     at all: one raster rounding and the DRC fails it. So the cost of entering a
+     pixel rises smoothly as the obstacle gets nearer, and the router buys its
+     way out of the tight spot with a detour.
+
+     ALPHA is the worst case detour a pixel can be worth: at 1.5 a path will go
+     up to about two and a half times as far to get off a wall. DMAX_MULT says
+     how far out the penalty reaches, in multiples of the clearance; beyond
+     three clearances there is nothing to gain and the field is flat, which also
+     keeps the heuristic honest. Both are taste, not measurement, and named so
+     they are one line from being changed. */
+  var ROUTE_ALPHA = 1.5;
+  var ROUTE_DMAX_MULT = 3;
+
+  /* Squared index distance helper for the two places that pick a nearest pad. */
+  function dist2(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  /* Which side of the button goes to the battery. A switch pad carries no net
+     of its own: the button sits BETWEEN BAT+ and VCC and either pad may take
+     either side. The tool decides it the only way that is not arbitrary, by
+     distance: the pad nearer the battery plus becomes BAT+, the other VCC. With
+     no battery on the board there is nothing to be near, and the assignment is
+     document order, which at least is stable. */
+  function assignSwitchPads(info) {
+    var out = {};
+    var keys = info.switchPads;
+    if (!keys.length) return out;
+    var batPad = null;
+    info.pads.forEach(function (p) {
+      if (p.net === 'BAT+' && !batPad) batPad = p;
+    });
+    if (!batPad || keys.length < 2) {
+      keys.forEach(function (k, i) { out[k] = i === 0 ? 'BAT+' : 'VCC'; });
+      return out;
+    }
+    var best = null, bestD = Infinity;
+    keys.forEach(function (k) {
+      var p = info.padByKey[k];
+      var d = dist2(p.cx, p.cy, batPad.cx, batPad.cy);
+      if (d < bestD) { bestD = d; best = k; }
+    });
+    keys.forEach(function (k) { out[k] = k === best ? 'BAT+' : 'VCC'; });
+    return out;
+  }
+
+  /* Which pads belong to which net for the purpose of the partition, switch
+     pads included by way of assignSwitchPads. Without a button BAT+ and VCC are
+     the same net and are merged, which is exactly what expectedNets means by
+     `bridged`: the two have to be connected, so giving them separate territories
+     would ask the solver to keep apart what the circuit needs joined. */
+  function partitionNets(doc) {
+    var info = expectedNets(doc);
+    var swAssign = assignSwitchPads(info);
+    var names = info.bridged ? ['GND', 'VCC'] : NETS.slice();
+    var remap = function (net) {
+      return (info.bridged && net === 'BAT+') ? 'VCC' : net;
+    };
+    var groups = {};
+    names.forEach(function (n) { groups[n] = []; });
+    info.pads.forEach(function (p) {
+      var net = p.role === 'sw' ? swAssign[p.key] : p.net;
+      if (!net) return;
+      net = remap(net);
+      if (groups[net]) groups[net].push(p);
+    });
+    /* Nets in the order they are routed, and the order is doing work: a net
+       routed earlier stamps corridors that later nets have to go around. GND
+       goes first because it is the largest net (every cathode plus the battery
+       minus), has the most edges and the least freedom; BAT+ last because it is
+       a single short hop and fits in whatever is left.
+       If a board ever turns up where this order deadlocks, the alternative is
+       one global edge list sorted by length, which is about five lines here. */
+    var order = names.filter(function (n) { return groups[n].length > 0; });
+    return { info: info, swAssign: swAssign, names: names, groups: groups, order: order };
+  }
+
+  /* A convex polygon pushed outwards by d millimetres, vertex by vertex along
+     the bisector of its two edges. For a rectangle, which is what every pad in
+     this tool is, that is exact; for anything convex it is the mitred offset,
+     and for a reflex corner it would overshoot, which is why this is not the
+     general offsetPath and does not pretend to be.
+     The winding is taken from the polygon rather than assumed: padPoly
+     normalises to positive area, but a caller that does not would otherwise get
+     a polygon shrunk instead of grown. */
+  function growPoly(poly, d) {
+    var m = poly.length;
+    if (m < 3 || !(d > 0)) return poly;
+    var sign = polyArea(poly) >= 0 ? 1 : -1;
+    var out = [];
+    for (var j = 0; j < m; j++) {
+      var prev = poly[(j + m - 1) % m], cur = poly[j], next = poly[(j + 1) % m];
+      /* Outward normals of the two edges meeting at this vertex. */
+      var e1x = cur[0] - prev[0], e1y = cur[1] - prev[1];
+      var e2x = next[0] - cur[0], e2y = next[1] - cur[1];
+      var l1 = Math.sqrt(e1x * e1x + e1y * e1y) || 1;
+      var l2 = Math.sqrt(e2x * e2x + e2y * e2y) || 1;
+      var n1x = sign * e1y / l1, n1y = -sign * e1x / l1;
+      var n2x = sign * e2y / l2, n2y = -sign * e2x / l2;
+      var bx = n1x + n2x, by = n1y + n2y;
+      var bl = Math.sqrt(bx * bx + by * by);
+      if (bl < 1e-9) { out.push([cur[0] + n1x * d, cur[1] + n1y * d]); continue; }
+      /* The miter length: the bisector has to travel 1/cos(half angle) further
+         than the edge normals, and the dot product of the unit bisector with
+         one unit normal IS that cosine. Clamped, because a needle-thin corner
+         would otherwise fly off to infinity. */
+      var ux = bx / bl, uy = by / bl;
+      var cos = ux * n1x + uy * n1y;
+      var k = cos > 0.2 ? 1 / cos : 5;
+      out.push([cur[0] + ux * d * k, cur[1] + uy * d * k]);
+    }
+    return out;
+  }
+
+  /* Everything the corridors must not run through, as a pixel mask.
+
+     A corridor of one net has to stay `clearance` away from every pad of every
+     OTHER net, from every drilled hole and from every cutout, and it has to
+     respect the fab's copper-to-edge distance. Grown by the clearance rather
+     than tested against it afterwards, because the router works on a boolean
+     grid and "may I be here" has to be answerable in one array lookup.
+
+     A pad of the net being routed is deliberately NOT keepout: the corridor has
+     to reach it, that being the point. */
+  function partitionKeepout(doc, derived, nets, px, clearanceMm, edgeMm, w, h) {
+    var n = w * h, i;
+    var out = {};
+    var holeList = doc.holes || [];
+    /* The board area, eroded by the copper-to-edge rule. Copper that runs into
+       the routed profile comes back with a burr or not at all, so the fab's own
+       number is the one place this is not taste. */
+    var area = new Uint8Array(n);
+    fillPolysPx(area, w, h, derived.outline || [], px, 1);
+    fillPolysPx(area, w, h, derived.cutouts || [], px, 0);
+    holeList.forEach(function (hh) {
+      fillPolysPx(area, w, h, [circlePoly(hh.x, hh.y, hh.d / 2, CIRC_TOL)], px, 0);
+    });
+    var edgePx = Math.max(0, edgeMm * px);
+    /* edtSq measures the distance to the nearest ZERO pixel of what it is
+       given, so it gets the board itself: a board pixel then reports how far it
+       is from the nearest non-board pixel, which is what the copper-to-edge
+       rule asks about.
+       openBorder: the raster IS the board rectangle, so copper running to the
+       edge has no background pixel beyond it and would otherwise measure as
+       infinitely far from an edge that is right there. Same argument as in the
+       DRC, and getting it wrong here lets a corridor sit on the profile. */
+    var dEdge = edtSq(area, w, h, true);
+    var inside = new Uint8Array(n);
+    var e2 = edgePx * edgePx;
+    for (i = 0; i < n; i++) inside[i] = (area[i] && dEdge[i] >= e2) ? 1 : 0;
+    out.inside = inside;
+
+    /* Two pad masks per net: the pads themselves, and the pads GROWN by the
+       clearance, which is what the other nets have to stay out of.
+
+       Grown by rasterizing the enlarged rectangle rather than by a distance
+       transform of the whole board, and that is the difference between this
+       function taking 350 ms and taking 20. A pad is a rectangle and padPoly
+       already knows how to expand one exactly; a distance transform would cost
+       one full-raster pass per net to answer a question about a few hundred
+       pixels. The corners come out square instead of round, which is stricter
+       than the rule by a hair in the corner and correct everywhere else, and
+       the router pays for the difference in a fraction of a pixel. */
+    var perNet = {}, grown = {};
+    nets.names.forEach(function (net) {
+      var m = new Uint8Array(n), gm = new Uint8Array(n);
+      nets.groups[net].forEach(function (p) {
+        fillPolysPx(m, w, h, [p.poly], px, 1);
+        fillPolysPx(gm, w, h, [growPoly(p.poly, clearanceMm)], px, 1);
+      });
+      perNet[net] = m;
+      grown[net] = gm;
+    });
+    var foreign = {};
+    nets.names.forEach(function (net) {
+      var mask = new Uint8Array(n);
+      nets.names.forEach(function (o) {
+        if (o === net) return;
+        var gm = grown[o];
+        for (i = 0; i < n; i++) if (gm[i]) mask[i] = 1;
+      });
+      foreign[net] = mask;
+    });
+    out.foreign = foreign;
+    out.perNet = perNet;
+    return out;
+  }
+
+  /* The cost field the router pays, one number per pixel.
+
+     Not a flat field, and the reason is the same as the keepout comment: a
+     corridor that touches a wall at exactly the clearance has no reserve. The
+     penalty is quadratic in how close the wall is, so the router leaves a tight
+     spot cheaply and stops caring once it is three clearances out.
+
+     `avoid` is what to stay away from, `pass` is where the path may go at all.
+     The minimum cost is 1, which is what makes the euclidean heuristic in
+     gridPath admissible. */
+  function routeCost(avoid, w, h, clearancePx) {
+    var n = w * h, i;
+    var cost = new Float64Array(n);
+    var dmax = Math.max(1, clearancePx * ROUTE_DMAX_MULT);
+    var inv = new Uint8Array(n);
+    var any = false;
+    for (i = 0; i < n; i++) { inv[i] = avoid[i] ? 0 : 1; if (avoid[i]) any = true; }
+    if (!any) { for (i = 0; i < n; i++) cost[i] = 1; return cost; }
+    var d2 = edtSq(inv, w, h);
+    for (i = 0; i < n; i++) {
+      var d = Math.sqrt(d2[i]);
+      var t = (dmax - d) / dmax;
+      if (t < 0) t = 0;
+      cost[i] = 1 + ROUTE_ALPHA * t * t;
+    }
+    return cost;
+  }
+
+  /* One pad into the seed plane, without taking a pixel an earlier net already
+     holds. `scratch` is a reusable buffer; only the pad's bounding box is
+     touched and cleared, so this stays proportional to the pad rather than to
+     the board. Overlapping pads of two different nets are a fault the
+     connectivity check reports, and this makes sure they do not silently swap
+     ownership on top of it. */
+  function stampPadSeed(seed, scratch, w, h, poly, px, label) {
+    var b = boundsOfPolys([poly]);
+    if (!b) return;
+    var x0 = Math.max(0, Math.floor(b.minX * px) - 1);
+    var y0 = Math.max(0, Math.floor(b.minY * px) - 1);
+    var x1 = Math.min(w - 1, Math.ceil(b.maxX * px) + 1);
+    var y1 = Math.min(h - 1, Math.ceil(b.maxY * px) + 1);
+    if (x1 < x0 || y1 < y0) return;
+    fillPolysPx(scratch, w, h, [poly], px, 1);
+    for (var y = y0; y <= y1; y++) {
+      var row = y * w;
+      for (var x = x0; x <= x1; x++) {
+        var i = row + x;
+        if (!scratch[i]) continue;
+        scratch[i] = 0;
+        if (seed[i] < 0) seed[i] = label;
+      }
+    }
+  }
+
+  /* Stamp a disc of radius rPx at every pixel of a path. The corridor is one
+     minimum-width trace wide, so a corridor squeezed through a gap IS a legal
+     trace and passes the DRC by construction rather than by luck. */
+  function stampCorridor(mask, w, h, path, rPx) {
+    var r = Math.max(0, rPx);
+    var ri = Math.ceil(r), r2 = r * r;
+    for (var k = 0; k < path.length; k++) {
+      var p = path[k], cx = p % w, cy = (p / w) | 0;
+      for (var dy = -ri; dy <= ri; dy++) {
+        var y = cy + dy;
+        if (y < 0 || y >= h) continue;
+        for (var dx = -ri; dx <= ri; dx++) {
+          var x = cx + dx;
+          if (x < 0 || x >= w) continue;
+          if (dx * dx + dy * dy > r2) continue;
+          mask[y * w + x] = 1;
+        }
+      }
+    }
+  }
+
+  /* The whole thing. See the pipeline comment at the top of this section.
+
+     opts: { derived (the PLAIN derivation, without opts.partition), pxPerMm,
+             clearanceMm, limits }
+     Returns everything the app and the check tab need, and never throws: a
+     board the solver cannot wire comes back with findings and whatever copper
+     it did manage, because a blank page tells the user nothing. */
+  function solvePartition(doc, opts) {
+    opts = opts || {};
+    var px = opts.pxPerMm == null ? PARTITION_PX_PER_MM : +opts.pxPerMm;
+    var lim = opts.limits || fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish);
+    var clearanceMm = opts.clearanceMm != null ? +opts.clearanceMm
+      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm : lim.spaceMm);
+    clearanceMm = Math.max(MIN_SOLVE_CLEARANCE_MM, clearanceMm);
+    var derived = opts.derived || deriveLayers(doc, opts);
+    var findings = [];
+
+    var ras = rasterizeCopper(derived, 'back', px);
+    var w = ras.width, h = ras.height, n = w * h, i;
+    var copper = ras.data;
+
+    var nets = partitionNets(doc);
+    var netIndex = {};
+    nets.order.forEach(function (net, k) { netIndex[net] = k; });
+
+    var pxOf = function (p) {
+      var ix = Math.floor(p.cx * px), iy = Math.floor(p.cy * px);
+      if (ix < 0 || iy < 0 || ix >= w || iy >= h) return -1;
+      return iy * w + ix;
+    };
+
+    /* Before anything else: can this board be wired at all? If two pads of one
+       net sit on pieces of copper that the graphic has cut apart, no partition
+       of that copper can join them, and saying so up front is far more useful
+       than a corridor that quietly fails to route. */
+    var cc = traceLib().labelComponents(copper, w, h, 1);
+    nets.order.forEach(function (net) {
+      var seen = null, seenPad = null;
+      nets.groups[net].forEach(function (p) {
+        var idx = pxOf(p);
+        var L = idx >= 0 && copper[idx] ? cc.labels[idx] : -1;
+        if (L < 0) return;
+        if (seen == null) { seen = L; seenPad = p; return; }
+        if (L !== seen) {
+          findings.push(finding('copper-severed', [seenPad.key, p.key], p.cx, p.cy, { net: net }));
+          seen = L; seenPad = p;
+        }
+      });
+    });
+
+    var keep = partitionKeepout(doc, derived, nets, px, clearanceMm,
+      lim.copperEdgeMm || 0, w, h);
+    var clearancePx = clearanceMm * px;
+    var traceRPx = Math.max(0.5, (lim.traceMm || clearanceMm) * px / 2);
+
+    /* What every net's router would rather keep away from: off the board, and
+       any pad at all. See the comment where it is used for why one field for
+       all nets is the right model and not a saving. */
+    var commonAvoid = new Uint8Array(n);
+    for (i = 0; i < n; i++) commonAvoid[i] = (copper[i] && keep.inside[i]) ? 0 : 1;
+    nets.names.forEach(function (net) {
+      var m = keep.perNet[net];
+      for (var q = 0; q < n; q++) if (m[q]) commonAvoid[q] = 1;
+    });
+    var sharedCost = routeCost(commonAvoid, w, h, clearancePx);
+
+    /* The seed plane. -1 everywhere, then each net's pads and the corridors
+       between them stamped with its index. A pixel already claimed by an
+       earlier net is not overwritten: the corridor that was laid first keeps
+       its copper, and the later net routes around it. */
+    var seed = new Int32Array(n);
+    for (i = 0; i < n; i++) seed[i] = -1;
+    var claimed = new Uint8Array(n);   // any net's seed, for the keepout below
+    var scratch = new Uint8Array(n);   // reused stamp buffer, cleared per use
+
+    nets.order.forEach(function (net) {
+      var k = netIndex[net];
+      var pads = nets.groups[net];
+      var anchors = [];
+      pads.forEach(function (p) {
+        var idx = pxOf(p);
+        if (idx < 0 || !copper[idx]) return;   // pad-dead, connectivity says so
+        anchors.push({ pad: p, idx: idx, x: idx % w, y: (idx / w) | 0 });
+        /* The pad itself is seed, all of it: a corridor arriving anywhere on
+           the rectangle has arrived. Stamped through a scratch mask rather than
+           straight into `seed`, so an earlier net keeps a pixel two pads happen
+           to share. Overlapping pads of different nets are a fault the
+           connectivity check reports; they must not silently change ownership
+           here on top of that. */
+        stampPadSeed(seed, scratch, w, h, p.poly, px, k);
+      });
+      pads.forEach(function (p) { fillPolysPx(claimed, w, h, [p.poly], px, 1); });
+      if (anchors.length < 2) return;
+
+      /* Where this net's corridors may run: on copper, inside the eroded board,
+         clear of foreign pads, and clear of what earlier nets already took.
+         Its own pads are punched back in, because a corridor has to be able to
+         end on one. */
+      var pass = new Uint8Array(n);
+      var foreign = keep.foreign[net];
+      for (i = 0; i < n; i++) {
+        pass[i] = (copper[i] && keep.inside[i] && !foreign[i] && !claimed[i]) ? 1 : 0;
+      }
+      var own = keep.perNet[net];
+      for (i = 0; i < n; i++) if (own[i] && copper[i]) pass[i] = 1;
+
+      /* The cost field is shared across the nets and computed once, from the
+         obstacles every net has in common: the board edge and every pad. The
+         per-net differences (foreign pads grown by the clearance, corridors an
+         earlier net already took) live in `pass`, where they are hard blocks.
+
+         That split is not a shortcut, it is where the two things belong. `pass`
+         decides what is LEGAL and has to be exact per net. The cost field only
+         expresses a PREFERENCE for keeping away from walls, and a preference
+         that is a little too cautious near a pad of your own net costs a
+         fraction of a millimetre of detour. Recomputing it per net cost 260 ms
+         of the 470 the routing took, to change nothing anyone could see. */
+      var cost = sharedCost;
+
+      /* Kruskal with the router as the feasibility oracle: build the tree on
+         euclidean lengths, route each edge, and if one cannot be routed, hand
+         Prim an infinite weight for that pair and let it pick the next cheapest
+         connection instead. Finitely many pairs, so it terminates; in practice
+         it runs zero times. */
+      var pts = anchors.map(function (a) { return [a.x, a.y]; });
+      var dead = {};
+      var routed = null;
+      for (var attempt = 0; attempt <= pts.length * pts.length; attempt++) {
+        var weight = function (a, b) {
+          if (dead[a + ':' + b]) return Infinity;
+          return Math.sqrt(dist2(pts[a][0], pts[a][1], pts[b][0], pts[b][1]));
+        };
+        var edges = netMst(pts, weight);
+        /* Prim stops early when everything still outside the tree is
+           unroutable, and that has to count as a failure rather than as a tree
+           with fewer edges. Without this the net silently keeps its pads as
+           separate seeds, the growth splits it in two, and the only symptom is
+           a net-split finding that blames the solver for the router's problem. */
+        if (edges.length < pts.length - 1) {
+          var orphanIdx = -1, inTree = {};
+          edges.forEach(function (ed) { inTree[ed[0]] = 1; inTree[ed[1]] = 1; });
+          inTree[0] = 1;
+          for (var q = 0; q < pts.length; q++) if (!inTree[q]) { orphanIdx = q; break; }
+          if (orphanIdx >= 0) {
+            findings.push(finding('route-blocked',
+              [anchors[0].pad.key, anchors[orphanIdx].pad.key],
+              anchors[orphanIdx].pad.cx, anchors[orphanIdx].pad.cy, { net: net }));
+          }
+        }
+        var paths = [], failed = null;
+        for (var e = 0; e < edges.length; e++) {
+          var a = edges[e][0], b = edges[e][1];
+          var pa = anchors[a], pb = anchors[b];
+          /* Bounded to the bounding box of the two endpoints plus a margin, so
+             a short hop does not scan the whole board. A margin of half the
+             separation, but never less than 8 mm, because on a short edge the
+             detour that saves it is absolute rather than proportional. */
+          var sep = Math.sqrt(dist2(pa.x, pa.y, pb.x, pb.y));
+          var mrg = Math.max(8 * px, 0.5 * sep);
+          var box = {
+            x0: Math.min(pa.x, pb.x) - mrg, y0: Math.min(pa.y, pb.y) - mrg,
+            x1: Math.max(pa.x, pb.x) + mrg, y1: Math.max(pa.y, pb.y) + mrg
+          };
+          var path = gridPath(cost, pass, w, h, pa.idx, pb.idx, box);
+          if (!path) path = gridPath(cost, pass, w, h, pa.idx, pb.idx);
+          if (!path) { failed = [a, b, pa, pb]; break; }
+          paths.push(path);
+        }
+        if (!failed) { routed = paths; break; }
+        dead[failed[0] + ':' + failed[1]] = 1;
+        dead[failed[1] + ':' + failed[0]] = 1;
+        if (attempt === pts.length * pts.length) {
+          findings.push(finding('route-blocked', [failed[2].pad.key, failed[3].pad.key],
+            failed[3].pad.cx, failed[3].pad.cy, { net: net }));
+        }
+      }
+      if (!routed) {
+        /* Route what can be routed and report the rest. Half a wired net is
+           still better to look at than none, and the finding names the pads. */
+        routed = [];
+      }
+      routed.forEach(function (path) {
+        var mask = new Uint8Array(n);
+        stampCorridor(mask, w, h, path, traceRPx);
+        for (i = 0; i < n; i++) {
+          if (!mask[i] || !copper[i]) continue;
+          if (seed[i] < 0) seed[i] = k;
+          claimed[i] = 1;
+        }
+      });
+    });
+
+    /* Step 6: grow. Every copper pixel goes to the net that reaches it first
+       THROUGH the copper, which is the step that leaves the maximum amount of
+       metal standing. */
+    var part = geodesicPartition(seed, copper, w, h);
+    var owner = part.owner;
+
+    /* Step 7: the channel. A pixel on the border between two owners, widened to
+       the clearance.
+
+       THE RADIUS IS ROUNDED UP, and this is the one place where the usual bias
+       of this file is deliberately reversed. Everywhere else (see openingLoss)
+       a marginal case is allowed to pass, because a false alarm costs the user
+       a hunt for a fault that is not there. Here a channel one pixel too narrow
+       is a SHORT between two nets and the board is scrap, while one pixel too
+       wide costs a sliver of copper nobody will miss. Do not turn this back
+       into a floor. */
+    var BDX = [1, -1, 0, 0, 1, 1, -1, -1];
+    var BDY = [0, 0, 1, -1, 1, -1, 1, -1];
+    var boundary = new Uint8Array(n);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        i = y * w + x;
+        var o = owner[i];
+        if (o < 0) continue;
+        for (var d = 0; d < 8; d++) {
+          var nx = x + BDX[d], ny = y + BDY[d];
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          var oj = owner[ny * w + nx];
+          if (oj >= 0 && oj !== o) { boundary[i] = 1; break; }
+        }
+      }
+    }
+    var chanRPx = Math.ceil(clearancePx / 2);
+    var actualClearanceMm = 2 * chanRPx / px;
+    var etch = new Uint8Array(n);
+    var anyB = false;
+    for (i = 0; i < n; i++) if (boundary[i]) { anyB = true; break; }
+    if (anyB) {
+      var invB = new Uint8Array(n);
+      for (i = 0; i < n; i++) invB[i] = boundary[i] ? 0 : 1;
+      var dB = edtSq(invB, w, h);
+      var cr2 = chanRPx * chanRPx;
+      for (i = 0; i < n; i++) if (dB[i] <= cr2) etch[i] = 1;
+    }
+
+    /* Orphans: copper no seed reached, because the graphic cut it off from
+       everything. It goes with the etch. Floating copper is a manufacturing
+       blemish the DFM complains about, and there is nothing useful to do with
+       a piece of metal that belongs to no net. The area is reported, because a
+       lot of it means the graphic is doing something the user did not intend. */
+    var orphanPx = 0;
+    for (i = 0; i < n; i++) {
+      if (copper[i] && owner[i] < 0) { etch[i] = 1; orphanPx++; }
+    }
+
+    var etchPx = 0;
+    for (i = 0; i < n; i++) if (etch[i] && copper[i]) etchPx++;
+    var pxArea = 1 / (px * px);
+
+    /* Step 9: the etch mask back into polygons, cropped to what is set, the
+       same way every other mask in this file is traced. */
+    var etchPolys = [];
+    var minX = w, minY = h, maxX = -1, maxY = -1;
+    for (i = 0; i < n; i++) {
+      if (!etch[i]) continue;
+      var ex = i % w, ey = (i / w) | 0;
+      if (ex < minX) minX = ex;
+      if (ex > maxX) maxX = ex;
+      if (ey < minY) minY = ey;
+      if (ey > maxY) maxY = ey;
+    }
+    if (maxX >= 0) {
+      var cw = maxX - minX + 1, ch2 = maxY - minY + 1;
+      var crop = new Uint8Array(cw * ch2);
+      for (var cy = 0; cy < ch2; cy++) {
+        var src = (cy + minY) * w + minX, dst = cy * cw;
+        for (var cx = 0; cx < cw; cx++) crop[dst + cx] = etch[src + cx];
+      }
+      etchPolys = flattenPath(maskToPath(crop, cw, ch2, minX, minY, px, opts),
+        opts.tolMm == null ? FLAT_TOL : +opts.tolMm);
+    }
+
+    /* Did it work? The same question the check tab asks, but asked here, where
+       the answer is cheap: a net whose territory came back in more than one
+       piece is a solver bug, not a user error, and the user would otherwise
+       find it in copper. */
+    var netStats = {};
+    nets.order.forEach(function (net) {
+      var k = netIndex[net];
+      var m = new Uint8Array(n);
+      var cnt = 0;
+      for (i = 0; i < n; i++) if (owner[i] === k && !etch[i]) { m[i] = 1; cnt++; }
+      var comp = cnt ? traceLib().labelComponents(m, w, h, 1).count : 0;
+      netStats[net] = { pixels: cnt, areaMm2: cnt * pxArea, components: comp };
+      if (comp > 1) {
+        var p0 = nets.groups[net][0];
+        findings.push(finding('net-split', [p0 ? p0.key : net], p0 ? p0.cx : null,
+          p0 ? p0.cy : null, { net: net, solver: true }));
+      }
+    });
+
+    /* A pad whose own copper the channel ate away. It happens where a corridor
+       is squeezed between two foreign pads and the clearance is wider than the
+       metal between them, and the answer is always the same: move the part a
+       millimetre, or ask for a narrower channel. */
+    nets.order.forEach(function (net) {
+      var k = netIndex[net];
+      nets.groups[net].forEach(function (p) {
+        var idx = pxOf(p);
+        if (idx < 0 || !copper[idx]) return;
+        if (owner[idx] === k && !etch[idx]) return;
+        findings.push(finding('pad-isolated', [p.key], p.cx, p.cy, { net: net }));
+      });
+    });
+
+    if (clearanceMm > 0 && actualClearanceMm > clearanceMm + 1e-9) {
+      findings.push(finding('clearance-tight', [], null, null, {
+        wantMm: round4(clearanceMm), gotMm: round4(actualClearanceMm)
+      }));
+    }
+
+    return {
+      etchPolys: etchPolys,
+      owner: { data: owner, width: w, height: h, pxPerMm: px },
+      copper: { data: copper, width: w, height: h, pxPerMm: px },
+      nets: nets.order,
+      netIndex: netIndex,
+      netStats: netStats,
+      swAssign: nets.swAssign,
+      placement: (doc.parts || []).map(function (p) {
+        return { id: p.id, type: p.type, x: +p.x, y: +p.y, rotDeg: +p.rotDeg || 0, pinned: !!p.pinned };
+      }),
+      findings: findings,
+      stats: {
+        etchedMm2: round4(etchPx * pxArea),
+        orphanMm2: round4(orphanPx * pxArea),
+        clearanceMm: round4(clearanceMm),
+        actualClearanceMm: round4(actualClearanceMm),
+        pxPerMm: px
+      }
+    };
   }
 
   /* DRC-lite: the checks that can be made honestly from what this tool knows.
@@ -6201,6 +6834,13 @@ var PCB = (function () {
     netMst: netMst,
     gridPath: gridPath,
     geodesicPartition: geodesicPartition,
+    solvePartition: solvePartition,
+    partitionNets: partitionNets,
+    assignSwitchPads: assignSwitchPads,
+    routeCost: routeCost,
+    growPoly: growPoly,
+    ROUTE_ALPHA: ROUTE_ALPHA,
+    ROUTE_DMAX_MULT: ROUTE_DMAX_MULT,
     rasterizeSide: rasterizeSide,
     coverageField: coverageField,
     maskToPath: maskToPath,
@@ -9082,6 +9722,9 @@ var PCB = (function () {
     const [view, setView] = useState({ z: 1, cx: 35, cy: 47.5 });
 
     const [boardDraft, setBoardDraft] = useState({ w: '70', h: '95' });
+    /* Empty means "whatever the fab demands", which is also how the document
+       stores a board that has never been told otherwise. */
+    const [clearDraft, setClearDraft] = useState('');
     const [holeDrafts, setHoleDrafts] = useState({});
     const [drillClick, setDrillClick] = useState('add');
 
@@ -9299,7 +9942,12 @@ var PCB = (function () {
 
     const stale = !bundles || bundles.doc !== doc;
 
-    const derived = useMemo(() => {
+    /* The PLAIN derivation: a solid back plane, exactly what this tool produced
+       before the solver existed. The solver reads its copper mask, and it is
+       also what the preview falls back to while a solve is running, which is
+       honest rather than blank: the back really is one sheet until the channels
+       are milled. */
+    const baseDerived = useMemo(() => {
       if (!bundles) return null;
       try {
         return PCB.deriveLayers(bundles.doc, { regions: { front: bundles.front, back: bundles.back } });
@@ -9307,6 +9955,66 @@ var PCB = (function () {
         return null;
       }
     }, [bundles]);
+
+    /* ---- the back copper solver ----
+
+       Second expensive stage, after the region flood and depending on it. About
+       a second on a 70x95 board at 20 px/mm, so it runs behind its own flag and
+       the page says it is working rather than freezing without explanation.
+
+       autoCopper === false is the off switch: the board then keeps the solid
+       back plane and the user wires it by hand, which is what this tool did
+       before and what a board whose solve fails can still be ordered as. */
+    const [partition, setPartition] = useState(null);
+    const [solving, setSolving] = useState(false);
+    const autoCopper = doc.board.autoCopper !== false;
+    const limits = PCB.fabLimits(doc.board.fab, doc.board.finish);
+    /* What the solver will actually use: the document's number if it has one,
+       the fab's minimum otherwise. Same fallback as in solvePartition, written
+       once here so the config tab and the solver cannot drift apart. */
+    const solveClearance = doc.board.clearanceMm == null ? limits.spaceMm : +doc.board.clearanceMm;
+
+    useEffect(() => {
+      if (!bundles || !baseDerived || !autoCopper) { setPartition(null); return undefined; }
+      let cancelled = false;
+      setSolving(true);
+      /* Two frames of slack before the work starts, so the "working" line is
+         painted before the main thread is taken. One rAF is not enough: the
+         first only schedules the paint. No worker, because the core block has
+         to stay evaluable for the tests and this file has no worker plumbing. */
+      const go = () => requestAnimationFrame(() => {
+        if (cancelled) return;
+        try {
+          const p = PCB.solvePartition(bundles.doc, { derived: baseDerived });
+          if (!cancelled) setPartition({ sol: p, doc: bundles.doc });
+        } catch (e) {
+          if (!cancelled) {
+            setPartition(null);
+            setErr('The copper solver failed: ' + (e && e.message ? e.message : 'unknown error'));
+          }
+        }
+        if (!cancelled) setSolving(false);
+      });
+      const id = requestAnimationFrame(go);
+      return () => { cancelled = true; cancelAnimationFrame(id); setSolving(false); };
+    }, [bundles, baseDerived, autoCopper]);
+
+    /* The derivation everything downstream sees. Falls back to the plain one
+       while the solve runs, so the preview never goes blank. */
+    const derived = useMemo(() => {
+      if (!baseDerived) return null;
+      if (!partition || partition.doc !== (bundles && bundles.doc)) return baseDerived;
+      try {
+        return PCB.deriveLayers(bundles.doc, {
+          regions: { front: bundles.front, back: bundles.back },
+          partition: partition.sol
+        });
+      } catch (e) {
+        return baseDerived;
+      }
+    }, [baseDerived, partition, bundles]);
+
+    const solution = (partition && bundles && partition.doc === bundles.doc) ? partition.sol : null;
 
     const lineMap = useMemo(() => {
       const m = {};
@@ -9406,8 +10114,11 @@ var PCB = (function () {
       if (restorePrompt) return undefined;
       const id = setTimeout(() => {
         try {
-          if (doc.objects.length || doc.seeds.length || doc.holes.length || doc.ref) {
-            localStorage.setItem('pcbDesignerDoc2', JSON.stringify(doc));
+          if (doc.objects.length || doc.seeds.length || doc.holes.length || doc.ref || (doc.parts || []).length) {
+            /* Stamped like the downloaded file, so a restored board is not
+               treated as one from before the solver and does not come back with
+               its battery and button pinned. */
+            localStorage.setItem('pcbDesignerDoc2', JSON.stringify(stamped()));
           } else {
             localStorage.removeItem('pcbDesignerDoc2');
           }
@@ -9429,6 +10140,10 @@ var PCB = (function () {
     useEffect(() => {
       setBoardDraft({ w: String(doc.board.widthMm), h: String(doc.board.heightMm) });
     }, [doc.board.widthMm, doc.board.heightMm]);
+
+    useEffect(() => {
+      setClearDraft(doc.board.clearanceMm == null ? '' : String(doc.board.clearanceMm));
+    }, [doc.board.clearanceMm]);
 
     /* One editable draft per hole, keyed by id, so a half typed number in one
        row does not disturb the others and a hole deleted elsewhere takes its
@@ -9543,6 +10258,30 @@ var PCB = (function () {
     }
 
     /* ---- base config ---- */
+
+    /* The isolation distance, edited as a draft like the board size and for the
+       same reason: a half-typed number must not run the solver. A blank field
+       means "whatever the fab demands", which is how the document stores it
+       too, so clearing the box is a real answer rather than an error. */
+    function commitClearance() {
+      const v = clearDraft === '' ? null : +clearDraft;
+      if (v !== null && (!isFinite(v) || v <= 0)) {
+        setClearDraft(doc.board.clearanceMm == null ? '' : String(doc.board.clearanceMm));
+        setErr('The isolation distance has to be a positive number, or empty for the fab minimum.');
+        return;
+      }
+      if (v !== null && v < PCB.MIN_SOLVE_CLEARANCE_MM) {
+        setClearDraft(String(PCB.MIN_SOLVE_CLEARANCE_MM));
+        setErr('Below ' + PCB.MIN_SOLVE_CLEARANCE_MM.toFixed(2)
+          + ' mm the tool cannot work the copper out accurately enough. Your fab asks for at least '
+          + limits.spaceMm + ' mm anyway.');
+        return;
+      }
+      setErr('');
+      const now = doc.board.clearanceMm == null ? null : +doc.board.clearanceMm;
+      if (v === now || (v !== null && now !== null && Math.abs(v - now) < 1e-9)) return;
+      runCmds([{ type: 'setBoard', board: { clearanceMm: v } }]);
+    }
 
     function commitBoard() {
       const w = +boardDraft.w, h = +boardDraft.h;
@@ -10444,6 +11183,42 @@ var PCB = (function () {
       return f.code;
     }
 
+    /* What the solver found, in sentences that turn the fault into an
+       instruction. The wording matters more than usual here: the user cannot
+       see the copper being worked out, so a finding is the only thing standing
+       between him and a board he does not understand. Every one of these ends
+       with what to DO about it. */
+    function solverText(f) {
+      const a = f.refs[0], b = f.refs[1];
+      if (f.code === 'copper-severed') {
+        return f.net + ' cannot be one piece of copper: ' + padName(a) + ' and ' + padName(b)
+          + ' sit on copper the graphic has cut apart. A window on the front takes the copper off the'
+          + ' back at the same spot, and one of yours runs the whole way through. Move a window or make'
+          + ' it narrower, so a bridge is left standing.';
+      }
+      if (f.code === 'route-blocked') {
+        return 'No route from ' + padName(a) + ' to ' + padName(b) + ' on ' + f.net
+          + ': every path between them is blocked by another net or by the board edge. Move one of the'
+          + ' two parts, or make the isolation distance smaller.';
+      }
+      if (f.code === 'pad-isolated') {
+        return 'The ' + padName(a) + ' pad ended up on a scrap of copper of its own: the clearance the'
+          + ' tool has to leave around the neighbouring pads is wider than the copper between them.'
+          + ' Move that part a millimetre or two, or reduce the isolation distance.';
+      }
+      if (f.code === 'net-split' && f.solver) {
+        return f.net + ' came back in more than one piece. That is a fault in this tool, not in your'
+          + ' board: the copper is meant to be separated by construction. Do not order this board;'
+          + ' turning off the automatic back copper under config lets you wire it by hand.';
+      }
+      if (f.code === 'clearance-tight') {
+        return 'You asked for ' + f.wantMm + ' mm of isolation and you are getting ' + f.gotMm
+          + ' mm: the copper is worked out on a grid and the channel is rounded up rather than down,'
+          + ' because a channel that is too narrow is a short circuit.';
+      }
+      return f.code;
+    }
+
     function drcText(f) {
       const name = RULE_LABEL[f.rule] || f.rule;
       const val = f.valueMm == null ? '' : mm2(f.valueMm) + ' against ' + mm2(f.limitMm);
@@ -10457,6 +11232,17 @@ var PCB = (function () {
        either. */
     const marks = useMemo(() => {
       const out = [];
+      /* Solver findings first, because they are the upstream cause: a pad the
+         channel isolated is also a broken net, and the user should be sent to
+         the one he can act on. Always on the back, which is the only side the
+         solver touches. */
+      ((solution && solution.findings) || []).forEach((f, i) => {
+        if (f.x == null) return;
+        out.push({
+          key: 's' + i, kind: 'solve', i: i, side: 'back', x: f.x, y: f.y,
+          color: f.code === 'clearance-tight' ? 'warn' : 'bad'
+        });
+      });
       ((conn && conn.findings) || []).forEach((f, i) => {
         if (f.x == null) return;
         out.push({ key: 'c' + i, kind: 'conn', i: i, side: 'back', x: f.x, y: f.y, color: 'bad' });
@@ -10469,7 +11255,7 @@ var PCB = (function () {
         });
       });
       return out;
-    }, [conn, drcRes]);
+    }, [conn, drcRes, solution]);
 
     /* Rebuilt when the connectivity result changes and when the skin changes,
        because the tint colours and the grey skin's outline-only variant are
@@ -10521,8 +11307,35 @@ var PCB = (function () {
       }
     }
 
+    /* The document as it goes out of the browser, carrying what the copper was
+       last worked out with.
+
+       The stamp is written HERE and not on every solve, for two reasons. It
+       would otherwise be a document change caused by looking at the document,
+       which loops through the solver and lands on the undo stack; and its whole
+       job is to mark a file that has been through the solver, which only
+       matters once the file leaves. Twenty bytes, and it buys the one thing a
+       recomputed result cannot say for itself: that this board was solved with
+       a different isolation distance than the one in force now, so the copper
+       may differ from Gerbers already exported.
+
+       algo is bumped by hand when a solver constant changes. */
+    function stamped() {
+      const out = PCB.cloneDoc(doc);
+      if (autoCopper) {
+        out.board.solveStamp = {
+          px: PCB.PARTITION_PX_PER_MM,
+          clearanceMm: solveClearance,
+          fab: doc.board.fab,
+          finish: doc.board.finish,
+          algo: 1
+        };
+      }
+      return out;
+    }
+
     function exportJson() {
-      download(new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' }), 'pcb-art-project.json');
+      download(new Blob([JSON.stringify(stamped(), null, 2)], { type: 'application/json' }), 'pcb-art-project.json');
     }
 
     function loadJson(file) {
@@ -11259,6 +12072,36 @@ var PCB = (function () {
       <span className="pcb-note">Ctrl+Z and Ctrl+Y do the same. ${doc.objects.length} object${doc.objects.length === 1 ? '' : 's'}, ${doc.seeds.length} seed point${doc.seeds.length === 1 ? '' : 's'}, ${doc.holes.length} hole${doc.holes.length === 1 ? '' : 's'}${outline ? '' : ', no outline yet'}.</span>
     </div>`;
 
+    /* What the back copper is doing, in one line under the history bar.
+
+       The solve takes about a second on a full-size board and blocks the main
+       thread while it runs, so saying nothing would read as a freeze. When it
+       has finished, the same line stops being a progress message and becomes
+       the result: how much copper was milled away, which is the only place the
+       "keep as much copper as possible" requirement is ever a number. */
+    const solveBar = (() => {
+      if (!autoCopper) {
+        return html`<p className="pcb-note">Automatic back copper is off: the back is one solid plane and
+          the traces on it are yours to draw. Turn it back on under config.</p>`;
+      }
+      if (solving || (!solution && bundles)) {
+        return html`<p className="pcb-note" role="status">Working out the back copper. This takes about a
+          second on a full-size board; the preview shows the solid plane until it is done.</p>`;
+      }
+      if (!solution) return null;
+      const s = solution.stats;
+      const bad = solution.findings.filter((f) => f.code !== 'clearance-tight');
+      const area = (+doc.board.widthMm || 0) * (+doc.board.heightMm || 0);
+      const pct = area > 0 ? (s.etchedMm2 / area * 100) : 0;
+      return html`<p className=${bad.length ? 'pcb-err' : 'pcb-note'} role="status">
+        Back copper solved: ${s.etchedMm2.toFixed(1)} mm² milled away, ${pct.toFixed(1)}% of the board,
+        the rest stays copper.${s.orphanMm2 > 0
+          ? ' ' + s.orphanMm2.toFixed(1) + ' mm² of it was copper no net could reach and went with it.'
+          : ''}${bad.length
+          ? ' ' + bad.length + ' thing' + (bad.length === 1 ? '' : 's') + ' to look at on the check tab.'
+          : ''}</p>`;
+    })();
+
     /* The view controls belong to the canvas, so they sit under it and inside
        the same frame. The zoom factor is in the status line next to them
        because "why is nothing visible" is almost always "you are at 14x". */
@@ -11637,6 +12480,42 @@ var PCB = (function () {
               tab, because a HASL board from Aisler is allowed a coarser trace than an ENIG one.
             </p>
           </div>
+          <!-- The one section the back copper solver owns. Two controls: the
+               channel width, and the off switch. Everything else about the
+               back side it works out for itself. -->
+          <div className="ctl-sec">
+            <p className="ctl-sec-h">Back copper</p>
+            <label className="pcb-note" style=${{ display: 'block' }}>
+              <input type="checkbox" checked=${autoCopper}
+                onChange=${(e) => runCmds([{ type: 'setBoard', board: { autoCopper: e.target.checked } }])} />
+              ${' '}Work out the back copper automatically
+            </label>
+            <p className="pcb-note" style=${{ marginTop: 8 }}>
+              On, the back is one sheet of copper divided into the three nets, and the only metal
+              removed is the channels between them. You place the LEDs and the tool does the rest.
+              Off, the back stays one solid plane and the traces on it are yours to draw, which is
+              what this tool did before. Turn it off to compare a board you find suspicious, or to
+              order one the solver cannot wire.
+            </p>
+            ${autoCopper ? html`<${React.Fragment}>
+              <div className="pcb-fields" style=${{ marginTop: 10 }}>
+                <${NumField} label="Isolation (mm)" value=${clearDraft} step="0.025"
+                  min=${PCB.MIN_SOLVE_CLEARANCE_MM}
+                  onChange=${(v) => setClearDraft(v)} onCommit=${commitClearance} />
+              </div>
+              <p className="pcb-note" style=${{ marginTop: 8 }}>
+                How wide the mill runs between two nets. ${solveClearance.toFixed(3)} mm by default,
+                which is what ${FAB_NAME[doc.board.fab]} demands as a minimum.
+                ${solution && solution.stats.actualClearanceMm > solution.stats.clearanceMm
+    ? ' The copper is worked out on a ' + (1 / PCB.PARTITION_PX_PER_MM).toFixed(2)
+      + ' mm grid, so you asked for ' + solution.stats.clearanceMm.toFixed(3)
+      + ' mm and you are getting ' + solution.stats.actualClearanceMm.toFixed(2) + ' mm.'
+    : ''}
+                Wider is safer and costs copper; narrower is only worth trying when a pad comes back
+                isolated on the check tab.
+              </p>
+            <//>` : null}
+          </div>
         </div>
       <//>`;
     } else if (tab === 'image') {
@@ -11788,9 +12667,14 @@ var PCB = (function () {
             pads is the anode: long leg on the long pad. The holder is a Keystone 1060 for a CR2032 cell, and
             the button sits in the plus line, so pressing it lights the board. Any number of LEDs, one holder,
             one button: the circuit is fixed, and that is what makes the netlist automatic.</p>
-          <p>Traces are copper strokes drawn on draw-back, 1 mm wide by default, which is what the boards this
-            is modelled on use. The pads show up there as an underlay, and with the point snap on, a stroke
-            end lands exactly on a pad centre. The check tab says whether the result is a circuit.</p>
+          <p>You do not wire this up. Placing the parts is the whole job: the tool divides the back copper into
+            the three nets itself and mills the channels between them, so the netlist is not only derived, it is
+            built. Almost all the copper stays, which is the opposite of drawing traces into an etched field.
+            The check tab is where it reports what it managed.</p>
+          <p>If you would rather do it by hand, turn the automatic back copper off under config. The back is
+            then one solid plane again and traces are copper strokes drawn on draw-back, 1 mm wide by default,
+            which is what the boards this is modelled on use. The pads show up there as an underlay, and with
+            the point snap on, a stroke end lands exactly on a pad centre.</p>
           <p>Parts of this kind are sold at <a href="https://shop.blinkyparts.com/de" target="_blank"
             rel="noopener">shop.blinkyparts.com</a>, which is where the footprints above come from.
             Personal recommendation, no affiliation fees, no commission.</p>
@@ -11958,6 +12842,7 @@ var PCB = (function () {
         </div>
       <//>`;
     } else if (tab === 'check') {
+      const solverFinds = (solution && solution.findings) || [];
       const findings = (conn && conn.findings) || [];
       const errs = findings.filter((f) => PCB.INCOMPLETE_CODES.indexOf(f.code) < 0);
       const todo = findings.filter((f) => PCB.INCOMPLETE_CODES.indexOf(f.code) >= 0);
@@ -11998,12 +12883,17 @@ var PCB = (function () {
           <p>The design checks ask whether a fab can make it: trace widths, copper spacing, copper to the board
             edge, silkscreen line widths, annular rings, drill diameters and drill to edge. Both fabs are
             documented profiles, and the numbers are editable below.</p>
+          <p>With the automatic back copper on, which it is unless you turned it off under config, this tab
+            stops being a debugger and becomes a receipt. The tool divides the back into the three nets itself
+            and mills only the channels between them, so the nets are separated and joined BY CONSTRUCTION.
+            What is listed below is the evidence: if anything here is red, the tool got it wrong and the board
+            should not be ordered.</p>
           <p>The thing worth knowing before reading any of it: a board starts as a continuous sheet of copper
-            under soldermask, on both sides. The templates take material away, they never add any. A stroke
-            painted with FR4 + copper opens the mask over copper that was already there; it does not create a
-            trace. What creates a trace is removing the copper AROUND it, with a window. So a board with
-            beautiful thick lines drawn on it and nothing else is one single piece of metal, and every net on it
-            is shorted to every other one.</p>
+            under soldermask, on both sides. The templates take material away, they never add any. That is why
+            the back copper is worked out rather than drawn: a stroke painted with FR4 + copper opens the mask
+            over copper that was already there and does not create a trace, so a back side with beautiful thick
+            lines on it and nothing else is one single piece of metal with every net shorted to every other one.
+            The graphic on the back still works exactly as before; the copper simply flows around it.</p>
           <p>The circuit being checked is fixed and derived from the parts: the LEDs sit in PARALLEL, GND is
             every cathode plus the battery minus, VCC is every anode, the button sits between the battery plus
             and VCC. Two LEDs in series would be reported as broken here, and would also not light up on a
@@ -12037,6 +12927,40 @@ var PCB = (function () {
           </div>
           <div>
             <div className="ctl-card">
+              <!-- The back copper, and what the solver could and could not do
+                   with it. It comes FIRST, before connectivity, because the
+                   connectivity report below is now a check on this one: with
+                   the solver on, the nets are separated by construction, so
+                   anything red down there is a bug up here. -->
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Back copper</p>
+                ${!autoCopper ? html`<p className="pcb-note">
+                  Off. The back is one solid plane and the traces on it are yours to draw, so the
+                  connectivity report below is a diagnosis rather than a confirmation.</p>`
+    : !solution ? html`<p className="pcb-note">Working it out.</p>` : html`<${React.Fragment}>
+                  <p className="pcb-note">
+                    ${solution.stats.etchedMm2.toFixed(1)} mm² milled away, the rest of the back stays
+                    copper. Isolation ${solution.stats.actualClearanceMm.toFixed(2)} mm.
+                    ${solution.stats.orphanMm2 > 0
+    ? ' ' + solution.stats.orphanMm2.toFixed(1) + ' mm² of it was copper no net could reach: a lot of that means the graphic is cutting the board up more than you meant it to.'
+    : ''}
+                  </p>
+                  ${PCB.NETS.filter((net) => solution.netStats[net]).map((net) => {
+      const st = solution.netStats[net];
+      const okc = st.components === 1;
+      return html`<div key=${net} className="pcb-checkrow">
+                      <span className="pcb-dot" style=${{ background: okc ? 'var(--tool-sig-good)' : 'var(--tool-sig-bad)' }}></span>
+                      <span><strong>${net}</strong>: ${st.areaMm2.toFixed(1)} mm²${okc ? ', one piece'
+    : ', in ' + st.components + ' pieces, which is a fault in this tool rather than in your board'}.</span>
+                    </div>`;
+    })}
+                  ${solverFinds.length ? html`<div className="pcb-findlist">
+                    ${solverFinds.map((f, i) => findRow('solve', i, f, solverText(f),
+    { color: f.code === 'clearance-tight' ? 'var(--tool-sig-warn)' : 'var(--tool-sig-bad)' }))}
+                  </div>` : html`<p className="pcb-note" style=${{ marginTop: 6 }}>
+                    Every net is one piece and every pad is on its own net. Nothing to fix.</p>`}
+                <//>`}
+              </div>
               <div className="ctl-sec">
                 <p className="ctl-sec-h">Connectivity</p>
                 ${!conn ? html`<p className="pcb-note">Working it out.</p>` : html`<${React.Fragment}>
@@ -12244,6 +13168,7 @@ var PCB = (function () {
       ${tabStrip}
       <div className="pcb-stage">${body}${tabHelp}</div>
       ${historyBar}
+      ${solveBar}
       ${err && html`<p className="pcb-err">${err}</p>`}
       ${msg && !err && html`<p className="pcb-note">${msg}</p>`}
       <details className="fold" style=${{ margin: '18px 0 0' }}>
