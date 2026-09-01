@@ -2069,34 +2069,18 @@
       markCell(g, C.GOAL, cs, COL.ok || '#34d399', 'out');
 
       /* --- towers --- */
-      for (const tw of st.towers) {
-        const def = C.TOWER_BY_ID[tw.type];
-        const x = tw.x * cs, y = tw.y * cs, pad = cs * 0.11;
-        g.fillStyle = COL.panel || '#1e293b';
-        g.strokeStyle = COL.label || '#94a3b8';
-        g.lineWidth = Math.max(1, cs * 0.05);
-        roundRect(g, x + pad, y + pad, cs - 2 * pad, cs - 2 * pad, cs * 0.16);
-        g.fill(); g.stroke();
-        g.fillStyle = COL.emph || '#e2e8f0';
-        g.font = '600 ' + Math.round(cs * 0.42) + 'px ui-sans-serif, system-ui, sans-serif';
-        g.textAlign = 'center'; g.textBaseline = 'middle';
-        g.fillText(def.name[0], x + cs / 2, y + cs / 2 + cs * 0.02);
-        if (tw.hp < tw.maxHp) {
-          const w = (cs - 2 * pad) * Math.max(0, tw.hp / tw.maxHp);
-          g.fillStyle = COL.danger || '#f87171';
-          g.fillRect(x + pad, y + cs - pad - cs * 0.09, w, cs * 0.075);
-        }
-      }
+      for (const tw of st.towers) drawTower(g, tw, cs);
 
       /* --- build preview --- */
       if (hover && hover.cell >= 0 && !hover.reason && hover.tool !== 'sell' && hover.tool !== 'none') {
         const def = C.TOWER_BY_ID[hover.tool];
         const x = C.cx(hover.cell) * cs, y = C.cy(hover.cell) * cs;
+        /* The preview is the silhouette that will stand there, not a generic
+           square: what the player is choosing between is the shapes. */
         g.save();
         g.globalAlpha = 0.55;
-        g.fillStyle = COL.info || '#38bdf8';
-        roundRect(g, x + cs * 0.11, y + cs * 0.11, cs * 0.78, cs * 0.78, cs * 0.16);
-        g.fill();
+        drawTower(g, { type: hover.tool, x: C.cx(hover.cell), y: C.cy(hover.cell),
+                       hp: 1, maxHp: 1, aim: -Math.PI / 2 }, cs);
         g.restore();
         const r = def.range || def.slowR || 0;
         if (r > 0) {
@@ -2151,43 +2135,228 @@
       }
 
       /* --- enemies --- */
-      for (const e of st.enemies) {
-        const prof = C.ENEMY_BY_ID[e.type];
-        const px = (e.x + 0.5) * cs, py = (e.y + 0.5) * cs, r = cs * (e.fly ? 0.24 : 0.2);
-        const hurt = Math.min(1, e.hurt || 0);
-        /* A flyer has no contact with the board, and the only way to say that
-           in a top down view is a shadow offset from the body. */
-        if (e.fly) {
-          g.fillStyle = withAlpha(COL.ink || '#020617', 0.4);
-          g.beginPath(); g.arc(px + cs * 0.17, py + cs * 0.2, r * 0.85, 0, Math.PI * 2); g.fill();
-        }
-        g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2);
-        /* Losing health dims the body towards the board instead of only moving
-           a bar: the colour is the unit's own, so a mauled runner still reads
-           as a runner. */
-        g.globalAlpha = 0.45 + 0.55 * Math.max(0.08, e.hp / e.maxHp);
-        g.fillStyle = prof.dot; g.fill();
-        g.globalAlpha = 1;
-        if (hurt > 0.01) {
-          g.fillStyle = withAlpha('#f8fafc', 0.75 * hurt);
-          g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2); g.fill();
-        }
-        g.strokeStyle = 'rgba(15,23,42,.85)'; g.lineWidth = 1; g.stroke();
-        if (e.hp < e.maxHp) {
-          g.beginPath();
-          g.arc(px, py, r + cs * 0.09, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.max(0, e.hp / e.maxHp));
-          g.strokeStyle = COL.ok || '#34d399';
-          g.lineWidth = Math.max(1.2, cs * 0.055);
-          g.stroke();
-        }
-        if (e.chew) {
-          g.strokeStyle = COL.danger || '#f87171';
-          g.lineWidth = Math.max(1, cs * 0.05);
-          g.beginPath(); g.arc(px, py, r + cs * 0.16, 0, Math.PI * 2); g.stroke();
-        }
-      }
+      for (const e of st.enemies) drawEnemy(g, e, cs);
 
       drawFx(g, st, cs);
+    }
+
+    /* ---------- silhouettes ----------
+
+       Five towers and five enemies have to be told apart at a cell width that
+       is often barely thirty pixels, sometimes less. A letter fails there
+       first: at that size the difference between an S and an M is two or three
+       pixels of stroke, and both are the same grey blob. An outline survives,
+       because the eye reads the shape of a thing before it reads anything
+       written on it, and it keeps working under every skin and under a coloured
+       field behind it.
+
+       The shapes are not decoration, they carry what the tower does. A barrel
+       means a direction, so the slower, which acts on the area around it and
+       has no direction at all, deliberately has none: it is a plain hexagon.
+       The gun's barrel is short and centred, the sniper's long and thin, the
+       mortar's thick and stubby and pinned at 45 degrees because it lobs rather
+       than aims. The wall is the only body with no turret at all. */
+
+    function poly(g, px, py, r, n, rot) {
+      g.beginPath();
+      for (let i = 0; i < n; i++) {
+        const a = rot + i * Math.PI * 2 / n;
+        const x = px + Math.cos(a) * r, y = py + Math.sin(a) * r;
+        if (i) g.lineTo(x, y); else g.moveTo(x, y);
+      }
+      g.closePath();
+    }
+
+    /* A barrel is a rounded bar from the centre outwards, so the pivot sits
+       where the turret sits and a turning tower does not wander in its cell. */
+    function barrel(g, px, py, ang, len, wid) {
+      g.save();
+      g.translate(px, py); g.rotate(ang);
+      g.lineCap = 'round';
+      g.lineWidth = wid;
+      g.beginPath(); g.moveTo(0, 0); g.lineTo(len, 0); g.stroke();
+      g.restore();
+      g.lineCap = 'butt';
+    }
+
+    function drawTower(g, tw, cs) {
+      const def = C.TOWER_BY_ID[tw.type];
+      const x = tw.x * cs, y = tw.y * cs, px = x + cs / 2, py = y + cs / 2;
+      const pad = cs * 0.11, in0 = cs - 2 * pad;
+      const frac = Math.max(0, Math.min(1, tw.hp / tw.maxHp));
+      const body = COL.panel || '#1e293b';
+      const edge = COL.label || '#94a3b8';
+      const metal = COL.emph || '#e2e8f0';
+      const lw = Math.max(1, cs * 0.05);
+
+      g.fillStyle = body; g.strokeStyle = edge; g.lineWidth = lw;
+
+      if (tw.type === 'wall') {
+        /* A solid block with two offset courses of brick. The joint lines are
+           the only marking, and they are what makes a row of walls read as one
+           built thing rather than five separate squares. */
+        g.fillRect(x + pad * 0.6, y + pad * 0.6, cs - 1.2 * pad, cs - 1.2 * pad);
+        g.strokeRect(x + pad * 0.6, y + pad * 0.6, cs - 1.2 * pad, cs - 1.2 * pad);
+        g.strokeStyle = withAlpha(edge, 0.55);
+        g.lineWidth = Math.max(1, cs * 0.035);
+        const x0 = x + pad * 0.6, x1 = x + cs - pad * 0.6;
+        g.beginPath();
+        for (let k = 1; k <= 2; k++) {
+          const yy = y + pad * 0.6 + (cs - 1.2 * pad) * k / 3;
+          g.moveTo(x0, yy); g.lineTo(x1, yy);
+        }
+        /* the head joints, offset course by course */
+        for (let k = 0; k < 3; k++) {
+          const yy0 = y + pad * 0.6 + (cs - 1.2 * pad) * k / 3;
+          const yy1 = yy0 + (cs - 1.2 * pad) / 3;
+          const mx = k % 2 ? (x0 + x1) / 2 : x0 + (x1 - x0) * 0.25;
+          g.moveTo(mx, yy0); g.lineTo(mx, yy1);
+          if (k % 2 === 0) { g.moveTo(x0 + (x1 - x0) * 0.75, yy0); g.lineTo(x0 + (x1 - x0) * 0.75, yy1); }
+        }
+        g.stroke();
+      } else if (tw.type === 'slower') {
+        poly(g, px, py, in0 * 0.5, 6, Math.PI / 6);
+        g.fill(); g.stroke();
+        /* Three rings instead of a barrel: the effect is a field around it. */
+        g.strokeStyle = withAlpha(COL.warn || '#fbbf24', 0.75);
+        g.lineWidth = Math.max(1, cs * 0.04);
+        for (let k = 1; k <= 3; k++) {
+          g.beginPath(); g.arc(px, py, in0 * 0.13 * k, 0, Math.PI * 2); g.stroke();
+        }
+      } else {
+        /* gun, mortar and sniper: a round base plus a barrel that says which */
+        g.beginPath(); g.arc(px, py, in0 * 0.46, 0, Math.PI * 2);
+        g.fill(); g.stroke();
+        const ang = tw.type === 'mortar' ? -Math.PI / 4 : (tw.aim == null ? -Math.PI / 2 : tw.aim);
+        g.strokeStyle = metal;
+        if (tw.type === 'gun') barrel(g, px, py, ang, in0 * 0.62, cs * 0.11);
+        else if (tw.type === 'sniper') barrel(g, px, py, ang, in0 * 0.95, cs * 0.055);
+        else barrel(g, px, py, ang, in0 * 0.42, cs * 0.19);
+        g.fillStyle = body; g.strokeStyle = edge; g.lineWidth = lw;
+        g.beginPath(); g.arc(px, py, in0 * 0.17, 0, Math.PI * 2);
+        g.fill(); g.stroke();
+      }
+
+      /* Damage crumbles the top right corner away rather than adding a bar.
+         Below half the bar comes back, because at that point the player wants
+         a number and not an impression. */
+      if (frac < 1) {
+        /* Painted in the board colour rather than punched out with a
+           composite operation: a tower cell is never tinted by the field
+           (blockedCells keeps it out), so the board colour is exactly what is
+           underneath, and destination-out would cut a hole through the canvas
+           to the page. */
+        const bite = (1 - frac) * in0 * 0.62;
+        g.fillStyle = COL.surface || '#0f172a';
+        g.beginPath();
+        g.moveTo(x + cs - pad * 0.5, y + pad * 0.5);
+        g.lineTo(x + cs - pad * 0.5 - bite, y + pad * 0.5);
+        g.lineTo(x + cs - pad * 0.5, y + pad * 0.5 + bite);
+        g.closePath();
+        g.fill();
+      }
+      if (frac < 0.5) {
+        g.fillStyle = COL.danger || '#f87171';
+        g.fillRect(x + pad, y + cs - pad - cs * 0.09, in0 * frac, cs * 0.075);
+      }
+    }
+
+    /* The enemy outlines follow the same rule: the shape says what the unit
+       weighs. The runner is a triangle pointed the way it is going, because
+       direction is the only thing it cares about; the cautious carries a shield;
+       the breaker is a heavy square with a bite out of its leading edge; the
+       swarm is three dots around one centre of mass, which is literally what it
+       is in the field; the flyer is a diamond over an offset shadow. */
+    function drawEnemy(g, e, cs) {
+      const prof = C.ENEMY_BY_ID[e.type];
+      const px = (e.x + 0.5) * cs, py = (e.y + 0.5) * cs;
+      const r = cs * (e.fly ? 0.26 : 0.23);
+      const hurt = Math.min(1, e.hurt || 0);
+      const frac = Math.max(0, e.hp / e.maxHp);
+      const head = Math.atan2(e.vy || 0, e.vx || 0);
+      const moving = (e.vx || e.vy) ? 1 : 0;
+
+      /* A flyer has no contact with the board, and the only way to say that in
+         a top down view is a shadow offset from the body. */
+      if (e.fly) {
+        g.save();
+        g.translate(px + cs * 0.17, py + cs * 0.2);
+        g.fillStyle = withAlpha(COL.ink || '#020617', 0.4);
+        poly(g, 0, 0, r * 0.85, 4, 0);
+        g.fill();
+        g.restore();
+      }
+
+      const path = () => {
+        if (e.type === 'runner') {
+          const a = moving ? head : 0;
+          g.beginPath();
+          g.moveTo(px + Math.cos(a) * r * 1.25, py + Math.sin(a) * r * 1.25);
+          g.lineTo(px + Math.cos(a + 2.5) * r, py + Math.sin(a + 2.5) * r);
+          g.lineTo(px + Math.cos(a - 2.5) * r, py + Math.sin(a - 2.5) * r);
+          g.closePath();
+        } else if (e.type === 'cautious') {
+          poly(g, px, py, r * 1.05, 6, Math.PI / 2);
+        } else if (e.type === 'breaker') {
+          g.beginPath();
+          g.rect(px - r * 0.95, py - r * 0.95, r * 1.9, r * 1.9);
+        } else if (e.type === 'flyer') {
+          poly(g, px, py, r, 4, moving ? head : 0);
+        } else {
+          /* swarm: one unit is three bodies, so it is drawn as three */
+          g.beginPath();
+          for (let k = 0; k < 3; k++) {
+            const a = -Math.PI / 2 + k * Math.PI * 2 / 3 + (moving ? head : 0);
+            const ox = px + Math.cos(a) * r * 0.52, oy = py + Math.sin(a) * r * 0.52;
+            g.moveTo(ox + r * 0.5, oy);
+            g.arc(ox, oy, r * 0.5, 0, Math.PI * 2);
+          }
+        }
+      };
+
+      /* Losing health dims the body towards the board instead of only moving a
+         bar: the colour is the unit's own, so a mauled runner still reads as a
+         runner. */
+      path();
+      g.globalAlpha = 0.45 + 0.55 * Math.max(0.08, frac);
+      g.fillStyle = prof.dot; g.fill();
+      g.globalAlpha = 1;
+      if (hurt > 0.01) {
+        path();
+        g.fillStyle = withAlpha('#f8fafc', 0.75 * hurt);
+        g.fill();
+      }
+      path();
+      g.strokeStyle = 'rgba(15,23,42,.85)'; g.lineWidth = 1; g.stroke();
+
+      /* The cautious gets its shield boss, the breaker its chipped edge: both
+         inside the outline, so neither changes the footprint. */
+      if (e.type === 'cautious') {
+        g.strokeStyle = withAlpha('#f8fafc', 0.55);
+        g.lineWidth = Math.max(1, cs * 0.035);
+        poly(g, px, py, r * 0.5, 6, Math.PI / 2);
+        g.stroke();
+      } else if (e.type === 'breaker') {
+        g.fillStyle = withAlpha(COL.ink || '#020617', 0.45);
+        g.beginPath();
+        g.moveTo(px + r * 0.95, py - r * 0.3);
+        g.lineTo(px + r * 0.35, py);
+        g.lineTo(px + r * 0.95, py + r * 0.3);
+        g.closePath(); g.fill();
+      }
+
+      if (e.hp < e.maxHp) {
+        g.beginPath();
+        g.arc(px, py, r + cs * 0.1, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+        g.strokeStyle = COL.ok || '#34d399';
+        g.lineWidth = Math.max(1.2, cs * 0.055);
+        g.stroke();
+      }
+      if (e.chew) {
+        g.strokeStyle = COL.danger || '#f87171';
+        g.lineWidth = Math.max(1, cs * 0.05);
+        g.beginPath(); g.arc(px, py, r + cs * 0.17, 0, Math.PI * 2); g.stroke();
+      }
     }
 
     /* Sparks, blasts and the number the core just lost. Nothing here is read
@@ -2253,16 +2422,6 @@
       g.font = '700 ' + Math.round(cs * 0.3) + 'px ui-sans-serif, system-ui, sans-serif';
       g.textAlign = 'center'; g.textBaseline = 'middle';
       g.fillText(kind === 'in' ? 'IN' : 'OUT', x + cs / 2, y + cs / 2);
-    }
-
-    function roundRect(g, x, y, w, h, r) {
-      g.beginPath();
-      g.moveTo(x + r, y);
-      g.arcTo(x + w, y, x + w, y + h, r);
-      g.arcTo(x + w, y + h, x, y + h, r);
-      g.arcTo(x, y + h, x, y, r);
-      g.arcTo(x, y, x + w, y, r);
-      g.closePath();
     }
 
     ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
