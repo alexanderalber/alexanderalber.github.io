@@ -3260,6 +3260,29 @@ var PCB = (function () {
       b.regions.forEach(function (r) {
         if (spec.templates.indexOf(r.template) >= 0) { want[r.labelId] = 1; any = true; }
       });
+      /* The STROKES of the same templates, stamped from their traced polygons
+         rather than from the label plane, because they are not in it: a stroke
+         is its own object with its own width and it never became a region.
+
+         Leaving them out was a silent hole, and the shape of it is worth
+         writing down. The fallback path below (groupEntries) walks
+         bundle.items, which is regions AND strokes, so a stroke painted bare
+         took its copper away exactly as a contour did. The union path walked
+         bundle.regions only. Which of the two runs is decided by
+         `fallback.length > 1 || extra`, and `extra` is the edge pullback, which
+         is non-zero on every real board: so on any board a fab would accept,
+         every bare or maskOnBare STROKE opened the mask and removed no copper
+         at all. The preview showed a window, the copper layer had none, and
+         nothing said so. Measured on a 40x30 board with a 3 mm bare stroke: the
+         copper stayed at 1151.5 mm2 with the pullback on and dropped to
+         1059.9 mm2 with it off, from one and the same board. */
+      var sPolys = [];
+      (b.strokes || []).forEach(function (s) {
+        if (spec.templates.indexOf(s.template) >= 0 && s.polys && s.polys.length) {
+          sPolys = sPolys.concat(s.polys);
+          any = true;
+        }
+      });
       if (!any) return;
       var labels = b.labels;
       var wants = function (L) { return L >= 0 && want[L] === 1; };
@@ -3280,13 +3303,24 @@ var PCB = (function () {
           }
           if (!on) continue;
           mask[idx] = 1;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
         }
       }
+      if (sPolys.length) fillPolysPx(mask, w, h, sPolys, k, 1);
     });
+    /* One pass for the bounding box, after every spec has had its say. The
+       strokes arrive through fillPolysPx, which sets pixels without reporting
+       where, so tracking the box inside the loops above would miss exactly
+       them. */
+    for (var by = 0; by < h; by++) {
+      var brow = by * w;
+      for (var bx = 0; bx < w; bx++) {
+        if (!mask[brow + bx]) continue;
+        if (bx < minX) minX = bx;
+        if (bx > maxX) maxX = bx;
+        if (by < minY) minY = by;
+        if (by > maxY) maxY = by;
+      }
+    }
     if (extra) {
       var before = new Uint8Array(mask);
       extra(mask, w, h, k);
@@ -13687,6 +13721,45 @@ var PCB = (function () {
       ctx.restore();
     }
 
+    /* The part OUTLINES alone: the dashed body box and the reference, without
+       the copper fill and without the polarity signs. The drill tab wants this
+       and not drawParts. It already has the pads from the rendered back side
+       underneath it, so a second copper fill would only double the ink, and the
+       big polarity glyphs belong to the blinky tab, where placing a part the
+       right way round is the job. Here they would be noise over a picture that
+       is being read for something else: where the parts physically sit, so a
+       hole does not land under the battery holder. */
+    function drawPartBodies(ctx, V, dpr) {
+      ctx.save();
+      ctx.font = (11 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.setLineDash([5 * dpr, 4 * dpr]);
+      ctx.strokeStyle = COL.note;
+      ctx.lineWidth = 1.2 * dpr;
+      parts.forEach((it) => {
+        const p = it.part;
+        const body = bodyPoly(p);
+        tracePolys(ctx, [body], V);
+        ctx.stroke();
+        const c = p.def.bodyCircle;
+        if (c) {
+          const q = V.toPx.apply(null, partToDoc(p, c.cxMm, c.cyMm));
+          ctx.beginPath();
+          ctx.arc(q[0], q[1], Math.max(2, c.rMm * V.k), 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        const pix = body.map((pt) => V.toPx(pt[0], pt[1]));
+        let lx = Infinity, ly = Infinity;
+        pix.forEach((q) => { lx = Math.min(lx, q[0]); ly = Math.min(ly, q[1]); });
+        ctx.save();
+        ctx.setLineDash([]);
+        ctx.fillStyle = COL.note;
+        ctx.fillText(p.ref, lx, ly - 9 * dpr);
+        ctx.restore();
+      });
+      ctx.restore();
+    }
+
     /* The placement overlay: pads in copper, the body as a dashed outline, and
        the reference designator beside it. The body is a drawing aid and nothing
        else, which is what the dashes say: it is not printed, not exported and
@@ -14724,11 +14797,20 @@ var PCB = (function () {
       <//>`;
     } else if (tab === 'drill') {
       body = html`<${React.Fragment}>
-        ${lead('drill', 'What this tab is for', html`<p>
-          Round holes: for hanging the board up, for a screw, for whatever the artwork needs. A plated hole gets a copper ring
-          on both sides and an opening in both masks; an unplated one is drilled and nothing else, and the two go into separate
-          Excellon files. The origin is the top left corner of the board, y pointing down.
-        </p>`)}
+        ${lead('drill', 'What this tab is for', html`<${React.Fragment}>
+          <p>
+            Round holes: for hanging the board up, for a screw, for whatever the artwork needs. A plated hole gets a copper ring
+            on both sides and an opening in both masks; an unplated one is drilled and nothing else, and the two go into separate
+            Excellon files. The origin is the top left corner of the board, y pointing down.
+          </p>
+          <p>
+            Underneath the artwork the finished BACK is shown, dimmed: the copper, the channels milled between the nets and the
+            pads of the parts, with the part bodies dashed on top. That is what decides where a hole may go. Through the middle
+            of a copper plane it usually may; through a pad, through a part body or across one of the narrow isolation channels
+            it may not, because the hole takes the copper with it and the net it belonged to stops there. This view is not
+            mirrored, because drill coordinates are a top view, so the back appears here the other way round than on the parts tab.
+          </p>
+        <//>`)}
         <div className="pcb-split">
           <div>
             <${BoardCanvas} bw=${bw} bh=${bh} mirror=${false} fill=${true}
@@ -14736,7 +14818,29 @@ var PCB = (function () {
               onDown=${drillDown}
               draw=${(ctx, V, W, H, dpr) => {
                 drawFrame(ctx, V, dpr);
+                /* The finished BACK as the underlay, dimmed, because the back is
+                   where the question "may I drill here" is actually decided: the
+                   solved copper, the isolation channels between the nets and the
+                   pads all live there, and a hole through a 1 mm channel or
+                   through a pad is the mistake this tab exists to prevent. A
+                   hole through the middle of a GND plane is usually fine, and
+                   the picture now says which of the two you are about to do.
+                   The front graphic goes over it at full strength, because the
+                   artwork is still what a hole has to look right in.
+
+                   This view is NOT mirrored, unlike every other back-side tab:
+                   drill coordinates are a top view, that is what the origin note
+                   above the canvas promises and what the Excellon files say. So
+                   the back appears here left to right flipped against the blinky
+                   tab. Deliberate, and viewIsMirrored('drill') stays false. */
+                if (derived) {
+                  ctx.save();
+                  ctx.globalAlpha = 0.45;
+                  renderSide(ctx, W, H, derived, 'back', V, fab);
+                  ctx.restore();
+                }
                 drawObjects(ctx, V, 'front', dpr, null);
+                drawPartBodies(ctx, V, dpr);
                 drawHoles(ctx, V, dpr);
               }} />
             ${viewBar}
