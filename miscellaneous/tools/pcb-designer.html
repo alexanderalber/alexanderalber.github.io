@@ -4762,7 +4762,7 @@ var PCB = (function () {
      taken out, and this file's Gerber writer emits one solid region per
      polygon. In the raster it is a subtraction like any other, and it joins the
      etch mask that is traced back into polygons once, at the end. */
-  function stampThermal(out, w, h, pad, spec, px) {
+  function stampThermal(out, w, h, pad, spec, px, sibling) {
     var poly = pad.poly;
     var ax = padAxes(poly);
     if (!ax) return;
@@ -4790,23 +4790,58 @@ var PCB = (function () {
     sub([growPoly(poly, gap)], 1);
     sub([poly], 0);
 
-    /* The spokes, as rectangles through the pad centre along its two axes. Each
-       is long enough to cross the whole ring in both directions, and only the
-       part of it that lies in the ring matters, the rest falling on pixels that
-       are already zero. */
+    /* The four spokes, each its own half-rectangle from the pad centre outward
+       rather than two full ones through it, because one of them may have to be
+       left out.
+
+       THE SPOKE POINTING AT THE OTHER PAD OF THE SAME PART IS NOT DRAWN. The
+       two pads of an LED sit 1.016 mm apart with the isolation channel between
+       them, so the ring gap on that side opens into the channel and the spoke
+       ends after a fraction of a millimetre. Measured over fourteen rotations
+       and 56 pads, that spoke gives the pad access to exactly 0.200 mm^2 of
+       extra copper, which is 0.5 mm of spoke width times the 0.4 mm ring gap:
+       its own area, joined to nothing. One case in 56 differed, and that was on
+       the board whose GND falls apart in the partition anyway.
+
+       Deliberately a statement about the footprint and not a general test. The
+       general form ("only draw a spoke that reaches copper") is harder than it
+       looks, because a spoke IS copper crossing the ring band and therefore
+       satisfies the naive version of its own condition. Three attempts at it
+       were thrown away; this is the claim that the measurement actually
+       supports.
+
+       `sibling` is the other pad's centre, or null for a part whose pads are far
+       apart, in which case all four spokes are drawn. */
     var cx = 0, cy = 0, m = poly.length;
     for (var j = 0; j < m; j++) { cx += poly[j][0]; cy += poly[j][1]; }
     cx /= m; cy /= m;
     var half = +spec.spokeWMm / 2;
     if (half > 0) {
       var reach = Math.max(b.maxX - b.minX, b.maxY - b.minY);
-      [[ax.ux, ax.uy, ax.vx, ax.vy], [ax.vx, ax.vy, ax.ux, ax.uy]].forEach(function (d) {
-        var lx = d[0], ly = d[1], nx = d[2], ny = d[3];
+      var dirs = [[ax.ux, ax.uy], [-ax.ux, -ax.uy], [ax.vx, ax.vy], [-ax.vx, -ax.vy]];
+      /* Which of the four points at the sibling: the largest dot product with
+         the direction to it. Taken from the polygon's own axes rather than from
+         rotDeg, for the reason stated at padAxes. */
+      var skip = -1;
+      if (sibling) {
+        var tx = sibling[0] - cx, ty = sibling[1] - cy;
+        var tl = Math.sqrt(tx * tx + ty * ty);
+        if (tl > 1e-9) {
+          var best = -2;
+          for (var q = 0; q < 4; q++) {
+            var dot = (dirs[q][0] * tx + dirs[q][1] * ty) / tl;
+            if (dot > best) { best = dot; skip = q; }
+          }
+        }
+      }
+      dirs.forEach(function (d, k) {
+        if (k === skip) return;
+        var lx = d[0], ly = d[1], nx = -ly, ny = lx;
         sub([[
-          [cx - lx * reach - nx * half, cy - ly * reach - ny * half],
+          [cx - nx * half, cy - ny * half],
           [cx + lx * reach - nx * half, cy + ly * reach - ny * half],
           [cx + lx * reach + nx * half, cy + ly * reach + ny * half],
-          [cx - lx * reach + nx * half, cy - ly * reach + ny * half]
+          [cx + nx * half, cy + ny * half]
         ]], 0);
       });
     }
@@ -4835,8 +4870,69 @@ var PCB = (function () {
      be left. Bounded to a window of twice the ring around the pad, because the
      question is local: if the pad reaches copper of its own net at the window's
      edge, it reaches the plane. */
+  /* The shortest distance between the OUTLINES of two polygons: every corner of
+     each against every edge of the other. Only ever asked of two pads of one
+     part, so the brute-force pass over sixteen pairs is the whole of it.
+
+     Outlines, not areas: two overlapping rectangles have their boundaries some
+     distance apart and this returns that, not zero. Pads of one part never
+     overlap (a footprint that did would be a fault the connectivity check
+     reports), so the distinction does not arise in use, but it is the reason
+     this is not called a polygon distance. */
+  function padEdgeGap(a, bpoly) {
+    var best = Infinity, i, j;
+    var seg = function (p, q, r) {
+      /* Distance from point r to segment p-q. */
+      var dx = q[0] - p[0], dy = q[1] - p[1];
+      var l2 = dx * dx + dy * dy;
+      var u = l2 > 0 ? ((r[0] - p[0]) * dx + (r[1] - p[1]) * dy) / l2 : 0;
+      if (u < 0) u = 0; else if (u > 1) u = 1;
+      var ex = p[0] + u * dx - r[0], ey = p[1] + u * dy - r[1];
+      return Math.sqrt(ex * ex + ey * ey);
+    };
+    for (i = 0; i < a.length; i++) {
+      for (j = 0; j < bpoly.length; j++) {
+        var d1 = seg(a[i], a[(i + 1) % a.length], bpoly[j]);
+        var d2 = seg(bpoly[j], bpoly[(j + 1) % bpoly.length], a[i]);
+        if (d1 < best) best = d1;
+        if (d2 < best) best = d2;
+      }
+    }
+    return best;
+  }
+
   function thermalRelief(doc, etch, owner, copper, w, h, px, nets, netIndex) {
     var n = w * h, applied = 0, skipped = [];
+
+    /* The other pad of the same part, by pad key, but ONLY where the two are
+       close enough for one's ring to open into the other's channel. The battery
+       holder's two pads are 29 mm apart and have a whole plane between them, so
+       nothing about them is a dead end; the LED's are 1.016 mm apart, which is
+       the case this exists for.
+
+       The measure is the gap between the two pads' EDGES, not between their
+       centres, because that is what has to hold copper. Two rings and one
+       isolation channel need 2*gapMm + clearance before anything is left over;
+       below that the spoke between them opens into the channel. Measured on the
+       three footprints this tool has: the LED leaves 1.016 mm against a
+       threshold of 1.1, the battery 24.3 mm against 1.3 and the button 18 mm.
+       Centre distance would have worked too but with far less headroom (2.589
+       against 2.8), and a slightly different footprint would have flipped it. */
+    var sibling = {};
+    var allPads = docPads(doc);
+    var byPart = {};
+    allPads.forEach(function (p) { (byPart[p.partId] = byPart[p.partId] || []).push(p); });
+    Object.keys(byPart).forEach(function (pid) {
+      var list = byPart[pid];
+      if (list.length !== 2) return;
+      var spec = THERMAL[list[0].type];
+      if (!spec) return;
+      var edgeGap = padEdgeGap(list[0].poly, list[1].poly);
+      if (!(edgeGap <= 2 * spec.gapMm + 3 * MIN_SOLVE_CLEARANCE_MM)) return;
+      sibling[list[0].key] = [list[1].cx, list[1].cy];
+      sibling[list[1].key] = [list[0].cx, list[0].cy];
+    });
+
     nets.order.forEach(function (net) {
       var k = netIndex[net];
       /* The net as it stands before any of its pads gets a ring, and how many
@@ -4861,7 +4957,7 @@ var PCB = (function () {
         var spec = THERMAL[pad.type];
         if (!spec) return;
         var ring = new Uint8Array(n);
-        stampThermal(ring, w, h, pad, spec, px);
+        stampThermal(ring, w, h, pad, spec, px, sibling[pad.key] || null);
         /* CLIPPED TO ITS OWN NET. A thermal is a cut inside one net, so it has
            no business milling a neighbour's plane, and the ring around a pad
            near a boundary reaches across the isolation channel and does exactly
@@ -7475,6 +7571,7 @@ var PCB = (function () {
     solvePartition: solvePartition,
     thermalRelief: thermalRelief,
     stampThermal: stampThermal,
+    padEdgeGap: padEdgeGap,
     componentCount: componentCount,
     trimSlivers: trimSlivers,
     thinMask: thinMask,
