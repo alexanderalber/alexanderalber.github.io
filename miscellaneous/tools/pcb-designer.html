@@ -1725,6 +1725,16 @@ var PCB = (function () {
        can be dropped without breaking the net. Zero switches the step off; see
        SLIVER_MM for why this is not the fab's trace width. */
     if (b.sliverMm != null && isFinite(b.sliverMm)) out.sliverMm = Math.max(0, +b.sliverMm);
+    /* The pad hull experiment, opt-in. See the block at PAD_HULL: it helps on a
+       synthetic board and hurts on a real one with windows, so it is a switch
+       to look at rather than a default. */
+    if (b.padHull != null) out.padHull = !!b.padHull;
+    if (b.padHullAirMm != null && isFinite(b.padHullAirMm)) {
+      out.padHullAirMm = Math.max(0, +b.padHullAirMm);
+    }
+    if (b.padHullStripMm != null && isFinite(b.padHullStripMm)) {
+      out.padHullStripMm = Math.max(0, +b.padHullStripMm);
+    }
     return out;
   }
 
@@ -5195,6 +5205,854 @@ var PCB = (function () {
     return false;
   }
 
+  /* ------------------------------------------------- rejoining a split net
+
+     THE BUG THIS EXISTS FOR, because it is not obvious from the code and cost a
+     session to find:
+
+     The partition is correct. Every net's territory comes out of
+     geodesicPartition in one piece, always, and that is the guarantee the MST
+     seeding buys. Then step 7 widens every owner BOUNDARY into a channel, and
+     where a net's territory is narrower than that channel, the channel eats
+     straight through it and the net falls apart. Measured on a 70 mm board with
+     four parts, rotating only the LEDs: at 15, 30, 165 and 180 degrees the GND
+     territory reaches its far cathode through a neck 0.25 mm wide, the channel
+     is 0.125 mm to either side of the border, and the cathode ends up stranded.
+
+     Three cheaper answers were tried against real boards and all three failed:
+
+       - A wider corridor stamp. Not monotone: at 0.5 mm the 15-degree board got
+         WORSE (four pieces instead of two), because more seed means more border
+         means more channel.
+       - Scoring placement candidates with a coarse solve (35 ms, affordable).
+         Useless as a signal: the same board at pxPerMm 3 to 8 reports between
+         one and four pieces. The coarse raster measures its own noise.
+       - A cheap geometric predictor (how close does a foreign pad come to a
+         net's MST edge). No correlation at all: a board with a foreign pad
+         0.01 mm off the line stays whole, one with nothing closer than 1.14 mm
+         splits.
+
+     So the fix is not prevention, it is repair, and it is safe for a reason
+     worth stating: the channel is grown SYMMETRICALLY around the border, so a
+     pixel in the middle of a net's own territory still has half a channel of
+     air to the foreign territory. Giving one pixel-wide bridge back therefore
+     costs nothing in clearance. Measured on the four failing boards, the
+     remaining gap to the foreign net at the bridge was 0.125 mm or more, i.e.
+     exactly the clearance that was asked for. If a board ever turns up where
+     it is less, `rejoinNets` says so in its findings and etches nothing. */
+
+  /* The shortest bridge, in etched pixels, from one piece of a net's territory
+     to another, running only through copper that belongs to this net. Returns
+     the pixel list, or null when the pieces cannot reach each other at all,
+     which means the graphic cut the copper and no amount of channel giveback
+     will help. */
+  function bridgePixels(owner, copper, etch, keep, labels, w, h, k, fromL, toL) {
+    var n = w * h, i;
+    var dist = new Int32Array(n);
+    var prev = new Int32Array(n);
+    for (i = 0; i < n; i++) { dist[i] = -1; prev[i] = -1; }
+    var q = new Int32Array(n), qh = 0, qt = 0;
+    for (i = 0; i < n; i++) {
+      if (keep[i] && labels[i] === fromL) { dist[i] = 0; q[qt++] = i; }
+    }
+    var hit = -1;
+    while (qh < qt) {
+      i = q[qh++];
+      if (keep[i] && labels[i] === toL) { hit = i; break; }
+      var x = i % w, y = (i / w) | 0;
+      for (var d = 0; d < 4; d++) {
+        var nx = x + (d === 0 ? 1 : d === 1 ? -1 : 0);
+        var ny = y + (d === 2 ? 1 : d === 3 ? -1 : 0);
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        var j = ny * w + nx;
+        if (dist[j] >= 0) continue;
+        /* Only this net's own copper. Crossing a foreign territory would be a
+           short, not a repair. */
+        if (owner[j] !== k || !copper[j]) continue;
+        dist[j] = dist[i] + 1; prev[j] = i; q[qt++] = j;
+      }
+    }
+    if (hit < 0) return null;
+    var out = [];
+    for (i = hit; i >= 0 && dist[i] > 0; i = prev[i]) if (etch[i]) out.push(i);
+    return out;
+  }
+
+  /* How far the nearest FOREIGN territory is from a pixel, in pixels. Searched
+     in a small box rather than with a distance transform, because this is asked
+     about a handful of bridge pixels and a full edtSq pass would cost more than
+     the whole repair. */
+  function foreignGapPx(owner, w, h, k, i, radius) {
+    var bx = i % w, by = (i / w) | 0;
+    var best = Infinity;
+    for (var dy = -radius; dy <= radius; dy++) {
+      for (var dx = -radius; dx <= radius; dx++) {
+        var nx = bx + dx, ny = by + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        var o = owner[ny * w + nx];
+        if (o >= 0 && o !== k) {
+          var d2 = dx * dx + dy * dy;
+          if (d2 < best) best = d2;
+        }
+      }
+    }
+    return best === Infinity ? Infinity : Math.sqrt(best);
+  }
+
+  /* Give the channel back where it severed a net, one bridge at a time, and
+     only where the bridge keeps the full clearance to every foreign net.
+
+     `etch` is modified in place. Returns what happened, so the check tab can
+     say it rather than the user wondering why a channel has a gap in it: a
+     repaired net is a normal, correct board, but a net that could NOT be
+     repaired is a real fault and has to stay visible. */
+  function rejoinNets(etch, owner, copper, w, h, px, nets, netIndex, clearanceMm) {
+    var n = w * h, i;
+    var out = { rejoined: 0, bridgePx: 0, failed: [] };
+    /* The gap a bridge pixel must keep. The channel is symmetric, so half the
+       clearance is what a pixel on the centre line has, and asking for the full
+       clearance here would reject every bridge there is.
+
+       ROUNDED DOWN TO WHOLE PIXELS, and that is not sloppiness. The bridge runs
+       on the raster, so the only gaps it can actually have are integers, and a
+       requirement of 1.2 pixels is one no bridge can ever meet: it rejected
+       every repair at a 0.3 mm clearance while the 0.125 mm boards, where the
+       same requirement came out at 0.5, sailed through. The channel is one
+       pixel wider than asked for anyway (chanRPx rounds UP, see step 7), so the
+       pixel given back here is inside a margin that already exists. What must
+       not be relaxed is the test itself: a bridge whose gap is genuinely below
+       the floor is refused and reported. */
+    var needPx = Math.floor((clearanceMm * px) / 2);
+    var searchR = Math.ceil((clearanceMm * px) / 2) + 2;
+
+    nets.order.forEach(function (net) {
+      var k = netIndex[net];
+      /* EXACTLY the mask netStats labels, for the same reason the thermals and
+         the sliver trim use it: a repair judged on a different mask can leave
+         the report it exists to prevent standing. */
+      var keep = new Uint8Array(n);
+      for (i = 0; i < n; i++) keep[i] = (owner[i] === k && !etch[i]) ? 1 : 0;
+
+      /* One bridge can join more than two pieces, and a net can be in more than
+         two, so this loops until the net is whole or nothing more can be done.
+         Bounded by the piece count, which only ever falls. */
+      for (var guard = 0; guard < 16; guard++) {
+        var cc = traceLib().labelComponents(keep, w, h, 1);
+        if (cc.count < 2) break;
+
+        var areas = new Int32Array(cc.count);
+        for (i = 0; i < n; i++) if (keep[i]) areas[cc.labels[i]]++;
+        var big = 0;
+        for (var L = 1; L < cc.count; L++) if (areas[L] > areas[big]) big = L;
+        /* The piece to reattach: the smallest one, because that is the stranded
+           pad rather than the plane. */
+        var small = -1;
+        for (L = 0; L < cc.count; L++) {
+          if (L === big || !areas[L]) continue;
+          if (small < 0 || areas[L] < areas[small]) small = L;
+        }
+        if (small < 0) break;
+
+        var bridge = bridgePixels(owner, copper, etch, keep, cc.labels, w, h, k, big, small);
+        if (!bridge || !bridge.length) {
+          out.failed.push({ net: net, reason: 'unreachable' });
+          break;
+        }
+        var tight = null;
+        for (i = 0; i < bridge.length; i++) {
+          var g = foreignGapPx(owner, w, h, k, bridge[i], searchR);
+          if (g < needPx - 1e-9) { tight = g; break; }
+        }
+        if (tight != null) {
+          out.failed.push({ net: net, reason: 'clearance', gotMm: round4(2 * tight / px) });
+          break;
+        }
+        for (i = 0; i < bridge.length; i++) {
+          etch[bridge[i]] = 0;
+          keep[bridge[i]] = 1;
+          out.bridgePx++;
+        }
+        out.rejoined++;
+      }
+    });
+    return out;
+  }
+
+  /* --------------------------------------------- placing battery and button
+
+     The user places the LEDs, because that is the design decision the tool
+     exists for. Battery and button are then a fitting problem with a right
+     answer, and solving it removes the worst manual bug this tool had: a
+     battery rotated by 180 degrees points its minus away from the cathode
+     group and its plus away from the button, and the resulting board looks
+     plausible until the copper comes back split.
+
+     The objective, all terms in millimetres and normalised, smaller better.
+     The weights are GUESSED. What is defensible is only their ORDER
+     (art > route > margin > compact > edge), and that order is a statement
+     about what the tool is for rather than a measurement. They live in a named
+     object so that changing one's mind is one line and one fixture away. */
+  var PLACE_WEIGHTS = {
+    route: 1.0,      // summed MST edge length over the board diagonal
+    margin: 0.6,     // negated distance to the nearest foreign pad
+    edge: 0.3,       // negated distance to the board edge
+    art: 1.2,        // fraction of the body sitting on front windows
+    compact: 0.5     // battery plus to the nearer button pad
+  };
+
+  /* The search grid. 2 mm and 12 rotations is coarse on purpose: the local
+     refinement afterwards is what buys the precision, and it costs a few dozen
+     candidates rather than a few thousand. Battery and button are both
+     180-degree symmetric in their OUTLINE but not in their PADS, so all 12
+     rotations are real candidates and none can be folded away. */
+  var PLACE_STEP_MM = 2;
+  var PLACE_ROTS = 12;
+  var PLACE_REFINE_MM = 0.25;
+  var PLACE_REFINE_DEG = 3;
+  var PLACE_REFINE_SPAN = 15;
+  var PLACE_KEEP = 12;          // batteries carried into the pair stage
+  var PLACE_BUTTON_RADIUS = 35; // mm around the battery the button is looked for
+
+  /* The four body corners plus every pad corner of one candidate, in document
+     millimetres. This is the cheap prefilter's whole input: eight to twelve
+     point tests kill over 90 percent of the grid before anything is
+     rasterized. */
+  function placeProbePoints(type, x, y, rotDeg) {
+    var def = PART_TYPES[type];
+    if (!def) return [];
+    var fake = { type: type, x: x, y: y, rotDeg: rotDeg };
+    var b = def.body;
+    var hw = b.wMm / 2, hh = b.hMm / 2;
+    var pts = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(function (c) {
+      return partPoint(fake, b.cxMm + c[0], b.cyMm + c[1]);
+    });
+    partPads(fake).forEach(function (pad) {
+      pad.poly.forEach(function (c) { pts.push(c); });
+    });
+    return pts;
+  }
+
+  /* Does this candidate sit on the board at all? Every probe point inside the
+     outline and outside every cutout and every hole. Deliberately not the
+     copper-to-edge rule: that one belongs to the router, and applying it here
+     as well would reject a battery whose pad is a tenth of a millimetre too
+     close to the profile when moving it there was never the user's idea. */
+  function placeOnBoard(pts, outline, cutouts, holes) {
+    var i, j;
+    for (i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      if (!pointInPolys(outline, p[0], p[1])) return false;
+      if (cutouts.length && pointInPolys(cutouts, p[0], p[1])) return false;
+      for (j = 0; j < holes.length; j++) {
+        var hh = holes[j];
+        var dx = p[0] - hh.x, dy = p[1] - hh.y;
+        var r = hh.d / 2;
+        if (dx * dx + dy * dy <= r * r) return false;
+      }
+    }
+    return true;
+  }
+
+  /* Two parts overlap when either one's probe points land inside the other's
+     body rectangle. Approximate on purpose: a rectangle-rectangle test would
+     be exact, but the bodies here are big and blunt and the grid is 2 mm, so
+     the corner case it would catch is one the refinement step walks out of
+     anyway. */
+  function placeBodyHit(type, x, y, rotDeg, pts) {
+    var def = PART_TYPES[type];
+    if (!def) return false;
+    var fake = { type: type, x: x, y: y, rotDeg: rotDeg };
+    var b = def.body;
+    var a = (+rotDeg || 0) * Math.PI / 180;
+    var ca = Math.cos(a), sa = Math.sin(a);
+    for (var i = 0; i < pts.length; i++) {
+      /* Into the part's local frame. The x axis is mirrored, exactly as in
+         partPoint, or a rotated part would be tested against its own mirror
+         image and the hit would be reported on the wrong side. */
+      var u = -(pts[i][0] - x), v = pts[i][1] - y;
+      var lx = u * ca + v * sa, ly = -u * sa + v * ca;
+      if (Math.abs(lx - b.cxMm) <= b.wMm / 2 && Math.abs(ly - b.cyMm) <= b.hMm / 2) return true;
+    }
+    return false;
+  }
+
+  /* How much of a body sits on a front window, as a fraction of its area.
+
+     Sampled on a grid over the body rather than clipped exactly, because the
+     windows are traced artwork with hundreds of vertices and this is a
+     preference term, not a rule. 7x7 samples resolve a fraction to about two
+     percent, which is far finer than the weight in front of it deserves. */
+  function placeArtOverlap(type, x, y, rotDeg, windows) {
+    if (!windows.length) return 0;
+    var def = PART_TYPES[type];
+    if (!def) return 0;
+    var fake = { type: type, x: x, y: y, rotDeg: rotDeg };
+    var b = def.body;
+    var N = 7, hit = 0, total = 0;
+    for (var iy = 0; iy < N; iy++) {
+      for (var ix = 0; ix < N; ix++) {
+        var lx = b.cxMm + b.wMm * ((ix + 0.5) / N - 0.5);
+        var ly = b.cyMm + b.hMm * ((iy + 0.5) / N - 0.5);
+        var p = partPoint(fake, lx, ly);
+        total++;
+        if (pointInPolys(windows, p[0], p[1])) hit++;
+      }
+    }
+    return total ? hit / total : 0;
+  }
+
+  /* The distance from every pad of a candidate to the nearest pad of a part
+     that is already fixed, and to the board edge. Both are MINIMA over the
+     candidate's pads, both are capped, and both enter the objective negated:
+     more room is better, but only up to the cap, past which it stops being an
+     argument. Centre-to-centre rather than edge-to-edge, which overstates the
+     distance by a pad radius uniformly and therefore changes no ranking. */
+  function placeClearances(type, x, y, rotDeg, fixedPads, outline, capM, capE) {
+    var fake = { type: type, x: x, y: y, rotDeg: rotDeg };
+    var pads = partPads(fake);
+    var minM = capM, minE = capE;
+    var ob = boundsOfPolys(outline);
+    for (var i = 0; i < pads.length; i++) {
+      var pa = pads[i];
+      for (var j = 0; j < fixedPads.length; j++) {
+        var d = Math.sqrt(dist2(pa.cx, pa.cy, fixedPads[j].cx, fixedPads[j].cy));
+        if (d < minM) minM = d;
+      }
+      if (ob) {
+        var de = Math.min(pa.cx - ob.minX, ob.maxX - pa.cx, pa.cy - ob.minY, ob.maxY - pa.cy);
+        if (de < minE) minE = de;
+      }
+    }
+    return { margin: minM, edge: minE };
+  }
+
+  /* The routing term: the summed length of the net MST over all pads, with the
+     candidate parts in place. Euclidean, not routed, because this is evaluated
+     tens of thousands of times and the router costs 200 ms a call. The
+     euclidean tree is a lower bound on the routed one and orders candidates the
+     same way whenever the board is not a maze, which it is not: the back is one
+     solid piece of copper.
+
+     Deliberately NOT a term for "how robust is the partition", i.e. the
+     narrowest channel the solver would end up with. It is the term one wants
+     and it is unaffordable: it needs a full solve per candidate. The margin
+     term is the cheap stand-in and catches most of it, because the tight spots
+     ARE the places where two pads sit close. */
+  function placeRouteLength(doc, cand) {
+    var parts = ((doc && doc.parts) || []).map(function (p) {
+      var c = cand[p.id];
+      return c ? Object.assign({}, p, { x: c.x, y: c.y, rotDeg: c.rotDeg }) : p;
+    });
+    var nets = partitionNets({ board: doc.board, parts: parts, objects: doc.objects, holes: doc.holes });
+    var total = 0;
+    nets.order.forEach(function (net) {
+      var g = nets.groups[net];
+      if (g.length < 2) return;
+      var pts = g.map(function (p) { return [p.cx, p.cy]; });
+      var edges = netMst(pts, function (a, b) {
+        return Math.sqrt(dist2(pts[a][0], pts[a][1], pts[b][0], pts[b][1]));
+      });
+      edges.forEach(function (e) {
+        total += Math.sqrt(dist2(pts[e[0]][0], pts[e[0]][1], pts[e[1]][0], pts[e[1]][1]));
+      });
+    });
+    return total;
+  }
+
+  /* The compact term: battery plus to the nearer of the two button pads. This
+     double-counts, because that hop is already inside the MST length, and the
+     double counting is the point: a long PLUS lead crossing the whole board is
+     worse than an equally long ground stretch, since ground is a plane and plus
+     is a single corridor squeezed between two other nets. */
+  function placeCompact(doc, cand) {
+    var bat = null, btn = null;
+    ((doc && doc.parts) || []).forEach(function (p) {
+      var c = cand[p.id] || p;
+      var fake = { id: p.id, type: p.type, x: c.x, y: c.y, rotDeg: c.rotDeg };
+      if (p.type === 'battery') bat = fake;
+      else if (p.type === 'button') btn = fake;
+    });
+    if (!bat || !btn) return 0;
+    var plus = partPads(bat).filter(function (p) { return p.role === 'bat+'; })[0];
+    if (!plus) return 0;
+    var pads = partPads(btn);
+    var best = Infinity;
+    pads.forEach(function (p) {
+      var d = Math.sqrt(dist2(plus.cx, plus.cy, p.cx, p.cy));
+      if (d < best) best = d;
+    });
+    return best === Infinity ? 0 : best;
+  }
+
+  /* One candidate's objective. `ctx` carries everything that does not change
+     between candidates, so the inner loop allocates nothing but the pad list. */
+  function placeScore(ctx, cand) {
+    var diag = ctx.diag || 1;
+    var R = placeRouteLength(ctx.doc, cand) / diag;
+    var A = 0, M = ctx.capM, E = ctx.capE;
+    Object.keys(cand).forEach(function (id) {
+      var c = cand[id];
+      A += placeArtOverlap(c.type, c.x, c.y, c.rotDeg, ctx.windows);
+      var cl = placeClearances(c.type, c.x, c.y, c.rotDeg, ctx.fixedPads, ctx.outline, ctx.capM, ctx.capE);
+      if (cl.margin < M) M = cl.margin;
+      if (cl.edge < E) E = cl.edge;
+    });
+    var nCand = Object.keys(cand).length || 1;
+    A = A / nCand;
+    var C = placeCompact(ctx.doc, cand) / diag;
+    var W = PLACE_WEIGHTS;
+    return W.route * R
+      + W.margin * (ctx.capM - M) / ctx.capM
+      + W.edge * (ctx.capE - E) / ctx.capE
+      + W.art * A
+      + W.compact * C;
+  }
+
+  /* Every grid position and rotation of one type that sits on the board and
+     clear of the parts that stay put. The prefilter runs first and is the
+     reason this is affordable at all. */
+  function placementCandidates(ctx, type, centre, radiusMm) {
+    var out = [];
+    var ob = ctx.bounds;
+    if (!ob) return out;
+    var step = PLACE_STEP_MM;
+    for (var r = 0; r < PLACE_ROTS; r++) {
+      var rot = r * (360 / PLACE_ROTS);
+      for (var y = ob.minY; y <= ob.maxY; y += step) {
+        for (var x = ob.minX; x <= ob.maxX; x += step) {
+          if (centre) {
+            var dx = x - centre.x, dy = y - centre.y;
+            if (dx * dx + dy * dy > radiusMm * radiusMm) continue;
+          }
+          var pts = placeProbePoints(type, x, y, rot);
+          if (!pts.length) continue;
+          if (!placeOnBoard(pts, ctx.outline, ctx.cutouts, ctx.holes)) continue;
+          var clash = false;
+          for (var q = 0; q < ctx.fixedBodies.length; q++) {
+            var fb = ctx.fixedBodies[q];
+            if (placeBodyHit(fb.type, fb.x, fb.y, fb.rotDeg, pts)) { clash = true; break; }
+          }
+          if (clash) continue;
+          out.push({ type: type, x: x, y: y, rotDeg: rot });
+        }
+      }
+    }
+    return out;
+  }
+
+  /* Local refinement around a winner: a finer grid and a few degrees either
+     way. The coarse grid finds the right REGION, this finds the spot. Kept
+     separate because the coarse pass has to stay cheap and this one only ever
+     runs on a handful of candidates. */
+  function placeRefine(ctx, cand, id, others) {
+    var base = cand[id];
+    var best = { c: base, s: placeScore(ctx, cand) };
+    var span = PLACE_REFINE_SPAN;
+    for (var dr = -span; dr <= span; dr += PLACE_REFINE_DEG) {
+      for (var dy = -4; dy <= 4; dy++) {
+        for (var dx = -4; dx <= 4; dx++) {
+          var x = base.x + dx * PLACE_REFINE_MM;
+          var y = base.y + dy * PLACE_REFINE_MM;
+          var rot = base.rotDeg + dr;
+          var pts = placeProbePoints(base.type, x, y, rot);
+          if (!pts.length) continue;
+          if (!placeOnBoard(pts, ctx.outline, ctx.cutouts, ctx.holes)) continue;
+          var clash = false;
+          for (var q = 0; q < ctx.fixedBodies.length; q++) {
+            var fb = ctx.fixedBodies[q];
+            if (placeBodyHit(fb.type, fb.x, fb.y, fb.rotDeg, pts)) { clash = true; break; }
+          }
+          if (clash) continue;
+          for (var o = 0; o < others.length; o++) {
+            var oc = cand[others[o]];
+            if (oc && placeBodyHit(oc.type, oc.x, oc.y, oc.rotDeg, pts)) { clash = true; break; }
+          }
+          if (clash) continue;
+          var trial = Object.assign({}, cand);
+          trial[id] = { type: base.type, x: x, y: y, rotDeg: rot };
+          var s = placeScore(ctx, trial);
+          if (s < best.s) best = { c: trial[id], s: s };
+        }
+      }
+    }
+    return best.c;
+  }
+
+  /* Place every unpinned battery and button, in three stages, and hand back a
+     map from part id to {x, y, rotDeg} plus whatever findings came up.
+
+     Three stages rather than one, because the two parts have to be scored
+     TOGETHER (the button wants to be near the battery) and the product of the
+     two candidate sets is too large to enumerate: score batteries alone, keep
+     the best PLACE_KEEP, find the best button within reach of each, then score
+     the pairs properly and refine the winner.
+
+     A pinned part is not touched and its pads count as fixed, which is the
+     whole escape hatch: dragging a part pins it, so a user who disagrees with
+     the automatic answer simply moves it and the tool stops arguing. */
+  function autoPlace(doc, opts) {
+    opts = opts || {};
+    var findings = [];
+    var parts = (doc && doc.parts) || [];
+    var derived = opts.derived || deriveLayers(doc, opts);
+    var outline = derived.outline || [];
+    var ob = boundsOfPolys(outline);
+    if (!ob) return { placement: {}, findings: findings };
+
+    var free = parts.filter(function (p) {
+      return !p.pinned && (p.type === 'battery' || p.type === 'button');
+    });
+    if (!free.length) return { placement: {}, findings: findings };
+
+    /* Front windows are what the artwork shows through, so a body on top of one
+       hides the picture. Both bare templates count, because mask-over-bare
+       still lets light through. */
+    var mats = (derived.materials && derived.materials.front) || {};
+    var windows = (mats.bare || []).concat(mats.maskOnBare || []);
+
+    var fixed = parts.filter(function (p) { return free.indexOf(p) < 0; });
+    var fixedPads = [];
+    fixed.forEach(function (p) {
+      partPads(p).forEach(function (pad) { fixedPads.push(pad); });
+    });
+    var lim = opts.limits || fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish);
+    var clearanceMm = opts.clearanceMm != null ? +opts.clearanceMm
+      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm : lim.spaceMm);
+
+    var ctx = {
+      doc: doc,
+      outline: outline,
+      cutouts: derived.cutouts || [],
+      holes: (doc.holes || []).map(function (h) { return { x: +h.x, y: +h.y, d: +h.d }; }),
+      windows: windows,
+      fixedPads: fixedPads,
+      fixedBodies: fixed.map(function (p) {
+        return { type: p.type, x: +p.x, y: +p.y, rotDeg: +p.rotDeg || 0 };
+      }),
+      bounds: ob,
+      diag: Math.sqrt((ob.maxX - ob.minX) * (ob.maxX - ob.minX)
+        + (ob.maxY - ob.minY) * (ob.maxY - ob.minY)) || 1,
+      capM: Math.max(1e-6, 3 * clearanceMm),
+      capE: Math.max(1e-6, 3 * Math.max(lim.copperEdgeMm || 0, clearanceMm))
+    };
+
+    var bat = free.filter(function (p) { return p.type === 'battery'; })[0] || null;
+    var btn = free.filter(function (p) { return p.type === 'button'; })[0] || null;
+
+    /* Stage 1: the battery alone, or the button alone if there is no free
+       battery. Scored with the other free part left where the document has it,
+       which is a rough number but only used to rank. */
+    var lead = bat || btn;
+    var leadCands = placementCandidates(ctx, lead.type, null, 0);
+    if (!leadCands.length) {
+      findings.push(finding('no-room', [lead.id], null, null, { type: lead.type }));
+      return { placement: {}, findings: findings };
+    }
+    var scored = leadCands.map(function (c) {
+      var cand = {};
+      cand[lead.id] = c;
+      return { c: c, s: placeScore(ctx, cand) };
+    }).sort(function (a, b) { return a.s - b.s; });
+
+    var placement = {};
+    var other = (lead === bat) ? btn : bat;
+    if (!other) {
+      var single = {};
+      single[lead.id] = scored[0].c;
+      var refined = placeRefine(ctx, single, lead.id, []);
+      placement[lead.id] = { x: refined.x, y: refined.y, rotDeg: refined.rotDeg };
+      return { placement: placement, findings: findings };
+    }
+
+    /* Stage 2 and 3: for each surviving lead position the best partner within
+       reach, then the pair scored properly. */
+    var best = null;
+    var keep = scored.slice(0, PLACE_KEEP);
+    for (var i = 0; i < keep.length; i++) {
+      var lc = keep[i].c;
+      var partnerCands = placementCandidates(ctx, other.type,
+        { x: lc.x, y: lc.y }, PLACE_BUTTON_RADIUS);
+      for (var j = 0; j < partnerCands.length; j++) {
+        var pc = partnerCands[j];
+        var pts = placeProbePoints(pc.type, pc.x, pc.y, pc.rotDeg);
+        if (placeBodyHit(lc.type, lc.x, lc.y, lc.rotDeg, pts)) continue;
+        var cand2 = {};
+        cand2[lead.id] = lc;
+        cand2[other.id] = pc;
+        var s = placeScore(ctx, cand2);
+        if (!best || s < best.s) best = { s: s, lead: lc, partner: pc };
+      }
+    }
+    if (!best) {
+      findings.push(finding('no-room', [other.id], null, null, { type: other.type }));
+      var only = {};
+      only[lead.id] = scored[0].c;
+      var r1 = placeRefine(ctx, only, lead.id, []);
+      placement[lead.id] = { x: r1.x, y: r1.y, rotDeg: r1.rotDeg };
+      return { placement: placement, findings: findings };
+    }
+
+    var pair = {};
+    pair[lead.id] = best.lead;
+    pair[other.id] = best.partner;
+    var rl = placeRefine(ctx, pair, lead.id, [other.id]);
+    pair[lead.id] = rl;
+    var rp = placeRefine(ctx, pair, other.id, [lead.id]);
+    pair[other.id] = rp;
+    placement[lead.id] = { x: rl.x, y: rl.y, rotDeg: rl.rotDeg };
+    placement[other.id] = { x: rp.x, y: rp.y, rotDeg: rp.rotDeg };
+    return { placement: placement, findings: findings };
+  }
+
+  /* THE PAD HULL, an experiment. Off by default, switched on with
+     `opts.padHull === true` or `board.padHull`.
+
+     The idea, from the owner: instead of letting the partition decide where the
+     boundary between an LED's two pads runs, prescribe it. One convex hull
+     around BOTH pads and their thermal spokes, split inside by a defined line,
+     and the copper inside that hull is assigned rather than grown.
+
+     What it is for: on some rotations the GND corridor has to reach the cathode
+     around the outside of the anode pad, the neck that leaves is thinner than
+     the isolation channel, and the channel eats it. The cathode then sits on
+     6 mm^2 of copper connected to nothing and the LED is dark. See
+     session13-handoff.md for the full diagnosis.
+
+     WHAT THE MEASUREMENTS SAY, because this is not a settled feature:
+     on a synthetic board (four parts, all rotated together) it fixes every
+     case, 0 of 24 rotations broken against 4 without it. On the owner's real
+     board it is WORSE, because that board has windows: the hull claims a ring
+     around the pads, the window has already broken the copper there, and the
+     sliver between window rim and hull rim belongs to a net while hanging off
+     nothing. Both numbers are in session14-handoff.md.
+
+     It is in the tree so the effect can be seen end to end in the browser
+     rather than only in a harness. Default off, and the default is the
+     recommendation. */
+  var PAD_HULL = {
+    airMm: 1.0,        // how far the hull reaches past pads and spokes
+    stripMm: 0.8,      // the isolation strip inside it
+    /* WHICH PART TYPES IT APPLIES TO, and this list is the measurement's scope
+       rather than a capability check.
+
+       The structural test ("two pads on different roles") also catches the
+       battery, whose pads sit 29.3 mm apart and whose joint hull is 35.3 mm
+       wide: most of a small board, with a prescribed line through the middle of
+       it. Nothing about that was ever measured, and it is a different problem
+       from the LED's, where the two pads are 1.016 mm apart and the corridor
+       between them is the whole difficulty. The button has both pads on one
+       net and needs no boundary at all. */
+    types: { led: 1 }
+  };
+
+  /* Andrew's monotone chain. Small enough to keep here rather than pulling in
+     a dependency for two dozen points. */
+  function convexHull(pts) {
+    var p = pts.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    if (p.length < 3) return p;
+    var cross = function (o, a, b) {
+      return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    };
+    var lo = [], i;
+    for (i = 0; i < p.length; i++) {
+      while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p[i]) <= 0) lo.pop();
+      lo.push(p[i]);
+    }
+    var up = [];
+    for (i = p.length - 1; i >= 0; i--) {
+      while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p[i]) <= 0) up.pop();
+      up.push(p[i]);
+    }
+    lo.pop(); up.pop();
+    return lo.concat(up);
+  }
+
+  /* Inside the hull, or within `grow` of it. The hull is convex and wound CCW,
+     so a point is inside when it is left of every edge, and the distance to the
+     nearest edge is the smallest of those signed distances. */
+  function inConvex(H, x, y, grow) {
+    var inside = true, minD = Infinity;
+    for (var i = 0; i < H.length; i++) {
+      var a = H[i], b = H[(i + 1) % H.length];
+      var ex = b[0] - a[0], ey = b[1] - a[1];
+      var len = Math.sqrt(ex * ex + ey * ey) || 1e-9;
+      var d = (ex * (y - a[1]) - ey * (x - a[0])) / len;
+      if (d < 0) inside = false;
+      if (d < minD) minD = d;
+    }
+    return inside ? true : (grow > 0 && minD > -grow);
+  }
+
+  /* One pad's rectangle plus its thermal spokes, as a point cloud in part-local
+     millimetres. The spoke pointing at the sibling pad is left out, exactly as
+     thermalRelief leaves it out; without that the cloud would reach into the
+     1.016 mm gap between the two pads and the two halves would touch. */
+  function padSpokePoints(pad, sibling, spec) {
+    var hw = pad.wMm / 2, hh = pad.hMm / 2, cx = pad.cxMm, cy = pad.cyMm;
+    var pts = [[cx - hw, cy - hh], [cx + hw, cy - hh], [cx + hw, cy + hh], [cx - hw, cy + hh]];
+    if (!spec) return pts;
+    var half = +spec.spokeWMm / 2, reach = +spec.gapMm;
+    var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    var skip = -1;
+    if (sibling) {
+      var tx = sibling.cxMm - cx, ty = sibling.cyMm - cy;
+      var tl = Math.sqrt(tx * tx + ty * ty);
+      if (tl > 1e-9) {
+        var best = -2;
+        for (var q = 0; q < dirs.length; q++) {
+          var dot = (dirs[q][0] * tx + dirs[q][1] * ty) / tl;
+          if (dot > best) { best = dot; skip = q; }
+        }
+      }
+    }
+    for (var k = 0; k < dirs.length; k++) {
+      if (k === skip) continue;
+      var d = dirs[k];
+      var ox = d[0] === 0 ? 0 : d[0] * hw, oy = d[1] === 0 ? 0 : d[1] * hh;
+      var x0 = cx + ox, y0 = cy + oy;
+      var px = -d[1], py = d[0];
+      for (var s = -1; s <= 1; s += 2) {
+        pts.push([x0 + px * half * s, y0 + py * half * s]);
+        pts.push([x0 + d[0] * reach + px * half * s, y0 + d[1] * reach + py * half * s]);
+      }
+    }
+    return pts;
+  }
+
+  /* The hull and the dividing line for one part type, computed once per type.
+     Returns null for a type this does not apply to: anything without exactly
+     two pads on different roles has no "left side / right side" to prescribe. */
+  var padHullCache = {};
+  function padHullFor(type) {
+    if (Object.prototype.hasOwnProperty.call(padHullCache, type)) return padHullCache[type];
+    var def = PART_TYPES[type];
+    var out = null;
+    if (PAD_HULL.types[type]
+      && def && def.pads && def.pads.length === 2 && def.pads[0].role !== def.pads[1].role) {
+      var a = def.pads[0], b = def.pads[1];
+      var spec = THERMAL[type];
+      var H = convexHull(padSpokePoints(a, b, spec).concat(padSpokePoints(b, a, spec)));
+      /* The dividing line, as a DECISION rather than a formula over the pad
+         distances. Three attempts at deriving it produced a new artefact each
+         time (spikes at the pad ends, an overhang at one corner), because the
+         two pads have different heights and offsets, so which edge is nearest
+         changes at every pad corner. Vertical between the pads, and below them
+         curved across to the body centre so the strip meets the window rather
+         than stopping in copper. */
+      var lo = a.cxMm < b.cxMm ? a : b, hi = a.cxMm < b.cxMm ? b : a;
+      var midX = (lo.cxMm + lo.wMm / 2 + hi.cxMm - hi.wMm / 2) / 2;
+      var padBot = Math.min(a.cyMm - a.hMm / 2, b.cyMm - b.hMm / 2)
+        - (spec ? +spec.gapMm : 0) - 0.15;
+      var head = def.bodyCircle;
+      var winTop = head ? head.cyMm + head.rMm : padBot - 1;
+      var headX = head ? head.cxMm : midX;
+      out = {
+        hull: H, midX: midX, padBot: padBot, winTop: winTop, headX: headX,
+        loRole: lo.role, hiRole: hi.role, loName: lo.name, hiName: hi.name
+      };
+    }
+    padHullCache[type] = out;
+    return out;
+  }
+
+  function padHullSep(spec, y) {
+    if (y >= spec.padBot) return spec.midX;
+    var span = Math.max(0.001, spec.padBot - spec.winTop);
+    var t = Math.min(1, (spec.padBot - y) / span);
+    return spec.midX + (spec.headX - spec.midX) * ((1 - Math.cos(Math.PI * t)) / 2);
+  }
+
+  /* Board millimetres to part-local. The inverse of partPoint, INCLUDING its
+     mirror in x (partPoint computes `part.x - rx`, because this is the back
+     side). Forgetting the mirror stamps the hull the wrong way round and the
+     two roles swap, silently. */
+  function padHullLocal(part, bx, by) {
+    var ang = (+part.rotDeg || 0) * Math.PI / 180;
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    var rx = -(bx - +part.x), ry = by - +part.y;
+    return [rx * ca + ry * sa, -rx * sa + ry * ca];
+  }
+
+  /* Step 6b. Overwrites `owner` inside each hull: one role on each side of the
+     dividing line, the strip itself given to nobody.
+
+     WHICH SIDE IS WHICH FOLLOWS THE DELIVERY, and that is not a detail. Fixing
+     the roles in part-local coordinates ("cathode side is always left") made
+     things strictly worse in the measurements, 10 of 24 rotations broken
+     against 4 without the hull, because which side the outside copper actually
+     arrives on depends on the rotation and on the neighbours. When the hull
+     prescribes GND on the side where the router delivered VCC, the whole GND
+     half is unreachable from outside and drops off in one piece. Reading the
+     delivery off the hull's own rim and flipping to match took it to 0 of 24 on
+     that board. */
+  function padHullPartition(owner, copper, w, h, px, doc, nets, netIndex, opts) {
+    var applied = 0, flipped = 0;
+    var airMm = opts && opts.airMm != null ? +opts.airMm : PAD_HULL.airMm;
+    var stripMm = opts && opts.stripMm != null ? +opts.stripMm : PAD_HULL.stripMm;
+    (doc.parts || []).forEach(function (part) {
+      var spec = padHullFor(part.type);
+      if (!spec) return;
+      /* This part's own nets, not the global ones: two LEDs may sit on
+         different nets and the hull must follow the pad it contains. */
+      var byName = {};
+      nets.order.forEach(function (net) {
+        (nets.groups[net] || []).forEach(function (p) {
+          if (p.partId === part.id) byName[p.name] = net;
+        });
+      });
+      var kLo = netIndex[byName[spec.loName]], kHi = netIndex[byName[spec.hiName]];
+      if (kLo == null || kHi == null) return;
+
+      var reach = airMm + 8;
+      var x0 = Math.max(0, Math.floor((+part.x - reach) * px));
+      var x1 = Math.min(w - 1, Math.ceil((+part.x + reach) * px));
+      var y0 = Math.max(0, Math.floor((+part.y - reach) * px));
+      var y1 = Math.min(h - 1, Math.ceil((+part.y + reach) * px));
+      var ix, iy, i, P;
+
+      /* Pass one: what does the free partition deliver at the hull's rim? */
+      var loLeft = 0, loRight = 0, hiLeft = 0, hiRight = 0;
+      for (iy = y0; iy <= y1; iy++) {
+        for (ix = x0; ix <= x1; ix++) {
+          i = iy * w + ix;
+          if (!copper[i]) continue;
+          P = padHullLocal(part, (ix + 0.5) / px, (iy + 0.5) / px);
+          if (!inConvex(spec.hull, P[0], P[1], airMm)) continue;
+          var rim = false;
+          var NX = [1, -1, 0, 0], NY = [0, 0, 1, -1];
+          for (var d = 0; d < 4; d++) {
+            var nx = ix + NX[d], ny = iy + NY[d];
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            var Q = padHullLocal(part, (nx + 0.5) / px, (ny + 0.5) / px);
+            if (!inConvex(spec.hull, Q[0], Q[1], airMm)) { rim = true; break; }
+          }
+          if (!rim) continue;
+          var isLeft = P[0] <= padHullSep(spec, P[1]);
+          if (owner[i] === kLo) { if (isLeft) loLeft++; else loRight++; }
+          else if (owner[i] === kHi) { if (isLeft) hiLeft++; else hiRight++; }
+        }
+      }
+      var flip = (loRight + hiLeft) > (loLeft + hiRight);
+      if (flip) flipped++;
+      var kL = flip ? kHi : kLo, kR = flip ? kLo : kHi;
+
+      /* Pass two: stamp. */
+      for (iy = y0; iy <= y1; iy++) {
+        for (ix = x0; ix <= x1; ix++) {
+          i = iy * w + ix;
+          if (!copper[i]) continue;
+          P = padHullLocal(part, (ix + 0.5) / px, (iy + 0.5) / px);
+          if (!inConvex(spec.hull, P[0], P[1], airMm)) continue;
+          var sx = padHullSep(spec, P[1]);
+          if (Math.abs(P[0] - sx) <= stripMm / 2) owner[i] = -1;
+          else owner[i] = P[0] <= sx ? kL : kR;
+          applied++;
+        }
+      }
+    });
+    return { applied: applied, flipped: flipped };
+  }
+
   /* The whole thing. See the pipeline comment at the top of this section.
 
      opts: { derived (the PLAIN derivation, without opts.partition), pxPerMm,
@@ -5211,6 +6069,40 @@ var PCB = (function () {
     clearanceMm = Math.max(MIN_SOLVE_CLEARANCE_MM, clearanceMm);
     var derived = opts.derived || deriveLayers(doc, opts);
     var findings = [];
+
+    /* Placement first, because everything below reads pad positions and they
+       are not settled until the free parts have been put somewhere. The
+       derivation is reused as is: a battery moving does not change the
+       artwork, the outline or the windows, which is all `autoPlace` reads out
+       of it. If a part does move, the document is rebuilt with the new
+       coordinates and rederived, because from here on the pads ARE copper and
+       the raster has to show them where they now sit.
+       PLACEMENT IS OFF BY DEFAULT and has to be asked for with
+       `opts.place === true`. It is built and it runs, but it is not finished:
+       its objective scores pad clearances, route length and artwork overlap
+       and never asks whether the position it picks can be WIRED. On the
+       no-button fixture it moves the battery one millimetre and shorts GND to
+       VCC, which the test at "without a button BAT+ and VCC are one net"
+       catches. See session13-handoff.md for the three candidate robustness
+       terms that were measured and did not work; the plan's assumption that
+       the pad-clearance term is a usable stand-in is wrong. */
+    var placed = { placement: {}, findings: [] };
+    if (opts.place === true) {
+      placed = autoPlace(doc, {
+        derived: derived, limits: lim, clearanceMm: clearanceMm
+      });
+      placed.findings.forEach(function (f) { findings.push(f); });
+    }
+    var movedIds = Object.keys(placed.placement);
+    if (movedIds.length) {
+      doc = Object.assign({}, doc, {
+        parts: (doc.parts || []).map(function (p) {
+          var c = placed.placement[p.id];
+          return c ? Object.assign({}, p, { x: c.x, y: c.y, rotDeg: c.rotDeg }) : p;
+        })
+      });
+      derived = deriveLayers(doc, opts);
+    }
 
     var ras = rasterizeCopper(derived, 'back', px);
     var w = ras.width, h = ras.height, n = w * h, i;
@@ -5393,6 +6285,23 @@ var PCB = (function () {
     var part = geodesicPartition(seed, copper, w, h);
     var owner = part.owner;
 
+    /* Step 6b: the pad hull, if asked for. After the growth, because it reads
+       what the growth delivered at its rim, and before the channel, so step 7
+       draws its channel along the prescribed line instead of along a boundary
+       the seeds raced for. Off by default; see the block at PAD_HULL for what
+       the measurements say. */
+    var hullOn = opts.padHull === true
+      || (opts.padHull !== false && !!(doc.board && doc.board.padHull));
+    var padHull = { applied: 0, flipped: 0 };
+    if (hullOn) {
+      padHull = padHullPartition(owner, copper, w, h, px, doc, nets, netIndex, {
+        airMm: (doc.board && doc.board.padHullAirMm) != null
+          ? +doc.board.padHullAirMm : PAD_HULL.airMm,
+        stripMm: (doc.board && doc.board.padHullStripMm) != null
+          ? +doc.board.padHullStripMm : PAD_HULL.stripMm
+      });
+    }
+
     /* Step 7: the channel. A pixel on the border between two owners, widened to
        the clearance.
 
@@ -5441,6 +6350,22 @@ var PCB = (function () {
     for (i = 0; i < n; i++) {
       if (copper[i] && owner[i] < 0) { etch[i] = 1; orphanPx++; }
     }
+
+    /* Step 7b: give the channel back where it cut a net in two. Straight after
+       the orphans and BEFORE the thermals and the sliver trim, because both of
+       those ask "does my net stay in one piece" and would be answering that
+       question about a net that is already broken. See the block at rejoinNets
+       for why this is a repair rather than a prevention, and for the three
+       cheaper approaches that were measured and did not work. */
+    var rejoin = rejoinNets(etch, owner, copper, w, h, px, nets, netIndex, clearanceMm);
+    rejoin.failed.forEach(function (f) {
+      var g = nets.groups[f.net][0];
+      findings.push(finding('net-unrepairable', [g ? g.key : f.net],
+        g ? g.cx : null, g ? g.cy : null,
+        f.reason === 'clearance'
+          ? { net: f.net, reason: f.reason, gotMm: f.gotMm, wantMm: round4(clearanceMm) }
+          : { net: f.net, reason: f.reason }));
+    });
 
     /* Step 8: thermal relief, stamped onto the finished etch mask. After the
        orphans, so a pad on a scrap of copper is already gone rather than
@@ -5542,8 +6467,14 @@ var PCB = (function () {
       netIndex: netIndex,
       netStats: netStats,
       swAssign: nets.swAssign,
+      /* `auto` says the solver put this part here, so the app can write the
+         coordinates back into the document and show the part where it is
+         actually going to be manufactured. A pinned part never carries it. */
       placement: (doc.parts || []).map(function (p) {
-        return { id: p.id, type: p.type, x: +p.x, y: +p.y, rotDeg: +p.rotDeg || 0, pinned: !!p.pinned };
+        return {
+          id: p.id, type: p.type, x: +p.x, y: +p.y, rotDeg: +p.rotDeg || 0,
+          pinned: !!p.pinned, auto: !!placed.placement[p.id]
+        };
       }),
       findings: findings,
       stats: {
@@ -5554,6 +6485,11 @@ var PCB = (function () {
         sliverMm: round4(sliverMm),
         sliversMm2: round4(slivers.removedPx * pxArea),
         sliversDropped: slivers.dropped,
+        rejoined: rejoin.rejoined,
+        rejoinedMm2: round4(rejoin.bridgePx * pxArea),
+        padHull: hullOn,
+        padHullMm2: round4(padHull.applied * pxArea),
+        padHullFlipped: padHull.flipped,
         clearanceMm: round4(clearanceMm),
         actualClearanceMm: round4(actualClearanceMm),
         pxPerMm: px
@@ -7569,6 +8505,27 @@ var PCB = (function () {
     gridPath: gridPath,
     geodesicPartition: geodesicPartition,
     solvePartition: solvePartition,
+    rejoinNets: rejoinNets,
+    bridgePixels: bridgePixels,
+    foreignGapPx: foreignGapPx,
+    convexHull: convexHull,
+    inConvex: inConvex,
+    padSpokePoints: padSpokePoints,
+    padHullFor: padHullFor,
+    padHullSep: padHullSep,
+    padHullPartition: padHullPartition,
+    PAD_HULL: PAD_HULL,
+    autoPlace: autoPlace,
+    placementCandidates: placementCandidates,
+    placeProbePoints: placeProbePoints,
+    placeOnBoard: placeOnBoard,
+    placeBodyHit: placeBodyHit,
+    placeArtOverlap: placeArtOverlap,
+    placeClearances: placeClearances,
+    placeRouteLength: placeRouteLength,
+    placeCompact: placeCompact,
+    placeScore: placeScore,
+    PLACE_WEIGHTS: PLACE_WEIGHTS,
     thermalRelief: thermalRelief,
     stampThermal: stampThermal,
     padEdgeGap: padEdgeGap,
@@ -10738,6 +11695,7 @@ var PCB = (function () {
     const [solving, setSolving] = useState(false);
     const autoCopper = doc.board.autoCopper !== false;
     const thermals = doc.board.thermals !== false;
+    const padHull = !!doc.board.padHull;
     const limits = PCB.fabLimits(doc.board.fab, doc.board.finish);
     /* What the solver will actually use: the document's number if it has one,
        the fab's minimum otherwise. Same fallback as in solvePartition, written
@@ -10792,7 +11750,7 @@ var PCB = (function () {
          re-runs this anyway. Named for the same reason autoCopper always was,
          that a reader should not have to trace a memo two hooks up to see that
          a switch on the config tab takes effect. */
-    }, [baseDerived, autoCopper, thermals]);
+    }, [baseDerived, autoCopper, thermals, padHull]);
 
     /* The derivation everything downstream sees. Falls back to the plain one
        while the solve runs, so the preview never goes blank. */
@@ -13333,6 +14291,29 @@ var PCB = (function () {
                   onChange=${(e) => runCmds([{ type: 'setBoard', board: { thermals: e.target.checked } }])} />
                 ${' '}Thermal relief on the pads
               </label>
+              <label className="pcb-note" style=${{ display: 'block', marginTop: 10 }}>
+                <input type="checkbox" checked=${padHull}
+                  onChange=${(e) => runCmds([{ type: 'setBoard', board: { padHull: e.target.checked } }])} />
+                ${' '}Prescribed copper around the LED pads (experiment)
+              </label>
+              <p className="pcb-note" style=${{ marginTop: 8 }}>
+                Normally the solver decides where the boundary between an LED's two pads runs. On,
+                a fixed shape is stamped instead: one hull around both pads and their spokes, split
+                down the middle, cathode copper on one side and anode copper on the other. It exists
+                because on some rotations the route to the cathode gets thinner than the isolation
+                channel and the channel eats it, leaving the LED dark.
+                ${' '}It is off by default because it is not a clear win: it fixed every case on a
+                test board with no windows, and made things worse on a real one with them, where the
+                hull rim and a window rim leave a sliver between them that belongs to a net while
+                touching nothing. Worth a look on the check tab either way.
+                ${solution && solution.stats.padHull
+    ? ' Right now it is claiming ' + solution.stats.padHullMm2.toFixed(1)
+      + ' mm² of copper' + (solution.stats.padHullFlipped
+      ? ', and it swapped the two sides on ' + solution.stats.padHullFlipped
+        + ' pad' + (solution.stats.padHullFlipped === 1 ? '' : 's')
+        + ' to match the copper arriving there.' : '.')
+    : ''}
+              </p>
               <p className="pcb-note" style=${{ marginTop: 8 }}>
                 A pad sitting in an unbroken sheet of copper is welded to the whole board thermally:
                 the iron heats the sheet instead of the joint and the solder never flows. On, each pad
