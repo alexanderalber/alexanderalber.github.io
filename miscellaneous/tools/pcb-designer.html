@@ -3998,6 +3998,32 @@ var PCB = (function () {
      against a hand-edited number rather than a limit anyone meets. */
   var MIN_SOLVE_CLEARANCE_MM = 2 / PARTITION_PX_PER_MM;
 
+  /* The channel the solver mills when the document does not ask for a width,
+     and DELIBERATELY not the fab's minimum any more (owner, 2026-09-02).
+
+     The minimum is what the fab can etch, not what this board wants. At 0.125 mm
+     the corridor a net needs to reach a pad around the outside of a foreign pad
+     can be thinner than the channel, and the channel eats it: the net falls in
+     two, an LED goes dark, and the tool reports a split it cannot repair. That
+     is the bug session 13 diagnosed at length.
+
+     Widening the channel is the cheapest thing that helps, and the measurement
+     is unambiguous. Four parts on a 70 mm board, all rotated together, broken
+     rotations out of 24:
+
+       0.125 -> 4     0.5 -> 3     1.0 -> 1     1.5 -> 1     2.0 -> 1     2.5 -> 1
+
+     The whole gain has arrived at 1.0 mm and nothing above it buys anything, so
+     1.0 mm it is. Going higher is not free either: at 3.0 mm it collapses to 19
+     of 24, because a battery holder (28.4 mm) and a button (27 mm) on a 70 mm
+     board leave no room for 3 mm channels between them.
+
+     This is a DEFAULT, not a rule. `lim.spaceMm` remains the floor the user may
+     not go under, and a board that wants dense copper can still ask for less.
+     The fit is the use: a hand-soldered decorative board, where density is not a
+     goal and a wide bright channel is easier to inspect. */
+  var DEFAULT_CLEARANCE_MM = 1.0;
+
   var EDT_INF = 1e20;
 
   /* Exact squared Euclidean distance transform, Felzenszwalb and Huttenlocher:
@@ -5717,7 +5743,8 @@ var PCB = (function () {
     });
     var lim = opts.limits || fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish);
     var clearanceMm = opts.clearanceMm != null ? +opts.clearanceMm
-      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm : lim.spaceMm);
+      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm
+        : Math.max(DEFAULT_CLEARANCE_MM, lim.spaceMm || 0));
 
     var ctx = {
       doc: doc,
@@ -6065,7 +6092,8 @@ var PCB = (function () {
     var px = opts.pxPerMm == null ? PARTITION_PX_PER_MM : +opts.pxPerMm;
     var lim = opts.limits || fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish);
     var clearanceMm = opts.clearanceMm != null ? +opts.clearanceMm
-      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm : lim.spaceMm);
+      : ((doc.board && doc.board.clearanceMm) != null ? +doc.board.clearanceMm
+        : Math.max(DEFAULT_CLEARANCE_MM, lim.spaceMm || 0));
     clearanceMm = Math.max(MIN_SOLVE_CLEARANCE_MM, clearanceMm);
     var derived = opts.derived || deriveLayers(doc, opts);
     var findings = [];
@@ -8523,6 +8551,7 @@ var PCB = (function () {
     DRC_MAX_FINDINGS: DRC_MAX_FINDINGS,
     PARTITION_PX_PER_MM: PARTITION_PX_PER_MM,
     MIN_SOLVE_CLEARANCE_MM: MIN_SOLVE_CLEARANCE_MM,
+    DEFAULT_CLEARANCE_MM: DEFAULT_CLEARANCE_MM,
     fabColors: fabColors,
     GERBER_LAYERS: GERBER_LAYERS,
     LAYER_ATTR: LAYER_ATTR,
@@ -11309,14 +11338,25 @@ var PCB = (function () {
        every reference to this tab); only the label is the shop's name.
 
        It sits directly after mat-front because that is the order of the work
-       now: draw the front, paint the front, place the parts, done. Since the
-       tool works the back copper out for itself, draw-back and mat-back are no
-       longer a step everyone takes, they are what you reach for when you want a
-       graphic on the back as well. So they moved behind the parts rather than
-       in front of them. */
+       now: draw the front, paint the front, place the parts, done. */
     { k: 'parts', label: 'blinky-parts', title: 'Place the LEDs, the battery holder and the button' },
-    { k: 'drawBack', label: 'draw-back', title: 'Draw dividing lines on the back' },
-    { k: 'matBack', label: 'mat-back', title: 'Paint the back areas with materials' },
+    /* draw-back and mat-back USED to sit here, and they are gone from the strip
+       (owner, browser test 2026-09-02): "nun nutzlos". The solver works the back
+       copper out for itself, so drawing dividing lines on the back by hand and
+       then painting the areas between them is not a step anybody takes any more.
+       Two tabs that only offer a slower way to get a worse answer.
+
+       Deliberately hidden rather than deleted. Everything behind them stays:
+       the schema still carries back-side objects and material regions, the
+       drawing and region code is untouched, the solver, the KiCad writer and the
+       3D view all still read that data, and a saved board that HAS back-side
+       graphics still renders and exports correctly. What is gone is the way in.
+
+       Why not rip it out: a text-annotation tab for the back is wanted next, and
+       that needs exactly this drawing surface. Deleting the back-side machinery
+       now would mean rebuilding it in a fortnight. The other reason is boring
+       and better: a schema change is not reversible for documents already
+       saved. */
     { k: 'drill', label: 'drill', title: 'Holes' },
     { k: 'check', label: 'check', title: 'Connectivity of the circuit and manufacturing checks' },
     { k: 'three', label: '3d-viz', title: 'The board as a lit three dimensional object, with the LEDs shining through it' },
@@ -11781,9 +11821,13 @@ var PCB = (function () {
     const padHull = !!doc.board.padHull;
     const limits = PCB.fabLimits(doc.board.fab, doc.board.finish);
     /* What the solver will actually use: the document's number if it has one,
-       the fab's minimum otherwise. Same fallback as in solvePartition, written
-       once here so the config tab and the solver cannot drift apart. */
-    const solveClearance = doc.board.clearanceMm == null ? limits.spaceMm : +doc.board.clearanceMm;
+       the default otherwise, and never under what the fab can etch. Same
+       fallback as in solvePartition, written once here so the config tab and
+       the solver cannot drift apart. See DEFAULT_CLEARANCE_MM for why the
+       default is no longer the fab's minimum. */
+    const solveClearance = doc.board.clearanceMm == null
+      ? Math.max(PCB.DEFAULT_CLEARANCE_MM, limits.spaceMm || 0)
+      : +doc.board.clearanceMm;
 
     useEffect(() => {
       if (!bundles || !baseDerived || !autoCopper) { setPartition(null); return undefined; }
@@ -13613,8 +13657,15 @@ var PCB = (function () {
     /* The pads alone, as a quiet underlay for the tabs where the traces are
        drawn: filled in the fab's copper at half strength, so a copper stroke
        drawn ON a pad still reads as the darker thing on top of it. The centre
-       cross marks what the point snap catches, which is the pad centre and not
-       its outline. */
+       mark says what the point snap catches, which is the pad centre and not
+       its outline.
+
+       That mark is a DOT and not a cross (owner, browser test): a cross is two
+       strokes through the centre, and at any normal zoom it reads as a "+" written
+       on the pad. Every pad then looks like a plus pole, cathodes and the two
+       symmetric button pads included, which contradicts the signs the
+       blinky-parts tab puts on the same pads. The polarity glyph is `padMark`
+       and belongs to that tab alone; this one is a snap target. */
     function drawPads(ctx, V, dpr) {
       if (!padList.length) return;
       ctx.save();
@@ -13626,17 +13677,13 @@ var PCB = (function () {
       ctx.strokeStyle = COL.hairline;
       ctx.lineWidth = 1 * dpr;
       ctx.stroke();
-      ctx.strokeStyle = COL.note;
-      ctx.beginPath();
+      ctx.fillStyle = COL.note;
       padList.forEach((p) => {
         const q = V.toPx(p.cx, p.cy);
-        const r = 3 * dpr;
-        ctx.moveTo(q[0] - r, q[1]);
-        ctx.lineTo(q[0] + r, q[1]);
-        ctx.moveTo(q[0], q[1] - r);
-        ctx.lineTo(q[0], q[1] + r);
+        ctx.beginPath();
+        ctx.arc(q[0], q[1], 1.6 * dpr, 0, Math.PI * 2);
+        ctx.fill();
       });
-      ctx.stroke();
       ctx.restore();
     }
 
@@ -14359,15 +14406,17 @@ var PCB = (function () {
                   onChange=${(v) => setClearDraft(v)} onCommit=${commitClearance} />
               </div>
               <p className="pcb-note" style=${{ marginTop: 8 }}>
-                How wide the mill runs between two nets. ${solveClearance.toFixed(3)} mm by default,
-                which is what ${FAB_NAME[doc.board.fab]} demands as a minimum.
+                How wide the mill runs between two nets. ${solveClearance.toFixed(3)} mm by default;
+                ${FAB_NAME[doc.board.fab]} demands at least ${(limits.spaceMm || 0).toFixed(3)} mm,
+                and the default sits above that on purpose.
                 ${solution && solution.stats.actualClearanceMm > solution.stats.clearanceMm
     ? ' The copper is worked out on a ' + (1 / PCB.PARTITION_PX_PER_MM).toFixed(2)
       + ' mm grid, so you asked for ' + solution.stats.clearanceMm.toFixed(3)
       + ' mm and you are getting ' + solution.stats.actualClearanceMm.toFixed(2) + ' mm.'
     : ''}
-                Wider is safer and costs copper; narrower is only worth trying when a pad comes back
-                isolated on the check tab.
+                A wide channel is what keeps a net from being pinched in two on its way around a
+                foreign pad, and on a board like this copper costs nothing. Go narrower for dense
+                artwork, and check the result.
               </p>
               <label className="pcb-note" style=${{ display: 'block', marginTop: 10 }}>
                 <input type="checkbox" checked=${thermals}
