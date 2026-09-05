@@ -305,12 +305,54 @@
         plusCapped: tzPct > 0 && basisRaw >= plusCap,
         plusFloored: tzPct > 0 && basisRaw < 150 };
     }
+    // ===== Zuschlaege §2a BEEG: Geschwisterbonus und Mehrlingszuschlag =====
+    // Beide sind Aufschlaege auf das fertig berechnete (und gedeckelte) Elterngeld,
+    // nicht Teil der Bemessung: der Deckel von 1.800 € steigt also effektiv mit.
+    // ACHTUNG, ungeprueft: die Lesart "Zuschlag oberhalb des Deckels", der beim
+    // Plus halbierte Mehrlingszuschlag (150 €) und "ein Zwilling ist kein
+    // Geschwisterkind fuer den anderen" stammen aus dem Gesetzestext, nicht aus
+    // einem amtlichen Rechner. Siehe HANDOFF.md.
+    const EG = {
+      siblingRate: 0.10,        // +10 % des Elterngelds
+      siblingMinBasis: 75,      // Mindestzuschlag Basis (§2a Abs. 1 S. 2)
+      siblingMinPlus: 37.5,     // beim Plus halbiert
+      multipleBasis: 300,       // je weiterem Mehrlingskind (§2a Abs. 4)
+      multiplePlus: 150,        // beim Plus halbiert
+      siblingLimitOne: 36,      // ein Geschwisterkind: unter 3 Jahren
+      siblingLimitTwo: 72,      // zwei Geschwisterkinder: unter 6 Jahren
+    };
+    // Zaehlt das Geschwisterkind im Lebensmonat lm (1-basiert) noch mit?
+    // siblingAgeMonths = Alter des juengsten Geschwisterkinds bei der Geburt.
+    // Der Bonus endet mit Ablauf des Lebensmonats, in dem die Grenze erreicht wird.
+    function siblingActive(siblingCount, siblingAgeMonths, lm) {
+      if (!siblingCount) return false;
+      const limit = siblingCount >= 2 ? EG.siblingLimitTwo : EG.siblingLimitOne;
+      return siblingAgeMonths + (lm - 1) < limit;
+    }
+    // Zuschlag auf einen Monatsbetrag. kind: "basis" | "plus"
+    function egSurcharge(base, kind, prm, lm) {
+      if (base <= 0) return 0;
+      const plus = kind === "plus";
+      let add = 0;
+      if (siblingActive(prm.siblingCount, prm.siblingAgeMonths, lm)) {
+        add += Math.max(plus ? EG.siblingMinPlus : EG.siblingMinBasis, EG.siblingRate * base);
+      }
+      // Mehrlinge: Elterngeld gibt es nur einmal, der Zuschlag gilt ab dem zweiten Kind.
+      add += Math.max(0, (prm.multiples || 1) - 1) * (plus ? EG.multiplePlus : EG.multipleBasis);
+      return Math.round(add);
+    }
+    // Monatsbetrag inkl. Zuschlaegen, die einzige Lesestelle fuer Auszahlungen.
+    function egAmount(pp, kind, prm, lm) {
+      const base = kind === "plus" ? pp.eg.plusTZ : pp.eg.basisFull;
+      return base + egSurcharge(base, kind, prm, lm);
+    }
     function parentParams(gross, cls, tz, married) {
       return { gross, grossM: gross / 12, tz, eg: calcEG(gross, cls, tz, married), net: netMonthly(gross, cls, married) };
     }
-    function makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married = true) {
+    function makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married = true,
+                        multiples = 1, siblingCount = 0, siblingAgeMonths = 0) {
       return { M: parentParams(mGross, mCls, mTZ, married), F: parentParams(fGross, fCls, fTZ, married),
-        bm0: birthMonth - 1, numChildren, married };
+        bm0: birthMonth - 1, numChildren, married, multiples, siblingCount, siblingAgeMonths };
     }
 
     // ===== Kern-Engine: bewertet einen Plan ueber alle Kalenderjahre =====
@@ -332,9 +374,10 @@
           if (lm >= 1 && lm <= 24) {
             const s = mother[lm - 1];
             if (s === MU) { muschCash += prm.M.net; progM += prm.M.net; }
-            else if (s === "basis") { egCash += prm.M.eg.basisFull; progM += prm.M.eg.basisFull; egM += prm.M.eg.basisFull; freeM += 1; }
+            else if (s === "basis") { const a = egAmount(prm.M, "basis", prm, lm); egCash += a; progM += a; egM += a; freeM += 1; }
             else if (s === "plus" || s === "bonus") {
-              egCash += prm.M.eg.plusTZ; progM += prm.M.eg.plusTZ; egM += prm.M.eg.plusTZ;
+              const a = egAmount(prm.M, "plus", prm, lm);
+              egCash += a; progM += a; egM += a;
               workM += prm.M.grossM * prm.M.tz / 100; freeM += 1 - prm.M.tz / 100;
             }
             else if (s === "frei") { freeM += 1; }
@@ -347,9 +390,10 @@
           // Vater
           if (lm >= 1 && lm <= 24) {
             const s = father[lm - 1];
-            if (s === "basis") { egCash += prm.F.eg.basisFull; progF += prm.F.eg.basisFull; egF += prm.F.eg.basisFull; freeF += 1; }
+            if (s === "basis") { const a = egAmount(prm.F, "basis", prm, lm); egCash += a; progF += a; egF += a; freeF += 1; }
             else if (s === "plus" || s === "bonus") {
-              egCash += prm.F.eg.plusTZ; progF += prm.F.eg.plusTZ; egF += prm.F.eg.plusTZ;
+              const a = egAmount(prm.F, "plus", prm, lm);
+              egCash += a; progF += a; egF += a;
               workF += prm.F.grossM * prm.F.tz / 100; freeF += 1 - prm.F.tz / 100;
             }
             else if (s === "frei") { freeF += 1; }
@@ -626,6 +670,27 @@
         birthMonthLabel: 'Geburtsmonat',
         children: 'Kinder',
         childrenSub: 'für Freibetrag & Kindergeld',
+        surcharge: {
+          multiplesLabel: 'Mehrlinge',
+          multiplesSub: 'Kinder bei dieser Geburt',
+          multiplesOpts: ['Einling', 'Zwillinge', 'Drillinge'],
+          multiplesHint: 'Elterngeld gibt es bei einer Mehrlingsgeburt nur einmal, nicht pro Kind, und die Zahl der Bezugsmonate ändert sich nicht. Für das zweite und jedes weitere Kind kommt aber ein Mehrlingszuschlag von 300 € im Monat dazu, beim ElterngeldPlus 150 €. Der Zuschlag ist ein Aufschlag auf das fertig berechnete Elterngeld, der Höchstbetrag von 1.800 € begrenzt ihn also nicht.',
+          siblingLabel: 'Geschwisterkinder',
+          siblingSub: 'für den Geschwisterbonus',
+          siblingOpts: ['keine', 'eines', 'zwei oder mehr'],
+          siblingAgeLabel: 'Alter des jüngsten Geschwisterkinds bei der Geburt',
+          ageValue: m => {
+            const y = Math.floor(m / 12), r = m % 12;
+            const yr = y === 0 ? '' : y === 1 ? '1 Jahr' : `${y} Jahre`;
+            const mo = r === 0 ? '' : r === 1 ? '1 Monat' : `${r} Monate`;
+            return [yr, mo].filter(Boolean).join(', ') || 'unter 1 Monat';
+          },
+          siblingAgeHint: 'Der Geschwisterbonus erhöht das Elterngeld um 10 %, mindestens um 75 € im Monat (beim ElterngeldPlus 37,50 €). Es gibt ihn, solange ein Geschwisterkind unter 3 Jahre alt ist, oder zwei unter 6. Er endet mit Ablauf des Lebensmonats, in dem diese Grenze erreicht wird, also oft mitten im Bezugszeitraum. Ein Zwilling zählt nicht als Geschwisterkind des anderen.',
+          multipleNote: n => `Mehrlingszuschlag für ${n === 1 ? 'ein weiteres Kind' : `${n} weitere Kinder`}, dauerhaft.`,
+          siblingNoteAll: 'Geschwisterbonus über den ganzen Zeitraum.',
+          siblingNoteNone: 'Geschwisterbonus: das Geschwisterkind ist zur Geburt schon zu alt.',
+          siblingNoteUntil: n => `Geschwisterbonus nur bis Lebensmonat ${n}, danach fällt er weg.`,
+        },
         monthNames: ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'],
         pareto: {
           title: 'Pareto-Front: Freizeit vs. Kosten',
@@ -751,6 +816,27 @@
         birthMonthLabel: 'Month of birth',
         children: 'Children',
         childrenSub: 'for allowance & child benefit',
+        surcharge: {
+          multiplesLabel: 'Multiples',
+          multiplesSub: 'children in this birth',
+          multiplesOpts: ['Single', 'Twins', 'Triplets'],
+          multiplesHint: 'A multiple birth still yields one parental allowance, not one per child, and the number of months stays the same. The second and every further child adds a multiples supplement of €300 per month, €150 under ElterngeldPlus. The supplement is added on top of the finished amount, so the €1,800 cap does not limit it.',
+          siblingLabel: 'Older siblings',
+          siblingSub: 'for the sibling bonus',
+          siblingOpts: ['none', 'one', 'two or more'],
+          siblingAgeLabel: 'Age of the youngest sibling at birth',
+          ageValue: m => {
+            const y = Math.floor(m / 12), r = m % 12;
+            const yr = y === 0 ? '' : y === 1 ? '1 year' : `${y} years`;
+            const mo = r === 0 ? '' : r === 1 ? '1 month' : `${r} months`;
+            return [yr, mo].filter(Boolean).join(', ') || 'under 1 month';
+          },
+          siblingAgeHint: 'The sibling bonus raises the allowance by 10 %, at least €75 per month (€37.50 under ElterngeldPlus). It applies while one sibling is under 3, or two are under 6. It ends with the life month in which that limit is reached, which is often in the middle of the period. A twin does not count as the sibling of the other.',
+          multipleNote: n => `Multiples supplement for ${n === 1 ? 'one further child' : `${n} further children`}, throughout.`,
+          siblingNoteAll: 'Sibling bonus for the whole period.',
+          siblingNoteNone: 'Sibling bonus: the sibling is already too old at birth.',
+          siblingNoteUntil: n => `Sibling bonus only until life month ${n}, then it drops away.`,
+        },
         monthNames: ['January','February','March','April','May','June','July','August','September','October','November','December'],
         pareto: {
           title: 'Pareto front: free time vs. cost',
@@ -1109,11 +1195,19 @@
          gerechnet hat und die Mehrheit der Nutzer darunter faellt. Der Schalter
          wirkt nur auf die Steuer, nicht auf das Elterngeld selbst. */
       const [married, setMarried] = useState(true);
+      /* Drei getrennte Felder statt eines aufgebohrten numChildren, weil die
+         Bedeutungen auseinanderfallen: Zwillinge sind steuerlich zwei Kinder,
+         aber ein Elterngeldanspruch, und ein fuenfjaehriges Geschwisterkind
+         zaehlt fuer Kindergeld, aber nicht fuer den Geschwisterbonus. */
+      const [multiples, setMultiples] = useState(1);
+      const [siblingCount, setSiblingCount] = useState(0);
+      const [siblingAgeMonths, setSiblingAgeMonths] = useState(24);
       const [mother, setMother] = useState(() => BASELINE_MOTHER.slice());
       const [father, setFather] = useState(() => BASELINE_FATHER.slice());
       /* Ein einziger State fuer alle Erklaerungen, kein Flag pro Punkt: so kann
          nie mehr als eine offen sein, und das Schliessen braucht keine
-         Aufraeumarbeit. Werte: null, 'help', 'cls', 'tz', 'marital'. */
+         Aufraeumarbeit. Werte: null, 'help', 'cls', 'tz', 'marital',
+         'multiples', 'sibling'. */
       const [info, setInfo] = useState(null);
       const toggleInfo = useCallback((id) => setInfo(cur => cur === id ? null : id), []);
       const [lang, setLang] = useState(INITIAL_LANG);
@@ -1143,8 +1237,26 @@
       const MONTHS_LABEL = useMemo(() => monthsLabelFor(t), [t]);
       const fmt = useMemo(() => fmtFor(lang), [lang]);
 
-      const prm = useMemo(() => makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married),
-        [mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married]);
+      const prm = useMemo(() => makeParams(mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married,
+          multiples, siblingCount, siblingAgeMonths),
+        [mGross, mCls, mTZ, fGross, fCls, fTZ, birthMonth, numChildren, married,
+          multiples, siblingCount, siblingAgeMonths]);
+
+      /* Hinweis unter den Einkommenskarten: die Karte zeigt den ersten Lebensmonat,
+         der Geschwisterbonus laeuft aber innerhalb der 24 Monate aus. Ohne den Satz
+         widerspricht die Karte dem Raster, ohne dass ein Grund sichtbar waere. */
+      const surchargeNote = useMemo(() => {
+        const parts = [];
+        if (multiples > 1) parts.push(t.surcharge.multipleNote(multiples - 1));
+        if (siblingCount > 0) {
+          const limit = siblingCount >= 2 ? EG.siblingLimitTwo : EG.siblingLimitOne;
+          const endsAfter = limit - siblingAgeMonths;   // Lebensmonate bis zum Auslaufen
+          parts.push(endsAfter >= 24 ? t.surcharge.siblingNoteAll
+            : endsAfter <= 0 ? t.surcharge.siblingNoteNone
+            : t.surcharge.siblingNoteUntil(endsAfter));
+        }
+        return parts.join(" · ");
+      }, [multiples, siblingCount, siblingAgeMonths, t]);
 
       const result = useMemo(() => evaluate(mother, father, prm), [mother, father, prm]);
       const baseline = useMemo(() => evaluate(BASELINE_MOTHER, BASELINE_FATHER, prm), [prm]);
@@ -1181,11 +1293,12 @@
       }, [mGross, fGross]);
 
       const financials = useMemo(() => {
-        const amt = (s, P) => s === MU ? P.net : s === "basis" ? P.eg.basisFull
-          : (s === "plus" || s === "bonus") ? P.eg.plusTZ : 0;
+        // lm = i + 1, damit der Geschwisterbonus im richtigen Monat ausläuft
+        const amt = (s, P, lm) => s === MU ? P.net : s === "basis" ? egAmount(P, "basis", prm, lm)
+          : (s === "plus" || s === "bonus") ? egAmount(P, "plus", prm, lm) : 0;
         const monthlyDetail = [];
         for (let i = 0; i < 24; i++) {
-          const mAmount = amt(mother[i], prm.M), fAmount = amt(father[i], prm.F);
+          const mAmount = amt(mother[i], prm.M, i + 1), fAmount = amt(father[i], prm.F, i + 1);
           monthlyDetail.push({ mAmount, fAmount, total: mAmount + fAmount });
         }
         return { monthlyDetail };
@@ -1327,11 +1440,15 @@
                   onChange=${e => setTz(Number(e.target.value))} style=${{ width: "100%" }}/>
                 <div style=${{ fontSize: 12, color: "var(--tool-note)", marginTop: 8, lineHeight: 1.6 }}>
                   ${t.inc.egNetto(fmt(P.eg.nettoVor))} · ${t.inc.netLine(fmt(P.net))}<br/>
-                  → ${t.inc.egBasis}: ${t.inc.egMoney(fmt(P.eg.basisFull))}
+                  <!-- Beträge im ersten Lebensmonat, also inklusive Zuschlägen. Sonst
+                       widerspräche die Karte dem Raster darunter. Der Hinweis auf das
+                       Auslaufen des Geschwisterbonus steht in der Zeile darunter. -->
+                  → ${t.inc.egBasis}: ${t.inc.egMoney(fmt(egAmount(P, "basis", prm, 1)))}
                   ${P.eg.basisCapped && html`<span style=${{ color: PAL.good, fontWeight: 600 }}> (${t.inc.egCap})</span>`}
-                  ${" · "}${t.inc.egPlus(tz)}: ${t.inc.egMoney(fmt(P.eg.plusTZ))}
+                  ${" · "}${t.inc.egPlus(tz)}: ${t.inc.egMoney(fmt(egAmount(P, "plus", prm, 1)))}
                   ${P.eg.plusCapped && html`<span style=${{ color: PAL.good, fontWeight: 600 }}> (${t.inc.egCap})</span>`}
                   ${P.eg.plusFloored && html`<span style=${{ color: "var(--tool-warn-text)", fontWeight: 600 }}> (${t.inc.egMin})</span>`}
+                  ${surchargeNote && html`<br/><span style=${{ color: "var(--tool-faint)" }}>${surchargeNote}</span>`}
                 </div>
               </div>
             `)}
@@ -1394,7 +1511,67 @@
                 <button className=${"lang-seg" + (!married ? " active" : "")} onClick=${() => setMarried(false)}>${t.marital.no}</button>
               </div>
             </div>
+            <!-- Mehrlinge und Geschwisterkinder sind eigene Felder, nicht Teil von
+                 "Kinder" oben: steuerliche Kinderzahl und Elterngeld-Zuschlaege
+                 folgen verschiedenen Regeln. -->
+            <div className="eg-anchor">
+              <div style=${{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "var(--tool-note)", marginBottom: 6 }}>
+                ${t.surcharge.multiplesLabel} <span style=${{ textTransform: "none", letterSpacing: 0, color: "var(--tool-faint)" }}>· ${t.surcharge.multiplesSub}</span>
+                <${InfoDot} open=${info === 'multiples'} toggle=${() => toggleInfo('multiples')}
+                  label=${t.surcharge.multiplesLabel}/>
+              </div>
+              ${info === 'multiples' && html`
+                <${Popover} close=${() => setInfo(null)} closeLabel=${t.helpClose}>
+                  <p>${t.surcharge.multiplesHint}</p>
+                <//>
+              `}
+              <div className="seg-row">
+                ${t.surcharge.multiplesOpts.map((lbl, i) => html`
+                  <button key=${i} className=${"lang-seg" + (multiples === i + 1 ? " active" : "")}
+                    onClick=${() => setMultiples(i + 1)}>${lbl}</button>
+                `)}
+              </div>
+            </div>
+            <div className="eg-anchor">
+              <div style=${{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "var(--tool-note)", marginBottom: 6 }}>
+                ${t.surcharge.siblingLabel} <span style=${{ textTransform: "none", letterSpacing: 0, color: "var(--tool-faint)" }}>· ${t.surcharge.siblingSub}</span>
+                <${InfoDot} open=${info === 'sibling'} toggle=${() => toggleInfo('sibling')}
+                  label=${t.surcharge.siblingLabel}/>
+              </div>
+              ${info === 'sibling' && html`
+                <${Popover} close=${() => setInfo(null)} closeLabel=${t.helpClose}>
+                  <p>${t.surcharge.siblingAgeHint}</p>
+                <//>
+              `}
+              <div className="seg-row">
+                ${t.surcharge.siblingOpts.map((lbl, i) => html`
+                  <button key=${i} className=${"lang-seg" + (siblingCount === i ? " active" : "")}
+                    onClick=${() => {
+                      setSiblingCount(i);
+                      // Beim Wechsel von "zwei oder mehr" auf "eines" faellt die
+                      // Altersgrenze von 72 auf 36 Monate. Ohne das Nachziehen
+                      // stuende der Schieberegler hinter seinem eigenen Maximum.
+                      const max = i >= 2 ? EG.siblingLimitTwo : EG.siblingLimitOne;
+                      if (siblingAgeMonths > max) setSiblingAgeMonths(max);
+                    }}>${lbl}</button>
+                `)}
+              </div>
+            </div>
           </div>
+          <!-- Das Altersfeld erscheint nur, wenn es etwas bewirkt: ohne
+               Geschwisterkind gibt es kein Alter zu erfragen. -->
+          ${siblingCount > 0 && html`
+            <div style=${{ marginBottom: 24, maxWidth: 420 }}>
+              <div style=${{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "var(--tool-note)", marginBottom: 6 }}>
+                ${t.surcharge.siblingAgeLabel}
+              </div>
+              <input type="range" min=${0} max=${siblingCount >= 2 ? 72 : 36} step=${1} value=${siblingAgeMonths}
+                onChange=${e => setSiblingAgeMonths(Number(e.target.value))} style=${{ width: "100%" }}/>
+              <div style=${{ fontSize: 12, color: "var(--tool-note)", marginTop: 4 }}>
+                ${t.surcharge.ageValue(siblingAgeMonths)}
+              </div>
+            </div>
+          `}
 
           <div style=${{ background: "var(--tool-surface)", borderRadius: 12, border: "1px solid var(--tool-hairline)", padding: 20, marginBottom: 24 }}>
             <div style=${{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "var(--tool-note)", marginBottom: 6 }}>
@@ -1442,8 +1619,8 @@
                         const colors = STATUS_COLORS[status];
                         const fixed = who === "mother" && i < 2;
                         const amount = status === MU ? P.net
-                          : status === "basis" ? P.eg.basisFull
-                          : (status === "plus" || status === "bonus") ? P.eg.plusTZ : null;
+                          : status === "basis" ? egAmount(P, "basis", prm, i + 1)
+                          : (status === "plus" || status === "bonus") ? egAmount(P, "plus", prm, i + 1) : null;
                         return html`
                           <td key=${i} onClick=${() => handleCellClick(who, i)} style=${{
                             padding: 2, textAlign: "center", cursor: fixed ? "default" : "pointer",
