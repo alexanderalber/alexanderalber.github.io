@@ -59,6 +59,12 @@
     link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
     /* a magnifier, for "search" / "inspect" triggers */
     search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+    /* three lines of text, for a button that loads or replaces a text */
+    text: '<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/>',
+    /* a die: the pips are zero-length paths with a round cap, so they are dots
+       in currentColor rather than filled shapes, which would break the colour
+       invariant. For "roll again": a new random seed, not a reset. */
+    dice: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h.01"/><path d="M16 8h.01"/><path d="M12 12h.01"/><path d="M8 16h.01"/><path d="M16 16h.01"/>',
     /* sliders, for "advanced" or "settings" triggers */
     tune: '<path d="M4 6h10"/><path d="M18 6h2"/><path d="M4 12h4"/><path d="M12 12h8"/><path d="M4 18h10"/><path d="M18 18h2"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/>'
   };
