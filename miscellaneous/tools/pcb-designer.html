@@ -2361,8 +2361,21 @@ var PCB = (function () {
      remove a one pixel step and only pins the noise down. maskToPath refines the
      boundary to subpixel now, so the opposite holds: measured on a 6mm disc
      (notes/dev/pcb-edge-quality.mjs), 1.0 gives 0.80 px of worst-case error, 0.5
-     gives 0.34 px with 48 vertices, and going below 0.5 only adds vertices. */
-  var REGION_TOL_PX = 0.5;
+     gives 0.34 px with 48 vertices, and going below 0.5 only adds vertices.
+
+     0.5 was still wrong, and the disc is the reason it looked right: it measures
+     ACCURACY, and accuracy was never the problem. The refinement leaves a
+     residual wiggle on the boundary of about 0.1 px median and 0.33 px at p90,
+     so a tolerance of 0.5 sits INSIDE that noise band rather than above it.
+     Douglas-Peucker then keeps exactly the vertices where the noise happens to
+     peak, alternating either side of the true edge, and joins them with long
+     chords: measured on the owner's document, segments of 0.61 mm median
+     meeting at 58 degrees (p90), next to drawn curves that turn 11 degrees. The
+     areas sat in the right place the whole time (p99 distance to the drawn
+     contour 0.086 mm) and still read as frayed, because the eye sees the
+     zigzag, not the offset. 0.2 is below the noise band: p90 turn drops from 58
+     to 17 degrees for three times the vertices. */
+  var REGION_TOL_PX = 0.2;
   var REGION_MAX_ERR_PX = 1.0; // curve fit tolerance, in raster pixels
 
   /* Region rings are NOT curve-fitted, and that is a fix rather than a saving.
@@ -6785,6 +6798,384 @@ var PCB = (function () {
     return { findings: findings, truncated: state.truncated };
   }
 
+  /* --------------------------------------------------- current flow (2D) */
+
+  /* What the copper does with the current, solved rather than guessed.
+
+     The question this answers came from looking at a narrow neck between two
+     areas and asking whether anything checks that it carries the current.
+     Nothing did, and the DRC above is the wrong place for it: its seven rules
+     are all about what a FAB can make, and none of them knows that copper
+     conducts. The honest answer needs the resistance over the whole path, not
+     the width at the narrowest point, because a short neck in a wide plane
+     costs almost nothing while a long thin run costs a lot. Width alone cannot
+     tell those two apart.
+
+     So this solves the actual field. Copper of one net is a resistor sheet,
+     one pad is held at 1 V and another at 0 V, and the potential in between
+     satisfies the Laplace equation. On a uniform square grid every edge
+     between two neighbouring pixels is exactly one square of copper, so the
+     conductance per edge is 1/Rsq and the pixel size cancels out of the matrix
+     entirely: the geometry enters only through WHICH pixels are connected.
+     That is what makes this cheap enough to run on a button press.
+
+     Sheet resistance rather than a volume: copper foil is thin and uniform, so
+     rho/t in ohms per square is the whole material model. One ounce is 35 um,
+     which with rho = 1.68e-8 ohm m gives 0.48 milliohm per square. Two ounce
+     copper halves it. The thickness of the board itself never enters.
+
+     THE RESULT IS ALWAYS GOING TO BE A SMALL NUMBER, and saying so is part of
+     the job rather than a reason to leave the feature out. Measured on the
+     owner's egg board the worst path is 18 milliohms, which at 20 mA is 0.36
+     mV against a cell that has 10 to 20 OHMS of internal resistance: a
+     thousand times more than the entire copper. A partition of this size
+     cannot fail this way, and a check that can never fail is worse than no
+     check, because it manufactures confidence. What the field is genuinely
+     good for is the picture: where the current actually flows, which parts of
+     a large pour do nothing, and how a neck concentrates it. That is a thing
+     nobody can see otherwise, and it is offered as a view, not as a verdict. */
+
+  var COPPER_RHO = 1.68e-8;     // ohm metre, annealed copper at 20 C
+  var OZ_THICK_UM = 35;         // one ounce of copper, in micrometres
+  var FIELD_PX_PER_MM = 5;      // the solve grid; see the note in currentField
+
+  /* Milliohms per square for a copper weight in ounces. */
+  function sheetResistance(oz) {
+    var t = (oz == null ? 1 : +oz) * OZ_THICK_UM * 1e-6;
+    return t > 0 ? COPPER_RHO / t * 1000 : 0;
+  }
+
+  /* Majority downsample of an owner raster by an integer factor.
+
+     Majority and not nearest: at 4x a nearest sample can drop a neck three
+     pixels wide, which would turn a real constriction into an open circuit and
+     report a broken net that is not broken. The majority keeps a feature that
+     occupies most of its cell, which is the conservative direction here. */
+  function downsampleOwner(owner, w, h, f) {
+    if (f <= 1) return { data: owner, width: w, height: h, factor: 1 };
+    var W = Math.floor(w / f), H = Math.floor(h / f);
+    var out = new Int32Array(W * H);
+    var seen = [], count = [];
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        var m = 0;
+        for (var dy = 0; dy < f; dy++) {
+          for (var dx = 0; dx < f; dx++) {
+            var v = owner[(y * f + dy) * w + (x * f + dx)];
+            var at = -1;
+            for (var s = 0; s < m; s++) if (seen[s] === v) { at = s; break; }
+            if (at < 0) { seen[m] = v; count[m] = 1; m++; } else count[at]++;
+          }
+        }
+        var best = -1, bc = -1;
+        for (var k = 0; k < m; k++) if (count[k] > bc) { bc = count[k]; best = seen[k]; }
+        out[y * W + x] = best;
+      }
+    }
+    return { data: out, width: W, height: H, factor: f };
+  }
+
+  /* The pixels of one pad polygon on a grid, by pixel centre, which is the
+     same sampling rule the rasterizer uses everywhere else in this file. */
+  function polyPixels(poly, w, h, px) {
+    var out = [];
+    if (!poly || poly.length < 3) return out;
+    var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, i;
+    for (i = 0; i < poly.length; i++) {
+      if (poly[i][0] < x0) x0 = poly[i][0];
+      if (poly[i][0] > x1) x1 = poly[i][0];
+      if (poly[i][1] < y0) y0 = poly[i][1];
+      if (poly[i][1] > y1) y1 = poly[i][1];
+    }
+    var pa = Math.max(0, Math.floor(x0 * px)), pb = Math.min(w - 1, Math.ceil(x1 * px));
+    var qa = Math.max(0, Math.floor(y0 * px)), qb = Math.min(h - 1, Math.ceil(y1 * px));
+    for (var py = qa; py <= qb; py++) {
+      for (var pxi = pa; pxi <= pb; pxi++) {
+        var mx = (pxi + 0.5) / px, my = (py + 0.5) / px, inside = false;
+        for (var a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+          var A = poly[a], B = poly[b];
+          if ((A[1] > my) !== (B[1] > my)
+            && mx < (B[0] - A[0]) * (my - A[1]) / (B[1] - A[1]) + A[0]) inside = !inside;
+        }
+        if (inside) out.push(py * w + pxi);
+      }
+    }
+    return out;
+  }
+
+  /* Solve one net between two electrodes.
+
+     Conjugate gradient and not Gauss-Seidel, and that is worth a sentence
+     because the first attempt at this WAS Gauss-Seidel with over-relaxation
+     and it silently did not converge: after 4000 sweeps over a 20 px/mm grid
+     the currents at the two electrodes disagreed by a factor of four while
+     every number still looked plausible. CG on this matrix (symmetric,
+     positive definite, five diagonals) reaches a residual of 1e-7 in a couple
+     of thousand iterations and, more importantly, TELLS you: the residual
+     comes back with the result, and the two currents agree to the last digit
+     when it worked. Never show this field without checking that.
+
+     Returns null when either electrode has no pixel on this net, which is the
+     ordinary case for a pad the partition put somewhere else, not an error. */
+  function solveField(own, w, h, ni, srcPix, dstPix, rsq, maxIter) {
+    var i, k, n = w * h;
+    var idx = new Int32Array(n), cells = [];
+    for (i = 0; i < n; i++) idx[i] = -1;
+    for (i = 0; i < n; i++) if (own[i] === ni) { idx[i] = cells.length; cells.push(i); }
+    var N = cells.length;
+    if (!N) return null;
+
+    var fixed = new Uint8Array(N), val = new Float64Array(N), ns = 0, nt = 0;
+    for (i = 0; i < srcPix.length; i++) {
+      k = idx[srcPix[i]];
+      if (k >= 0 && !fixed[k]) { fixed[k] = 1; val[k] = 1; ns++; }
+    }
+    for (i = 0; i < dstPix.length; i++) {
+      k = idx[dstPix[i]];
+      if (k >= 0 && !fixed[k]) { fixed[k] = 1; val[k] = 0; nt++; }
+    }
+    if (!ns || !nt) return null;
+
+    /* CSR over the four-neighbourhood, restricted to this net. Four and not
+       eight: a diagonal step is not a square of copper, and counting it as one
+       would understate the resistance of anything running at 45 degrees. */
+    var deg = new Int32Array(N), ptr = new Int32Array(N + 1);
+    var DX = [1, -1, 0, 0], DY = [0, 0, 1, -1];
+    var d, x, y, nx, ny, j;
+    for (k = 0; k < N; k++) {
+      i = cells[k]; x = i % w; y = (i - x) / w;
+      var c = 0;
+      for (d = 0; d < 4; d++) {
+        nx = x + DX[d]; ny = y + DY[d];
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        if (idx[ny * w + nx] >= 0) c++;
+      }
+      deg[k] = c; ptr[k + 1] = ptr[k] + c;
+    }
+    var col = new Int32Array(ptr[N]);
+    for (k = 0; k < N; k++) {
+      i = cells[k]; x = i % w; y = (i - x) / w; j = ptr[k];
+      for (d = 0; d < 4; d++) {
+        nx = x + DX[d]; ny = y + DY[d];
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        var q = idx[ny * w + nx];
+        if (q >= 0) col[j++] = q;
+      }
+    }
+
+    /* A u = b on the free cells, with the fixed neighbours moved to the right
+       hand side. A is deg on the diagonal and -1 off it: the graph Laplacian
+       of the copper, which is symmetric positive definite once the Dirichlet
+       cells are removed, and that is exactly what CG needs. */
+    var u = new Float64Array(N);
+    for (k = 0; k < N; k++) u[k] = fixed[k] ? val[k] : 0;
+    var b = new Float64Array(N);
+    for (k = 0; k < N; k++) {
+      if (fixed[k]) continue;
+      var s = 0;
+      for (j = ptr[k]; j < ptr[k + 1]; j++) if (fixed[col[j]]) s += val[col[j]];
+      b[k] = s;
+    }
+    var r = new Float64Array(N), p = new Float64Array(N), Ap = new Float64Array(N);
+    var applyA = function (v, out) {
+      for (var q2 = 0; q2 < N; q2++) {
+        if (fixed[q2]) { out[q2] = 0; continue; }
+        var s2 = deg[q2] * v[q2];
+        for (var j2 = ptr[q2]; j2 < ptr[q2 + 1]; j2++) {
+          if (!fixed[col[j2]]) s2 -= v[col[j2]];
+        }
+        out[q2] = s2;
+      }
+    };
+    var xv = new Float64Array(N);
+    applyA(xv, Ap);
+    var rs = 0;
+    for (k = 0; k < N; k++) { r[k] = fixed[k] ? 0 : b[k] - Ap[k]; p[k] = r[k]; rs += r[k] * r[k]; }
+    var rs0 = rs || 1, it = 0, lim = maxIter == null ? 20000 : maxIter;
+    for (; it < lim && rs > 1e-14 * rs0; it++) {
+      applyA(p, Ap);
+      var pa = 0;
+      for (k = 0; k < N; k++) pa += p[k] * Ap[k];
+      if (!pa) break;
+      var al = rs / pa, rs2 = 0;
+      for (k = 0; k < N; k++) { xv[k] += al * p[k]; r[k] -= al * Ap[k]; rs2 += r[k] * r[k]; }
+      var be = rs2 / rs;
+      for (k = 0; k < N; k++) p[k] = r[k] + be * p[k];
+      rs = rs2;
+    }
+    for (k = 0; k < N; k++) if (!fixed[k]) u[k] = xv[k];
+
+    /* The current leaving each electrode, which is the resistance and the
+       convergence check in one: on a solved field the two are equal. */
+    var cur = function (pix, lvl) {
+      var I = 0, done = new Uint8Array(N);
+      for (var a2 = 0; a2 < pix.length; a2++) {
+        var kk = idx[pix[a2]];
+        if (kk < 0 || !fixed[kk] || val[kk] !== lvl || done[kk]) continue;
+        done[kk] = 1;
+        for (var j3 = ptr[kk]; j3 < ptr[kk + 1]; j3++) {
+          var c3 = col[j3];
+          if (fixed[c3] && val[c3] === lvl) continue;
+          I += Math.abs(lvl - u[c3]) / rsq;
+        }
+      }
+      return I;
+    };
+    var Isrc = cur(srcPix, 1), Idst = cur(dstPix, 0);
+    if (!(Isrc > 0) || !(Idst > 0)) return null;
+
+    return {
+      u: u, idx: idx, cells: cells, count: N,
+      rMilliOhm: 1 / Isrc,
+      rSinkMilliOhm: 1 / Idst,
+      iterations: it,
+      residual: Math.sqrt(rs / rs0),
+      srcPixels: ns, dstPixels: nt
+    };
+  }
+
+  /* Current density at every cell, as the magnitude of the gradient.
+
+     The value returned is the SHAPE only, in volts per pixel, because the
+     field carries an arbitrary 1 V; currentField scales it to a real current.
+     Central differences where both neighbours exist, one-sided at a boundary,
+     zero where a cell has no neighbour on that axis at all. */
+  function currentDensity(f, w, h) {
+    var N = f.count, g = new Float64Array(N), i, k, x, y;
+    var at = function (xx, yy) {
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) return -1;
+      return f.idx[yy * w + xx];
+    };
+    for (k = 0; k < N; k++) {
+      i = f.cells[k]; x = i % w; y = (i - x) / w;
+      var l = at(x - 1, y), r = at(x + 1, y), t = at(x, y - 1), bo = at(x, y + 1);
+      var gx = 0, gy = 0;
+      if (l >= 0 && r >= 0) gx = (f.u[r] - f.u[l]) / 2;
+      else if (r >= 0) gx = f.u[r] - f.u[k];
+      else if (l >= 0) gx = f.u[k] - f.u[l];
+      if (t >= 0 && bo >= 0) gy = (f.u[bo] - f.u[t]) / 2;
+      else if (bo >= 0) gy = f.u[bo] - f.u[k];
+      else if (t >= 0) gy = f.u[k] - f.u[t];
+      g[k] = Math.sqrt(gx * gx + gy * gy);
+    }
+    return g;
+  }
+
+  /* The whole thing, for one pair of pads on one net.
+
+     opts: { solution (a solvePartition result, required), pxPerMm, oz,
+             currentA (what to scale the density by), maxIter }
+
+     The grid is FIVE pixels per millimetre and not the twenty the partition
+     runs at. The field is smooth by its nature (that is what the Laplace
+     equation means), so little accuracy is lost, while the cost is not little:
+     CG over 570k cells takes about a minute, over 36k it takes a second, and a
+     button press has to come back. The downsample is a majority vote so that a
+     narrow neck survives it. */
+  function currentField(doc, netName, srcKey, dstKey, opts) {
+    opts = opts || {};
+    var sol = opts.solution;
+    if (!sol || !sol.owner) return null;
+    var ni = sol.netIndex ? sol.netIndex[netName] : -1;
+    if (!(ni >= 0)) return null;
+
+    var src = sol.owner, sw = src.width, sh = src.height, spx = src.pxPerMm;
+    var want = opts.pxPerMm == null ? FIELD_PX_PER_MM : +opts.pxPerMm;
+    var f = Math.max(1, Math.round(spx / want));
+    var ds = downsampleOwner(src.data, sw, sh, f);
+    var w = ds.width, h = ds.height, px = spx / f;
+
+    var pads = docPads(doc), polys = docPadPolys(doc);
+    var si = -1, di = -1, i;
+    for (i = 0; i < pads.length; i++) {
+      if (pads[i].key === srcKey) si = i;
+      if (pads[i].key === dstKey) di = i;
+    }
+    if (si < 0 || di < 0) return null;
+    var sp = polyPixels(polys[si], w, h, px), dp = polyPixels(polys[di], w, h, px);
+    if (!sp.length || !dp.length) return null;
+
+    var rsq = sheetResistance(opts.oz);
+    var res = solveField(ds.data, w, h, ni, sp, dp, rsq, opts.maxIter);
+    if (!res) return null;
+
+    var dens = currentDensity(res, w, h);
+    var maxG = 0;
+    for (i = 0; i < dens.length; i++) if (dens[i] > maxG) maxG = dens[i];
+
+    /* Amps per millimetre at the busiest cell, for the read-out. The field
+       carries 1 V, so scaling to a real current is a ratio: the density at
+       unit voltage over the total current at unit voltage, times the current
+       actually asked about. */
+    var I1 = 1 / res.rMilliOhm;                    // amps at 1 V, since R is in mOhm
+    var amps = opts.currentA == null ? 0.02 : +opts.currentA;
+    var peakPerMm = I1 > 0 ? (maxG / rsq) * px * (amps / I1) : 0;
+    var bal = res.rMilliOhm > 0
+      ? Math.abs(res.rMilliOhm - res.rSinkMilliOhm) / res.rMilliOhm : 1;
+
+    return {
+      net: netName, from: srcKey, to: dstKey,
+      width: w, height: h, pxPerMm: px, factor: f,
+      u: res.u, idx: res.idx, cells: res.cells, density: dens, maxDensity: maxG,
+      rMilliOhm: res.rMilliOhm, rSinkMilliOhm: res.rSinkMilliOhm, balance: bal,
+      iterations: res.iterations, residual: res.residual,
+      sheetMilliOhmSq: rsq, currentA: amps,
+      dropMilliVolt: res.rMilliOhm * amps,
+      peakAmpPerMm: peakPerMm,
+      converged: res.residual < 1e-6 && bal < 0.01
+    };
+  }
+
+  /* The pad pairs worth solving, derived from the fixed circuit the rest of
+     this file already assumes: the battery feeds the button, the button feeds
+     every anode, every cathode returns to the battery minus. One entry per
+     stretch of copper that carries current, in the order the current takes it.
+
+     The two button pads are told apart by the solver, not by their names, so
+     the assignment is read from the solution when there is one. Without it the
+     pair is skipped rather than guessed: a reversed button would draw a field
+     that is simply wrong, and wrong is worse than absent here. */
+  function currentPaths(doc, solution) {
+    var pads = docPads(doc), out = [], i;
+    var byRole = function (role) {
+      var r = [];
+      for (i = 0; i < pads.length; i++) if (pads[i].role === role) r.push(pads[i]);
+      return r;
+    };
+    var batP = byRole('bat+')[0] || null;
+    var gnd = byRole('gnd'), anodes = byRole('vcc'), sw = byRole('sw');
+    var batM = null, cathodes = [];
+    for (i = 0; i < gnd.length; i++) {
+      if (gnd[i].type === 'battery') batM = gnd[i]; else cathodes.push(gnd[i]);
+    }
+
+    /* Which button pad the battery feeds. swAssign maps a pad key to the net
+       the solver put it on, so the one on BAT+ is the input. */
+    var swIn = null, swOut = null;
+    var assign = solution && solution.swAssign;
+    if (sw.length === 2 && assign) {
+      for (i = 0; i < sw.length; i++) {
+        if (assign[sw[i].key] === 'BAT+') swIn = sw[i];
+        else if (assign[sw[i].key] === 'VCC') swOut = sw[i];
+      }
+    }
+
+    if (batP && swIn) {
+      out.push({ net: 'BAT+', from: batP.key, to: swIn.key, what: 'battery plus to the button' });
+    }
+    if (swOut) {
+      anodes.forEach(function (a) {
+        out.push({ net: 'VCC', from: swOut.key, to: a.key, what: 'button to ' + a.ref + ' anode' });
+      });
+    }
+    if (batM) {
+      cathodes.forEach(function (c) {
+        out.push({ net: 'GND', from: c.key, to: batM.key, what: c.ref + ' cathode back to the battery' });
+      });
+    }
+    return out;
+  }
+
   /* ------------------------------------------------------- Gerber writer */
 
   /* 4.6 fixed point, leading zeros omitted, so the integer is written plainly.
@@ -8601,6 +8992,11 @@ var PCB = (function () {
     FINISH_LIMITS: FINISH_LIMITS,
     fabLimits: fabLimits,
     DRC_PX_PER_MM: DRC_PX_PER_MM,
+    FIELD_PX_PER_MM: FIELD_PX_PER_MM,
+    sheetResistance: sheetResistance,
+    solveField: solveField,
+    currentField: currentField,
+    currentPaths: currentPaths,
     DRC_MAX_FINDINGS: DRC_MAX_FINDINGS,
     PARTITION_PX_PER_MM: PARTITION_PX_PER_MM,
     MIN_SOLVE_CLEARANCE_MM: MIN_SOLVE_CLEARANCE_MM,
@@ -8920,6 +9316,95 @@ var PCB = (function () {
     silk: 'Legend ink printed on top of the default stack.',
     cutout: 'Milled clean through: no FR4, no copper, no mask, no silkscreen, and on both sides at once. The area becomes an inner contour on Edge.Cuts.'
   };
+
+  /* The current-flow colormaps. Two SEQUENTIAL ramps, and the choice is the
+     one the site conventions call for rather than a preference: both
+     quantities only go up. Potential runs from one pad to the other and
+     current density from nothing to the busiest cell, so a diverging scale
+     would spend its strongest contrast on a middle that means nothing.
+
+     Read out of matplotlib rather than written from memory, nine stops each,
+     interpolated linearly. Potential gets viridis, because the field is read
+     as a height and viridis is monotone in lightness, so the equipotential
+     bands come out evenly spaced to the eye. Density gets inferno, because the
+     thing being looked for is the HOT spot and inferno puts almost all of its
+     lightness range in the top third, which is exactly where a neck shows up.
+
+     Neither is a theme colour, for the same reason as the island tints: they
+     are painted on top of the board render, so what they stand out against is
+     soldermask and copper, not a page surface. */
+  const FIELD_MAPS = {
+    potential: [
+      [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142],
+      [31, 158, 137], [53, 183, 121], [110, 206, 88], [253, 231, 37]
+    ],
+    density: [
+      [0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
+      [245, 125, 21], [250, 193, 39], [252, 255, 164], [252, 255, 164]
+    ]
+  };
+  function fieldColor(map, t) {
+    const s = FIELD_MAPS[map] || FIELD_MAPS.potential;
+    let u = t;
+    if (!(u >= 0)) u = 0;
+    if (u > 1) u = 1;
+    const f = u * (s.length - 1), i = Math.min(s.length - 2, Math.floor(f)), g = f - i;
+    const a = s[i], b = s[i + 1];
+    return [
+      Math.round(a[0] + (b[0] - a[0]) * g),
+      Math.round(a[1] + (b[1] - a[1]) * g),
+      Math.round(a[2] + (b[2] - a[2]) * g)
+    ];
+  }
+
+  /* The solved field as an overlay canvas in millimetres, same contract as
+     islandOverlay: the caller draws it through the view transform.
+
+     Density is shown on a SQUARE ROOT scale and that is not cosmetics. The
+     peak sits at a pad edge, where the electrode meets the copper and the
+     gradient is close to singular; on a linear scale that one ring saturates
+     and the entire rest of the board reads as black, which hides the very
+     thing the view exists to show. The square root pulls the mid range up
+     without reordering anything, so a neck carrying half the peak is visibly
+     half rather than invisibly dark. The legend says which scale is in force.
+
+     Equipotential lines are drawn for the potential map only, at every tenth
+     of the range: a cell whose value crosses a tenth boundary against its
+     right or lower neighbour is inked. That is a contour by the cheapest
+     honest method, and at this grid it is a clean one because the field is
+     smooth. They are what makes a constriction legible: the lines crowd
+     together exactly where the current has to squeeze. */
+  function fieldOverlay(field, map) {
+    if (!field || !field.cells || !field.cells.length) return null;
+    const w = field.width, h = field.height;
+    const c = scratch(w, h);
+    const g = c.getContext('2d');
+    const img = g.createImageData(w, h);
+    const d = img.data;
+    const dens = field.density, u = field.u, idx = field.idx, cells = field.cells;
+    const maxD = field.maxDensity > 0 ? field.maxDensity : 1;
+    const lines = map === 'potential';
+    const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h) ? -1 : idx[y * w + x];
+
+    for (let k = 0; k < cells.length; k++) {
+      const i = cells[k], x = i % w, y = (i - x) / w;
+      const t = map === 'density' ? Math.sqrt(dens[k] / maxD) : u[k];
+      const col = fieldColor(map, t);
+      const o = (y * w + x) * 4;
+      d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 225;
+
+      if (lines) {
+        const band = Math.floor(u[k] * 10);
+        const r = at(x + 1, y), b = at(x, y + 1);
+        if ((r >= 0 && Math.floor(u[r] * 10) !== band)
+          || (b >= 0 && Math.floor(u[b] * 10) !== band)) {
+          d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = 255;
+        }
+      }
+    }
+    g.putImageData(img, 0, 0);
+    return { canvas: c, wMm: w / field.pxPerMm, hMm: h / field.pxPerMm };
+  }
 
   /* ------------------------------------------------------- canvas plumbing */
 
@@ -11535,6 +12020,23 @@ var PCB = (function () {
     { v: 'back', label: 'Back (mirrored)' }
   ];
 
+  /* What is painted on top of the back copper. Islands and current flow are
+     alternatives rather than two checkboxes because they answer the same
+     question at two levels of detail and would sit on top of each other:
+     islands say WHICH pieces of copper exist, the field says what the current
+     does inside one of them. Both are back-only, so the whole row disappears
+     on the front. */
+  const CHECK_OVERLAYS = [
+    { v: 'none', label: 'None', title: 'The bare board render.' },
+    { v: 'islands', label: 'Islands', title: 'Every separate piece of copper in its own colour, with the pads lettered by the island they sit on.' },
+    { v: 'flow', label: 'Current flow', title: 'The potential and the current density on one net, solved as a resistor sheet.' }
+  ];
+
+  const FIELD_MAP_OPTS = [
+    { v: 'potential', label: 'Potential', title: 'The voltage across the copper, with a contour line every tenth of the range. Where the lines crowd together, the current is squeezing through.' },
+    { v: 'density', label: 'Current density', title: 'How much current each patch of copper carries, on a square-root scale. Bright is busy.' }
+  ];
+
   function limitDraftOf(fab, finish) {
     const src = PCB.fabLimits(fab, finish);
     const out = {};
@@ -11624,7 +12126,12 @@ var PCB = (function () {
     const [drcRes, setDrcRes] = useState(null);
     const [drcBusy, setDrcBusy] = useState(false);
     const [checkSide, setCheckSide] = useState('back');
-    const [showIslands, setShowIslands] = useState(true);
+    const [checkOverlay, setCheckOverlay] = useState('islands');
+    const [fieldPath, setFieldPath] = useState(0);
+    const [fieldMap, setFieldMap] = useState('potential');
+    const [fieldRes, setFieldRes] = useState(null);
+    const [fieldBusy, setFieldBusy] = useState(false);
+    const showIslands = checkOverlay === 'islands';
     const [markSel, setMarkSel] = useState(null);
     const [limDraft, setLimDraft] = useState(() => limitDraftOf('aisler', 'enig'));
     const [restorePrompt, setRestorePrompt] = useState(null);
@@ -13207,6 +13714,53 @@ var PCB = (function () {
     const islandPic = useMemo(() => (showIslands ? islandOverlay(conn) : null),
       [conn, showIslands, themeTick]);
 
+    /* The paths worth solving, which is a property of the circuit and not of
+       the field: it needs the solution only to tell the two button pads
+       apart. */
+    const flowPaths = useMemo(() => {
+      if (!solution) return [];
+      try { return PCB.currentPaths(doc, solution); } catch (e) { return []; }
+    }, [doc, solution]);
+
+    /* The field solve BLOCKS, the same trade the DRC button makes above and for
+       the same reason: conjugate gradient over 36k cells is about a second, and
+       a worker for one button press would cost more code than it saves. The
+       requestAnimationFrame plus setTimeout is the identical dance, so the
+       "solving" label reaches the screen before the arithmetic starts.
+
+       It runs on selection rather than on a button, because the choice of path
+       IS the request; a second button to confirm it would be a click for
+       nothing. Switching the colormap does not re-solve, only re-paints. */
+    useEffect(() => {
+      if (checkOverlay !== 'flow' || !solution || !flowPaths.length) {
+        setFieldRes(null);
+        return;
+      }
+      const pa = flowPaths[Math.min(fieldPath, flowPaths.length - 1)];
+      if (!pa) { setFieldRes(null); return; }
+      let live = true;
+      setFieldBusy(true);
+      const id = requestAnimationFrame(() => setTimeout(() => {
+        let out = null;
+        try {
+          out = PCB.currentField(doc, pa.net, pa.from, pa.to, {
+            solution: solution, oz: 1, currentA: 0.02
+          });
+        } catch (e) { out = null; }
+        if (!live) return;
+        setFieldRes(out ? Object.assign({ what: pa.what }, out) : null);
+        setFieldBusy(false);
+      }, 0));
+      return () => { live = false; cancelAnimationFrame(id); };
+    }, [checkOverlay, solution, flowPaths, fieldPath, doc]);
+
+    /* Repainted on a colormap change and on a skin change, solved only on the
+       dependencies above: the ramps are not theme colours, but the grey skin
+       still has to be able to drop the overlay, so themeTick stays in. */
+    const fieldPic = useMemo(
+      () => (checkOverlay === 'flow' && fieldRes ? fieldOverlay(fieldRes, fieldMap) : null),
+      [checkOverlay, fieldRes, fieldMap, themeTick]);
+
     function focusMark(kind, i, side, x, y) {
       setMarkSel({ kind: kind, i: i });
       if (side) setCheckSide(side);
@@ -13864,6 +14418,48 @@ var PCB = (function () {
       ctx.translate(c[0], c[1]);
       if (V.mirror) ctx.scale(-1, 1);
       ctx.drawImage(islandPic.canvas, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+
+    /* Same placement as the islands, because both are a raster in board
+       millimetres and the mirroring is a property of the view, not of the
+       picture. Nearest neighbour is deliberately NOT forced off: the field is
+       smooth, so the browser's bilinear filter is doing the right thing when it
+       makes the ramp continuous between cells. */
+    function drawField(ctx, V, dpr) {
+      if (!fieldPic) return;
+      const c = V.toPx(fieldPic.wMm / 2, fieldPic.hMm / 2);
+      const w = fieldPic.wMm * V.k, h = fieldPic.hMm * V.k;
+      ctx.save();
+      ctx.translate(c[0], c[1]);
+      if (V.mirror) ctx.scale(-1, 1);
+      ctx.drawImage(fieldPic.canvas, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+
+    /* The two electrodes, so the picture says WHICH pads the field runs
+       between. A filled dot at the high side and a ring at the low side: the
+       current leaves the filled one. Drawn after the field, so they survive
+       the overlay. */
+    function drawFieldPads(ctx, V, dpr) {
+      if (!fieldRes) return;
+      const ends = [[fieldRes.from, true], [fieldRes.to, false]];
+      ctx.save();
+      ends.forEach(([key, high]) => {
+        const p = padByKey[key];
+        if (!p) return;
+        const q = V.toPx(p.cx, p.cy);
+        const r = 7 * dpr;
+        ctx.beginPath();
+        ctx.arc(q[0], q[1], r, 0, Math.PI * 2);
+        ctx.lineWidth = 2.5 * dpr;
+        ctx.strokeStyle = '#0b1220';
+        ctx.stroke();
+        if (high) { ctx.fillStyle = '#f8fafc'; ctx.fill(); }
+        ctx.lineWidth = 1.5 * dpr;
+        ctx.strokeStyle = '#f8fafc';
+        ctx.stroke();
+      });
       ctx.restore();
     }
 
@@ -14970,17 +15566,35 @@ var PCB = (function () {
           <p>What is deliberately not checked: soldermask slivers, the minimum router radius and slot widths.
             Those need an analysis this tool does not do yet, and a green light here is not a promise about
             them.</p>
+          <p>Current flow, the third overlay on the back, is a view rather than a check, and the distinction is
+            the point. It treats one net as a resistor sheet, holds one pad at one volt and another at zero,
+            and solves for the potential everywhere in between; the current density is the gradient of that.
+            What comes out is a resistance in milliohms and a picture of where the current goes. The
+            resistance will always be tiny, because a copper pour this size cannot be anything else: a CR2032
+            has ten to twenty ohms of internal resistance and the copper has thousandths of one, so the cell
+            sets the current and the board has no say in it. A check that can never fail would only
+            manufacture confidence, which is why this is not offered as one. The picture earns its place on
+            its own: it shows which parts of a large area do nothing, and how a narrow neck concentrates what
+            passes through it, and neither of those is visible any other way.</p>
         <//>`)}
         <div className="pcb-split pcb-split-wide">
           <div>
             <div className="pcb-row" style=${{ marginBottom: 8 }}>
               <${Seg} value=${checkSide} onChange=${setCheckSide} options=${CHECK_SIDES} />
-              <label style=${{ fontSize: '0.8rem', margin: 0 }}>
-                <input type="checkbox" checked=${showIslands}
-                  onChange=${(e) => setShowIslands(e.target.checked)} /> Copper islands
-              </label>
+              ${checkSide === 'back' ? html`<${Seg} value=${checkOverlay}
+                onChange=${setCheckOverlay} options=${CHECK_OVERLAYS} />` : null}
               <span className="pcb-note">Markers sit where a finding is. Clicking a line below zooms to it.</span>
             </div>
+            ${checkSide === 'back' && checkOverlay === 'flow' ? html`<div className="pcb-row"
+              style=${{ marginBottom: 8 }}>
+              <select value=${String(fieldPath)} disabled=${!flowPaths.length}
+                onChange=${(e) => setFieldPath(+e.target.value)}
+                style=${{ margin: 0, width: 'auto', fontSize: '0.8rem' }}>
+                ${flowPaths.map((pa, i) => html`<option key=${i} value=${String(i)}>
+                  ${pa.net + ': ' + pa.what}</option>`)}
+              </select>
+              <${Seg} value=${fieldMap} onChange=${setFieldMap} options=${FIELD_MAP_OPTS} />
+            </div>` : null}
             <${BoardCanvas} bw=${bw} bh=${bh} mirror=${checkSide === 'back'} fill=${true}
               view=${view} onView=${mouseView}
               draw=${(ctx, V, W, H, dpr) => {
@@ -14989,6 +15603,10 @@ var PCB = (function () {
                 if (checkSide === 'back' && showIslands) {
                   drawIslands(ctx, V, dpr);
                   drawIslandPads(ctx, V, dpr);
+                }
+                if (checkSide === 'back' && checkOverlay === 'flow') {
+                  drawField(ctx, V, dpr);
+                  drawFieldPads(ctx, V, dpr);
                 }
                 drawMarks(ctx, V, dpr, checkSide);
               }} />
@@ -15037,6 +15655,64 @@ var PCB = (function () {
                     Every net is one piece and every pad is on its own net. Nothing to fix.</p>`}
                 <//>`}
               </div>
+              ${checkSide === 'back' && checkOverlay === 'flow' ? html`<div className="ctl-sec">
+                <p className="ctl-sec-h">Current flow</p>
+                ${!solution ? html`<p className="pcb-note">
+                  The back copper is still being worked out.</p>`
+    : !flowPaths.length ? html`<p className="pcb-note">
+                  Nothing to solve yet: this needs a battery, a button and at least one LED placed.</p>`
+    : fieldBusy ? html`<p className="pcb-note">Solving the field.</p>`
+    : !fieldRes ? html`<p className="pcb-note">
+                  That pair of pads is not on one piece of copper, so there is no field to solve. The
+                  connectivity report below says why.</p>`
+    : html`<${React.Fragment}>
+                  <p className="pcb-note">
+                    ${fieldRes.rMilliOhm.toFixed(1)} milliohms from one pad to the other, over
+                    ${' ' + fieldRes.width + ' by ' + fieldRes.height} cells
+                    at ${fieldRes.pxPerMm} per mm. At 20 mA that is
+                    ${' ' + fieldRes.dropMilliVolt.toFixed(2)} mV dropped in the copper, and the
+                    busiest patch carries ${fieldRes.peakAmpPerMm.toFixed(3)} A per mm of width.
+                    One ounce copper, ${fieldRes.sheetMilliOhmSq.toFixed(2)} milliohms per square.
+                  </p>
+                  <!-- The convergence line is not decoration. The first version
+                       of this solver used Gauss-Seidel and silently did not
+                       converge, and the numbers still looked plausible: the two
+                       electrode currents disagreed by a factor of four. So the
+                       agreement is shown, always, and a field that failed it is
+                       labelled rather than drawn as if it were fine. -->
+                  <p className="pcb-note">
+                    <span className="pcb-dot" style=${{ background: fieldRes.converged
+      ? 'var(--tool-sig-good)' : 'var(--tool-sig-warn)' }}></span>
+                    ${fieldRes.converged
+      ? 'Converged in ' + fieldRes.iterations + ' iterations. The current leaving one pad and the current arriving at the other agree, which is the check that the field is actually solved.'
+      : 'Did NOT converge in ' + fieldRes.iterations + ' iterations: the two electrode currents disagree by ' + (fieldRes.balance * 100).toFixed(1) + ' per cent. Read the picture as a sketch, not as a measurement.'}
+                  </p>
+                  <div className="fold-body" style=${{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                    <span className="pcb-note" style=${{ margin: 0 }}>
+                      ${fieldMap === 'potential' ? fieldRes.to : 'none'}</span>
+                    <span style=${{ flex: 1, height: 10, borderRadius: 2, border: '1px solid var(--tool-border)',
+      background: 'linear-gradient(to right, ' + [0, 0.25, 0.5, 0.75, 1]
+        .map((t) => 'rgb(' + fieldColor(fieldMap, t).join(',') + ')').join(', ') + ')' }}></span>
+                    <span className="pcb-note" style=${{ margin: 0 }}>
+                      ${fieldMap === 'potential' ? fieldRes.from : 'busiest'}</span>
+                  </div>
+                  <p className="pcb-note" style=${{ marginTop: 6 }}>
+                    ${fieldMap === 'potential'
+      ? 'A contour line every tenth of the voltage. Where the lines crowd together the current is being squeezed through a narrow place; where the colour barely changes over a wide area, that copper is carrying almost nothing.'
+      : 'Square-root scale, because the peak sits in a thin ring at the pad edge and a linear scale would make everything else look black.'}
+                  </p>
+                  <!-- The honest framing, and it belongs next to the numbers
+                       rather than in the fold at the top of the tab, because
+                       this is where somebody will be tempted to read the field
+                       as a verdict. -->
+                  <p className="pcb-note">
+                    This is a view, not a check. A copper pour of this size cannot fail on resistance:
+                    a CR2032 has ten to twenty OHMS of internal resistance, a thousand times more than
+                    anything measured here, so the cell decides the current and the board does not. What
+                    the picture is good for is seeing where the current actually goes.
+                  </p>
+                <//>`}
+              </div>` : null}
               <div className="ctl-sec">
                 <p className="ctl-sec-h">Connectivity</p>
                 ${!conn ? html`<p className="pcb-note">Working it out.</p>` : html`<${React.Fragment}>
