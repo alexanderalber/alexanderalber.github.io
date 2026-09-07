@@ -7761,6 +7761,30 @@ var PCB = (function () {
      meaningless across the sum (each path has its own pair of electrodes), so
      the combined result carries no u and the potential view stays per path. */
   function currentFieldAll(doc, paths, opts) {
+    var run = currentFieldAllRunner(doc, paths, opts);
+    if (!run) return null;
+    while (!run.done) run.step();
+    return run.result();
+  }
+
+  /* The same computation, but handed back one path at a time so a caller can
+     paint a progress bar between the steps.
+
+     The work splits along the paths and NOT any finer, because a single
+     conjugate gradient solve is not interruptible in any honest way: stopping
+     it early does not give a worse picture, it gives an unconverged one, and
+     this file makes rather a point of never showing one of those as if it were
+     fine. So the page still blocks for the length of one solve, about half a
+     second on a real board, and is responsive between them. That is a bar that
+     moves in n jumps rather than smoothly, which is the truth about where the
+     time goes. Genuine smoothness would need a worker, and the core block has
+     to stay plain evaluable JS for the tests.
+
+     Usage: step() advances by one path and returns the progress, done says
+     when to stop, result() builds the field. Calling result() early returns
+     what has been summed so far, which is a valid field over fewer paths
+     rather than a broken one, so an abandoned run costs nothing. */
+  function currentFieldAllRunner(doc, paths, opts) {
     opts = opts || {};
     if (!paths || !paths.length) return null;
     var amps = opts.currentA == null ? 0.02 : +opts.currentA;
@@ -7779,91 +7803,116 @@ var PCB = (function () {
     var sub = ds0 ? Object.assign({}, opts, { ds: ds0 }) : opts;
 
     var parts = [], gx = null, gy = null, w = 0, h = 0, px = 0, rsq = 0;
-    var owned = null, skipped = 0, i, k;
+    var owned = null, skipped = 0, pi = 0;
+    var labelOf = function (q) { return q ? q.net + ': ' + q.what : ''; };
 
-    for (var pi = 0; pi < paths.length; pi++) {
-      var pa = paths[pi];
-      var f = null;
-      try {
-        f = currentField(doc, pa.net, pa.from, pa.to, sub);
-      } catch (e) { f = null; }
-      if (!f) { skipped++; parts.push(null); continue; }
-      parts.push(f);
-      if (!gx) {
-        w = f.width; h = f.height; px = f.pxPerMm; rsq = f.sheetMilliOhmSq;
-        gx = new Float64Array(w * h); gy = new Float64Array(w * h);
-        owned = new Uint8Array(w * h);
-      } else if (f.width !== w || f.height !== h) {
-        /* Cannot happen: every solve downsamples the same owner plane by the
-           same factor. Guarded anyway, because silently adding two grids of
-           different sizes would produce a picture that looks fine. */
-        skipped++; parts[parts.length - 1] = null; continue;
+    var run = {
+      total: paths.length,
+      index: 0,
+      done: false,
+      /* What the current step is about to do, so the bar can name it rather
+         than only count. Read before step(), not after. */
+      label: labelOf(paths[0]),
+      step: function () {
+        if (pi >= paths.length) { run.done = true; return 1; }
+        var pa = paths[pi];
+        var f = null, k, i;
+        try {
+          f = currentField(doc, pa.net, pa.from, pa.to, sub);
+        } catch (e) { f = null; }
+        if (!f) { skipped++; parts.push(null); }
+        else {
+          parts.push(f);
+          var bad = false;
+          if (!gx) {
+            w = f.width; h = f.height; px = f.pxPerMm; rsq = f.sheetMilliOhmSq;
+            gx = new Float64Array(w * h); gy = new Float64Array(w * h);
+            owned = new Uint8Array(w * h);
+          } else if (f.width !== w || f.height !== h) {
+            /* Cannot happen: every solve downsamples the same owner plane by
+               the same factor. Guarded anyway, because silently adding two
+               grids of different sizes would produce a picture that looks
+               fine. */
+            skipped++; parts[parts.length - 1] = null; bad = true;
+          }
+          if (!bad) {
+            /* Back to gradient components on the full grid. currentDensity
+               throws the direction away, and the direction is exactly what the
+               sum needs. */
+            var idx = f.idx, cells = f.cells, u = f.u;
+            var scale = weights[pi] * (f.rMilliOhm > 0 ? f.rMilliOhm : 0);
+            var at = function (xx, yy) {
+              if (xx < 0 || yy < 0 || xx >= w || yy >= h) return -1;
+              return idx[yy * w + xx];
+            };
+            for (k = 0; k < cells.length; k++) {
+              var ci = cells[k], x = ci % w, y = (ci - x) / w;
+              var l = at(x - 1, y), r = at(x + 1, y), t = at(x, y - 1), b = at(x, y + 1);
+              var ax = 0, ay = 0;
+              if (l >= 0 && r >= 0) ax = (u[r] - u[l]) / 2;
+              else if (r >= 0) ax = u[r] - u[k];
+              else if (l >= 0) ax = u[k] - u[l];
+              if (t >= 0 && b >= 0) ay = (u[b] - u[t]) / 2;
+              else if (b >= 0) ay = u[b] - u[k];
+              else if (t >= 0) ay = u[k] - u[t];
+              /* The field carries an arbitrary 1 V, so the amps this path
+                 really pushes are its weight; multiplying the unit-voltage
+                 gradient by I * R puts every path on the same physical scale
+                 before they add. */
+              gx[ci] += ax * scale;
+              gy[ci] += ay * scale;
+              owned[ci] = 1;
+            }
+          }
+        }
+        pi++;
+        run.index = pi;
+        run.done = pi >= paths.length;
+        run.label = run.done ? '' : labelOf(paths[pi]);
+        return pi / paths.length;
+      },
+      result: function () {
+        if (!gx) return null;
+        var i, k;
+        /* Repack into the cells/idx form the overlay expects, over the union
+           of the copper every path touched. */
+        var cellsOut = [], idxOut = new Int32Array(w * h);
+        for (i = 0; i < w * h; i++) idxOut[i] = -1;
+        for (i = 0; i < w * h; i++) if (owned[i]) { idxOut[i] = cellsOut.length; cellsOut.push(i); }
+        var dens = new Float64Array(cellsOut.length), maxG = 0;
+        for (k = 0; k < cellsOut.length; k++) {
+          var q = cellsOut[k];
+          var m = Math.sqrt(gx[q] * gx[q] + gy[q] * gy[q]);
+          dens[k] = m;
+          if (m > maxG) maxG = m;
+        }
+
+        /* dens is already in amps per unit voltage-gradient times I*R, so the
+           conversion to amps per millimetre is the sheet resistance and the
+           cell pitch, with no per-path current left to divide out. */
+        var peakPerMm = rsq > 0 ? (maxG / rsq) * px : 0;
+        var solved = 0, conv = 0, totalMilliOhm = 0;
+        for (i = 0; i < parts.length; i++) {
+          if (!parts[i]) continue;
+          solved++;
+          if (parts[i].converged) conv++;
+          totalMilliOhm += parts[i].rMilliOhm;
+        }
+
+        return {
+          all: true, parts: parts, weights: weights,
+          pathCount: paths.length, solvedCount: solved, skippedCount: skipped,
+          width: w, height: h, pxPerMm: px, factor: parts.find(Boolean).factor,
+          u: null, idx: idxOut, cells: cellsOut, density: dens, maxDensity: maxG,
+          srcCells: null, dstCells: null,
+          sheetMilliOhmSq: rsq, currentA: amps,
+          totalMilliOhm: totalMilliOhm,
+          peakAmpPerMm: peakPerMm,
+          converged: solved > 0 && conv === solved
+        };
       }
-
-      /* Back to gradient components on the full grid. currentDensity throws
-         the direction away, and the direction is exactly what the sum needs. */
-      var idx = f.idx, cells = f.cells, u = f.u;
-      var scale = weights[pi] * (f.rMilliOhm > 0 ? f.rMilliOhm : 0);
-      var at = function (xx, yy) {
-        if (xx < 0 || yy < 0 || xx >= w || yy >= h) return -1;
-        return idx[yy * w + xx];
-      };
-      for (k = 0; k < cells.length; k++) {
-        var ci = cells[k], x = ci % w, y = (ci - x) / w;
-        var l = at(x - 1, y), r = at(x + 1, y), t = at(x, y - 1), b = at(x, y + 1);
-        var ax = 0, ay = 0;
-        if (l >= 0 && r >= 0) ax = (u[r] - u[l]) / 2;
-        else if (r >= 0) ax = u[r] - u[k];
-        else if (l >= 0) ax = u[k] - u[l];
-        if (t >= 0 && b >= 0) ay = (u[b] - u[t]) / 2;
-        else if (b >= 0) ay = u[b] - u[k];
-        else if (t >= 0) ay = u[k] - u[t];
-        /* The field carries an arbitrary 1 V, so the amps this path really
-           pushes are its weight; multiplying the unit-voltage gradient by
-           I * R puts every path on the same physical scale before they add. */
-        gx[ci] += ax * scale;
-        gy[ci] += ay * scale;
-        owned[ci] = 1;
-      }
-    }
-    if (!gx) return null;
-
-    /* Repack into the cells/idx form the overlay expects, over the union of
-       the copper every path touched. */
-    var cellsOut = [], idxOut = new Int32Array(w * h);
-    for (i = 0; i < w * h; i++) idxOut[i] = -1;
-    for (i = 0; i < w * h; i++) if (owned[i]) { idxOut[i] = cellsOut.length; cellsOut.push(i); }
-    var dens = new Float64Array(cellsOut.length), maxG = 0;
-    for (k = 0; k < cellsOut.length; k++) {
-      var q = cellsOut[k];
-      var m = Math.sqrt(gx[q] * gx[q] + gy[q] * gy[q]);
-      dens[k] = m;
-      if (m > maxG) maxG = m;
-    }
-
-    /* dens is already in amps per unit voltage-gradient times I*R, so the
-       conversion to amps per millimetre is the sheet resistance and the cell
-       pitch, with no per-path current left to divide out. */
-    var peakPerMm = rsq > 0 ? (maxG / rsq) * px : 0;
-    var solved = 0, conv = 0, totalMilliOhm = 0;
-    for (i = 0; i < parts.length; i++) {
-      if (!parts[i]) continue;
-      solved++;
-      if (parts[i].converged) conv++;
-      totalMilliOhm += parts[i].rMilliOhm;
-    }
-
-    return {
-      all: true, parts: parts, weights: weights,
-      pathCount: paths.length, solvedCount: solved, skippedCount: skipped,
-      width: w, height: h, pxPerMm: px, factor: parts.find(Boolean).factor,
-      u: null, idx: idxOut, cells: cellsOut, density: dens, maxDensity: maxG,
-      srcCells: null, dstCells: null,
-      sheetMilliOhmSq: rsq, currentA: amps,
-      totalMilliOhm: totalMilliOhm,
-      peakAmpPerMm: peakPerMm,
-      converged: solved > 0 && conv === solved
     };
+    return run;
   }
 
   /* ------------------------------------------------------- Gerber writer */
@@ -9713,6 +9762,7 @@ var PCB = (function () {
     currentPaths: currentPaths,
     pathCurrents: pathCurrents,
     currentFieldAll: currentFieldAll,
+    currentFieldAllRunner: currentFieldAllRunner,
     DRC_MAX_FINDINGS: DRC_MAX_FINDINGS,
     PARTITION_PX_PER_MM: PARTITION_PX_PER_MM,
     MIN_SOLVE_CLEARANCE_MM: MIN_SOLVE_CLEARANCE_MM,
@@ -13087,16 +13137,20 @@ var PCB = (function () {
     /* Kept as a string so the select can carry both the 'all' entry and an
        index without a sentinel.
 
-       NOT defaulting to 'all', although the question somebody arrives with
-       really is where the copper is busy. All paths means one conjugate
-       gradient solve per path, and the cost is set by the board area rather
-       than by the path count: measured on a plain square board, seven paths
-       take about one second at 40 mm and over three at 60 mm, and a real
-       board with a graphic on it took five and a half. That is a tab switch
-       that blocks, and the tab has to come back. So the cheap view opens and
-       the expensive one is a deliberate pick. */
-    const [fieldPath, setFieldPath] = useState('0');
-    const [fieldMap, setFieldMap] = useState('potential');
+       'all' is the default, and it is knowingly the expensive one: it means a
+       conjugate gradient solve per path, with the cost set by the board area
+       rather than by the path count. Seven paths measure about a second on a
+       plain 40 mm square, over three at 60 mm, and five and a half on a real
+       board with a graphic on it. That is a blocking tab switch, and it was
+       weighed against what the view is for: the question somebody arrives at
+       this tab with is where the copper is busy, not what one pad pair does,
+       and answering the actual question is worth the wait. The owner decided
+       this explicitly. The entry is labelled with the cost so a single path
+       is one click away for anybody who wants the fast view. */
+    const [fieldPath, setFieldPath] = useState('all');
+    /* Density rather than potential, because the default path is now 'all',
+       and the potential has no meaning across a sum of paths. */
+    const [fieldMap, setFieldMap] = useState('density');
     /* The ramp is remembered per quantity rather than globally, because the
        right default differs between them and a shared pick would silently
        override one of the two. null means "whatever this map defaults to". */
@@ -13106,6 +13160,10 @@ var PCB = (function () {
     const activeRamp = rampFor(fieldMap);
     const [fieldRes, setFieldRes] = useState(null);
     const [fieldBusy, setFieldBusy] = useState(false);
+    /* null while a single path solves, since that is one indivisible step and
+       a bar would only ever show 0 or 1. { done, total, label } while the
+       all-paths run walks its list. */
+    const [fieldProg, setFieldProg] = useState(null);
     const showIslands = checkOverlay === 'islands';
     const [markSel, setMarkSel] = useState(null);
     const [limDraft, setLimDraft] = useState(() => limitDraftOf('aisler', 'enig'));
@@ -14821,20 +14879,66 @@ var PCB = (function () {
       const pa = all ? null : flowPaths[Math.min(+fieldPath, flowPaths.length - 1)];
       if (!all && !pa) { setFieldRes(null); return; }
       let live = true;
+      let id = 0;
       setFieldBusy(true);
-      const id = requestAnimationFrame(() => setTimeout(() => {
-        let out = null;
-        try {
-          out = all
-            ? PCB.currentFieldAll(doc, flowPaths, { solution: solution, oz: 1, currentA: 0.02 })
-            : PCB.currentField(doc, pa.net, pa.from, pa.to, {
+      setFieldProg(null);
+
+      /* The single path stays one blocking call: it is one solve, there is
+         nothing to report progress about, and the rAF-then-timeout dance is
+         only there so the busy label reaches the screen before the arithmetic
+         starts. */
+      if (!all) {
+        id = requestAnimationFrame(() => setTimeout(() => {
+          let out = null;
+          try {
+            out = PCB.currentField(doc, pa.net, pa.from, pa.to, {
               solution: solution, oz: 1, currentA: 0.02
             });
-        } catch (e) { out = null; }
+          } catch (e) { out = null; }
+          if (!live) return;
+          setFieldRes(out ? Object.assign({ what: pa.what }, out) : null);
+          setFieldBusy(false);
+        }, 0));
+        return () => { live = false; cancelAnimationFrame(id); };
+      }
+
+      /* All paths walks its runner one solve per frame, so the bar moves and
+         the page breathes between the steps. Each individual solve still
+         blocks for its own length: a conjugate gradient run cannot be stopped
+         half way and still mean anything, and this tool does not show an
+         unconverged field as though it were fine. Seven jumps rather than a
+         smooth sweep, which is where the time honestly goes.
+
+         Abandoning the run costs nothing: `live` stops the chain, and the
+         partial sums are simply dropped. */
+      let run = null;
+      try {
+        run = PCB.currentFieldAllRunner(doc, flowPaths, {
+          solution: solution, oz: 1, currentA: 0.02
+        });
+      } catch (e) { run = null; }
+      if (!run) { setFieldRes(null); setFieldBusy(false); return; }
+
+      setFieldProg({ done: 0, total: run.total, label: run.label });
+      const tick = () => {
         if (!live) return;
-        setFieldRes(out ? Object.assign({ what: all ? 'every path at once' : pa.what }, out) : null);
-        setFieldBusy(false);
-      }, 0));
+        id = requestAnimationFrame(() => setTimeout(() => {
+          if (!live) return;
+          try { run.step(); } catch (e) { run.done = true; }
+          if (!live) return;
+          if (run.done) {
+            let out = null;
+            try { out = run.result(); } catch (e) { out = null; }
+            setFieldRes(out ? Object.assign({ what: 'every path at once' }, out) : null);
+            setFieldProg(null);
+            setFieldBusy(false);
+            return;
+          }
+          setFieldProg({ done: run.index, total: run.total, label: run.label });
+          tick();
+        }, 0));
+      };
+      tick();
       return () => { live = false; cancelAnimationFrame(id); };
     }, [checkOverlay, solution, flowPaths, fieldPath, doc]);
 
@@ -16956,7 +17060,21 @@ var PCB = (function () {
                   The back copper is still being worked out.</p>`
     : !flowPaths.length ? html`<p className="pcb-note">
                   Nothing to solve yet: this needs a battery, a button and at least one LED placed.</p>`
-    : fieldBusy ? html`<p className="pcb-note">Solving the field.</p>`
+    : fieldBusy ? html`<${React.Fragment}>
+                  <p className="pcb-note">
+                    ${fieldProg
+    ? 'Solving path ' + Math.min(fieldProg.done + 1, fieldProg.total) + ' of ' + fieldProg.total
+      + (fieldProg.label ? ': ' + fieldProg.label : '')
+    : 'Solving the field.'}</p>
+                  ${fieldProg ? html`<div style=${{ height: 6, borderRadius: 3,
+      border: '1px solid var(--tool-border)', overflow: 'hidden', marginTop: 4 }}>
+                    <div style=${{ height: '100%', width: (100 * fieldProg.done / fieldProg.total) + '%',
+      background: 'var(--tool-sig-good)' }}></div>
+                  </div>
+                  <p className="pcb-note" style=${{ marginTop: 4 }}>
+                    One solve per path. The page still stops for the length of each single solve,
+                    because a conjugate gradient run cannot be cut short and still mean anything.</p>` : null}
+                <//>`
     : !fieldRes ? html`<p className="pcb-note">
                   ${fieldPath === 'all'
     ? 'None of the paths could be solved: no pad pair sits on one piece of copper. The connectivity report below says why.'
