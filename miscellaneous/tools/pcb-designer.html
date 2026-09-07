@@ -1585,6 +1585,472 @@ var PCB = (function () {
     return docPads(doc, expandMm).map(function (p) { return p.poly; });
   }
 
+  /* ------------------------------------------------------- silkscreen text */
+
+  /* A stroke font, deliberately built as axis-parallel bars on a 5 by 7 grid,
+     and both halves of that sentence are a decision the export forced.
+
+     WHY A FONT AT ALL, rather than the browser's. Canvas can measure and fill
+     text, and a fill handed to maskToPath would give outlines with no code
+     here. It would also give a DIFFERENT outline on every machine: the glyphs
+     would depend on which fonts are installed and on the platform's hinting and
+     rasterizer, so the same document would export different Gerbers on two
+     computers and no test could pin any of it down. A table in this file is the
+     same everywhere and the suite can assert its geometry to the micron.
+
+     WHY AXIS PARALLEL, and this is the part that was measured rather than
+     assumed. All artwork reaches KiCad through kicadArtPolys, which rasterizes
+     at KICAD_PX_PER_MM and traces the result back. A diagonal edge survives
+     that round trip as a staircase with roughly 0.05mm left in it (the note at
+     OFFSET_PX_PER_MM has the numbers), which is a third of the minimum silk
+     feature and plainly visible on a 3mm capital. An axis-parallel edge on the
+     pixel grid survives it EXACTLY: measured on a 6 by 120 pixel bar, the
+     traced ring comes back on 0.2500 and 0.4000mm, the nominal values, with the
+     corners chamfered by half a pixel and the straight runs dimensionally
+     exact. So the font gives up its diagonals and gets a clean export for them,
+     which on a legend is the better trade: nobody reads a silkscreen for the
+     elegance of its V.
+
+     WHY THE COUNTERS ARE CLOSED, which is the opposite of what this file said
+     for half a day. The worry was bridgeRings: KiCad's gr_poly carries no
+     holes, so a ring with a counter is emitted as one outline with a slit cut
+     from the hole to the outside, and a gash across an O would be worse than an
+     open letter. The first version of this font therefore had open counters and
+     looked like it: the owner called B, N, Q, V, X, Z, 0, 1, 8 and 9 hard to
+     read, and he was right. Measuring the slit settled it. bridgeRings lays the
+     outward and the return leg exactly on top of each other, so the slit is
+     0.0000mm wide, encloses no area, and the filled result is pixel for pixel
+     the ring with its hole. There was never anything to avoid. A test pins that
+     down on a rectangular annulus, because the property belongs to bridgeRings
+     rather than to any one letter.
+
+     GEOMETRY. A cell is FONT_W by FONT_H units and a bar is FONT_BAR units
+     thick, so a glyph is a set of unit-aligned rectangles. The cell was 7 high
+     with a one unit bar to begin with, which made every stroke a seventh of the
+     cap height and left no room for a counter to be more than one bar wide;
+     14 by 10 with a two unit bar keeps the same 7:1 stroke ratio and buys the
+     space the shapes needed. Sizing by cap height: the bar is textBarMm, so a
+     2.1mm text has a 0.3mm bar.
+
+     ROUND ENDS ARE NOT A CHOICE MADE HERE. A text is placed as a STROKE object
+     (see textStrokePath), and rasterizeSide stamps a stroke with a round brush,
+     which is also what a fab's round aperture does. Sharp corners would mean
+     either giving up the object (the part legend is sharp because it is polygons
+     in a layer entry, and it is not selectable or movable) or adding a cap flag
+     to the stroke schema. Left round deliberately: on silkscreen it is the
+     normal look, and the object properties are worth more. */
+  var FONT_W = 10;
+  var FONT_H = 14;
+  var FONT_BAR = 2;          // bar thickness in cell units
+  var FONT_ADVANCE = 13;     // cell width plus three units of side bearing
+
+  /* Every glyph as a list of [x0, y0, x1, y1] rectangles in cell units, y down
+     from the cap line. Written out rather than generated: the shapes are the
+     data, and a clever encoding would only make them harder to correct. */
+  var FONT_GLYPHS = {
+    'A': [[0,2,2,14],[8,2,10,14],[2,0,8,2],[2,6,8,8]],
+    'B': [[0,0,2,14],[2,0,7,2],[2,6,8,8],[2,12,7,14],[7,2,9,6],[8,8,10,12]],
+    'C': [[0,2,2,12],[2,0,10,2],[2,12,10,14]],
+    'D': [[0,0,2,14],[2,0,8,2],[2,12,8,14],[8,2,10,12]],
+    'E': [[0,0,2,14],[2,0,10,2],[2,6,8,8],[2,12,10,14]],
+    'F': [[0,0,2,14],[2,0,10,2],[2,6,8,8]],
+    'G': [[0,2,2,12],[2,0,10,2],[2,12,10,14],[8,7,10,12],[5,6,10,8]],
+    'H': [[0,0,2,14],[8,0,10,14],[2,6,8,8]],
+    'I': [[1,0,9,2],[1,12,9,14],[4,2,6,12]],
+    'J': [[2,0,10,2],[8,2,10,12],[2,12,8,14],[0,8,2,12]],
+    'K': [[0,0,2,14],[2,6,4,8],[4,4,6,6],[6,2,8,4],[8,0,10,2],[4,8,6,10],[6,10,8,12],[8,12,10,14]],
+    'L': [[0,0,2,14],[2,12,10,14]],
+    'M': [[0,0,2,14],[8,0,10,14],[2,2,4,6],[4,4,6,8],[6,2,8,6]],
+    'N': [[0,0,2,14],[8,0,10,14],[2,2,4,6],[4,5,6,9],[6,8,8,12]],
+    'O': [[0,2,2,12],[8,2,10,12],[2,0,8,2],[2,12,8,14]],
+    'P': [[0,0,2,14],[2,0,8,2],[2,6,8,8],[8,2,10,6]],
+    'Q': [[0,2,2,12],[8,2,10,12],[2,0,8,2],[2,12,8,14],[6,10,10,12],[8,10,10,14]],
+    'R': [[0,0,2,14],[2,0,8,2],[2,6,8,8],[8,2,10,6],[4,8,6,10],[6,10,8,14]],
+    'S': [[2,0,10,2],[0,2,2,6],[2,6,8,8],[8,8,10,12],[0,12,8,14]],
+    'T': [[0,0,10,2],[4,2,6,14]],
+    'U': [[0,0,2,12],[8,0,10,12],[2,12,8,14]],
+    'V': [[0,0,2,7],[8,0,10,7],[2,6,4,10],[6,6,8,10],[4,9,6,14]],
+    'W': [[0,0,2,14],[8,0,10,14],[2,12,8,14],[4,6,6,12]],
+    'X': [[0,0,2,4],[8,0,10,4],[2,3,4,7],[6,3,8,7],[4,6,6,8],[2,7,4,11],[6,7,8,11],[0,10,2,14],[8,10,10,14]],
+    'Y': [[0,0,2,3],[8,0,10,3],[2,2,4,5],[6,2,8,5],[4,4,6,14]],
+    'Z': [[0,0,10,2],[6,2,8,5],[4,4,6,8],[2,7,4,10],[0,9,2,12],[0,12,10,14]],
+    '0': [[1,2,3,12],[7,2,9,12],[3,0,7,2],[3,12,7,14]],
+    '1': [[4,0,6,14],[2,1,4,3],[2,12,8,14]],
+    '2': [[2,0,8,2],[0,2,2,4],[8,2,10,6],[2,6,8,8],[0,8,2,12],[0,12,10,14]],
+    '3': [[0,0,8,2],[8,2,10,6],[2,6,8,8],[8,8,10,12],[0,12,8,14]],
+    '4': [[0,0,2,9],[2,7,8,9],[8,0,10,14]],
+    '5': [[0,0,10,2],[0,2,2,6],[2,6,8,8],[8,8,10,12],[0,12,8,14]],
+    '6': [[2,0,10,2],[0,2,2,12],[2,6,8,8],[8,8,10,12],[2,12,8,14]],
+    '7': [[0,0,10,2],[8,2,10,5],[6,5,8,9],[4,9,6,14]],
+    '8': [[0,2,2,6],[0,8,2,12],[8,2,10,6],[8,8,10,12],[2,0,8,2],[2,6,8,8],[2,12,8,14]],
+    '9': [[0,2,2,6],[8,2,10,12],[2,0,8,2],[2,6,8,8],[2,12,8,14]],
+    '+': [[1,6,9,8],[4,3,6,11]],
+    '-': [[1,6,9,8]],
+    '.': [[4,12,6,14]],
+    ':': [[4,3,6,5],[4,9,6,11]]
+  };
+
+  /* Whatever the font cannot draw is dropped rather than substituted, and the
+     caller is told through textSupported: a legend that silently loses a
+     character is worse than one that refuses to take it. Lower case folds up,
+     because the alphabet has no descenders and a board legend is upper case
+     anyway. */
+  function textNormalize(s) {
+    return String(s == null ? '' : s).toUpperCase();
+  }
+
+  function textSupported(s) {
+    var t = textNormalize(s), out = [], i, c;
+    for (i = 0; i < t.length; i++) {
+      c = t.charAt(i);
+      if (c !== ' ' && !FONT_GLYPHS[c] && out.indexOf(c) < 0) out.push(c);
+    }
+    return out;
+  }
+
+  /* The advance width of a string in cell units, which is what textWidthMm and
+     the centring in partLegend are both derived from. The last cell contributes
+     FONT_W rather than FONT_ADVANCE: the side bearing after the final glyph is
+     not part of the text. */
+  function textCells(s) {
+    var t = textNormalize(s), n = 0, i, c, any = false;
+    for (i = 0; i < t.length; i++) {
+      c = t.charAt(i);
+      if (c !== ' ' && !FONT_GLYPHS[c]) continue;
+      n += FONT_ADVANCE;
+      any = true;
+    }
+    return any ? n - (FONT_ADVANCE - FONT_W) : 0;
+  }
+
+  function textWidthMm(s, heightMm) {
+    return textCells(s) * (+heightMm / FONT_H);
+  }
+
+  /* The stroke width of a text of this cap height. One place, because the app,
+     the ladder and the export all have to agree about it and a second copy of
+     heightMm * FONT_BAR / FONT_H is exactly the kind of thing that drifts. */
+  function textBarMm(heightMm) {
+    return +heightMm * FONT_BAR / FONT_H;
+  }
+
+  /* A text as the CENTRE LINES of its bars, which is the form a stroke object
+     takes: one subpath per bar, all of them the same width, so a whole string
+     is a single object. textPolys gives the bars as rectangles; this turns each
+     one back into the line it is a stroke of.
+
+     THE SQUARE BAR IS THE POINT OF THIS FUNCTION LIVING HERE. A bar as wide as
+     it is tall (the full stop, both dots of the colon) has no long side, so
+     pulling both ends in by half the width leaves a line of length ZERO. That
+     is not merely thin: rasterizeSide stamps a stroke by walking its polyline,
+     and a segment with no extent stamps nothing, so the character vanished from
+     the board entirely while sitting in the object list with a perfectly good
+     path. It shipped that way once, and the owner found it.
+     A square bar is emitted as a segment ONE BAR LONG through its centre
+     instead. The round brush then covers the square exactly (a stroke of width
+     u along a line of length u is a stadium u+u long), which overshoots the
+     nominal square by half a bar at each end. For a full stop that is right:
+     the dot wants to be round and to read at a glance, and it is the one glyph
+     whose exact extent nobody measures. */
+  function textStrokePath(str, xMm, yMm, heightMm, align, mirror) {
+    var u = textBarMm(heightMm);
+    var polys = textPolys(str, xMm, yMm, heightMm, align, mirror);
+    var path = [], i, j;
+    for (i = 0; i < polys.length; i++) {
+      var poly = polys[i];
+      var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (j = 0; j < poly.length; j++) {
+        if (poly[j][0] < x0) x0 = poly[j][0];
+        if (poly[j][0] > x1) x1 = poly[j][0];
+        if (poly[j][1] < y0) y0 = poly[j][1];
+        if (poly[j][1] > y1) y1 = poly[j][1];
+      }
+      var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+      var w = x1 - x0, hh = y1 - y0;
+      var seg;
+      if (w <= u + 1e-6 && hh <= u + 1e-6) seg = linePath(cx - u / 2, cy, cx + u / 2, cy);
+      else if (w >= hh) seg = linePath(x0 + u / 2, cy, x1 - u / 2, cy);
+      else seg = linePath(cx, y0 + u / 2, cx, y1 - u / 2);
+      for (j = 0; j < seg.length; j++) path.push(seg[j]);
+    }
+    return path;
+  }
+
+  /* The text heights the tool offers, and it offers ONLY these: the height is
+     stepped through with arrows rather than typed.
+
+     WHY A LADDER INSTEAD OF A NUMBER, and the honest version is that this is a
+     consistency fix and not a correctness one. The font is built from
+     axis-parallel bars so that every edge survives the export raster, and a
+     height that does not divide evenly by that raster gives the edges back a
+     fraction of a pixel. The numbers: the KiCad path rasterizes at
+     KICAD_PX_PER_MM, a cell unit is heightMm / FONT_H, so an exact height is a
+     multiple of FONT_H / KICAD_PX_PER_MM = 0.35 mm. Off the ladder the worst
+     edge lands 0.0107 mm from its pixel, which is just under half a pixel and
+     is set by the pixel size rather than by the cell, so it did not change when
+     the cell got finer. That is nothing next to a diagonal
+     edge, which costs about 0.05 mm, or the print's own registration, which is
+     worse than either. The point is that there is no reason to offer a control
+     whose only possible effect is to make the result very slightly worse, and a
+     stepper hides an awkward ladder behind two arrows.
+
+     What the ladder DOES buy, and this one is a fab rule rather than taste: the
+     bar is heightMm * FONT_BAR / FONT_H, so a short enough text is thinner than
+     the board house will print. The bottom rung is 1.4 mm, a 0.2 mm bar, which
+     clears the 0.15 mm minimum of both presets with room to spare. A free
+     number field had no way to know that and would happily place a legend the
+     check tab then flags.
+
+     The top is 5.6 mm, a bar of 0.8: past that a legend is not a legend any
+     more, and nothing on a board this size wants it. */
+  /* Spelled out rather than written as FONT_H / KICAD_PX_PER_MM, because
+     KICAD_PX_PER_MM is declared a few thousand lines further down: `var` hoists
+     the NAME but not the value, so the expression would evaluate to NaN here
+     and the whole ladder would come out empty. A test asserts the two agree, so
+     changing the export resolution cannot leave this number behind. */
+  var TEXT_STEP_MM = 0.35;                       // = FONT_H / KICAD_PX_PER_MM
+  var TEXT_HEIGHT_DEFAULT_MM = 2.1;
+
+  function textHeights() {
+    var out = [], n;
+    for (n = 4; n <= 16; n++) out.push(Math.round(n * TEXT_STEP_MM * 1e4) / 1e4);
+    return out;
+  }
+
+  /* The next height up or down the ladder, clamped at both ends. Takes any
+     number, so a document written before the ladder existed still lands on a
+     real step the first time the arrows are used. */
+  function textHeightStep(heightMm, dir) {
+    var list = textHeights();
+    var h = +heightMm, i;
+    if (!isFinite(h)) return TEXT_HEIGHT_DEFAULT_MM;
+    if (dir > 0) {
+      for (i = 0; i < list.length; i++) if (list[i] > h + 1e-9) return list[i];
+      return list[list.length - 1];
+    }
+    for (i = list.length - 1; i >= 0; i--) if (list[i] < h - 1e-9) return list[i];
+    return list[0];
+  }
+
+  /* Whether a height is one the export can hit exactly. Used by the tests, and
+     by nothing in the app: the app cannot produce a height that fails it. */
+  function textHeightExact(heightMm) {
+    var steps = +heightMm / TEXT_STEP_MM;
+    return isFinite(steps) && Math.abs(steps - Math.round(steps)) < 1e-6;
+  }
+
+  /* One string as polygons in millimetres, laid out from an anchor.
+
+     The rectangles come out AXIS PARALLEL AND UNROTATED on purpose, and any
+     rotation is the caller's business: a legend on a rotated part goes through
+     partPoint, and text placed by hand is upright. Rotating here would put
+     diagonals back into a font that gave them up for the export.
+
+     align is 'left', 'center' or 'right' and refers to x; the anchor y is the
+     CAP LINE, so a row of text lines up on its top edge whatever it contains.
+     Bars that touch are emitted as separate rectangles rather than merged: the
+     Gerber writer unions overlapping dark regions anyway, and the raster the
+     KiCad path traces does the same, so merging here would buy nothing and cost
+     the property that every rectangle is exactly one bar.
+
+     mirror reflects the whole run about the anchor x, which is what a legend on
+     the back needs when it is composed in document space rather than through
+     partPoint. */
+  function textPolys(s, xMm, yMm, heightMm, align, mirror) {
+    var u = +heightMm / FONT_H;
+    if (!(u > 0)) return [];
+    var t = textNormalize(s), out = [], i, c, g, j, r;
+    var w = textCells(s) * u;
+    var x0 = xMm;
+    if (align === 'center') x0 = xMm - w / 2;
+    else if (align === 'right') x0 = xMm - w;
+    var pen = 0;
+    for (i = 0; i < t.length; i++) {
+      c = t.charAt(i);
+      g = FONT_GLYPHS[c];
+      if (!g) { if (c === ' ') pen += FONT_ADVANCE; continue; }
+      for (j = 0; j < g.length; j++) {
+        r = g[j];
+        var ax = x0 + (pen + r[0]) * u, bx = x0 + (pen + r[2]) * u;
+        var ay = yMm + r[1] * u, by = yMm + r[3] * u;
+        if (mirror) { var m = 2 * xMm - ax; ax = 2 * xMm - bx; bx = m; }
+        out.push([[ax, ay], [bx, ay], [bx, by], [ax, by]]);
+      }
+      pen += FONT_ADVANCE;
+    }
+    return out;
+  }
+
+  /* ----------------------------------------------------- part legends */
+
+  /* The assembly legend of the three parts: the outline a builder sets the part
+     against, and the polarity marks that say which way round it goes.
+
+     PROVENANCE, and it matters more here than anywhere else in this file: every
+     coordinate below is copied from the same reference project the pads came
+     from (notes/tmp_research/SolderingTutorial/Shrocket/kicad/mushroom_rocket/
+     mushroom_rocket.kicad_pcb), off the B.SilkS graphics of footprints
+     blinkyparts:BatteryHolder_Keystone_1060_1x2032_HandSoldering,
+     blinkyparts:5mm_SMD-Pad and blinkyparts:Push_Button. Nothing here was
+     drawn by eye. Where the reference has a run of fp_line segments they are
+     kept as the same run, in the same order, so a diff against the source file
+     is possible.
+
+     THE FRAME IS THE SAME ONE THE PADS USE, which is the one thing that could
+     silently go wrong. In the reference the battery's +3V0 pad sits at local
+     x -14.65 and PART_TYPES.battery has its 'bat+' pad at exactly -14.65, so
+     the silk coordinates need no sign flip: they are already in the back-side
+     view that partPoint expects, and partPoint mirrors legend and pads
+     together. Checked pad by pad rather than assumed, because a flipped legend
+     would put the plus on the minus terminal, which is the one error on this
+     board that destroys a part.
+
+     THE BATTERY CHAMFER IS REAL AND IT IS ONE CORNER, not four. The holder's
+     moulding has a bevel on all four corners (the owner's photograph shows
+     them), but the reference legend draws only the one at the top left, from
+     (-9.55, -8.35) to (-11.35, -6.55), because that is the corner that MEANS
+     something: it sits on the plus side, and it is the shape the builder lines
+     the part up against. Copying all four would turn a polarity mark back into
+     decoration. The reference backs it up with a plus glyph right beside it at
+     (-13, -6), and both are kept.
+
+     WHY LINES AND NOT AREAS. A legend is strokes of a stated width, so it is
+     carried as segments plus a width and turned into rectangles here, rather
+     than as filled outlines. Same reason the text font is a stroke font: what
+     reaches the Gerber and the KiCad raster is then axis-parallel wherever the
+     source line is, and the one diagonal in the whole set (the chamfer) is a
+     deliberate exception the eye needs.
+
+     Rendered NOWHERE unless doc.board.partLegend is on. The tool printed no
+     legend at all until this existed, so a board saved before it must not grow
+     ink it never had; cloneBoard defaults the flag to true for new documents
+     and validateDoc leaves an existing false alone. */
+  /* 0.20 rather than the 0.15 the fabs allow, and the reason is measured. The
+     button's legend is two RINGS, and a ring is tessellated into chords by
+     circlePoly, so consecutive chords meet at a shallow angle and the union is
+     slightly thinner across that joint than the segments that make it. At a
+     nominal 0.15 the DRC's opening test found 0.1414 on both rings of a plain
+     board (the 'thermal never breaks a fab rule' case), which is a real defect
+     and not a false alarm: at the fab's own limit there is no room for the
+     chord to lose anything. 0.20 leaves a third of the width as headroom, is
+     still a fine line on a board, and prints on every process both fabs offer.
+     The reference project draws 0.12, which JLCPCB would reject outright. */
+  var LEGEND_WIDTH_MM = 0.2;
+
+  var PART_LEGENDS = {
+    led: {
+      /* Only the plus beside the anode. The 5mm head is a guess (see the note
+         at PART_TYPES) and printing a guessed outline would be worse than
+         printing none: a builder would trust it. */
+      lines: [],
+      marks: [{ kind: 'plus', xMm: 3, yMm: -4.25, sizeMm: 1 }]
+    },
+    battery: {
+      /* The holder outline, verbatim from the reference, one run of segments
+         around the body with the chamfer at the top left. The two short stubs
+         at x +-14.55 are the ends the reference leaves open where the pads sit;
+         they are kept, because the gap is where the metal tab lands. */
+      lines: [
+        [14.55, 3.85, 14.55, 2.3],
+        [14.55, -3.85, 14.55, -2.3],
+        [11.35, 8.35, 11.35, 3.85],
+        [11.35, 3.85, 14.55, 3.85],
+        [11.35, -3.85, 14.55, -3.85],
+        [11.35, -8.35, 11.35, -3.85],
+        [11.35, -8.35, -9.55, -8.35],
+        [-9.55, -8.35, -11.35, -6.55],
+        [-11.35, 8.35, 11.35, 8.35],
+        [-11.35, 8.35, -11.35, 3.85],
+        [-11.35, 3.85, -14.55, 3.85],
+        [-11.35, -3.85, -14.55, -3.85],
+        [-11.35, -6.55, -11.35, -3.85],
+        [-14.55, 3.85, -14.55, 2.3],
+        [-14.55, -3.85, -14.55, -2.3]
+      ],
+      marks: [{ kind: 'plus', xMm: -13, yMm: -6, sizeMm: 2 }]
+    },
+    button: {
+      /* Two concentric rings around the plunger, shifted by -12 because the
+         reference puts its origin on pad 1 while PART_TYPES centres the part
+         between its pads. Radii 2 and 3.5 straight from the fp_circle pair. */
+      lines: [],
+      circles: [
+        { cxMm: 0, cyMm: 0, rMm: 2 },
+        { cxMm: 0, cyMm: 0, rMm: 3.5 }
+      ],
+      marks: []
+    }
+  };
+
+  /* A segment of a legend as a rectangle: the line grown by half the stroke
+     width on each side. Butt ends, no joins and no caps, which is what the
+     reference's own overlapping segments already assume. */
+  function legendSeg(x0, y0, x1, y1, wMm) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (!(len > 0)) return null;
+    var hx = -dy / len * wMm / 2, hy = dx / len * wMm / 2;
+    return [[x0 + hx, y0 + hy], [x1 + hx, y1 + hy], [x1 - hx, y1 - hy], [x0 - hx, y0 - hy]];
+  }
+
+  /* A ring as a run of segments, tessellated like every other circle here so
+     the legend and the pads agree about what a curve is. */
+  function legendRing(cx, cy, r, wMm, tolMm) {
+    var pts = circlePoly(cx, cy, r, tolMm), out = [], i, s;
+    for (i = 0; i < pts.length; i++) {
+      var a = pts[i], b = pts[(i + 1) % pts.length];
+      s = legendSeg(a[0], a[1], b[0], b[1], wMm);
+      if (s) out.push(s);
+    }
+    return out;
+  }
+
+  /* One part's legend in DOCUMENT millimetres: every rectangle already rotated,
+     mirrored and placed by partPoint, so it lines up with that part's pads by
+     construction rather than by a second copy of the transform. */
+  function partLegend(part, opts) {
+    opts = opts || {};
+    var def = part && PART_TYPES[part.type];
+    var spec = def && PART_LEGENDS[part.type];
+    if (!spec) return [];
+    var w = opts.widthMm == null ? LEGEND_WIDTH_MM : +opts.widthMm;
+    var tol = opts.circleTolMm == null ? CIRC_TOL : +opts.circleTolMm;
+    var local = [], i;
+
+    (spec.lines || []).forEach(function (l) {
+      var s = legendSeg(l[0], l[1], l[2], l[3], w);
+      if (s) local.push(s);
+    });
+    (spec.circles || []).forEach(function (c) {
+      legendRing(c.cxMm, c.cyMm, c.rMm, w, tol).forEach(function (s) { local.push(s); });
+    });
+    (spec.marks || []).forEach(function (m) {
+      var h = m.sizeMm / 2;
+      if (m.kind === 'plus') {
+        local.push(legendSeg(m.xMm - h, m.yMm, m.xMm + h, m.yMm, w));
+        local.push(legendSeg(m.xMm, m.yMm - h, m.xMm, m.yMm + h, w));
+      }
+    });
+
+    var out = [];
+    for (i = 0; i < local.length; i++) {
+      if (!local[i]) continue;
+      var poly = local[i].map(function (p) { return partPoint(part, p[0], p[1]); });
+      out.push(polyArea(poly) < 0 ? poly.slice().reverse() : poly);
+    }
+    return out;
+  }
+
+  /* Every part's legend on the back, which is the only side parts live on. */
+  function docPartLegends(doc, opts) {
+    if (!doc || !doc.board || !doc.board.partLegend) return [];
+    var out = [];
+    ((doc && doc.parts) || []).forEach(function (p) {
+      partLegend(p, opts).forEach(function (poly) { out.push(poly); });
+    });
+    return out;
+  }
+
   /* ------------------------------------------------------------- snapping */
 
   /* Everything the pointer can snap to on one side, in millimetres: the anchors
@@ -1703,6 +2169,12 @@ var PCB = (function () {
       fab: fab,
       maskColor: mask,
       silkColor: SILK_COLORS.indexOf(b.silkColor) < 0 ? defaultSilk(mask) : b.silkColor,
+      /* The assembly legend of the parts. Additive like silkColor and finish
+         above, so no document version, but the DEFAULT IS THE OPPOSITE of what
+         those took: a board saved before this existed carried no legend, and
+         opening it must not silently print ink on it. So an absent flag means
+         false here, and emptyDoc turns it on for new documents instead. */
+      partLegend: !!b.partLegend,
       finish: FINISHES.indexOf(b.finish) < 0 ? (FINISH_BY_FAB[fab] || FINISHES[0]) : b.finish
     };
     /* The one number the back-copper solver takes from the user: how wide the
@@ -1829,7 +2301,7 @@ var PCB = (function () {
       version: VERSION,
       board: {
         widthMm: 70, heightMm: 95, fab: 'aisler', maskColor: 'green',
-        silkColor: 'white', finish: 'enig'
+        silkColor: 'white', finish: 'enig', partLegend: true
       },
       objects: [], seeds: [], holes: [], parts: [], ref: null
     };
@@ -3608,7 +4080,15 @@ var PCB = (function () {
       .concat([entry(padOpen, 'dark', false, 'pad'), entry(ringOpen, 'dark', false, 'ring')]).concat(cutClear));
     /* Silk is clipped for the same reason: legend ink printed onto a hole. */
     layers['F.Silkscreen'] = nonEmpty(fSilk.concat(cutClear));
-    layers['B.Silkscreen'] = nonEmpty(bSilk.concat(cutClear));
+    /* The part legend goes on BEFORE the cutout clear, like every other dark
+       step on this layer, so a legend running into a milled hole is trimmed
+       rather than printed over the void. It is its own entry rather than part
+       of bSilk because it does not come from a region: it is geometry the parts
+       carry with them, the way the pads are. */
+    var legendPolys = docPartLegends(doc, { circleTolMm: ctol });
+    var legendEntries = legendPolys.length
+      ? [entry(legendPolys, 'dark', false, 'legend')] : [];
+    layers['B.Silkscreen'] = nonEmpty(bSilk.concat(legendEntries).concat(cutClear));
     /* Edge.Cuts carries the profile AND every cutout ring: the outer ring of the
        board is where the router goes around it, a cutout ring is where it goes
        through it. Both are stroked, not filled.
@@ -9123,6 +9603,26 @@ var PCB = (function () {
     rasterizeSide: rasterizeSide,
     coverageField: coverageField,
     maskToPath: maskToPath,
+    FONT_W: FONT_W,
+    FONT_H: FONT_H,
+    FONT_BAR: FONT_BAR,
+    textBarMm: textBarMm,
+    textStrokePath: textStrokePath,
+    FONT_ADVANCE: FONT_ADVANCE,
+    FONT_GLYPHS: FONT_GLYPHS,
+    textSupported: textSupported,
+    textCells: textCells,
+    textWidthMm: textWidthMm,
+    textPolys: textPolys,
+    TEXT_STEP_MM: TEXT_STEP_MM,
+    TEXT_HEIGHT_DEFAULT_MM: TEXT_HEIGHT_DEFAULT_MM,
+    textHeights: textHeights,
+    textHeightStep: textHeightStep,
+    textHeightExact: textHeightExact,
+    LEGEND_WIDTH_MM: LEGEND_WIDTH_MM,
+    PART_LEGENDS: PART_LEGENDS,
+    partLegend: partLegend,
+    docPartLegends: docPartLegends,
     findRegions: findRegions,
     seedRegions: seedRegions,
     vectorizeRegions: vectorizeRegions,
@@ -9148,6 +9648,7 @@ var PCB = (function () {
     kicadFileSet: kicadFileSet,
     KICAD_VERSION: KICAD_VERSION,
     KICAD_ART_LAYERS: KICAD_ART_LAYERS,
+    KICAD_PX_PER_MM: KICAD_PX_PER_MM,
     KICAD_SKIP_ROLES: KICAD_SKIP_ROLES,
     crc32: crc32,
     utf8Bytes: utf8Bytes,
@@ -10343,7 +10844,7 @@ var PCB = (function () {
      The export tab is deliberately absent: it shows both sides at once, so
      there is no single mirroring, and its canvases do not pan. */
   function viewIsMirrored(tab, checkSide) {
-    if (tab === 'drawBack' || tab === 'matBack' || tab === 'parts') return true;
+    if (tab === 'drawBack' || tab === 'matBack' || tab === 'parts' || tab === 'labelBack') return true;
     if (tab === 'check') return checkSide === 'back';
     return false;
   }
@@ -11913,6 +12414,17 @@ var PCB = (function () {
        now would mean rebuilding it in a fortnight. The other reason is boring
        and better: a schema change is not reversible for documents already
        saved. */
+    /* The back is a LABELLING surface, and that is the whole of what came back
+       from the two tabs hidden above it. Drawing dividing lines there and then
+       painting the areas between them is still pointless (the solver owns the
+       back copper), but printing a legend on it is not: an assembly print says
+       which way round the battery goes, and a board wants its name on it
+       somewhere. So the drawing surface returns with everything that decides
+       MATERIAL taken away. Every line it makes is silkscreen, and for anything
+       beyond that there is KiCad, which is a deliberate limit rather than an
+       unfinished one: the export is editable and this tool does not have to
+       grow into a layout program. */
+    { k: 'labelBack', label: 'label-back', title: 'Silkscreen on the back: text, lines and the assembly legend' },
     { k: 'drill', label: 'drill', title: 'Holes' },
     { k: 'check', label: 'check', title: 'Connectivity of the circuit and manufacturing checks' },
     { k: 'three', label: '3d-viz', title: 'The board as a lit three dimensional object, with the LEDs shining through it' },
@@ -11927,8 +12439,18 @@ var PCB = (function () {
     { v: 'pen', label: 'Pen', title: 'Curves: click for a corner, click and drag for a smooth anchor whose tangent follows the drag. Click the first anchor to close, double click or Esc to end open.' },
     { v: 'rect', label: 'Rect', title: 'Click two opposite corners, or drag.' },
     { v: 'circle', label: 'Circle', title: 'Click the centre and then the rim, or drag from the centre.' },
-    { v: 'stroke', label: 'Stroke', title: 'Like a polyline, but a band of material with a width.' }
+    { v: 'stroke', label: 'Stroke', title: 'Like a polyline, but a band of material with a width.' },
+    { v: 'text', label: 'Text', title: 'Type the wording and the height in the panel, then click where it goes. One click, no drag: the click sets the centre of the line.' }
   ];
+
+  /* The labelling tab offers a subset of the tools, and the ones it leaves out
+     are left out on purpose rather than for want of room. Everything here draws
+     silkscreen and nothing else, so a tool whose entire meaning is to divide
+     the board into areas of different material (the closed shapes, which are
+     contours and take their material from a seed) would either do nothing
+     visible or quietly carve up the back. What is left is the tools that draw a
+     LINE, plus text, plus the two that edit what is already there. */
+  const LABEL_TOOLS = ['select', 'points', 'text', 'line', 'polyline', 'stroke'];
 
   /* The two-click tools. They share one gesture that works at two speeds, which
      is the whole point of listing them: press, and then either release far away
@@ -11946,6 +12468,12 @@ var PCB = (function () {
     rect: 'Nothing to set. A rectangle is axis aligned already.',
     circle: 'Nothing to set. A circle has no direction to constrain.'
   };
+
+  /* The silkscreen line width offered on the labelling tab. 0.15 mm is the
+     minimum both fabs print reliably and what the reference board's legend uses
+     (it draws 0.12, which JLCPCB would reject); the wider ones are there because
+     a line meant to be seen from across a room wants more than the minimum. */
+  const SILK_WIDTHS = ['0.15', '0.2', '0.3', '0.5'];
 
   const SNAPS = [
     { v: 'free', label: 'Free', title: 'No angle grid. Shift still forces 45 degrees.' },
@@ -12107,6 +12635,15 @@ var PCB = (function () {
     const [onion, setOnion] = useState(true);
     const [strokeW, setStrokeW] = useState('1');
     const [strokeTpl, setStrokeTpl] = useState('copper');
+    /* The text tool. The string and its size are view state, not document
+       state: a text is turned into silk polygons the moment it is placed, so
+       what the document carries afterwards is an ordinary contour object and
+       nothing here has to be replayed to render it. The cap height default is
+       2.1 mm, which is 0.3 mm per bar at the font's seven units, comfortably
+       over every fab's silk minimum and still small enough that a part
+       reference fits beside a footprint. */
+    const [textStr, setTextStr] = useState('');
+    const [textH, setTextH] = useState(String(PCB.TEXT_HEIGHT_DEFAULT_MM));
     const [offsetMm, setOffsetMm] = useState('1');
     const [snapDeg, setSnapDeg] = useState('free');
     const [snapMode, setSnapMode] = useState('off');
@@ -12530,7 +13067,8 @@ var PCB = (function () {
           setPartSel(null);
           return;
         }
-        const drawing = tabRef.current === 'drawFront' || tabRef.current === 'drawBack';
+        const drawing = tabRef.current === 'drawFront' || tabRef.current === 'drawBack'
+          || tabRef.current === 'labelBack';
         if (drawing && (k === 'delete' || k === 'backspace')) {
           /* Under the point editor Delete means the anchor, NEVER the object:
              the object is still selected there, and taking the whole shape away
@@ -13092,16 +13630,99 @@ var PCB = (function () {
       }
       if (!path || !path.length) { tiny(); return; }
       const id = PCB.nextObjectIds(docRef.current, 1)[0];
-      const o = { id: id, side: d.side, kind: d.tool === 'stroke' ? 'stroke' : 'contour', path: path };
-      if (d.tool === 'stroke') {
+      /* On the labelling tab EVERY line is a stroke, not just the stroke tool's
+         own. A contour is a dividing line with no material of its own, so a
+         line drawn there would print nothing at all and only carve the back
+         into regions: exactly the failure that text as contours produced. The
+         tool strip on that tab therefore offers only the tools that draw a
+         line, and all of them land here as silkscreen bands. */
+      const asStroke = d.tool === 'stroke' || tabRef.current === 'labelBack';
+      const o = { id: id, side: d.side, kind: asStroke ? 'stroke' : 'contour', path: path };
+      /* On the labelling tab a stroke is always silkscreen, whatever the
+         material picker last stood at: that tab does not show the picker, so
+         reading it here would let a value the user cannot see decide what gets
+         drawn. Read off the tab rather than passed in, because commitDraft is
+         also reached from the Esc and blur paths, which have no side channel. */
+      const labelling = tabRef.current === 'labelBack';
+      if (asStroke) {
         const w = +strokeW;
-        o.widthMm = isFinite(w) && w > 0 ? w : 1;
-        o.template = strokeTpl;
+        o.widthMm = isFinite(w) && w > 0 ? w : (labelling ? 0.15 : 1);
+        o.template = labelling ? 'silk' : strokeTpl;
       } else {
         o.role = null;
       }
       runCmds([{ type: 'addObjects', objects: [o] }]);
-      setMsg(d.tool === 'stroke' ? 'Stroke added: it is a barrier and a band of material at once.' : 'Contour added.');
+      setMsg(labelling ? 'Silkscreen line added.'
+        : (d.tool === 'stroke' ? 'Stroke added: it is a barrier and a band of material at once.'
+          : 'Contour added.'));
+    }
+
+    /* Text, placed with one click and frozen into geometry on the spot.
+
+       WHY IT DOES NOT STAY EDITABLE, since that is the obvious objection. A
+       text kept as a string would need a new object kind in the schema, and
+       every consumer would have to learn it: the rasterizer, the region flood,
+       the solver, the DRC, the Gerber writer, the KiCad writer and the 3D view.
+       A schema change is also the one thing in this document that cannot be
+       taken back for boards already saved. Turning the string into geometry at
+       the moment of placing costs the ability to retype it and buys the fact
+       that nothing downstream needs to know text exists at all.
+
+       WHY A STROKE AND NOT A CONTOUR, which is the trap this walked into once
+       and the reason the comment is this long. A contour has no material of its
+       own: it is a DIVIDING LINE, and the material of the area it encloses comes
+       from a seed dropped inside it. Text placed as contours therefore produces
+       no silkscreen whatsoever, only a back side carved into one region per
+       letter hole, every one of them still the default board material. Measured
+       rather than reasoned: 'AB' as contours gives eleven regions and ZERO
+       entries on B.Silkscreen. A stroke carries its template itself, so it
+       needs no seed and cannot be separated from its material.
+
+       ONE OBJECT PER TEXT, not one per bar, and the font is what makes that
+       possible: widthMm sits on the OBJECT rather than on the subpath, so a
+       single stroke object can only hold bars that are all the same thickness.
+       Every bar of this font is exactly one cell unit thick by construction,
+       which is the property that lets a whole string be one object that moves,
+       deletes and undoes as the single thing the user thinks it is.
+
+       MIRRORED ON THE BACK. The tab draws the back through a mirrored view, so
+       a string composed left to right in document space would read backwards
+       under the eye looking at the tab. textPolys takes the flip, so the text
+       reads correctly here, which is also how it reads on the real board seen
+       from the back, and that is the side this ink is printed on. */
+    function placeText(p, side) {
+      const str = String(textStr || '').trim();
+      if (!str) { setMsg('Type the text first: the tool places what is in the text field.'); return; }
+      /* The stepper cannot produce a height off the ladder, so this is only a
+         belt: it catches a value that arrived from somewhere else (a restored
+         session, a hand edited state) and puts it back on a step, rather than
+         quietly placing text the export cannot hit exactly. */
+      let h = +textH;
+      if (!PCB.textHeightExact(h)) h = PCB.textHeightStep(h, 1);
+      if (!(h > 0)) { setMsg('The text height has to be a positive number of millimetres.'); return; }
+      const missing = PCB.textSupported(str);
+      /* snapDraw hands back a PAIR, not a point object. Reading .x/.y off it
+         gives undefined, the whole run lands on NaN, and the object is created
+         with real subpaths that draw nowhere: an empty canvas and a populated
+         object list, which is exactly how this failed the first time. */
+      const s = snapDraw(null, p, side);
+      if (!isFinite(s[0]) || !isFinite(s[1])) {
+        setMsg('The click did not resolve to a place on the board.');
+        return;
+      }
+      /* The bars back to their centre lines, in the core block: it is geometry,
+         the tests can reach it there, and the square-bar case that made the full
+         stop disappear is documented at the function itself. */
+      const u = PCB.textBarMm(h);
+      const path = PCB.textStrokePath(str, s[0], s[1], h, 'center', side === 'back');
+      if (!path.length) { setMsg('Nothing of that text can be drawn with this font.'); return; }
+      const id = PCB.nextObjectIds(docRef.current, 1)[0];
+      runCmds([{ type: 'addObjects', objects: [{
+        id: id, side: side, kind: 'stroke', widthMm: u, template: 'silk', path: path
+      }] }]);
+      setMsg(missing.length
+        ? 'Text placed, but the font has no ' + missing.join(' ') + ', so those were left out. It carries A to Z, 0 to 9, plus, minus, full stop and colon.'
+        : 'Text placed as silkscreen, ' + u.toFixed(2) + ' mm bars. It is geometry now, so changing the wording means placing it again.');
     }
 
     const hitObject = (p, side) => {
@@ -13211,6 +13832,11 @@ var PCB = (function () {
         return;
       }
       const d = draftRef.current;
+      /* Text is a ONE CLICK tool and it has no draft: the string and the size
+         are already set in the panel, so the click only says where. It commits
+         straight to the document as an ordinary silk contour, because that is
+         what the glyphs are once they are polygons. See placeText. */
+      if (t === 'text') { placeText(p, side); return; }
       if (t === 'pen') { penDown(d, p, side); return; }
       if (TWO_POINT[t]) {
         /* Click-click and drag are the SAME gesture at two speeds. The old code
@@ -14312,6 +14938,27 @@ var PCB = (function () {
       ctx.restore();
     }
 
+    /* The assembly legend as it will actually be printed: the silk polygons
+       themselves, in the board's silkscreen colour, not a schematic stand-in.
+       That is the point of drawing it here rather than reusing the dashed body
+       box next to it. The dashes say "drawing aid, not on the board"; this says
+       the opposite, and a builder deciding whether the legend collides with a
+       trace has to see the real ink.
+
+       Drawn UNDER drawParts, so the pads and the big polarity letters stay on
+       top: the legend is the quiet layer and the placement marks are the loud
+       one. */
+    function drawPartLegend(ctx, V, dpr) {
+      if (!doc.board.partLegend) return;
+      const polys = PCB.docPartLegends(doc, {});
+      if (!polys.length) return;
+      ctx.save();
+      ctx.fillStyle = fab.silk;
+      tracePolys(ctx, polys, V);
+      ctx.fill();
+      ctx.restore();
+    }
+
     /* The part OUTLINES alone: the dashed body box and the reference, without
        the copper fill and without the polarity signs. The drill tab wants this
        and not drawParts. It already has the pads from the rendered back side
@@ -14782,7 +15429,15 @@ var PCB = (function () {
         }))} />
     </div>`;
 
-    function drawTab(side) {
+    /* One drawing surface, two tabs. opts.silkOnly turns it into the labelling
+       tab: the tool strip drops to LABEL_TOOLS, every stroke is silkscreen at a
+       silk line width, and the material picker goes away entirely rather than
+       being set to silk and left clickable. The rest (snap, onion skin, the
+       point editor, the object list) is the same code, because it is the same
+       job. See the comment at the labelBack entry in TABS for why the back is
+       label-only in the first place. */
+    function drawTab(side, opts) {
+      const silkOnly = !!(opts && opts.silkOnly);
       const mirror = side === 'back';
       const b = bundles && bundles[side];
       /* The corner/smooth switch works on the anchor that is active right now,
@@ -14804,7 +15459,30 @@ var PCB = (function () {
           options=${SNAPS} />
       </span>`;
       return html`<${React.Fragment}>
-        ${lead('draw-' + side, 'What this tab is for', html`<${React.Fragment}>
+        ${silkOnly ? lead('label-back', 'What this tab is for', html`<${React.Fragment}>
+          <p>Everything you draw here is <b>silkscreen on the back</b>: the printed legend, the writing on a board.
+            The view is mirrored, so what you draw lands under your finger when you turn the real board over, and
+            text placed here reads the right way round from that side.</p>
+          <p>There is no material to choose, and that is the point of a separate tab. The back copper is worked out
+            by the tool itself, so the only thing left to decide back there is what gets printed on top. Every line,
+            polyline and text on this tab becomes silkscreen at the width in the panel. Anything beyond that, a
+            different material or a shape filled with ink, is a job for KiCad on the exported project.</p>
+          <p>Text takes one click, not a drag: type the wording, pick a height with the arrows, then click where
+            the middle of the line goes. The font is a rectangular stencil alphabet with capitals, digits and a few
+            marks, and it is deliberately plain: its bars are axis parallel so they survive the export without a
+            staircase, and its letters have no closed holes so KiCad never has to slit one open. A text becomes
+            geometry the moment it is placed, so changing the wording means deleting it and placing it again.</p>
+          <p>The height steps rather than taking any number, for the same reason the letters are rectangular. Each
+            step is a size the export can place on whole pixels, so the edges stay exactly where they are drawn, and
+            the smallest one still has bars above the minimum line the board house will print. In between there is
+            nothing to gain, so there is nothing to pick.</p>
+          <p>The battery holder, the button and the LEDs already print their own outline and polarity marks if the
+            assembly legend is on, which is the switch on the blinky-parts tab. They are drawn here in the printing
+            colour so you can see what room is left; the dashed boxes are the part bodies and are not printed.</p>
+          <p>Silkscreen is ink on top of the soldermask. It cannot go where there is no mask, so a line running into
+            a bare window or off the board edge is trimmed, and the check tab reports a line thinner than the fab
+            will print.</p>
+        <//>`) : lead('draw-' + side, 'What this tab is for', html`<${React.Fragment}>
           <p>Draw the lines that divide the board${mirror ? ', seen from the back: the view is mirrored, so what you draw here lands under your finger when you turn the real board over' : ''}.
             A contour is a line with no width and no material. A stroke is a band that is both a barrier and a material of its own.
             The board outline is drawn on both sides, because it is the edge of the board.</p>
@@ -14858,7 +15536,8 @@ var PCB = (function () {
               setTool(v); setDraft(null); setDrag(null);
               ptDragRef.current = null; setPtSel(null); setSnapHint(null);
             }}
-              options=${TOOLS.map((t) => ({ v: t.v, label: t.label, title: t.title }))} />
+              options=${(silkOnly ? TOOLS.filter((t) => LABEL_TOOLS.indexOf(t.v) >= 0) : TOOLS)
+    .map((t) => ({ v: t.v, label: t.label, title: t.title }))} />
             <div className="pcb-toolbar-r">
               <span className="pcb-optgrp">
                 <span className="pcb-optlbl">Snap</span>
@@ -14876,16 +15555,66 @@ var PCB = (function () {
             <div className=${'pcb-ctxpanel pcb-optrow' + (tool === 'stroke' ? '' : ' off')}
               aria-hidden=${tool === 'stroke' ? null : 'true'}>
               <${NumField} label="Width (mm)" value=${strokeW} step="0.1" min=${0.05} width="4.2rem" inline=${true}
-                onChange=${setStrokeW} onCommit=${() => { if (!(+strokeW > 0)) setStrokeW('1'); }} />
-              <span className="pcb-optgrp">
+                onChange=${setStrokeW} onCommit=${() => { if (!(+strokeW > 0)) setStrokeW(silkOnly ? '0.15' : '1'); }} />
+              ${silkOnly ? html`<span className="pcb-optgrp">
+                <span className="pcb-optlbl">Common widths</span>
+                <${Seg} value=${SILK_WIDTHS.indexOf(strokeW) >= 0 ? strokeW : ''} onChange=${setStrokeW}
+                  title="0.15 mm is the thinnest line both fabs will print. Wider reads better from a distance."
+                  options=${SILK_WIDTHS.map((w) => ({ v: w, label: w }))} />
+              </span>` : html`<span className="pcb-optgrp">
                 <span className="pcb-optlbl">Material</span>
                 <${Seg} value=${strokeTpl} onChange=${setStrokeTpl}
                   options=${PCB.TEMPLATES.map((t) => ({
     v: t, title: TPL_HINT[t],
     label: html`<${React.Fragment}><span className="pcb-sw" style=${swatchStyle(t, fab)}></span>${TPL_LABEL[t]}<//>`
   }))} />
-              </span>
+              </span>`}
               ${angleGrp}
+            </div>
+            <div className=${'pcb-ctxpanel pcb-optrow' + (tool === 'text' ? '' : ' off')}
+              aria-hidden=${tool === 'text' ? null : 'true'}>
+              <span className="pcb-optgrp">
+                <span className="pcb-optlbl">Text</span>
+                <input type="text" value=${textStr} placeholder="BAT1" spellCheck=${false}
+                  style=${{ width: '11rem', marginBottom: 0 }}
+                  onChange=${(e) => setTextStr(e.target.value)} />
+              </span>
+              <!-- A stepper, not a number field, and the reason is the font.
+                   Every height on the ladder divides evenly by the export
+                   raster, so the bars land on whole pixels and the edges come
+                   back exact; a typed height would let the user pick one that
+                   does not, for no gain. The arrows hide a ladder of 0.175 mm
+                   steps, which is a spacing nobody would choose to type, and
+                   that is exactly why it is behind two buttons instead of in a
+                   field. The bottom step also keeps the bar above the fab's
+                   silkscreen minimum, which a free field could not. -->
+              <span className="pcb-optgrp">
+                <span className="pcb-optlbl">Height</span>
+                <span className="seg-row">
+                  <button type="button" className="lang-seg"
+                    title="One step smaller. The steps are the heights the export can place exactly."
+                    disabled=${+textH <= PCB.textHeights()[0] + 1e-9}
+                    onClick=${() => setTextH(String(PCB.textHeightStep(+textH, -1)))}>-</button>
+                  <button type="button" className="lang-seg" disabled=${true}
+                    style=${{ minWidth: '4.6rem', fontVariantNumeric: 'tabular-nums' }}
+                    title=${'Bars ' + (+textH / PCB.FONT_H).toFixed(3) + ' mm wide.'}
+                    >${(+textH).toFixed(3).replace(/0+$/, '').replace(/\.$/, '')} mm</button>
+                  <button type="button" className="lang-seg"
+                    title="One step larger."
+                    disabled=${+textH >= PCB.textHeights()[PCB.textHeights().length - 1] - 1e-9}
+                    onClick=${() => setTextH(String(PCB.textHeightStep(+textH, 1)))}>+</button>
+                </span>
+              </span>
+              <span className="pcb-note">
+                ${(() => {
+    const t = String(textStr || '').trim();
+    if (!t) return 'Type the wording, then click the board where it goes.';
+    const miss = PCB.textSupported(t);
+    if (miss.length) return 'No glyph for ' + miss.join(' ') + '; those are left out.';
+    const h = +textH;
+    return PCB.textWidthMm(t, h).toFixed(1) + ' mm wide, ' + (h / PCB.FONT_H).toFixed(3) + ' mm bars.';
+  })()}
+              </span>
             </div>
             <div className=${'pcb-ctxpanel pcb-optrow' + (tool === 'line' ? '' : ' off')}
               aria-hidden=${tool === 'line' ? null : 'true'}>
@@ -14939,6 +15668,12 @@ var PCB = (function () {
                    traces are drawn onto them, and the point snap catches their
                    centres. Front has no parts, so it has no underlay. */
                 if (side === 'back') drawPads(ctx, V, dpr);
+                /* On the labelling tab the automatic legend is context, not
+                   decoration: the whole question there is where there is still
+                   room, and half the ink on the back is already printed by the
+                   legend. The dashed bodies come with it for the same reason,
+                   because text may not sit under a part. */
+                if (silkOnly) { drawPartLegend(ctx, V, dpr); drawPartBodies(ctx, V, dpr); }
                 if (onion) drawObjects(ctx, V, side, dpr, { ghost: true });
                 drawObjects(ctx, V, side, dpr, null);
                 drawDraftShape(ctx, V, dpr);
@@ -15301,6 +16036,8 @@ var PCB = (function () {
       body = drawTab('front');
     } else if (tab === 'drawBack') {
       body = drawTab('back');
+    } else if (tab === 'labelBack') {
+      body = drawTab('back', { silkOnly: true });
     } else if (tab === 'matFront') {
       body = materialsTab('front');
     } else if (tab === 'matBack') {
@@ -15351,6 +16088,20 @@ var PCB = (function () {
               <span className="pcb-note">Snapping acts on the origin of the footprint while you drag it: the 1 mm grid, a nearby anchor, a board corner or a hole centre.</span>
             </div>
           </div>
+          <div className="ctl-sec">
+            <label style=${{ display: 'block' }}>
+              <input type="checkbox" checked=${doc.board.partLegend}
+                onChange=${(e) => runCmds([{ type: 'setBoard', board: { partLegend: e.target.checked } }])} />
+              Assembly legend on the back
+            </label>
+            <p className="pcb-note" style=${{ marginTop: 4 }}>
+              Prints the outline of the battery holder and the button, and a <b>+</b> beside the positive
+              terminal of the holder and beside the anode of every LED. The holder outline has one corner
+              chamfered, on the plus side, which is the corner the part is lined up against. Real silkscreen:
+              it goes into the Gerber and costs nothing extra to make, but it does take room on the back,
+              so turn it off if the artwork there matters more than the assembly help.
+            </p>
+          </div>
         </div>
         <div className="pcb-split pcb-split-wide">
           <div>
@@ -15364,6 +16115,7 @@ var PCB = (function () {
                 drawObjects(ctx, V, 'back', dpr, { ghost: true });
                 drawObjects(ctx, V, 'back', dpr, null);
                 drawHoles(ctx, V, dpr);
+                drawPartLegend(ctx, V, dpr);
                 drawParts(ctx, V, dpr);
                 drawSnapHint(ctx, V, dpr);
               }} />
