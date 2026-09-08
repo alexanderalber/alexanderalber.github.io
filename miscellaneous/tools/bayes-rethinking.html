@@ -1,0 +1,2964 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quap Lab - Bayesian Model Fitting in the Browser</title>
+  <meta name="description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation. Posterior summaries, prior and posterior predictive simulation, WAIC and PSIS-LOO. Nothing leaves the browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
+  <meta property="og:title" content="Quap Lab - Bayesian Model Fitting in the Browser">
+  <meta property="og:description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation. Posterior summaries, predictive simulation, WAIC and PSIS-LOO.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/icons.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Quap Lab",
+    "description": "Fits Bayesian models written as a formula list by quadratic approximation of the posterior, entirely in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/bayes-rethinking.html",
+    "applicationCategory": "UtilitiesApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+  <style>
+    /* Monospace surfaces: the model editor and the CSV box are code, and the
+       column alignment of the precis table only reads if the digits line up. */
+    .qp-mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px; line-height: 1.55;
+    }
+    /* Pico styles textarea by element selector, so the class alone would lose on
+       the paddings. Sizing via Pico's own variables is the documented way in. */
+    textarea.qp-editor {
+      --pico-form-element-spacing-vertical: 10px;
+      --pico-form-element-spacing-horizontal: 12px;
+      min-height: 190px; resize: vertical; white-space: pre; overflow-wrap: normal;
+      overflow-x: auto; tab-size: 2;
+    }
+    textarea.qp-csv { min-height: 120px; }
+
+    /* The results table. Numbers right-aligned and tabular so a column of
+       posterior means can be compared by eye, which is the whole point of it. */
+    .qp-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .qp-tbl th, .qp-tbl td { padding: 5px 10px; border-bottom: 1px solid var(--tool-hairline); }
+    .qp-tbl th { text-align: left; color: var(--tool-label); font-weight: 600; }
+    .qp-tbl td.qp-num, .qp-tbl th.qp-num {
+      text-align: right; font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .qp-tbl td.qp-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--tool-emph);
+    }
+    .qp-tbl tr:last-child td { border-bottom: none; }
+
+    /* Anything that shows something gets the site frame. */
+    .qp-plot {
+      border: 1px solid var(--tool-border); border-radius: 8px;
+      box-shadow: 0 12px 28px rgba(0,0,0,.45); background: var(--tool-surface);
+      display: block; width: 100%; height: auto;
+    }
+    html[data-skin="grey"] .qp-plot, html[data-skin="light"] .qp-plot { box-shadow: none; }
+
+    .qp-drop {
+      border: 2px dashed var(--pico-muted-border-color); border-radius: 12px;
+      padding: 14px; text-align: center; color: var(--tool-note); font-size: 13px;
+    }
+    .qp-drop.qp-over { border-color: var(--tool-sig-info); color: var(--tool-text); }
+
+    /* Message strips. Three severities, all from the signal groups so the grey
+       skin flattens them along with everything else. */
+    .qp-msg {
+      border-radius: 6px; padding: 8px 11px; font-size: 12.5px; margin: 0 0 8px;
+      border: 1px solid transparent;
+    }
+    .qp-msg-err  { color: var(--tool-danger-text); border-color: var(--tool-danger-border); background: var(--tool-danger-bg); }
+    .qp-msg-warn { color: var(--tool-warn-text);   border-color: var(--tool-warn-border);   background: var(--tool-warn-bg); }
+    .qp-msg-info { color: var(--tool-info-text);   border-color: var(--tool-info-border);   background: var(--tool-info-bg); }
+    .qp-msg code { font-size: 12px; }
+
+    /* A deliberate row of separate chip actions: adjacency-based corner rounding
+       cannot see the gap, so this row opts out on its own class. */
+    .qp-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .qp-chips .lang-seg { border-radius: 4px; margin-left: 0; }
+
+    .qp-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 800px) { .qp-grid2 { grid-template-columns: 1fr; } }
+
+    .qp-scroll { overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#concepts" id="nav-cat">Concepts, Visualised</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Quap Lab</h1>
+        <p style="color:var(--tool-label);max-width:70ch">Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. The posterior is approximated by a Gaussian at its mode, which is fast, honest about its own limits, and enough for a surprising number of real models.</p>
+        <ul style="color:var(--tool-label);max-width:70ch">
+          <li>A formula list with <code>~</code> for stochastic and <code>&lt;-</code> for deterministic relations, twelve distributions.</li>
+          <li>Posterior summaries with compatibility intervals, plus a grid cross-check that says when the approximation is off.</li>
+          <li>Prior predictive and posterior predictive simulation, so you can see what a prior actually believes.</li>
+          <li>WAIC and PSIS-LOO with Pareto k diagnostics for comparing models.</li>
+        </ul>
+      </div>
+    </div>
+  </main>
+
+  <script id="rthcore">
+  /* Bayesian model fitting by quadratic (Laplace) approximation.
+   *
+   * The whole numerical side of the tool lives here: tokenizer, parser, model
+   * compiler, distributions, optimizer, Hessian, posterior sampling, predictive
+   * simulation and information criteria. No DOM, no markup, no async. The Node
+   * tests read this block out of the HTML by its id and eval it, and the worker
+   * is built from this same text, so it has to run in three places at once.
+   *
+   * Two structural decisions are worth knowing before reading:
+   *
+   * 1. Everything is computed on the UNCONSTRAINED scale. A standard deviation
+   *    is carried as log(sigma), a probability as logit(p), and the log-Jacobian
+   *    of that change of variables is part of the target. That is where the
+   *    normal approximation is actually defensible, and it happens to be exactly
+   *    what Hamiltonian Monte Carlo would need if it is ever added.
+   *
+   * 2. Expressions compile to closures over Float64Array, not to per-observation
+   *    scalar calls. Values broadcast, length 1 against length n. The speed is
+   *    welcome, but the real reason is that a reverse-mode derivative tape then
+   *    has one node per expression instead of one per (expression, observation).
+   */
+  var RTH = (function () {
+    'use strict';
+
+    /* ================================================================
+       Numerical primitives
+       ================================================================ */
+
+    var LN_2PI = Math.log(2 * Math.PI);
+
+    /* Lanczos g = 7 with nine coefficients, taken verbatim from the levcore
+       block of leverage-ruin.html, where the same series already serves the
+       skewed-t moments. A dozen lines, no tables, relative error near machine
+       precision over the positive axis. Below 1/2 the series is invalid and the
+       reflection formula Gamma(x)Gamma(1-x) = pi/sin(pi x) takes over. */
+    var LGAMMA_C = [
+      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+      771.32342877765313, -176.61502916214059, 12.507343278686905,
+      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
+    ];
+    function lgamma(x) {
+      if (x < 0.5) {
+        return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+      }
+      var z = x - 1, a = LGAMMA_C[0], t = z + 7.5;
+      for (var i = 1; i < 9; i++) a += LGAMMA_C[i] / (z + i);
+      return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(a);
+    }
+    function lbeta(a, b) { return lgamma(a) + lgamma(b) - lgamma(a + b); }
+    function lchoose(n, k) { return lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1); }
+
+    /* Acklam's inverse normal CDF. Relative error below 1.15e-9 over the whole
+       open interval, which is far more than a compatibility interval needs, and
+       it avoids carrying an erfinv around just for the two PI columns. */
+    var QN_A = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+                 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+    var QN_B = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+                 6.680131188771972e+01, -1.328068155288572e+01];
+    var QN_C = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+                -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+    var QN_D = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+                3.754408661907416e+00];
+    function qnorm(p) {
+      if (p <= 0) return -Infinity;
+      if (p >= 1) return Infinity;
+      var q, r, x;
+      if (p < 0.02425) {
+        q = Math.sqrt(-2 * Math.log(p));
+        x = (((((QN_C[0]*q+QN_C[1])*q+QN_C[2])*q+QN_C[3])*q+QN_C[4])*q+QN_C[5]) /
+            ((((QN_D[0]*q+QN_D[1])*q+QN_D[2])*q+QN_D[3])*q+1);
+      } else if (p <= 0.97575) {
+        q = p - 0.5; r = q * q;
+        x = (((((QN_A[0]*r+QN_A[1])*r+QN_A[2])*r+QN_A[3])*r+QN_A[4])*r+QN_A[5])*q /
+            (((((QN_B[0]*r+QN_B[1])*r+QN_B[2])*r+QN_B[3])*r+QN_B[4])*r+1);
+      } else {
+        q = Math.sqrt(-2 * Math.log(1 - p));
+        x = -(((((QN_C[0]*q+QN_C[1])*q+QN_C[2])*q+QN_C[3])*q+QN_C[4])*q+QN_C[5]) /
+             ((((QN_D[0]*q+QN_D[1])*q+QN_D[2])*q+QN_D[3])*q+1);
+      }
+      /* One Halley step against the true CDF would buy another six digits. Not
+         worth it here: 1e-9 is already below the Monte Carlo noise of every
+         quantity this feeds. */
+      return x;
+    }
+
+    /* mulberry32, the same generator book-recommender.html uses for its exposure
+       negatives. Seeded everywhere, so a fit is reproducible within a browser. */
+    function makeRng(seed) {
+      var s = seed >>> 0;
+      return function () {
+        s = (s + 0x6D2B79F5) >>> 0;
+        var t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    /* Box-Muller. The pair is not cached: the caller always wants many draws and
+       the branch costs more than the second sine. */
+    function rnorm1(rng) {
+      var u = 1 - rng(), v = rng();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+
+    function quantileSorted(sorted, p) {
+      var n = sorted.length;
+      if (!n) return NaN;
+      if (n === 1) return sorted[0];
+      var h = (n - 1) * p, lo = Math.floor(h), hi = Math.ceil(h);
+      return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+    }
+    function meanOf(a) {
+      var s = 0;
+      for (var i = 0; i < a.length; i++) s += a[i];
+      return s / a.length;
+    }
+    function sdOf(a) {
+      var n = a.length;
+      if (n < 2) return 0;
+      var m = meanOf(a), s = 0;
+      for (var i = 0; i < n; i++) { var d = a[i] - m; s += d * d; }
+      return Math.sqrt(s / (n - 1));
+    }
+    /* log(sum(exp(x))) without overflowing. Used by lppd and by the grid
+       cross-check, both of which add likelihoods that are individually tiny. */
+    function logSumExp(a) {
+      var mx = -Infinity, i;
+      for (i = 0; i < a.length; i++) if (a[i] > mx) mx = a[i];
+      if (!isFinite(mx)) return mx;
+      var s = 0;
+      for (i = 0; i < a.length; i++) s += Math.exp(a[i] - mx);
+      return mx + Math.log(s);
+    }
+
+    /* ---------- linear algebra ----------
+
+       Cholesky adapted from the recmath block of book-recommender.html. One
+       deliberate difference, and it must not be "fixed" back: that version
+       clamps the diagonal with Math.max(s, 1e-12) so it always returns a matrix.
+       That is right for a recommender, which wants an answer more than it wants
+       a complaint, and it is exactly wrong here. A posterior whose curvature is
+       not positive definite means the model is not identified, and silently
+       returning a repaired matrix would turn that into confident nonsense. So
+       this one returns null and lets the caller diagnose. */
+    function cholesky(A, n) {
+      var L = new Float64Array(n * n);
+      for (var i = 0; i < n; i++) {
+        for (var j = 0; j <= i; j++) {
+          var s = A[i * n + j];
+          for (var k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
+          if (i === j) {
+            if (!(s > 0)) return null;
+            L[i * n + j] = Math.sqrt(s);
+          } else {
+            L[i * n + j] = s / L[j * n + j];
+          }
+        }
+      }
+      return L;
+    }
+
+    /* Solves A x = b for A = L Lt. */
+    function cholSolve(L, n, b) {
+      var y = new Float64Array(n), i, k, s;
+      for (i = 0; i < n; i++) {
+        s = b[i];
+        for (k = 0; k < i; k++) s -= L[i * n + k] * y[k];
+        y[i] = s / L[i * n + i];
+      }
+      var x = new Float64Array(n);
+      for (i = n - 1; i >= 0; i--) {
+        s = y[i];
+        for (k = i + 1; k < n; k++) s -= L[k * n + i] * x[k];
+        x[i] = s / L[i * n + i];
+      }
+      return x;
+    }
+
+    /* Full inverse of a symmetric positive definite matrix, by solving against
+       each unit vector. Only used to turn the precision matrix into a covariance
+       matrix for reporting; the sampler never needs it. */
+    function cholInverse(L, n) {
+      var inv = new Float64Array(n * n), e = new Float64Array(n);
+      for (var c = 0; c < n; c++) {
+        e.fill(0); e[c] = 1;
+        var col = cholSolve(L, n, e);
+        for (var r = 0; r < n; r++) inv[r * n + c] = col[r];
+      }
+      return inv;
+    }
+
+    /* Draws from N(mu, Sigma) given the Cholesky factor L of the PRECISION
+       matrix, Sigma^-1 = L Lt. Solving Lt z' = z back-substitutes in place and
+       gives a draw with covariance Sigma without ever forming Sigma, let alone
+       factoring it. Cheaper and better conditioned than chol(inv(precision)). */
+    function mvnDraw(mu, L, n, rng, out) {
+      var z = new Float64Array(n), i, k;
+      for (i = 0; i < n; i++) z[i] = rnorm1(rng);
+      for (i = n - 1; i >= 0; i--) {
+        var s = z[i];
+        for (k = i + 1; k < n; k++) s -= L[k * n + i] * out[k];
+        out[i] = s / L[i * n + i];
+      }
+      for (i = 0; i < n; i++) out[i] += mu[i];
+      return out;
+    }
+
+    /* Jacobi eigenvalue iteration for a symmetric matrix. At p <= 30 this is
+       microseconds and it always converges, and unlike a bare Cholesky attempt
+       it tells you WHY a Hessian failed: the eigenvector belonging to a
+       non-positive eigenvalue names the direction in which the posterior has no
+       curvature, which is almost always the pair of parameters that are not
+       separately identified. */
+    function jacobiEigen(Ain, n, maxSweeps) {
+      var A = Float64Array.from(Ain), V = new Float64Array(n * n), i, j, k, p, q;
+      for (i = 0; i < n; i++) V[i * n + i] = 1;
+      var sweeps = maxSweeps || 60;
+      for (var sweep = 0; sweep < sweeps; sweep++) {
+        var off = 0;
+        for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) off += A[i * n + j] * A[i * n + j];
+        if (off < 1e-30) break;
+        for (p = 0; p < n - 1; p++) {
+          for (q = p + 1; q < n; q++) {
+            var apq = A[p * n + q];
+            if (Math.abs(apq) < 1e-300) continue;
+            var theta = (A[q * n + q] - A[p * n + p]) / (2 * apq);
+            var t = Math.sign(theta) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+            if (!isFinite(t) || theta === 0) t = 1;
+            var c = 1 / Math.sqrt(t * t + 1), s = t * c;
+            for (k = 0; k < n; k++) {
+              var akp = A[k * n + p], akq = A[k * n + q];
+              A[k * n + p] = c * akp - s * akq;
+              A[k * n + q] = s * akp + c * akq;
+            }
+            for (k = 0; k < n; k++) {
+              var apk = A[p * n + k], aqk = A[q * n + k];
+              A[p * n + k] = c * apk - s * aqk;
+              A[q * n + k] = s * apk + c * aqk;
+              var vkp = V[k * n + p], vkq = V[k * n + q];
+              V[k * n + p] = c * vkp - s * vkq;
+              V[k * n + q] = s * vkp + c * vkq;
+            }
+          }
+        }
+      }
+      var vals = new Float64Array(n);
+      for (i = 0; i < n; i++) vals[i] = A[i * n + i];
+      /* Ascending, so vals[0] is the smallest and the first thing to check. */
+      var idx = [];
+      for (i = 0; i < n; i++) idx.push(i);
+      idx.sort(function (a, b) { return vals[a] - vals[b]; });
+      var sv = new Float64Array(n), sVec = new Float64Array(n * n);
+      for (i = 0; i < n; i++) {
+        sv[i] = vals[idx[i]];
+        for (k = 0; k < n; k++) sVec[k * n + i] = V[k * n + idx[i]];
+      }
+      return { values: sv, vectors: sVec };
+    }
+
+    /* ================================================================
+       Distributions
+
+       Every log-density is fully normalized. That costs a few lgamma calls that
+       cancel out of the optimization, and it is not optional: WAIC and PSIS
+       compare log-likelihoods across models, and an unnormalized one silently
+       shifts the comparison.
+
+       Parameterizations follow R, because that is what anyone writing this
+       notation already has in their fingers: dexp by RATE, dgamma by shape and
+       RATE, dnorm by standard deviation and not variance.
+
+       `support` drives the automatic change of variables for any parameter
+       declared with this distribution as its prior. `d` is the slot for analytic
+       partial derivatives; it stays null in this version, where gradients come
+       from finite differences, and it is what a Hamiltonian sampler would fill.
+       ================================================================ */
+
+    /* Each lp receives plain numbers for the parameters and either a number or a
+       Float64Array for the outcome, and returns the summed log-density. Summing
+       inside the distribution rather than outside keeps one loop instead of two
+       and lets the constant terms be hoisted per call. */
+    function eachSum(y, f) {
+      if (typeof y === 'number') return f(y);
+      var s = 0;
+      for (var i = 0; i < y.length; i++) s += f(y[i]);
+      return s;
+    }
+
+    var DIST = {
+      dnorm: {
+        args: ['mean', 'sd'], support: 'real',
+        lp: function (y, mu, sd) {
+          if (!(sd > 0)) return -Infinity;
+          var c = -0.5 * LN_2PI - Math.log(sd), inv = 1 / sd;
+          return eachSum(y, function (v) { var z = (v - mu) * inv; return c - 0.5 * z * z; });
+        },
+        rng: function (rng, mu, sd) { return mu + sd * rnorm1(rng); },
+        d: null
+      },
+      dlnorm: {
+        args: ['meanlog', 'sdlog'], support: 'positive',
+        lp: function (y, mu, sd) {
+          if (!(sd > 0)) return -Infinity;
+          var c = -0.5 * LN_2PI - Math.log(sd), inv = 1 / sd;
+          return eachSum(y, function (v) {
+            if (!(v > 0)) return -Infinity;
+            var l = Math.log(v), z = (l - mu) * inv;
+            return c - 0.5 * z * z - l;
+          });
+        },
+        rng: function (rng, mu, sd) { return Math.exp(mu + sd * rnorm1(rng)); },
+        d: null
+      },
+      dunif: {
+        args: ['min', 'max'], support: 'interval',
+        lp: function (y, a, b) {
+          if (!(b > a)) return -Infinity;
+          var c = -Math.log(b - a);
+          return eachSum(y, function (v) { return (v < a || v > b) ? -Infinity : c; });
+        },
+        rng: function (rng, a, b) { return a + (b - a) * rng(); },
+        d: null
+      },
+      dexp: {
+        /* Rate, as in R. Someone thinking in means will get this backwards and
+           the tool says so at the point of use. */
+        args: ['rate'], support: 'positive',
+        lp: function (y, rate) {
+          if (!(rate > 0)) return -Infinity;
+          var lr = Math.log(rate);
+          return eachSum(y, function (v) { return v < 0 ? -Infinity : lr - rate * v; });
+        },
+        rng: function (rng, rate) { return -Math.log(1 - rng()) / rate; },
+        d: null
+      },
+      dcauchy: {
+        args: ['location', 'scale'], support: 'real',
+        lp: function (y, x0, g) {
+          if (!(g > 0)) return -Infinity;
+          var c = -Math.log(Math.PI) - Math.log(g), inv = 1 / g;
+          return eachSum(y, function (v) {
+            var z = (v - x0) * inv;
+            return c - Math.log1p(z * z);
+          });
+        },
+        rng: function (rng, x0, g) { return x0 + g * Math.tan(Math.PI * (rng() - 0.5)); },
+        d: null
+      },
+      dbinom: {
+        args: ['size', 'prob'], support: 'count',
+        lp: function (y, n, p) {
+          if (!(p >= 0 && p <= 1) || !(n >= 0)) return -Infinity;
+          /* At p exactly 0 or 1 the log terms are infinite but the density is
+             perfectly well defined: all mass sits on one outcome. The logit link
+             never reaches the ends, but a deterministic node can be written to
+             land there, so handle it rather than returning NaN. */
+          if (p === 0) return eachSum(y, function (v) { return v === 0 ? 0 : -Infinity; });
+          if (p === 1) return eachSum(y, function (v) { return v === n ? 0 : -Infinity; });
+          var lp1 = Math.log(p), lq1 = Math.log1p(-p);
+          return eachSum(y, function (v) {
+            if (v < 0 || v > n || v !== Math.round(v)) return -Infinity;
+            return lchoose(n, v) + v * lp1 + (n - v) * lq1;
+          });
+        },
+        rng: function (rng, n, p) {
+          var k = 0;
+          for (var i = 0; i < n; i++) if (rng() < p) k++;
+          return k;
+        },
+        d: null
+      },
+      dpois: {
+        args: ['lambda'], support: 'count',
+        lp: function (y, lam) {
+          if (!(lam > 0)) return -Infinity;
+          var ll = Math.log(lam);
+          return eachSum(y, function (v) {
+            if (v < 0 || v !== Math.round(v)) return -Infinity;
+            return v * ll - lam - lgamma(v + 1);
+          });
+        },
+        rng: function (rng, lam) {
+          /* Knuth. Fine for the lambdas a predictive simulation produces; it
+             degrades above lambda 30 or so, which is flagged nowhere because a
+             posterior predictive draw at that rate is still correct, just slow. */
+          var L = Math.exp(-lam), k = 0, p = 1;
+          do { k++; p *= rng(); } while (p > L);
+          return k - 1;
+        },
+        d: null
+      },
+      dbeta: {
+        args: ['shape1', 'shape2'], support: 'unit',
+        lp: function (y, a, b) {
+          if (!(a > 0 && b > 0)) return -Infinity;
+          var c = -lbeta(a, b);
+          return eachSum(y, function (v) {
+            if (!(v > 0 && v < 1)) return -Infinity;
+            return c + (a - 1) * Math.log(v) + (b - 1) * Math.log1p(-v);
+          });
+        },
+        rng: function (rng, a, b) {
+          var x = rgamma1(rng, a), y2 = rgamma1(rng, b);
+          return x / (x + y2);
+        },
+        d: null
+      },
+      dbeta2: {
+        /* The mean-and-concentration parameterization the book uses whenever a
+           beta actually appears. Without it the notation does not transfer. */
+        args: ['pbar', 'theta'], support: 'unit',
+        lp: function (y, pbar, theta) {
+          return DIST.dbeta.lp(y, pbar * theta, (1 - pbar) * theta);
+        },
+        rng: function (rng, pbar, theta) {
+          return DIST.dbeta.rng(rng, pbar * theta, (1 - pbar) * theta);
+        },
+        d: null
+      },
+      dgamma: {
+        args: ['shape', 'rate'], support: 'positive',
+        lp: function (y, sh, rate) {
+          if (!(sh > 0 && rate > 0)) return -Infinity;
+          var c = sh * Math.log(rate) - lgamma(sh);
+          return eachSum(y, function (v) {
+            if (!(v > 0)) return -Infinity;
+            return c + (sh - 1) * Math.log(v) - rate * v;
+          });
+        },
+        rng: function (rng, sh, rate) { return rgamma1(rng, sh) / rate; },
+        d: null
+      },
+      dgamma2: {
+        args: ['mu', 'scale'], support: 'positive',
+        lp: function (y, mu, scale) { return DIST.dgamma.lp(y, mu / scale, 1 / scale); },
+        rng: function (rng, mu, scale) { return DIST.dgamma.rng(rng, mu / scale, 1 / scale); },
+        d: null
+      },
+      dstudent: {
+        args: ['nu', 'mu', 'sigma'], support: 'real',
+        lp: function (y, nu, mu, sig) {
+          if (!(nu > 0 && sig > 0)) return -Infinity;
+          var c = lgamma((nu + 1) / 2) - lgamma(nu / 2) - 0.5 * Math.log(nu * Math.PI) - Math.log(sig);
+          var k = (nu + 1) / 2, inv = 1 / sig;
+          return eachSum(y, function (v) {
+            var z = (v - mu) * inv;
+            return c - k * Math.log1p(z * z / nu);
+          });
+        },
+        rng: function (rng, nu, mu, sig) {
+          var g = rgamma1(rng, nu / 2) * 2 / nu;
+          return mu + sig * rnorm1(rng) / Math.sqrt(g);
+        },
+        d: null
+      }
+    };
+    /* rethinking calls the scaled-t dt2; accept both spellings. */
+    DIST.dt2 = DIST.dstudent;
+
+    /* Marsaglia-Tsang, with the shape < 1 boost. Only needed to draw from beta,
+       gamma and t in predictive simulation; never on the fitting path. */
+    function rgamma1(rng, shape) {
+      if (shape < 1) return rgamma1(rng, shape + 1) * Math.pow(1 - rng(), 1 / shape);
+      var d = shape - 1 / 3, c = 1 / Math.sqrt(9 * d);
+      for (;;) {
+        var x, v;
+        do { x = rnorm1(rng); v = 1 + c * x; } while (v <= 0);
+        v = v * v * v;
+        var u = 1 - rng();
+        if (u < 1 - 0.0331 * x * x * x * x) return d * v;
+        if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+      }
+    }
+
+    /* Deterministic functions usable inside expressions. Deliberately small:
+       everything here is smooth, because the Hessian is taken by finite
+       differences and a kink produces curvature that is numerically real and
+       statistically meaningless. abs() is the obvious omission and it is
+       omitted on purpose. */
+    var FUNCS = {
+      log:    function (x) { return Math.log(x); },
+      exp:    function (x) { return Math.exp(x); },
+      sqrt:   function (x) { return Math.sqrt(x); },
+      logit:  function (x) { return Math.log(x / (1 - x)); },
+      inv_logit: function (x) { return 1 / (1 + Math.exp(-x)); },
+      log1p:  function (x) { return Math.log1p(x); },
+      expm1:  function (x) { return Math.expm1(x); },
+      sin:    function (x) { return Math.sin(x); },
+      cos:    function (x) { return Math.cos(x); },
+      tanh:   function (x) { return Math.tanh(x); }
+    };
+    FUNCS.logistic = FUNCS.inv_logit;
+
+    /* ================================================================
+       Tokenizer
+
+       The shape follows lambdacore in lambda-diagram.html: a character scan
+       pushing {t, v} objects and a final sentinel. What differs is that this
+       grammar has real precedence and real operators, so the scanner has to
+       match longest-first, and that newlines are significant.
+       ================================================================ */
+
+    function ParseError(msg, line, col) {
+      this.name = 'ParseError';
+      this.msg = msg; this.line = line; this.col = col;
+      this.message = 'line ' + line + ': ' + msg;
+    }
+    ParseError.prototype = Object.create(Error.prototype);
+    ParseError.prototype.constructor = ParseError;
+
+    function tokenize(src) {
+      var toks = [], i = 0, n = src.length, line = 1, col = 1;
+      function push(t, v, l, c) { toks.push({ t: t, v: v, line: l, col: c }); }
+      while (i < n) {
+        var ch = src[i], l0 = line, c0 = col;
+        if (ch === '\n') { push('nl', '\n', l0, c0); i++; line++; col = 1; continue; }
+        if (ch === ' ' || ch === '\t' || ch === '\r') { i++; col++; continue; }
+        if (ch === '#') { while (i < n && src[i] !== '\n') { i++; col++; } continue; }
+        /* Longest match first, or `<-` is read as `<` and the statement becomes
+           an unparseable comparison. Same for the two-character comparisons,
+           which exist only to be rejected with a useful message. */
+        if (src.startsWith('<-', i)) { push('assign', '<-', l0, c0); i += 2; col += 2; continue; }
+        if (src.startsWith('<=', i) || src.startsWith('>=', i) ||
+            src.startsWith('==', i) || src.startsWith('!=', i)) {
+          throw new ParseError('comparisons are not part of the model notation', l0, c0);
+        }
+        if (ch === '~') { push('tilde', '~', l0, c0); i++; col++; continue; }
+        if (ch === '=') { push('assign', '=', l0, c0); i++; col++; continue; }
+        if (ch === '<' || ch === '>') {
+          throw new ParseError('comparisons are not part of the model notation; did you mean "<-"?', l0, c0);
+        }
+        if ('+-*/^'.indexOf(ch) >= 0) { push('op', ch, l0, c0); i++; col++; continue; }
+        if (ch === '(') { push('lp', ch, l0, c0); i++; col++; continue; }
+        if (ch === ')') { push('rp', ch, l0, c0); i++; col++; continue; }
+        if (ch === '[') { push('lb', ch, l0, c0); i++; col++; continue; }
+        if (ch === ']') { push('rb', ch, l0, c0); i++; col++; continue; }
+        if (ch === ',') { push('comma', ch, l0, c0); i++; col++; continue; }
+        if (ch >= '0' && ch <= '9' || (ch === '.' && src[i + 1] >= '0' && src[i + 1] <= '9')) {
+          var j = i;
+          while (j < n && /[0-9.]/.test(src[j])) j++;
+          if (j < n && (src[j] === 'e' || src[j] === 'E')) {
+            var k = j + 1;
+            if (src[k] === '+' || src[k] === '-') k++;
+            if (src[k] >= '0' && src[k] <= '9') { j = k; while (j < n && src[j] >= '0' && src[j] <= '9') j++; }
+          }
+          var txt = src.slice(i, j), num = Number(txt);
+          if (!isFinite(num)) throw new ParseError('"' + txt + '" is not a number', l0, c0);
+          push('num', num, l0, c0); col += j - i; i = j; continue;
+        }
+        if (/[A-Za-z._]/.test(ch)) {
+          var j2 = i;
+          while (j2 < n && /[A-Za-z0-9._]/.test(src[j2])) j2++;
+          push('id', src.slice(i, j2), l0, c0); col += j2 - i; i = j2; continue;
+        }
+        throw new ParseError('unexpected character "' + ch + '"', l0, c0);
+      }
+      push('end', null, line, col);
+      return toks;
+    }
+
+    /* ================================================================
+       Parser: recursive descent, precedence as in R.
+
+         add   -> mul (('+'|'-') mul)*
+         mul   -> unary (('*'|'/') unary)*
+         unary -> '-' unary | pow
+         pow   -> atom ('^' unary)?          right associative
+         atom  -> num | id | call | index | '(' expr ')'
+
+       ^ binds tighter than unary minus, so -x^2 is -(x^2), and it associates to
+       the right, so 2^3^2 is 512. Both match R, which is what the fingers of
+       anyone writing this notation already expect.
+       ================================================================ */
+
+    function parseModel(src) {
+      var toks = tokenize(src), pos = 0;
+      function peek() { return toks[pos]; }
+      function next() { return toks[pos++]; }
+      function at(t, v) {
+        var k = toks[pos];
+        return k.t === t && (v === undefined || k.v === v);
+      }
+      function expect(t, what) {
+        if (!at(t)) {
+          var k = peek();
+          throw new ParseError('expected ' + what + ' but found ' +
+            (k.t === 'end' ? 'end of model' : '"' + k.v + '"'), k.line, k.col);
+        }
+        return next();
+      }
+
+      function parseAtom() {
+        var k = peek();
+        if (k.t === 'num') { next(); return { tag: 'num', v: k.v }; }
+        if (k.t === 'lp') {
+          next();
+          var e = parseAdd();
+          expect('rp', '")"');
+          return e;
+        }
+        if (k.t === 'id') {
+          next();
+          if (at('lp')) {
+            next();
+            var args = [];
+            if (!at('rp')) {
+              args.push(parseAdd());
+              while (at('comma')) { next(); args.push(parseAdd()); }
+            }
+            expect('rp', '")" to close the call to ' + k.v);
+            return { tag: 'call', fn: k.v, args: args, line: k.line, col: k.col };
+          }
+          if (at('lb')) {
+            next();
+            var idx = parseAdd();
+            expect('rb', '"]"');
+            return { tag: 'index', name: k.v, idx: idx, line: k.line, col: k.col };
+          }
+          return { tag: 'var', name: k.v, line: k.line, col: k.col };
+        }
+        throw new ParseError(k.t === 'end' || k.t === 'nl'
+          ? 'the expression ends too early'
+          : 'unexpected "' + k.v + '" in an expression', k.line, k.col);
+      }
+      function parsePow() {
+        var base = parseAtom();
+        if (at('op', '^')) { next(); return { tag: 'bin', op: '^', l: base, r: parseUnary() }; }
+        return base;
+      }
+      function parseUnary() {
+        if (at('op', '-')) { next(); return { tag: 'neg', x: parseUnary() }; }
+        if (at('op', '+')) { next(); return parseUnary(); }
+        return parsePow();
+      }
+      function parseMul() {
+        var l = parseUnary();
+        while (at('op', '*') || at('op', '/')) {
+          var op = next().v;
+          l = { tag: 'bin', op: op, l: l, r: parseUnary() };
+        }
+        return l;
+      }
+      function parseAdd() {
+        var l = parseMul();
+        while (at('op', '+') || at('op', '-')) {
+          var op = next().v;
+          l = { tag: 'bin', op: op, l: l, r: parseMul() };
+        }
+        return l;
+      }
+
+      var stmts = [];
+      while (!at('end')) {
+        if (at('nl')) { next(); continue; }
+        var k0 = peek();
+        var lhsTok = expect('id', 'a name on the left of the line');
+        var lhs = { name: lhsTok.v, idx: null };
+        if (at('lb')) {
+          next();
+          lhs.idx = parseAdd();
+          expect('rb', '"]"');
+        }
+        if (at('tilde')) {
+          next();
+          var dk = peek();
+          var call = parseAdd();
+          if (call.tag !== 'call') {
+            throw new ParseError('the right of "~" has to be a distribution such as dnorm(0, 1)', dk.line, dk.col);
+          }
+          stmts.push({ tag: 'stoch', lhs: lhs, dist: call, line: k0.line, col: k0.col });
+        } else if (at('assign')) {
+          next();
+          stmts.push({ tag: 'det', lhs: lhs, expr: parseAdd(), line: k0.line, col: k0.col });
+        } else {
+          var bad = peek();
+          throw new ParseError('expected "~" or "<-" after ' + lhs.name, bad.line, bad.col);
+        }
+        if (!at('end') && !at('nl')) {
+          var extra = peek();
+          throw new ParseError('unexpected "' + extra.v + '"; one statement per line', extra.line, extra.col);
+        }
+      }
+      if (!stmts.length) throw new ParseError('the model is empty', 1, 1);
+      return stmts;
+    }
+
+    /* ================================================================
+       Values and the compiler
+
+       A value is {n, d} with d a Float64Array of length n, and n either 1 or the
+       number of observations. Broadcasting is the one rule: length 1 goes with
+       anything, otherwise the lengths have to match. Scalars are arrays of
+       length one so that every operation has exactly one code path.
+
+       A scratch pool hands out the arrays. logp runs thousands of times during a
+       fit, and allocating a fresh Float64Array per node per call is the whole
+       difference between this being instant and being sluggish.
+       ================================================================ */
+
+    function makePool(n) {
+      var free = [], used = [];
+      return {
+        take: function (len) {
+          var want = len === 1 ? 1 : n;
+          for (var i = 0; i < free.length; i++) {
+            if (free[i].length === want) {
+              var a = free.splice(i, 1)[0];
+              used.push(a);
+              return a;
+            }
+          }
+          var b = new Float64Array(want);
+          used.push(b);
+          return b;
+        },
+        release: function () {
+          for (var i = 0; i < used.length; i++) free.push(used[i]);
+          used.length = 0;
+        }
+      };
+    }
+
+    function compileExpr(node, ctx) {
+      var i;
+      if (node.tag === 'num') {
+        var kv = node.v;
+        return function () { return { n: 1, d: [kv] }; };
+      }
+      if (node.tag === 'var') {
+        var nm = node.name;
+        return function (fr) {
+          var v = fr[nm];
+          if (v === undefined) throw new Error('unknown symbol ' + nm);
+          return v;
+        };
+      }
+      if (node.tag === 'index') {
+        var inm = node.name, fidx = compileExpr(node.idx, ctx);
+        return function (fr) {
+          var base = fr[inm];
+          if (base === undefined) throw new Error('unknown symbol ' + inm);
+          var ix = fidx(fr);
+          var len = ix.n === 1 ? base.n : ix.n;
+          var out = ctx.pool.take(len === 1 ? 1 : ctx.n);
+          for (var k = 0; k < (len === 1 ? 1 : ctx.n); k++) {
+            /* One-based, as in the notation this imitates. */
+            var j = (ix.n === 1 ? ix.d[0] : ix.d[k]) - 1;
+            out[k] = base.d[j];
+          }
+          return { n: len, d: out };
+        };
+      }
+      if (node.tag === 'neg') {
+        var fx = compileExpr(node.x, ctx);
+        return function (fr) {
+          var a = fx(fr), len = a.n, out = ctx.pool.take(len);
+          for (var k = 0; k < (len === 1 ? 1 : ctx.n); k++) out[k] = -a.d[k];
+          return { n: len, d: out };
+        };
+      }
+      if (node.tag === 'bin') {
+        var fl = compileExpr(node.l, ctx), fr2 = compileExpr(node.r, ctx), op = node.op;
+        return function (fr) {
+          var a = fl(fr), b = fr2(fr);
+          var len = a.n === 1 ? b.n : (b.n === 1 ? a.n : (a.n === b.n ? a.n : -1));
+          if (len < 0) throw new Error('length mismatch: ' + a.n + ' against ' + b.n);
+          var cnt = len === 1 ? 1 : ctx.n, out = ctx.pool.take(len), k;
+          var as = a.n === 1, bs = b.n === 1;
+          if (op === '+') for (k = 0; k < cnt; k++) out[k] = a.d[as ? 0 : k] + b.d[bs ? 0 : k];
+          else if (op === '-') for (k = 0; k < cnt; k++) out[k] = a.d[as ? 0 : k] - b.d[bs ? 0 : k];
+          else if (op === '*') for (k = 0; k < cnt; k++) out[k] = a.d[as ? 0 : k] * b.d[bs ? 0 : k];
+          else if (op === '/') for (k = 0; k < cnt; k++) out[k] = a.d[as ? 0 : k] / b.d[bs ? 0 : k];
+          else for (k = 0; k < cnt; k++) out[k] = Math.pow(a.d[as ? 0 : k], b.d[bs ? 0 : k]);
+          return { n: len, d: out };
+        };
+      }
+      if (node.tag === 'call') {
+        var fn = FUNCS[node.fn];
+        if (!fn) {
+          if (DIST[node.fn]) {
+            throw new ParseError('"' + node.fn + '" is a distribution and can only appear after "~"',
+              node.line, node.col);
+          }
+          throw new ParseError('"' + node.fn + '" is not a function this tool knows; available: ' +
+            Object.keys(FUNCS).join(', '), node.line, node.col);
+        }
+        if (node.args.length !== 1) {
+          throw new ParseError('"' + node.fn + '" takes exactly one argument', node.line, node.col);
+        }
+        var fa = compileExpr(node.args[0], ctx);
+        return function (fr) {
+          var a = fa(fr), len = a.n, cnt = len === 1 ? 1 : ctx.n, out = ctx.pool.take(len);
+          for (var k = 0; k < cnt; k++) out[k] = fn(a.d[k]);
+          return { n: len, d: out };
+        };
+      }
+      throw new Error('cannot compile node ' + node.tag);
+    }
+
+    /* Free symbols of an expression, used for the dependency sort and for
+       telling the user which name is the one that does not resolve. */
+    function freeVars(node, acc) {
+      acc = acc || [];
+      if (!node) return acc;
+      if (node.tag === 'var') acc.push(node.name);
+      else if (node.tag === 'index') { acc.push(node.name); freeVars(node.idx, acc); }
+      else if (node.tag === 'neg') freeVars(node.x, acc);
+      else if (node.tag === 'bin') { freeVars(node.l, acc); freeVars(node.r, acc); }
+      else if (node.tag === 'call') for (var i = 0; i < node.args.length; i++) freeVars(node.args[i], acc);
+      return acc;
+    }
+
+    /* ---------- links ----------
+
+       The change of variables that makes a constrained parameter unconstrained,
+       chosen from the support of its own prior rather than from its name. Each
+       carries the log absolute derivative of the inverse map, which is the term
+       that has to be added to the target so the density transforms correctly.
+       Getting this wrong is nearly invisible: the mode merely moves a little. */
+    var LINKS = {
+      identity: {
+        to: function (x) { return x; },
+        from: function (u) { return u; },
+        logJac: function () { return 0; }
+      },
+      log: {
+        to: function (x) { return Math.log(x); },
+        from: function (u) { return Math.exp(u); },
+        logJac: function (u) { return u; }
+      },
+      logit: {
+        to: function (x) { return Math.log(x / (1 - x)); },
+        from: function (u) { return 1 / (1 + Math.exp(-u)); },
+        logJac: function (u) {
+          /* log(p) + log(1-p) written stably for large |u|. */
+          var a = u > 0 ? -u : u;
+          return a - 2 * Math.log1p(Math.exp(a)) + (u > 0 ? 0 : 0);
+        }
+      }
+    };
+    function intervalLink(a, b) {
+      return {
+        to: function (x) { var u = (x - a) / (b - a); return Math.log(u / (1 - u)); },
+        from: function (u) { return a + (b - a) / (1 + Math.exp(-u)); },
+        logJac: function (u) { return Math.log(b - a) + LINKS.logit.logJac(u); }
+      };
+    }
+
+    /* ================================================================
+       compileModel: from statements plus data to a target function
+       ================================================================ */
+
+    function compileModel(src, data, opts) {
+      opts = opts || {};
+      var stmts = typeof src === 'string' ? parseModel(src) : src;
+      var warnings = [];
+
+      var cols = data && data.columns ? data.columns : {};
+      var colNames = Object.keys(cols);
+      var nObs = 0;
+      for (var ci = 0; ci < colNames.length; ci++) {
+        var cl = cols[colNames[ci]].length;
+        if (cl > nObs) nObs = cl;
+      }
+
+      /* ---- classify every left-hand side ---- */
+      var stochByName = {}, detByName = {}, order = [];
+      for (var si = 0; si < stmts.length; si++) {
+        var st = stmts[si];
+        var nm = st.lhs.name;
+        if (st.tag === 'stoch') {
+          if (stochByName[nm]) throw new ParseError('"' + nm + '" is given a distribution twice', st.line, 1);
+          if (detByName[nm]) throw new ParseError('"' + nm + '" is both computed with "<-" and given a distribution', st.line, 1);
+          stochByName[nm] = st;
+        } else {
+          if (detByName[nm]) throw new ParseError('"' + nm + '" is computed twice', st.line, 1);
+          if (stochByName[nm]) throw new ParseError('"' + nm + '" is both computed with "<-" and given a distribution', st.line, 1);
+          detByName[nm] = st;
+          order.push(nm);
+        }
+      }
+
+      /* A name that is a data column AND gets a distribution is either the
+         outcome, or a genuine collision. The difference is whether anything
+         depends on it. R resolves collisions silently in favour of the data;
+         doing that here would let a typo turn a parameter into a constant with
+         no sign at all, so it is an error. */
+      var outcomes = [], params = [];
+      for (var nm2 in stochByName) {
+        if (cols[nm2]) outcomes.push(nm2);
+        else params.push(nm2);
+      }
+      if (!outcomes.length) {
+        throw new ParseError('no line links the data to the model: the outcome on the left of "~" ' +
+          'has to be one of the CSV columns (' + (colNames.join(', ') || 'none loaded') + ')', 1, 1);
+      }
+      for (var di in detByName) {
+        if (cols[di]) throw new ParseError('"' + di + '" is a column in the data and cannot also be computed with "<-"', detByName[di].line, 1);
+      }
+
+      /* ---- resolve every free symbol ---- */
+      var known = {};
+      colNames.forEach(function (c) { known[c] = 'data'; });
+      params.forEach(function (p) { known[p] = 'param'; });
+      Object.keys(detByName).forEach(function (d) { known[d] = 'det'; });
+      outcomes.forEach(function (o) { known[o] = 'data'; });
+
+      function checkSymbols(node, where, line) {
+        var fv = freeVars(node);
+        for (var i = 0; i < fv.length; i++) {
+          if (!known[fv[i]]) {
+            throw new ParseError('"' + fv[i] + '" in ' + where + ' is neither a column in the data ' +
+              'nor given a distribution nor computed with "<-"', line, 1);
+          }
+        }
+      }
+      for (var s2 = 0; s2 < stmts.length; s2++) {
+        var st2 = stmts[s2];
+        if (st2.tag === 'det') checkSymbols(st2.expr, 'the definition of ' + st2.lhs.name, st2.line);
+        else for (var ai = 0; ai < st2.dist.args.length; ai++) {
+          checkSymbols(st2.dist.args[ai], 'the prior of ' + st2.lhs.name, st2.line);
+        }
+      }
+
+      /* ---- order the deterministic nodes ---- */
+      var sorted = [], mark = {};
+      function visit(nm3, stack) {
+        if (mark[nm3] === 'done') return;
+        if (mark[nm3] === 'open') {
+          throw new ParseError('"' + nm3 + '" is defined in terms of itself (' +
+            stack.concat(nm3).join(' -> ') + ')', detByName[nm3].line, 1);
+        }
+        mark[nm3] = 'open';
+        var deps = freeVars(detByName[nm3].expr);
+        for (var i = 0; i < deps.length; i++) {
+          if (detByName[deps[i]]) visit(deps[i], stack.concat(nm3));
+        }
+        mark[nm3] = 'done';
+        sorted.push(nm3);
+      }
+      for (var oi = 0; oi < order.length; oi++) visit(order[oi], []);
+
+      /* ---- links and initial values ---- */
+      var pool = makePool(nObs || 1);
+      var ctx = { n: nObs || 1, pool: pool };
+
+      var pinfo = params.map(function (p) {
+        var st3 = stochByName[p];
+        var dname = st3.dist.fn, dd = DIST[dname];
+        if (!dd) {
+          throw new ParseError('"' + dname + '" is not a distribution this tool knows; available: ' +
+            Object.keys(DIST).join(', '), st3.line, 1);
+        }
+        if (st3.dist.args.length !== dd.args.length) {
+          throw new ParseError('"' + dname + '" takes ' + dd.args.length + ' argument' +
+            (dd.args.length === 1 ? '' : 's') + ' (' + dd.args.join(', ') + ') but got ' +
+            st3.dist.args.length, st3.line, 1);
+        }
+        /* The support of the prior decides the change of variables. A dunif
+           whose bounds are literal numbers becomes a scaled logit; a dunif with
+           a computed bound cannot, because the map would move with the
+           parameters, so it falls back to identity and says so. */
+        var link = LINKS.identity, linkName = 'identity';
+        if (dd.support === 'positive') { link = LINKS.log; linkName = 'log'; }
+        else if (dd.support === 'unit') { link = LINKS.logit; linkName = 'logit'; }
+        else if (dd.support === 'interval') {
+          var a0 = st3.dist.args[0], b0 = st3.dist.args[1];
+          if (a0.tag === 'num' && b0.tag === 'num') {
+            link = intervalLink(a0.v, b0.v);
+            linkName = 'interval(' + a0.v + ', ' + b0.v + ')';
+          } else {
+            warnings.push('The bounds of the prior for ' + p + ' are not plain numbers, so it is fitted ' +
+              'without a change of variables. If the posterior sits near a bound the summary will be poor.');
+          }
+        }
+        return { name: p, dist: dname, distArgs: st3.dist.args, link: link, linkName: linkName, stmt: st3 };
+      });
+
+      /* Check the outcome's own distribution before anything else can fail:
+         a model whose only mistake is a typo in dnorm should say so, not
+         complain about a consequence of the typo. */
+      outcomes.forEach(function (o) {
+        var st5 = stochByName[o], dd5 = DIST[st5.dist.fn];
+        if (!dd5) {
+          throw new ParseError('"' + st5.dist.fn + '" is not a distribution this tool knows; available: ' +
+            Object.keys(DIST).join(', '), st5.line, 1);
+        }
+        if (st5.dist.args.length !== dd5.args.length) {
+          throw new ParseError('"' + st5.dist.fn + '" takes ' + dd5.args.length + ' argument' +
+            (dd5.args.length === 1 ? '' : 's') + ' (' + dd5.args.join(', ') + ') but got ' +
+            st5.dist.args.length, st5.line, 1);
+        }
+      });
+
+      var P = pinfo.length;
+      if (!P) throw new ParseError('the model has no parameters to estimate: every name on the left of ' +
+        '"~" is already a column in the data', 1, 1);
+
+      /* ---- compiled pieces ---- */
+      var dataVals = {};
+      colNames.forEach(function (c) {
+        var arr = cols[c];
+        dataVals[c] = { n: arr.length === 1 ? 1 : arr.length, d: arr };
+      });
+
+      var detFns = sorted.map(function (nm4) {
+        return { name: nm4, fn: compileExpr(detByName[nm4].expr, ctx) };
+      });
+      var priorFns = pinfo.map(function (pi) {
+        return { name: pi.name, dist: DIST[pi.dist], args: pi.distArgs.map(function (a) { return compileExpr(a, ctx); }) };
+      });
+      var likeFns = outcomes.map(function (o) {
+        var st4 = stochByName[o], dd2 = DIST[st4.dist.fn];
+        if (!dd2) {
+          throw new ParseError('"' + st4.dist.fn + '" is not a distribution this tool supports; available: ' +
+            Object.keys(DIST).join(', '), st4.line, 1);
+        }
+        if (st4.dist.args.length !== dd2.args.length) {
+          throw new ParseError('"' + st4.dist.fn + '" takes ' + dd2.args.length + ' arguments (' +
+            dd2.args.join(', ') + ') but got ' + st4.dist.args.length, st4.line, 1);
+        }
+        return { name: o, dist: dd2, distName: st4.dist.fn, args: st4.dist.args.map(function (a) { return compileExpr(a, ctx); }) };
+      });
+
+      /* Builds the frame: data columns, then parameters on their natural scale,
+         then the deterministic nodes in dependency order. */
+      function frameFor(theta) {
+        var fr = Object.create(null), i;
+        for (var c in dataVals) fr[c] = dataVals[c];
+        for (i = 0; i < P; i++) {
+          fr[pinfo[i].name] = { n: 1, d: [pinfo[i].link.from(theta[i])] };
+        }
+        for (i = 0; i < detFns.length; i++) fr[detFns[i].name] = detFns[i].fn(fr);
+        return fr;
+      }
+
+      function argVals(fns, fr) {
+        var out = new Array(fns.length);
+        for (var i = 0; i < fns.length; i++) {
+          var v = fns[i](fr);
+          /* Distribution parameters are scalars in this version: a vectorized
+             parameter would need the per-observation loop to live inside the
+             distribution, which is exactly the generalization phase two brings. */
+          out[i] = v.n === 1 ? v.d[0] : v.d;
+        }
+        return out;
+      }
+
+      /* The target on the unconstrained scale: log-likelihood, plus log-prior,
+         plus the log-Jacobian of every change of variables. */
+      function logp(theta) {
+        pool.release();
+        var total = 0, i, j;
+        for (i = 0; i < P; i++) {
+          var lj = pinfo[i].link.logJac(theta[i]);
+          if (!isFinite(lj)) return -Infinity;
+          total += lj;
+        }
+        var fr;
+        try { fr = frameFor(theta); } catch (e) { return -Infinity; }
+        for (i = 0; i < priorFns.length; i++) {
+          var pf = priorFns[i], pv = fr[pf.name];
+          var pa = argVals(pf.args, fr);
+          var lpv = pf.dist.lp.apply(null, [pv.d[0]].concat(pa));
+          if (!isFinite(lpv)) return -Infinity;
+          total += lpv;
+        }
+        for (i = 0; i < likeFns.length; i++) {
+          var lf = likeFns[i];
+          var la = argVals(lf.args, fr);
+          var y = dataVals[lf.name].d;
+          var scalarArgs = true;
+          for (j = 0; j < la.length; j++) if (typeof la[j] !== 'number') scalarArgs = false;
+          var llv;
+          if (scalarArgs) {
+            llv = lf.dist.lp.apply(null, [y].concat(la));
+          } else {
+            /* At least one argument varies per observation, so the sum has to be
+               taken one row at a time. Slower, and the common case (a linear
+               model for the mean) lands here, which is why the distributions
+               hoist their constants per call rather than per row. */
+            llv = 0;
+            for (var r = 0; r < y.length; r++) {
+              var ra = new Array(la.length);
+              for (j = 0; j < la.length; j++) ra[j] = typeof la[j] === 'number' ? la[j] : la[j][r];
+              llv += lf.dist.lp.apply(null, [y[r]].concat(ra));
+              if (!isFinite(llv)) return -Infinity;
+            }
+          }
+          if (!isFinite(llv)) return -Infinity;
+          total += llv;
+        }
+        return total;
+      }
+
+      /* Per-observation log-likelihood at one parameter vector. WAIC and PSIS
+         both need the full n by S matrix, and this is the row of it. */
+      function logLikPerObs(theta, out) {
+        pool.release();
+        var fr = frameFor(theta);
+        var lf = likeFns[0], la = argVals(lf.args, fr), y = dataVals[lf.name].d;
+        var res = out || new Float64Array(y.length);
+        for (var r = 0; r < y.length; r++) {
+          var ra = new Array(la.length);
+          for (var j = 0; j < la.length; j++) ra[j] = typeof la[j] === 'number' ? la[j] : la[j][r];
+          res[r] = lf.dist.lp.apply(null, [y[r]].concat(ra));
+        }
+        return res;
+      }
+
+      /* Evaluates a named node (usually the linear model) at one parameter
+         vector, optionally against columns the model was not fitted on. */
+      function nodeValues(theta, name, newCols) {
+        pool.release();
+        var saved = null, c;
+        if (newCols) {
+          saved = {};
+          for (c in newCols) {
+            saved[c] = dataVals[c];
+            dataVals[c] = { n: newCols[c].length === 1 ? 1 : newCols[c].length, d: newCols[c] };
+          }
+        }
+        var fr = frameFor(theta);
+        var v = fr[name];
+        var res;
+        if (!v) res = null;
+        else {
+          res = new Float64Array(v.n === 1 ? 1 : (newCols ? v.d.length : ctx.n));
+          for (var i = 0; i < res.length; i++) res[i] = v.d[v.n === 1 ? 0 : i];
+        }
+        if (saved) for (c in saved) dataVals[c] = saved[c];
+        return res;
+      }
+
+      /* Central differences on the unconstrained scale. The cube root of machine
+         epsilon is the classic balance for a first derivative: truncation grows
+         as h squared, roundoff falls as 1/h. Phase two replaces this with a
+         derivative tape and nothing around it has to change. */
+      function grad(theta, out) {
+        var g = out || new Float64Array(P), x = Float64Array.from(theta);
+        for (var i = 0; i < P; i++) {
+          var h = 6.06e-6 * Math.max(1, Math.abs(theta[i]));
+          var xi = x[i];
+          x[i] = xi + h; var fp = logp(x);
+          x[i] = xi - h; var fm = logp(x);
+          x[i] = xi;
+          g[i] = (fp - fm) / (2 * h);
+        }
+        return g;
+      }
+
+      function initial(seed) {
+        var rng = makeRng(seed >>> 0), th = new Float64Array(P);
+        for (var i = 0; i < P; i++) {
+          var pi2 = pinfo[i], dd3 = DIST[pi2.dist];
+          var x = null;
+          try {
+            /* Draw from the prior, which is what makes a restart meaningfully
+               different rather than merely perturbed. Only works when the prior
+               has constant arguments; otherwise fall back to the origin of the
+               unconstrained scale, which is a sane point for every link here. */
+            var consts = pi2.distArgs.map(function (a) { return a.tag === 'num' ? a.v : null; });
+            if (consts.indexOf(null) < 0) x = dd3.rng.apply(null, [rng].concat(consts));
+          } catch (e) { x = null; }
+          var u = x === null ? 0 : pi2.link.to(x);
+          if (!isFinite(u)) u = 0;
+          /* Keep the start away from the far tails: a draw from dnorm(0, 100)
+             can start the optimizer 300 units out for no benefit. */
+          th[i] = Math.max(-10, Math.min(10, u));
+        }
+        return th;
+      }
+
+      /* What sim() and the prior predictive need: the outcome's distribution and,
+         for each of its arguments, either a constant or the name of a node to
+         evaluate per draw. An argument that is a bare name resolves directly; a
+         compound expression gets a hidden node so it can be evaluated the same
+         way as any other. */
+      var hidden = 0;
+      function likeSpec() {
+        var st6 = stochByName[outcomes[0]];
+        var nodes = st6.dist.args.map(function (a) {
+          if (a.tag === 'num') return a.v;
+          if (a.tag === 'var') return a.name;
+          /* Compound argument, e.g. y ~ dnorm(a + b*x, s) written inline. Give
+             it a name once and compile it into the frame like a det node. */
+          var nm5 = '__like' + (hidden++);
+          detByName[nm5] = { tag: 'det', lhs: { name: nm5, idx: null }, expr: a, line: st6.line };
+          detFns.push({ name: nm5, fn: compileExpr(a, ctx) });
+          sorted.push(nm5);
+          return nm5;
+        });
+        return { dist: DIST[st6.dist.fn], distName: st6.dist.fn, argNodes: nodes };
+      }
+
+      return {
+        params: pinfo,
+        names: params,
+        likeSpec: likeSpec,
+        outcome: outcomes[0],
+        outcomes: outcomes,
+        detNames: sorted,
+        nObs: nObs,
+        nPar: P,
+        logp: logp,
+        grad: grad,
+        logLikPerObs: logLikPerObs,
+        nodeValues: nodeValues,
+        initial: initial,
+        warnings: warnings,
+        toNatural: function (theta) {
+          var out = new Float64Array(P);
+          for (var i = 0; i < P; i++) out[i] = pinfo[i].link.from(theta[i]);
+          return out;
+        }
+      };
+    }
+
+    /* ================================================================
+       Optimization: BFGS with a strong-Wolfe line search
+
+       Dense rather than limited memory, because p here is single digits to a few
+       dozen, where the p by p matrix costs nothing and the final inverse Hessian
+       approximation is a free second opinion on the numeric Hessian later.
+       ================================================================ */
+
+    function lineSearchWolfe(f, gf, x, p, f0, g0, opts) {
+      var n = x.length, c1 = 1e-4, c2 = 0.9, maxIt = opts && opts.maxLineSearch || 30;
+      var dphi0 = 0, i;
+      for (i = 0; i < n; i++) dphi0 += g0[i] * p[i];
+      if (dphi0 >= 0) return null;      // not a descent direction
+
+      var xt = new Float64Array(n), gt = new Float64Array(n);
+      function phi(a) {
+        for (var k = 0; k < n; k++) xt[k] = x[k] + a * p[k];
+        return f(xt);
+      }
+      function dphi(a) {
+        for (var k = 0; k < n; k++) xt[k] = x[k] + a * p[k];
+        gf(xt, gt);
+        var s = 0;
+        for (k = 0; k < n; k++) s += gt[k] * p[k];
+        return s;
+      }
+
+      var alo = 0, ahi = 0, a = 1, aPrev = 0, fPrev = f0, found = -1;
+      for (i = 0; i < maxIt; i++) {
+        var fa = phi(a);
+        if (!isFinite(fa) || fa > f0 + c1 * a * dphi0 || (i > 0 && fa >= fPrev)) {
+          alo = aPrev; ahi = a; break;
+        }
+        var da = dphi(a);
+        if (Math.abs(da) <= -c2 * dphi0) { found = a; break; }
+        if (da >= 0) { alo = a; ahi = aPrev; break; }
+        aPrev = a; fPrev = fa; a *= 2;
+        if (i === maxIt - 1) { found = a; }
+      }
+      if (found < 0) {
+        /* Zoom. Bisection rather than interpolation: the objective here is a
+           log-posterior with finite-difference gradients, and a cubic fit
+           through noisy derivatives can propose a step outside the bracket. */
+        for (i = 0; i < maxIt; i++) {
+          a = 0.5 * (alo + ahi);
+          if (!(Math.abs(ahi - alo) > 1e-14)) break;
+          var fa2 = phi(a);
+          if (!isFinite(fa2) || fa2 > f0 + c1 * a * dphi0 || fa2 >= phi(alo)) {
+            ahi = a;
+          } else {
+            var da2 = dphi(a);
+            if (Math.abs(da2) <= -c2 * dphi0) { found = a; break; }
+            if (da2 * (ahi - alo) >= 0) ahi = alo;
+            alo = a;
+          }
+        }
+        if (found < 0) found = a;
+      }
+      for (i = 0; i < n; i++) xt[i] = x[i] + found * p[i];
+      var fend = f(xt);
+      if (!isFinite(fend) || fend > f0) return null;
+      gf(xt, gt);
+      return { x: Float64Array.from(xt), fx: fend, g: Float64Array.from(gt), alpha: found };
+    }
+
+    /* Maximizes. The line search above is written the textbook way, for a
+       function that goes DOWN, so the objective is negated on the way in and the
+       result negated back on the way out. Doing it here rather than asking every
+       caller to hand over a negated log-posterior keeps the sign convention in
+       exactly one place, which is the only way it stays right. */
+    function bfgs(fMax, gradMax, x0, opts) {
+      opts = opts || {};
+      var n = x0.length, maxIter = opts.maxIter || 200;
+      var gtol = opts.gtol || 1e-8, ftol = opts.ftol || 1e-12;
+      var f = function (xx) { var v = fMax(xx); return isFinite(v) ? -v : Infinity; };
+      var gradf = function (xx, out) {
+        var g2 = gradMax(xx, out);
+        for (var q = 0; q < g2.length; q++) g2[q] = -g2[q];
+        return g2;
+      };
+      var x = Float64Array.from(x0), fx = f(x);
+      if (!isFinite(fx)) return { x: x, fx: -Infinity, converged: false, reason: 'the starting point has zero posterior density', iters: 0, Hinv: null, grad: null };
+      var g = gradf(x), H = new Float64Array(n * n), i, j, k;
+      for (i = 0; i < n; i++) H[i * n + i] = 1;
+      var p = new Float64Array(n), s = new Float64Array(n), y = new Float64Array(n);
+      var reason = 'iteration limit', converged = false, it = 0, firstStep = true;
+
+      for (it = 0; it < maxIter; it++) {
+        var gmax = 0;
+        for (i = 0; i < n; i++) gmax = Math.max(gmax, Math.abs(g[i]));
+        if (gmax < gtol) { converged = true; reason = 'gradient below tolerance'; break; }
+
+        for (i = 0; i < n; i++) {
+          var acc = 0;
+          for (j = 0; j < n; j++) acc -= H[i * n + j] * g[j];
+          p[i] = acc;
+        }
+        var ls = lineSearchWolfe(f, function (xx, gg) { gradf(xx, gg); }, x, p, fx, g, opts);
+        if (!ls) { reason = 'the line search could not find an improving step'; break; }
+
+        for (i = 0; i < n; i++) { s[i] = ls.x[i] - x[i]; y[i] = ls.g[i] - g[i]; }
+        var dfx = fx - ls.fx;
+        x = ls.x; g = ls.g;
+        var fPrev2 = fx; fx = ls.fx;
+
+        var sy = 0, yy = 0, ss = 0;
+        for (i = 0; i < n; i++) { sy += s[i] * y[i]; yy += y[i] * y[i]; ss += s[i] * s[i]; }
+
+        /* The very first inverse Hessian is the identity, which is only right if
+           every parameter has scale one. Rescaling it once by (s.y)/(y.y) is the
+           standard fix and it matters here, where an intercept near 155 sits next
+           to a slope near 0.9 in the same vector. */
+        if (firstStep && sy > 0 && yy > 0) {
+          var sc = sy / yy;
+          for (i = 0; i < n; i++) for (j = 0; j < n; j++) H[i * n + j] = (i === j ? sc : 0);
+          firstStep = false;
+        }
+
+        if (Math.abs(dfx) <= ftol * Math.max(1, Math.abs(fPrev2))) {
+          converged = true; reason = 'the posterior stopped changing'; break;
+        }
+        /* Skip the update rather than corrupt it. With finite-difference
+           gradients the curvature condition fails occasionally on a flat stretch,
+           and forcing the update there is what turns a good inverse Hessian into
+           an indefinite one. */
+        if (!(sy > 1e-10 * Math.sqrt(ss * yy))) continue;
+
+        var rho = 1 / sy;
+        var Hy = new Float64Array(n);
+        for (i = 0; i < n; i++) {
+          var a2 = 0;
+          for (j = 0; j < n; j++) a2 += H[i * n + j] * y[j];
+          Hy[i] = a2;
+        }
+        var yHy = 0;
+        for (i = 0; i < n; i++) yHy += y[i] * Hy[i];
+        for (i = 0; i < n; i++) {
+          for (j = 0; j < n; j++) {
+            H[i * n + j] += rho * rho * (sy + yHy) * s[i] * s[j] - rho * (Hy[i] * s[j] + s[i] * Hy[j]);
+          }
+        }
+      }
+      /* fx and g are of the negated objective; hand back the log posterior and
+         its own gradient so nothing downstream has to know about the flip. */
+      var gOut = new Float64Array(n);
+      for (i = 0; i < n; i++) gOut[i] = -g[i];
+      return { x: x, fx: -fx, grad: gOut, Hinv: H, iters: it, converged: converged, reason: reason };
+    }
+
+    /* Derivative-free fallback, offered as an explicit choice rather than run
+       silently: the user should know which algorithm produced their answer. */
+    function nelderMead(f, x0, opts) {
+      opts = opts || {};
+      var n = x0.length, maxIter = opts.maxIter || 400 * n;
+      var step = opts.step || 0.5;
+      var simplex = [], i, j;
+      for (i = 0; i <= n; i++) {
+        var v = Float64Array.from(x0);
+        if (i > 0) v[i - 1] += step;
+        simplex.push({ x: v, f: -f(v) });   // minimize the negative
+      }
+      var it = 0;
+      for (it = 0; it < maxIter; it++) {
+        simplex.sort(function (a, b) { return a.f - b.f; });
+        if (Math.abs(simplex[n].f - simplex[0].f) < 1e-12 * (Math.abs(simplex[0].f) + 1e-12)) break;
+        var cen = new Float64Array(n);
+        for (i = 0; i < n; i++) for (j = 0; j < n; j++) cen[j] += simplex[i].x[j] / n;
+        var worst = simplex[n];
+        var xr = new Float64Array(n);
+        for (j = 0; j < n; j++) xr[j] = cen[j] + (cen[j] - worst.x[j]);
+        var fr3 = -f(xr);
+        if (fr3 < simplex[0].f) {
+          var xe = new Float64Array(n);
+          for (j = 0; j < n; j++) xe[j] = cen[j] + 2 * (cen[j] - worst.x[j]);
+          var fe = -f(xe);
+          simplex[n] = fe < fr3 ? { x: xe, f: fe } : { x: xr, f: fr3 };
+        } else if (fr3 < simplex[n - 1].f) {
+          simplex[n] = { x: xr, f: fr3 };
+        } else {
+          var xc = new Float64Array(n);
+          for (j = 0; j < n; j++) xc[j] = cen[j] + 0.5 * (worst.x[j] - cen[j]);
+          var fc = -f(xc);
+          if (fc < worst.f) simplex[n] = { x: xc, f: fc };
+          else {
+            for (i = 1; i <= n; i++) {
+              for (j = 0; j < n; j++) simplex[i].x[j] = simplex[0].x[j] + 0.5 * (simplex[i].x[j] - simplex[0].x[j]);
+              simplex[i].f = -f(simplex[i].x);
+            }
+          }
+        }
+      }
+      simplex.sort(function (a, b) { return a.f - b.f; });
+      return { x: simplex[0].x, fx: -simplex[0].f, iters: it, converged: it < maxIter, reason: 'Nelder-Mead' };
+    }
+
+    /* ================================================================
+       The Hessian and what to do when it is not usable
+       ================================================================ */
+
+    function numHessian(f, x, typ, opts) {
+      opts = opts || {};
+      var n = x.length, H = new Float64Array(n * n), i, j;
+      var h = new Float64Array(n);
+      /* The fourth root of epsilon, not the cube root: a second difference
+         divides by h squared, so roundoff grows twice as fast and the optimum
+         step is larger. Scaling by the approximate posterior sd is what makes
+         this work at all when one parameter lives near 150 and another near 0.9;
+         a fixed absolute step gets one of the two catastrophically wrong. */
+      for (i = 0; i < n; i++) {
+        var t = typ && isFinite(typ[i]) && typ[i] > 0 ? typ[i] : 1;
+        h[i] = 1.22e-4 * Math.max(t, 1e-4 * Math.max(1, Math.abs(x[i])));
+      }
+      var xs = Float64Array.from(x);
+      function fAt(mods) {
+        for (var k = 0; k < mods.length; k += 2) xs[mods[k]] += mods[k + 1];
+        var v = f(xs);
+        for (k = 0; k < mods.length; k += 2) xs[mods[k]] -= mods[k + 1];
+        return v;
+      }
+      var f0 = f(x);
+      /* Richardson: compute at h and at 2h and combine as (4A(h) - A(2h))/3,
+         which cancels the leading truncation term. Four times the evaluations,
+         and at p under 30 that is still under a millisecond. */
+      function second(i2, scale) {
+        var hi = h[i2] * scale;
+        return (fAt([i2, hi]) - 2 * f0 + fAt([i2, -hi])) / (hi * hi);
+      }
+      function cross(i2, j2, scale) {
+        var hi = h[i2] * scale, hj = h[j2] * scale;
+        return (fAt([i2, hi, j2, hj]) - fAt([i2, hi, j2, -hj]) -
+                fAt([i2, -hi, j2, hj]) + fAt([i2, -hi, j2, -hj])) / (4 * hi * hj);
+      }
+      for (i = 0; i < n; i++) {
+        H[i * n + i] = (4 * second(i, 1) - second(i, 2)) / 3;
+        for (j = i + 1; j < n; j++) {
+          var v2 = (4 * cross(i, j, 1) - cross(i, j, 2)) / 3;
+          H[i * n + j] = v2; H[j * n + i] = v2;
+        }
+      }
+      /* Symmetrize unconditionally. The two estimates of an off-diagonal differ
+         in the last digits, and an asymmetric matrix breaks the factorization in
+         a way that looks like a modelling problem rather than arithmetic. */
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
+        var m2 = 0.5 * (H[i * n + j] + H[j * n + i]);
+        H[i * n + j] = m2; H[j * n + i] = m2;
+      }
+      return H;
+    }
+
+    /* Turns the curvature into either a covariance matrix or an explanation.
+       This is where a fit most often fails in practice, so the failure has to be
+       specific: which direction, which parameters, and what it means. */
+    function analyzeCurvature(H, names, ridge) {
+      var n = names.length, i, j;
+      var prec = new Float64Array(n * n);
+      for (i = 0; i < n * n; i++) prec[i] = -H[i];
+
+      for (i = 0; i < n * n; i++) {
+        if (!isFinite(prec[i])) {
+          return { ok: false, kind: 'nonfinite',
+            message: 'The curvature of the posterior could not be measured: some second derivatives came ' +
+              'out non-finite. That usually means the mode sits exactly on the edge of a prior, where the ' +
+              'density falls to zero. Widen the prior that is doing the constraining.' };
+        }
+      }
+
+      var eig = jacobiEigen(prec, n);
+      var lo = eig.values[0], hi = eig.values[n - 1];
+
+      if (!(lo > 0)) {
+        /* Name the direction. The eigenvector of the smallest eigenvalue is the
+           combination of parameters the data cannot pin down, and reading it out
+           is nearly always the actual diagnosis. */
+        var terms = [];
+        for (i = 0; i < n; i++) {
+          var w = eig.vectors[i * n + 0];
+          if (Math.abs(w) > 0.15) terms.push((w > 0 ? '+' : '-') + Math.abs(w).toFixed(2) + '*' + names[i]);
+        }
+        var msg = 'The posterior has no curvature in the direction ' + (terms.join(' ') || 'of one parameter combination') +
+          ' (eigenvalue ' + lo.toExponential(2) + '). The data cannot separate those parameters, so there is no ' +
+          'single best fit and no honest standard error.';
+        if (terms.length >= 2) msg += ' The usual cause is two predictors carrying the same information.';
+        if (!ridge) return { ok: false, kind: 'notPD', message: msg, eigen: eig };
+
+        /* Opt-in only, and the caller labels it as untrustworthy. */
+        var shift = Math.abs(lo) + 1e-6 * Math.max(1, Math.abs(hi));
+        for (i = 0; i < n; i++) prec[i * n + i] += shift;
+        var L2 = cholesky(prec, n);
+        if (!L2) return { ok: false, kind: 'notPD', message: msg, eigen: eig };
+        return { ok: true, ridged: true, shift: shift, prec: prec, L: L2, eigen: eig,
+          cov: cholInverse(L2, n),
+          message: msg + ' The results below were forced through by adding ' + shift.toExponential(2) +
+            ' to the curvature. They are not trustworthy.' };
+      }
+
+      var L = cholesky(prec, n);
+      if (!L) {
+        return { ok: false, kind: 'notPD',
+          message: 'The curvature matrix is not positive definite even though its eigenvalues are. ' +
+            'That is a numerical edge case; try the derivative-free restart.', eigen: eig };
+      }
+      var cov = cholInverse(L, n);
+      var cond = hi / lo;
+      var warn = null;
+      /* The trigger is the strongest posterior correlation, not the condition
+         number. Conditioning depends on how the parameters happen to be scaled:
+         an intercept near 150 next to a slope near 0.9 produces a large
+         condition number with nothing wrong, and two perfectly redundant
+         predictors on the same scale produce a modest one with everything
+         wrong. The correlation is scale free and says what was actually asked. */
+      var bi = 0, bj = 1, br = 0;
+      if (n > 1) {
+        for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
+          var r = cov[i * n + j] / Math.sqrt(cov[i * n + i] * cov[j * n + j]);
+          if (Math.abs(r) > Math.abs(br)) { br = r; bi = i; bj = j; }
+        }
+      }
+      if (Math.abs(br) > 0.95 || cond > 1e8) {
+        /* Above about 0.999 the two parameters are not merely correlated, they
+           are the same parameter written twice, and the advice differs: centring
+           fixes the intercept-slope kind of correlation and does nothing at all
+           for a predictor that appears twice. */
+        if (Math.abs(br) > 0.999) {
+          warn = names[bi] + ' and ' + names[bj] + ' have a posterior correlation of ' +
+            br.toFixed(4) + ', so the data cannot tell them apart at all: only their ' +
+            (br < 0 ? 'sum' : 'difference') + ' is determined, and each one separately is held in place ' +
+            'only by its prior. The numbers below are arithmetically fine and individually meaningless. ' +
+            'Drop one of them, or combine them into a single parameter.';
+        } else {
+          warn = 'The posterior is very stretched (condition number ' + cond.toExponential(1) + '). ' +
+            names[bi] + ' and ' + names[bj] + ' have a posterior correlation of ' + br.toFixed(3) + '. ' +
+            (Math.abs(br) > 0.9 ? 'If one of them is an intercept, centring the predictor usually removes most of it.' : '');
+        }
+      }
+      return { ok: true, prec: prec, L: L, cov: cov, eigen: eig, cond: cond, warning: warn };
+    }
+
+    /* ================================================================
+       quap: the whole fit
+       ================================================================ */
+
+    function fitQuap(model, opts) {
+      opts = opts || {};
+      var seed = opts.seed === undefined ? 1 : opts.seed;
+      var restarts = opts.restarts === undefined ? 4 : opts.restarts;
+      var P = model.nPar;
+      var f = model.logp;
+      var gf = function (x, out) { return model.grad(x, out); };
+
+      var best = null, tried = [], i;
+      for (i = 0; i <= restarts; i++) {
+        var x0 = i === 0 && opts.start ? Float64Array.from(opts.start) : model.initial(seed + i * 7919);
+        var r = bfgs(f, gf, x0, opts);
+        tried.push(r);
+        if (isFinite(r.fx) && (!best || r.fx > best.fx)) best = r;
+        /* One good converged fit is enough; the extra starts exist to catch a
+           second mode, so keep going only while something looks wrong. */
+        if (best && best.converged && i >= 1) break;
+      }
+      if (!best || !isFinite(best.fx)) {
+        return { ok: false, kind: 'nofit',
+          message: 'No starting point produced a finite posterior density. Check that the priors cover ' +
+            'plausible values and that the data columns contain what the model expects.' };
+      }
+
+      var messages = [];
+      if (!best.converged) {
+        return { ok: false, kind: 'noconverge',
+          message: 'The optimizer stopped without converging: ' + best.reason + '. ' +
+            'The mode it reached is not reliable, so no summary is shown.' };
+      }
+      /* A second start landing somewhere materially better means the surface has
+         more than one hill, which invalidates the entire premise of summarizing
+         it with one Gaussian. */
+      var others = tried.filter(function (r2) { return r2 !== best && isFinite(r2.fx) && r2.converged; });
+      for (i = 0; i < others.length; i++) {
+        if (Math.abs(others[i].fx - best.fx) > 1e-4 * Math.max(1, Math.abs(best.fx))) {
+          var diff = 0;
+          for (var k = 0; k < P; k++) diff = Math.max(diff, Math.abs(others[i].x[k] - best.x[k]));
+          if (diff > 1e-3) {
+            messages.push({ kind: 'warn', text: 'Different starting points converged to different modes ' +
+              '(log posterior ' + best.fx.toFixed(3) + ' against ' + others[i].fx.toFixed(3) + '). ' +
+              'A single Gaussian cannot describe a posterior with several peaks.' });
+          }
+        }
+      }
+
+      /* The diagonal of the BFGS inverse Hessian is a usable guess at the
+         posterior scale, and feeding it back as the step scale is the difference
+         between a meaningful Hessian and noise. */
+      var typ = new Float64Array(P);
+      for (i = 0; i < P; i++) {
+        var hv = best.Hinv ? best.Hinv[i * P + i] : 1;
+        typ[i] = hv > 0 && isFinite(hv) ? Math.sqrt(hv) : 1;
+      }
+      var H = numHessian(f, best.x, typ, opts);
+      var cur = analyzeCurvature(H, model.names, !!opts.ridge);
+      if (!cur.ok) {
+        return { ok: false, kind: cur.kind, message: cur.message, mode: best.x, logp: best.fx };
+      }
+      if (cur.warning) messages.push({ kind: 'warn', text: cur.warning });
+      if (cur.ridged) messages.push({ kind: 'err', text: cur.message });
+
+      var sd = new Float64Array(P);
+      for (i = 0; i < P; i++) sd[i] = Math.sqrt(cur.cov[i * P + i]);
+
+      model.warnings.forEach(function (w) { messages.push({ kind: 'warn', text: w }); });
+
+      return {
+        ok: true,
+        mode: best.x,
+        modeNatural: model.toNatural(best.x),
+        logp: best.fx,
+        cov: cur.cov, prec: cur.prec, L: cur.L, sd: sd,
+        eigen: cur.eigen, cond: cur.cond,
+        iters: best.iters, reason: best.reason,
+        messages: messages,
+        names: model.names,
+        links: model.params.map(function (p) { return p.linkName; })
+      };
+    }
+
+    /* Posterior draws on the unconstrained scale, plus the same draws mapped
+       back to natural units. Both are wanted: the summary is on the transformed
+       scale, predictions need the natural one. */
+    function extractSamples(model, fit, n, seed) {
+      var P = model.nPar, S = n || 4000, rng = makeRng((seed === undefined ? 7 : seed) >>> 0);
+      var raw = new Float64Array(S * P), nat = new Float64Array(S * P);
+      var tmp = new Float64Array(P);
+      for (var s = 0; s < S; s++) {
+        mvnDraw(fit.mode, fit.L, P, rng, tmp);
+        for (var i = 0; i < P; i++) {
+          raw[s * P + i] = tmp[i];
+          nat[s * P + i] = model.params[i].link.from(tmp[i]);
+        }
+      }
+      return { S: S, P: P, raw: raw, natural: nat, names: model.names };
+    }
+
+    /* The summary table. Everything is reported on the scale the model is fitted
+       on, which is the transformed one, and the natural-scale median is carried
+       alongside because that is the number people actually want to quote. */
+    function precis(model, fit, samples, prob) {
+      var p = prob === undefined ? 0.89 : prob;
+      var lo = (1 - p) / 2, hi = 1 - lo;
+      var P = model.nPar, rows = [];
+      var z = qnorm(hi);
+      for (var i = 0; i < P; i++) {
+        var col = new Float64Array(samples.S), natcol = new Float64Array(samples.S);
+        for (var s = 0; s < samples.S; s++) {
+          col[s] = samples.raw[s * P + i];
+          natcol[s] = samples.natural[s * P + i];
+        }
+        var sorted = Float64Array.from(natcol).sort();
+        rows.push({
+          name: model.names[i],
+          link: model.params[i].linkName,
+          mean: fit.mode[i],
+          sd: fit.sd[i],
+          lo: fit.mode[i] - z * fit.sd[i],
+          hi: fit.mode[i] + z * fit.sd[i],
+          natMode: model.params[i].link.from(fit.mode[i]),
+          natLo: quantileSorted(sorted, lo),
+          natHi: quantileSorted(sorted, hi),
+          natMedian: quantileSorted(sorted, 0.5)
+        });
+      }
+      return { prob: p, rows: rows };
+    }
+
+    /* Posterior correlation, for the pairs view and for spotting the
+       ridge that makes a quadratic approximation misleading. */
+    function posteriorCor(fit, P) {
+      var R = new Float64Array(P * P);
+      for (var i = 0; i < P; i++) {
+        for (var j = 0; j < P; j++) {
+          R[i * P + j] = fit.cov[i * P + j] / (fit.sd[i] * fit.sd[j]);
+        }
+      }
+      return R;
+    }
+
+    /* ================================================================
+       The grid cross-check
+
+       quap replaces the posterior with a Gaussian at its mode. Sometimes that is
+       exact, often it is close, and occasionally it is badly wrong, and the tool
+       has no business staying quiet about which case it is in. So: walk each
+       parameter along a grid with the others held at the mode, normalize, and
+       compare the resulting mean and interval against what the Gaussian claims.
+
+       This is a profile, not a marginal, so it is not a substitute for real
+       sampling. It catches the failure it is aimed at, which is a posterior that
+       is visibly skewed or bounded in one coordinate.
+       ================================================================ */
+    function gridCheck(model, fit, opts) {
+      opts = opts || {};
+      var P = model.nPar, span = opts.span || 4.5, K = opts.points || 161;
+      var prob = opts.prob === undefined ? 0.89 : opts.prob;
+      var qlo = (1 - prob) / 2, qhi = 1 - qlo;
+      var x = Float64Array.from(fit.mode), out = [];
+      for (var i = 0; i < P; i++) {
+        var sd = fit.sd[i], x0 = fit.mode[i];
+        if (!isFinite(sd) || sd <= 0) { out.push({ name: model.names[i], ok: false }); continue; }
+        var xs = new Float64Array(K), ls = new Float64Array(K), k;
+        for (k = 0; k < K; k++) {
+          var xv = x0 + (2 * k / (K - 1) - 1) * span * sd;
+          xs[k] = xv; x[i] = xv;
+          ls[k] = model.logp(x);
+        }
+        x[i] = x0;
+        var norm = logSumExp(ls);
+        var w = new Float64Array(K), tot = 0;
+        for (k = 0; k < K; k++) { w[k] = Math.exp(ls[k] - norm); tot += w[k]; }
+        if (!(tot > 0)) { out.push({ name: model.names[i], ok: false }); continue; }
+        var mean = 0;
+        for (k = 0; k < K; k++) mean += xs[k] * w[k] / tot;
+        var varr = 0;
+        for (k = 0; k < K; k++) varr += w[k] / tot * (xs[k] - mean) * (xs[k] - mean);
+        var cum = 0, glo = xs[0], ghi = xs[K - 1], haveLo = false;
+        for (k = 0; k < K; k++) {
+          cum += w[k] / tot;
+          if (!haveLo && cum >= qlo) { glo = xs[k]; haveLo = true; }
+          if (cum >= qhi) { ghi = xs[k]; break; }
+        }
+        var z = qnorm(qhi);
+        var qLo = x0 - z * sd, qHi = x0 + z * sd;
+        /* The scale of the disagreement is the posterior sd itself: a shift of a
+           tenth of a standard deviation is invisible in any plot, half of one is
+           not. */
+        var dMean = Math.abs(mean - x0) / sd;
+        var dLo = Math.abs(glo - qLo) / sd, dHi = Math.abs(ghi - qHi) / sd;
+        var worst = Math.max(dMean, dLo, dHi);
+        out.push({
+          name: model.names[i], ok: true,
+          gridMean: mean, gridSd: Math.sqrt(varr), gridLo: glo, gridHi: ghi,
+          quapMean: x0, quapSd: sd, quapLo: qLo, quapHi: qHi,
+          dMean: dMean, dLo: dLo, dHi: dHi, worst: worst,
+          verdict: worst < 0.1 ? 'good' : (worst < 0.35 ? 'fair' : 'poor'),
+          grid: { xs: xs, w: w }
+        });
+      }
+      return out;
+    }
+
+    /* ================================================================
+       Predictive simulation
+       ================================================================ */
+
+    /* Values of a deterministic node over the posterior, optionally at data the
+       model has not seen. The equivalent of rethinking's link(). */
+    function linkNode(model, samples, nodeName, newCols, maxDraws) {
+      var S = Math.min(samples.S, maxDraws || samples.S), P = samples.P;
+      var th = new Float64Array(P), rows = [];
+      var first = null;
+      for (var s = 0; s < S; s++) {
+        for (var i = 0; i < P; i++) th[i] = samples.raw[s * P + i];
+        var v = model.nodeValues(th, nodeName, newCols);
+        if (!v) return null;
+        if (!first) first = v.length;
+        rows.push(Float64Array.from(v));
+      }
+      return { S: S, n: first, rows: rows };
+    }
+
+    /* Draws of the outcome itself, so observation noise is included. The
+       equivalent of sim(). */
+    function simOutcome(model, samples, newCols, maxDraws, seed) {
+      var S = Math.min(samples.S, maxDraws || samples.S), P = samples.P;
+      var rng = makeRng((seed === undefined ? 11 : seed) >>> 0);
+      var spec = model.likeSpec();
+      var th = new Float64Array(P), rows = [];
+      for (var s = 0; s < S; s++) {
+        for (var i = 0; i < P; i++) th[i] = samples.raw[s * P + i];
+        var args = spec.argNodes.map(function (nd) {
+          return typeof nd === 'number' ? nd : model.nodeValues(th, nd, newCols);
+        });
+        var n = 1;
+        args.forEach(function (a) { if (a && a.length > n) n = a.length; });
+        var row = new Float64Array(n);
+        for (var r = 0; r < n; r++) {
+          var ra = args.map(function (a) {
+            if (typeof a === 'number') return a;
+            return a.length === 1 ? a[0] : a[r];
+          });
+          row[r] = spec.dist.rng.apply(null, [rng].concat(ra));
+        }
+        rows.push(row);
+      }
+      return { S: S, n: rows.length ? rows[0].length : 0, rows: rows };
+    }
+
+    /* Draws from the prior alone: what the model believes before it sees the
+       outcome. The single most useful thing to look at before fitting, and the
+       reason a prior that looks harmless can imply negative heights. */
+    function priorPredictive(model, nDraws, newCols, seed) {
+      var rng = makeRng((seed === undefined ? 23 : seed) >>> 0);
+      var P = model.nPar, spec = model.likeSpec(), rows = [], th = new Float64Array(P);
+      var got = 0, tries = 0;
+      while (got < nDraws && tries < nDraws * 20) {
+        tries++;
+        var ok = true;
+        for (var i = 0; i < P; i++) {
+          var pi = model.params[i], dd = DIST[pi.dist];
+          var consts = pi.distArgs.map(function (a) { return a.tag === 'num' ? a.v : null; });
+          if (consts.indexOf(null) >= 0) { ok = false; break; }
+          var draw = dd.rng.apply(null, [rng].concat(consts));
+          var u = pi.link.to(draw);
+          if (!isFinite(u)) { ok = false; break; }
+          th[i] = u;
+        }
+        if (!ok) return null;
+        var args;
+        try {
+          args = spec.argNodes.map(function (nd) {
+            return typeof nd === 'number' ? nd : model.nodeValues(th, nd, newCols);
+          });
+        } catch (e) { continue; }
+        var n = 1;
+        args.forEach(function (a) { if (a && a.length > n) n = a.length; });
+        var row = new Float64Array(n);
+        for (var r = 0; r < n; r++) {
+          var ra = args.map(function (a) {
+            if (typeof a === 'number') return a;
+            return a.length === 1 ? a[0] : a[r];
+          });
+          row[r] = spec.dist.rng.apply(null, [rng].concat(ra));
+        }
+        rows.push(row);
+        got++;
+      }
+      return { S: rows.length, n: rows.length ? rows[0].length : 0, rows: rows };
+    }
+
+    /* Pointwise summary of a set of draws: the mean and an interval per column,
+       which is what every band in the plots is made of. */
+    function summarizeDraws(draws, prob) {
+      var p = prob === undefined ? 0.89 : prob;
+      var lo = (1 - p) / 2, hi = 1 - lo;
+      var n = draws.n, S = draws.S;
+      var mean = new Float64Array(n), qlo = new Float64Array(n), qhi = new Float64Array(n);
+      var col = new Float64Array(S);
+      for (var j = 0; j < n; j++) {
+        for (var s = 0; s < S; s++) col[s] = draws.rows[s][n === 1 ? 0 : j];
+        mean[j] = meanOf(col);
+        var sorted = Float64Array.from(col).sort();
+        qlo[j] = quantileSorted(sorted, lo);
+        qhi[j] = quantileSorted(sorted, hi);
+      }
+      return { mean: mean, lo: qlo, hi: qhi, prob: p };
+    }
+
+    /* ================================================================
+       Information criteria
+
+       Both need the S by n matrix of pointwise log-likelihoods, which is the
+       expensive part; computing it once and handing it to both is the only
+       reason WAIC and PSIS are in the same function.
+       ================================================================ */
+
+    function logLikMatrix(model, samples, maxDraws) {
+      var S = Math.min(samples.S, maxDraws || samples.S), P = samples.P;
+      var n = model.nObs, th = new Float64Array(P);
+      var M = new Float64Array(S * n), row = new Float64Array(n);
+      for (var s = 0; s < S; s++) {
+        for (var i = 0; i < P; i++) th[i] = samples.raw[s * P + i];
+        model.logLikPerObs(th, row);
+        M.set(row, s * n);
+      }
+      return { S: S, n: n, m: M };
+    }
+
+    function waic(ll) {
+      var S = ll.S, n = ll.n, lppd = 0, pen = 0;
+      var col = new Float64Array(S);
+      for (var j = 0; j < n; j++) {
+        for (var s = 0; s < S; s++) col[s] = ll.m[s * n + j];
+        lppd += logSumExp(col) - Math.log(S);
+        /* The variance of the log-likelihood across the posterior, which is the
+           effective number of parameters in the WAIC sense. */
+        var m = meanOf(col), v = 0;
+        for (s = 0; s < S; s++) { var d = col[s] - m; v += d * d; }
+        pen += v / (S - 1);
+      }
+      return { WAIC: -2 * (lppd - pen), lppd: lppd, pWAIC: pen, n: n, se: waicSE(ll) };
+    }
+
+    function waicSE(ll) {
+      var S = ll.S, n = ll.n, col = new Float64Array(S), parts = new Float64Array(n);
+      for (var j = 0; j < n; j++) {
+        for (var s = 0; s < S; s++) col[s] = ll.m[s * n + j];
+        var lp = logSumExp(col) - Math.log(S);
+        var m = meanOf(col), v = 0;
+        for (s = 0; s < S; s++) { var d = col[s] - m; v += d * d; }
+        parts[j] = -2 * (lp - v / (S - 1));
+      }
+      return Math.sqrt(n) * sdOf(parts);
+    }
+
+    /* Pareto-smoothed importance sampling LOO. The generalized Pareto fit is
+       Zhang and Stephens' quadrature estimator, which is what makes k itself
+       meaningful as a diagnostic rather than just a knob. */
+    function gpdFit(x) {
+      var n = x.length;
+      if (n < 5) return { k: Infinity, sigma: NaN };
+      var sorted = Float64Array.from(x).sort();
+      var prior = 3, m = 30 + Math.floor(Math.sqrt(n));
+      var q1 = sorted[Math.floor(n / 4 + 0.5) - 1] || sorted[0];
+      var bs = new Float64Array(m), i, j;
+      for (i = 0; i < m; i++) {
+        bs[i] = 1 / sorted[n - 1] + (1 - Math.sqrt(m / (i + 0.5))) / (prior * q1);
+      }
+      var lw = new Float64Array(m);
+      for (i = 0; i < m; i++) {
+        var b = bs[i], ksum = 0;
+        for (j = 0; j < n; j++) ksum += Math.log1p(-b * sorted[j]);
+        var kk = ksum / n;
+        lw[i] = n * (Math.log(-b / kk) - kk - 1);
+      }
+      var mx = -Infinity;
+      for (i = 0; i < m; i++) if (lw[i] > mx) mx = lw[i];
+      var wsum = 0, wts = new Float64Array(m);
+      for (i = 0; i < m; i++) { wts[i] = Math.exp(lw[i] - mx); wsum += wts[i]; }
+      var bhat = 0;
+      for (i = 0; i < m; i++) bhat += bs[i] * wts[i] / wsum;
+      var khat = 0;
+      for (j = 0; j < n; j++) khat += Math.log1p(-bhat * sorted[j]);
+      khat /= n;
+      var sigma = -khat / bhat;
+      /* The weakly informative prior on k that Vehtari et al. use, which keeps a
+         small tail sample from producing an absurd k. */
+      khat = khat * n / (n + 5) + 0.5 * 5 / (n + 5);
+      return { k: khat, sigma: sigma };
+    }
+
+    function psis(ll) {
+      var S = ll.S, n = ll.n;
+      var elpd = 0, ks = new Float64Array(n);
+      var lw = new Float64Array(S), parts = new Float64Array(n);
+      /* The tail that gets smoothed. Vehtari et al. use min(S/5, 3 sqrt(S)),
+         which at the few thousand draws this tool produces is a few hundred. */
+      var M = Math.max(5, Math.min(Math.floor(S / 5), Math.floor(3 * Math.sqrt(S))));
+      var idx = new Array(S), s, j;
+      for (j = 0; j < n; j++) {
+        /* The importance weight for leaving observation j out is 1/p(y_j|theta_s),
+           so in logs it is minus the pointwise log-likelihood. Everything stays
+           in logs until the very last step. */
+        for (s = 0; s < S; s++) { lw[s] = -ll.m[s * n + j]; idx[s] = s; }
+        idx.sort(function (a, b) { return lw[a] - lw[b]; });
+
+        var cutIdx = S - M, lcut = lw[idx[cutIdx - 1]];
+        /* Fit the generalized Pareto to the excesses of the largest M weights
+           over the cutoff, on the natural scale as the estimator requires. */
+        var tail = new Float64Array(M), ok = true;
+        for (s = 0; s < M; s++) {
+          var ex = Math.exp(lw[idx[cutIdx + s]] - lcut) - 1;
+          if (!isFinite(ex) || ex < 0) { ok = false; break; }
+          tail[s] = ex;
+        }
+        var gk = Infinity, gsig = NaN;
+        if (ok && tail[M - 1] > 0) {
+          var gf = gpdFit(tail);
+          gk = gf.k; gsig = gf.sigma;
+          if (isFinite(gk) && isFinite(gsig) && gsig > 0 && gk < 1) {
+            /* Replace the tail weights by the fitted quantiles, which is the
+               smoothing: it keeps the estimate from being dominated by one draw
+               without discarding the tail altogether. */
+            for (s = 0; s < M; s++) {
+              var pq = (s + 0.5) / M;
+              var q = Math.abs(gk) < 1e-10
+                ? -Math.log1p(-pq) * gsig
+                : gsig * (Math.pow(1 - pq, -gk) - 1) / gk;
+              lw[idx[cutIdx + s]] = lcut + Math.log1p(q);
+            }
+          }
+        }
+        ks[j] = gk;
+
+        /* elpd_i = log( sum_s w_s p_s / sum_s w_s ). With w_s = 1/p_s the
+           numerator is exactly S, so this reduces to log S minus the
+           log-sum-exp of the log weights, computed stably. */
+        var mx = -Infinity;
+        for (s = 0; s < S; s++) if (lw[s] > mx) mx = lw[s];
+        var acc = 0;
+        for (s = 0; s < S; s++) acc += Math.exp(lw[s] - mx);
+        parts[j] = Math.log(S) - (mx + Math.log(acc));
+        elpd += parts[j];
+      }
+      var pl = new Float64Array(n);
+      for (var j2 = 0; j2 < n; j2++) pl[j2] = -2 * parts[j2];
+      var bad = 0;
+      for (j2 = 0; j2 < n; j2++) if (!(ks[j2] <= 0.5)) bad++;
+      return {
+        PSIS: -2 * elpd, elpd: elpd, k: ks,
+        se: Math.sqrt(n) * sdOf(pl),
+        nBadK: bad
+      };
+    }
+
+    /* ================================================================
+       CSV
+       ================================================================ */
+
+    function detectDelim(line) {
+      var best = ',', bestN = 0;
+      [',', ';', '\t', '|'].forEach(function (d) {
+        var n = line.split(d).length - 1;
+        if (n > bestN) { bestN = n; best = d; }
+      });
+      return best;
+    }
+
+    function parseCSV(text) {
+      var src = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+      if (!src.trim()) return { columns: {}, names: [], n: 0, dropped: 0, notes: [] };
+      var firstNl = src.indexOf('\n');
+      var delim = detectDelim(firstNl < 0 ? src : src.slice(0, firstNl));
+      var rows = [], field = '', row = [], inQ = false, i;
+      for (i = 0; i < src.length; i++) {
+        var c = src[i];
+        if (inQ) {
+          if (c === '"') {
+            if (src[i + 1] === '"') { field += '"'; i++; }
+            else inQ = false;
+          } else field += c;
+        } else if (c === '"') inQ = true;
+        else if (c === delim) { row.push(field); field = ''; }
+        else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+        else field += c;
+      }
+      row.push(field); rows.push(row);
+      if (!rows.length) return { columns: {}, names: [], n: 0, dropped: 0, notes: [] };
+
+      var header = rows[0].map(function (h, k) {
+        var t = h.trim().replace(/^"|"$/g, '');
+        /* A name that cannot be written in the model notation is useless, so
+           normalize it once here rather than failing later with a parse error
+           the user cannot connect to their file. */
+        var clean = t.replace(/[^A-Za-z0-9._]/g, '_');
+        if (!clean || /^[0-9]/.test(clean)) clean = 'v' + (k + 1) + (clean ? '_' + clean : '');
+        return clean;
+      });
+      var notes = [];
+      for (i = 0; i < header.length; i++) {
+        var orig = (rows[0][i] || '').trim();
+        if (orig && orig !== header[i]) notes.push('Column "' + orig + '" is available as ' + header[i] + '.');
+      }
+
+      var body = rows.slice(1).filter(function (r) { return r.length > 1 || (r[0] || '').trim() !== ''; });
+      var numeric = header.map(function () { return true; });
+      var levels = header.map(function () { return null; });
+      for (i = 0; i < body.length; i++) {
+        for (var j = 0; j < header.length; j++) {
+          var v = (body[i][j] || '').trim();
+          if (v === '' || v === 'NA' || v === 'NaN' || v === 'null') continue;
+          if (!isFinite(Number(v))) numeric[j] = false;
+        }
+      }
+      var columns = {}, kept = [], dropped = 0;
+      for (i = 0; i < body.length; i++) {
+        var ok = true;
+        for (var j2 = 0; j2 < header.length; j2++) {
+          var v2 = (body[i][j2] || '').trim();
+          if (v2 === '' || v2 === 'NA' || v2 === 'NaN' || v2 === 'null') { ok = false; break; }
+        }
+        if (ok) kept.push(body[i]); else dropped++;
+      }
+      for (var j3 = 0; j3 < header.length; j3++) {
+        var arr = new Float64Array(kept.length);
+        if (numeric[j3]) {
+          for (i = 0; i < kept.length; i++) arr[i] = Number((kept[i][j3] || '').trim());
+        } else {
+          /* Categorical columns become one-based integer codes, which is the
+             form an index variable needs. The level table goes back to the UI so
+             the user can see which number is which. */
+          var map = {}, next = 1, lv = [];
+          for (i = 0; i < kept.length; i++) {
+            var key = (kept[i][j3] || '').trim();
+            if (!(key in map)) { map[key] = next++; lv.push(key); }
+            arr[i] = map[key];
+          }
+          levels[j3] = lv;
+        }
+        columns[header[j3]] = arr;
+      }
+      if (dropped) {
+        notes.push(dropped + ' row' + (dropped === 1 ? '' : 's') + ' dropped because of missing values.');
+      }
+      return { columns: columns, names: header, n: kept.length, dropped: dropped, levels: levels, numeric: numeric, notes: notes };
+    }
+
+    /* Column statistics for the data panel, and for the standardize helper. */
+    function describeColumns(data) {
+      return data.names.map(function (nm, i) {
+        var a = data.columns[nm], n = a.length;
+        if (!n) return { name: nm, n: 0 };
+        var sorted = Float64Array.from(a).sort();
+        return {
+          name: nm, n: n, numeric: data.numeric ? data.numeric[i] : true,
+          levels: data.levels ? data.levels[i] : null,
+          mean: meanOf(a), sd: sdOf(a),
+          min: sorted[0], max: sorted[n - 1], median: quantileSorted(sorted, 0.5)
+        };
+      });
+    }
+
+    /* ================================================================
+       The example, generated rather than shipped
+
+       No dataset from anyone else's package ends up on this site. This is drawn
+       fresh from a seeded generator whose parameters are printed next to it, so
+       the user can check that the fit recovers what went in, which is something
+       a real dataset cannot offer.
+       ================================================================ */
+    function exampleData(seed) {
+      var rng = makeRng((seed === undefined ? 20260909 : seed) >>> 0);
+      var n = 60, lines = ['weight,height'];
+      var a = 154, b = 0.9, sigma = 5.2;
+      for (var i = 0; i < n; i++) {
+        var w = 32 + 30 * rng();
+        var h = a + b * (w - 45) + sigma * rnorm1(rng);
+        lines.push(w.toFixed(2) + ',' + h.toFixed(2));
+      }
+      return {
+        csv: lines.join('\n'),
+        model: [
+          'height ~ dnorm(mu, sigma)',
+          'mu <- a + b*(weight - 45)',
+          'a ~ dnorm(155, 20)',
+          'b ~ dlnorm(0, 1)',
+          /* dexp und nicht dunif: eine harte obere Schranke fuer eine Streuung
+             ist eine Behauptung, die niemand glaubt, und sie erzwingt die
+             Logit-Klammer statt der glatten log-Abbildung. Rate 0.2, also
+             Erwartungswert 5, was zur Skala von Koerpergroessen in Zentimetern
+             passt. dexp(1) ist die Zahl aus der zweiten Buchhaelfte, dort aber
+             fuer standardisierte Daten; hier zieht sie sigma ueber 200
+             Datensaetze um rund 5 Prozent nach unten und kostet Ueberdeckung. */
+          'sigma ~ dexp(0.2)'
+        ].join('\n'),
+        truth: { a: a, b: b, sigma: sigma, n: n },
+        note: 'Synthetic data, drawn from a = ' + a + ', b = ' + b + ', sigma = ' + sigma +
+          '. It is shaped like a height-on-weight regression but it is not anyone real: the point ' +
+          'is that you can check the fit against the numbers that produced it.'
+      };
+    }
+
+    /* ================================================================
+       Worker entry point
+
+       Runs inside the worker, where RTH is in scope because the worker source is
+       this script's own text plus one line installing this as the handler.
+       ================================================================ */
+    function runJob(msg, post) {
+      var job = msg.job;
+      try {
+        if (job === 'fit') {
+          post({ type: 'progress', stage: 'compiling', frac: 0.02 });
+          var data = msg.data;
+          /* Typed arrays survive the structured clone, but as plain objects when
+             they went through JSON; rebuild them either way. */
+          var cols = {};
+          for (var c in data.columns) cols[c] = data.columns[c] instanceof Float64Array
+            ? data.columns[c] : Float64Array.from(data.columns[c]);
+          var model = compileModel(msg.model, { columns: cols }, msg.opts);
+
+          post({ type: 'progress', stage: 'optimizing', frac: 0.1 });
+          var fit = fitQuap(model, msg.opts);
+          if (!fit.ok) { post({ type: 'done', res: { ok: false, kind: fit.kind, message: fit.message } }); return; }
+
+          post({ type: 'progress', stage: 'sampling', frac: 0.45 });
+          var samples = extractSamples(model, fit, msg.opts && msg.opts.draws || 4000, msg.opts && msg.opts.seed);
+          var pr = precis(model, fit, samples, msg.opts && msg.opts.prob);
+
+          post({ type: 'progress', stage: 'cross-check', frac: 0.6 });
+          var gc = gridCheck(model, fit, { prob: msg.opts && msg.opts.prob });
+
+          post({ type: 'progress', stage: 'information criteria', frac: 0.75 });
+          var ll = logLikMatrix(model, samples, Math.min(samples.S, 2000));
+          var w = waic(ll), ps = psis(ll);
+
+          post({ type: 'progress', stage: 'predictions', frac: 0.9 });
+          var pred = null;
+          if (model.detNames.length) {
+            var nd = model.detNames[model.detNames.length - 1];
+            var lk = linkNode(model, samples, nd, null, 400);
+            var sm = simOutcome(model, samples, null, 400, msg.opts && msg.opts.seed);
+            if (lk && sm) {
+              pred = {
+                node: nd,
+                link: summarizeDraws(lk, msg.opts && msg.opts.prob),
+                sim: summarizeDraws(sm, msg.opts && msg.opts.prob)
+              };
+            }
+          }
+
+          post({
+            type: 'done',
+            res: {
+              ok: true,
+              precis: pr,
+              cor: posteriorCor(fit, model.nPar),
+              grid: gc.map(function (g) { return { name: g.name, ok: g.ok, verdict: g.verdict, worst: g.worst,
+                gridMean: g.gridMean, gridLo: g.gridLo, gridHi: g.gridHi,
+                quapMean: g.quapMean, quapLo: g.quapLo, quapHi: g.quapHi }; }),
+              waic: w, psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK, maxK: Math.max.apply(null, Array.from(ps.k)) },
+              messages: fit.messages, names: model.names, links: fit.links,
+              nObs: model.nObs, nPar: model.nPar, iters: fit.iters, logp: fit.logp,
+              outcome: model.outcome, pred: pred,
+              detNames: model.detNames
+            }
+          });
+          return;
+        }
+        post({ type: 'done', res: { ok: false, kind: 'unknown', message: 'unknown job ' + job } });
+      } catch (err) {
+        post({
+          type: 'done',
+          res: {
+            ok: false, kind: err && err.name === 'ParseError' ? 'parse' : 'error',
+            message: err && err.msg ? err.msg : (err && err.message ? err.message : String(err)),
+            line: err && err.line, col: err && err.col
+          }
+        });
+      }
+    }
+
+    function workerMain(ev) {
+      runJob(ev.data, function (m) { postMessage(m); });
+    }
+
+    return {
+      lgamma: lgamma, lbeta: lbeta, lchoose: lchoose, qnorm: qnorm,
+      makeRng: makeRng, rnorm1: rnorm1, rgamma1: rgamma1,
+      quantileSorted: quantileSorted, meanOf: meanOf, sdOf: sdOf, logSumExp: logSumExp,
+      cholesky: cholesky, cholSolve: cholSolve, cholInverse: cholInverse,
+      mvnDraw: mvnDraw, jacobiEigen: jacobiEigen,
+      DIST: DIST, FUNCS: FUNCS, LINKS: LINKS,
+      tokenize: tokenize, parseModel: parseModel, ParseError: ParseError,
+      compileModel: compileModel,
+      bfgs: bfgs, nelderMead: nelderMead, lineSearchWolfe: lineSearchWolfe,
+      numHessian: numHessian, analyzeCurvature: analyzeCurvature,
+      fitQuap: fitQuap, extractSamples: extractSamples, precis: precis,
+      posteriorCor: posteriorCor, gridCheck: gridCheck,
+      linkNode: linkNode, simOutcome: simOutcome, priorPredictive: priorPredictive,
+      summarizeDraws: summarizeDraws,
+      logLikMatrix: logLikMatrix, waic: waic, psis: psis, gpdFit: gpdFit,
+      parseCSV: parseCSV, detectDelim: detectDelim, describeColumns: describeColumns,
+      exampleData: exampleData,
+      runJob: runJob, workerMain: workerMain
+    };
+  })();
+  if (typeof window !== 'undefined') window.RTH = RTH;
+  </script>
+
+  <script id="rthrun">
+  /* Worker plumbing, kept out of the app block so the core stays test-clean.
+     The worker source is the core block's own text plus one line installing the
+     handler, which is why that block may not touch document or window except
+     through the guarded export on its last line. */
+  var RTHRun = {
+    _job: null,
+    run: function (msg, onProgress) {
+      return new Promise(function (resolve, reject) {
+        var src = document.getElementById('rthcore').textContent + '\nonmessage = (RTH.workerMain);';
+        var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        var w = new Worker(url);
+        RTHRun._job = { worker: w, url: url };
+        var settle = function (fn, v) {
+          URL.revokeObjectURL(url);
+          w.terminate();
+          RTHRun._job = null;
+          fn(v);
+        };
+        w.onerror = function (e) { settle(reject, new Error(e.message || 'Worker error')); };
+        w.onmessage = function (ev) {
+          if (ev.data.type === 'progress') { if (onProgress) onProgress(ev.data); }
+          else if (ev.data.type === 'done') settle(resolve, ev.data.res);
+        };
+        w.postMessage(msg);
+      });
+    },
+    busy: function () { return !!RTHRun._job; },
+    cancel: function () {
+      if (RTHRun._job) {
+        RTHRun._job.worker.terminate();
+        URL.revokeObjectURL(RTHRun._job.url);
+        RTHRun._job = null;
+      }
+    }
+  };
+  </script>
+
+  <script id="app">
+    const { useState, useMemo, useRef, useEffect, useCallback } = React;
+    const html = htm.bind(React.createElement);
+
+    const fmt = (v, d) => {
+      if (v === null || v === undefined || !isFinite(v)) return '--';
+      const a = Math.abs(v);
+      if (a !== 0 && (a < 1e-4 || a >= 1e6)) return v.toExponential(2);
+      return v.toFixed(d === undefined ? 2 : d);
+    };
+
+    const DEFAULT_MODEL = [
+      '# One statement per line.',
+      '#   ~   gives something a distribution',
+      '#   <-  computes something from other things',
+      '',
+      'y ~ dnorm(mu, sigma)',
+      'mu <- a + b*x',
+      'a ~ dnorm(0, 20)',
+      'b ~ dnorm(0, 5)',
+      'sigma ~ dunif(0, 20)'
+    ].join('\n');
+
+    function Msg({ kind, children }) {
+      const cls = kind === 'err' ? 'qp-msg qp-msg-err'
+        : kind === 'warn' ? 'qp-msg qp-msg-warn' : 'qp-msg qp-msg-info';
+      return html`<div className=${cls}>${children}</div>`;
+    }
+
+    /* ---- the data panel ---- */
+    function DataPanel({ csv, setCsv, data, onExample }) {
+      const [over, setOver] = useState(false);
+      const fileRef = useRef(null);
+
+      const readFile = (file) => {
+        const r = new FileReader();
+        r.onload = () => setCsv(String(r.result));
+        r.readAsText(file);
+      };
+
+      const cols = data && data.names.length ? RTH.describeColumns(data) : [];
+
+      return html`
+        <div className="ctl-card">
+          <div className="ctl-sec">
+            <p className="ctl-sec-h">Data</p>
+            <div className="qp-chips" style=${{ marginBottom: 8 }}>
+              <button className="tool-btn tool-btn-sm" onClick=${() => fileRef.current && fileRef.current.click()}>
+                ${ToolIcons.el('upload')} Load CSV
+              </button>
+              <button className="tool-btn tool-btn-sm" onClick=${onExample}>
+                Paste an example
+              </button>
+              <button className="tool-btn tool-btn-sm tool-danger" onClick=${() => setCsv('')}>
+                ${ToolIcons.el('remove')} Clear
+              </button>
+              <input ref=${fileRef} type="file" accept=".csv,.txt,text/csv" style=${{ display: 'none' }}
+                onChange=${(e) => { const f = e.target.files && e.target.files[0]; if (f) readFile(f); e.target.value = ''; }} />
+            </div>
+            <div className=${'qp-drop' + (over ? ' qp-over' : '')}
+              onDragOver=${(e) => { e.preventDefault(); setOver(true); }}
+              onDragLeave=${() => setOver(false)}
+              onDrop=${(e) => {
+                e.preventDefault(); setOver(false);
+                const f = e.dataTransfer.files && e.dataTransfer.files[0];
+                if (f) readFile(f);
+              }}>
+              Drop a CSV here, or paste one below. It stays in this browser tab.
+            </div>
+            <textarea className="qp-mono qp-csv" style=${{ marginTop: 8 }} spellCheck=${false}
+              placeholder="x,y" value=${csv} onChange=${(e) => setCsv(e.target.value)}></textarea>
+          </div>
+          ${cols.length ? html`
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Columns (${data.n} rows)</p>
+              <div className="qp-scroll">
+                <table className="qp-tbl">
+                  <thead><tr>
+                    <th>name</th><th className="qp-num">mean</th><th className="qp-num">sd</th>
+                    <th className="qp-num">min</th><th className="qp-num">max</th><th>kind</th>
+                  </tr></thead>
+                  <tbody>
+                    ${cols.map((c) => html`
+                      <tr key=${c.name}>
+                        <td className="qp-name">${c.name}</td>
+                        <td className="qp-num">${fmt(c.mean)}</td>
+                        <td className="qp-num">${fmt(c.sd)}</td>
+                        <td className="qp-num">${fmt(c.min)}</td>
+                        <td className="qp-num">${fmt(c.max)}</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>
+                          ${c.numeric ? 'numeric' : 'codes 1..' + (c.levels ? c.levels.length : 0)}
+                        </td>
+                      </tr>`)}
+                  </tbody>
+                </table>
+              </div>
+              ${data.notes.map((nt, i) => html`
+                <p key=${i} style=${{ fontSize: 12, color: 'var(--tool-note)', margin: '6px 0 0' }}>${nt}</p>`)}
+            </div>` : null}
+        </div>`;
+    }
+
+    /* ---- the precis table ---- */
+    function PrecisTable({ precis, links, grid }) {
+      const pct = (p) => (p * 100).toFixed(1).replace(/\.0$/, '') + '%';
+      const lo = (1 - precis.prob) / 2, hi = 1 - lo;
+      const verdictOf = (name) => {
+        const g = grid && grid.find((x) => x.name === name);
+        return g && g.ok ? g.verdict : null;
+      };
+      const vcol = { good: 'var(--tool-sig-good)', fair: 'var(--tool-sig-warn)', poor: 'var(--tool-sig-bad)' };
+      return html`
+        <div className="qp-scroll">
+          <table className="qp-tbl">
+            <thead><tr>
+              <th>parameter</th>
+              <!-- "mode", nicht "mean": quap setzt die Gausskurve an den Modus,
+                   und auf einer transformierten Skala ist der nicht derselbe
+                   Punkt wie der Mittelwert. Die Spalte hiess bis 2026-09-10
+                   "mean" und war damit schlicht falsch beschriftet. -->
+              <th className="qp-num">mode</th>
+              <th className="qp-num">sd</th>
+              <th className="qp-num">${pct(lo)}</th>
+              <th className="qp-num">${pct(hi)}</th>
+              <th className="qp-num">natural</th>
+              <th>scale</th>
+              <th>check</th>
+            </tr></thead>
+            <tbody>
+              ${precis.rows.map((r, i) => html`
+                <tr key=${r.name}>
+                  <td className="qp-name">${r.name}</td>
+                  <td className="qp-num">${fmt(r.mean, 3)}</td>
+                  <td className="qp-num">${fmt(r.sd, 3)}</td>
+                  <td className="qp-num">${fmt(r.lo, 3)}</td>
+                  <td className="qp-num">${fmt(r.hi, 3)}</td>
+                  <td className="qp-num" style=${{ color: 'var(--tool-emph)' }}>${fmt(r.natMedian, 3)}</td>
+                  <td style=${{ fontSize: 12, color: 'var(--tool-note)' }}>${links && links[i] ? links[i] : 'identity'}</td>
+                  <td style=${{ fontSize: 12, color: vcol[verdictOf(r.name)] || 'var(--tool-note)' }}>
+                    ${verdictOf(r.name) || '--'}
+                  </td>
+                </tr>`)}
+            </tbody>
+          </table>
+        </div>`;
+    }
+
+    /* ---- correlation matrix ---- */
+    function CorMatrix({ names, cor }) {
+      const P = names.length;
+      if (P < 2) return null;
+      /* Diverging ramp: the quantity runs from -1 to 1 through a meaningful
+         zero, which is the case a diverging map is actually for. */
+      const col = (r) => {
+        const t = Math.max(-1, Math.min(1, r));
+        const neg = [239, 108, 92], mid = [148, 163, 184], pos = [56, 189, 248];
+        const a = t < 0 ? neg : pos, w = Math.abs(t);
+        return 'rgb(' + [0, 1, 2].map((k) => Math.round(mid[k] + (a[k] - mid[k]) * w)).join(',') + ')';
+      };
+      return html`
+        <div className="qp-scroll">
+          <table className="qp-tbl">
+            <thead><tr><th></th>${names.map((n) => html`<th key=${n} className="qp-num">${n}</th>`)}</tr></thead>
+            <tbody>
+              ${names.map((rn, i) => html`
+                <tr key=${rn}>
+                  <td className="qp-name">${rn}</td>
+                  ${names.map((cn, j) => html`
+                    <td key=${cn} className="qp-num" style=${{
+                      color: i === j ? 'var(--tool-note)' : col(cor[i * P + j]),
+                      fontWeight: i !== j && Math.abs(cor[i * P + j]) > 0.9 ? 600 : 400
+                    }}>${i === j ? '1' : fmt(cor[i * P + j], 3)}</td>`)}
+                </tr>`)}
+            </tbody>
+          </table>
+        </div>`;
+    }
+
+    /* ---- the grid cross-check ----
+       The one view that says where quap is lying: two intervals per parameter,
+       what the Gaussian claims and what a direct evaluation says. */
+    function GridCheck({ grid }) {
+      const good = grid.filter((g) => g.ok);
+      if (!good.length) return html`<p style=${{ color: 'var(--tool-note)' }}>No cross-check available.</p>`;
+      const W = 560, rowH = 46, H = good.length * rowH + 26;
+      return html`
+        <${React.Fragment}>
+          <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H} preserveAspectRatio="xMidYMid meet">
+            ${good.map((g, i) => {
+              const y = 20 + i * rowH;
+              const sd = (g.quapHi - g.quapLo) / 3.2 || 1;
+              const lo = g.quapMean - 4 * sd, hi = g.quapMean + 4 * sd;
+              const sx = (v) => 110 + (v - lo) / (hi - lo) * (W - 130);
+              const c = g.verdict === 'good' ? 'var(--tool-sig-good)'
+                : g.verdict === 'fair' ? 'var(--tool-sig-warn)' : 'var(--tool-sig-bad)';
+              return html`
+                <g key=${g.name}>
+                  <text x="8" y=${y + 4} fill="var(--tool-emph)" fontSize="12"
+                    fontFamily="ui-monospace, monospace">${g.name}</text>
+                  <line x1=${sx(g.quapLo)} y1=${y - 5} x2=${sx(g.quapHi)} y2=${y - 5}
+                    stroke="var(--tool-sig-info)" strokeWidth="3" strokeLinecap="round" />
+                  <circle cx=${sx(g.quapMean)} cy=${y - 5} r="3" fill="var(--tool-sig-info)" />
+                  <line x1=${sx(g.gridLo)} y1=${y + 7} x2=${sx(g.gridHi)} y2=${y + 7}
+                    stroke=${c} strokeWidth="3" strokeLinecap="round" />
+                  <circle cx=${sx(g.gridMean)} cy=${y + 7} r="3" fill=${c} />
+                  <text x=${W - 6} y=${y + 4} textAnchor="end" fontSize="11"
+                    fill="var(--tool-note)">${g.worst < 0.01 ? '' : (g.worst.toFixed(2) + ' sd off')}</text>
+                </g>`;
+            })}
+            <text x="8" y=${H - 6} fontSize="11" fill="var(--tool-sig-info)">upper bar: quadratic approximation</text>
+            <text x="290" y=${H - 6} fontSize="11" fill="var(--tool-note)">lower bar: direct grid evaluation</text>
+          </svg>
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+            The two bars are the same compatibility interval computed two ways. Where they sit on top of
+            each other, the Gaussian approximation is doing no harm. Where they do not, the summary is
+            wrong in the direction shown and that parameter wants a real sampler rather than this one. The
+            grid holds the other parameters at the mode, so it is a profile and not a marginal.
+          </p>
+        <//>`;
+    }
+
+    /* ---- predictions ---- */
+    function PredPlot({ pred, data, outcome, xname }) {
+      if (!pred || !data || !xname) return null;
+      const x = data.columns[xname], y = data.columns[outcome];
+      if (!x || !y) return null;
+      const n = Math.min(x.length, pred.link.mean.length);
+      const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => x[a] - x[b]);
+      const W = 560, H = 330, pad = 42;
+      let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
+      for (let i = 0; i < n; i++) {
+        xlo = Math.min(xlo, x[i]); xhi = Math.max(xhi, x[i]);
+        ylo = Math.min(ylo, y[i], pred.sim.lo[i]); yhi = Math.max(yhi, y[i], pred.sim.hi[i]);
+      }
+      const px = (v) => pad + (v - xlo) / (xhi - xlo || 1) * (W - pad - 12);
+      const py = (v) => H - pad - (v - ylo) / (yhi - ylo || 1) * (H - pad - 14);
+      const band = (loA, hiA) => {
+        const up = order.map((i) => px(x[i]) + ',' + py(hiA[i])).join(' L');
+        const dn = order.slice().reverse().map((i) => px(x[i]) + ',' + py(loA[i])).join(' L');
+        return 'M' + up + ' L' + dn + ' Z';
+      };
+      const line = order.map((i, k) => (k ? 'L' : 'M') + px(x[i]) + ',' + py(pred.link.mean[i])).join(' ');
+      return html`
+        <${React.Fragment}>
+          <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H}>
+            <path d=${band(pred.sim.lo, pred.sim.hi)} fill="var(--tool-sig-info)" opacity="0.13" />
+            <path d=${band(pred.link.lo, pred.link.hi)} fill="var(--tool-sig-info)" opacity="0.30" />
+            <path d=${line} fill="none" stroke="var(--tool-sig-info)" strokeWidth="1.8" />
+            ${order.map((i) => html`
+              <circle key=${i} cx=${px(x[i])} cy=${py(y[i])} r="2.6"
+                fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
+            <line x1=${pad} y1=${H - pad} x2=${W - 10} y2=${H - pad} stroke="var(--tool-border)" />
+            <line x1=${pad} y1=${12} x2=${pad} y2=${H - pad} stroke="var(--tool-border)" />
+            <text x=${(W + pad) / 2} y=${H - 10} textAnchor="middle" fontSize="12" fill="var(--tool-label)">${xname}</text>
+            <text x=${12} y=${16} fontSize="12" fill="var(--tool-label)">${outcome}</text>
+            <text x=${pad} y=${H - pad + 14} fontSize="10" fill="var(--tool-note)">${fmt(xlo)}</text>
+            <text x=${W - 10} y=${H - pad + 14} textAnchor="end" fontSize="10" fill="var(--tool-note)">${fmt(xhi)}</text>
+          </svg>
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+            Circles are the observed data. The dark band is the uncertainty in ${pred.node} itself, the
+            pale one adds the observation noise, so about ${(pred.link.prob * 100).toFixed(0)} percent of
+            real points should fall inside it. A band too narrow for its own data is the honest sign of a
+            model that is too sure of itself.
+          </p>
+        <//>`;
+    }
+
+    /* ---- the app ---- */
+    function App() {
+      const [csv, setCsv] = useState('');
+      const [model, setModel] = useState(DEFAULT_MODEL);
+      const [res, setRes] = useState(null);
+      const [err, setErr] = useState(null);
+      const [busy, setBusy] = useState(null);
+      const [tab, setTab] = useState('precis');
+      const [prob, setProb] = useState(0.89);
+      const [draws, setDraws] = useState(4000);
+      const [note, setNote] = useState(null);
+
+      const data = useMemo(() => {
+        if (!csv.trim()) return null;
+        try { return RTH.parseCSV(csv); } catch (e) { return null; }
+      }, [csv]);
+
+      const onExample = useCallback(() => {
+        const ex = RTH.exampleData();
+        setCsv(ex.csv);
+        setModel(ex.model);
+        setNote(ex.note);
+        setRes(null); setErr(null);
+      }, []);
+
+      const run = useCallback(() => {
+        if (!data || !data.n) { setErr({ message: 'Load or paste a CSV first.' }); return; }
+        setErr(null); setRes(null); setBusy({ stage: 'starting', frac: 0 });
+        const cols = {};
+        Object.keys(data.columns).forEach((k) => { cols[k] = Array.from(data.columns[k]); });
+        RTHRun.run({ job: 'fit', model: model, data: { columns: cols },
+          opts: { prob: prob, draws: draws, seed: 1 } },
+          (p) => setBusy({ stage: p.stage, frac: p.frac }))
+          .then((r) => {
+            setBusy(null);
+            if (r.ok) { setRes(r); setTab('precis'); }
+            else setErr(r);
+          })
+          .catch((e) => { setBusy(null); setErr({ message: e.message }); });
+      }, [data, model, prob, draws]);
+
+      const copyPrecis = useCallback(() => {
+        if (!res) return;
+        const loP = ((1 - res.precis.prob) / 2 * 100).toFixed(1);
+        const hiP = ((1 - (1 - res.precis.prob) / 2) * 100).toFixed(1);
+        const head = ['parameter', 'mode', 'sd', loP + '%', hiP + '%', 'natural'];
+        const rows = res.precis.rows.map((r) => [r.name, r.mean, r.sd, r.lo, r.hi, r.natMedian]
+          .map((v, i) => i === 0 ? v : (isFinite(v) ? v.toFixed(4) : '--')));
+        const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => String(r[i]).length)));
+        const fmtRow = (r) => r.map((v, i) => String(v).padStart(i === 0 ? 0 : w[i])).join('  ');
+        navigator.clipboard.writeText([fmtRow(head)].concat(rows.map(fmtRow)).join('\n'));
+      }, [res]);
+
+      /* The predictor for the plot: the first data column the model actually
+         mentions, which is the one worth putting on the x axis. */
+      const xname = useMemo(() => {
+        if (!res || !data) return null;
+        const inModel = Object.keys(data.columns).filter((c) => c !== res.outcome &&
+          new RegExp('\\b' + c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(model));
+        return inModel.length ? inModel[0] : null;
+      }, [res, data, model]);
+
+      const tabs = [['precis', 'Summary'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
+        ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']];
+
+      return html`
+        <div className="container">
+          <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-text)', marginBottom: 8 }}>Quap Lab</h1>
+          <p style=${{ color: 'var(--tool-label)', maxWidth: '70ch' }}>
+            Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. The
+            posterior is approximated by a Gaussian at its mode, which is fast, honest about its own
+            limits, and enough for a surprising number of real models.
+          </p>
+
+          <div className="qp-grid2" style=${{ marginTop: 18 }}>
+            <${DataPanel} csv=${csv} setCsv=${setCsv} data=${data} onExample=${onExample} />
+            <div className="ctl-card">
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Model</p>
+                <textarea className="qp-mono qp-editor" spellCheck=${false}
+                  value=${model} onChange=${(e) => setModel(e.target.value)}></textarea>
+                <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
+                  The outcome on the left of the first tilde has to be a column in your data. Every other
+                  name on the left of a tilde becomes a parameter. Distributions:
+                  ${' ' + Object.keys(RTH.DIST).join(', ')}.
+                </p>
+              </div>
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Interval and posterior draws</p>
+                <div className="qp-chips">
+                  ${[[0.5, '50%'], [0.89, '89%'], [0.95, '95%']].map(([v, l]) => html`
+                    <button key=${l} className=${'lang-seg' + (prob === v ? ' active' : '')}
+                      onClick=${() => setProb(v)}>${l}</button>`)}
+                  <span style=${{ width: 10 }}></span>
+                  ${[[1000, '1k'], [4000, '4k'], [10000, '10k']].map(([v, l]) => html`
+                    <button key=${l} className=${'lang-seg' + (draws === v ? ' active' : '')}
+                      onClick=${() => setDraws(v)}>${l} draws</button>`)}
+                </div>
+                <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
+                  The fit itself is an optimization and draws nothing. These draws are taken afterwards
+                  from the fitted Gaussian, for the natural column, the predictions and the information
+                  criteria. mode, sd and the interval do not depend on them.
+                </p>
+              </div>
+              <div className="ctl-sec">
+                <div className="qp-chips">
+                  <button className="tool-btn tool-btn-primary" disabled=${!!busy} onClick=${run}>
+                    ${ToolIcons.el('play')} Fit the model
+                  </button>
+                  ${busy ? html`
+                    <button className="tool-btn tool-btn-sm tool-danger"
+                      onClick=${() => { RTHRun.cancel(); setBusy(null); }}>Cancel</button>` : null}
+                  ${busy ? html`<span style=${{ fontSize: 12, color: 'var(--tool-note)' }}>
+                    ${busy.stage}${busy.frac ? ' ' + Math.round(busy.frac * 100) + '%' : ''}</span>` : null}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          ${note ? html`<div style=${{ marginTop: 14 }}><${Msg} kind="info">${note}<//></div>` : null}
+
+          ${err ? html`
+            <div style=${{ marginTop: 14 }}>
+              <${Msg} kind="err">
+                ${err.line ? html`<strong>Line ${err.line}: </strong>` : null}${err.message}
+              <//>
+            </div>` : null}
+
+          ${res ? html`
+            <div style=${{ marginTop: 20 }}>
+              ${(res.messages || []).map((m, i) => html`
+                <${Msg} key=${i} kind=${m.kind}>${m.text}<//>`)}
+
+              <div className="tabstrip" role="tablist" style=${{ margin: '10px 0 14px' }}>
+                ${tabs.map(([id, label]) => html`
+                  <button key=${id} role="tab" className=${tab === id ? 'active' : ''}
+                    onClick=${() => setTab(id)}>${label}</button>`)}
+              </div>
+
+              ${tab === 'precis' ? html`
+                <${React.Fragment}>
+                  <${PrecisTable} precis=${res.precis} links=${res.links} grid=${res.grid} />
+                  <div className="qp-chips" style=${{ marginTop: 10 }}>
+                    <button className="tool-btn tool-btn-sm" onClick=${copyPrecis}>
+                      ${ToolIcons.el('copy')} Copy table
+                    </button>
+                    <span style=${{ fontSize: 12, color: 'var(--tool-note)' }}>
+                      ${res.nObs} rows, ${res.nPar} parameters, ${res.iters} iterations, log posterior
+                      ${' ' + fmt(res.logp, 2)}
+                    </span>
+                  </div>
+                  <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 10, maxWidth: '78ch' }}>
+                    mode, sd and the interval are on the scale the model is fitted on, which for a bounded
+                    parameter is its transformed scale: log for a standard deviation, logit for a
+                    probability. The natural column is the posterior median back on the original scale, and
+                    that is the number to quote. The check column is the cross-check tab in one word.
+                  </p>
+                <//>` : null}
+
+              ${tab === 'grid' ? html`<${GridCheck} grid=${res.grid} />` : null}
+              ${tab === 'cor' ? html`<${CorMatrix} names=${res.names} cor=${res.cor} />` : null}
+              ${tab === 'pred' ? (res.pred
+                ? html`<${PredPlot} pred=${res.pred} data=${data} outcome=${res.outcome} xname=${xname} />`
+                : html`<p style=${{ color: 'var(--tool-note)' }}>
+                    This model has no deterministic node to plot against a predictor.</p>`) : null}
+
+              ${tab === 'ic' ? html`
+                <${React.Fragment}>
+                  <table className="qp-tbl" style=${{ maxWidth: 520 }}>
+                    <tbody>
+                      <tr><td>WAIC</td><td className="qp-num">${fmt(res.waic.WAIC, 2)}</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>se ${fmt(res.waic.se, 2)}</td></tr>
+                      <tr><td>effective parameters</td><td className="qp-num">${fmt(res.waic.pWAIC, 2)}</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>of ${res.nPar} in the model</td></tr>
+                      <tr><td>PSIS-LOO</td><td className="qp-num">${fmt(res.psis.PSIS, 2)}</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>se ${fmt(res.psis.se, 2)}</td></tr>
+                      <tr><td>worst Pareto k</td>
+                        <td className="qp-num" style=${{ color: res.psis.maxK > 0.7 ? 'var(--tool-sig-bad)'
+                          : res.psis.maxK > 0.5 ? 'var(--tool-sig-warn)' : 'var(--tool-sig-good)' }}>
+                          ${fmt(res.psis.maxK, 2)}</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>
+                          ${res.psis.nBadK} of ${res.nObs} above 0.5</td></tr>
+                    </tbody>
+                  </table>
+                  <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 10, maxWidth: '78ch' }}>
+                    Both numbers estimate out-of-sample deviance, lower is better, and only the difference
+                    between two models fitted to the same rows means anything at all. A Pareto k above 0.7
+                    says the importance sampling behind PSIS has broken down for that observation, usually
+                    an outlier the model cannot absorb. Then the two criteria disagree and neither deserves
+                    much trust.
+                  </p>
+                <//>` : null}
+            </div>` : null}
+
+          <details className="fold" style=${{ marginTop: 26 }}>
+            <summary>What this does, and where it stops</summary>
+            <div className="fold-body">
+              <p>
+                The posterior is approximated by a Gaussian centred on its mode, with the curvature taken
+                from a numerical second derivative. That is quadratic approximation. It is exact when the
+                posterior really is Gaussian, which happens more often than you would expect, and it fails
+                without warning when it does not. Hence the cross-check tab, which evaluates the posterior
+                directly along each parameter and shows the disagreement rather than hiding it.
+              </p>
+              <p>
+                Everything is computed on an unconstrained scale: a standard deviation is carried as its
+                logarithm, a probability through a logit, with the Jacobian of that change of variables
+                included in the target. That is where a Gaussian approximation is defensible. It also means
+                the summary will not match a textbook that summarizes the same model on its natural scale.
+                The numbers differ because the mode of a density is not preserved by a nonlinear change of
+                variables, and neither answer is the wrong one.
+              </p>
+              <p>
+                Not here: multilevel models, varying effects, multivariate priors, mixtures, and anything
+                that needs Markov chain Monte Carlo. There are no chains, so there is no Rhat, no effective
+                sample size and no divergence count. Gradients and curvature come from finite differences,
+                giving roughly seven correct digits, and a model whose log posterior has a kink in it
+                produces curvature that is arithmetically real and statistically meaningless. Everything
+                runs in one browser tab on one core, which in practice means a few thousand rows and a few
+                dozen parameters.
+              </p>
+              <p>
+                Results are reproducible within a browser, because the sampling is seeded. They are not
+                bit-identical across browsers: the standard does not require log and exp to be correctly
+                rounded, and engines differ in the last place. The difference is far below anything worth
+                reporting, but it is not zero.
+              </p>
+            </div>
+          </details>
+
+          <p style=${{ fontSize: 11, color: 'var(--tool-note)', marginTop: 22 }}>
+            The notation follows the formula lists used in Richard McElreath's Statistical Rethinking and
+            its R package. This is an independent implementation, not affiliated with either, and it
+            differs deliberately wherever a different choice is better defended.
+          </p>
+        </div>`;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
