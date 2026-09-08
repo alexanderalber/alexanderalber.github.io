@@ -2177,6 +2177,16 @@ var PCB = (function () {
       partLegend: !!b.partLegend,
       finish: FINISHES.indexOf(b.finish) < 0 ? (FINISH_BY_FAB[fab] || FINISHES[0]) : b.finish
     };
+    /* The project name, as typed, and additive like silkColor above. Kept raw
+       and not slugified here: the field is what the user sees in the config tab,
+       and squeezing "Franzi's Herz" down to "Franzi-s-Herz" behind their back
+       while they type would be baffling. projectSlug does that once, at the
+       moment a file gets a name. An empty or missing name means the export
+       falls back to pcb-art, which is what every board did before this existed,
+       so an older document needs no migration. */
+    if (b.name != null && String(b.name).trim()) {
+      out.name = String(b.name).trim().slice(0, PROJECT_NAME_MAX);
+    }
     /* The one number the back-copper solver takes from the user: how wide the
        channel between two nets is milled. Missing means "whatever this fab
        demands", which is the honest default and the reason it is not written
@@ -2342,6 +2352,7 @@ var PCB = (function () {
       if (doc.board.solveStamp != null && (typeof doc.board.solveStamp !== 'object' || Array.isArray(doc.board.solveStamp))) {
         push('board.solveStamp must be an object');
       }
+      if (doc.board.name != null && typeof doc.board.name !== 'string') push('board.name must be a string');
     }
     var seen = {};
     if (!Array.isArray(doc.objects)) push('objects must be an array');
@@ -7522,8 +7533,19 @@ var PCB = (function () {
     var Isrc = cur(srcPix, 1), Idst = cur(dstPix, 0);
     if (!(Isrc > 0) || !(Idst > 0)) return null;
 
+    /* Which cells the two electrodes actually claimed, per free-cell index,
+       for the mesh view. Not derivable afterwards from the pad polygon: the
+       majority-vote downsample decides this, and the point of showing it is
+       that the decision is not obvious. */
+    var srcCells = new Uint8Array(N), dstCells = new Uint8Array(N);
+    for (k = 0; k < N; k++) {
+      if (!fixed[k]) continue;
+      if (val[k] === 1) srcCells[k] = 1; else dstCells[k] = 1;
+    }
+
     return {
       u: u, idx: idx, cells: cells, count: N,
+      srcCells: srcCells, dstCells: dstCells,
       rMilliOhm: 1 / Isrc,
       rSinkMilliOhm: 1 / Idst,
       iterations: it,
@@ -7615,6 +7637,7 @@ var PCB = (function () {
       net: netName, from: srcKey, to: dstKey,
       width: w, height: h, pxPerMm: px, factor: f,
       u: res.u, idx: res.idx, cells: res.cells, density: dens, maxDensity: maxG,
+      srcCells: res.srcCells, dstCells: res.dstCells,
       rMilliOhm: res.rMilliOhm, rSinkMilliOhm: res.rSinkMilliOhm, balance: bal,
       iterations: res.iterations, residual: res.residual,
       sheetMilliOhmSq: rsq, currentA: amps,
@@ -7674,6 +7697,152 @@ var PCB = (function () {
     return out;
   }
 
+  /* How much current each path actually carries when the button is pressed.
+
+     The copper is linear, so the field of the whole circuit is exactly the sum
+     of the per-pair fields weighted by their real currents. What that needs is
+     the weights, and this is where the equal-weight version would be wrong:
+     solving every pair at 20 mA and adding them up would push 20 mA through
+     the battery-to-button stretch when three LEDs are actually pulling 60 mA
+     through it.
+
+     The weights come out of the operating point without needing an LED model,
+     because of how lopsided this circuit is. The LEDs drop nearly the whole
+     cell voltage, the copper drops microvolts, so the branches do not compete:
+     each LED branch carries the per-LED current, and a shared stretch carries
+     the sum of the branches behind it. Kirchhoff at the button node, with the
+     copper contributing nothing to the split. That approximation is the same
+     one the rest of this tab already rests on, and it is stated in the panel.
+
+     Equal per-LED current is the second approximation and the shakier one:
+     real LEDs from the same reel differ enough in forward voltage that the
+     parallel branches do NOT share evenly, which is why paralleling LEDs on
+     one resistor is bad practice in the first place. For a picture of where
+     the copper is busy it does not matter, and the panel says so. */
+  function pathCurrents(paths, perLedA) {
+    var per = perLedA == null ? 0.02 : +perLedA;
+    var nLed = 0, i;
+    for (i = 0; i < paths.length; i++) if (paths[i].net === 'VCC') nLed++;
+    var out = [];
+    for (i = 0; i < paths.length; i++) {
+      /* BAT+ is upstream of the button, so the whole string goes through it.
+         VCC and GND are one branch each. A board with no LED placed yet gets
+         the bare per-LED current rather than zero, so the picture is not
+         blank for a reason nobody can see. */
+      out.push(paths[i].net === 'BAT+' ? per * (nLed || 1) : per);
+    }
+    return out;
+  }
+
+  /* Every path solved and superposed, which is the whole circuit at once.
+
+     Returns the same shape as currentField so the overlay and the legend do
+     not have to know which one they were handed, with the per-path solves kept
+     alongside for the read-out. Fields that failed to solve are skipped and
+     counted rather than aborting the sum: one pad pair sitting on separate
+     copper is an ordinary finding on this tab, not a reason to show nothing.
+
+     The density of a sum is NOT the sum of the densities in general, because
+     these are vector magnitudes and two currents crossing at an angle do not
+     add arithmetically. Here they are summed as vectors, by re-deriving the
+     gradient components per path and adding those before taking the length,
+     which is why this does not just add the density arrays. The potential is
+     meaningless across the sum (each path has its own pair of electrodes), so
+     the combined result carries no u and the potential view stays per path. */
+  function currentFieldAll(doc, paths, opts) {
+    opts = opts || {};
+    if (!paths || !paths.length) return null;
+    var amps = opts.currentA == null ? 0.02 : +opts.currentA;
+    var weights = pathCurrents(paths, amps);
+
+    var parts = [], gx = null, gy = null, w = 0, h = 0, px = 0, rsq = 0;
+    var owned = null, skipped = 0, i, k;
+
+    for (var pi = 0; pi < paths.length; pi++) {
+      var pa = paths[pi];
+      var f = null;
+      try {
+        f = currentField(doc, pa.net, pa.from, pa.to, opts);
+      } catch (e) { f = null; }
+      if (!f) { skipped++; parts.push(null); continue; }
+      parts.push(f);
+      if (!gx) {
+        w = f.width; h = f.height; px = f.pxPerMm; rsq = f.sheetMilliOhmSq;
+        gx = new Float64Array(w * h); gy = new Float64Array(w * h);
+        owned = new Uint8Array(w * h);
+      } else if (f.width !== w || f.height !== h) {
+        /* Cannot happen: every solve downsamples the same owner plane by the
+           same factor. Guarded anyway, because silently adding two grids of
+           different sizes would produce a picture that looks fine. */
+        skipped++; parts[parts.length - 1] = null; continue;
+      }
+
+      /* Back to gradient components on the full grid. currentDensity throws
+         the direction away, and the direction is exactly what the sum needs. */
+      var idx = f.idx, cells = f.cells, u = f.u;
+      var scale = weights[pi] * (f.rMilliOhm > 0 ? f.rMilliOhm : 0);
+      var at = function (xx, yy) {
+        if (xx < 0 || yy < 0 || xx >= w || yy >= h) return -1;
+        return idx[yy * w + xx];
+      };
+      for (k = 0; k < cells.length; k++) {
+        var ci = cells[k], x = ci % w, y = (ci - x) / w;
+        var l = at(x - 1, y), r = at(x + 1, y), t = at(x, y - 1), b = at(x, y + 1);
+        var ax = 0, ay = 0;
+        if (l >= 0 && r >= 0) ax = (u[r] - u[l]) / 2;
+        else if (r >= 0) ax = u[r] - u[k];
+        else if (l >= 0) ax = u[k] - u[l];
+        if (t >= 0 && b >= 0) ay = (u[b] - u[t]) / 2;
+        else if (b >= 0) ay = u[b] - u[k];
+        else if (t >= 0) ay = u[k] - u[t];
+        /* The field carries an arbitrary 1 V, so the amps this path really
+           pushes are its weight; multiplying the unit-voltage gradient by
+           I * R puts every path on the same physical scale before they add. */
+        gx[ci] += ax * scale;
+        gy[ci] += ay * scale;
+        owned[ci] = 1;
+      }
+    }
+    if (!gx) return null;
+
+    /* Repack into the cells/idx form the overlay expects, over the union of
+       the copper every path touched. */
+    var cellsOut = [], idxOut = new Int32Array(w * h);
+    for (i = 0; i < w * h; i++) idxOut[i] = -1;
+    for (i = 0; i < w * h; i++) if (owned[i]) { idxOut[i] = cellsOut.length; cellsOut.push(i); }
+    var dens = new Float64Array(cellsOut.length), maxG = 0;
+    for (k = 0; k < cellsOut.length; k++) {
+      var q = cellsOut[k];
+      var m = Math.sqrt(gx[q] * gx[q] + gy[q] * gy[q]);
+      dens[k] = m;
+      if (m > maxG) maxG = m;
+    }
+
+    /* dens is already in amps per unit voltage-gradient times I*R, so the
+       conversion to amps per millimetre is the sheet resistance and the cell
+       pitch, with no per-path current left to divide out. */
+    var peakPerMm = rsq > 0 ? (maxG / rsq) * px : 0;
+    var solved = 0, conv = 0, totalMilliOhm = 0;
+    for (i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      solved++;
+      if (parts[i].converged) conv++;
+      totalMilliOhm += parts[i].rMilliOhm;
+    }
+
+    return {
+      all: true, parts: parts, weights: weights,
+      pathCount: paths.length, solvedCount: solved, skippedCount: skipped,
+      width: w, height: h, pxPerMm: px, factor: parts.find(Boolean).factor,
+      u: null, idx: idxOut, cells: cellsOut, density: dens, maxDensity: maxG,
+      srcCells: null, dstCells: null,
+      sheetMilliOhmSq: rsq, currentA: amps,
+      totalMilliOhm: totalMilliOhm,
+      peakAmpPerMm: peakPerMm,
+      converged: solved > 0 && conv === solved
+    };
+  }
+
   /* ------------------------------------------------------- Gerber writer */
 
   /* 4.6 fixed point, leading zeros omitted, so the integer is written plainly.
@@ -7715,7 +7884,7 @@ var PCB = (function () {
     var attr = LAYER_ATTR[layerName];
     if (!attr) throw new Error('unknown layer: ' + layerName);
     opts = opts || {};
-    var project = opts.project || 'pcb-art';
+    var project = projectSlug(opts.project);
     var ap = opts.apertureMm == null ? 0.1 : +opts.apertureMm;
     var entries = layerEntries(derived, layerName);
     var L = [];
@@ -8248,7 +8417,7 @@ var PCB = (function () {
      in KiCad checks against the same numbers the tool checked against. */
   function kicadProFile(doc, opts) {
     opts = opts || {};
-    var project = opts.project || 'pcb-art';
+    var project = projectSlug(opts.project);
     var lim = fabLimits(doc && doc.board && doc.board.fab, doc && doc.board && doc.board.finish);
     var pro = {
       board: {
@@ -8276,7 +8445,7 @@ var PCB = (function () {
      same way. */
   function kicadFileSet(doc, opts) {
     opts = opts || {};
-    var project = opts.project || 'pcb-art';
+    var project = projectSlug(opts.project);
     var files = {};
     files[project + '.kicad_pcb'] = kicadPcbFile(doc, opts);
     files[project + '.kicad_pro'] = kicadProFile(doc, opts);
@@ -8284,6 +8453,30 @@ var PCB = (function () {
   }
 
   /* ---------------------------------------------------------- file names */
+
+  /* What a user types as the project name, reduced to something that is safe as
+     a file name on all three platforms and as a Gerber %TF.ProjectId attribute.
+
+     Deliberately strict rather than clever: letters, digits, dot, dash and
+     underscore survive, everything else becomes a dash, runs of dashes collapse
+     and leading or trailing dashes go. That kills umlauts too, which is the
+     point: this string ends up in a zip that a fab's CAM software unpacks, and
+     the ones that still choke on a non-ASCII byte are exactly the ones a
+     hobbyist meets. The typed name is kept intact in the document; only what
+     goes on disk is squeezed through here.
+
+     An empty result falls back to PROJECT_FALLBACK, so a name of nothing but
+     punctuation cannot produce a file called "-.gbr". Length is capped because
+     a Gerber project id sits in a header line that some readers truncate. */
+  var PROJECT_FALLBACK = 'pcb-art';
+  var PROJECT_NAME_MAX = 40;
+
+  function projectSlug(name) {
+    var s = String(name == null ? '' : name).trim();
+    s = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+    s = s.slice(0, PROJECT_NAME_MAX).replace(/[-.]+$/, '');
+    return s || PROJECT_FALLBACK;
+  }
 
   function gerberFileName(project, layerName) {
     return project + '-' + layerName.replace('.', '_') + '.gbr';
@@ -8298,7 +8491,7 @@ var PCB = (function () {
      operator. */
   function exportFileSet(doc, opts) {
     opts = opts || {};
-    var project = opts.project || 'pcb-art';
+    var project = projectSlug(opts.project);
     var derived = opts.derived || deriveLayers(doc, opts);
     var files = {};
     GERBER_LAYERS.forEach(function (name) {
@@ -9495,6 +9688,8 @@ var PCB = (function () {
     solveField: solveField,
     currentField: currentField,
     currentPaths: currentPaths,
+    pathCurrents: pathCurrents,
+    currentFieldAll: currentFieldAll,
     DRC_MAX_FINDINGS: DRC_MAX_FINDINGS,
     PARTITION_PX_PER_MM: PARTITION_PX_PER_MM,
     MIN_SOLVE_CLEARANCE_MM: MIN_SOLVE_CLEARANCE_MM,
@@ -9537,6 +9732,9 @@ var PCB = (function () {
     snapPoint: snapPoint,
     emptyDoc: emptyDoc,
     validateDoc: validateDoc,
+    projectSlug: projectSlug,
+    PROJECT_FALLBACK: PROJECT_FALLBACK,
+    PROJECT_NAME_MAX: PROJECT_NAME_MAX,
     cloneDoc: cloneDoc,
     docBounds: docBounds,
     outlineObject: outlineObject,
@@ -9836,34 +10034,46 @@ var PCB = (function () {
     cutout: 'Milled clean through: no FR4, no copper, no mask, no silkscreen, and on both sides at once. The area becomes an inner contour on Edge.Cuts.'
   };
 
-  /* The current-flow colormaps. Two SEQUENTIAL ramps, and the choice is the
-     one the site conventions call for rather than a preference: both
-     quantities only go up. Potential runs from one pad to the other and
-     current density from nothing to the busiest cell, so a diverging scale
-     would spend its strongest contrast on a middle that means nothing.
+  /* The current-flow colormaps. All SEQUENTIAL ramps, and that is the site
+     convention rather than a preference: both quantities only go up. Potential
+     runs from one pad to the other and current density from nothing to the
+     busiest cell, so a diverging scale would spend its strongest contrast on a
+     middle that means nothing.
 
      Read out of matplotlib rather than written from memory, nine stops each,
-     interpolated linearly. Potential gets viridis, because the field is read
-     as a height and viridis is monotone in lightness, so the equipotential
-     bands come out evenly spaced to the eye. Density gets inferno, because the
-     thing being looked for is the HOT spot and inferno puts almost all of its
-     lightness range in the top third, which is exactly where a neck shows up.
+     interpolated linearly. The defaults are chosen per quantity and stay the
+     defaults: potential gets viridis, because the field is read as a height
+     and viridis is monotone in lightness, so equal steps of voltage come out
+     as equal steps of brightness; density gets inferno, because the thing being
+     looked for is the HOT spot and inferno puts almost all of its lightness
+     range in the top third, which is exactly where a neck shows up.
 
-     Neither is a theme colour, for the same reason as the island tints: they
-     are painted on top of the board render, so what they stand out against is
-     soldermask and copper, not a page surface. */
-  const FIELD_MAPS = {
-    potential: [
+     Bone is offered as the third, and it is not there for symmetry: it is the
+     one ramp here that stays legible when the picture is printed or read by
+     somebody who cannot separate the red from the green, at the price of a
+     much shorter contrast range.
+
+     None of them is a theme colour, for the same reason as the island tints:
+     they are painted on top of the board render, so what they stand out
+     against is soldermask and copper, not a page surface. */
+  const FIELD_RAMPS = {
+    viridis: [
       [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142],
       [31, 158, 137], [53, 183, 121], [110, 206, 88], [253, 231, 37]
     ],
-    density: [
+    inferno: [
       [0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66],
       [245, 125, 21], [250, 193, 39], [252, 255, 164], [252, 255, 164]
+    ],
+    bone: [
+      [0, 0, 0], [28, 28, 39], [56, 56, 78], [84, 87, 117], [112, 119, 143],
+      [140, 151, 158], [172, 183, 176], [212, 212, 205], [255, 255, 255]
     ]
   };
-  function fieldColor(map, t) {
-    const s = FIELD_MAPS[map] || FIELD_MAPS.potential;
+  const FIELD_DEFAULT_RAMP = { potential: 'viridis', density: 'inferno' };
+
+  function fieldColor(ramp, t) {
+    const s = FIELD_RAMPS[ramp] || FIELD_RAMPS.viridis;
     let u = t;
     if (!(u >= 0)) u = 0;
     if (u > 1) u = 1;
@@ -9876,53 +10086,133 @@ var PCB = (function () {
     ];
   }
 
+  /* How a density in amps per millimetre becomes a position on the ramp, and
+     back again for the legend ticks. Three scales, because which one is honest
+     depends on what is being asked.
+
+     LINEAR is the truthful one and usually the useless one: the peak sits in a
+     thin ring where the electrode meets the copper and the gradient is close
+     to singular there, so one ring saturates and the whole rest of the board
+     reads as black.
+
+     SQRT is the default. It has no free parameter, it preserves order and it
+     preserves ratios readably: a neck carrying half the peak looks half rather
+     than invisibly dark.
+
+     LOG reads orders of magnitude, which is the right question for the dead
+     areas of a large pour, but it cannot be had for free. The density really
+     is zero in the corners of a pour and log(0) is not a number, so a floor
+     has to be picked, and where the floor goes decides how much of the picture
+     is empty. Four decades below the peak is that choice, it is arbitrary, and
+     the legend says so rather than hiding it.
+
+     All three are strictly increasing on (0, 1], so switching between them
+     never reorders two cells, only restretches them. */
+  const FIELD_LOG_DECADES = 4;
+  const FIELD_SCALES = {
+    linear: {
+      label: 'Linear',
+      to: (r) => r,
+      from: (t) => t
+    },
+    sqrt: {
+      label: 'Square root',
+      to: (r) => Math.sqrt(r),
+      from: (t) => t * t
+    },
+    log: {
+      label: 'Logarithmic',
+      to: (r) => (r > 0 ? Math.max(0, 1 + Math.log10(r) / FIELD_LOG_DECADES) : 0),
+      from: (t) => Math.pow(10, (t - 1) * FIELD_LOG_DECADES)
+    }
+  };
+  function fieldScaleTo(scale, ratio) {
+    const s = FIELD_SCALES[scale] || FIELD_SCALES.sqrt;
+    let t = s.to(ratio);
+    if (!(t >= 0)) t = 0;
+    return t > 1 ? 1 : t;
+  }
+  function fieldScaleFrom(scale, t) {
+    const s = FIELD_SCALES[scale] || FIELD_SCALES.sqrt;
+    return s.from(t);
+  }
+
   /* The solved field as an overlay canvas in millimetres, same contract as
      islandOverlay: the caller draws it through the view transform.
 
-     Density is shown on a SQUARE ROOT scale and that is not cosmetics. The
-     peak sits at a pad edge, where the electrode meets the copper and the
-     gradient is close to singular; on a linear scale that one ring saturates
-     and the entire rest of the board reads as black, which hides the very
-     thing the view exists to show. The square root pulls the mid range up
-     without reordering anything, so a neck carrying half the peak is visibly
-     half rather than invisibly dark. The legend says which scale is in force.
+     Three views of the same solve. POTENTIAL is the voltage, drawn straight
+     because it already lives on 0 to 1 between the two electrodes: a scale
+     choice would be meaningless there, since the numbers are not a magnitude
+     spanning decades but a position between two fixed ends. DENSITY is the
+     gradient magnitude, which does span decades, so it goes through the scale
+     picked by the caller (see FIELD_SCALES). MESH shows the discretisation
+     itself rather than the answer.
 
-     Equipotential lines are drawn for the potential map only, at every tenth
-     of the range: a cell whose value crosses a tenth boundary against its
-     right or lower neighbour is inked. That is a contour by the cheapest
-     honest method, and at this grid it is a clean one because the field is
-     smooth. They are what makes a constriction legible: the lines crowd
-     together exactly where the current has to squeeze. */
-  function fieldOverlay(field, map) {
+     The MESH view exists because every number on this tab is a statement about
+     a grid, not about the board: the solve runs at five cells per millimetre
+     on a majority-vote downsample of the copper, and a neck two cells wide is
+     a neck the solver only half believes in. What it draws is the cells the
+     solver actually owns, tinted by role (free copper, high electrode, low
+     electrode) with the cell boundaries inked, so a staircased edge or a
+     one-cell isthmus is visible as what it is. It deliberately does NOT use
+     the ramp: this view says where the arithmetic happened, not how much of
+     anything went through it. */
+  const MESH_COL = {
+    free: [56, 96, 138],
+    high: [248, 250, 252],
+    low: [100, 116, 139],
+    grid: [12, 22, 38]
+  };
+  function fieldOverlay(field, map, opts) {
     if (!field || !field.cells || !field.cells.length) return null;
+    opts = opts || {};
+    const ramp = opts.ramp || FIELD_DEFAULT_RAMP[map] || 'viridis';
+    const scale = opts.scale || 'sqrt';
     const w = field.width, h = field.height;
+    const dens = field.density, u = field.u, idx = field.idx, cells = field.cells;
+    const maxD = field.maxDensity > 0 ? field.maxDensity : 1;
+
+    /* The mesh is drawn at three device pixels per solver cell, because a
+       one-pixel image cannot show both a cell and the line between two of
+       them. Everything else stays at one pixel per cell and lets the browser
+       interpolate, which is right for a smooth field and wrong for a grid. */
+    if (map === 'mesh') {
+      const S = 3;
+      const c2 = scratch(w * S, h * S);
+      const g2 = c2.getContext('2d');
+      const im2 = g2.createImageData(w * S, h * S);
+      const d2 = im2.data;
+      const hi = field.srcCells, lo = field.dstCells;
+      for (let k = 0; k < cells.length; k++) {
+        const i2 = cells[k], x = i2 % w, y = (i2 - x) / w;
+        const role = (hi && hi[k]) ? MESH_COL.high : (lo && lo[k]) ? MESH_COL.low : MESH_COL.free;
+        for (let dy = 0; dy < S; dy++) {
+          for (let dx = 0; dx < S; dx++) {
+            const edge = dx === 0 || dy === 0;
+            const col = edge ? MESH_COL.grid : role;
+            const o = ((y * S + dy) * w * S + (x * S + dx)) * 4;
+            d2[o] = col[0]; d2[o + 1] = col[1]; d2[o + 2] = col[2];
+            d2[o + 3] = edge ? 235 : 205;
+          }
+        }
+      }
+      g2.putImageData(im2, 0, 0);
+      return { canvas: c2, wMm: w / field.pxPerMm, hMm: h / field.pxPerMm, nearest: true };
+    }
+
     const c = scratch(w, h);
     const g = c.getContext('2d');
     const img = g.createImageData(w, h);
     const d = img.data;
-    const dens = field.density, u = field.u, idx = field.idx, cells = field.cells;
-    const maxD = field.maxDensity > 0 ? field.maxDensity : 1;
-    const lines = map === 'potential';
-    const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h) ? -1 : idx[y * w + x];
-
     for (let k = 0; k < cells.length; k++) {
-      const i = cells[k], x = i % w, y = (i - x) / w;
-      const t = map === 'density' ? Math.sqrt(dens[k] / maxD) : u[k];
-      const col = fieldColor(map, t);
+      const i2 = cells[k], x = i2 % w, y = (i2 - x) / w;
+      const t = map === 'density' ? fieldScaleTo(scale, dens[k] / maxD) : u[k];
+      const col = fieldColor(ramp, t);
       const o = (y * w + x) * 4;
       d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 225;
-
-      if (lines) {
-        const band = Math.floor(u[k] * 10);
-        const r = at(x + 1, y), b = at(x, y + 1);
-        if ((r >= 0 && Math.floor(u[r] * 10) !== band)
-          || (b >= 0 && Math.floor(u[b] * 10) !== band)) {
-          d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = 255;
-        }
-      }
     }
     g.putImageData(img, 0, 0);
-    return { canvas: c, wMm: w / field.pxPerMm, hMm: h / field.pxPerMm };
+    return { canvas: c, wMm: w / field.pxPerMm, hMm: h / field.pxPerMm, nearest: false };
   }
 
   /* ------------------------------------------------------- canvas plumbing */
@@ -10475,7 +10765,7 @@ var PCB = (function () {
   function Seg({ value, onChange, options, disabled, title }) {
     return html`<span className="seg-row" title=${title || null}>
       ${options.map((o) => html`<button key=${String(o.v)} type="button" title=${o.title || null}
-        disabled=${!!disabled}
+        disabled=${!!disabled || !!o.disabled}
         className=${'lang-seg' + (value === o.v ? ' active' : '')}
         onClick=${() => onChange(o.v)}>${o.label}</button>`)}
     </span>`;
@@ -11375,6 +11665,8 @@ var PCB = (function () {
   }
 
   function Board3D({ derived, doc, stale, hasSpnav, spnavBtn }) {
+    /* Pulled out as a plain string so savePng can depend on it, see there. */
+    const pngName = doc.board.name || '';
     const hostRef = useRef(null);
     const S = useRef(null);
     const [ready, setReady] = useState(!!window.THREE);
@@ -11504,13 +11796,17 @@ var PCB = (function () {
       const cv = r.domElement;
       if (typeof cv.toBlob === 'function') {
         cv.toBlob((b) => {
-          if (b) download(b, 'pcb-art-view.png');
+          if (b) download(b, PCB.projectSlug(pngName) + '-view.png');
           restore();
         }, 'image/png');
       } else {
         restore();
       }
-    }, []);
+      /* The project name is the ONE thing in here that has to be current: the
+         rest of the closure only touches S.current, which is a ref. Listing the
+         name rather than the whole doc keeps the callback from being rebuilt on
+         every edit to the board. */
+    }, [pngName]);
 
     const faceView = useCallback((back) => {
       const s = S.current;
@@ -12579,8 +12875,24 @@ var PCB = (function () {
   ];
 
   const FIELD_MAP_OPTS = [
-    { v: 'potential', label: 'Potential', title: 'The voltage across the copper, with a contour line every tenth of the range. Where the lines crowd together, the current is squeezing through.' },
-    { v: 'density', label: 'Current density', title: 'How much current each patch of copper carries, on a square-root scale. Bright is busy.' }
+    { v: 'potential', label: 'Potential', title: 'The voltage across the copper between the two pads. Where the colour changes fast, the current is squeezing through.' },
+    { v: 'density', label: 'Current density', title: 'How much current each patch of copper carries. Bright is busy.' },
+    { v: 'mesh', label: 'Mesh', title: 'The grid the field is solved on: one square per solver cell, with the two electrodes marked. Shows what the numbers are actually a statement about.' }
+  ];
+
+  /* Only offered for density. The potential is a position between two fixed
+     electrodes rather than a magnitude, so restretching it would say nothing,
+     and the ramp already gives it a reading. */
+  const FIELD_SCALE_OPTS = [
+    { v: 'linear', label: 'Linear', title: 'Honest and usually unreadable: the near-singular ring at the pad edge takes the whole range and everything else goes black.' },
+    { v: 'sqrt', label: 'Sqrt', title: 'The default. No free parameter, and half the peak still looks like half.' },
+    { v: 'log', label: 'Log', title: 'Four decades below the peak. Reads the quiet copper, at the price of an arbitrary floor: the density really is zero in the dead corners.' }
+  ];
+
+  const FIELD_RAMP_OPTS = [
+    { v: 'viridis', label: 'Viridis', title: 'Monotone in lightness, so bands come out evenly spaced to the eye.' },
+    { v: 'inferno', label: 'Inferno', title: 'Almost all of its lightness range in the top third, which is where a hot spot shows up.' },
+    { v: 'bone', label: 'Bone', title: 'Grey to white. Survives printing and colour blindness, at the price of a much shorter contrast range.' }
   ];
 
   function limitDraftOf(fab, finish) {
@@ -12662,6 +12974,10 @@ var PCB = (function () {
     const [view, setView] = useState({ z: 1, cx: 35, cy: 47.5 });
 
     const [boardDraft, setBoardDraft] = useState({ w: '70', h: '95' });
+    /* Same draft-then-commit shape as the size fields: typing goes to the draft,
+       and only blur or Enter puts it in the document, so a name is one undo step
+       and not one per keystroke. */
+    const [nameDraft, setNameDraft] = useState('');
     /* Empty means "whatever the fab demands", which is also how the document
        stores a board that has never been told otherwise. */
     const [clearDraft, setClearDraft] = useState('');
@@ -12682,8 +12998,18 @@ var PCB = (function () {
     const [drcBusy, setDrcBusy] = useState(false);
     const [checkSide, setCheckSide] = useState('back');
     const [checkOverlay, setCheckOverlay] = useState('islands');
-    const [fieldPath, setFieldPath] = useState(0);
-    const [fieldMap, setFieldMap] = useState('potential');
+    /* 'all' rather than an index, and it is the default: the question somebody
+       arrives with is where the copper is busy, not what one pad pair does.
+       Kept as a string so the select can carry both without a sentinel. */
+    const [fieldPath, setFieldPath] = useState('all');
+    const [fieldMap, setFieldMap] = useState('density');
+    /* The ramp is remembered per quantity rather than globally, because the
+       right default differs between them and a shared pick would silently
+       override one of the two. null means "whatever this map defaults to". */
+    const [fieldRamp, setFieldRamp] = useState({ potential: null, density: null });
+    const [fieldScale, setFieldScale] = useState('sqrt');
+    const rampFor = (m) => fieldRamp[m] || FIELD_DEFAULT_RAMP[m] || 'viridis';
+    const activeRamp = rampFor(fieldMap);
     const [fieldRes, setFieldRes] = useState(null);
     const [fieldBusy, setFieldBusy] = useState(false);
     const showIslands = checkOverlay === 'islands';
@@ -13145,6 +13471,10 @@ var PCB = (function () {
       setClearDraft(doc.board.clearanceMm == null ? '' : String(doc.board.clearanceMm));
     }, [doc.board.clearanceMm]);
 
+    useEffect(() => {
+      setNameDraft(doc.board.name || '');
+    }, [doc.board.name]);
+
     /* One editable draft per hole, keyed by id, so a half typed number in one
        row does not disturb the others and a hole deleted elsewhere takes its
        draft with it. */
@@ -13281,6 +13611,19 @@ var PCB = (function () {
       const now = doc.board.clearanceMm == null ? null : +doc.board.clearanceMm;
       if (v === now || (v !== null && now !== null && Math.abs(v - now) < 1e-9)) return;
       runCmds([{ type: 'setBoard', board: { clearanceMm: v } }]);
+    }
+
+    /* An empty field is legal and means "no name": cloneBoard then drops the
+       key and the exports fall back to pcb-art, which is where every board
+       started before this field existed. Nothing is rejected here, because
+       there is nothing a name can be that is wrong; what a file system cannot
+       take is dealt with by projectSlug at download time, and the note under
+       the field shows the result before you get there. */
+    function commitName() {
+      const v = nameDraft.trim().slice(0, PCB.PROJECT_NAME_MAX);
+      if (v !== nameDraft) setNameDraft(v);
+      if (v === (doc.board.name || '')) return;
+      runCmds([{ type: 'setBoard', board: { name: v } }]);
     }
 
     function commitBoard() {
@@ -14380,19 +14723,22 @@ var PCB = (function () {
         setFieldRes(null);
         return;
       }
-      const pa = flowPaths[Math.min(fieldPath, flowPaths.length - 1)];
-      if (!pa) { setFieldRes(null); return; }
+      const all = fieldPath === 'all';
+      const pa = all ? null : flowPaths[Math.min(+fieldPath, flowPaths.length - 1)];
+      if (!all && !pa) { setFieldRes(null); return; }
       let live = true;
       setFieldBusy(true);
       const id = requestAnimationFrame(() => setTimeout(() => {
         let out = null;
         try {
-          out = PCB.currentField(doc, pa.net, pa.from, pa.to, {
-            solution: solution, oz: 1, currentA: 0.02
-          });
+          out = all
+            ? PCB.currentFieldAll(doc, flowPaths, { solution: solution, oz: 1, currentA: 0.02 })
+            : PCB.currentField(doc, pa.net, pa.from, pa.to, {
+              solution: solution, oz: 1, currentA: 0.02
+            });
         } catch (e) { out = null; }
         if (!live) return;
-        setFieldRes(out ? Object.assign({ what: pa.what }, out) : null);
+        setFieldRes(out ? Object.assign({ what: all ? 'every path at once' : pa.what }, out) : null);
         setFieldBusy(false);
       }, 0));
       return () => { live = false; cancelAnimationFrame(id); };
@@ -14402,8 +14748,10 @@ var PCB = (function () {
        dependencies above: the ramps are not theme colours, but the grey skin
        still has to be able to drop the overlay, so themeTick stays in. */
     const fieldPic = useMemo(
-      () => (checkOverlay === 'flow' && fieldRes ? fieldOverlay(fieldRes, fieldMap) : null),
-      [checkOverlay, fieldRes, fieldMap, themeTick]);
+      () => (checkOverlay === 'flow' && fieldRes
+        ? fieldOverlay(fieldRes, fieldMap, { ramp: activeRamp, scale: fieldScale })
+        : null),
+      [checkOverlay, fieldRes, fieldMap, activeRamp, fieldScale, themeTick]);
 
     function focusMark(kind, i, side, x, y) {
       setMarkSel({ kind: kind, i: i });
@@ -14414,16 +14762,24 @@ var PCB = (function () {
 
     /* ---- export and project files ---- */
 
+    /* Every downloaded file is named after this, and it is the slug rather than
+       the typed name: the zip, the files inside it and the Gerber project id
+       all have to survive a fab's CAM software. An unnamed board keeps the old
+       pcb-art, so nothing about an existing workflow changes until a name is
+       actually typed on the config tab. */
+    const projName = PCB.projectSlug(doc.board.name);
+
     function exportGerber() {
       if (!derived) { setErr('The area pass is still running. One moment.'); return; }
       try {
         const files = PCB.exportFileSet(doc, {
-          project: 'pcb-art', date: isoStamp(),
+          project: projName, date: isoStamp(),
           derived: derived, regions: { front: bundles.front, back: bundles.back }
         });
         const bytes = PCB.buildZip(files);
-        download(new Blob([bytes], { type: 'application/zip' }), 'pcb-art-gerber.zip');
-        setMsg(Object.keys(files).length + ' files written to pcb-art-gerber.zip.');
+        const zipName = projName + '-gerber.zip';
+        download(new Blob([bytes], { type: 'application/zip' }), zipName);
+        setMsg(Object.keys(files).length + ' files written to ' + zipName + '.');
         setErr('');
       } catch (e) {
         setErr('Export failed: ' + (e && e.message ? e.message : 'unknown error'));
@@ -14437,12 +14793,13 @@ var PCB = (function () {
       if (!derived) { setErr('The area pass is still running. One moment.'); return; }
       try {
         const files = PCB.kicadFileSet(doc, {
-          project: 'pcb-art', date: isoStamp(),
+          project: projName, date: isoStamp(),
           derived: derived, regions: { front: bundles.front, back: bundles.back }
         });
         const bytes = PCB.buildZip(files);
-        download(new Blob([bytes], { type: 'application/zip' }), 'pcb-art-kicad.zip');
-        setMsg(Object.keys(files).length + ' files written to pcb-art-kicad.zip.');
+        const zipName = projName + '-kicad.zip';
+        download(new Blob([bytes], { type: 'application/zip' }), zipName);
+        setMsg(Object.keys(files).length + ' files written to ' + zipName + '.');
         setErr('');
       } catch (e) {
         setErr('Export failed: ' + (e && e.message ? e.message : 'unknown error'));
@@ -14477,7 +14834,7 @@ var PCB = (function () {
     }
 
     function exportJson() {
-      download(new Blob([JSON.stringify(stamped(), null, 2)], { type: 'application/json' }), 'pcb-art-project.json');
+      download(new Blob([JSON.stringify(stamped(), null, 2)], { type: 'application/json' }), projName + '-project.json');
     }
 
     function loadJson(file) {
@@ -15098,7 +15455,12 @@ var PCB = (function () {
       ctx.save();
       ctx.translate(c[0], c[1]);
       if (V.mirror) ctx.scale(-1, 1);
+      /* The mesh is the one view that must NOT be smoothed: the whole point is
+         the cell boundary, and bilinear filtering turns a grid into a haze. */
+      const sm = ctx.imageSmoothingEnabled;
+      if (fieldPic.nearest) ctx.imageSmoothingEnabled = false;
       ctx.drawImage(fieldPic.canvas, -w / 2, -h / 2, w, h);
+      ctx.imageSmoothingEnabled = sm;
       ctx.restore();
     }
 
@@ -15107,7 +15469,10 @@ var PCB = (function () {
        current leaves the filled one. Drawn after the field, so they survive
        the overlay. */
     function drawFieldPads(ctx, V, dpr) {
-      if (!fieldRes) return;
+      /* Nothing to mark in the all-paths sum: there is no one pair of
+         electrodes, every pad is an electrode in some path and a bystander in
+         the others, so drawing them all would say nothing. */
+      if (!fieldRes || fieldRes.all) return;
       const ends = [[fieldRes.from, true], [fieldRes.to, false]];
       ctx.save();
       ends.forEach(([key, high]) => {
@@ -15760,6 +16125,32 @@ var PCB = (function () {
         </p>`)}
         <div className="ctl-card">
           <div className="ctl-sec">
+            <p className="ctl-sec-h">Project</p>
+            <label className="pcb-field">
+              <span>Project name</span>
+              <input type="text" className="tool-input" value=${nameDraft}
+                maxLength=${PCB.PROJECT_NAME_MAX} placeholder=${PCB.PROJECT_FALLBACK}
+                onChange=${(e) => setNameDraft(e.target.value)}
+                onBlur=${commitName}
+                onKeyDown=${(e) => { if (e.key === 'Enter') e.target.blur(); }} />
+            </label>
+            <p className="pcb-note" style=${{ marginTop: 8 }}>
+              What the downloads are called. The Gerber zip becomes
+              ${' '}<code>${projName}-gerber.zip</code>, and every file inside it, the KiCad project and
+              the project JSON follow the same name.
+              ${doc.board.name && projName !== doc.board.name.trim()
+    ? ' Spaces and anything a file system or a fab’s CAM software might trip over are replaced,'
+      + ' which is why the name on disk reads differently from what you typed.' : ''}
+              ${!doc.board.name ? ' Leave it empty and the boards keep the old generic name.' : ''}
+            </p>
+            <div className="pcb-row" style=${{ marginTop: 10 }}>
+              <!-- The same control as on the export tab, deliberately in both
+                   places: loading a saved board is the first thing you do in a
+                   session, and the export tab is the last tab in the strip. -->
+              <button type="button" className="tool-btn" onClick=${() => jsonRef.current && jsonRef.current.click()}>${ToolIcons.el('upload')}Load project JSON</button>
+            </div>
+          </div>
+          <div className="ctl-sec">
             <p className="ctl-sec-h">Board size</p>
             <div className="pcb-fields">
               <${NumField} label="Width (mm)" value=${boardDraft.w} step="1" min=${5}
@@ -16345,7 +16736,9 @@ var PCB = (function () {
             sets the current and the board has no say in it. A check that can never fail would only
             manufacture confidence, which is why this is not offered as one. The picture earns its place on
             its own: it shows which parts of a large area do nothing, and how a narrow neck concentrates what
-            passes through it, and neither of those is visible any other way.</p>
+            passes through it, and neither of those is visible any other way. The third view there, the
+            mesh, is the disclaimer made visible: the field is solved on a grid of five cells per
+            millimetre, and anything thinner than a few cells is a shape the solver is guessing at.</p>
         <//>`)}
         <div className="pcb-split pcb-split-wide">
           <div>
@@ -16358,12 +16751,30 @@ var PCB = (function () {
             ${checkSide === 'back' && checkOverlay === 'flow' ? html`<div className="pcb-row"
               style=${{ marginBottom: 8 }}>
               <select value=${String(fieldPath)} disabled=${!flowPaths.length}
-                onChange=${(e) => setFieldPath(+e.target.value)}
+                onChange=${(e) => {
+    const v = e.target.value;
+    setFieldPath(v);
+    /* The potential has no meaning across the sum, so a switch to all paths
+       carries the view over to the density rather than showing an empty
+       picture and leaving somebody to work out why. */
+    if (v === 'all' && fieldMap === 'potential') setFieldMap('density');
+  }}
                 style=${{ margin: 0, width: 'auto', fontSize: '0.8rem' }}>
+                <option value="all">All paths at once</option>
                 ${flowPaths.map((pa, i) => html`<option key=${i} value=${String(i)}>
                   ${pa.net + ': ' + pa.what}</option>`)}
               </select>
-              <${Seg} value=${fieldMap} onChange=${setFieldMap} options=${FIELD_MAP_OPTS} />
+              <${Seg} value=${fieldMap} onChange=${setFieldMap}
+                options=${fieldPath === 'all'
+    ? FIELD_MAP_OPTS.map((o) => (o.v === 'potential'
+      ? Object.assign({}, o, { disabled: true, title: 'Only for a single path. Each path has its own pair of electrodes, so there is no one voltage across the sum of them.' })
+      : o))
+    : FIELD_MAP_OPTS} />
+              ${fieldMap === 'density' ? html`<${Seg} value=${fieldScale}
+                onChange=${setFieldScale} options=${FIELD_SCALE_OPTS} />` : null}
+              ${fieldMap === 'mesh' ? null : html`<${Seg} value=${activeRamp}
+                onChange=${(v) => setFieldRamp(Object.assign({}, fieldRamp, { [fieldMap]: v }))}
+                options=${FIELD_RAMP_OPTS} />`}
             </div>` : null}
             <${BoardCanvas} bw=${bw} bh=${bh} mirror=${checkSide === 'back'} fill=${true}
               view=${view} onView=${mouseView}
@@ -16433,17 +16844,52 @@ var PCB = (function () {
                   Nothing to solve yet: this needs a battery, a button and at least one LED placed.</p>`
     : fieldBusy ? html`<p className="pcb-note">Solving the field.</p>`
     : !fieldRes ? html`<p className="pcb-note">
-                  That pair of pads is not on one piece of copper, so there is no field to solve. The
-                  connectivity report below says why.</p>`
+                  ${fieldPath === 'all'
+    ? 'None of the paths could be solved: no pad pair sits on one piece of copper. The connectivity report below says why.'
+    : 'That pair of pads is not on one piece of copper, so there is no field to solve. The connectivity report below says why.'}</p>`
     : html`<${React.Fragment}>
+                  <!-- The all-paths read-out cannot quote a resistance from one
+                       pad to another, because there is no such pair any more.
+                       What it quotes instead is how many paths went into the
+                       sum and what current each was given, since that IS the
+                       modelling assumption and hiding it would make the
+                       picture look more authoritative than it is. -->
+                  ${fieldRes.all ? html`<${React.Fragment}>
                   <p className="pcb-note">
+                    ${fieldRes.solvedCount} of ${fieldRes.pathCount} paths solved and added up, over
+                    ${' ' + fieldRes.width + ' by ' + fieldRes.height} cells
+                    at ${fieldRes.pxPerMm} per mm. The busiest patch carries
+                    ${' ' + fieldRes.peakAmpPerMm.toFixed(3)} A per mm of width.
+                    One ounce copper, ${fieldRes.sheetMilliOhmSq.toFixed(2)} milliohms per square.
+                    ${fieldRes.skippedCount
+    ? ' ' + fieldRes.skippedCount + ' path' + (fieldRes.skippedCount === 1 ? ' was' : 's were')
+      + ' left out because the two pads are not on one piece of copper.'
+    : ''}
+                  </p>
+                  <p className="pcb-note">
+                    The copper is linear, so the whole circuit is exactly the sum of the single paths,
+                    as long as each one is given the current it really carries. Each LED branch gets
+                    20 mA and the stretch from the battery to the button gets the sum of them, because
+                    the LEDs drop nearly the whole cell voltage while the copper drops microvolts: the
+                    branches do not compete for it, so the split is Kirchhoff at the button and nothing
+                    else. The gradients are added as vectors before the magnitude is taken, so two
+                    currents crossing at an angle do not add up to more than they are.
+                  </p>
+                  <p className="pcb-note">
+                    Equal current per LED is the shakier half of that. Real LEDs off one reel differ
+                    enough in forward voltage that parallel branches do not share evenly, which is why
+                    paralleling them on one resistor is bad practice to begin with. For a picture of
+                    which copper is busy it does not matter; for a prediction of what any one LED
+                    draws, it would.
+                  </p>
+                  <//>` : html`<p className="pcb-note">
                     ${fieldRes.rMilliOhm.toFixed(1)} milliohms from one pad to the other, over
                     ${' ' + fieldRes.width + ' by ' + fieldRes.height} cells
                     at ${fieldRes.pxPerMm} per mm. At 20 mA that is
                     ${' ' + fieldRes.dropMilliVolt.toFixed(2)} mV dropped in the copper, and the
                     busiest patch carries ${fieldRes.peakAmpPerMm.toFixed(3)} A per mm of width.
                     One ounce copper, ${fieldRes.sheetMilliOhmSq.toFixed(2)} milliohms per square.
-                  </p>
+                  </p>`}
                   <!-- The convergence line is not decoration. The first version
                        of this solver used Gauss-Seidel and silently did not
                        converge, and the numbers still looked plausible: the two
@@ -16453,23 +16899,76 @@ var PCB = (function () {
                   <p className="pcb-note">
                     <span className="pcb-dot" style=${{ background: fieldRes.converged
       ? 'var(--tool-sig-good)' : 'var(--tool-sig-warn)' }}></span>
-                    ${fieldRes.converged
+                    ${fieldRes.all
+      ? (fieldRes.converged
+        ? 'Every one of the ' + fieldRes.solvedCount + ' solves converged, and in each the current leaving one pad and the current arriving at the other agree. That is the check that the fields being added are actually solved.'
+        : 'At least one of the ' + fieldRes.solvedCount + ' solves did not converge: its two electrode currents disagree. Read the picture as a sketch, not as a measurement, and look at the single paths to find which one.')
+      : fieldRes.converged
       ? 'Converged in ' + fieldRes.iterations + ' iterations. The current leaving one pad and the current arriving at the other agree, which is the check that the field is actually solved.'
       : 'Did NOT converge in ' + fieldRes.iterations + ' iterations: the two electrode currents disagree by ' + (fieldRes.balance * 100).toFixed(1) + ' per cent. Read the picture as a sketch, not as a measurement.'}
                   </p>
-                  <div className="fold-body" style=${{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
-                    <span className="pcb-note" style=${{ margin: 0 }}>
-                      ${fieldMap === 'potential' ? fieldRes.to : 'none'}</span>
-                    <span style=${{ flex: 1, height: 10, borderRadius: 2, border: '1px solid var(--tool-border)',
-      background: 'linear-gradient(to right, ' + [0, 0.25, 0.5, 0.75, 1]
-        .map((t) => 'rgb(' + fieldColor(fieldMap, t).join(',') + ')').join(', ') + ')' }}></span>
-                    <span className="pcb-note" style=${{ margin: 0 }}>
-                      ${fieldMap === 'potential' ? fieldRes.from : 'busiest'}</span>
-                  </div>
+                  <!-- The legend, with numbers on it. A bare ramp says which
+                       end is more without saying more WHAT, and this view is
+                       the one place on the tab where somebody will want to
+                       read a value off the picture rather than off a sentence.
+
+                       Five ticks at even positions ALONG THE BAR, not at even
+                       values: the bar is what is being read, so the labels
+                       have to sit where the eye lands. The value at each tick
+                       is the scale inverted, which is why FIELD_SCALES carries
+                       both directions. On a log bar that puts the ticks at
+                       four orders of magnitude, which looks lopsided and is
+                       correct.
+
+                       The potential bar is labelled in millivolts rather than
+                       in the solver's 0 to 1, because volts across the copper
+                       is the thing anybody wants; the field carries an
+                       arbitrary 1 V, so the drop at 20 mA is the scale. -->
+                  ${fieldMap === 'mesh' ? html`<div className="fold-body" style=${{ marginTop: 6 }}>
+                    <div style=${{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      ${(fieldRes.all
+    ? [['rgb(56,96,138)', 'copper the solver owns']]
+    : [['rgb(56,96,138)', 'free copper'], ['rgb(248,250,252)', 'held at ' + fieldRes.from],
+      ['rgb(100,116,139)', 'held at ' + fieldRes.to]]).map(([col, lab]) => html`
+                        <span key=${lab} className="pcb-note" style=${{ margin: 0, display: 'flex',
+    alignItems: 'center', gap: 5 }}>
+                          <span style=${{ width: 11, height: 11, borderRadius: 2, background: col,
+    border: '1px solid var(--tool-border)', display: 'inline-block' }}></span>${lab}</span>`)}
+                    </div>
+                  </div>` : html`<div className="fold-body" style=${{ marginTop: 6 }}>
+                    <div style=${{ height: 10, borderRadius: 2, border: '1px solid var(--tool-border)',
+    background: 'linear-gradient(to right, ' + [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]
+      .map((t) => 'rgb(' + fieldColor(activeRamp, t).join(',') + ')').join(', ') + ')' }}></div>
+                    <div style=${{ display: 'flex', justifyContent: 'space-between', marginTop: 3 }}>
+                      ${[0, 0.25, 0.5, 0.75, 1].map((t, ti) => {
+    const val = fieldMap === 'density'
+      ? fieldScaleFrom(fieldScale, t) * fieldRes.peakAmpPerMm
+      : t * fieldRes.dropMilliVolt;
+    const txt = fieldMap === 'density'
+      ? (val >= 0.1 ? val.toFixed(2) : val >= 0.001 ? val.toFixed(3) : val > 0 ? val.toExponential(0) : '0')
+      : val.toFixed(3);
+    return html`<span key=${ti} className="pcb-mono" style=${{ fontSize: 10,
+      color: 'var(--tool-faint)', flex: ti === 0 || ti === 4 ? '0 0 auto' : '1 1 0',
+      textAlign: ti === 0 ? 'left' : ti === 4 ? 'right' : 'center' }}>${txt}</span>`;
+  })}
+                    </div>
+                    <p className="pcb-note" style=${{ marginTop: 2 }}>
+                      ${fieldMap === 'density'
+    ? 'Amps per millimetre of copper width, at 20 mA through the net.'
+    : 'Millivolts above ' + fieldRes.to + ', at 20 mA through the net. The full range is '
+      + fieldRes.dropMilliVolt.toFixed(3) + ' mV, from ' + fieldRes.to + ' to ' + fieldRes.from + '.'}
+                    </p>
+                  </div>`}
                   <p className="pcb-note" style=${{ marginTop: 6 }}>
                     ${fieldMap === 'potential'
-      ? 'A contour line every tenth of the voltage. Where the lines crowd together the current is being squeezed through a narrow place; where the colour barely changes over a wide area, that copper is carrying almost nothing.'
-      : 'Square-root scale, because the peak sits in a thin ring at the pad edge and a linear scale would make everything else look black.'}
+      ? 'The voltage across the copper. Where the colour changes fast over a short distance the current is being squeezed through a narrow place; where it barely changes over a wide area, that copper is carrying almost nothing.'
+      : fieldMap === 'mesh'
+      ? 'One square per solver cell, at ' + fieldRes.pxPerMm + ' cells per millimetre, which is what every number above is really a statement about. The copper is majority-voted down to this grid from the 20 per mm plane the rest of the tab uses, so a neck two cells wide is a neck the solver only half believes in, and a staircased edge here is a staircase in the arithmetic rather than in your board.'
+      : fieldScale === 'sqrt'
+      ? 'Square-root scale, because the peak sits in a thin ring at the pad edge and a linear scale would make everything else look black. No free parameter, and half the peak still reads as half.'
+      : fieldScale === 'log'
+      ? 'Logarithmic over four decades below the peak. The floor is arbitrary and has to be: the density really is zero in the dead corners of a pour, and log has nothing to say about zero. Anything quieter than a ten-thousandth of the peak is pinned to the bottom of the ramp.'
+      : 'Linear, which is the truthful scale and usually the useless one: the near-singular ring where the electrode meets the copper takes almost the whole range, so everything else reads as black.'}
                   </p>
                   <!-- The honest framing, and it belongs next to the numbers
                        rather than in the fold at the top of the tab, because
@@ -16669,8 +17168,6 @@ var PCB = (function () {
           <button type="button" className="tool-btn" disabled=${!derived} onClick=${exportKicad}>${ToolIcons.el('download')}Download KiCad project</button>
           <button type="button" className="tool-btn" onClick=${exportJson}>${ToolIcons.el('download')}Download project JSON</button>
           <button type="button" className="tool-btn" onClick=${() => jsonRef.current && jsonRef.current.click()}>${ToolIcons.el('upload')}Load project JSON</button>
-          <input ref=${jsonRef} type="file" accept="application/json,.json" style=${{ display: 'none' }}
-            onChange=${(e) => { loadJson(e.target.files && e.target.files[0]); e.target.value = ''; }} />
         </div>
         <p className="pcb-status">
           The Gerber zip holds one file per layer plus an Excellon drill file, written to the KiCad 9 conventions Aisler and
@@ -16686,6 +17183,12 @@ var PCB = (function () {
 
     return html`<div className="pcb-wrap"><div className="pcb-inner">
       <h1 className="pcb-h1">PCB Art Designer</h1>
+      <!-- Outside the tab body on purpose. Two tabs offer "Load project JSON"
+           and a hidden input living in one of them is unmounted while the other
+           is showing, so the button there would click a null ref. One input,
+           always mounted, both buttons reach it. -->
+      <input ref=${jsonRef} type="file" accept="application/json,.json" style=${{ display: 'none' }}
+        onChange=${(e) => { loadJson(e.target.files && e.target.files[0]); e.target.value = ''; }} />
       ${restoreBar}
       ${tabStrip}
       <div className="pcb-stage">${body}${tabHelp}</div>
