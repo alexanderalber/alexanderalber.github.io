@@ -7149,6 +7149,12 @@ var PCB = (function () {
       etchPolys: etchPolys,
       owner: { data: owner, width: w, height: h, pxPerMm: px },
       copper: { data: copper, width: w, height: h, pxPerMm: px },
+      /* The milled channel as a plane, for the check tab to draw. It cannot be
+         recovered from the two planes above: by the time they are returned,
+         `copper` has already had the etch taken out of it, so `copper && owner
+         < 0` is empty everywhere. Handing the mask over is the only honest way
+         to let a view show the same area the fab will remove. */
+      etch: { data: etch, width: w, height: h, pxPerMm: px },
       nets: nets.order,
       netIndex: netIndex,
       netStats: netStats,
@@ -7602,7 +7608,12 @@ var PCB = (function () {
     var src = sol.owner, sw = src.width, sh = src.height, spx = src.pxPerMm;
     var want = opts.pxPerMm == null ? FIELD_PX_PER_MM : +opts.pxPerMm;
     var f = Math.max(1, Math.round(spx / want));
-    var ds = downsampleOwner(src.data, sw, sh, f);
+    /* The caller may hand the downsample in. It depends only on the owner
+       plane and the factor, not on which pair of pads is being solved, so
+       solving every path in turn recomputed the identical majority vote over
+       640k pixels once per path. That was most of the cost of the all-paths
+       view and none of its answer. */
+    var ds = (opts.ds && opts.ds.factor === f) ? opts.ds : downsampleOwner(src.data, sw, sh, f);
     var w = ds.width, h = ds.height, px = spx / f;
 
     var pads = docPads(doc), polys = docPadPolys(doc);
@@ -7755,6 +7766,18 @@ var PCB = (function () {
     var amps = opts.currentA == null ? 0.02 : +opts.currentA;
     var weights = pathCurrents(paths, amps);
 
+    /* The majority-vote downsample once for all of them. It is the same
+       arithmetic for every path, and at 20 px/mm on a real board it was the
+       single biggest cost of this view. */
+    var ds0 = null;
+    if (opts.solution && opts.solution.owner) {
+      var so = opts.solution.owner;
+      var wantPx = opts.pxPerMm == null ? FIELD_PX_PER_MM : +opts.pxPerMm;
+      var f0 = Math.max(1, Math.round(so.pxPerMm / wantPx));
+      ds0 = downsampleOwner(so.data, so.width, so.height, f0);
+    }
+    var sub = ds0 ? Object.assign({}, opts, { ds: ds0 }) : opts;
+
     var parts = [], gx = null, gy = null, w = 0, h = 0, px = 0, rsq = 0;
     var owned = null, skipped = 0, i, k;
 
@@ -7762,7 +7785,7 @@ var PCB = (function () {
       var pa = paths[pi];
       var f = null;
       try {
-        f = currentField(doc, pa.net, pa.from, pa.to, opts);
+        f = currentField(doc, pa.net, pa.from, pa.to, sub);
       } catch (e) { f = null; }
       if (!f) { skipped++; parts.push(null); continue; }
       parts.push(f);
@@ -10272,6 +10295,69 @@ var PCB = (function () {
     }
     g.putImageData(img, 0, 0);
     return { canvas: c, wMm: R.width / R.pxPerMm, hMm: R.height / R.pxPerMm };
+  }
+
+  /* The isolation zone: the copper that was milled away so the nets do not
+     touch. Drawn as a filled area on every view of the check tab, because on
+     the flow overlay it was effectively invisible.
+
+     That is not a contrast tweak, it is the overlay covering it up. The field
+     is painted at alpha 225 over the whole net, so where two nets meet, the
+     only thing left of the channel between them is the seam between two
+     colours, and when the two happen to be a similar colour the seam is gone.
+     The channel is the single most important line on this tab, since it is
+     what makes the nets separate nets, so it is drawn on top instead of being
+     left to show through from below.
+
+     The zone is the solver's own `etch` plane, handed over for exactly this.
+     It is deliberately NOT recomputed here as `copper && owner < 0`: that
+     looks like the definition and is empty, because by the time the solver
+     returns, the etch has already been taken out of `copper`, so the two
+     planes agree everywhere and their difference is nothing. Drawing the
+     solver's own mask is also the only way this cannot drift from what the
+     fab actually removes.
+
+     The downsample is an OR over the block and NOT a sample, which is the
+     whole reason this does not reuse islandOverlay's `at`. At 20 px/mm a
+     0.4 mm channel is eight pixels wide; sampling every third pixel drops
+     parts of it, and the parts most likely to be dropped are the narrowest
+     ones, which are the ones somebody is looking for. An OR can only ever
+     make a thin channel look one pixel too WIDE, and erring towards visible is
+     the right direction for a warning. */
+  const ETCH_MAX = 1600;
+  function etchOverlay(sol) {
+    if (!sol || !sol.etch || !sol.etch.data) return null;
+    const C = sol.etch;
+    const step = Math.max(1, Math.ceil(Math.max(C.width, C.height) / ETCH_MAX));
+    const w = Math.max(1, Math.floor(C.width / step));
+    const h = Math.max(1, Math.floor(C.height / step));
+    const c = scratch(w, h);
+    const g = c.getContext('2d');
+    const img = g.createImageData(w, h);
+    const d = img.data;
+    /* Near-black in the light skin and in the dark ones alike: the zone is an
+       absence of metal, and every board render behind it is either soldermask
+       or bare copper, both of which are lighter than this. One colour rather
+       than a theme variable for the same reason the field ramps are not theme
+       colours: what it has to stand out against is the render, not the page. */
+    const col = COL.grey ? [226, 232, 240] : [8, 14, 24];
+    const alpha = COL.grey ? 235 : 245;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let on = 0;
+        const y1 = Math.min(C.height, (y + 1) * step), x1 = Math.min(C.width, (x + 1) * step);
+        for (let sy = y * step; sy < y1 && !on; sy++) {
+          for (let sx = x * step; sx < x1; sx++) {
+            if (C.data[sy * C.width + sx]) { on = 1; break; }
+          }
+        }
+        if (!on) continue;
+        const o = (y * w + x) * 4;
+        d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = alpha;
+      }
+    }
+    g.putImageData(img, 0, 0);
+    return { canvas: c, wMm: C.width / C.pxPerMm, hMm: C.height / C.pxPerMm };
   }
 
   function decodeViaImg(file) {
@@ -12998,11 +13084,19 @@ var PCB = (function () {
     const [drcBusy, setDrcBusy] = useState(false);
     const [checkSide, setCheckSide] = useState('back');
     const [checkOverlay, setCheckOverlay] = useState('islands');
-    /* 'all' rather than an index, and it is the default: the question somebody
-       arrives with is where the copper is busy, not what one pad pair does.
-       Kept as a string so the select can carry both without a sentinel. */
-    const [fieldPath, setFieldPath] = useState('all');
-    const [fieldMap, setFieldMap] = useState('density');
+    /* Kept as a string so the select can carry both the 'all' entry and an
+       index without a sentinel.
+
+       NOT defaulting to 'all', although the question somebody arrives with
+       really is where the copper is busy. All paths means one conjugate
+       gradient solve per path, and the cost is set by the board area rather
+       than by the path count: measured on a plain square board, seven paths
+       take about one second at 40 mm and over three at 60 mm, and a real
+       board with a graphic on it took five and a half. That is a tab switch
+       that blocks, and the tab has to come back. So the cheap view opens and
+       the expensive one is a deliberate pick. */
+    const [fieldPath, setFieldPath] = useState('0');
+    const [fieldMap, setFieldMap] = useState('potential');
     /* The ramp is remembered per quantity rather than globally, because the
        right default differs between them and a shared pick would silently
        override one of the two. null means "whatever this map defaults to". */
@@ -14747,6 +14841,11 @@ var PCB = (function () {
     /* Repainted on a colormap change and on a skin change, solved only on the
        dependencies above: the ramps are not theme colours, but the grey skin
        still has to be able to drop the overlay, so themeTick stays in. */
+    /* Solved once per partition and repainted on a skin change, like the
+       islands: it is a property of the copper, not of the view on top of it. */
+    const etchPic = useMemo(
+      () => (solution ? etchOverlay(solution) : null), [solution, themeTick]);
+
     const fieldPic = useMemo(
       () => (checkOverlay === 'flow' && fieldRes
         ? fieldOverlay(fieldRes, fieldMap, { ramp: activeRamp, scale: fieldScale })
@@ -15448,6 +15547,19 @@ var PCB = (function () {
        picture. Nearest neighbour is deliberately NOT forced off: the field is
        smooth, so the browser's bilinear filter is doing the right thing when it
        makes the ramp continuous between cells. */
+    /* Under the pads and the markers, over everything else: the zone is part of
+       the board, not an annotation on top of one. */
+    function drawEtch(ctx, V, dpr) {
+      if (!etchPic) return;
+      const c = V.toPx(etchPic.wMm / 2, etchPic.hMm / 2);
+      const w = etchPic.wMm * V.k, h = etchPic.hMm * V.k;
+      ctx.save();
+      ctx.translate(c[0], c[1]);
+      if (V.mirror) ctx.scale(-1, 1);
+      ctx.drawImage(etchPic.canvas, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+
     function drawField(ctx, V, dpr) {
       if (!fieldPic) return;
       const c = V.toPx(fieldPic.wMm / 2, fieldPic.hMm / 2);
@@ -16760,7 +16872,7 @@ var PCB = (function () {
     if (v === 'all' && fieldMap === 'potential') setFieldMap('density');
   }}
                 style=${{ margin: 0, width: 'auto', fontSize: '0.8rem' }}>
-                <option value="all">All paths at once</option>
+                <option value="all">All paths at once (slow)</option>
                 ${flowPaths.map((pa, i) => html`<option key=${i} value=${String(i)}>
                   ${pa.net + ': ' + pa.what}</option>`)}
               </select>
@@ -16781,14 +16893,16 @@ var PCB = (function () {
               draw=${(ctx, V, W, H, dpr) => {
                 drawFrame(ctx, V, dpr);
                 if (derived) renderSide(ctx, W, H, derived, checkSide, V, fab);
+                if (checkSide === 'back' && checkOverlay === 'flow') drawField(ctx, V, dpr);
+                /* After the field, so the channel survives an overlay drawn at
+                   alpha 225 over the whole net; before the pads and the
+                   markers, which have to stay on top of everything. */
+                if (checkSide === 'back') drawEtch(ctx, V, dpr);
                 if (checkSide === 'back' && showIslands) {
                   drawIslands(ctx, V, dpr);
                   drawIslandPads(ctx, V, dpr);
                 }
-                if (checkSide === 'back' && checkOverlay === 'flow') {
-                  drawField(ctx, V, dpr);
-                  drawFieldPads(ctx, V, dpr);
-                }
+                if (checkSide === 'back' && checkOverlay === 'flow') drawFieldPads(ctx, V, dpr);
                 drawMarks(ctx, V, dpr, checkSide);
               }} />
             ${viewBar}
@@ -16856,7 +16970,9 @@ var PCB = (function () {
                        picture look more authoritative than it is. -->
                   ${fieldRes.all ? html`<${React.Fragment}>
                   <p className="pcb-note">
-                    ${fieldRes.solvedCount} of ${fieldRes.pathCount} paths solved and added up, over
+                    ${fieldRes.solvedCount} of ${fieldRes.pathCount} paths solved and added up, one
+                    conjugate gradient solve each, which is why this one takes seconds rather than
+                    the moment a single path takes. Over
                     ${' ' + fieldRes.width + ' by ' + fieldRes.height} cells
                     at ${fieldRes.pxPerMm} per mm. The busiest patch carries
                     ${' ' + fieldRes.peakAmpPerMm.toFixed(3)} A per mm of width.
