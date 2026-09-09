@@ -6,10 +6,10 @@
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Quap Lab - Bayesian Model Fitting in the Browser</title>
-  <meta name="description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation. Posterior summaries, prior and posterior predictive simulation, WAIC and PSIS-LOO. Nothing leaves the browser.">
+  <meta name="description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, prior and posterior predictive simulation, WAIC and PSIS-LOO. Nothing leaves the browser.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
   <meta property="og:title" content="Quap Lab - Bayesian Model Fitting in the Browser">
-  <meta property="og:description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation. Posterior summaries, predictive simulation, WAIC and PSIS-LOO.">
+  <meta property="og:description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, predictive simulation, WAIC and PSIS-LOO.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -24,7 +24,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Quap Lab",
-    "description": "Fits Bayesian models written as a formula list by quadratic approximation of the posterior, entirely in the browser.",
+    "description": "Fits Bayesian models written as a formula list, by quadratic approximation of the posterior or by Hamiltonian Monte Carlo, entirely in the browser.",
     "url": "https://alber.me/miscellaneous/tools/bayes-rethinking.html",
     "applicationCategory": "UtilitiesApplication",
     "inLanguage": "en",
@@ -127,7 +127,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Quap Lab</h1>
-        <p style="color:var(--tool-label);max-width:70ch">Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. The posterior is approximated by a Gaussian at its mode, which is fast, honest about its own limits, and enough for a surprising number of real models.</p>
+        <p style="color:var(--tool-label);max-width:70ch">Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. Either by a Gaussian at the posterior mode, which is fast and honest about its own limits, or by Hamiltonian Monte Carlo, which makes no assumption about the shape at all.</p>
         <ul style="color:var(--tool-label);max-width:70ch">
           <li>A formula list with <code>~</code> for stochastic and <code>&lt;-</code> for deterministic relations, twelve distributions.</li>
           <li>Posterior summaries with compatibility intervals, plus a grid cross-check that says when the approximation is off.</li>
@@ -2299,6 +2299,768 @@
       };
     }
 
+
+    /* ================================================================
+       NUTS: the No-U-Turn Sampler
+
+       The other way to get a posterior out of this tool, and the honest one
+       where quadratic approximation stops being defensible. Everything it needs
+       was already here: the target lives on an unconstrained scale, so a
+       Hamiltonian trajectory never has to be told about a boundary, and the
+       gradient is exact and cheap since the tape landed.
+
+       The variant implemented is the one from the Stan reference manual, not the
+       slice-sampling construction of Hoffman and Gelman's original paper. Two
+       differences matter in practice. Selection along the trajectory is
+       multinomial, weighted by exp(-H), rather than uniform over a slice, which
+       uses the whole trajectory instead of the part that happens to clear a
+       threshold. And the U-turn test is applied not only to the full tree but
+       also across the merge boundary of every subtree, which catches a turn that
+       the outermost test alone would walk straight through.
+
+       On "divergent" below: it is not a crash. The leapfrog integrator conserves
+       energy up to its own truncation error, so a large energy error means the
+       step size was too big for the local curvature, usually in a funnel. Such a
+       trajectory is stopped and the transition counted, because the count is the
+       diagnostic. A run with divergences is not a run with slightly worse
+       numbers, it is a run whose geometry the sampler did not manage to explore,
+       and the count is the only warning it will ever produce.
+       ================================================================ */
+
+    function logAddExp(a, b) {
+      if (a === -Infinity) return b;
+      if (b === -Infinity) return a;
+      var m = a > b ? a : b;
+      return m + Math.log(Math.exp(a - m) + Math.exp(b - m));
+    }
+
+    /* One leapfrog step, in place on q, p and grad. `inv` is the diagonal
+       metric, that is the estimated posterior variance per coordinate, so the
+       kinetic energy is 0.5 * sum(inv[i] * p[i]^2) and dK/dp = inv * p.
+
+       Returns the log density at the new point, or -Infinity if the step left
+       the support. The caller turns that into an infinite energy, which the
+       divergence test then catches, so a step off the edge needs no special
+       case anywhere above this line. */
+    function leapfrog(model, q, p, grad, eps, inv, gbuf) {
+      var P = q.length, i;
+      for (i = 0; i < P; i++) p[i] += 0.5 * eps * grad[i];
+      for (i = 0; i < P; i++) q[i] += eps * inv[i] * p[i];
+      var lp = model.logp(q);
+      if (!isFinite(lp)) return -Infinity;
+      model.grad(q, gbuf);
+      for (i = 0; i < P; i++) {
+        if (!isFinite(gbuf[i])) return -Infinity;
+        grad[i] = gbuf[i];
+      }
+      for (i = 0; i < P; i++) p[i] += 0.5 * eps * grad[i];
+      return lp;
+    }
+
+    function kinetic(p, inv) {
+      var s = 0;
+      for (var i = 0; i < p.length; i++) s += inv[i] * p[i] * p[i];
+      return 0.5 * s;
+    }
+
+    /* The U-turn criterion, taken in the metric. The momenta are contracted
+       through the same inverse metric that defines the kinetic energy;
+       otherwise a coordinate with a large scale dominates the dot product and
+       the trajectory keeps going long after it has turned. */
+    function uTurn(qMinus, pMinus, qPlus, pPlus, inv) {
+      var P = qMinus.length, dMinus = 0, dPlus = 0;
+      for (var i = 0; i < P; i++) {
+        var d = qPlus[i] - qMinus[i];
+        dMinus += d * inv[i] * pMinus[i];
+        dPlus += d * inv[i] * pPlus[i];
+      }
+      return dMinus < 0 || dPlus < 0;
+    }
+
+    /* Recursive tree building.
+
+       Returns a subtree summary: both ends with their momenta and gradients, the
+       candidate drawn from within it, the log of its total weight relative to
+       H0, whether it turned or diverged, and the running sums for the acceptance
+       statistic that dual averaging consumes.
+
+       The recursion is depth first and doubles at each level, so a tree of depth
+       d costs 2^d leapfrog steps while holding only d subtree ends at a time.
+       That is the whole reason NUTS is affordable: it never stores the
+       trajectory it built. */
+    function buildTree(model, q, p, grad, dir, depth, eps, inv, H0, rng, work) {
+      if (depth === 0) {
+        var q1 = Float64Array.from(q), p1 = Float64Array.from(p), g1 = Float64Array.from(grad);
+        var lp = leapfrog(model, q1, p1, g1, dir * eps, inv, work.gbuf);
+        var H = isFinite(lp) ? -lp + kinetic(p1, inv) : Infinity;
+        /* The energy error is measured against the start of the whole
+           trajectory, not against the previous leaf. Both the acceptance
+           statistic and the divergence test are defined that way. */
+        var dE = H0 - H;
+        work.nLeapfrog++;
+        return {
+          qm: q1, pm: p1, gm: g1, qp: q1, pp: p1, gp: g1,
+          qs: q1, gs: g1, lps: lp,
+          logW: isFinite(H) ? -H + H0 : -Infinity,
+          diverged: !(dE > -work.maxDeltaH),
+          turned: false,
+          sumAcc: isFinite(dE) ? Math.min(1, Math.exp(dE)) : 0, nAcc: 1
+        };
+      }
+      var a = buildTree(model, q, p, grad, dir, depth - 1, eps, inv, H0, rng, work);
+      if (a.diverged || a.turned) return a;
+      /* Continue from whichever end of the first subtree points outward. */
+      var fq = dir < 0 ? a.qm : a.qp, fp = dir < 0 ? a.pm : a.pp, fg = dir < 0 ? a.gm : a.gp;
+      var b = buildTree(model, fq, fp, fg, dir, depth - 1, eps, inv, H0, rng, work);
+      var out = {
+        qm: dir < 0 ? b.qm : a.qm, pm: dir < 0 ? b.pm : a.pm, gm: dir < 0 ? b.gm : a.gm,
+        qp: dir < 0 ? a.qp : b.qp, pp: dir < 0 ? a.pp : b.pp, gp: dir < 0 ? a.gp : b.gp,
+        qs: a.qs, gs: a.gs, lps: a.lps,
+        logW: logAddExp(a.logW, b.logW),
+        diverged: a.diverged || b.diverged,
+        turned: a.turned || b.turned,
+        sumAcc: a.sumAcc + b.sumAcc, nAcc: a.nAcc + b.nAcc
+      };
+      /* Multinomial selection between the two halves: the merged tree's
+         candidate is the second half's with probability W_b / (W_a + W_b). */
+      if (isFinite(b.logW) && Math.log(rng()) < b.logW - out.logW) {
+        out.qs = b.qs; out.gs = b.gs; out.lps = b.lps;
+      }
+      if (!out.diverged && !out.turned) {
+        /* Three U-turn tests. The first is the merged subtree end to end. The
+           other two straddle the boundary between the halves, comparing the
+           leftmost point against the rightmost momentum of the merge and the
+           other way round. A turn that happens across that seam is invisible to
+           the outer test alone, and leaving these two out is the standard way
+           this algorithm ends up subtly wrong rather than broken. */
+        /* Name the two halves in TRAJECTORY order, not in the order they
+           were built: when dir is negative the subtree built second is the left
+           one. Everything below reads in that order, which is the only way these
+           three tests stay legible. */
+        var L = dir < 0 ? b : a, R = dir < 0 ? a : b;
+        var turned = uTurn(out.qm, out.pm, out.qp, out.pp, inv);
+        /* Left end of the merged tree against the INNER end of the right half. */
+        if (!turned) turned = uTurn(out.qm, out.pm, R.qm, R.pm, inv);
+        /* Inner end of the left half against the right end of the merged tree. */
+        if (!turned) turned = uTurn(L.qp, L.pp, out.qp, out.pp, inv);
+        out.turned = turned;
+      }
+      return out;
+    }
+
+    /* A reasonable first step size: double or halve until the energy error of a
+       single step crosses log(0.8). Without it dual averaging spends its first
+       hundred iterations merely finding the right order of magnitude. */
+    function findEpsilon(model, q0, inv, rng, gbuf) {
+      var P = q0.length, eps = 1, i;
+      var lp0 = model.logp(q0);
+      if (!isFinite(lp0)) return 1;
+      var g0 = model.grad(q0, new Float64Array(P));
+      var p0 = new Float64Array(P);
+      for (i = 0; i < P; i++) p0[i] = rnorm1(rng) / Math.sqrt(inv[i]);
+      var H0 = -lp0 + kinetic(p0, inv);
+
+      var step = function (e) {
+        var q = Float64Array.from(q0), g = Float64Array.from(g0), p = Float64Array.from(p0);
+        var lp = leapfrog(model, q, p, g, e, inv, gbuf);
+        var H = isFinite(lp) ? -lp + kinetic(p, inv) : Infinity;
+        return H0 - H;
+      };
+      var dE = step(eps);
+      var dir = (isFinite(dE) && dE > Math.log(0.8)) ? 1 : -1;
+      for (var k = 0; k < 100; k++) {
+        var e2 = eps * (dir === 1 ? 2 : 0.5);
+        if (e2 > 1e7 || e2 < 1e-10) break;
+        var d2 = step(e2);
+        var better = dir === 1 ? (isFinite(d2) && d2 > Math.log(0.8)) : !(isFinite(d2) && d2 > Math.log(0.8));
+        eps = e2;
+        if (!better) break;
+      }
+      return eps;
+    }
+
+    /* Dual averaging, Nesterov as adapted by Hoffman and Gelman. Drives the
+       average acceptance statistic to `delta`, 0.8 by default: the value Stan
+       uses, and the one that trades step size against divergences sensibly for
+       a posterior that is not pathological. Raising it is the first thing to try
+       when divergences appear, which is why it is a control in the UI. */
+    function makeDualAvg(eps0, delta) {
+      return {
+        mu: Math.log(10 * eps0),
+        logEps: Math.log(eps0),
+        logEpsBar: 0,
+        Hbar: 0,
+        t: 0,
+        gamma: 0.05, t0: 10, kappa: 0.75, delta: delta,
+        update: function (acc) {
+          this.t++;
+          var eta = 1 / (this.t + this.t0);
+          this.Hbar = (1 - eta) * this.Hbar + eta * (this.delta - acc);
+          this.logEps = this.mu - Math.sqrt(this.t) / this.gamma * this.Hbar;
+          var w = Math.pow(this.t, -this.kappa);
+          this.logEpsBar = w * this.logEps + (1 - w) * this.logEpsBar;
+          return Math.exp(this.logEps);
+        },
+        finish: function () { return Math.exp(this.logEpsBar); }
+      };
+    }
+
+    /* Stan's three-phase warmup schedule. Phase I only finds the typical set,
+       phase II is a sequence of doubling windows in which the metric is
+       estimated, phase III re-tunes the step size against the final metric and
+       nothing else. Returns where phase II starts and the iteration indices at
+       which its windows close. */
+    function warmupWindows(nWarmup, initBuffer, termBuffer, baseWindow) {
+      var ib = initBuffer === undefined ? 75 : initBuffer;
+      var tb = termBuffer === undefined ? 50 : termBuffer;
+      var bw = baseWindow === undefined ? 25 : baseWindow;
+      if (nWarmup < ib + tb + bw) {
+        /* Too short for the full schedule. 15 / 75 / 10 percent with one single
+           window, which is what Stan falls back to in the same situation. */
+        ib = Math.max(1, Math.floor(0.15 * nWarmup));
+        tb = Math.max(1, Math.floor(0.1 * nWarmup));
+        bw = nWarmup - ib - tb;
+        if (bw < 1) return { start: nWarmup, ends: [] };
+        return { start: ib, ends: [ib + bw] };
+      }
+      var ends = [], next = ib + bw, w = bw;
+      for (var guard = 0; guard < 1000; guard++) {
+        if (next >= nWarmup - tb) break;
+        ends.push(next);
+        var nextW = w * 2;
+        /* If the next window would run past the terminal buffer, absorb the
+           remainder into this one rather than opening a stub. */
+        if (next + nextW >= nWarmup - tb) { ends[ends.length - 1] = nWarmup - tb; break; }
+        w = nextW; next = next + w;
+      }
+      if (!ends.length) ends.push(nWarmup - tb);
+      return { start: ib, ends: ends };
+    }
+
+    /* Welford, so the metric is estimated in one pass without keeping the warmup
+       draws around. */
+    function makeWelford(P) {
+      return {
+        n: 0, mean: new Float64Array(P), m2: new Float64Array(P),
+        add: function (x) {
+          this.n++;
+          for (var i = 0; i < this.mean.length; i++) {
+            var d = x[i] - this.mean[i];
+            this.mean[i] += d / this.n;
+            this.m2[i] += d * (x[i] - this.mean[i]);
+          }
+        },
+        variance: function () {
+          var P2 = this.mean.length, v = new Float64Array(P2), i;
+          if (this.n < 2) { for (i = 0; i < P2; i++) v[i] = 1; return v; }
+          for (i = 0; i < P2; i++) {
+            /* Stan's shrinkage towards one. With few draws the sample variance
+               of a coordinate can come out absurdly small, and a metric built on
+               that makes the next step size absurdly large. */
+            var s = this.m2[i] / (this.n - 1);
+            v[i] = (this.n / (this.n + 5)) * s + 1e-3 * (5 / (this.n + 5));
+            if (!isFinite(v[i]) || v[i] <= 0) v[i] = 1;
+          }
+          return v;
+        },
+        reset: function () {
+          this.n = 0;
+          this.mean = new Float64Array(this.mean.length);
+          this.m2 = new Float64Array(this.m2.length);
+        }
+      };
+    }
+
+    /* One chain. Returns the draws on the unconstrained scale plus everything
+       that has to be looked at before those draws may be believed. */
+    function nutsChain(model, opts) {
+      opts = opts || {};
+      var P = model.nPar, i;
+      var nWarmup = opts.warmup === undefined ? 1000 : opts.warmup;
+      var nSample = opts.iter === undefined ? 1000 : opts.iter;
+      var maxDepth = opts.maxDepth === undefined ? 10 : opts.maxDepth;
+      var delta = opts.adaptDelta === undefined ? 0.8 : opts.adaptDelta;
+      var maxDeltaH = opts.maxDeltaH === undefined ? 1000 : opts.maxDeltaH;
+      var seed = opts.seed === undefined ? 1 : opts.seed;
+      var rng = makeRng(seed >>> 0);
+      var onProgress = opts.onProgress;
+
+      var q = opts.init ? Float64Array.from(opts.init) : model.initial(seed);
+      var lp = model.logp(q);
+      /* A start with zero density happens: a prior draw can land where the
+         likelihood forbids. Shrink towards the origin with a little noise, which
+         is a sane point for every link this tool has. */
+      for (var tries = 0; tries < 100 && !isFinite(lp); tries++) {
+        for (i = 0; i < P; i++) q[i] = q[i] * 0.5 + 0.2 * rnorm1(rng);
+        lp = model.logp(q);
+      }
+      if (!isFinite(lp)) return { ok: false, message: 'no starting point with nonzero posterior density was found' };
+
+      var inv = new Float64Array(P);
+      for (i = 0; i < P; i++) inv[i] = 1;
+      var gbuf = new Float64Array(P);
+      var grad = Float64Array.from(model.grad(q, new Float64Array(P)));
+
+      var eps = findEpsilon(model, q, inv, rng, gbuf);
+      var da = makeDualAvg(eps, delta);
+      var win = warmupWindows(nWarmup);
+      var wel = makeWelford(P);
+      var winIdx = 0;
+
+      var total = nWarmup + nSample;
+      var draws = new Float64Array(nSample * P);
+      var lpDraw = new Float64Array(nSample);
+      var divergent = new Uint8Array(nSample);
+      var depths = new Uint8Array(nSample);
+      var accStat = new Float64Array(nSample);
+      var nDiv = 0, nMaxDepth = 0, nDivWarmup = 0;
+      var work = { gbuf: gbuf, nLeapfrog: 0, maxDeltaH: maxDeltaH };
+
+      for (var it = 0; it < total; it++) {
+        var warm = it < nWarmup;
+        if (onProgress && (it % 20 === 0)) {
+          if (onProgress(it, total, warm) === false) return { ok: false, cancelled: true };
+        }
+        /* Fresh momentum. Together with the multinomial choice this is the only
+           stochastic input, and it is what makes the chain a chain. */
+        var p = new Float64Array(P);
+        for (i = 0; i < P; i++) p[i] = rnorm1(rng) / Math.sqrt(inv[i]);
+        var H0 = -lp + kinetic(p, inv);
+
+        var qm = Float64Array.from(q), pm = Float64Array.from(p), gm = Float64Array.from(grad);
+        var qp = Float64Array.from(q), pp = Float64Array.from(p), gp = Float64Array.from(grad);
+        var qs = q, gs = grad, lps = lp;
+        var logW = 0;            /* the starting point's own weight, relative to H0 */
+        var depth = 0, diverged = false, turnedOut = false;
+        var sumAcc = 0, nAcc = 0;
+
+        while (depth < maxDepth) {
+          var dir = rng() < 0.5 ? -1 : 1;
+          var sub;
+          if (dir < 0) sub = buildTree(model, qm, pm, gm, -1, depth, eps, inv, H0, rng, work);
+          else sub = buildTree(model, qp, pp, gp, 1, depth, eps, inv, H0, rng, work);
+          sumAcc += sub.sumAcc; nAcc += sub.nAcc;
+          /* A subtree that diverged or turned inside itself is DISCARDED whole:
+             its candidate is not eligible and its weight does not enter the
+             merge. Only then is the trajectory extended. Getting this order
+             wrong is what makes a NUTS implementation sample a distribution
+             slightly wider than the target while every diagnostic stays green,
+             because the extra draws come from the far end of trajectories that
+             should never have been offered in the first place. */
+          if (sub.diverged) { diverged = true; break; }
+          if (sub.turned) { turnedOut = true; break; }
+          /* Now the subtree counts. Extend the corresponding end of the tree. */
+          if (dir < 0) { qm = sub.qm; pm = sub.pm; gm = sub.gm; }
+          else { qp = sub.qp; pp = sub.pp; gp = sub.gp; }
+          /* Both weights are relative to H0, so they are directly comparable.
+             The Stan form takes the new candidate with probability
+             min(1, W_new / W_old), which biases towards the newly built half
+             rather than merging the two proportionally. That is deliberate: it
+             moves further per transition at no cost in correctness, because the
+             old and the new half are exchangeable by construction. */
+          if (isFinite(sub.logW) && Math.log(rng()) < sub.logW - logW) {
+            qs = sub.qs; gs = sub.gs; lps = sub.lps;
+          }
+          logW = logAddExp(logW, sub.logW);
+          depth++;
+          if (uTurn(qm, pm, qp, pp, inv)) { turnedOut = true; break; }
+        }
+        var hitMax = !diverged && !turnedOut && depth >= maxDepth;
+
+        q = Float64Array.from(qs); grad = Float64Array.from(gs); lp = lps;
+        var acc = nAcc ? sumAcc / nAcc : 0;
+
+        if (warm) {
+          if (diverged) nDivWarmup++;
+          eps = da.update(acc);
+          if (it >= win.start && winIdx < win.ends.length) {
+            wel.add(q);
+            if (it + 1 >= win.ends[winIdx]) {
+              inv = wel.variance();
+              wel.reset();
+              winIdx++;
+              /* A new metric makes the step size tuned against the old one
+                 meaningless, so both the search and the dual averaging restart
+                 here. Skipping this restart is the classic warmup bug: the chain
+                 looks adapted and is not. */
+              eps = findEpsilon(model, q, inv, rng, gbuf);
+              da = makeDualAvg(eps, delta);
+            }
+          }
+          if (it + 1 === nWarmup) eps = da.finish();
+        } else {
+          var s2 = it - nWarmup;
+          for (i = 0; i < P; i++) draws[s2 * P + i] = q[i];
+          lpDraw[s2] = lp;
+          divergent[s2] = diverged ? 1 : 0;
+          depths[s2] = depth;
+          accStat[s2] = acc;
+          if (diverged) nDiv++;
+          if (hitMax) nMaxDepth++;
+        }
+      }
+
+      return {
+        ok: true, P: P, S: nSample, draws: draws, lp: lpDraw,
+        divergent: divergent, depths: depths, accStat: accStat,
+        nDivergent: nDiv, nDivergentWarmup: nDivWarmup, nMaxDepth: nMaxDepth,
+        stepSize: eps, metric: inv, nLeapfrog: work.nLeapfrog,
+        warmup: nWarmup, names: model.names
+      };
+    }
+
+    /* ================================================================
+       Convergence diagnostics
+
+       Rank-normalized split-Rhat and both effective sample sizes, following
+       Vehtari, Gelman, Simpson, Carpenter and Buerkner (2021), which is what
+       current Stan and posterior report. Three details earn the extra code over
+       the classic version:
+
+       - Splitting each chain in half turns a chain that drifts slowly within
+         itself into two chains that disagree, which the unsplit statistic cannot
+         see at all.
+       - Rank normalization drops the assumption that the marginal has a finite
+         variance. Without it a heavy-tailed posterior can report a perfect Rhat
+         while nothing has converged.
+       - Bulk and tail are two different questions. Bulk ESS governs the mean,
+         tail ESS governs the interval ends, and the tail one is routinely the
+         smaller: an interval end is estimated from the draws out there, and by
+         construction there are few of them.
+       ================================================================ */
+
+    /* Rank normalization: average ranks across all chains pooled, then the
+       normal quantile of the fractional rank. The 3/8 offset is Blom's. */
+    function rankNormalize(chains) {
+      var all = [], c, i;
+      for (c = 0; c < chains.length; c++) for (i = 0; i < chains[c].length; i++) all.push(chains[c][i]);
+      var N = all.length;
+      var idx = all.map(function (v, j) { return j; });
+      idx.sort(function (a, b) { return all[a] - all[b]; });
+      var rank = new Float64Array(N);
+      /* Ties take their average rank. That matters here because the tail-ESS
+         indicator series below is all zeros and ones. */
+      var j = 0;
+      while (j < N) {
+        var j2 = j;
+        while (j2 + 1 < N && all[idx[j2 + 1]] === all[idx[j]]) j2++;
+        var avg = (j + j2) / 2 + 1;
+        for (var t = j; t <= j2; t++) rank[idx[t]] = avg;
+        j = j2 + 1;
+      }
+      var out = [], k = 0;
+      for (c = 0; c < chains.length; c++) {
+        var row = new Float64Array(chains[c].length);
+        for (i = 0; i < chains[c].length; i++) row[i] = qnorm((rank[k++] - 0.375) / (N + 0.25));
+        out.push(row);
+      }
+      return out;
+    }
+
+    function splitChains(chains) {
+      var out = [];
+      for (var c = 0; c < chains.length; c++) {
+        var n = chains[c].length, h = Math.floor(n / 2);
+        if (h < 2) { out.push(chains[c]); continue; }
+        out.push(chains[c].slice(0, h));
+        out.push(chains[c].slice(n - h));
+      }
+      return out;
+    }
+
+    /* The plain between/within statistic, on whatever chains it is handed. */
+    function rhatRaw(chains) {
+      var M = chains.length, c, i;
+      if (M < 2) return NaN;
+      var n = chains[0].length;
+      for (c = 0; c < M; c++) n = Math.min(n, chains[c].length);
+      if (n < 2) return NaN;
+      var means = new Float64Array(M), vars = new Float64Array(M), grand = 0;
+      for (c = 0; c < M; c++) {
+        var m = 0;
+        for (i = 0; i < n; i++) m += chains[c][i];
+        m /= n;
+        var v = 0;
+        for (i = 0; i < n; i++) { var d = chains[c][i] - m; v += d * d; }
+        means[c] = m; vars[c] = v / (n - 1); grand += m;
+      }
+      grand /= M;
+      var B = 0, W = 0;
+      for (c = 0; c < M; c++) { var dm = means[c] - grand; B += dm * dm; W += vars[c]; }
+      B = B * n / (M - 1); W /= M;
+      if (!(W > 0)) return NaN;
+      return Math.sqrt((((n - 1) * W + B) / n) / W);
+    }
+
+    /* Rank-normalized split-Rhat, with the folded version taken alongside. The
+       folded one works on |x - median|, which is how a difference in SCALE
+       between chains becomes visible: two chains with the same mean and
+       different spread have a perfect ordinary Rhat. The reported number is the
+       larger of the two, since either one failing is a failure. */
+    function rhat(chains) {
+      var sp = splitChains(chains), c, i;
+      var r1 = rhatRaw(rankNormalize(sp));
+      var all = [];
+      for (c = 0; c < sp.length; c++) for (i = 0; i < sp[c].length; i++) all.push(sp[c][i]);
+      var med = quantileSorted(Float64Array.from(all).sort(), 0.5);
+      var folded = sp.map(function (ch) {
+        var o = new Float64Array(ch.length);
+        for (var k = 0; k < ch.length; k++) o[k] = Math.abs(ch[k] - med);
+        return o;
+      });
+      var r2 = rhatRaw(rankNormalize(folded));
+      if (!isFinite(r1)) return r2;
+      if (!isFinite(r2)) return r1;
+      return Math.max(r1, r2);
+    }
+
+    /* Effective sample size from the combined autocorrelation, with Geyer's
+       initial positive sequence: sum the autocorrelations in pairs and stop at
+       the first pair that is not positive. That truncation is what makes the
+       estimator usable at all, because the tail of an empirical autocorrelation
+       is noise that would otherwise be summed up faithfully. */
+    function essRaw(chains) {
+      var M = chains.length, c, i, t;
+      if (!M) return NaN;
+      var n = chains[0].length;
+      for (c = 0; c < M; c++) n = Math.min(n, chains[c].length);
+      if (n < 4) return NaN;
+      var means = new Float64Array(M), vars = new Float64Array(M);
+      for (c = 0; c < M; c++) {
+        var m = 0;
+        for (i = 0; i < n; i++) m += chains[c][i];
+        m /= n;
+        var v = 0;
+        for (i = 0; i < n; i++) { var d = chains[c][i] - m; v += d * d; }
+        means[c] = m; vars[c] = v / (n - 1);
+      }
+      var W = 0, grand = 0;
+      for (c = 0; c < M; c++) { W += vars[c]; grand += means[c]; }
+      W /= M; grand /= M;
+      if (!(W > 0)) return NaN;
+      var varPlus = W;
+      if (M > 1) {
+        var B = 0;
+        for (c = 0; c < M; c++) { var dm = means[c] - grand; B += dm * dm; }
+        B = B * n / (M - 1);
+        varPlus = ((n - 1) * W + B) / n;
+      }
+      /* Autocovariance by direct summation. n is one or two thousand here, so an
+         FFT would be the right thing at ten times this size and needless
+         complication at this one. The lag is capped for the same reason: past a
+         few hundred the pairs have long since gone negative. */
+      var maxLag = Math.min(n - 2, 500);
+      var rho = new Float64Array(maxLag + 1);
+      for (t = 0; t <= maxLag; t++) {
+        var acc = 0;
+        for (c = 0; c < M; c++) {
+          var s = 0;
+          for (i = 0; i + t < n; i++) s += (chains[c][i] - means[c]) * (chains[c][i + t] - means[c]);
+          acc += s / n;
+        }
+        rho[t] = 1 - (W - acc / M) / varPlus;
+      }
+      var sum = 0, tt = 1, prevPair = Infinity;
+      while (tt + 1 <= maxLag) {
+        var pair = rho[tt] + rho[tt + 1];
+        if (pair <= 0) break;
+        if (pair > prevPair) pair = prevPair;   /* monotone by construction */
+        prevPair = pair;
+        sum += pair;
+        tt += 2;
+      }
+      var tau = 1 + 2 * sum;
+      if (!(tau > 0)) tau = 1;
+      var N = M * n;
+      /* The cap is Vehtari et al.'s: an estimate above N * log10(N) is noise in
+         the autocorrelation, not information in the chain. */
+      return Math.min(N / tau, N * Math.log(N) / Math.LN10);
+    }
+
+    function essBulk(chains) { return essRaw(rankNormalize(splitChains(chains))); }
+
+    /* Tail ESS: the smaller of the two effective sizes of the indicator series
+       for the 5% and 95% quantiles. That is literally the question "how many
+       independent draws do I have out there", and it is the number the interval
+       ends live on. */
+    function essTail(chains) {
+      var all = [], c, i;
+      for (c = 0; c < chains.length; c++) for (i = 0; i < chains[c].length; i++) all.push(chains[c][i]);
+      var sorted = Float64Array.from(all).sort();
+      var q05 = quantileSorted(sorted, 0.05), q95 = quantileSorted(sorted, 0.95);
+      var ind = function (cmp) {
+        return chains.map(function (ch) {
+          var o = new Float64Array(ch.length);
+          for (var k = 0; k < ch.length; k++) o[k] = cmp(ch[k]) ? 1 : 0;
+          return o;
+        });
+      };
+      var a = essRaw(splitChains(ind(function (v) { return v <= q05; })));
+      var b = essRaw(splitChains(ind(function (v) { return v >= q95; })));
+      if (!isFinite(a)) return b;
+      if (!isFinite(b)) return a;
+      return Math.min(a, b);
+    }
+
+    /* ================================================================
+       Putting the chains together
+       ================================================================ */
+
+    /* Chains in, one samples object out, in exactly the shape extractSamples
+       produces. That is deliberate and is the whole integration story: precis,
+       logLikMatrix, linkNode and simOutcome then work on NUTS output without
+       knowing that anything changed underneath them. */
+    function chainsToSamples(model, chains) {
+      var P = model.nPar, S = 0, c, s, i;
+      for (c = 0; c < chains.length; c++) S += chains[c].S;
+      var raw = new Float64Array(S * P), nat = new Float64Array(S * P), at = 0;
+      for (c = 0; c < chains.length; c++) {
+        for (s = 0; s < chains[c].S; s++) {
+          for (i = 0; i < P; i++) {
+            var v = chains[c].draws[s * P + i];
+            raw[at * P + i] = v;
+            nat[at * P + i] = model.params[i].link.from(v);
+          }
+          at++;
+        }
+      }
+      return { S: S, P: P, raw: raw, natural: nat, names: model.names, nChains: chains.length };
+    }
+
+    /* The series of one coordinate, one array per chain. Everything above takes
+       this shape, and so does the trace plot. */
+    function paramChains(chains, i) {
+      return chains.map(function (ch) {
+        var out = new Float64Array(ch.S);
+        for (var s = 0; s < ch.S; s++) out[s] = ch.draws[s * ch.P + i];
+        return out;
+      });
+    }
+
+    /* The summary table for a sampled posterior. Same columns as precis where
+       they mean the same thing, plus the three numbers that exist only because
+       there are chains. Mean and sd are the draws' own here, not a curvature,
+       and the interval is an actual quantile of the draws rather than a normal
+       one around the mode: that is the entire point of running this instead of
+       quap. */
+    function precisNuts(model, chains, samples, prob) {
+      var p = prob === undefined ? 0.89 : prob;
+      var lo = (1 - p) / 2, hi = 1 - lo;
+      var P = model.nPar, rows = [];
+      for (var i = 0; i < P; i++) {
+        var per = paramChains(chains, i);
+        var col = new Float64Array(samples.S), natcol = new Float64Array(samples.S);
+        for (var s = 0; s < samples.S; s++) {
+          col[s] = samples.raw[s * P + i];
+          natcol[s] = samples.natural[s * P + i];
+        }
+        var sortedRaw = Float64Array.from(col).sort();
+        var sortedNat = Float64Array.from(natcol).sort();
+        rows.push({
+          name: model.names[i],
+          link: model.params[i].linkName,
+          mean: meanOf(col),
+          sd: sdOf(col),
+          lo: quantileSorted(sortedRaw, lo),
+          hi: quantileSorted(sortedRaw, hi),
+          natMode: quantileSorted(sortedNat, 0.5),
+          natLo: quantileSorted(sortedNat, lo),
+          natHi: quantileSorted(sortedNat, hi),
+          natMedian: quantileSorted(sortedNat, 0.5),
+          rhat: rhat(per),
+          essBulk: essBulk(per),
+          essTail: essTail(per)
+        });
+      }
+      return { prob: p, rows: rows, nuts: true, nChains: chains.length };
+    }
+
+    /* Posterior correlation from draws rather than from a covariance matrix, so
+       the correlations tab says something in both modes. */
+    function sampleCor(samples) {
+      var P = samples.P, S = samples.S, i, j, s;
+      var mean = new Float64Array(P), sd = new Float64Array(P);
+      for (i = 0; i < P; i++) {
+        var m = 0;
+        for (s = 0; s < S; s++) m += samples.raw[s * P + i];
+        mean[i] = m / S;
+        var v = 0;
+        for (s = 0; s < S; s++) { var d = samples.raw[s * P + i] - mean[i]; v += d * d; }
+        sd[i] = Math.sqrt(v / (S - 1));
+      }
+      var R = new Float64Array(P * P);
+      for (i = 0; i < P; i++) {
+        for (j = 0; j < P; j++) {
+          var cv = 0;
+          for (s = 0; s < S; s++) cv += (samples.raw[s * P + i] - mean[i]) * (samples.raw[s * P + j] - mean[j]);
+          cv /= (S - 1);
+          R[i * P + j] = (sd[i] > 0 && sd[j] > 0) ? cv / (sd[i] * sd[j]) : NaN;
+        }
+      }
+      return R;
+    }
+
+    /* The paragraph a reader has to see before believing anything else on the
+       page. Thresholds are the current Stan ones: Rhat above 1.01 rather than
+       the old 1.1, which was always too generous, and an effective sample size
+       below 100 per chain. */
+    function samplerDiagnostics(rows, chains) {
+      var msgs = [], i;
+      var nDiv = 0, nMax = 0, nChains = chains.length, S = 0;
+      for (i = 0; i < nChains; i++) {
+        nDiv += chains[i].nDivergent; nMax += chains[i].nMaxDepth; S += chains[i].S;
+      }
+      var worstRhat = 0, minBulk = Infinity, minTail = Infinity;
+      for (i = 0; i < rows.length; i++) {
+        if (isFinite(rows[i].rhat) && rows[i].rhat > worstRhat) worstRhat = rows[i].rhat;
+        if (isFinite(rows[i].essBulk) && rows[i].essBulk < minBulk) minBulk = rows[i].essBulk;
+        if (isFinite(rows[i].essTail) && rows[i].essTail < minTail) minTail = rows[i].essTail;
+      }
+      if (nDiv > 0) {
+        msgs.push({ kind: 'warn', text: nDiv + ' of ' + S + ' transitions ended in a divergence. The ' +
+          'sampler could not follow the geometry there, which biases the draws in a direction nothing ' +
+          'on this page can measure. Raise the target acceptance rate first; if that does not help, the ' +
+          'model needs reparametrizing rather than more iterations.' });
+      }
+      if (nMax > 0) {
+        msgs.push({ kind: 'warn', text: nMax + ' transitions hit the maximum tree depth. That is an ' +
+          'efficiency problem rather than a correctness one: the trajectories were cut off before they ' +
+          'turned, so the draws are more correlated than they need to be.' });
+      }
+      if (worstRhat > 1.01) {
+        msgs.push({ kind: 'warn', text: 'The largest Rhat is ' + worstRhat.toFixed(3) + '. The chains ' +
+          'have not converged to the same distribution, so the summary below is describing several ' +
+          'different things averaged together.' });
+      }
+      var need = 100 * nChains;
+      if (isFinite(minBulk) && minBulk < need) {
+        msgs.push({ kind: 'warn', text: 'The smallest bulk effective sample size is ' + Math.round(minBulk) +
+          '. Below roughly ' + need + ' the posterior mean is not pinned down well enough to quote.' });
+      } else if (isFinite(minTail) && minTail < need) {
+        msgs.push({ kind: 'warn', text: 'The smallest tail effective sample size is ' + Math.round(minTail) +
+          '. The mean is fine, the interval ends are not.' });
+      }
+      if (!msgs.length) {
+        msgs.push({ kind: 'info', text: 'No divergences, no tree-depth saturation, every Rhat below 1.01 ' +
+          'and every effective sample size above ' + need + '. Nothing here says the draws are wrong, ' +
+          'which is not the same as saying the model is right.' });
+      }
+      return { messages: msgs, nDivergent: nDiv, nMaxDepth: nMax, worstRhat: worstRhat,
+        minEssBulk: minBulk, minEssTail: minTail, nChains: nChains, nDraws: S };
+    }
+
+    /* Thinning for the trace plot. A thousand points per chain is more points
+       than the plot is wide, and drawing them costs more than the transitions
+       that produced them. Every k-th draw, k chosen so about 400 survive. */
+    function traceSeries(chains, i, maxPoints) {
+      var mp = maxPoints || 400;
+      return chains.map(function (ch) {
+        var step = Math.max(1, Math.ceil(ch.S / mp)), out = [];
+        for (var s = 0; s < ch.S; s += step) out.push(ch.draws[s * ch.P + i]);
+        return out;
+      });
+    }
+
     /* Posterior draws on the unconstrained scale, plus the same draws mapped
        back to natural units. Both are wanted: the summary is on the transformed
        scale, predictions need the natural one. */
@@ -2882,6 +3644,7 @@
             type: 'done',
             res: {
               ok: true,
+              mode: 'quap',
               precis: pr,
               cor: posteriorCor(fit, model.nPar),
               grid: gc.map(function (g) { return { name: g.name, ok: g.ok, verdict: g.verdict, worst: g.worst,
@@ -2896,6 +3659,114 @@
           });
           return;
         }
+        if (job === 'chain') {
+          /* One chain, one worker. The chain itself is all this job does: the
+             draws go back raw and everything derived from them is computed once,
+             later, over all four chains together. Splitting it that way is not
+             an optimization, it is the only correct place to do it, because Rhat
+             and ESS are statements ABOUT the set of chains and mean nothing
+             inside one. */
+          var cdata = msg.data, ccols = {};
+          for (var cc in cdata.columns) ccols[cc] = cdata.columns[cc] instanceof Float64Array
+            ? cdata.columns[cc] : Float64Array.from(cdata.columns[cc]);
+          var cmodel = compileModel(msg.model, { columns: ccols }, msg.opts);
+          var chain = nutsChain(cmodel, {
+            seed: msg.seed, warmup: msg.warmup, iter: msg.iter,
+            maxDepth: msg.maxDepth, adaptDelta: msg.adaptDelta,
+            onProgress: function (it, tot, warm) {
+              post({ type: 'progress', chain: msg.chain, it: it, total: tot, warmup: warm });
+            }
+          });
+          if (!chain.ok) {
+            post({ type: 'done', res: { ok: false, kind: 'nuts', message: chain.message ||
+              'the chain was stopped', cancelled: !!chain.cancelled } });
+            return;
+          }
+          post({ type: 'done', res: { ok: true, chain: {
+            P: chain.P, S: chain.S, draws: chain.draws, lp: chain.lp,
+            divergent: chain.divergent, depths: chain.depths, accStat: chain.accStat,
+            nDivergent: chain.nDivergent, nDivergentWarmup: chain.nDivergentWarmup,
+            nMaxDepth: chain.nMaxDepth, stepSize: chain.stepSize, metric: chain.metric,
+            nLeapfrog: chain.nLeapfrog, warmup: chain.warmup
+          }, warnings: cmodel.warnings } });
+          return;
+        }
+
+        if (job === 'merge') {
+          /* The second half of a NUTS run: everything that needs all chains at
+             once. Deliberately the same downstream calls the quap path makes,
+             on a samples object of the same shape, so precis, WAIC, PSIS and the
+             predictions cannot drift apart between the two modes. */
+          post({ type: 'progress', stage: 'diagnostics', frac: 0.55 });
+          var mdata = msg.data, mcols = {};
+          for (var mc in mdata.columns) mcols[mc] = mdata.columns[mc] instanceof Float64Array
+            ? mdata.columns[mc] : Float64Array.from(mdata.columns[mc]);
+          var mmodel = compileModel(msg.model, { columns: mcols }, msg.opts);
+          var chains = msg.chains.map(function (ch) {
+            return {
+              P: ch.P, S: ch.S,
+              draws: ch.draws instanceof Float64Array ? ch.draws : Float64Array.from(ch.draws),
+              lp: ch.lp instanceof Float64Array ? ch.lp : Float64Array.from(ch.lp),
+              divergent: ch.divergent, depths: ch.depths,
+              accStat: ch.accStat instanceof Float64Array ? ch.accStat : Float64Array.from(ch.accStat),
+              nDivergent: ch.nDivergent, nMaxDepth: ch.nMaxDepth,
+              stepSize: ch.stepSize, nLeapfrog: ch.nLeapfrog
+            };
+          });
+          var msamples = chainsToSamples(mmodel, chains);
+          var mpr = precisNuts(mmodel, chains, msamples, msg.opts && msg.opts.prob);
+          var diag = samplerDiagnostics(mpr.rows, chains);
+
+          post({ type: 'progress', stage: 'information criteria', frac: 0.75 });
+          var mll = logLikMatrix(mmodel, msamples, Math.min(msamples.S, 2000));
+          var mw = waic(mll), mps = psis(mll);
+
+          post({ type: 'progress', stage: 'predictions', frac: 0.9 });
+          var mpred = null;
+          if (mmodel.detNames.length) {
+            var mnd = mmodel.detNames[mmodel.detNames.length - 1];
+            var mlk = linkNode(mmodel, msamples, mnd, null, 400);
+            var msm = simOutcome(mmodel, msamples, null, 400, msg.opts && msg.opts.seed);
+            if (mlk && msm) {
+              mpred = {
+                node: mnd,
+                link: summarizeDraws(mlk, msg.opts && msg.opts.prob),
+                sim: summarizeDraws(msm, msg.opts && msg.opts.prob)
+              };
+            }
+          }
+          /* The trace plot gets its own thinned copy rather than the draws:
+             sending a thousand points per chain per parameter back to the main
+             thread would be the largest message this tool ever posts, for a plot
+             a few hundred pixels wide. */
+          var traces = [];
+          for (var ti = 0; ti < mmodel.nPar; ti++) traces.push(traceSeries(chains, ti, 400));
+
+          var mmsgs = (msg.warnings || []).map(function (w) { return { kind: 'warn', text: w }; })
+            .concat(diag.messages);
+          post({
+            type: 'done',
+            res: {
+              ok: true, mode: 'nuts',
+              precis: mpr,
+              cor: sampleCor(msamples),
+              grid: null,
+              waic: mw, psis: { PSIS: mps.PSIS, se: mps.se, nBadK: mps.nBadK,
+                maxK: Math.max.apply(null, Array.from(mps.k)) },
+              messages: mmsgs, names: mmodel.names,
+              links: mmodel.params.map(function (pp) { return pp.linkName; }),
+              nObs: mmodel.nObs, nPar: mmodel.nPar,
+              outcome: mmodel.outcome, pred: mpred, detNames: mmodel.detNames,
+              diag: diag, traces: traces,
+              chainInfo: chains.map(function (ch) {
+                return { S: ch.S, nDivergent: ch.nDivergent, nMaxDepth: ch.nMaxDepth,
+                  stepSize: ch.stepSize, nLeapfrog: ch.nLeapfrog };
+              })
+            }
+          });
+          return;
+        }
+
         post({ type: 'done', res: { ok: false, kind: 'unknown', message: 'unknown job ' + job } });
       } catch (err) {
         post({
@@ -2926,6 +3797,13 @@
       bfgs: bfgs, nelderMead: nelderMead, lineSearchWolfe: lineSearchWolfe,
       numHessian: numHessian, analyzeCurvature: analyzeCurvature,
       fitQuap: fitQuap, extractSamples: extractSamples, precis: precis,
+      leapfrog: leapfrog, kinetic: kinetic, uTurn: uTurn, buildTree: buildTree,
+      logAddExp: logAddExp, findEpsilon: findEpsilon, makeDualAvg: makeDualAvg,
+      warmupWindows: warmupWindows, makeWelford: makeWelford, nutsChain: nutsChain,
+      rankNormalize: rankNormalize, splitChains: splitChains, rhatRaw: rhatRaw, rhat: rhat,
+      essRaw: essRaw, essBulk: essBulk, essTail: essTail,
+      chainsToSamples: chainsToSamples, paramChains: paramChains, precisNuts: precisNuts,
+      sampleCor: sampleCor, samplerDiagnostics: samplerDiagnostics, traceSeries: traceSeries,
       posteriorCor: posteriorCor, gridCheck: gridCheck,
       linkNode: linkNode, simOutcome: simOutcome, priorPredictive: priorPredictive,
       summarizeDraws: summarizeDraws,
@@ -2942,34 +3820,122 @@
   /* Worker plumbing, kept out of the app block so the core stays test-clean.
      The worker source is the core block's own text plus one line installing the
      handler, which is why that block may not touch document or window except
-     through the guarded export on its last line. */
+     through the guarded export on its last line.
+
+     Since the NUTS mode landed this runs N workers rather than one, and the
+     bookkeeping that used to be a single field is a set: a run owns several
+     workers, cancelling has to reach all of them, and a failure in any one has
+     to tear down the rest rather than leave them burning a core each. That is
+     the whole reason this is a layer at all and not two lines in the app. */
   var RTHRun = {
     _job: null,
+
+    /* Build one worker from the core block. Both entry points below need it and
+       neither should know how the blob URL is made. */
+    _spawn: function () {
+      var src = document.getElementById('rthcore').textContent + '\nonmessage = (RTH.workerMain);';
+      var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      return { worker: new Worker(url), url: url };
+    },
+
+    _kill: function (w) {
+      try { w.worker.terminate(); } catch (e) { /* already gone */ }
+      URL.revokeObjectURL(w.url);
+    },
+
+    /* One worker, one message, one result. The quap path and the merge step
+       both use this unchanged. */
     run: function (msg, onProgress) {
       return new Promise(function (resolve, reject) {
-        var src = document.getElementById('rthcore').textContent + '\nonmessage = (RTH.workerMain);';
-        var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
-        var w = new Worker(url);
-        RTHRun._job = { worker: w, url: url };
+        var w = RTHRun._spawn();
+        RTHRun._job = { workers: [w] };
         var settle = function (fn, v) {
-          URL.revokeObjectURL(url);
-          w.terminate();
+          RTHRun._kill(w);
           RTHRun._job = null;
           fn(v);
         };
-        w.onerror = function (e) { settle(reject, new Error(e.message || 'Worker error')); };
-        w.onmessage = function (ev) {
+        w.worker.onerror = function (e) { settle(reject, new Error(e.message || 'Worker error')); };
+        w.worker.onmessage = function (ev) {
           if (ev.data.type === 'progress') { if (onProgress) onProgress(ev.data); }
           else if (ev.data.type === 'done') settle(resolve, ev.data.res);
         };
-        w.postMessage(msg);
+        w.worker.postMessage(msg);
       });
     },
+
+    /* N workers in parallel, one message each, all results in order.
+
+       Progress is aggregated rather than interleaved: four chains reporting
+       their own iteration counts would make a progress bar that jumps
+       backwards. Each chain's fraction is kept and the mean is reported, which
+       is monotone because every part of it is. */
+    runAll: function (msgs, onProgress) {
+      return new Promise(function (resolve, reject) {
+        var n = msgs.length;
+        var workers = [], results = new Array(n), left = n, dead = false;
+        var fracs = new Array(n);
+        for (var f = 0; f < n; f++) fracs[f] = 0;
+
+        var teardown = function () {
+          for (var i = 0; i < workers.length; i++) RTHRun._kill(workers[i]);
+          RTHRun._job = null;
+        };
+        var fail = function (err) {
+          if (dead) return;
+          dead = true;
+          teardown();
+          reject(err);
+        };
+
+        for (var k = 0; k < n; k++) {
+          workers.push(RTHRun._spawn());
+        }
+        RTHRun._job = { workers: workers };
+
+        workers.forEach(function (w, idx) {
+          w.worker.onerror = function (e) { fail(new Error(e.message || 'Worker error')); };
+          w.worker.onmessage = function (ev) {
+            if (dead) return;
+            if (ev.data.type === 'progress') {
+              if (ev.data.total) fracs[idx] = ev.data.it / ev.data.total;
+              if (onProgress) {
+                var sum = 0;
+                for (var i = 0; i < n; i++) sum += fracs[i];
+                onProgress({ frac: sum / n, chain: idx, warmup: ev.data.warmup });
+              }
+              return;
+            }
+            if (ev.data.type === 'done') {
+              results[idx] = ev.data.res;
+              /* A chain that failed makes the whole run meaningless: three
+                 chains out of four are not a posterior, they are three chains.
+                 Stop the others rather than reporting a partial answer. */
+              if (!ev.data.res || !ev.data.res.ok) {
+                dead = true;
+                teardown();
+                resolve(results.map(function (r, i) { return r || { ok: false, kind: 'cancelled', chain: i }; }));
+                return;
+              }
+              fracs[idx] = 1;
+              if (onProgress) {
+                var s2 = 0;
+                for (var j = 0; j < n; j++) s2 += fracs[j];
+                onProgress({ frac: s2 / n, chain: idx, warmup: false });
+              }
+              left--;
+              if (left === 0) { teardown(); resolve(results); }
+            }
+          };
+          w.worker.postMessage(msgs[idx]);
+        });
+      });
+    },
+
     busy: function () { return !!RTHRun._job; },
     cancel: function () {
       if (RTHRun._job) {
-        RTHRun._job.worker.terminate();
-        URL.revokeObjectURL(RTHRun._job.url);
+        var ws = RTHRun._job.workers;
+        for (var i = 0; i < ws.length; i++) RTHRun._kill(ws[i]);
         RTHRun._job = null;
       }
     }
@@ -3082,11 +4048,21 @@
     function PrecisTable({ precis, links, grid }) {
       const pct = (p) => (p * 100).toFixed(1).replace(/\.0$/, '') + '%';
       const lo = (1 - precis.prob) / 2, hi = 1 - lo;
+      const nuts = !!precis.nuts;
       const verdictOf = (name) => {
         const g = grid && grid.find((x) => x.name === name);
         return g && g.ok ? g.verdict : null;
       };
       const vcol = { good: 'var(--tool-sig-good)', fair: 'var(--tool-sig-warn)', poor: 'var(--tool-sig-bad)' };
+      /* The thresholds are the ones the diagnostics text uses, so a number
+         coloured red here and a warning above it always mean the same thing. */
+      const rhatCol = (v) => !isFinite(v) ? 'var(--tool-note)'
+        : v > 1.05 ? 'var(--tool-sig-bad)' : v > 1.01 ? 'var(--tool-sig-warn)' : 'var(--tool-sig-good)';
+      const essCol = (v, chains) => {
+        const need = 100 * (chains || 4);
+        return !isFinite(v) ? 'var(--tool-note)'
+          : v < need / 2 ? 'var(--tool-sig-bad)' : v < need ? 'var(--tool-sig-warn)' : 'var(--tool-sig-good)';
+      };
       return html`
         <div className="qp-scroll">
           <table className="qp-tbl">
@@ -3095,14 +4071,20 @@
               <!-- "mode", nicht "mean": quap setzt die Gausskurve an den Modus,
                    und auf einer transformierten Skala ist der nicht derselbe
                    Punkt wie der Mittelwert. Die Spalte hiess bis 2026-09-10
-                   "mean" und war damit schlicht falsch beschriftet. -->
-              <th className="qp-num">mode</th>
+                   "mean" und war damit schlicht falsch beschriftet. Im
+                   NUTS-Modus ist es dagegen wirklich ein Mittelwert, naemlich
+                   der der Draws, also wechselt auch die Beschriftung mit. -->
+              <th className="qp-num">${nuts ? 'mean' : 'mode'}</th>
               <th className="qp-num">sd</th>
               <th className="qp-num">${pct(lo)}</th>
               <th className="qp-num">${pct(hi)}</th>
               <th className="qp-num">natural</th>
               <th>scale</th>
-              <th>check</th>
+              ${nuts ? html`<${React.Fragment}>
+                <th className="qp-num">Rhat</th>
+                <th className="qp-num">ESS bulk</th>
+                <th className="qp-num">ESS tail</th>
+              <//>` : html`<th>check</th>`}
             </tr></thead>
             <tbody>
               ${precis.rows.map((r, i) => html`
@@ -3114,13 +4096,123 @@
                   <td className="qp-num">${fmt(r.hi, 3)}</td>
                   <td className="qp-num" style=${{ color: 'var(--tool-emph)' }}>${fmt(r.natMedian, 3)}</td>
                   <td style=${{ fontSize: 12, color: 'var(--tool-note)' }}>${links && links[i] ? links[i] : 'identity'}</td>
-                  <td style=${{ fontSize: 12, color: vcol[verdictOf(r.name)] || 'var(--tool-note)' }}>
-                    ${verdictOf(r.name) || '--'}
-                  </td>
+                  ${nuts ? html`<${React.Fragment}>
+                    <td className="qp-num" style=${{ color: rhatCol(r.rhat) }}>${fmt(r.rhat, 3)}</td>
+                    <td className="qp-num" style=${{ color: essCol(r.essBulk, precis.nChains) }}>
+                      ${isFinite(r.essBulk) ? Math.round(r.essBulk) : '--'}</td>
+                    <td className="qp-num" style=${{ color: essCol(r.essTail, precis.nChains) }}>
+                      ${isFinite(r.essTail) ? Math.round(r.essTail) : '--'}</td>
+                  <//>` : html`
+                    <td style=${{ fontSize: 12, color: vcol[verdictOf(r.name)] || 'var(--tool-note)' }}>
+                      ${verdictOf(r.name) || '--'}
+                    </td>`}
                 </tr>`)}
             </tbody>
           </table>
         </div>`;
+    }
+
+    /* ---- trace plots ----
+
+       The one picture that is worth more than any single diagnostic number. Four
+       chains drawn over each other: if they occupy the same band and none of
+       them wanders, they have converged, and no summary statistic conveys that
+       as directly. Rhat compresses this plot into one number, which is why it is
+       possible to have a green Rhat and a plot that is obviously wrong. */
+    function TracePlot({ series, name }) {
+      const W = 620, H = 92, padL = 46, padR = 8, padT = 8, padB = 16;
+      let lo = Infinity, hi = -Infinity, maxLen = 0;
+      series.forEach((s) => {
+        maxLen = Math.max(maxLen, s.length);
+        for (let i = 0; i < s.length; i++) {
+          if (s[i] < lo) lo = s[i];
+          if (s[i] > hi) hi = s[i];
+        }
+      });
+      if (!isFinite(lo) || !isFinite(hi)) return null;
+      if (hi === lo) { hi = lo + 1; lo -= 1; }
+      const pad = (hi - lo) * 0.06;
+      lo -= pad; hi += pad;
+      const X = (i) => padL + (maxLen < 2 ? 0 : i / (maxLen - 1)) * (W - padL - padR);
+      const Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
+      /* Four hues that stay apart in all three skins. Not a colormap: these are
+         categories with no order, so they are only required to be distinct. */
+      const hues = ['var(--tool-sig-info)', 'var(--tool-sig-good)',
+        'var(--tool-sig-warn)', 'var(--tool-sig-bad)'];
+      return html`
+        <div style=${{ marginBottom: 10 }}>
+          <p style=${{ fontSize: 12, color: 'var(--tool-label)', margin: '0 0 2px' }}>${name}</p>
+          <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H} width="100%"
+            style=${{ maxWidth: W, display: 'block' }} role="img"
+            aria-label=${'Trace plot for ' + name}>
+            <line x1=${padL} y1=${padT} x2=${padL} y2=${H - padB}
+              stroke="var(--tool-hairline)" strokeWidth="1" />
+            <text x=${padL - 4} y=${padT + 8} textAnchor="end"
+              style=${{ fontSize: 9, fill: 'var(--tool-note)' }}>${fmt(hi, 2)}</text>
+            <text x=${padL - 4} y=${H - padB} textAnchor="end"
+              style=${{ fontSize: 9, fill: 'var(--tool-note)' }}>${fmt(lo, 2)}</text>
+            ${series.map((s, c) => {
+              let d = '';
+              for (let i = 0; i < s.length; i++) d += (i ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(s[i]).toFixed(1);
+              return html`<path key=${c} d=${d} fill="none" stroke=${hues[c % hues.length]}
+                strokeWidth="0.8" opacity="0.8" />`;
+            })}
+          </svg>
+        </div>`;
+    }
+
+    /* ---- the sampler diagnostics tab ---- */
+    function SamplerReport({ diag, chainInfo }) {
+      const num = (v, d) => isFinite(v) ? fmt(v, d === undefined ? 3 : d) : '--';
+      return html`
+        <${React.Fragment}>
+          <table className="qp-tbl" style=${{ maxWidth: 560 }}>
+            <tbody>
+              <tr><td>chains</td><td className="qp-num">${diag.nChains}</td>
+                <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>${diag.nDraws} draws after warmup</td></tr>
+              <tr><td>divergent transitions</td>
+                <td className="qp-num" style=${{ color: diag.nDivergent ? 'var(--tool-sig-bad)' : 'var(--tool-sig-good)' }}>
+                  ${diag.nDivergent}</td>
+                <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>
+                  ${diag.nDivergent ? 'any is too many' : 'none, which is what it should be'}</td></tr>
+              <tr><td>hit the depth limit</td>
+                <td className="qp-num" style=${{ color: diag.nMaxDepth ? 'var(--tool-sig-warn)' : 'var(--tool-sig-good)' }}>
+                  ${diag.nMaxDepth}</td>
+                <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>efficiency, not correctness</td></tr>
+              <tr><td>largest Rhat</td>
+                <td className="qp-num" style=${{ color: diag.worstRhat > 1.01 ? 'var(--tool-sig-bad)' : 'var(--tool-sig-good)' }}>
+                  ${num(diag.worstRhat)}</td>
+                <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>wanted below 1.01</td></tr>
+              <tr><td>smallest ESS (bulk / tail)</td>
+                <td className="qp-num">${num(diag.minEssBulk, 0)} / ${num(diag.minEssTail, 0)}</td>
+                <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>wanted above ${100 * diag.nChains}</td></tr>
+            </tbody>
+          </table>
+          ${chainInfo && chainInfo.length ? html`
+            <table className="qp-tbl" style=${{ maxWidth: 560, marginTop: 14 }}>
+              <thead><tr>
+                <th>chain</th><th className="qp-num">step size</th>
+                <th className="qp-num">divergent</th><th className="qp-num">depth limit</th>
+                <th className="qp-num">gradient evals</th>
+              </tr></thead>
+              <tbody>
+                ${chainInfo.map((c, i) => html`
+                  <tr key=${i}>
+                    <td className="qp-name">${i + 1}</td>
+                    <td className="qp-num">${fmt(c.stepSize, 4)}</td>
+                    <td className="qp-num">${c.nDivergent}</td>
+                    <td className="qp-num">${c.nMaxDepth}</td>
+                    <td className="qp-num">${c.nLeapfrog}</td>
+                  </tr>`)}
+              </tbody>
+            </table>` : null}
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 10, maxWidth: '78ch' }}>
+            The step sizes are adapted per chain and end up close to each other when the warmup went
+            well, so four very different ones are themselves a warning. Gradient evaluations are the
+            real cost of the run: each is one forward and one backward pass over the tape, and the
+            count is roughly the number of leapfrog steps taken.
+          </p>
+        <//>`;
     }
 
     /* ---- correlation matrix ---- */
@@ -3245,6 +4337,13 @@
 
     /* ---- the app ---- */
     function App() {
+      /* Die REIHENFOLGE dieser useState-Aufrufe ist load-bearing: der
+         Rendertest in notes/dev/bayes-rethinking.render.mjs ersetzt einzelne
+         Anfangswerte ueber ihren Index, und nur so kommt er ueberhaupt in den
+         Ergebniszweig. Wer hier eine Zeile einschiebt statt anhaengt, bricht
+         den Test auf eine Weise, die wie ein Fehler in der Komponente aussieht.
+         0 csv, 1 model, 2 res, 3 err, 4 busy, 5 tab, 6 prob, 7 draws, 8 note,
+         9 mode, 10 nChains, 11 nIter, 12 adaptDelta. */
       const [csv, setCsv] = useState('');
       const [model, setModel] = useState(DEFAULT_MODEL);
       const [res, setRes] = useState(null);
@@ -3254,6 +4353,13 @@
       const [prob, setProb] = useState(0.89);
       const [draws, setDraws] = useState(4000);
       const [note, setNote] = useState(null);
+      /* Der Modus. quap bleibt der Default, weil er in unter einer Sekunde
+         antwortet und fuer die Mehrzahl der Modelle hier richtig liegt; NUTS
+         ist die Instanz, an die man sich wendet, wenn der Cross-Check meckert. */
+      const [mode, setMode] = useState('quap');
+      const [nChains, setNChains] = useState(4);
+      const [nIter, setNIter] = useState(1000);
+      const [adaptDelta, setAdaptDelta] = useState(0.8);
 
       const data = useMemo(() => {
         if (!csv.trim()) return null;
@@ -3273,24 +4379,71 @@
         setErr(null); setRes(null); setBusy({ stage: 'starting', frac: 0 });
         const cols = {};
         Object.keys(data.columns).forEach((k) => { cols[k] = Array.from(data.columns[k]); });
-        RTHRun.run({ job: 'fit', model: model, data: { columns: cols },
-          opts: { prob: prob, draws: draws, seed: 1 } },
-          (p) => setBusy({ stage: p.stage, frac: p.frac }))
-          .then((r) => {
-            setBusy(null);
-            if (r.ok) { setRes(r); setTab('precis'); }
-            else setErr(r);
+        const payload = { model: model, data: { columns: cols } };
+
+        if (mode === 'quap') {
+          RTHRun.run(Object.assign({ job: 'fit' }, payload,
+            { opts: { prob: prob, draws: draws, seed: 1 } }),
+            (p) => setBusy({ stage: p.stage, frac: p.frac }))
+            .then((r) => {
+              setBusy(null);
+              if (r.ok) { setRes(r); setTab('precis'); }
+              else setErr(r);
+            })
+            .catch((e) => { setBusy(null); setErr({ message: e.message }); });
+          return;
+        }
+
+        /* NUTS: four chains in four workers, then one worker for everything
+           that needs all four at once. The second step is a separate job on
+           purpose rather than main-thread work, because it recompiles the model
+           and computes the log-likelihood matrix, which is the same amount of
+           work as a small fit and would freeze the page for it. */
+        const opts = { prob: prob, seed: 1 };
+        const msgs = [];
+        for (let c = 0; c < nChains; c++) {
+          msgs.push(Object.assign({ job: 'chain', chain: c, seed: 1 + c * 1013,
+            warmup: nIter, iter: nIter, adaptDelta: adaptDelta, opts: opts }, payload));
+        }
+        RTHRun.runAll(msgs, (p) => setBusy({
+          stage: p.warmup ? 'warmup' : 'sampling',
+          /* The chains occupy the first 55 percent of the bar and the merge the
+             rest, which is roughly how the time actually divides. */
+          frac: p.frac * 0.55
+        }))
+          .then((results) => {
+            const bad = results.find((r) => !r || !r.ok);
+            if (bad) {
+              setBusy(null);
+              setErr(bad.cancelled ? { message: 'The run was cancelled.' } : bad);
+              return;
+            }
+            setBusy({ stage: 'diagnostics', frac: 0.55 });
+            return RTHRun.run(Object.assign({ job: 'merge', opts: opts,
+              chains: results.map((r) => r.chain),
+              warnings: results[0].warnings || [] }, payload),
+              (p) => setBusy({ stage: p.stage, frac: p.frac }))
+              .then((r) => {
+                setBusy(null);
+                if (r.ok) { setRes(r); setTab('precis'); }
+                else setErr(r);
+              });
           })
           .catch((e) => { setBusy(null); setErr({ message: e.message }); });
-      }, [data, model, prob, draws]);
+      }, [data, model, prob, draws, mode, nChains, nIter, adaptDelta]);
 
       const copyPrecis = useCallback(() => {
         if (!res) return;
+        const nuts = res.precis.nuts;
         const loP = ((1 - res.precis.prob) / 2 * 100).toFixed(1);
         const hiP = ((1 - (1 - res.precis.prob) / 2) * 100).toFixed(1);
-        const head = ['parameter', 'mode', 'sd', loP + '%', hiP + '%', 'natural'];
+        const head = ['parameter', nuts ? 'mean' : 'mode', 'sd', loP + '%', hiP + '%', 'natural']
+          .concat(nuts ? ['Rhat', 'ESSbulk', 'ESStail'] : []);
         const rows = res.precis.rows.map((r) => [r.name, r.mean, r.sd, r.lo, r.hi, r.natMedian]
-          .map((v, i) => i === 0 ? v : (isFinite(v) ? v.toFixed(4) : '--')));
+          .map((v, i) => i === 0 ? v : (isFinite(v) ? v.toFixed(4) : '--'))
+          .concat(nuts ? [isFinite(r.rhat) ? r.rhat.toFixed(3) : '--',
+            isFinite(r.essBulk) ? String(Math.round(r.essBulk)) : '--',
+            isFinite(r.essTail) ? String(Math.round(r.essTail)) : '--'] : []));
         const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => String(r[i]).length)));
         const fmtRow = (r) => r.map((v, i) => String(v).padStart(i === 0 ? 0 : w[i])).join('  ');
         navigator.clipboard.writeText([fmtRow(head)].concat(rows.map(fmtRow)).join('\n'));
@@ -3305,16 +4458,23 @@
         return inModel.length ? inModel[0] : null;
       }, [res, data, model]);
 
-      const tabs = [['precis', 'Summary'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
-        ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']];
+      /* Der Cross-Check existiert nur im quap-Modus: seine Frage lautet "taugt
+         die Gaussnaeherung hier", und im NUTS-Modus gibt es keine. An seine
+         Stelle treten die Ketten selbst. */
+      const isNuts = res && res.mode === 'nuts';
+      const tabs = isNuts
+        ? [['precis', 'Summary'], ['trace', 'Chains'], ['cor', 'Correlations'],
+           ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']]
+        : [['precis', 'Summary'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
+           ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']];
 
       return html`
         <div className="container">
           <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-text)', marginBottom: 8 }}>Quap Lab</h1>
           <p style=${{ color: 'var(--tool-label)', maxWidth: '70ch' }}>
-            Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. The
-            posterior is approximated by a Gaussian at its mode, which is fast, honest about its own
-            limits, and enough for a surprising number of real models.
+            Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it. Either
+            by a Gaussian at the posterior mode, which is fast and honest about its own limits, or by
+            Hamiltonian Monte Carlo, which makes no assumption about the shape at all.
           </p>
 
           <div className="qp-grid2" style=${{ marginTop: 18 }}>
@@ -3331,20 +4491,67 @@
                 </p>
               </div>
               <div className="ctl-sec">
-                <p className="ctl-sec-h">Interval and posterior draws</p>
+                <p className="ctl-sec-h">How to fit it</p>
+                <div className="seg-row">
+                  ${[['quap', 'Quadratic approximation'], ['nuts', 'NUTS']].map(([v, l]) => html`
+                    <button key=${v} className=${'lang-seg' + (mode === v ? ' active' : '')}
+                      onClick=${() => setMode(v)}>${l}</button>`)}
+                </div>
+                <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
+                  ${mode === 'quap'
+                    ? html`A Gaussian fitted at the posterior mode. Answers in well under a second, and
+                        the cross-check tab tells you when that answer is not good enough.`
+                    : html`Hamiltonian Monte Carlo with the No-U-Turn sampler: the chains explore the
+                        posterior as it actually is, at the cost of seconds rather than milliseconds.
+                        This is the mode for a posterior the cross-check has already complained about.`}
+                </p>
+              </div>
+              ${mode === 'nuts' ? html`
+                <div className="ctl-sec">
+                  <p className="ctl-sec-h">Chains, iterations, target acceptance</p>
+                  <div className="qp-chips">
+                    ${[2, 4, 6].map((v) => html`
+                      <button key=${'c' + v} className=${'lang-seg' + (nChains === v ? ' active' : '')}
+                        onClick=${() => setNChains(v)}>${v} chains</button>`)}
+                    <span style=${{ width: 10 }}></span>
+                    ${[[500, '500'], [1000, '1000'], [2000, '2000']].map(([v, l]) => html`
+                      <button key=${'i' + v} className=${'lang-seg' + (nIter === v ? ' active' : '')}
+                        onClick=${() => setNIter(v)}>${l} iter</button>`)}
+                    <span style=${{ width: 10 }}></span>
+                    ${[[0.8, '0.8'], [0.95, '0.95'], [0.99, '0.99']].map(([v, l]) => html`
+                      <button key=${'d' + v} className=${'lang-seg' + (adaptDelta === v ? ' active' : '')}
+                        onClick=${() => setAdaptDelta(v)}>delta ${l}</button>`)}
+                  </div>
+                  <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
+                    The iteration count is used twice: that many warmup steps, which are discarded, and
+                    that many kept draws per chain. Warmup is not a burn-in that could be shortened for
+                    free, it is where the step size and the metric are learned, and a chain that skips it
+                    is slower afterwards rather than faster. Raising the target acceptance rate makes the
+                    steps smaller and is the first thing to try against divergences; it is not free, since
+                    smaller steps mean more of them per transition.
+                  </p>
+                </div>` : null}
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">${mode === 'quap' ? 'Interval and posterior draws' : 'Interval'}</p>
                 <div className="qp-chips">
                   ${[[0.5, '50%'], [0.89, '89%'], [0.95, '95%']].map(([v, l]) => html`
                     <button key=${l} className=${'lang-seg' + (prob === v ? ' active' : '')}
                       onClick=${() => setProb(v)}>${l}</button>`)}
-                  <span style=${{ width: 10 }}></span>
-                  ${[[1000, '1k'], [4000, '4k'], [10000, '10k']].map(([v, l]) => html`
-                    <button key=${l} className=${'lang-seg' + (draws === v ? ' active' : '')}
-                      onClick=${() => setDraws(v)}>${l} draws</button>`)}
+                  ${mode === 'quap' ? html`<${React.Fragment}>
+                    <span style=${{ width: 10 }}></span>
+                    ${[[1000, '1k'], [4000, '4k'], [10000, '10k']].map(([v, l]) => html`
+                      <button key=${l} className=${'lang-seg' + (draws === v ? ' active' : '')}
+                        onClick=${() => setDraws(v)}>${l} draws</button>`)}
+                  <//>` : null}
                 </div>
                 <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
-                  The fit itself is an optimization and draws nothing. These draws are taken afterwards
-                  from the fitted Gaussian, for the natural column, the predictions and the information
-                  criteria. mode, sd and the interval do not depend on them.
+                  ${mode === 'quap'
+                    ? html`The fit itself is an optimization and draws nothing. These draws are taken
+                        afterwards from the fitted Gaussian, for the natural column, the predictions and
+                        the information criteria. mode, sd and the interval do not depend on them.`
+                    : html`Here the draws are the fit, so there is no separate number of them: every
+                        column of the summary, the predictions and both information criteria come from
+                        the same chains.`}
                 </p>
               </div>
               <div className="ctl-sec">
@@ -3392,19 +4599,45 @@
                       ${ToolIcons.el('copy')} Copy table
                     </button>
                     <span style=${{ fontSize: 12, color: 'var(--tool-note)' }}>
-                      ${res.nObs} rows, ${res.nPar} parameters, ${res.iters} iterations, log posterior
-                      ${' ' + fmt(res.logp, 2)}
+                      ${isNuts
+                        ? res.nObs + ' rows, ' + res.nPar + ' parameters, ' + res.diag.nChains +
+                          ' chains, ' + res.diag.nDraws + ' draws'
+                        : res.nObs + ' rows, ' + res.nPar + ' parameters, ' + res.iters +
+                          ' iterations, log posterior ' + fmt(res.logp, 2)}
                     </span>
                   </div>
                   <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 10, maxWidth: '78ch' }}>
-                    mode, sd and the interval are on the scale the model is fitted on, which for a bounded
-                    parameter is its transformed scale: log for a standard deviation, logit for a
-                    probability. The natural column is the posterior median back on the original scale, and
-                    that is the number to quote. The check column is the cross-check tab in one word.
+                    ${isNuts
+                      ? html`mean, sd and the interval are on the scale the model is fitted on, which
+                          for a bounded parameter is its transformed scale: log for a standard deviation,
+                          logit for a probability. They are the draws' own mean, sd and quantiles, so the
+                          interval may come out asymmetric, and where it does, that asymmetry is the
+                          finding rather than a defect. The natural column is the posterior median back on
+                          the original scale, and that is the number to quote. Rhat and the two effective
+                          sample sizes are explained in full on the chains tab.`
+                      : html`mode, sd and the interval are on the scale the model is fitted on, which
+                          for a bounded parameter is its transformed scale: log for a standard deviation,
+                          logit for a probability. The natural column is the posterior median back on the
+                          original scale, and that is the number to quote. The check column is the
+                          cross-check tab in one word.`}
                   </p>
                 <//>` : null}
 
-              ${tab === 'grid' ? html`<${GridCheck} grid=${res.grid} />` : null}
+              ${tab === 'grid' && res.grid ? html`<${GridCheck} grid=${res.grid} />` : null}
+
+              ${tab === 'trace' && isNuts ? html`
+                <${React.Fragment}>
+                  <${SamplerReport} diag=${res.diag} chainInfo=${res.chainInfo} />
+                  <p className="ctl-sec-h" style=${{ marginTop: 18 }}>Traces</p>
+                  ${(res.traces || []).map((series, i) => html`
+                    <${TracePlot} key=${i} series=${series} name=${res.names[i]} />`)}
+                  <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 4, maxWidth: '78ch' }}>
+                    What a healthy trace looks like: the chains overlap completely, none of them wanders
+                    off on its own, and the whole thing reads as noise around a level rather than as a
+                    landscape. A chain that drifts, or one band sitting beside the others, is a problem
+                    the numbers above also report, but it is easier to see here first.
+                  </p>
+                <//>` : null}
               ${tab === 'cor' ? html`<${CorMatrix} names=${res.names} cor=${res.cor} />` : null}
               ${tab === 'pred' ? (res.pred
                 ? html`<${PredPlot} pred=${res.pred} data=${data} outcome=${res.outcome} xname=${xname} />`
@@ -3443,11 +4676,20 @@
             <summary>What this does, and where it stops</summary>
             <div className="fold-body">
               <p>
-                The posterior is approximated by a Gaussian centred on its mode, with the curvature taken
-                from a numerical second derivative. That is quadratic approximation. It is exact when the
-                posterior really is Gaussian, which happens more often than you would expect, and it fails
-                without warning when it does not. Hence the cross-check tab, which evaluates the posterior
-                directly along each parameter and shows the disagreement rather than hiding it.
+                There are two ways to fit a model here, and they answer the same question differently.
+                Quadratic approximation puts a Gaussian at the posterior mode, with the curvature from a
+                numerical second derivative. It is exact when the posterior really is Gaussian, which
+                happens more often than you would expect, and it fails without warning when it does not.
+                Hence the cross-check tab, which evaluates the posterior directly along each parameter and
+                shows the disagreement rather than hiding it.
+              </p>
+              <p>
+                NUTS is the other way: Hamiltonian Monte Carlo, several chains, no assumption about the
+                shape at all. It costs seconds instead of milliseconds and it is what the cross-check is
+                pointing at whenever it says a parameter is poorly approximated. The honest summary of the
+                relationship is that quadratic approximation is the fast answer that is usually right, and
+                the chains are how you find out which case you are in. Where both apply they agree, and
+                where they disagree the chains are the ones to believe.
               </p>
               <p>
                 Everything is computed on an unconstrained scale: a standard deviation is carried as its
@@ -3458,17 +4700,28 @@
                 variables, and neither answer is the wrong one.
               </p>
               <p>
-                Not here: multilevel models, varying effects, multivariate priors, mixtures, and anything
-                that needs Markov chain Monte Carlo. There are no chains, so there is no Rhat, no effective
-                sample size and no divergence count. Gradients are exact, from a reverse-mode derivative
-                tape, but the curvature still comes from finite differences, so a model whose log posterior
-                has a kink in it produces curvature that is arithmetically real and statistically
-                meaningless. Everything
-                runs in one browser tab on one core, which in practice means a few thousand rows and a few
-                dozen parameters.
+                Not here: multilevel models, varying effects, multivariate priors and mixtures. A parameter
+                is still a single number, so a model with one intercept per group has to be written out one
+                parameter at a time, and beyond a handful of groups that stops being reasonable. Gradients
+                are exact, from a reverse-mode derivative tape, but in the quadratic mode the curvature
+                still comes from finite differences, so a model whose log posterior has a kink in it
+                produces curvature that is arithmetically real and statistically meaningless. Everything
+                runs in one browser tab, the chains on one core each, which in practice means a few
+                thousand rows and a few dozen parameters.
               </p>
               <p>
-                Results are reproducible within a browser, because the sampling is seeded. They are not
+                What the chains report about themselves is worth reading before the numbers they produce.
+                A divergent transition means the sampler could not follow the shape of the posterior at
+                that point, and the draws are then biased in a direction nothing on the page can measure,
+                which is why the count is shown even when it is small. Rhat compares the chains against
+                each other and effective sample size says how many independent draws the correlated ones
+                are worth, separately for the middle of the distribution and for its ends. None of these
+                can tell you the model is right. They can only tell you the arithmetic underneath the
+                answer did not fail, which is a lower bar and still worth clearing first.
+              </p>
+              <p>
+                Results are reproducible within a browser, because every chain and every draw is seeded.
+                They are not
                 bit-identical across browsers: the standard does not require log and exp to be correctly
                 rounded, and engines differ in the last place. The difference is far below anything worth
                 reporting, but it is not zero.
