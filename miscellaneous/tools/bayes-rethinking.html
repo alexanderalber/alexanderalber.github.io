@@ -1785,6 +1785,109 @@
       }
       for (var oi = 0; oi < order.length; oi++) visit(order[oi], []);
 
+      /* ---- which columns does this model actually read ----
+
+         Every statement that survives, plus the index column of a vector
+         parameter, which is read as data even though it never appears in an
+         expression. Used twice: to decide which rows are usable (just below),
+         and to tell the Python export what predict() has to be given. */
+      function usesColumn(c) {
+        var used = false;
+        function scan(nd) {
+          if (!nd || used) return;
+          if (nd.tag === 'var') { if (nd.name === c) used = true; return; }
+          if (nd.tag === 'index') { if (nd.name === c) used = true; scan(nd.idx); return; }
+          if (nd.tag === 'neg') { scan(nd.x); return; }
+          if (nd.tag === 'bin') { scan(nd.l); scan(nd.r); return; }
+          if (nd.tag === 'call') { nd.args.forEach(scan); return; }
+        }
+        sorted.forEach(function (nm) { scan(detByName[nm].expr); });
+        /* The outcome itself is read as data, and so is anything in its
+           distribution's arguments (the size of a dbinom, typically another
+           column). */
+        for (var k = 0; k < outcomes.length; k++) {
+          if (outcomes[k] === c) used = true;
+          stochByName[outcomes[k]].dist.args.forEach(scan);
+        }
+        /* Priors can mention columns too, and a vector parameter's index column
+           (the cid in a[cid]) sits on the LEFT of "~", where no scan of
+           expressions would ever find it. */
+        for (var s = 0; s < stmts.length; s++) {
+          var stU = stmts[s];
+          if (stU.tag !== 'stoch' || cols[stU.lhs.name]) continue;
+          if (stU.lhs.idx && stU.lhs.idx.tag === 'var' && stU.lhs.idx.name === c) used = true;
+          stU.dist.args.forEach(scan);
+        }
+        return used;
+      }
+      var usedCols = colNames.filter(usesColumn);
+
+      /* ---- drop the rows this model cannot use ----
+
+         Complete-case deletion, but scoped to usedCols rather than to the file.
+         A column the model never mentions cannot make a row unusable, and until
+         2026-09-10 it did: parseCSV dropped on any missing value anywhere, so an
+         unrelated column with holes silently shrank every fit in the tool.
+
+         What stays is the standard assumption, MCAR, and it is worth being
+         plain about: dropping rows is unbiased only if what is missing is
+         missing for reasons unrelated to the outcome, which is a claim about
+         the world that no amount of code can check. The alternative that is
+         actually correct more often is to give the missing value a prior and
+         let the sampler carry its uncertainty (Rethinking ch. 15), and that is
+         deliberately not implemented here: it needs a notation for "this column
+         has holes", and it changes what a row even is.
+
+         rows[] is the map back to the original file, and it has to travel with
+         the model, because the prediction plot pairs data[i] with a fitted
+         value and would otherwise pair row 7 of the file with row 7 of a
+         shortened fit. */
+      var rows = null, nDropped = 0, culprits = [];
+      if (usedCols.length && nObs) {
+        rows = [];
+        var blamed = {};
+        for (var ri = 0; ri < nObs; ri++) {
+          var keep = true;
+          for (var uc = 0; uc < usedCols.length; uc++) {
+            var cv = cols[usedCols[uc]];
+            if (ri >= cv.length || !isFinite(cv[ri])) {
+              keep = false;
+              /* No break: the message names every column that is at fault, and
+                 stopping at the first would blame one column for a row that two
+                 of them ruined. One extra pass over a handful of columns. */
+              blamed[usedCols[uc]] = true;
+            }
+          }
+          if (keep) rows.push(ri); else nDropped++;
+        }
+        culprits = usedCols.filter(function (c) { return blamed[c]; });
+        if (!rows.length) {
+          throw new ParseError('every row has a missing value in at least one of the columns this ' +
+            'model uses (' + usedCols.join(', ') + '), so there is nothing left to fit', 1, 1);
+        }
+        if (nDropped) {
+          /* Subset every column, not just the used ones: the frame and the
+             plots read columns the likelihood never touches, and they have to
+             stay the same length as everything else. A column that is itself
+             all missing stays all missing, which is correct and visible. */
+          var sub = {};
+          for (var sc = 0; sc < colNames.length; sc++) {
+            var oldA = cols[colNames[sc]], newA = new Float64Array(rows.length);
+            for (var rr = 0; rr < rows.length; rr++) {
+              newA[rr] = rows[rr] < oldA.length ? oldA[rows[rr]] : NaN;
+            }
+            sub[colNames[sc]] = newA;
+          }
+          cols = sub;
+          nObs = rows.length;
+          warnings.push(nDropped + ' of ' + (nObs + nDropped) + ' rows dropped for missing values in ' +
+            culprits.join(', ') + '. The fit uses the remaining ' + nObs + '. Comparing this model ' +
+            'with one that keeps a different set of rows is not meaningful.');
+        } else {
+          rows = null;
+        }
+      }
+
       /* ---- links and initial values ---- */
       var pool = makePool(nObs || 1);
       var ctx = { n: nObs || 1, pool: pool };
@@ -2436,6 +2539,18 @@
         outcomes: outcomes,
         detNames: sorted,
         nObs: nObs,
+        /* Rows dropped for missing values, and the map from the fitted rows
+           back to the rows of the file. rows is null when nothing was dropped,
+           which is the common case and lets every consumer skip the mapping
+           entirely. usedCols says WHICH columns caused it, which is the only
+           part of the message a user can act on. */
+        nDropped: nDropped,
+        rows: rows,
+        usedCols: usedCols,
+        /* The columns the model actually fitted on, already subset. Same objects
+           the target function reads, not a copy: a test that checks the subset
+           has to check the buffers that were used, or it checks nothing. */
+        cols: cols,
         nPar: P,
         logp: logp,
         grad: grad,
@@ -2490,24 +2605,11 @@
                 })() };
             }),
             displayNames: displayNames(),
-            /* Which data columns the model actually reads. That is the set the
-               exported predict() has to be given, and asking for anything else
-               would be a worse error message later. */
-            columns: colNames.filter(function (c) {
-              var used = false;
-              function scan(nd) {
-                if (!nd || used) return;
-                if (nd.tag === 'var' && nd.name === c) { used = true; return; }
-                if (nd.tag === 'index') { if (nd.name === c) used = true; scan(nd.idx); return; }
-                if (nd.tag === 'neg') { scan(nd.x); return; }
-                if (nd.tag === 'bin') { scan(nd.l); scan(nd.r); return; }
-                if (nd.tag === 'call') { nd.args.forEach(scan); return; }
-              }
-              sorted.forEach(function (nm) { scan(detByName[nm].expr); });
-              stochByName[outcomes[0]].dist.args.forEach(scan);
-              blocks.forEach(function (b) { if (b.vec && b.index === c) used = true; });
-              return used;
-            }),
+            /* Which data columns the model reads as INPUTS. usedCols minus the
+               outcomes: predicting is exactly the case where the outcome is not
+               known, so demanding it would be wrong, and asking for anything
+               else would be a worse error message later. */
+            columns: usedCols.filter(function (c) { return outcomes.indexOf(c) < 0; }),
             levels: (function () {
               var out = {};
               colNames.forEach(function (c) {
@@ -5020,11 +5122,30 @@
        number wins for no reason at all. And a difference in row count breaks
        the pairing outright.
 
-       In this tool the row count is currently fixed by the CSV rather than by
-       the model, because parseCSV drops a row with any missing value before any
-       model sees it. So the second check is cheap insurance rather than a live
-       hazard today: it costs one comparison and it keeps the pairing honest if
-       that ever changes. */
+       Until 2026-09-10 the row count was fixed by the CSV rather than by the
+       model, because parseCSV dropped a row with any missing value before any
+       model saw it, and the row check here was cheap insurance against a hazard
+       that could not occur. It can occur now: rows are dropped per model, for
+       the columns that model uses, so adding a predictor with holes in it
+       shortens the data. This is the classic way to make a model comparison
+       lie, and it is worth naming, because both numbers look entirely normal:
+       the model with fewer rows has less to explain and its deviance is smaller
+       for that reason alone, not because it is better.
+
+       Which is why the check compares the row SET and not just its size. Two
+       models can drop the same NUMBER of rows and not the same rows, and then
+       parts_b[j] - parts_a[j] silently subtracts two different observations
+       from each other. Equal counts are the case that would slip through. */
+    function sameRows(a, b) {
+      /* null means "nothing dropped", i.e. the identity 0..n-1. Two nulls agree
+         trivially, and a null against a list agrees only if the list is that
+         identity, which it never is when something was dropped. */
+      if (!a && !b) return true;
+      if (!a || !b) return false;
+      if (a.length !== b.length) return false;
+      for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
     function comparable(fits) {
       var i;
       for (i = 0; i < fits.length; i++) {
@@ -5039,6 +5160,9 @@
       for (i = 1; i < fits.length; i++) {
         if (fits[i].nObs !== fits[0].nObs) {
           return { reason: 'nobs', which: i, a: fits[0].nObs, b: fits[i].nObs };
+        }
+        if (!sameRows(fits[0].rows, fits[i].rows)) {
+          return { reason: 'rowset', which: i, n: fits[0].nObs };
         }
       }
       return null;
@@ -5134,7 +5258,7 @@
 
     function parseCSV(text) {
       var src = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
-      if (!src.trim()) return { columns: {}, names: [], n: 0, dropped: 0, notes: [] };
+      if (!src.trim()) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
       var firstNl = src.indexOf('\n');
       var delim = detectDelim(firstNl < 0 ? src : src.slice(0, firstNl));
       var rows = [], field = '', row = [], inQ = false, i;
@@ -5151,7 +5275,7 @@
         else field += c;
       }
       row.push(field); rows.push(row);
-      if (!rows.length) return { columns: {}, names: [], n: 0, dropped: 0, notes: [] };
+      if (!rows.length) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
 
       var header = rows[0].map(function (h, k) {
         var t = h.trim().replace(/^"|"$/g, '');
@@ -5178,37 +5302,60 @@
           if (!isFinite(Number(v))) numeric[j] = false;
         }
       }
-      var columns = {}, kept = [], dropped = 0;
-      for (i = 0; i < body.length; i++) {
-        var ok = true;
-        for (var j2 = 0; j2 < header.length; j2++) {
-          var v2 = (body[i][j2] || '').trim();
-          if (v2 === '' || v2 === 'NA' || v2 === 'NaN' || v2 === 'null') { ok = false; break; }
-        }
-        if (ok) kept.push(body[i]); else dropped++;
+      /* Missing values are KEPT here, as NaN, and dropped later by compileModel
+         against the columns a model actually reads.
+
+         This used to drop the row right here, as soon as ANY column was empty.
+         That is complete-case deletion, which is defensible, but it was applied
+         against the whole file rather than against the model: one unusable
+         notes column with a few holes in it cost rows that every model in the
+         tool would have been perfectly happy with. Which rows are unusable is a
+         property of the model, and it is not known at this point, so the
+         decision does not belong here.
+
+         NaN is the sentinel and needs no companion mask, because a Float64Array
+         carries it natively and nothing downstream can mistake it for data: the
+         target function returns -Infinity on the first NaN it touches, so a
+         missing value that slipped through would fail loudly rather than
+         quietly shifting an estimate. A categorical column gets NaN too, and
+         deliberately no level of its own: "missing" is not a category, and
+         giving it one would silently estimate a parameter for it. */
+      var columns = {}, missCount = header.map(function () { return 0; });
+      function isMissing(v) {
+        return v === '' || v === 'NA' || v === 'NaN' || v === 'null';
       }
       for (var j3 = 0; j3 < header.length; j3++) {
-        var arr = new Float64Array(kept.length);
-        if (numeric[j3]) {
-          for (i = 0; i < kept.length; i++) arr[i] = Number((kept[i][j3] || '').trim());
-        } else {
+        var arr = new Float64Array(body.length);
+        var map = {}, next = 1, lv = [];
+        for (i = 0; i < body.length; i++) {
+          var raw = (body[i][j3] || '').trim();
+          if (isMissing(raw)) { arr[i] = NaN; missCount[j3]++; continue; }
+          if (numeric[j3]) { arr[i] = Number(raw); continue; }
           /* Categorical columns become one-based integer codes, which is the
              form an index variable needs. The level table goes back to the UI so
              the user can see which number is which. */
-          var map = {}, next = 1, lv = [];
-          for (i = 0; i < kept.length; i++) {
-            var key = (kept[i][j3] || '').trim();
-            if (!(key in map)) { map[key] = next++; lv.push(key); }
-            arr[i] = map[key];
-          }
-          levels[j3] = lv;
+          if (!(raw in map)) { map[raw] = next++; lv.push(raw); }
+          arr[i] = map[raw];
         }
+        if (!numeric[j3]) levels[j3] = lv;
         columns[header[j3]] = arr;
       }
-      if (dropped) {
-        notes.push(dropped + ' row' + (dropped === 1 ? '' : 's') + ' dropped because of missing values.');
+
+      /* Reported per column, because that is the actionable form: it says which
+         column is the expensive one, and a total does not. How many ROWS a given
+         model loses is a different number and is reported by the model panel,
+         where it can be said truthfully. */
+      var totalMissing = 0;
+      for (i = 0; i < header.length; i++) {
+        if (missCount[i]) {
+          totalMissing += missCount[i];
+          notes.push(header[i] + ' has ' + missCount[i] + ' missing value' +
+            (missCount[i] === 1 ? '' : 's') + '. Rows are dropped per model, ' +
+            'and only for the columns that model uses.');
+        }
       }
-      return { columns: columns, names: header, n: kept.length, dropped: dropped, levels: levels, numeric: numeric, notes: notes };
+      return { columns: columns, names: header, n: body.length, missing: missCount,
+        nMissing: totalMissing, levels: levels, numeric: numeric, notes: notes };
     }
 
     /* Column statistics for the data panel, and for the standardize helper. */
@@ -5216,19 +5363,33 @@
       return data.names.map(function (nm, i) {
         var a = data.columns[nm], n = a.length;
         if (!n) return { name: nm, n: 0 };
-        var sorted = Float64Array.from(a).sort();
+        /* Die Kennzahlen laufen ueber die BEOBACHTETEN Werte, nicht ueber die
+           Spalte. Seit fehlende Werte als NaN stehenbleiben, waere sonst jede
+           einzelne Zahl hier NaN, sobald irgendwo ein Loch ist: ein NaN
+           vergiftet eine Summe vollstaendig. n ist entsprechend die Zahl der
+           beobachteten Werte, weil eine Laenge, die Loecher mitzaehlt, neben
+           einem Mittelwert steht, der sie nicht mitzaehlt. */
+        var obs = Float64Array.from(Array.prototype.filter.call(a, isFinite));
+        var nObsC = obs.length;
+        var nMiss = n - nObsC;
         var isNum = data.numeric ? data.numeric[i] : true;
         /* Keine Lagemasse fuer eine Kategorienspalte. Die Zahlen darin sind
            Codes, und ihr Mittelwert haengt daran, in welcher Reihenfolge die
            Stufen in der Datei zum ersten Mal auftauchen. Eine Zahl, die sich
            aendert, wenn man die Zeilen umsortiert, ist keine Statistik. */
-        return isNum ? {
-          name: nm, n: n, numeric: true, levels: null,
-          mean: meanOf(a), sd: sdOf(a),
-          min: sorted[0], max: sorted[n - 1], median: quantileSorted(sorted, 0.5)
-        } : {
-          name: nm, n: n, numeric: false,
-          levels: data.levels ? data.levels[i] : null
+        if (!isNum) {
+          return { name: nm, n: nObsC, missing: nMiss, numeric: false,
+            levels: data.levels ? data.levels[i] : null };
+        }
+        if (!nObsC) {
+          return { name: nm, n: 0, missing: nMiss, numeric: true, levels: null,
+            mean: NaN, sd: NaN, min: NaN, max: NaN, median: NaN };
+        }
+        var sorted = Float64Array.from(obs).sort();
+        return {
+          name: nm, n: nObsC, missing: nMiss, numeric: true, levels: null,
+          mean: meanOf(obs), sd: sdOf(obs),
+          min: sorted[0], max: sorted[nObsC - 1], median: quantileSorted(sorted, 0.5)
         };
       });
     }
@@ -5553,7 +5714,8 @@
               python: pysrc, pythonError: pyerr,
               messages: fit.messages, names: model.displayNames, links: fit.links,
               slotGroup: model.slotGroup, nonCentred: model.nonCentred,
-              nObs: model.nObs, nPar: model.nPar, iters: fit.iters, logp: fit.logp,
+              nObs: model.nObs, nDropped: model.nDropped, rows: model.rows,
+              nPar: model.nPar, iters: fit.iters, logp: fit.logp,
               outcome: model.outcome, pred: pred, pairs: qpairs,
               detNames: model.detNames
             }
@@ -5696,7 +5858,8 @@
               messages: mmsgs, names: mmodel.displayNames,
               slotGroup: mmodel.slotGroup, nonCentred: mmodel.nonCentred,
               links: mmodel.params.map(function (pp) { return pp.linkName; }),
-              nObs: mmodel.nObs, nPar: mmodel.nPar,
+              nObs: mmodel.nObs, nDropped: mmodel.nDropped, rows: mmodel.rows,
+              nPar: mmodel.nPar,
               outcome: mmodel.outcome, pred: mpred, detNames: mmodel.detNames,
               pairs: mpairs,
               diag: diag, traces: traces,
@@ -6083,7 +6246,10 @@
                         <td className="qp-num">${fmt(c.sd)}</td>
                         <td className="qp-num">${fmt(c.min)}</td>
                         <td className="qp-num">${fmt(c.max)}</td>
-                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>numeric</td>
+                        <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>
+                          numeric${c.missing ? html`<span style=${{ color: 'var(--tool-warn-text)' }}>
+                            , ${c.missing} missing</span>` : null}
+                        </td>
                       </tr>` : html`
                       <tr key=${c.name}>
                         <td className="qp-name">${c.name}</td>
@@ -6091,7 +6257,9 @@
                           ${levelList(c.levels)}
                         </td>
                         <td style=${{ color: 'var(--tool-note)', fontSize: 12 }}>
-                          ${(c.levels ? c.levels.length : 0)} categories
+                          ${(c.levels ? c.levels.length : 0)} categories${c.missing
+                            ? html`<span style=${{ color: 'var(--tool-warn-text)' }}>
+                              , ${c.missing} missing</span>` : null}
                         </td>
                       </tr>`)}
                   </tbody>
@@ -6830,9 +6998,18 @@
             + 'and another has "' + p.b + '". Both criteria are on the scale of the outcome, so '
             + 'comparing models of different outcomes would produce numbers that look perfectly '
             + 'ordinary and mean nothing at all.'
+          : p.reason === 'rowset'
+          ? 'These models were fitted to ' + p.n + ' rows each, but not to the SAME ' + p.n + ' rows: '
+            + 'they use columns with missing values in different places, so each dropped a different '
+            + 'set. The comparison pairs the models up row by row, and here that would subtract one '
+            + 'observation from a different one. Restrict the models to columns that are missing in '
+            + 'the same rows, or drop the incomplete rows from the CSV yourself so every model sees '
+            + 'the same data.'
           : 'These models were fitted to different numbers of rows (' + p.a + ' against ' + p.b
             + '). The comparison pairs the two models up row by row, so it cannot be formed here, '
-            + 'and the difference of the totals would silently be a difference of sample sizes.';
+            + 'and the difference of the totals would silently be a difference of sample sizes. The '
+            + 'usual cause is a predictor with missing values: a row without it cannot be used, so '
+            + 'the model that mentions it is fitted to less data.';
         return html`<${Msg} kind=${p.reason === 'toofew' || p.reason === 'notfit' ? 'info' : 'err'}>
           ${why}<//>`;
       }
@@ -6953,10 +7130,21 @@
     }
 
     /* ---- predictions ---- */
-    function PredPlot({ pred, data, outcome, xname }) {
+    /* rows is the fit's map back into the file, non-null exactly when the model
+       dropped rows for missing values. Both columns are gathered through it up
+       front, so pred.link.mean[i] belongs to x[i] again and nothing below has to
+       know that a row is missing. Without this the plot would pair the i-th row
+       of the FILE with the i-th fitted value and draw a quietly wrong picture,
+       which is the worst kind. */
+    function PredPlot({ pred, data, outcome, xname, rows }) {
       if (!pred || !data || !xname) return null;
-      const x = data.columns[xname], y = data.columns[outcome];
+      let x = data.columns[xname], y = data.columns[outcome];
       if (!x || !y) return null;
+      if (rows && rows.length) {
+        const xa = x, ya = y;
+        x = Float64Array.from(rows, (r) => xa[r]);
+        y = Float64Array.from(rows, (r) => ya[r]);
+      }
       const n = Math.min(x.length, pred.link.mean.length);
       const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => x[a] - x[b]);
       const W = 560, H = 330, pad = 42;
@@ -7675,7 +7863,7 @@
                   <${CorMatrix} names=${res.names} cor=${res.cor} keep=${subset.keep} />
                 <//>` : null}
               ${tab === 'pred' ? (res.pred
-                ? html`<${PredPlot} pred=${res.pred} data=${data} outcome=${res.outcome} xname=${xname} />`
+                ? html`<${PredPlot} pred=${res.pred} data=${data} outcome=${res.outcome} xname=${xname} rows=${res.rows} />`
                 : html`<p style=${{ color: 'var(--tool-note)' }}>
                     This model has no deterministic node to plot against a predictor.</p>`) : null}
 
