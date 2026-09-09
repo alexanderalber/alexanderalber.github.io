@@ -54,6 +54,24 @@
     }
     textarea.qp-csv { min-height: 120px; }
 
+    /* Das Namensfeld eines Modells. Schmal, weil ein Modellname zwei Woerter
+       ist und nicht ein Satz. Padding wieder ueber Picos Variablen, aus
+       demselben Grund wie beim Editor oben. */
+    input.qp-name {
+      --pico-form-element-spacing-vertical: 4px;
+      --pico-form-element-spacing-horizontal: 8px;
+      width: 15ch; margin: 0; font-size: 13px;
+    }
+
+    /* Die Vorschau auf das erzeugte Python. Scrollt statt zu wachsen: die
+       Datei ist im NUTS-Fall ein paar hundert kB, und davon sind
+       neunundneunzig Prozent Zahlen. */
+    .qp-pysrc {
+      max-height: 420px; overflow: auto; font-size: 11.5px; line-height: 1.5;
+      background: var(--tool-surface); border: 1px solid var(--tool-border);
+      border-radius: 8px; padding: 12px; margin-top: 14px; white-space: pre;
+    }
+
     /* The results table. Numbers right-aligned and tabular so a column of
        posterior means can be compared by eye, which is the whole point of it. */
     .qp-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -2336,6 +2354,78 @@
         nodeValues: nodeValues,
         initial: initial,
         warnings: warnings,
+        /* Everything a code generator needs to re-express this model in
+           another language, and nothing that is a closure.
+
+           The Python export walks THIS rather than the compiled functions,
+           which is the only reason it can exist: the frame functions are fast
+           because they write into pooled buffers, and a buffer pool does not
+           translate. The structure does. Deliberately the parsed tree AFTER the
+           non-centred rewrite, so the exported script and the fit it came from
+           are the same model in the same coordinates. */
+        spec: function () {
+          return {
+            outcome: outcomes[0],
+            like: (function () {
+              var st = stochByName[outcomes[0]];
+              return { dist: st.dist.fn, args: st.dist.args };
+            })(),
+            /* In dependency order, which is the order they can be emitted. */
+            det: sorted.map(function (nm) {
+              return { name: nm, expr: detByName[nm].expr };
+            }),
+            blocks: blocks.map(function (b) {
+              return { name: b.name, at: b.at, K: b.K, vec: b.vec, index: b.index,
+                labels: b.labels, dist: b.dist };
+            }),
+            /* The non-centred rewrite, as trees rather than as compiled
+               closures, so a generator can reconstruct what the user wrote.
+               Empty unless the model actually has a hierarchical prior and the
+               rewrite was applied. */
+            disp: dispBlocks.map(function (db) {
+              return { from: db.from, to: db.to, at: db.at, K: db.K, names: db.names,
+                mu: (function () {
+                  for (var i = 0; i < ncRenamed.length; i++) {
+                    if (ncRenamed[i].to === db.to) return ncRenamed[i].mu;
+                  }
+                  return null;
+                })(),
+                sd: (function () {
+                  for (var i = 0; i < ncRenamed.length; i++) {
+                    if (ncRenamed[i].to === db.to) return ncRenamed[i].sd;
+                  }
+                  return null;
+                })() };
+            }),
+            displayNames: displayNames(),
+            /* Which data columns the model actually reads. That is the set the
+               exported predict() has to be given, and asking for anything else
+               would be a worse error message later. */
+            columns: colNames.filter(function (c) {
+              var used = false;
+              function scan(nd) {
+                if (!nd || used) return;
+                if (nd.tag === 'var' && nd.name === c) { used = true; return; }
+                if (nd.tag === 'index') { if (nd.name === c) used = true; scan(nd.idx); return; }
+                if (nd.tag === 'neg') { scan(nd.x); return; }
+                if (nd.tag === 'bin') { scan(nd.l); scan(nd.r); return; }
+                if (nd.tag === 'call') { nd.args.forEach(scan); return; }
+              }
+              sorted.forEach(function (nm) { scan(detByName[nm].expr); });
+              stochByName[outcomes[0]].dist.args.forEach(scan);
+              blocks.forEach(function (b) { if (b.vec && b.index === c) used = true; });
+              return used;
+            }),
+            levels: (function () {
+              var out = {};
+              colNames.forEach(function (c) {
+                var li = colNames.indexOf(c);
+                if (data && data.levels && data.levels[li]) out[c] = data.levels[li];
+              });
+              return out;
+            })()
+          };
+        },
         toNatural: function (theta) {
           var out = new Float64Array(P);
           for (var i = 0; i < P; i++) out[i] = pinfo[i].link.from(theta[i]);
@@ -4132,10 +4222,19 @@
         for (s = 0; s < S; s++) { var d = col[s] - m; v += d * d; }
         pen += v / (S - 1);
       }
-      return { WAIC: -2 * (lppd - pen), lppd: lppd, pWAIC: pen, n: n, se: waicSE(ll) };
+      var parts = waicParts(ll);
+      return { WAIC: -2 * (lppd - pen), lppd: lppd, pWAIC: pen, n: n,
+        se: Math.sqrt(n) * sdOf(parts), parts: parts };
     }
 
-    function waicSE(ll) {
+    /* The per-observation contributions to WAIC, which are what the standard
+       error is built from and, since the model comparison landed, the thing
+       that actually has to leave this function. Two models fitted to the same
+       rows have CORRELATED errors, so the se of their difference cannot be
+       assembled from their two individual ses; it needs these parts, paired up
+       row by row. Keeping them was a one-word change here and saves recomputing
+       the whole log-likelihood matrix later. */
+    function waicParts(ll) {
       var S = ll.S, n = ll.n, col = new Float64Array(S), parts = new Float64Array(n);
       for (var j = 0; j < n; j++) {
         for (var s = 0; s < S; s++) col[s] = ll.m[s * n + j];
@@ -4144,7 +4243,12 @@
         for (s = 0; s < S; s++) { var d = col[s] - m; v += d * d; }
         parts[j] = -2 * (lp - v / (S - 1));
       }
-      return Math.sqrt(n) * sdOf(parts);
+      return parts;
+    }
+
+    function waicSE(ll) {
+      var parts = waicParts(ll);
+      return Math.sqrt(parts.length) * sdOf(parts);
     }
 
     /* Pareto-smoothed importance sampling LOO. The generalized Pareto fit is
@@ -4243,7 +4347,676 @@
       return {
         PSIS: -2 * elpd, elpd: elpd, k: ks,
         se: Math.sqrt(n) * sdOf(pl),
-        nBadK: bad
+        nBadK: bad, parts: pl
+      };
+    }
+
+    /* ================================================================
+       Exporting a fitted model as Python
+
+       What this produces is a PREDICTION FUNCTION, not a fitted object and not
+       a model definition. The question it answers is "I have new inputs, what
+       does the model say", and the three shapes of that question get one
+       function each: a point value, an interval, and the draws behind both.
+
+       Deliberately no PyMC, no scipy, no ArviZ. numpy and pandas, which are in
+       every environment that would want this, and nothing else. Emitting a PyMC
+       model would also be a strange thing for this tool to do, since one reason
+       it exists is that expressing a small model in PyMC is more work than
+       writing it down.
+
+       The posterior travels in the smallest lossless form available, which is
+       not the same form in the two fit modes:
+
+         quap  mean vector and covariance matrix, a few dozen numbers. That IS
+               the fitted posterior, so nothing is approximated by shipping it
+               this way, and the script draws from it with a Cholesky factor.
+         NUTS  the draws themselves. There is no compact summary of a set of
+               chains that does not throw away exactly the thing the chains were
+               run to find, so several hundred kB of literal it is.
+
+       Everything downstream of that split is shared: both scripts define the
+       same functions and the same posterior() contract, so two exports of the
+       same model can be compared line by line.
+
+       On what is NOT exported: the log posterior, the gradient, WAIC. The first
+       two would mean translating the tape, and a Python script that can compute
+       a gradient but has no sampler to use it is a curiosity. WAIC is a
+       statement about the rows the model was fitted on, and this file is about
+       rows it was not.
+       ================================================================ */
+
+    /* Every operator and function the model language has, as numpy. The table
+       is total on purpose: a missing entry has to be an error at generation
+       time and not a NameError in someone's Python three days later. */
+    var PYFUNCS = {
+      log: 'np.log', exp: 'np.exp', sqrt: 'np.sqrt',
+      log1p: 'np.log1p', expm1: 'np.expm1',
+      sin: 'np.sin', cos: 'np.cos', tanh: 'np.tanh',
+      logit: '_logit', inv_logit: '_inv_logit', logistic: '_inv_logit'
+    };
+
+    /* The expression tree as a numpy expression string.
+
+       Parameters are indexed out of the draw matrix, so `a` becomes th[:, 0:1]
+       and stays a column: every value in the generated expression is an
+       (S, 1) or (S, n) array, and numpy broadcasting then does exactly what the
+       frame does in JS. Keeping the trailing axis rather than using th[:, 0] is
+       what makes a scalar parameter combine with an n-long data column without
+       a single reshape anywhere in the emitted code.
+
+       A vector parameter indexed by a column, a[cid], becomes a gather:
+       th[:, at:at+K][:, idx], which is (S, n). Same shape, same rules. */
+    function pyExpr(node, env) {
+      function emit(nd, prec) {
+        var out = pyExprNode(nd);
+        return out.prec < prec ? '(' + out.s + ')' : out.s;
+      }
+      function pyExprNode(nd) {
+        if (!nd) throw new Error('empty expression');
+        if (nd.tag === 'num') {
+          /* A whole number has to stay a float, or an integer division or an
+             integer power silently changes the arithmetic. */
+          var v = nd.v;
+          return { s: (Number.isInteger(v) ? v.toFixed(1) : String(v)), prec: 4 };
+        }
+        if (nd.tag === 'var') {
+          if (env.par[nd.name] !== undefined) {
+            var b = env.par[nd.name];
+            if (b.vec) throw new Error('the vector parameter "' + nd.name + '" is used without an index');
+            /* nat, not th: the model's own frame holds every parameter on its
+               NATURAL scale, so an expression mentioning sigma means sigma and
+               not log sigma. Reading th here was a bug that produced a
+               perfectly plausible wrong answer for any bounded parameter. */
+            return { s: 'nat[:, ' + b.at + ':' + (b.at + 1) + ']', prec: 4 };
+          }
+          if (env.det[nd.name] !== undefined) return { s: '_' + nd.name, prec: 4 };
+          if (env.col[nd.name] !== undefined) return { s: 'd_' + nd.name, prec: 4 };
+          throw new Error('"' + nd.name + '" is not a parameter, a computed node or a data column');
+        }
+        if (nd.tag === 'index') {
+          var bb = env.par[nd.name];
+          if (!bb) throw new Error('"' + nd.name + '" is indexed but is not a parameter');
+          /* The index expression is one-based in the model language and
+             zero-based in numpy, and it has to be an integer to index with. */
+          var ix = emit(nd.idx, 0);
+          return { s: 'nat[:, ' + bb.at + ':' + (bb.at + bb.K) + '][:, (' + ix +
+            ').astype(np.intp).ravel() - 1]', prec: 4 };
+        }
+        if (nd.tag === 'neg') return { s: '-' + emit(nd.x, 3), prec: 2 };
+        if (nd.tag === 'bin') {
+          if (nd.op === '+' || nd.op === '-') {
+            return { s: emit(nd.l, 1) + ' ' + nd.op + ' ' + emit(nd.r, 2), prec: 1 };
+          }
+          if (nd.op === '*' || nd.op === '/') {
+            return { s: emit(nd.l, 2) + ' ' + nd.op + ' ' + emit(nd.r, 3), prec: 2 };
+          }
+          if (nd.op === '^') return { s: emit(nd.l, 4) + ' ** ' + emit(nd.r, 3), prec: 3 };
+          throw new Error('operator "' + nd.op + '" has no Python form');
+        }
+        if (nd.tag === 'call') {
+          var f = PYFUNCS[nd.fn];
+          if (!f) throw new Error('the function "' + nd.fn + '" has no Python form');
+          return { s: f + '(' + nd.args.map(function (a) { return emit(a, 0); }).join(', ') + ')', prec: 4 };
+        }
+        throw new Error('cannot translate a node of type "' + nd.tag + '"');
+      }
+      return emit(node, 0);
+    }
+
+    /* Drawing the outcome, per distribution, given the argument expressions.
+       numpy's Generator covers all of them directly except the two
+       reparametrizations, which are forwarded exactly as DIST does. */
+    var PYRNG = {
+      dnorm: function (a) { return 'rng.normal(' + a[0] + ', ' + a[1] + ')'; },
+      dlnorm: function (a) { return 'rng.lognormal(' + a[0] + ', ' + a[1] + ')'; },
+      dunif: function (a) { return 'rng.uniform(' + a[0] + ', ' + a[1] + ')'; },
+      dexp: function (a) { return 'rng.exponential(1.0 / (' + a[0] + '))'; },
+      dcauchy: function (a) { return '(' + a[0] + ') + (' + a[1] + ') * rng.standard_cauchy(size=shape)'; },
+      dbinom: function (a) { return 'rng.binomial((' + a[0] + ').astype(np.int64), ' + a[1] + ')'; },
+      dpois: function (a) { return 'rng.poisson(' + a[0] + ')'; },
+      dbeta: function (a) { return 'rng.beta(' + a[0] + ', ' + a[1] + ')'; },
+      dbeta2: function (a) { return 'rng.beta((' + a[0] + ') * (' + a[1] + '), (1.0 - (' +
+        a[0] + ')) * (' + a[1] + '))'; },
+      dgamma: function (a) { return 'rng.gamma(' + a[0] + ', 1.0 / (' + a[1] + '))'; },
+      dgamma2: function (a) { return 'rng.gamma((' + a[0] + ') / (' + a[1] + '), ' + a[1] + ')'; },
+      dstudent: function (a) { return '(' + a[1] + ') + (' + a[2] +
+        ') * rng.standard_t(' + a[0] + ')'; }
+    };
+    PYRNG.dt2 = PYRNG.dstudent;
+
+    /* The inverse link per parameter, as a numpy expression in `u`. This is
+       what turns the sampled coordinate back into the number the user named. */
+    function pyInvLink(name) {
+      if (name === 'identity') return 'u';
+      if (name === 'log') return 'np.exp(u)';
+      if (name === 'logit') return '_inv_logit(u)';
+      var m = /^interval\(\s*([-0-9.eE+]+)\s*,\s*([-0-9.eE+]+)\s*\)$/.exec(name || '');
+      if (m) return '(' + m[1] + ' + (' + m[2] + ' - ' + m[1] + ') * _inv_logit(u))';
+      throw new Error('the link "' + name + '" has no Python form');
+    }
+
+    function pyNum(v) {
+      if (!isFinite(v)) return 'float("nan")';
+      return Number.isInteger(v) && Math.abs(v) < 1e15 ? v.toFixed(1) : String(v);
+    }
+
+    function pyMatrix(rows, cols, get, indent) {
+      var out = [], i, j;
+      for (i = 0; i < rows; i++) {
+        var r = [];
+        for (j = 0; j < cols; j++) r.push(pyNum(get(i, j)));
+        out.push(indent + '[' + r.join(', ') + ']');
+      }
+      return out.join(',\n');
+    }
+
+    function pyStr(x) {
+      return '"' + String(x).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+    }
+
+    /* The generator itself.
+
+       fit is either a quap fit (mode and cov) or an object carrying draws, and
+       the ONLY difference between the two outputs is the posterior() block near
+       the top. Everything after it is generated from the model alone. */
+    function toPython(model, fit, opts) {
+      opts = opts || {};
+      var sp = model.spec();
+      var P = model.nPar;
+      var env = { par: {}, det: {}, col: {} };
+      sp.blocks.forEach(function (b) { env.par[b.name] = b; });
+      sp.det.forEach(function (d) { env.det[d.name] = true; });
+      sp.columns.forEach(function (c) { env.col[c] = true; });
+
+      var lines = [];
+      var W = function (t) { lines.push(t === undefined ? '' : t); };
+      var links = fit.links || model.params.map(function (pp) { return pp.linkName; });
+
+      var title = opts.name ? String(opts.name) : 'model';
+      var isNuts = !!fit.draws;
+
+      W('"""' + title + ': a fitted Bayesian model, exported from Quap Lab.');
+      W();
+      W('    https://alber.me/miscellaneous/tools/bayes-rethinking.html');
+      W();
+      W('The model, as it was written:');
+      W();
+      String(opts.source || '').split('\n').forEach(function (l) { W('    ' + l); });
+      W();
+      if (isNuts) {
+        W('Fitted by Hamiltonian Monte Carlo (NUTS). The posterior below is the');
+        W('draws themselves, because a set of chains has no smaller honest form.');
+      } else {
+        W('Fitted by quadratic approximation: a Gaussian at the posterior mode.');
+        W('MEAN and COV below are that Gaussian in full, so nothing is lost by');
+        W('shipping it this way rather than as draws. Whether the Gaussian is a');
+        W('good description of the posterior is a separate question, and it is');
+        W('the one the cross-check tab in the tool answers.');
+      }
+      W();
+      W('Parameters are stored on the scale they were fitted on, which for a');
+      W('bounded parameter is a transformed one: log for a standard deviation,');
+      W('logit for a probability. natural() converts back. Predictions do this');
+      W('themselves, so this only matters if you look at the draws directly.');
+      W();
+      W('Needs numpy and pandas, nothing else.');
+      W('"""');
+      W();
+      W('import numpy as np');
+      W('import pandas as pd');
+      W();
+      W('__all__ = ["median", "mean", "interval", "percentiles", "samples",');
+      W('           "posterior", "natural", "PARAMS", "INPUTS"]');
+      W();
+      W();
+      W('def _inv_logit(x):');
+      W('    return 1.0 / (1.0 + np.exp(-x))');
+      W();
+      W();
+      W('def _logit(x):');
+      W('    return np.log(x / (1.0 - x))');
+      W();
+      W();
+      /* The names the user wrote, not the sampled coordinates: under a
+         non-centred rewrite those differ, and everywhere else in this tool the
+         written name is what is shown. */
+      var shownNames = sp.displayNames || model.names;
+      W('PARAMS = [' + shownNames.map(pyStr).join(', ') + ']');
+      W('INPUTS = [' + sp.columns.map(pyStr).join(', ') + ']');
+      W('OUTCOME = ' + pyStr(sp.outcome));
+      W();
+
+      /* ---- the posterior, the one place the two modes differ ---- */
+      if (isNuts) {
+        var dr = fit.draws, S = fit.S;
+        W('# ' + S + ' draws' + (fit.nChains ? ' from ' + fit.nChains + ' chains' : '') + ', one row each.');
+        W('DRAWS = np.array([');
+        var rowsOut = [];
+        for (var s = 0; s < S; s++) {
+          var r = [];
+          for (var i = 0; i < P; i++) r.push(pyNum(dr[s * P + i]));
+          rowsOut.push('    [' + r.join(', ') + ']');
+        }
+        W(rowsOut.join(',\n'));
+        W('])');
+        W();
+        W();
+        W('def posterior(n=None, seed=0):');
+        W('    """The posterior draws, on the fitted scale, shape (n, ' + P + ').');
+        W();
+        W('    The chains are already a sample, so n only thins them; asking for');
+        W('    more draws than were run cannot invent any and returns all of them.');
+        W('    seed is accepted so that both kinds of export have one signature.');
+        W('    """');
+        W('    if n is None or n >= DRAWS.shape[0]:');
+        W('        return DRAWS');
+        W('    idx = np.linspace(0, DRAWS.shape[0] - 1, int(n)).astype(np.intp)');
+        W('    return DRAWS[idx]');
+      } else {
+        W('MEAN = np.array([' + Array.prototype.slice.call(fit.mode).map(pyNum).join(', ') + '])');
+        W();
+        W('COV = np.array([');
+        W(pyMatrix(P, P, function (i, j) { return fit.cov[i * P + j]; }, '    '));
+        W('])');
+        W();
+        W();
+        W('def posterior(n=4000, seed=0):');
+        W('    """Draws from the fitted Gaussian, on the fitted scale, shape (n, ' + P + ').');
+        W();
+        W('    Drawn rather than stored: MEAN and COV are the whole posterior, so');
+        W('    any number of draws is available and none had to be shipped.');
+        W('    """');
+        W('    L = np.linalg.cholesky(COV)');
+        W('    z = np.random.default_rng(seed).standard_normal((int(n), MEAN.size))');
+        W('    return MEAN + z @ L.T');
+      }
+      W();
+      W();
+
+      /* ---- natural scale ---- */
+      W('def natural(th=None):');
+      W('    """The draws on the scale the parameters were named on.');
+      W();
+      W('    A DataFrame, one column per parameter. Use it to summarize the');
+      W('    parameters themselves; predictions do the conversion internally.');
+      W('    """');
+      W('    th = posterior() if th is None else np.atleast_2d(th)');
+      W('    return pd.DataFrame(' + (sp.disp && sp.disp.length ? '_displayed' : '_natural') +
+        '(th), columns=PARAMS)');
+      W();
+      W();
+
+      /* ---- the frame: data columns and deterministic nodes ---- */
+      W('def _natural(th):');
+      W('    """The draws with every parameter mapped back to its own scale.');
+      W();
+      W('    Same shape as th. Everything below reads THIS and never th, because');
+      W('    the model was written in terms of sigma, not log sigma.');
+      W('    """');
+      W('    out = np.empty_like(th)');
+      for (var ni = 0; ni < P; ni++) {
+        var inv = pyInvLink(links[ni]);
+        if (inv === 'u') {
+          W('    out[:, ' + ni + '] = th[:, ' + ni + ']');
+        } else {
+          W('    u = th[:, ' + ni + ']');
+          W('    out[:, ' + ni + '] = ' + inv);
+        }
+      }
+      W('    return out');
+      W();
+      W();
+      /* The reconstruction, when there was a non-centred rewrite. It is a
+         separate function from _natural because the model's own expressions
+         read the SAMPLED coordinate (that is the whole point of the rewrite),
+         while the reported parameters are the written ones. Mixing the two
+         would silently apply the offset twice. */
+      if (sp.disp && sp.disp.length) {
+        W('def _displayed(th):');
+        W('    """The parameters as WRITTEN, reconstructed from the sampled ones.');
+        W();
+        W('    This model was fitted in standardized offsets: the sampler moved in');
+        W('    z, and the group parameter is abar + z * tau. The tool reports the');
+        W('    written parameter, so this does too. It is an exact rewrite, not an');
+        W('    approximation.');
+        W('    """');
+        W('    nat = _natural(th)');
+        W('    out = nat.copy()');
+        sp.disp.forEach(function (db, di) {
+          W('    _mu' + di + ' = ' + pyExpr(db.mu, env));
+          W('    _sd' + di + ' = ' + pyExpr(db.sd, env));
+          W('    out[:, ' + db.at + ':' + (db.at + db.K) + '] = (_mu' + di +
+            ' + nat[:, ' + db.at + ':' + (db.at + db.K) + '] * _sd' + di + ')');
+        });
+        W('    return out');
+        W();
+        W();
+      }
+      W('def _frame(df, th):');
+      W('    """Every value the model computes, at one set of inputs.');
+      W();
+      W('    Each is an array of shape (draws, rows): the model is evaluated at');
+      W('    every posterior draw at once, which is what makes the spread below');
+      W('    a posterior spread rather than a plug-in estimate.');
+      W('    """');
+      W('    n = len(df)');
+      W('    nat = _natural(th)');
+      sp.columns.forEach(function (c) {
+        if (sp.levels[c]) {
+          /* A categorical column was coded one-based in the tool, and the user
+             has the labels rather than the codes. Accept either. */
+          W('    _lv = [' + sp.levels[c].map(pyStr).join(', ') + ']');
+          W('    _c = df[' + pyStr(c) + ']');
+          /* Not "dtype == object": since pandas 3 a column of strings is an
+             arrow-backed str dtype, and the old test silently fell through to
+             the numeric branch, which then tried to cast "S01" to a float.
+             Asking whether the values are numbers is the question that was
+             meant anyway. */
+          W('    if not pd.api.types.is_numeric_dtype(_c):');
+          W('        _m = {v: i + 1 for i, v in enumerate(_lv)}');
+          W('        _bad = sorted(set(_c.unique()) - set(_m))');
+          W('        if _bad:');
+          W('            raise ValueError(' + pyStr('unknown level in ' + c + ': ') + ' + repr(_bad)');
+          W('                             + ' + pyStr(', known: ') + ' + repr(_lv))');
+          W('        d_' + c + ' = _c.map(_m).to_numpy(dtype=float)[None, :]');
+          W('    else:');
+          W('        d_' + c + ' = np.asarray(_c, dtype=float)[None, :]');
+        } else {
+          W('    d_' + c + ' = np.asarray(df[' + pyStr(c) + '], dtype=float)[None, :]');
+        }
+      });
+      W('    out = {}');
+      sp.det.forEach(function (d) {
+        W('    _' + d.name + ' = ' + pyExpr(d.expr, env));
+        W('    out[' + pyStr(d.name) + '] = np.broadcast_to(_' + d.name + ', (th.shape[0], n))');
+      });
+      /* The arguments of the outcome's distribution belong here rather than in
+         samples(), because this is the scope where the computed nodes and the
+         data columns exist. They go into the same dict under keys no model can
+         collide with, since a name in the model language cannot contain a
+         colon. */
+      var likeArgs = sp.like.args.map(function (a) { return pyExpr(a, env); });
+      likeArgs.forEach(function (e, ai) {
+        W('    out[' + pyStr('arg:' + ai) + '] = np.broadcast_to(' + e + ', (th.shape[0], n))');
+      });
+      W('    return out');
+      W();
+      W();
+
+      /* ---- the prediction kernel ----
+
+         Which value is "the level"? The last computed node when there is one,
+         since that is what an arrow line is for. When the model has no arrow
+         line at all, as a multilevel model written straight into the
+         likelihood does not, the level is the first argument of the outcome's
+         distribution: y ~ dnorm(a[school], sigma) has its level in a[school]
+         and nowhere else. Reporting nothing there would withhold exactly the
+         quantity such a model is fitted to find. */
+      var muNode = sp.det.length ? sp.det[sp.det.length - 1].name : null;
+      var muArg = muNode === null ? 0 : null;
+      var pr = PYRNG[sp.like.dist];
+      if (!pr) throw new Error('the distribution "' + sp.like.dist + '" has no Python form');
+
+      W('def samples(df, kind="y", n=None, seed=0):');
+      W('    """The raw draws behind every other function here.');
+      W();
+      W('    Returns an array of shape (draws, len(df)).');
+      W();
+      W('    kind="y"  a draw of the outcome itself: uncertainty about the');
+      W('              parameters AND the scatter of a single observation around');
+      W('              the level. This is the answer to "what will the next');
+      W('              measurement at these inputs be".');
+      var muLabel = muNode !== null ? muNode
+        : (sp.like.args[0] && sp.like.args[0].tag === 'index'
+          ? sp.like.args[0].name + '[' + (sp.like.args[0].idx.tag === 'var'
+            ? sp.like.args[0].idx.name : '...') + ']'
+          : DIST[sp.like.dist].args[0]);
+      W('    kind="mu" the level only (' + muLabel + '): uncertainty about the parameters');
+      W('              alone, so "where is the average". Narrower, and it keeps');
+      W('              shrinking as the data grow, which the other does not,');
+      W('              because observation scatter is a property of the world.');
+      W('    """');
+      W('    df = pd.DataFrame(df)');
+      W('    missing = [c for c in INPUTS if c not in df.columns]');
+      W('    if missing:');
+      W('        raise ValueError("these columns are needed and not in the input: "');
+      W('                         + ", ".join(missing))');
+      W('    th = posterior() if n is None else posterior(n, seed)');
+      W('    fr = _frame(df, th)');
+      W('    if kind == "mu":');
+      W('        return np.asarray(fr[' + pyStr(muNode !== null ? muNode : 'arg:' + muArg) +
+        '], dtype=float)');
+      W('    if kind != "y":');
+      W('        raise ValueError("kind has to be \'y\' or \'mu\', got %r" % (kind,))');
+      W('    rng = np.random.default_rng(seed + 1)');
+      W('    shape = (th.shape[0], len(df))');
+      W('    return np.asarray(' + pr(likeArgs.map(function (e, ai) {
+        return 'fr[' + pyStr('arg:' + ai) + ']';
+      })) + ', dtype=float)');
+      W();
+      W();
+      W('def median(df, kind="mu", n=None, seed=0):');
+      W('    """One number per input row: the median over the posterior.');
+      W();
+      W('    The median rather than the mean, because it passes through the');
+      W('    transformations in the model unchanged and therefore agrees with');
+      W('    the natural column in the tool.');
+      W();
+      W('    Defaults to kind="mu", the level. Where the outcome is symmetric the');
+      W('    point value of "y" is the same number with more Monte Carlo noise;');
+      W('    where it is a count or a probability the two are different');
+      W('    quantities and the choice is a real one.');
+      W('    """');
+      W('    return pd.Series(np.median(samples(df, kind, n, seed), axis=0),');
+      W('                     index=pd.DataFrame(df).index, name="median")');
+      W();
+      W();
+      W('def mean(df, kind="mu", n=None, seed=0):');
+      W('    """One number per input row: the mean over the posterior."""');
+      W('    return pd.Series(samples(df, kind, n, seed).mean(axis=0),');
+      W('                     index=pd.DataFrame(df).index, name="mean")');
+      W();
+      W();
+      W('def interval(df, prob=' + pyNum(opts.prob === undefined ? 0.8 : opts.prob) +
+        ', kind="y", n=None, seed=0):');
+      W('    """A lower and an upper bound per input row, as a DataFrame.');
+      W();
+      W('    The central interval of the draws, so it is free to be asymmetric,');
+      W('    and where it is that asymmetry is the finding rather than a defect.');
+      W();
+      W('    kind="y" by default: an interval is nearly always read as "where');
+      W('    will the next observation fall", and that reading needs the');
+      W('    observation scatter in it. Pass kind="mu" for the narrower band');
+      W('    around the average.');
+      W('    """');
+      W('    s = samples(df, kind, n, seed)');
+      W('    lo, hi = (1.0 - prob) / 2.0, 1.0 - (1.0 - prob) / 2.0');
+      W('    q = np.quantile(s, [lo, hi], axis=0)');
+      W('    return pd.DataFrame({"lo": q[0], "hi": q[1]},');
+      W('                        index=pd.DataFrame(df).index)');
+      W();
+      W();
+      W('def percentiles(df, step=5, kind="y", n=None, seed=0):');
+      W('    """The whole predictive distribution per row, in percentile steps.');
+      W();
+      W('    A DataFrame with one row per input row and columns p5, p10, ... p95');
+      W('    by default. This is the shape to reach for when you want the');
+      W('    distribution rather than a summary of it, without carrying the');
+      W('    draws around.');
+      W('    """');
+      W('    s = samples(df, kind, n, seed)');
+      W('    ps = np.arange(step, 100, step)');
+      W('    q = np.quantile(s, ps / 100.0, axis=0)');
+      W('    return pd.DataFrame({("p%d" % p): q[i] for i, p in enumerate(ps)},');
+      W('                        index=pd.DataFrame(df).index)');
+      W();
+      W();
+      W('if __name__ == "__main__":');
+      W('    # A few rows from the data the model was fitted on, which is the one');
+      W('    # input that is certainly available. Replace with your own.');
+      W('    demo = pd.DataFrame({');
+      sp.columns.forEach(function (c) {
+        var col = opts.demo && opts.demo[c];
+        var vals = col ? Array.prototype.slice.call(col).slice(0, 5) : [0, 1];
+        if (sp.levels[c]) {
+          W('        ' + pyStr(c) + ': [' + vals.map(function (v) {
+            var lab = sp.levels[c][Math.round(v) - 1];
+            return pyStr(lab === undefined ? String(v) : lab);
+          }).join(', ') + '],');
+        } else {
+          W('        ' + pyStr(c) + ': [' + vals.map(pyNum).join(', ') + '],');
+        }
+      });
+      W('    })');
+      W('    print(natural().describe().T[["mean", "50%", "std"]])');
+      W('    print()');
+      /* Printed as two tables rather than one joined one, because the point
+         value and the interval are not on the same scale unless the outcome is
+         continuous: for a count model median() is a rate and interval() is a
+         range of counts. Side by side in one table that looks like a bug. */
+      W('    print("the level (' + muLabel + '), per row:")');
+      W('    print(pd.DataFrame({"median": median(demo), "mean": mean(demo)}))');
+      W('    print()');
+      W('    print("where the next ' + sp.outcome + ' would fall, ' +
+        Math.round((opts.prob === undefined ? 0.8 : opts.prob) * 100) + ' percent of the time:")');
+      W('    print(interval(demo))');
+      W();
+
+      return lines.join('\n');
+    }
+
+    /* ================================================================
+       Comparing several models
+
+       The tool has reported WAIC and PSIS since it existed, next to a sentence
+       saying that only the DIFFERENCE between two models on the same rows means
+       anything. Until now forming that difference meant copying numbers off the
+       screen, which is exactly the operation that loses the one quantity that
+       makes it readable: the standard error OF the difference.
+
+       That se is the whole point of this section. It is not assembled from the
+       two models' individual standard errors, and the reason is not a
+       refinement but a sign error waiting to happen: both models are fitted to
+       the same rows, so their pointwise errors are strongly correlated, usually
+       above 0.9. Combining the marginal ses as if they were independent
+       overstates the uncertainty of the difference by a large factor and turns
+       a real distinction into "not distinguishable". The correct quantity is
+       the sd of the PAIRED differences, which is why waicParts had to start
+       returning its parts.
+
+       Concretely: dWAIC = WAIC_b - WAIC_a, and its se is sqrt(n) times the sd
+       of (parts_b[j] - parts_a[j]) over j. The pairing is by row index, and
+       that is the only reason the same-rows check below is a hard error rather
+       than a warning.
+       ================================================================ */
+
+    /* Is this set of fits comparable at all? Returns null when it is, and a
+       reason when it is not.
+
+       Two things can go wrong, and neither is exotic. Comparing models of
+       DIFFERENT outcomes is meaningless in a way that produces perfectly
+       plausible numbers: deviance is on the scale of the outcome, so a model of
+       a probability and a model of a count differ by hundreds and the smaller
+       number wins for no reason at all. And a difference in row count breaks
+       the pairing outright.
+
+       In this tool the row count is currently fixed by the CSV rather than by
+       the model, because parseCSV drops a row with any missing value before any
+       model sees it. So the second check is cheap insurance rather than a live
+       hazard today: it costs one comparison and it keeps the pairing honest if
+       that ever changes. */
+    function comparable(fits) {
+      var i;
+      for (i = 0; i < fits.length; i++) {
+        if (!fits[i] || !fits[i].ok) return { reason: 'notfit', which: i };
+      }
+      if (fits.length < 2) return { reason: 'toofew' };
+      for (i = 1; i < fits.length; i++) {
+        if (fits[i].outcome !== fits[0].outcome) {
+          return { reason: 'outcome', which: i, a: fits[0].outcome, b: fits[i].outcome };
+        }
+      }
+      for (i = 1; i < fits.length; i++) {
+        if (fits[i].nObs !== fits[0].nObs) {
+          return { reason: 'nobs', which: i, a: fits[0].nObs, b: fits[i].nObs };
+        }
+      }
+      return null;
+    }
+
+    /* The comparison table, sorted best first.
+
+       Everything is expressed relative to the best model rather than to the
+       first one entered, because "better or worse than the leader" is the
+       question a reader has, and because it puts the zero row where the eye
+       expects it. weight is the Akaike weight over the criterion shown, which
+       is the least defensible column here and is labelled as such in the UI:
+       it is a normalized exp(-dIC/2) and it takes the criterion at face value,
+       so it is confident exactly where the se says not to be. */
+    function compareFits(fits, which) {
+      var crit = which === 'psis' ? 'psis' : 'waic';
+      var bad = comparable(fits);
+      if (bad) return { ok: false, problem: bad };
+
+      var n = fits[0].nObs, i, j;
+      var rows = fits.map(function (f, idx) {
+        var ic = crit === 'psis' ? f.psis.PSIS : f.waic.WAIC;
+        return { i: idx, name: f.name, ic: ic, se: crit === 'psis' ? f.psis.se : f.waic.se,
+          pWAIC: f.waic.pWAIC, parts: crit === 'psis' ? f.psis.parts : f.waic.parts };
+      });
+      rows.sort(function (a, b) { return a.ic - b.ic; });
+
+      var best = rows[0];
+      for (i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        r.d = r.ic - best.ic;
+        if (i === 0) { r.dse = 0; continue; }
+        /* The paired difference, row by row. sqrt(n) * sd is the same scaling
+           the individual se uses, so the two columns are on one scale. */
+        var diff = new Float64Array(n), pa = best.parts, pb = r.parts;
+        if (!pa || !pb || pa.length !== n || pb.length !== n) { r.dse = NaN; continue; }
+        for (j = 0; j < n; j++) diff[j] = pb[j] - pa[j];
+        r.dse = Math.sqrt(n) * sdOf(diff);
+      }
+
+      /* Akaike weights over the shown criterion. Computed in logs for the same
+         reason everything else here is. */
+      var lw = rows.map(function (r) { return -0.5 * r.d; });
+      var mx = -Infinity;
+      for (i = 0; i < lw.length; i++) if (lw[i] > mx) mx = lw[i];
+      var tot = 0;
+      for (i = 0; i < lw.length; i++) tot += Math.exp(lw[i] - mx);
+      for (i = 0; i < rows.length; i++) rows[i].weight = Math.exp(lw[i] - mx) / tot;
+
+      /* The full pairwise matrix, not just against the leader. Cheap, and it is
+         the honest form: with three models the interesting comparison is often
+         not the one involving the best. Indexed by POSITION IN rows, that is in
+         sorted order, so the display can walk it directly. */
+      var m = rows.length, dm = [], dsem = [];
+      for (i = 0; i < m; i++) {
+        dm.push(new Float64Array(m));
+        dsem.push(new Float64Array(m));
+      }
+      for (i = 0; i < m; i++) {
+        for (j = 0; j < m; j++) {
+          if (i === j) continue;
+          dm[i][j] = rows[j].ic - rows[i].ic;
+          var pa2 = rows[i].parts, pb2 = rows[j].parts;
+          if (!pa2 || !pb2 || pa2.length !== n || pb2.length !== n) { dsem[i][j] = NaN; continue; }
+          var dv = new Float64Array(n);
+          for (var k = 0; k < n; k++) dv[k] = pb2[k] - pa2[k];
+          dsem[i][j] = Math.sqrt(n) * sdOf(dv);
+        }
+      }
+
+      return {
+        ok: true, criterion: crit, nObs: n,
+        rows: rows.map(function (r) {
+          return { i: r.i, name: r.name, ic: r.ic, se: r.se, d: r.d, dse: r.dse,
+            weight: r.weight, pWAIC: r.pWAIC };
+        }),
+        dm: dm, dse: dsem
       };
     }
 
@@ -4643,6 +5416,17 @@
           var ll = logLikMatrix(model, samples, Math.min(samples.S, 2000));
           var w = waic(ll), ps = psis(ll);
 
+          /* The Python export is generated here rather than on demand in the
+             app, because it needs the compiled model, which lives only in this
+             worker. Generating it always costs a few milliseconds for quap and
+             is the difference between a download button that responds and one
+             that has to refit. */
+          var pysrc = null, pyerr = null;
+          try {
+            pysrc = toPython(model, fit, { name: msg.title || 'model', source: msg.model,
+              prob: msg.opts && msg.opts.prob, demo: data.columns });
+          } catch (e) { pyerr = e && e.message ? e.message : String(e); }
+
           post({ type: 'progress', stage: 'shape', frac: 0.85 });
           /* No divergences here: quap has no sampler that could diverge, and the
              draws are exact draws from the reported Gaussian. */
@@ -4673,7 +5457,10 @@
               grid: gc.map(function (g) { return { name: g.name, ok: g.ok, verdict: g.verdict, worst: g.worst,
                 gridMean: g.gridMean, gridLo: g.gridLo, gridHi: g.gridHi,
                 quapMean: g.quapMean, quapLo: g.quapLo, quapHi: g.quapHi }; }),
-              waic: w, psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK, maxK: Math.max.apply(null, Array.from(ps.k)) },
+              waic: { WAIC: w.WAIC, lppd: w.lppd, pWAIC: w.pWAIC, n: w.n, se: w.se, parts: w.parts },
+              psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK,
+                maxK: Math.max.apply(null, Array.from(ps.k)), parts: ps.parts },
+              python: pysrc, pythonError: pyerr,
               messages: fit.messages, names: model.displayNames, links: fit.links,
               slotGroup: model.slotGroup, nonCentred: model.nonCentred,
               nObs: model.nObs, nPar: model.nPar, iters: fit.iters, logp: fit.logp,
@@ -4745,6 +5532,31 @@
           var mll = logLikMatrix(mmodel, msamples, Math.min(msamples.S, 2000));
           var mw = waic(mll), mps = psis(mll);
 
+          /* Same as the quap path, except that what travels is the draws
+             themselves. They are thinned to at most 2000 first: the export is
+             a text file of numbers, and 8000 draws of a 46 parameter model
+             would be several megabytes of source for no gain in the second
+             decimal of a percentile. */
+          var pysrc = null, pyerr = null;
+          try {
+            var cap = 2000, useS = Math.min(msamples.S, cap), draws;
+            if (useS === msamples.S) {
+              draws = msamples.raw;
+            } else {
+              draws = new Float64Array(useS * msamples.P);
+              for (var qs = 0; qs < useS; qs++) {
+                var src = Math.round(qs * (msamples.S - 1) / (useS - 1));
+                for (var qp = 0; qp < msamples.P; qp++) {
+                  draws[qs * msamples.P + qp] = msamples.raw[src * msamples.P + qp];
+                }
+              }
+            }
+            pysrc = toPython(mmodel, { draws: draws, S: useS, nChains: chains.length,
+              links: mmodel.params.map(function (pp) { return pp.linkName; }) },
+              { name: msg.title || 'model', source: msg.model,
+                prob: msg.opts && msg.opts.prob, demo: mcols });
+          } catch (e) { pyerr = e && e.message ? e.message : String(e); }
+
           post({ type: 'progress', stage: 'shape', frac: 0.85 });
           /* The divergence flags have to be concatenated in exactly the order
              chainsToSamples walks the chains, or the marked points land on
@@ -4786,8 +5598,11 @@
               precis: mpr,
               cor: sampleCor(msamples),
               grid: null,
-              waic: mw, psis: { PSIS: mps.PSIS, se: mps.se, nBadK: mps.nBadK,
-                maxK: Math.max.apply(null, Array.from(mps.k)) },
+              waic: { WAIC: mw.WAIC, lppd: mw.lppd, pWAIC: mw.pWAIC, n: mw.n, se: mw.se,
+                parts: mw.parts },
+              psis: { PSIS: mps.PSIS, se: mps.se, nBadK: mps.nBadK,
+                maxK: Math.max.apply(null, Array.from(mps.k)), parts: mps.parts },
+              python: pysrc, pythonError: pyerr,
               messages: mmsgs, names: mmodel.displayNames,
               slotGroup: mmodel.slotGroup, nonCentred: mmodel.nonCentred,
               links: mmodel.params.map(function (pp) { return pp.linkName; }),
@@ -4848,7 +5663,10 @@
       posteriorCor: posteriorCor, gridCheck: gridCheck,
       linkNode: linkNode, simOutcome: simOutcome, priorPredictive: priorPredictive,
       summarizeDraws: summarizeDraws,
-      logLikMatrix: logLikMatrix, waic: waic, psis: psis, gpdFit: gpdFit,
+      logLikMatrix: logLikMatrix, waic: waic, waicParts: waicParts, psis: psis, gpdFit: gpdFit,
+      comparable: comparable, compareFits: compareFits,
+      pyExpr: pyExpr, pyInvLink: pyInvLink, toPython: toPython,
+      PYFUNCS: PYFUNCS, PYRNG: PYRNG,
       parseCSV: parseCSV, detectDelim: detectDelim, describeColumns: describeColumns,
       exampleData: exampleData, EXAMPLES: EXAMPLES,
       rbinom1: rbinom1, rpois1: rpois1,
@@ -5824,6 +6642,102 @@
     /* ---- the grid cross-check ----
        The one view that says where quap is lying: two intervals per parameter,
        what the Gaussian claims and what a direct evaluation says. */
+    /* Die Vergleichstabelle.
+
+       Die eine Spalte, um die es hier geht, ist dSE. Zwei Modelle, deren WAIC
+       sich um 3 unterscheidet bei einem SE der Differenz von 8, sind nicht
+       unterscheidbar, und eine Tabelle ohne diese Spalte laedt genau zu dieser
+       Fehllesung ein. Sie steht deshalb direkt neben der Differenz und nicht
+       am Rand. */
+    function CompareTable({ cmp, models, crit, setCrit }) {
+      if (!cmp) return null;
+      if (!cmp.ok) {
+        const p = cmp.problem;
+        const why = p.reason === 'toofew'
+          ? 'A comparison needs at least two fitted models. Add one with "add model", write a '
+            + 'different model into it, and fit both.'
+          : p.reason === 'notfit'
+          ? 'Not every model has been fitted yet, or one of them failed. Fit them all, and if one '
+            + 'refuses to fit, that is the finding: a comparison cannot include it.'
+          : p.reason === 'outcome'
+          ? 'These models are not comparable: one has "' + p.a + '" on the left of the first tilde '
+            + 'and another has "' + p.b + '". Both criteria are on the scale of the outcome, so '
+            + 'comparing models of different outcomes would produce numbers that look perfectly '
+            + 'ordinary and mean nothing at all.'
+          : 'These models were fitted to different numbers of rows (' + p.a + ' against ' + p.b
+            + '). The comparison pairs the two models up row by row, so it cannot be formed here, '
+            + 'and the difference of the totals would silently be a difference of sample sizes.';
+        return html`<${Msg} kind=${p.reason === 'toofew' || p.reason === 'notfit' ? 'info' : 'err'}>
+          ${why}<//>`;
+      }
+      const best = cmp.rows[0];
+      return html`
+        <${React.Fragment}>
+          <div className="seg-row" style=${{ marginBottom: 12 }}>
+            ${[['waic', 'WAIC'], ['psis', 'PSIS-LOO']].map(([v, l]) => html`
+              <button key=${v} className=${'lang-seg' + (crit === v ? ' active' : '')}
+                onClick=${() => setCrit(v)}>${l}</button>`)}
+          </div>
+          <table className="qp-tbl">
+            <thead>
+              <tr>
+                <th>model</th>
+                <th className="qp-num">${crit === 'psis' ? 'PSIS' : 'WAIC'}</th>
+                <th className="qp-num">se</th>
+                <th className="qp-num">d${crit === 'psis' ? 'PSIS' : 'WAIC'}</th>
+                <th className="qp-num">dSE</th>
+                <th className="qp-num">weight</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${cmp.rows.map((r) => {
+                /* Ein Unterschied, der kleiner ist als sein eigener
+                   Standardfehler, wird nicht hervorgehoben. Das ist die
+                   ganze Aussage der Spalte daneben, und sie hier zu
+                   wiederholen ist billiger als sie zu erklaeren. */
+                const clear = r.d > 0 && isFinite(r.dse) && r.dse > 0 && r.d > 2 * r.dse;
+                return html`
+                  <tr key=${r.i}>
+                    <td>${r.name}${r.i === best.i ? html`<span style=${{ color: 'var(--tool-note)',
+                      fontSize: 11 }}> best</span>` : null}</td>
+                    <td className="qp-num">${fmt(r.ic, 1)}</td>
+                    <td className="qp-num" style=${{ color: 'var(--tool-note)' }}>${fmt(r.se, 1)}</td>
+                    <td className="qp-num">${r.d === 0 ? '0' : fmt(r.d, 1)}</td>
+                    <td className="qp-num" style=${{ color: clear ? 'var(--tool-sig-bad)'
+                      : 'var(--tool-note)' }}>${r.d === 0 ? '' : (isFinite(r.dse) ? fmt(r.dse, 1) : '--')}</td>
+                    <td className="qp-num" style=${{ color: 'var(--tool-note)' }}>${fmt(r.weight, 2)}</td>
+                  </tr>`;
+              })}
+            </tbody>
+          </table>
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 12, maxWidth: '78ch' }}>
+            Lower is better, and the column that decides whether a difference is worth anything is
+            dSE, not the difference itself. It is the standard error <em>of the difference</em>,
+            computed from the two models' per-observation contributions paired row by row, and it is
+            deliberately not assembled from the two se values to its left: both models are fitted to
+            the same rows, so their errors are strongly correlated, and combining the marginal
+            standard errors as if they were independent overstates the uncertainty by a large factor.
+            A difference smaller than its own dSE says the data cannot tell these two models apart.
+            Marked in red are the ones that are larger than twice their dSE, which is the loosest
+            threshold at which the word "better" is defensible.
+          </p>
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+            The weight is the least trustworthy column here and it is included because it is the one
+            everybody looks for. It is exp(-d/2) normalized over the models shown, so it takes the
+            criterion at face value and knows nothing about dSE: it will happily report 0.73 against
+            0.27 for a pair that the column beside it says are indistinguishable. It also depends on
+            which models happen to be in the table, so adding a fifth model changes all of them.
+          </p>
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+            All of this compares predictive accuracy on ${cmp.nObs} rows of the data the models were
+            fitted to, estimated out of sample. It is not a test, there is no p, and the better
+            number does not make a model true. A model can win here and still be the wrong causal
+            story, which is the usual reason two models that predict equally well are not equally
+            useful.
+          </p>
+        <//>`;
+    }
+
     function GridCheck({ grid }) {
       const good = grid.filter((g) => g.ok);
       if (!good.length) return html`<p style=${{ color: 'var(--tool-note)' }}>No cross-check available.</p>`;
@@ -5918,7 +6832,8 @@
          Ergebniszweig. Wer hier eine Zeile einschiebt statt anhaengt, bricht
          den Test auf eine Weise, die wie ein Fehler in der Komponente aussieht.
          0 csv, 1 model, 2 res, 3 err, 4 busy, 5 tab, 6 prob, 7 draws, 8 note,
-         9 mode, 10 nChains, 11 nIter, 12 adaptDelta, 13 nonCentred.
+         9 mode, 10 nChains, 11 nIter, 12 adaptDelta, 13 nonCentred,
+         14 others, 15 active, 16 cmpCrit.
          ANHAENGEN, nicht einschieben. */
       const [csv, setCsv] = useState('');
       const [model, setModel] = useState(DEFAULT_MODEL);
@@ -5944,6 +6859,85 @@
          Vergleich der beiden Laeufe die anschaulichste Vorfuehrung des
          Trichters ist, die dieses Werkzeug zu bieten hat. */
       const [nonCentred, setNonCentred] = useState(true);
+
+      /* Mehrere Modelle nebeneinander, Stufe 4.
+
+         Der Zuschnitt ist mit Absicht schief: `model` bleibt der Text des
+         AKTIVEN Modells und behaelt seinen State-Index, waehrend `others` die
+         uebrigen traegt. Der naheliegende Weg (ein Array aller Modelle plus
+         ein Index) haette `model` verdraengt und damit jeden bestehenden Pfad
+         und jeden Rendertest angefasst, fuer null Gewinn: das aktive Modell
+         wird an fuenfzehn Stellen gelesen, die anderen an dreien.
+
+         Ein Eintrag ist { name, src, res }. res ist das Ergebnis DIESES
+         Modells, und der Vergleich unten lebt genau davon: ein Modell, dessen
+         Text sich seit dem Fit geaendert hat, verliert sein res sofort, weil
+         ein Vergleich gegen ein Ergebnis, das nicht mehr zum Text gehoert, die
+         teuerste Art von falsch ist. */
+      const [others, setOthers] = useState([]);
+      const [active, setActive] = useState(0);
+      const [cmpCrit, setCmpCrit] = useState('waic');
+
+      /* Die Modelle als eine Liste, in Anzeigereihenfolge, mit dem aktiven an
+         seiner Stelle. Alles unterhalb liest diese Sicht und nicht die beiden
+         Haelften. */
+      const models = useMemo(() => {
+        const out = others.slice();
+        out.splice(active, 0, { name: null, src: model, res: res });
+        return out.map((m, i) => ({
+          name: m.name || ('model ' + (i + 1)),
+          rawName: m.name || null,
+          src: m.src, res: m.res, i: i
+        }));
+      }, [others, active, model, res]);
+
+      /* Schreibt eine Aenderung an Modell i zurueck, egal ob es das aktive ist
+         oder nicht. Eine Stelle, damit die Aufspaltung oben nirgends sonst
+         auftaucht. */
+      const patchModel = useCallback((i, patch) => {
+        /* Text geaendert heisst Ergebnis ungueltig, ohne Ausnahme: ein
+           Vergleich gegen ein Ergebnis, das nicht mehr zum Text daneben
+           gehoert, ist die teuerste Art von falsch, weil er plausibel
+           aussieht. */
+        const cur = models.map((m, k) => {
+          if (k !== i) return { name: m.rawName, src: m.src, res: m.res };
+          const next = { name: patch.name !== undefined ? patch.name : m.rawName,
+            src: patch.src !== undefined ? patch.src : m.src,
+            res: patch.res !== undefined ? patch.res : m.res };
+          if (patch.src !== undefined && patch.src !== m.src && patch.res === undefined) next.res = null;
+          return next;
+        });
+        if (i === active) { setModel(cur[i].src); setRes(cur[i].res); }
+        setOthers(cur.filter((m, k) => k !== active));
+      }, [models, active]);
+
+      const addModel = useCallback(() => {
+        if (models.length >= 4) return;
+        setOthers((o) => o.concat([{ name: null, src: model, res: null }]));
+        setActive(models.length);
+        setModel(model);
+        setRes(null);
+      }, [models.length, model]);
+
+      const removeModel = useCallback((i) => {
+        if (models.length <= 1) return;
+        const keep = models.filter((m) => m.i !== i);
+        const nextActive = Math.min(active > i ? active - 1 : active, keep.length - 1);
+        setModel(keep[nextActive].src);
+        setRes(keep[nextActive].res);
+        setOthers(keep.filter((m, k) => k !== nextActive)
+          .map((m) => ({ name: m.rawName, src: m.src, res: m.res })));
+        setActive(nextActive);
+      }, [models, active]);
+
+      const selectModel = useCallback((i) => {
+        if (i === active) return;
+        const cur = models.map((m) => ({ name: m.rawName, src: m.src, res: m.res }));
+        setModel(cur[i].src);
+        setRes(cur[i].res);
+        setOthers(cur.filter((m, k) => k !== i));
+        setActive(i);
+      }, [models, active]);
 
       const data = useMemo(() => {
         if (!csv.trim()) return null;
@@ -5974,28 +6968,28 @@
         setRes(null); setErr(null);
       }, []);
 
-      const run = useCallback(() => {
-        if (!data || !data.n) { setErr({ message: 'Load or paste a CSV first.' }); return; }
-        setErr(null); setRes(null); setBusy({ stage: 'starting', frac: 0 });
+      /* Ein Modell fitten. Liefert das Ergebnis als Promise, statt State zu
+         schreiben, damit der Treiber darunter mehrere davon hintereinander
+         haengen kann. Das war vorher der Rumpf von run(); geaendert hat sich
+         nur, wohin das Resultat geht.
+
+         onStage bekommt (stage, frac) mit frac in [0,1] fuer DIESES Modell.
+         Wie das in einen Balken ueber alle Modelle faellt, entscheidet der
+         Aufrufer, weil nur er weiss, wieviele es sind. */
+      const fitOne = useCallback((src, title, onStage) => {
         const cols = {};
         Object.keys(data.columns).forEach((k) => { cols[k] = Array.from(data.columns[k]); });
         /* Die Stufennamen reisen mit. Ohne sie heisst ein Vektorparameter im
            Ergebnis a[1] statt a[ONAN], weil der Kern im Worker die
            CSV-Stufentabelle sonst nie zu sehen bekommt: uebertragen wurden
            bisher nur die Zahlenspalten. */
-        const payload = { model: model, data: { columns: cols, names: data.names, levels: data.levels } };
+        const payload = { model: src, title: title,
+          data: { columns: cols, names: data.names, levels: data.levels } };
 
         if (mode === 'quap') {
-          RTHRun.run(Object.assign({ job: 'fit' }, payload,
+          return RTHRun.run(Object.assign({ job: 'fit' }, payload,
             { opts: { prob: prob, draws: draws, seed: 1, nonCentred: nonCentred } }),
-            (p) => setBusy({ stage: p.stage, frac: p.frac }))
-            .then((r) => {
-              setBusy(null);
-              if (r.ok) { setRes(r); setTab('precis'); }
-              else setErr(r);
-            })
-            .catch((e) => { setBusy(null); setErr({ message: e.message }); });
-          return;
+            (p) => onStage(p.stage, p.frac));
         }
 
         /* NUTS: four chains in four workers, then one worker for everything
@@ -6009,32 +7003,116 @@
           msgs.push(Object.assign({ job: 'chain', chain: c, seed: 1 + c * 1013,
             warmup: nIter, iter: nIter, adaptDelta: adaptDelta, opts: opts }, payload));
         }
-        RTHRun.runAll(msgs, (p) => setBusy({
-          stage: p.warmup ? 'warmup' : 'sampling',
+        return RTHRun.runAll(msgs, (p) => onStage(p.warmup ? 'warmup' : 'sampling',
           /* The chains occupy the first 55 percent of the bar and the merge the
              rest, which is roughly how the time actually divides. */
-          frac: p.frac * 0.55
-        }))
+          p.frac * 0.55))
           .then((results) => {
             const bad = results.find((r) => !r || !r.ok);
             if (bad) {
-              setBusy(null);
-              setErr(bad.cancelled ? { message: 'The run was cancelled.' } : bad);
-              return;
+              return bad.cancelled ? { ok: false, cancelled: true,
+                message: 'The run was cancelled.' } : bad;
             }
-            setBusy({ stage: 'diagnostics', frac: 0.55 });
+            onStage('diagnostics', 0.55);
             return RTHRun.run(Object.assign({ job: 'merge', opts: opts,
               chains: results.map((r) => r.chain),
               warnings: results[0].warnings || [] }, payload),
-              (p) => setBusy({ stage: p.stage, frac: p.frac }))
-              .then((r) => {
-                setBusy(null);
-                if (r.ok) { setRes(r); setTab('precis'); }
-                else setErr(r);
-              });
-          })
-          .catch((e) => { setBusy(null); setErr({ message: e.message }); });
-      }, [data, model, prob, draws, mode, nChains, nIter, adaptDelta, nonCentred]);
+              (p) => onStage(p.stage, p.frac));
+          });
+      }, [data, prob, draws, mode, nChains, nIter, adaptDelta, nonCentred]);
+
+      /* Der Treiber. `which` ist eine Liste von Modellindizes.
+
+         Nacheinander, nicht parallel: vier Modelle mal vier Ketten waeren
+         sechzehn Worker, und die Maschine soll waehrenddessen bedienbar
+         bleiben. Ein Modell nach dem anderen haelt die Spitze bei nChains,
+         also genau bei dem, was der Nutzer ohnehin eingestellt hat. Bei quap
+         ist die Frage ohnehin akademisch, dort dauert ein Fit Millisekunden. */
+      const runThese = useCallback((which) => {
+        if (!data || !data.n) { setErr({ message: 'Load or paste a CSV first.' }); return; }
+        const list = which.map((i) => models[i]).filter(Boolean);
+        if (!list.length) return;
+        setErr(null);
+        if (which.indexOf(active) >= 0) setRes(null);
+
+        const total = list.length;
+        /* Die Ergebnisse werden GESAMMELT und am Ende in einem Rutsch
+           geschrieben, nicht eines nach dem anderen. Der Grund ist eine
+           Falle und keine Vorliebe: patchModel rechnet gegen `models`, und
+           `models` ist in dieser Closure eingefroren. Vier Einzelschreiber
+           nacheinander wuerden also jeder auf demselben alten Stand aufsetzen
+           und sich gegenseitig ueberschreiben, was genau bei "alle fitten"
+           auffaellt und bei einem einzelnen Modell nie. */
+        const got = {};
+        let done = 0, stopped = false;
+        const commit = () => {
+          const cur = models.map((m) => ({ name: m.rawName, src: m.src,
+            res: Object.prototype.hasOwnProperty.call(got, m.i) ? got[m.i] : m.res }));
+          setModel(cur[active].src);
+          setRes(cur[active].res);
+          setOthers(cur.filter((m, k) => k !== active));
+        };
+        const step = () => {
+          if (stopped || done >= total) {
+            commit();
+            setBusy(null);
+            return Promise.resolve();
+          }
+          const m = list[done];
+          const label = total > 1 ? (m.name + ' (' + (done + 1) + ' of ' + total + '): ') : '';
+          return fitOne(m.src, m.name, (stage, frac) => setBusy({
+            stage: label + stage,
+            frac: (done + (frac || 0)) / total
+          })).then((out) => {
+            if (out && out.ok) {
+              got[m.i] = out;
+              if (m.i === active) setTab('precis');
+            } else if (out && out.cancelled) {
+              stopped = true;
+              setErr({ message: 'The run was cancelled.' });
+            } else {
+              /* Ein gescheitertes Modell haelt die anderen nicht auf: bei
+                 einem Vergleich ist genau die Information interessant, WELCHES
+                 nicht faellt. Der Fehler wird gezeigt, wenn es das aktive ist,
+                 und sonst als fehlende Zeile in der Vergleichstabelle. */
+              got[m.i] = null;
+              if (m.i === active) setErr(out);
+            }
+            done++;
+            return step();
+          });
+        };
+        setBusy({ stage: 'starting', frac: 0 });
+        step().catch((e) => { setBusy(null); setErr({ message: e.message }); });
+      }, [data, models, active, fitOne]);
+
+      const run = useCallback(() => runThese([active]), [runThese, active]);
+      const runAll = useCallback(() => runThese(models.map((m) => m.i)), [runThese, models]);
+
+      /* Der Vergleich. Neu gerechnet, sobald sich irgendein Ergebnis aendert,
+         und das ist billig: die pro-Beobachtung-Beitraege liegen fertig im
+         Ergebnis, hier wird nur noch eine Standardabweichung ueber sie
+         gebildet. */
+      const cmp = useMemo(() => {
+        const fits = models.map((m) => m.res
+          ? Object.assign({}, m.res, { name: m.name })
+          : { ok: false, name: m.name });
+        return RTH.compareFits(fits, cmpCrit);
+      }, [models, cmpCrit]);
+
+      /* Das Python-Skript liegt schon im Ergebnis, erzeugt im Worker, wo das
+         compilierte Modell lebt. Hier bleibt nur der Download. */
+      const downloadPython = useCallback(() => {
+        if (!res || !res.python) return;
+        const name = (models[active] ? models[active].name : 'model')
+          .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'model';
+        const blob = new Blob([res.python], { type: 'text/x-python' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name + '.py';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, [res, models, active]);
 
       const copyPrecis = useCallback(() => {
         if (!res) return;
@@ -6069,11 +7147,16 @@
       /* Unconditionally, because it holds hooks. An absent result is an empty
          model with no blocks, which the picker renders as nothing. */
       const subset = useSubset(res ? res.names || [] : [], res ? res.slotGroup : null);
-      const tabs = isNuts
+      const tabs = (isNuts
         ? [['precis', 'Summary'], ['shape', 'Shape'], ['trace', 'Chains'], ['cor', 'Correlations'],
            ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']]
         : [['precis', 'Summary'], ['shape', 'Shape'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
-           ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']];
+           ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']])
+        /* Der Vergleichsreiter erscheint erst, wenn es etwas zu vergleichen
+           gibt. Bei einem Modell waere er ein Reiter, der nur erklaeren kann,
+           warum er leer ist. */
+        .concat(models.length > 1 ? [['cmp', 'Compare']] : [])
+        .concat([['py', 'Python']]);
 
       return html`
         <div className="container">
@@ -6089,6 +7172,34 @@
             <div className="ctl-card">
               <div className="ctl-sec">
                 <p className="ctl-sec-h">Model</p>
+                <!-- Die Modellauswahl erscheint erst, wenn es mehr als eines
+                     gibt. Der Ein-Modell-Fall soll aussehen wie vorher, und
+                     eine Leiste mit genau einem Reiter darin ist Moebiliar
+                     ohne Funktion. Der Knopf zum Hinzufuegen steht trotzdem
+                     immer da, sonst findet niemand das Feature. -->
+                ${models.length > 1 ? html`
+                  <div className="tabstrip" role="tablist" style=${{ marginBottom: 10 }}>
+                    ${models.map((m) => html`
+                      <button key=${m.i} role="tab" className=${m.i === active ? 'active' : ''}
+                        onClick=${() => selectModel(m.i)}>
+                        ${m.name}${m.res ? '' : ' *'}
+                      </button>`)}
+                  </div>` : null}
+                <div className="qp-chips" style=${{ marginBottom: 8 }}>
+                  ${models.length > 1 ? html`
+                    <input className="qp-name" type="text" value=${models[active] ? models[active].name : ''}
+                      aria-label="model name"
+                      onChange=${(e) => patchModel(active, { name: e.target.value })} />` : null}
+                  ${models.length < 4 ? html`
+                    <button className="tool-btn tool-btn-sm" disabled=${!!busy} onClick=${addModel}>
+                      ${ToolIcons.el('plus')} add model
+                    </button>` : null}
+                  ${models.length > 1 ? html`
+                    <button className="tool-btn tool-btn-sm tool-danger" disabled=${!!busy}
+                      onClick=${() => removeModel(active)}>
+                      ${ToolIcons.el('remove')} remove
+                    </button>` : null}
+                </div>
                 <textarea className="qp-mono qp-editor" spellCheck=${false}
                   value=${model} onChange=${(e) => setModel(e.target.value)}></textarea>
                 <p style=${{ fontSize: 11.5, color: 'var(--tool-note)', margin: '6px 0 0' }}>
@@ -6214,8 +7325,12 @@
               <div className="ctl-sec">
                 <div className="qp-chips">
                   <button className="tool-btn tool-btn-primary" disabled=${!!busy} onClick=${run}>
-                    ${ToolIcons.el('play')} Fit the model
+                    ${ToolIcons.el('play')} ${models.length > 1 ? 'Fit this model' : 'Fit the model'}
                   </button>
+                  ${models.length > 1 ? html`
+                    <button className="tool-btn" disabled=${!!busy} onClick=${runAll}>
+                      ${ToolIcons.el('play')} Fit all ${models.length}
+                    </button>` : null}
                   ${busy ? html`
                     <button className="tool-btn tool-btn-sm tool-danger"
                       onClick=${() => { RTHRun.cancel(); setBusy(null); }}>Cancel</button>` : null}
@@ -6321,6 +7436,64 @@
                 : html`<p style=${{ color: 'var(--tool-note)' }}>
                     This model has no deterministic node to plot against a predictor.</p>`) : null}
 
+              ${tab === 'cmp' ? html`
+                <${CompareTable} cmp=${cmp} models=${models} crit=${cmpCrit} setCrit=${setCmpCrit} />` : null}
+
+              ${tab === 'py' ? html`
+                <${React.Fragment}>
+                  ${res.python ? html`
+                    <${React.Fragment}>
+                      <div className="qp-chips" style=${{ marginBottom: 12 }}>
+                        <button className="tool-btn tool-btn-primary" onClick=${downloadPython}>
+                          ${ToolIcons.el('download')} Download the .py
+                        </button>
+                        <button className="tool-btn tool-btn-sm"
+                          onClick=${() => navigator.clipboard.writeText(res.python)}>
+                          ${ToolIcons.el('copy')} Copy
+                        </button>
+                        <span style=${{ fontSize: 12, color: 'var(--tool-note)' }}>
+                          ${Math.round(res.python.length / 1024)} kB
+                        </span>
+                      </div>
+                      <p style=${{ fontSize: 12, color: 'var(--tool-note)', maxWidth: '78ch' }}>
+                        A standalone script that answers the one question a fitted model is usually
+                        wanted for: given new inputs, what does it say. It needs numpy and pandas and
+                        nothing else, and it carries the posterior with it, so it does not refit
+                        anything and does not need this page. Deliberately not a PyMC model: it is a
+                        prediction function, not a model definition.
+                      </p>
+                      <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+                        <code>median(df)</code> and <code>mean(df)</code> give one number per input
+                        row. <code>interval(df, prob=${prob})</code> gives a lower and an upper bound,
+                        <code>percentiles(df)</code> the whole distribution in five percent steps, and
+                        <code>samples(df)</code> the draws behind all of them. Those three take
+                        <code>kind="y"</code> by default, which includes the scatter of a single
+                        observation, or <code>kind="mu"</code> for the narrower band around the
+                        average. Running the file directly prints both for a few rows of your own
+                        data.
+                      </p>
+                      <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+                        ${isNuts
+                          ? 'Because this fit is a set of chains, the draws travel inside the file, '
+                            + 'thinned to at most 2000. That is what makes it large. A quadratic fit '
+                            + 'of the same model exports as a mean vector and a covariance matrix '
+                            + 'instead, which is a few dozen numbers and loses nothing.'
+                          : 'This is a quadratic fit, so the file carries the mean vector and the '
+                            + 'covariance matrix rather than draws. That is the fitted posterior in '
+                            + 'full, and the script draws from it as needed. Whether a Gaussian '
+                            + 'describes this posterior well is what the cross-check tab is for.'}
+                      </p>
+                      <pre className="qp-pysrc">${res.python.length > 4000
+                        ? res.python.slice(0, 2000) + '\n\n... ' +
+                          (res.python.split('\n').length) + ' lines in total, the numbers are the bulk ...\n\n' +
+                          res.python.slice(-1200)
+                        : res.python}</pre>
+                    <//>`
+                    : html`<${Msg} kind="warn">
+                        This fit could not be exported as Python${res.pythonError ? ': ' + res.pythonError : '.'}
+                      <//>`}
+                <//>` : null}
+
               ${tab === 'ic' ? html`
                 <${React.Fragment}>
                   <table className="qp-tbl" style=${{ maxWidth: 520 }}>
@@ -6411,6 +7584,26 @@
                 different coordinates for such a model, sampling standardized offsets and reconstructing
                 the parameters you wrote, which is an exact rewrite of the same posterior and not an
                 approximation of it. The parameter names you see are the ones you typed.
+              </p>
+              <p>
+                Several models can sit side by side, sharing the data, and be compared. The number to
+                read there is not the difference in WAIC but the standard error of that difference,
+                which is computed from the two models' per-observation contributions paired row by
+                row. It is not the two individual standard errors combined: models fitted to the same
+                rows have correlated errors, and treating them as independent inflates the uncertainty
+                of the difference by a factor that is often ten or more, precisely for the pairs of
+                similar models where the comparison was interesting. A comparison across different
+                outcomes, or across different numbers of rows, is refused rather than shown.
+              </p>
+              <p>
+                A fitted model can be downloaded as a Python file. It is a prediction function and not
+                a model definition: it carries the posterior with it and answers what the model says at
+                new inputs, as a point value, as an interval, as percentiles or as raw draws. It needs
+                numpy and pandas and nothing else, deliberately, since assembling a small model in a
+                probabilistic programming framework is most of the work this page exists to avoid. A
+                quadratic fit exports as a mean vector and a covariance matrix, which is that posterior
+                in full; a set of chains exports as the draws themselves, because there is no smaller
+                honest form of them.
               </p>
               <p>
                 Not here: multivariate priors over several varying effects at once, so a model can have a
