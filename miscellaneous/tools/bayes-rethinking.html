@@ -77,6 +77,31 @@
     }
     html[data-skin="grey"] .qp-plot, html[data-skin="light"] .qp-plot { box-shadow: none; }
 
+    /* The pairs figure. One canvas per panel in a CSS grid, rather than one big
+       canvas: the panels then keep their own device-pixel scaling, the labels
+       stay real text (selectable, and readable by a screen reader), and a panel
+       can be redrawn on its own when the theme changes. */
+    .qp-pairs { display: grid; gap: 3px; justify-content: start; }
+    .qp-cell { position: relative; }
+    .qp-cell canvas {
+      display: block; width: 100%; height: 100%;
+      border: 1px solid var(--tool-border); border-radius: 4px;
+      background: var(--tool-surface);
+    }
+    .qp-cell-lab {
+      font-size: 11px; color: var(--tool-label);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center; overflow: hidden; padding: 2px;
+    }
+    /* The left column carries the row name rotated, so a long parameter name
+       does not push the whole grid sideways. */
+    .qp-cell-rot { writing-mode: vertical-rl; transform: rotate(180deg); }
+    .qp-legend { display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+      font-size: 11px; color: var(--tool-note); margin-top: 8px; }
+    .qp-legend span.qp-key { display: inline-flex; align-items: center; gap: 5px; }
+    .qp-swatch { width: 22px; height: 8px; border-radius: 2px; display: inline-block; }
+
     .qp-drop {
       border: 2px dashed var(--pico-muted-border-color); border-radius: 12px;
       padding: 14px; text-align: center; color: var(--tool-note); font-size: 13px;
@@ -114,7 +139,7 @@
       <ul class="site-crumbs">
         <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
         <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
-        <li><a href="/miscellaneous/#concepts" id="nav-cat">Concepts, Visualised</a></li>
+        <li><a href="/miscellaneous/#models" id="nav-cat">Models & Uncertainty</a></li>
       </ul>
       <ul>
         <li class="theme-switcher">
@@ -3064,6 +3089,312 @@
       });
     }
 
+
+    /* ================================================================
+       Posterior shape: marginal and pairwise densities
+
+       This exists because precis reduces a parameter to four numbers, and four
+       numbers are a complete description of a Gaussian and a lossy one of
+       anything else. Under quap that loss is zero by construction, since the
+       posterior IS the Gaussian the table reports. Under NUTS it throws away
+       the entire reason for running NUTS: a skewed sigma, a posterior piled up
+       against a boundary, two modes with a thin valley between them, a funnel.
+       None of those are visible in mean and sd, and all of them change what the
+       model is telling you.
+
+       Everything here is deliberately a BINNED estimate rather than a Gaussian
+       kernel density. A real 2D KDE costs O(draws x grid cells) per panel, which
+       for fifteen panels is the most expensive thing this tool would do, and it
+       would do it to produce a picture visually indistinguishable from a
+       histogram with a couple of blur passes. The blur is separable, so the
+       smoothing is O(cells) and independent of the number of draws. What travels
+       back to the main thread is the grid, a few thousand floats for the whole
+       figure, which is less than a thinned scatter of the same draws would cost. */
+
+    /* A binomial (1 2 1) blur, applied `passes` times, separably. Repeated
+       binomial passes approach a Gaussian by the central limit theorem, which is
+       the standard reason this substitution is allowed at all: two passes are
+       already smoother than the binning error underneath them. Edges REPLICATE
+       rather than wrap, because a posterior that touches the edge of its own
+       grid must not bleed into the opposite corner. */
+    function blurGrid(g, nx, ny, passes) {
+      var tmp = new Float64Array(nx * ny), i, x, y;
+      for (i = 0; i < (passes || 1); i++) {
+        for (y = 0; y < ny; y++) {
+          for (x = 0; x < nx; x++) {
+            var l = g[y * nx + (x > 0 ? x - 1 : 0)];
+            var c = g[y * nx + x];
+            var r = g[y * nx + (x < nx - 1 ? x + 1 : nx - 1)];
+            tmp[y * nx + x] = 0.25 * l + 0.5 * c + 0.25 * r;
+          }
+        }
+        for (x = 0; x < nx; x++) {
+          for (y = 0; y < ny; y++) {
+            var u = tmp[(y > 0 ? y - 1 : 0) * nx + x];
+            var m = tmp[y * nx + x];
+            var d = tmp[(y < ny - 1 ? y + 1 : ny - 1) * nx + x];
+            g[y * nx + x] = 0.25 * u + 0.5 * m + 0.25 * d;
+          }
+        }
+      }
+      return g;
+    }
+
+    /* Range for one coordinate, trimmed at quantiles rather than at the extremes.
+       One draw in the far tail of a heavy-tailed posterior would otherwise set
+       the whole axis and squeeze everything that matters into three pixels. The
+       trim is symmetric and mild, and it is widened by a margin so the density
+       has somewhere to fall back to zero. */
+    function densRange(col, trim) {
+      var s = Float64Array.from(col);
+      s.sort();
+      var t = trim === undefined ? 0.002 : trim;
+      var lo = quantileSorted(s, t), hi = quantileSorted(s, 1 - t);
+      if (!isFinite(lo) || !isFinite(hi)) return null;
+      if (hi === lo) { var e = Math.abs(lo) * 0.05 || 0.5; lo -= e; hi += e; }
+      var pad = (hi - lo) * 0.08;
+      return { lo: lo - pad, hi: hi + pad };
+    }
+
+    /* One marginal, as a smoothed histogram on a fixed grid. The values are a
+       density (area one over the range), not counts, so a panel can be compared
+       against a normal curve drawn over it without rescaling either. */
+    function marginalDensity(col, nbins, range, passes) {
+      var nb = nbins || 64;
+      var r = range || densRange(col);
+      if (!r) return null;
+      var g = new Float64Array(nb), n = col.length, i;
+      var w = (r.hi - r.lo) / nb, inv = 1 / w;
+      for (i = 0; i < n; i++) {
+        var b = Math.floor((col[i] - r.lo) * inv);
+        if (b >= 0 && b < nb) g[b] += 1;
+      }
+      blurGrid(g, nb, 1, passes === undefined ? 2 : passes);
+      /* Renormalize after the blur: the replicating edges do not conserve mass
+         exactly, and it is the normalization here that makes the area one. */
+      var sum = 0;
+      for (i = 0; i < nb; i++) sum += g[i];
+      if (sum > 0) for (i = 0; i < nb; i++) g[i] = g[i] / (sum * w);
+      var mx = 0;
+      for (i = 0; i < nb; i++) if (g[i] > mx) mx = g[i];
+      return { lo: r.lo, hi: r.hi, n: nb, v: round4(g), max: mx };
+    }
+
+    /* The joint of two coordinates on a coarse grid, the same construction one
+       dimension up. The default 48x48 is chosen against the panel size rather
+       than against the number of draws: at 150 px a panel cannot resolve more,
+       and a finer grid would only add noise for the blur to remove again. The
+       values sum to one, so a cell is posterior mass. */
+    function jointDensity(cx, cy, nb, rx, ry, passes) {
+      var n = nb || 48;
+      var a = rx || densRange(cx), b = ry || densRange(cy);
+      if (!a || !b) return null;
+      var g = new Float64Array(n * n), N = cx.length, i;
+      var ix = n / (a.hi - a.lo), iy = n / (b.hi - b.lo);
+      for (i = 0; i < N; i++) {
+        var px = Math.floor((cx[i] - a.lo) * ix);
+        var py = Math.floor((cy[i] - b.lo) * iy);
+        if (px >= 0 && px < n && py >= 0 && py < n) g[py * n + px] += 1;
+      }
+      blurGrid(g, n, n, passes === undefined ? 2 : passes);
+      var sum = 0, mx = 0;
+      for (i = 0; i < n * n; i++) sum += g[i];
+      if (sum > 0) for (i = 0; i < n * n; i++) g[i] /= sum;
+      for (i = 0; i < n * n; i++) if (g[i] > mx) mx = g[i];
+      return { x: a, y: b, n: n, v: Array.from(g), max: mx };
+    }
+
+    /* Contour levels enclosing a given posterior MASS, not a given density.
+
+       That is the whole difference between a contour meaning "95% of the
+       posterior is inside here" and one meaning "the density is 0.7 here", where
+       the second is incomparable between two panels and therefore says nothing
+       at all. Sort the cells by density, walk down from the densest accumulating
+       mass, and take the density at which the running total first reaches each
+       target. Returns one level per requested probability, descending in mass
+       and therefore ascending in density. */
+    function hpdLevels(grid, probs) {
+      var ps = probs || [0.5, 0.8, 0.95];
+      var v = Float64Array.from(grid.v);
+      v.sort();
+      var total = 0, i;
+      for (i = 0; i < v.length; i++) total += v[i];
+      if (!(total > 0)) return ps.map(function () { return 0; });
+      var out = [], acc = 0, pi = 0;
+      /* v is ascending, so walk it backwards to go densest first. */
+      for (i = v.length - 1; i >= 0 && pi < ps.length; i--) {
+        acc += v[i];
+        while (pi < ps.length && acc / total >= ps[pi]) { out.push(v[i]); pi++; }
+      }
+      while (out.length < ps.length) out.push(0);
+      return out;
+    }
+
+    /* Significant-digit rounding for everything that leaves the worker as part
+       of the figure.
+
+       This is not cosmetic. A density grid is 2304 cells and a JSON float is up
+       to 17 digits, so the untrimmed figure serializes to about 213 kB, which is
+       larger than the raw draws it was supposed to replace. Every number here
+       ends up driving at most a few hundred pixels, where four significant
+       digits are already far more than can be seen. Rounding first makes the
+       message roughly four times smaller and changes no pixel. */
+    function round4(a) {
+      var out = new Array(a.length);
+      for (var i = 0; i < a.length; i++) {
+        var v = a[i];
+        out[i] = v === 0 || !isFinite(v) ? v : Number(v.toPrecision(4));
+      }
+      return out;
+    }
+
+    /* Coordinates are rounded against the AXIS, not to significant digits.
+
+       Significant digits are the wrong unit for a position, and visibly so: an
+       intercept living around 154 keeps only one decimal at four significant
+       digits, which quantizes it to steps of 0.1 and draws the scatter as a set
+       of vertical stripes, while a slope around 0.98 keeps five decimals and
+       looks fine. Same rounding, two completely different resolutions, because
+       the numbers happen to sit at different magnitudes.
+
+       What actually matters is resolution relative to the panel the point is
+       drawn in. A step of one part in 2000 of the axis range is far below one
+       pixel at any panel size this figure uses, and it costs the same few
+       characters per value everywhere. */
+    function roundToRange(a, range) {
+      var span = range.hi - range.lo;
+      if (!(span > 0)) return Array.from(a);
+      /* A power of ten keeps the decimal representation short, which is the
+         whole point: quantizing to an arbitrary step would print full-length
+         floats again. */
+      var dec = Math.max(0, Math.ceil(-Math.log10(span / 2000)));
+      var out = new Array(a.length);
+      for (var i = 0; i < a.length; i++) {
+        var v = a[i];
+        out[i] = isFinite(v) ? Number(v.toFixed(dec)) : v;
+      }
+      return out;
+    }
+
+    /* The whole pairs figure, computed once in the worker.
+
+       The parameter cap is a display decision, not a numerical one: a triangle
+       over P parameters has P(P-1)/2 panels, so seven parameters is already 21
+       panels and none of them large enough to read. Six is where the panels are
+       still worth drawing.
+
+       `divergent` is optional and only NUTS supplies it. Divergent draws are
+       carried as their own point list rather than folded into the density,
+       because their POSITION is the diagnosis: they collect where the geometry
+       defeated the sampler, classically in the neck of a funnel, and a density
+       estimate would average exactly that signal away. They are not thinned,
+       because a healthy run has none and an unhealthy one has few. */
+    function pairsFigure(samples, opts) {
+      opts = opts || {};
+      var maxP = opts.maxPar || 6;
+      var P = Math.min(samples.P, maxP);
+      var S = samples.S, i, j, s;
+      var src = opts.scale === 'raw' ? samples.raw : samples.natural;
+      var probs = opts.probs || [0.5, 0.8, 0.95];
+      if (!(P > 0) || !(S > 0)) return null;
+
+      var cols = [];
+      for (i = 0; i < P; i++) {
+        var c = new Float64Array(S);
+        for (s = 0; s < S; s++) c[s] = src[s * samples.P + i];
+        cols.push(c);
+      }
+      var ranges = cols.map(function (c) { return densRange(c); });
+      for (i = 0; i < P; i++) if (!ranges[i]) return null;
+
+      var marg = [];
+      for (i = 0; i < P; i++) marg.push(marginalDensity(cols[i], opts.nbins || 64, ranges[i]));
+
+      /* The normal the summary table implies FOR THIS AXIS. The panels are in
+         natural units, and for a parameter with a log or logit link the mean and
+         sd in the precis table are not: they live on the computation scale,
+         where the Gaussian is actually fitted. Drawing that Gaussian over a
+         natural-scale histogram would be comparing two different things and
+         would make an ordinary log-linked sigma look badly approximated.
+         So the moments are taken from the same column the histogram was built
+         from, which is the only pairing that is honest in both modes. */
+      var normals = [];
+      for (i = 0; i < P; i++) {
+        var nm = meanOf(cols[i]), ns = sdOf(cols[i]);
+        normals.push(isFinite(nm) && isFinite(ns) && ns > 0 ? { mean: nm, sd: ns } : null);
+      }
+
+      /* A thin scatter over the density, for the two things a smoothed grid
+         cannot say: where the individual draws actually are, and that there are
+         finitely many of them. More points than this is a solid blob at panel
+         size and costs message space for nothing.
+
+         The thinned draws travel ONCE, as one column per parameter, and the
+         renderer pairs them up per panel. Carrying an (x, y) list inside every
+         panel instead would serialize the same draws P-1 times over, and since
+         the panel count grows quadratically while the draws grow linearly, that
+         is what made the first version of this figure larger than the raw draws
+         it was supposed to replace. Same for the divergent draws. */
+      var nPts = Math.min(S, opts.maxPoints || 600);
+      var step = Math.max(1, Math.floor(S / nPts));
+      var thin = [], divCols = [];
+      for (i = 0; i < P; i++) {
+        var tc = [];
+        for (s = 0; s < S; s += step) tc.push(cols[i][s]);
+        thin.push(roundToRange(tc, ranges[i]));
+        if (opts.divergent) {
+          var dc = [];
+          for (s = 0; s < S; s++) if (opts.divergent[s]) dc.push(cols[i][s]);
+          divCols.push(roundToRange(dc, ranges[i]));
+        }
+      }
+
+      var panels = [];
+      for (j = 1; j < P; j++) {
+        for (i = 0; i < j; i++) {
+          var jd = jointDensity(cols[i], cols[j], opts.ngrid || 48, ranges[i], ranges[j]);
+          if (!jd) continue;
+          /* The grid ships as BAND INDICES, not as densities.
+
+             The renderer's only question about a cell is which contour band it
+             falls in, and there are four possible answers. Shipping the density
+             itself meant 13824 cells of "0.0001234" per figure, which was 85% of
+             the whole message and every digit of it was thrown away on arrival.
+             One small integer per cell says exactly as much and compresses to
+             about a tenth of the size.
+
+             Band 0 is outside the widest contour, band k is inside probs[k-1].
+             hpdLevels still runs on the unrounded densities, so where the
+             boundaries lie is unaffected by any of this. */
+          var lv = hpdLevels(jd, probs);
+          /* lv is DESCENDING in density (the 50% contour is the densest), so
+             band lv.length is the innermost. Break on the first threshold the
+             cell clears, because a cell inside the 50% contour is inside all of
+             them and must be reported as the innermost band, not the outermost. */
+          var band = new Array(jd.v.length);
+          for (var bi = 0; bi < jd.v.length; bi++) {
+            var bv = jd.v[bi], bk = 0;
+            for (var bl = 0; bl < lv.length; bl++) {
+              if (bv >= lv[bl]) { bk = lv.length - bl; break; }
+            }
+            band[bi] = bk;
+          }
+          panels.push({ i: i, j: j, n: jd.n, band: band, x: jd.x, y: jd.y });
+        }
+      }
+
+      var nDiv = 0;
+      if (opts.divergent) for (s = 0; s < S; s++) if (opts.divergent[s]) nDiv++;
+
+      return {
+        P: P, nTotal: samples.P, probs: probs,
+        names: samples.names.slice(0, P),
+        marg: marg, panels: panels, nDivergent: nDiv, normals: normals,
+        pts: thin, div: opts.divergent ? divCols : null,
+        scale: opts.scale === 'raw' ? 'raw' : 'natural'
+      };
+    }
+
     /* Posterior draws on the unconstrained scale, plus the same draws mapped
        back to natural units. Both are wanted: the summary is on the transformed
        scale, predictions need the natural one. */
@@ -3628,6 +3959,11 @@
           var ll = logLikMatrix(model, samples, Math.min(samples.S, 2000));
           var w = waic(ll), ps = psis(ll);
 
+          post({ type: 'progress', stage: 'shape', frac: 0.85 });
+          /* No divergences here: quap has no sampler that could diverge, and the
+             draws are exact draws from the reported Gaussian. */
+          var qpairs = pairsFigure(samples, { probs: [0.5, 0.8, 0.95] });
+
           post({ type: 'progress', stage: 'predictions', frac: 0.9 });
           var pred = null;
           if (model.detNames.length) {
@@ -3656,7 +3992,7 @@
               waic: w, psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK, maxK: Math.max.apply(null, Array.from(ps.k)) },
               messages: fit.messages, names: model.names, links: fit.links,
               nObs: model.nObs, nPar: model.nPar, iters: fit.iters, logp: fit.logp,
-              outcome: model.outcome, pred: pred,
+              outcome: model.outcome, pred: pred, pairs: qpairs,
               detNames: model.detNames
             }
           });
@@ -3724,6 +4060,17 @@
           var mll = logLikMatrix(mmodel, msamples, Math.min(msamples.S, 2000));
           var mw = waic(mll), mps = psis(mll);
 
+          post({ type: 'progress', stage: 'shape', frac: 0.85 });
+          /* The divergence flags have to be concatenated in exactly the order
+             chainsToSamples walks the chains, or the marked points land on
+             innocent draws and the funnel appears in the wrong place. */
+          var mdiv = new Uint8Array(msamples.S), mdat = 0;
+          for (var dc = 0; dc < chains.length; dc++) {
+            var dch = chains[dc];
+            for (var ds = 0; ds < dch.S; ds++) mdiv[mdat++] = dch.divergent[ds] ? 1 : 0;
+          }
+          var mpairs = pairsFigure(msamples, { divergent: mdiv, probs: [0.5, 0.8, 0.95] });
+
           post({ type: 'progress', stage: 'predictions', frac: 0.9 });
           var mpred = null;
           if (mmodel.detNames.length) {
@@ -3760,6 +4107,7 @@
               links: mmodel.params.map(function (pp) { return pp.linkName; }),
               nObs: mmodel.nObs, nPar: mmodel.nPar,
               outcome: mmodel.outcome, pred: mpred, detNames: mmodel.detNames,
+              pairs: mpairs,
               diag: diag, traces: traces,
               chainInfo: chains.map(function (ch) {
                 return { S: ch.S, nDivergent: ch.nDivergent, nMaxDepth: ch.nMaxDepth,
@@ -3807,6 +4155,9 @@
       essRaw: essRaw, essBulk: essBulk, essTail: essTail,
       chainsToSamples: chainsToSamples, paramChains: paramChains, precisNuts: precisNuts,
       sampleCor: sampleCor, samplerDiagnostics: samplerDiagnostics, traceSeries: traceSeries,
+      blurGrid: blurGrid, densRange: densRange, marginalDensity: marginalDensity,
+      roundToRange: roundToRange,
+      jointDensity: jointDensity, hpdLevels: hpdLevels, pairsFigure: pairsFigure,
       posteriorCor: posteriorCor, gridCheck: gridCheck,
       linkNode: linkNode, simOutcome: simOutcome, priorPredictive: priorPredictive,
       summarizeDraws: summarizeDraws,
@@ -4256,6 +4607,337 @@
         </div>`;
     }
 
+
+    /* ---- the posterior shape view (marginals + pairs) ----
+
+       Three layers per panel, in this order and for three different reasons.
+       The filled HPD contours carry the SHAPE, because a smoothed grid is the
+       only one of the three that can show a ridge or a bend at panel size. The
+       thinned scatter carries the TAILS and the honesty, since a density
+       estimate looks equally smooth whether it rests on four thousand draws or
+       on forty. The divergences carry the DIAGNOSIS and sit on top of both,
+       because where they are is the entire message. */
+
+    /* Palette values baked into canvas drawing have to be re-read when the skin
+       changes, which is what data-theme-live promises the user. Everything the
+       renderer needs goes through here, so a new colour is added in one place. */
+    function readPairsPalette() {
+      /* Every value has a fallback and the whole read is optional. A palette
+         lookup must never be the thing that blanks the page: this runs during
+         render, so a throw here would take the whole tool down, and it also has
+         to survive the Node render harness, which has no CSSOM at all. */
+      const el = typeof document !== 'undefined' ? document.documentElement : null;
+      const cs = el && typeof getComputedStyle === 'function' ? getComputedStyle(el) : null;
+      const get = (n, fb) => {
+        if (!cs) return fb;
+        const v = cs.getPropertyValue(n);
+        return (v || '').trim() || fb;
+      };
+      return {
+        /* --tool-text, NOT --tool-ink. The two are easy to confuse and only one
+           of them is a foreground colour for the page: --tool-ink means "text
+           on a light chip", so it is DARK in the grey skin (#22262b on a #55595f
+           panel) and LIGHT in the light skin (#ecf3fb on white). Draws painted
+           in it were muddy on grey and would have been invisible on light.
+           --tool-grid is the other candidate and is deliberately faint, since it
+           is meant for grid lines behind the data rather than for the data. */
+        text: get('--tool-text', '#bcc5cf'),
+        note: get('--tool-note', '#94a3b8'),
+        hair: get('--tool-hairline', '#334155'),
+        surface: get('--tool-surface', '#0f172a'),
+        info: get('--tool-sig-info', '#38bdf8'),
+        bad: get('--tool-sig-bad', '#ef6c5c'),
+        emph: get('--tool-emph', '#f1f5f9'),
+        light: !!(el && el.dataset && el.dataset.theme === 'light')
+      };
+    }
+
+    /* rgba() from whatever the variable happens to hold. Custom properties may
+       be hex or rgb(); parsing both here keeps the alpha blending working in
+       every skin instead of only in the one that was tested. */
+    function withAlpha(col, a) {
+      const c = String(col).trim();
+      let m = c.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+      if (m) {
+        let h = m[1];
+        if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+        const n = parseInt(h, 16);
+        return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+      }
+      m = c.match(/^rgba?\(([^)]+)\)$/i);
+      if (m) {
+        const p = m[1].split(/[\s,\/]+/).filter(Boolean);
+        return 'rgba(' + p[0] + ',' + p[1] + ',' + p[2] + ',' + a + ')';
+      }
+      return c;
+    }
+
+    /* One joint panel. The contours are drawn as filled cells per band rather
+       than as traced isolines: at a 48-cell grid a marching-squares outline
+       would be visibly polygonal, while filled cells with a mild alpha read as
+       exactly what they are, a coarse density. */
+    function drawPanel(cv, pn, pal, opts) {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = cv.clientWidth || 150, h = cv.clientHeight || 150;
+      if (!w || !h) return;
+      cv.width = Math.round(w * dpr);
+      cv.height = Math.round(h * dpr);
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+
+      const n = pn.n;
+      const X = (v) => (v - pn.x.lo) / (pn.x.hi - pn.x.lo) * w;
+      /* Canvas y grows downward and the posterior does not. */
+      const Y = (v) => h - (v - pn.y.lo) / (pn.y.hi - pn.y.lo) * h;
+
+      if (opts.showDens) {
+        const cw = w / n, ch = h / n;
+        /* One pass per band, palest first, so the densest ends up on top. The
+           cell already carries its band index, so this is a comparison against
+           a small integer rather than against a density. */
+        const nb = opts.nBands || 3;
+        for (let b = 1; b <= nb; b++) {
+          g.fillStyle = withAlpha(pal.info, 0.16 + 0.20 * b);
+          for (let j = 0; j < n; j++) {
+            for (let i = 0; i < n; i++) {
+              if (pn.band[j * n + i] === b) {
+                /* The slight overdraw closes the hairline seams between cells
+                   that would otherwise show as a grid of light lines. */
+                g.fillRect(i * cw, h - (j + 1) * ch, cw + 0.6, ch + 0.6);
+              }
+            }
+          }
+        }
+      }
+
+      /* The draws arrive as one column per parameter, so a panel pairs its own
+         two columns rather than carrying a copy of them. */
+      const px = opts.pts && opts.pts[pn.i], py = opts.pts && opts.pts[pn.j];
+      if (opts.showPts && px && py) {
+        /* The draws sit on top of a filled contour, so they need a little more
+           opacity on the light skin, where the fill is closer to the page. */
+        g.fillStyle = withAlpha(pal.text, pal.light ? 0.42 : 0.32);
+        const m = Math.min(px.length, py.length);
+        for (let k = 0; k < m; k++) {
+          g.fillRect(X(px[k]) - 0.6, Y(py[k]) - 0.6, 1.2, 1.2);
+        }
+      }
+
+      const dx = opts.div && opts.div[pn.i], dy = opts.div && opts.div[pn.j];
+      if (opts.showDiv && dx && dy && dx.length) {
+        g.fillStyle = pal.bad;
+        g.strokeStyle = withAlpha(pal.surface, 0.8);
+        g.lineWidth = 0.5;
+        const m = Math.min(dx.length, dy.length);
+        for (let k = 0; k < m; k++) {
+          g.beginPath();
+          g.arc(X(dx[k]), Y(dy[k]), 1.9, 0, 6.2832);
+          g.fill();
+          g.stroke();
+        }
+      }
+    }
+
+    /* One marginal, on the diagonal. The normal overlay is the whole didactic
+       point where it appears: it is what quap would have claimed about this
+       parameter, drawn over what the sampler actually found. Where the two
+       separate, that gap is the reason NUTS exists. */
+    function drawMarginal(cv, m, pal, normal) {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = cv.clientWidth || 150, h = cv.clientHeight || 150;
+      if (!w || !h) return;
+      cv.width = Math.round(w * dpr);
+      cv.height = Math.round(h * dpr);
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+
+      const top = Math.max(m.max, normal ? normal.peak : 0) * 1.08 || 1;
+      const X = (v) => (v - m.lo) / (m.hi - m.lo) * w;
+      const bw = w / m.n;
+
+      g.fillStyle = withAlpha(pal.info, 0.34);
+      g.beginPath();
+      g.moveTo(0, h);
+      for (let i = 0; i < m.n; i++) {
+        const y = h - (m.v[i] / top) * h;
+        g.lineTo(i * bw, y);
+        g.lineTo((i + 1) * bw, y);
+      }
+      g.lineTo(w, h);
+      g.closePath();
+      g.fill();
+
+      g.strokeStyle = pal.info;
+      g.lineWidth = 1;
+      g.beginPath();
+      for (let i = 0; i < m.n; i++) {
+        const y = h - (m.v[i] / top) * h;
+        if (i === 0) g.moveTo(0, y); else g.lineTo(i * bw, y);
+        g.lineTo((i + 1) * bw, y);
+      }
+      g.stroke();
+
+      if (normal) {
+        g.strokeStyle = pal.emph;
+        g.lineWidth = 1;
+        g.setLineDash([3, 2]);
+        g.beginPath();
+        for (let px = 0; px <= w; px += 2) {
+          const x = m.lo + (px / w) * (m.hi - m.lo);
+          const z = (x - normal.mean) / normal.sd;
+          const d = Math.exp(-0.5 * z * z) / (normal.sd * 2.5066282746310002);
+          const y = h - (d / top) * h;
+          if (px === 0) g.moveTo(px, y); else g.lineTo(px, y);
+        }
+        g.stroke();
+        g.setLineDash([]);
+      }
+    }
+
+    /* A single panel, wrapped so each one owns its canvas ref and redraws only
+       when its own inputs change. */
+    function PairCell({ kind, panel, marg, normal, opts, size, pal }) {
+      const ref = useRef(null);
+      useEffect(() => {
+        const cv = ref.current;
+        if (!cv) return;
+        if (kind === 'diag') drawMarginal(cv, marg, pal, normal);
+        else drawPanel(cv, panel, pal, opts);
+      });
+      return html`
+        <div className="qp-cell" style=${{ width: size, height: size }}>
+          <canvas ref=${ref} aria-hidden="true"></canvas>
+        </div>`;
+    }
+
+    function PairsView({ pairs, precis, isNuts, prob }) {
+      const [showDens, setShowDens] = useState(true);
+      const [showPts, setShowPts] = useState(true);
+      const [showNormal, setShowNormal] = useState(true);
+      const [pal, setPal] = useState(readPairsPalette);
+
+      /* data-theme-live means the skin can change under a rendered canvas, and
+         a canvas does not inherit anything. Re-read and redraw on the event the
+         central switcher fires. */
+      useEffect(() => {
+        const onTheme = () => setPal(readPairsPalette());
+        window.addEventListener('themechange', onTheme);
+        return () => window.removeEventListener('themechange', onTheme);
+      }, []);
+
+      if (!pairs || !pairs.P) {
+        return html`<p style=${{ color: 'var(--tool-note)' }}>
+          No posterior shape to show for this fit.</p>`;
+      }
+
+      const P = pairs.P;
+      const size = P >= 6 ? 116 : P >= 5 ? 132 : P >= 4 ? 150 : 168;
+      const lab = 58;
+      const byIJ = {};
+      pairs.panels.forEach((pn) => { byIJ[pn.i + ',' + pn.j] = pn; });
+
+      /* The normal with this axis's own mean and sd, computed in the worker on
+         the same column the histogram came from. It is deliberately NOT the
+         precis mean and sd, which for a linked parameter live on the
+         computation scale while these panels are in natural units. */
+      const normalFor = (i) => {
+        const nr = showNormal && pairs.normals ? pairs.normals[i] : null;
+        if (!nr) return null;
+        return { mean: nr.mean, sd: nr.sd, peak: 1 / (nr.sd * 2.5066282746310002) };
+      };
+
+      const opts = { showDens, showPts, showDiv: true, pts: pairs.pts, div: pairs.div,
+        nBands: pairs.probs.length };
+      const cells = [];
+      for (let j = 0; j < P; j++) {
+        cells.push(html`
+          <div key=${'r' + j} className="qp-cell-lab qp-cell-rot"
+            style=${{ width: lab, height: size }}>${pairs.names[j]}</div>`);
+        for (let i = 0; i < P; i++) {
+          if (i === j) {
+            cells.push(html`
+              <${PairCell} key=${'d' + i} kind="diag" marg=${pairs.marg[i]}
+                normal=${normalFor(i)} size=${size} pal=${pal} />`);
+          } else if (i < j) {
+            cells.push(html`
+              <${PairCell} key=${i + '-' + j} kind="joint" panel=${byIJ[i + ',' + j]}
+                opts=${opts} size=${size} pal=${pal} />`);
+          } else {
+            cells.push(html`<div key=${i + '-' + j} style=${{ width: size, height: size }}></div>`);
+          }
+        }
+      }
+      /* Column names along the bottom, in the same grid so they stay aligned
+         with their columns at every panel size. */
+      cells.push(html`<div key="corner" style=${{ width: lab }}></div>`);
+      for (let i = 0; i < P; i++) {
+        cells.push(html`
+          <div key=${'c' + i} className="qp-cell-lab"
+            style=${{ width: size, height: 20 }}>${pairs.names[i]}</div>`);
+      }
+
+      const pct = (p) => (p * 100).toFixed(0) + '%';
+      return html`
+        <${React.Fragment}>
+          <div className="qp-chips" style=${{ marginBottom: 10 }}>
+            <button className=${'lang-seg' + (showDens ? ' active' : '')}
+              onClick=${() => setShowDens(!showDens)}>density</button>
+            <button className=${'lang-seg' + (showPts ? ' active' : '')}
+              onClick=${() => setShowPts(!showPts)}>draws</button>
+            <button className=${'lang-seg' + (showNormal ? ' active' : '')}
+              onClick=${() => setShowNormal(!showNormal)}>normal overlay</button>
+          </div>
+
+          <div className="qp-scroll">
+            <div className="qp-pairs"
+              style=${{ gridTemplateColumns: lab + 'px repeat(' + P + ', ' + size + 'px)' }}>
+              ${cells}
+            </div>
+          </div>
+
+          <div className="qp-legend">
+            <span className="qp-key">
+              <span className="qp-swatch" style=${{ background: withAlpha(pal.info, 0.7) }}></span>
+              contours at ${pairs.probs.map(pct).join(' / ')} of the posterior mass
+            </span>
+            ${pairs.nDivergent ? html`
+              <span className="qp-key">
+                <span className="qp-swatch" style=${{ background: pal.bad, width: 8, height: 8,
+                  borderRadius: '50%' }}></span>
+                ${pairs.nDivergent} divergent transition${pairs.nDivergent === 1 ? '' : 's'}
+              </span>` : null}
+            ${pairs.nTotal > P ? html`
+              <span>showing ${P} of ${pairs.nTotal} parameters</span>` : null}
+          </div>
+
+          <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 12, maxWidth: '78ch' }}>
+            ${isNuts
+              ? html`The contours enclose posterior mass, not a fixed density, so the outer one really
+                  does contain ${pct(pairs.probs[pairs.probs.length - 1])} of the draws and the same
+                  band means the same thing in every panel. The dashed curve is the normal that mean
+                  and sd alone would imply: where the filled shape leans away from it, the summary
+                  table is losing something, and that is the case this sampler was run for. A banana
+                  or a narrow ridge in an off-diagonal panel says the two parameters are trading off
+                  against each other, which is also what a large correlation says, except that here
+                  you can see whether the trade is linear.`
+              : html`Every shape here is an ellipse, and it has to be: quap draws these from the
+                  Gaussian it fitted, so the plot cannot show anything the summary table did not
+                  already say. That is worth looking at once, as a picture of what the approximation
+                  assumes. What the posterior actually looks like is a question only the sampler can
+                  answer, and the cross-check tab is where quap admits how far off it might be.`}
+          </p>
+          ${pairs.nDivergent ? html`
+            <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
+              The red points are the transitions that diverged. Scattered thinly they are noise; a
+              cluster of them sitting in one corner of a panel is a region the sampler could not
+              follow, and the draws are then biased away from exactly that region, which no
+              diagnostic number on the chains tab can see.
+            </p>` : null}
+        <//>`;
+    }
+
     /* ---- the grid cross-check ----
        The one view that says where quap is lying: two intervals per parameter,
        what the Gaussian claims and what a direct evaluation says. */
@@ -4473,9 +5155,9 @@
          Stelle treten die Ketten selbst. */
       const isNuts = res && res.mode === 'nuts';
       const tabs = isNuts
-        ? [['precis', 'Summary'], ['trace', 'Chains'], ['cor', 'Correlations'],
+        ? [['precis', 'Summary'], ['shape', 'Shape'], ['trace', 'Chains'], ['cor', 'Correlations'],
            ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']]
-        : [['precis', 'Summary'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
+        : [['precis', 'Summary'], ['shape', 'Shape'], ['grid', 'Cross-check'], ['cor', 'Correlations'],
            ['pred', 'Predictions'], ['ic', 'WAIC / PSIS']];
 
       return html`
@@ -4655,6 +5337,10 @@
                           with a log or logit link. The check column is the cross-check tab in one word.`}
                   </p>
                 <//>` : null}
+
+              ${tab === 'shape' ? html`
+                <${PairsView} pairs=${res.pairs} precis=${res.precis} isNuts=${isNuts}
+                  prob=${prob} />` : null}
 
               ${tab === 'grid' && res.grid ? html`<${GridCheck} grid=${res.grid} />` : null}
 
