@@ -137,8 +137,14 @@
       border: 1px solid var(--tool-border); border-radius: 4px;
       background: var(--tool-surface);
     }
+    /* 13px und --tool-text, nicht 11px und --tool-label. Das waren die Werte
+       einer Bildunterschrift, und diese Beschriftungen sind keine: sie sagen,
+       welcher Parameter in welcher Zeile und Spalte steht, ohne sie ist das
+       Raster unlesbar. Monospace macht 11px zusaetzlich klein, weil die
+       Ziffernbreite die x-Hoehe drueckt. Die Legende darunter bleibt bei 11px,
+       die ist wirklich eine Fussnote. */
     .qp-cell-lab {
-      font-size: 11px; color: var(--tool-label);
+      font-size: 13px; color: var(--tool-text);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       display: flex; align-items: center; justify-content: center;
       text-align: center; overflow: hidden; padding: 2px;
@@ -185,6 +191,17 @@
        auseinander: sichtbar als Kerbe zwischen zwei Schaltern, die eigentlich
        ein Element sind. */
     .qp-chips > .lang-seg { border-radius: 4px; margin-left: 0; }
+
+    /* Die Exportleiste sitzt seit 2026-09-10 IM Reiterrahmen und braucht dort
+       eine Trennung nach oben, sonst klebt sie am Diagramm und liest sich als
+       dessen Legende. Eine Haarlinie und nicht ein zweiter Kasten: das ist
+       dieselbe Trennung, die .ctl-sec innerhalb einer Karte benutzt. Der
+       negative Seitenrand zieht sie bis an den Rahmen, damit sie den Inhalt
+       wirklich teilt statt als kurzer Strich in der Mitte zu haengen. */
+    .qp-panel > .qp-savebar {
+      border-top: 1px solid var(--tool-hairline);
+      margin: 14px -14px 0; padding: 12px 14px 0;
+    }
 
     /* Die Entwarnung nach einem sauberen Lauf. Bewusst klein und ohne Kasten:
        eine Warnung soll im Weg stehen, eine Entwarnung nicht. Der Punkt davor
@@ -4316,6 +4333,40 @@
       return { S: S, n: first, rows: rows };
     }
 
+    /* Die Versuchszahl eines Binomialmodells, je Datenzeile.
+
+       Ohne sie kann der Vorhersageplot ein dbinom-Modell nicht zeichnen, und
+       zwar auf eine Art, die wie ein Fehler in der Rechnung aussieht statt wie
+       einer in der Darstellung: der deterministische Knoten ist p und lebt in
+       0..1, das Outcome zaehlt aber Erfolge und lebt in 0..asked. Beide in
+       dieselbe Achse gezeichnet ergibt eine Linie, die bei 12 Versuchen
+       zwoelfmal zu flach am Boden entlangkriecht.
+
+       Geliefert wird die Spalte, nicht ihr Name: sie darf je Zeile
+       verschieden sein (unterschiedlich grosse Gruppen sind der Normalfall),
+       und der Plot braucht den Wert und nicht den Verweis. Eine Konstante im
+       Modell (dbinom(1, p), also eine Zeile je Person) kommt als Zahl an und
+       wird hier zur Spalte ausgerollt, damit der Verbraucher nur einen Fall
+       kennen muss.
+
+       null fuer jede andere Verteilung, denn nur die binomiale hat ein n. Bei
+       dpois ist lambda bereits der Erwartungswert der Zaehlung, und bei dnorm
+       ist mu die Sache selbst; dort ist nichts umzurechnen. */
+    function binomTrials(model) {
+      var sp = model.likeSpec();
+      if (sp.distName !== 'dbinom') return null;
+      var a0 = sp.argNodes[0];
+      var n = model.nObs, out = new Float64Array(n), i;
+      if (typeof a0 === 'number') {
+        for (i = 0; i < n; i++) out[i] = a0;
+        return out;
+      }
+      var col = model.cols && model.cols[a0];
+      if (!col) return null;
+      for (i = 0; i < n; i++) out[i] = col[i];
+      return out;
+    }
+
     /* Draws of the outcome itself, so observation noise is included. The
        equivalent of sim(). */
     function simOutcome(model, samples, newCols, maxDraws, seed) {
@@ -5952,13 +6003,42 @@
       },
       {
         id: 'poisson',
+        /* Nachtfalter an einer Lichtfalle, nach Temperatur.
+
+           Bis 2026-09-10 stand hier die Zahl der Titel auf x Regalmetern, und
+           das war das falsche Beispiel fuer diese Verteilung. Ein Log-Link
+           sagt "je Einheit MAL einem Faktor", Regalmeter erwartet man aber
+           proportional: doppelt so viel Regal, doppelt so viele Buecher. Die
+           Folgen standen sichtbar im Bild. Bei null Metern sagte das Modell
+           1.35 Titel, was ein leeres Regal nicht hat; die Titeldichte fiel von
+           3.4 auf 1.7 je Meter, statt konstant zu bleiben; und auf drei Metern
+           standen fuenf Buecher statt hundert. Der Fit war korrekt, die
+           Geschichte nicht, und wer das Beispiel las, lernte den Log-Link an
+           einem Fall, in dem er nicht hingehoert.
+
+           Insektenaktivitaet ist der Gegenfall: sie steigt mit der Temperatur
+           tatsaechlich multiplikativ, jedes Grad ist ein Faktor. Und der
+           Nullpunkt liegt ausserhalb der Daten, es gibt hier also gar kein
+           "bei null Grad" zu erklaeren.
+
+           Die Temperatur ist ZENTRIERT, und das ist keine Kosmetik. Roh
+           multipliziert der Prior auf b eine Zahl um 16, so dass
+           dnorm(0, 0.5) Raten von einer halben Million Faltern je Nacht
+           zulaesst. Zentriert bedeutet a die Rate bei mittlerer Temperatur,
+           und beide Prioren sind wieder lesbar: Median 7 Falter, 95% bis
+           etwa 60. */
         label: 'Poisson regression',
         build: function (rng) {
-          var n = 70, lines = ['shelf_metres,titles'];
-          var a = 0.3, b = 0.45;
+          var n = 70, lines = ['temp_c,moths'];
+          /* a auf der zentrierten Skala: exp(2) = 7.4 Falter bei 16 Grad.
+             exp(0.2) = 1.22, also gut ein Fuenftel mehr je Grad. Ueber die
+             Spanne von 10 bis 22 Grad macht das den Faktor 11, was fuer eine
+             Lichtfalle realistisch ist und dem Sampler unten kleine Raten
+             laesst. */
+          var a = 2.0, b = 0.20, mid = 16;
           for (var i = 0; i < n; i++) {
-            var h = rng() * 3;
-            lines.push(h.toFixed(3) + ',' + rpois1(rng, Math.exp(a + b * h)));
+            var t = 10 + 12 * rng();
+            lines.push(t.toFixed(1) + ',' + rpois1(rng, Math.exp(a + b * (t - mid))));
           }
           return {
             csv: lines.join('\n'),
@@ -5967,13 +6047,16 @@
               '# happened, not how many out of how many.',
               '# The outcome column holds whole numbers 0, 1, 2, ...',
               '#   exp keeps the rate positive whatever the linear part does.',
-              '#   b = MULTIPLIES the rate per unit: exp(b) is the factor.',
+              '#   b = MULTIPLIES the rate per unit: exp(b) is the factor, so',
+              '#   exp(b) = 1.2 means a fifth more moths for every degree.',
+              '#   The temperature is centred, so a is the rate at 16 degrees',
+              '#   rather than the rate at zero, which no trap ever sees.',
               '# Assumes variance equals the mean. If the counts scatter wider',
               '# than that, dgamma2 is the usual next step.',
-              'titles ~ dpois(lambda)',
-              'lambda <- exp(a + b*shelf_metres)',
-              'a ~ dnorm(0, 1)',
-              'b ~ dnorm(0, 0.5)'
+              'moths ~ dpois(lambda)',
+              'lambda <- exp(a + b*(temp_c - 16))',
+              'a ~ dnorm(2, 0.5)',
+              'b ~ dnorm(0, 0.2)'
             ].join('\n'),
             truth: { a: a, b: b, n: n }
           };
@@ -5981,7 +6064,19 @@
       },
       {
         id: 'index',
-        label: 'One parameter per category',
+        /* "Index variables" ist McElreaths Name fuer genau dieses Muster
+           (Kapitel 5.3), und das Werkzeug schreibt sich ohnehin dem Buch zu.
+           Bis 2026-09-10 hiess der Eintrag "One parameter per category", was
+           die Mechanik beschrieb, waehrend jeder Nachbar im Menue nach dem
+           Modelltyp benannt ist.
+
+           Nicht "MLM" oder "no pooling", obwohl der Kontrast zum naechsten
+           Beispiel genau der ist: hier steht ein FESTER Prior, dnorm(1.5, 1),
+           mit vorgegebenen Zahlen. Erst wenn dessen Parameter selbst geschaetzt
+           werden, teilen die Kategorien Information, und erst dann ist es ein
+           Multilevel-Modell. Dieses hier ein MLM zu nennen waere schlicht
+           falsch. */
+        label: 'Index variables',
         build: function (rng) {
           var kinds = ['clay', 'loam', 'sand', 'peat'];
           var eff = [0.0, 0.35, 0.7, 1.15], sigma = 0.28;
@@ -5994,8 +6089,8 @@
           return {
             csv: lines.join('\n'),
             model: [
-              '# One parameter per category. Use when a predictor is a label',
-              '# rather than a number, and you want a value for each label.',
+              '# Index variables: one parameter per category. Use when a predictor',
+              '# is a label rather than a number, and you want a value per label.',
               '# The indexing column may hold text, or whole numbers from 1 up.',
               '# The number of levels is counted from the data, not declared.',
               '#   a[soil] = the outcome for that soil, at the centred water',
@@ -6150,10 +6245,13 @@
             var lk = linkNode(model, samples, nd, null, 2000);
             var sm = simOutcome(model, samples, null, 2000, msg.opts && msg.opts.seed);
             if (lk && sm) {
+              var qtr = binomTrials(model);
               pred = {
                 node: nd,
                 link: summarizeDraws(lk, msg.opts && msg.opts.prob),
-                sim: summarizeDraws(sm, msg.opts && msg.opts.prob)
+                sim: summarizeDraws(sm, msg.opts && msg.opts.prob),
+                /* Nur bei dbinom gesetzt, siehe binomTrials. */
+                trials: qtr ? Array.prototype.slice.call(qtr) : null
               };
             }
           }
@@ -6299,10 +6397,12 @@
             var mlk = linkNode(mmodel, msamples, mnd, null, 2000);
             var msm = simOutcome(mmodel, msamples, null, 2000, msg.opts && msg.opts.seed);
             if (mlk && msm) {
+              var mtr = binomTrials(mmodel);
               mpred = {
                 node: mnd,
                 link: summarizeDraws(mlk, msg.opts && msg.opts.prob),
-                sim: summarizeDraws(msm, msg.opts && msg.opts.prob)
+                sim: summarizeDraws(msm, msg.opts && msg.opts.prob),
+                trials: mtr ? Array.prototype.slice.call(mtr) : null
               };
             }
           }
@@ -6660,19 +6760,39 @@
        zum Renderzeitpunkt der Panelinhalt des NEUEN Reiters noch nicht steht:
        gezaehlt wuerde der alte, und die Leiste waere immer einen Reiter im
        Rueckstand. */
-    function PlotSaveBar({ panelRef, tab, baseName }) {
+    function PlotSaveBar({ panelRef, tab, baseName, drawnRef }) {
       const [plots, setPlots] = useState(0);
+      /* Der Shape-Reiter zeichnet auf Canvas und hat deshalb kein SVG im
+         Panel, das sich herausschneiden liesse. Er meldet stattdessen eine
+         Funktion an, die sein Bild auf Verlangen als SVG baut. Die Leiste
+         bleibt damit die eine Stelle, an der ein Bild das Werkzeug verlaesst,
+         statt dass der Shape-Reiter einen zweiten, anders aussehenden Knopf
+         mit eigener Hintergrundwahl bekommt.
+
+         Ein ref und kein Zustand: die Funktion aendert sich bei jedem Render
+         des Reiters (sie schliesst ueber die Schalter density/draws/normal),
+         und ein Zustand daraus wuerde die Leiste bei jedem Klick im Reiter
+         neu rendern, um am Ende denselben Knopf zu zeigen. */
       /* Vorgabe: mit Flaeche. Der Grund steht bei svgSource, kurz: diese Plots
          zeichnen im dunklen Skin hell, und durchsichtig auf Weiss ist dann
          nicht zu lesen. */
       const [transparent, setTransparent] = useState(false);
       React.useLayoutEffect(() => {
         const el = panelRef.current;
-        setPlots(el ? el.querySelectorAll('svg.qp-plot').length : 0);
-      }, [panelRef, tab]);
+        const inDom = el ? el.querySelectorAll('svg.qp-plot').length : 0;
+        setPlots(inDom || ((drawnRef && drawnRef.current) ? 1 : 0));
+      }, [panelRef, tab, drawnRef]);
       if (!plots) return null;
 
       const save = () => {
+        /* Die gemeldete Quelle hat Vorrang, weil ein Reiter, der eine
+           anmeldet, gerade deshalb keine im Panel hat. */
+        const fn = drawnRef && drawnRef.current;
+        if (fn) {
+          download(fn({ transparent: transparent }),
+            baseName() + '-' + tab + '.svg', 'image/svg+xml');
+          return;
+        }
         const el = panelRef.current;
         if (!el) return;
         const svgs = el.querySelectorAll('svg.qp-plot');
@@ -6690,7 +6810,7 @@
       };
 
       return html`
-        <div className="qp-chips" style=${{ marginTop: 12 }}>
+        <div className="qp-savebar qp-chips">
           <button className="tool-btn tool-btn-sm" onClick=${save}>
             ${ToolIcons.el('download')} ${plots > 1 ? 'Save ' + plots + ' plots (SVG)' : 'Save plot (SVG)'}
           </button>
@@ -7296,6 +7416,10 @@
         text: get('--tool-text', '#bcc5cf'),
         note: get('--tool-note', '#94a3b8'),
         hair: get('--tool-hairline', '#334155'),
+        /* Der Rahmen der Zellen. Auf dem Bildschirm zieht ihn das CSS
+           (.qp-cell canvas), gebraucht wird er hier fuer den SVG-Export, der
+           kein Stylesheet mitnimmt. */
+        border: get('--tool-border', '#334155'),
         surface: get('--tool-surface', '#0f172a'),
         info: get('--tool-sig-info', '#38bdf8'),
         bad: get('--tool-sig-bad', '#ef6c5c'),
@@ -7448,6 +7572,208 @@
       }
     }
 
+    /* ---- Das Shape-Raster als SVG ----
+
+       Die uebrigen Reiter zeichnen ihre Diagramme als SVG in die Seite, und
+       der Exportknopf schneidet sie schlicht heraus. Hier geht das nicht: die
+       Panels sind Canvas, und zwar mit Absicht, weil ein Raster aus bis zu 36
+       Feldern mit je 2000 Punkten als DOM zaehflaessig waere.
+
+       Also wird fuer den Export ein zweites Mal gezeichnet, in dieselbe
+       Geometrie, aber als Text. Das ist eine Verdopplung und die einzige
+       Stelle im Werkzeug, die eine hat; die Alternativen sind schlechter.
+       canvas.toDataURL() gaebe ein PNG, also Pixel, wo jeder andere Reiter
+       Vektor liefert und wo die Beschriftungen zu Bildpunkten wuerden. Das
+       Raster dauerhaft als SVG zu zeichnen macht die Seite langsam, damit ein
+       gelegentlicher Klick einfacher wird. Die Kopplung ist ausgehalten,
+       indem beide Wege dieselben Abbildungen X/Y und dieselben Alpha-Werte
+       benutzen: was hier abweicht, weicht sichtbar ab.
+
+       EIN Dokument fuer das ganze Raster, anders als bei den Ketten, wo je
+       Plot eine Datei faellt. Die Ketten sind gestapelte Einzelbilder, das
+       Shape-Raster ist eine Matrix: eine einzelne Zelle daraus sagt nichts,
+       ihre Aussage ist die Stellung zu den anderen.
+
+       Farben stehen hier als konkrete Werte, nicht als var(--tool-*): die
+       Palette ist ohnehin schon aufgeloest, weil das Canvas sie so braucht,
+       und svgSource, das die Variablen sonst einsetzt, laeuft fuer dieses
+       Dokument nicht. Der Hintergrund ist deshalb auch hier eine Wahl. */
+    function pairsSvg(pairs, opts, pal, normalFor, geom) {
+      const size = geom.size, lab = geom.lab, gap = 3, botH = 20;
+      const P = pairs.P;
+      const W = lab + P * (size + gap);
+      const H = P * (size + gap) + botH;
+      /* Die drei Entitaeten werden aus ihrem Ampersand zusammengesetzt statt
+         ausgeschrieben. Grund ist check-syntax.mjs: die Pruefung durchsucht
+         den ganzen App-Block zeilenweise nach Entitaeten, weil htm keine
+         dekodiert und eine im Markup deshalb fast immer ein Fehler ist. Hier
+         ist sie keiner, denn dieser Text geht nicht durch htm, sondern in
+         eine SVG-Datei. Der Pruefung auszuweichen ist billiger, als ihr eine
+         Ausnahme beizubringen, die dann fuer jedes andere Werkzeug mitgilt.
+         (Auch dieser Kommentar darf sie deshalb nicht ausschreiben.) */
+      const AMP = String.fromCharCode(38);
+      const esc = (t) => String(t).replace(/&/g, AMP + 'amp;')
+        .replace(/</g, AMP + 'lt;').replace(/>/g, AMP + 'gt;');
+      /* Zwei Nachkommastellen ueberall: bei 2000 Punkten je Panel ist die
+         volle Fliesskommaschreibweise der halbe Dateiumfang, und ein
+         Hundertstel Pixel sieht niemand. */
+      const n2 = (v) => (Math.round(v * 100) / 100);
+      const out = [];
+      const byIJ = {};
+      pairs.panels.forEach((pn) => { byIJ[pn.i + ',' + pn.j] = pn; });
+
+      const cellX = (i) => lab + i * (size + gap);
+      const cellY = (j) => j * (size + gap);
+
+      /* Durchsichtig heisst durchsichtig, und zwar auf BEIDEN Ebenen: die
+         Flaeche des Dokuments und die der einzelnen Zelle. Sie hier
+         auseinanderlaufen zu lassen war ein Fehler und sah aus wie neun
+         dunkle Kacheln, die auf weissem Papier schweben. Der Rahmen der
+         Zelle bleibt in jedem Fall, denn er trennt die Panels voneinander
+         und nicht das Bild von der Seite. */
+      const solid = !(opts && opts.transparent);
+      if (solid) {
+        out.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="'
+          + pal.surface + '"/>');
+      }
+
+      for (let j = 0; j < P; j++) {
+        for (let i = 0; i <= j; i++) {
+          const ox = cellX(i), oy = cellY(j);
+          out.push('<g transform="translate(' + ox + ',' + oy + ')">');
+          out.push('<rect x="0.5" y="0.5" width="' + (size - 1) + '" height="' + (size - 1)
+            + '" rx="3.5" fill="' + (solid ? pal.surface : 'none') + '" stroke="'
+            + pal.border + '"/>');
+          /* Abschneiden am Zellenrand: ein Punkt genau auf der Grenze wuerde
+             sonst ueber den Rahmen hinausragen, was auf dem Bildschirm nicht
+             passiert, weil dort das Canvas selbst die Grenze ist. */
+          const cid = 'qpc' + i + '_' + j;
+          out.push('<clipPath id="' + cid + '"><rect width="' + size + '" height="' + size
+            + '" rx="4"/></clipPath>');
+          out.push('<g clip-path="url(#' + cid + ')">');
+          if (i === j) {
+            pairsSvgMarginal(out, pairs.marg[i], pal, normalFor(i), size, n2);
+          } else {
+            pairsSvgPanel(out, byIJ[i + ',' + j], pal, opts, size, n2);
+          }
+          out.push('</g></g>');
+        }
+      }
+
+      /* Die Zeilennamen stehen gedreht am linken Rand, die Spaltennamen
+         aufrecht unten, wie im Raster auf dem Bildschirm. Gedreht heisst hier
+         eine eigene Transformation je Beschriftung, weil SVG kein
+         writing-mode kennt. */
+      const fs = 13;
+      const fam = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+      const lblAttr = ' text-anchor="middle" dominant-baseline="central" font-size="' + fs
+        + '" font-family="' + fam + '" fill="' + pal.text + '"';
+      for (let j = 0; j < P; j++) {
+        const cy = cellY(j) + size / 2;
+        out.push('<text transform="translate(' + (lab / 2) + ',' + cy + ') rotate(-90)"'
+          + lblAttr + '>' + esc(pairs.names[j]) + '</text>');
+      }
+      for (let i = 0; i < P; i++) {
+        out.push('<text x="' + (cellX(i) + size / 2) + '" y="' + (P * (size + gap) + botH / 2)
+          + '"' + lblAttr + '>' + esc(pairs.names[i]) + '</text>');
+      }
+
+      return '<?xml version="1.0" encoding="UTF-8"?>\n'
+        + '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H
+        + '" width="' + W + '" height="' + H + '">' + out.join('') + '</svg>\n';
+    }
+
+    /* Ein gemeinsames Panel als SVG. Spiegelt drawPanel Schritt fuer Schritt. */
+    function pairsSvgPanel(out, pn, pal, opts, size, n2) {
+      if (!pn) return;
+      const w = size, h = size, n = pn.n;
+      const X = (v) => (v - pn.x.lo) / (pn.x.hi - pn.x.lo) * w;
+      const Y = (v) => h - (v - pn.y.lo) / (pn.y.hi - pn.y.lo) * h;
+
+      if (opts.showDens) {
+        const cw = w / n, ch = h / n;
+        const nb = opts.nBands || 3;
+        for (let b = 1; b <= nb; b++) {
+          /* Ein Pfad je Band statt eines Rechtecks je Zelle. Bei 48x48 Zellen
+             und drei Baendern waeren das sonst tausende Elemente je Panel,
+             und die Datei ein Vielfaches so gross, ohne anders auszusehen. */
+          let d = '';
+          for (let j = 0; j < n; j++) {
+            for (let i = 0; i < n; i++) {
+              if (pn.band[j * n + i] === b) {
+                d += 'M' + n2(i * cw) + ' ' + n2(h - (j + 1) * ch)
+                  + 'h' + n2(cw + 0.6) + 'v' + n2(ch + 0.6) + 'h' + n2(-(cw + 0.6)) + 'z';
+              }
+            }
+          }
+          if (d) {
+            out.push('<path d="' + d + '" fill="' + withAlpha(pal.info, 0.16 + 0.20 * b) + '"/>');
+          }
+        }
+      }
+
+      const px = opts.pts && opts.pts[pn.i], py = opts.pts && opts.pts[pn.j];
+      if (opts.showPts && px && py) {
+        let d = '';
+        const m = Math.min(px.length, py.length);
+        for (let k = 0; k < m; k++) {
+          d += 'M' + n2(X(px[k]) - 0.6) + ' ' + n2(Y(py[k]) - 0.6) + 'h1.2v1.2h-1.2z';
+        }
+        if (d) {
+          out.push('<path d="' + d + '" fill="'
+            + withAlpha(pal.text, pal.light ? 0.42 : 0.32) + '"/>');
+        }
+      }
+
+      const dx = opts.div && opts.div[pn.i], dy = opts.div && opts.div[pn.j];
+      if (opts.showDiv && dx && dy && dx.length) {
+        const m = Math.min(dx.length, dy.length);
+        for (let k = 0; k < m; k++) {
+          out.push('<circle cx="' + n2(X(dx[k])) + '" cy="' + n2(Y(dy[k]))
+            + '" r="1.9" fill="' + pal.bad + '" stroke="' + withAlpha(pal.surface, 0.8)
+            + '" stroke-width="0.5"/>');
+        }
+      }
+    }
+
+    /* Eine Randverteilung auf der Diagonalen, als SVG. Spiegelt drawMarginal. */
+    function pairsSvgMarginal(out, m, pal, normal, size, n2) {
+      if (!m) return;
+      const w = size, h = size;
+      const top = Math.max(m.max, normal ? normal.peak : 0) * 1.08 || 1;
+      const bw = w / m.n;
+
+      /* Die Treppe einmal als Punktfolge, dann zweimal benutzt: gefuellt bis
+         zur Grundlinie und als blosser Umriss darueber. Auf dem Canvas sind
+         das zwei getrennte Pfade, hier stuende dieselbe Zahlenkette zweimal
+         in der Datei. */
+      let step = '';
+      for (let i = 0; i < m.n; i++) {
+        const y = n2(h - (m.v[i] / top) * h);
+        step += (i === 0 ? 'M0 ' + y : 'L' + n2(i * bw) + ' ' + y)
+          + 'L' + n2((i + 1) * bw) + ' ' + y;
+      }
+      if (step) {
+        out.push('<path d="M0 ' + h + 'L' + step.slice(1) + 'L' + n2(w) + ' ' + h
+          + 'Z" fill="' + withAlpha(pal.info, 0.34) + '"/>');
+        out.push('<path d="' + step + '" fill="none" stroke="' + pal.info
+          + '" stroke-width="1"/>');
+      }
+
+      if (normal) {
+        let d = '';
+        for (let px = 0; px <= w; px += 2) {
+          const x = m.lo + (px / w) * (m.hi - m.lo);
+          const z = (x - normal.mean) / normal.sd;
+          const dens = Math.exp(-0.5 * z * z) / (normal.sd * 2.5066282746310002);
+          const y = n2(h - (dens / top) * h);
+          d += (px === 0 ? 'M' : 'L') + px + ' ' + y;
+        }
+        out.push('<path d="' + d + '" fill="none" stroke="' + pal.emph
+          + '" stroke-width="1" stroke-dasharray="3 2"/>');
+      }
+    }
+
     /* A single panel, wrapped so each one owns its canvas ref and redraws only
        when its own inputs change. */
     function PairCell({ kind, panel, marg, normal, opts, size, pal }) {
@@ -7464,7 +7790,7 @@
         </div>`;
     }
 
-    function PairsView({ pairs, precis, isNuts, prob }) {
+    function PairsView({ pairs, precis, isNuts, prob, drawnRef }) {
       const [showDens, setShowDens] = useState(true);
       const [showPts, setShowPts] = useState(true);
       const [showNormal, setShowNormal] = useState(true);
@@ -7502,6 +7828,18 @@
 
       const opts = { showDens, showPts, showDiv: true, pts: pairs.pts, div: pairs.div,
         nBands: pairs.probs.length };
+
+      /* Die Anmeldung beim Exportknopf. Waehrend des Renders und nicht in
+         einem Effekt: die Leiste steht im selben Durchlauf weiter unten im
+         Baum und liest das ref, wenn sie selbst rendert. Ein Effekt liefe
+         danach, und der erste Klick nach einem Reiterwechsel ginge ins
+         Leere. Das Abmelden beim Verlassen des Reiters uebernimmt der
+         Effekt darunter, denn dann rendert diese Komponente nicht mehr. */
+      if (drawnRef) {
+        drawnRef.current = (o) => pairsSvg(pairs, Object.assign({}, opts, o), pal,
+          normalFor, { size: size, lab: lab });
+      }
+      useEffect(() => () => { if (drawnRef) drawnRef.current = null; }, [drawnRef]);
       const cells = [];
       for (let j = 0; j < P; j++) {
         cells.push(html`
@@ -7762,6 +8100,47 @@
         x = Float64Array.from(rows, (r) => xa[r]);
         y = Float64Array.from(rows, (r) => ya[r]);
       }
+      /* Nach der Zeilenauswahl, denn trials zaehlt die Zeilen des FITS und y
+         ab hier ebenfalls. Vorher geteilt waere um die verworfenen Zeilen
+         verschoben. */
+      const asProp = (arr, t) => Float64Array.from(arr, (v, i) => (
+        t[i] > 0 ? v / t[i] : NaN));
+      /* Ein Binomialmodell wird als ANTEIL gezeichnet und nicht als Zahl der
+         Erfolge. Der Grund ist der deterministische Knoten: bei
+         `yes ~ dbinom(asked, p)` ist p eine Wahrscheinlichkeit in 0..1,
+         waehrend die Spalte yes bis asked zaehlt. Zeichnet man beide in
+         dieselbe Achse, kriecht die Linie bei zwoelf Versuchen zwoelfmal zu
+         flach am Boden entlang und das Band um p liegt platt auf der Null.
+         Genau so sah es bis zum 2026-09-10 aus.
+
+         Von den zwei Wegen, das geradezuziehen, ist dies der gewaehlte: das
+         OUTCOME kommt auf die Skala von p, nicht p auf die des Outcomes. Die
+         Achse laeuft dann 0..1, was die Frage eines logistischen Modells auch
+         ist ("wie wahrscheinlich ist ja"), und p bleibt unangetastet die
+         Groesse, die das Modell schaetzt.
+
+         Der Preis steht im Bild und ist nicht wegzurechnen: ein Anteil aus
+         zwoelf Versuchen sieht aus wie einer aus tausend, obwohl er sehr viel
+         unsicherer ist. Das aeussere Band traegt diese Information, denn es
+         wird bei genau dieser Versuchszahl simuliert und ist entsprechend
+         breit. Solange asked ueber alle Zeilen gleich ist, ist das exakt; wo
+         es sich unterscheidet, ist die Breite des Bandes je Zeile verschieden,
+         was ebenfalls stimmt.
+
+         trials ist null fuer jede andere Verteilung, und dann passiert hier
+         nichts: dpois liefert mit lambda bereits den Erwartungswert der
+         Zaehlung, dnorm mit mu die Sache selbst. */
+      const trials = pred.trials && pred.trials.length ? pred.trials : null;
+
+      /* Das simulierte Band zaehlt Erfolge und wird mitgeteilt; das Band um
+         den Knoten selbst ist schon eine Wahrscheinlichkeit und bleibt. */
+      let simLo = pred.sim.lo, simHi = pred.sim.hi;
+      if (trials) {
+        y = asProp(y, trials);
+        simLo = asProp(simLo, trials);
+        simHi = asProp(simHi, trials);
+      }
+
       const n = Math.min(x.length, pred.link.mean.length);
       const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => x[a] - x[b]);
       /* pad traegt jetzt die Zahlen UND den gedrehten Achsentitel daneben, also
@@ -7770,8 +8149,26 @@
       let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
       for (let i = 0; i < n; i++) {
         xlo = Math.min(xlo, x[i]); xhi = Math.max(xhi, x[i]);
-        ylo = Math.min(ylo, y[i], pred.sim.lo[i]); yhi = Math.max(yhi, y[i], pred.sim.hi[i]);
+        ylo = Math.min(ylo, y[i], simLo[i]); yhi = Math.max(yhi, y[i], simHi[i]);
       }
+      /* Die Skala liegt exakt auf min und max, ohne jeden Zuschlag. Das
+         Band ist ein Polygon durch die beobachteten x-Werte und kann deshalb
+         nie weiter reichen als diese; jede Luft am Rand wird damit
+         zwangslaeufig zu einem Spalt zwischen Band und Rahmen.
+
+         Am 2026-09-10 standen hier nacheinander zwei Versuche, das anders zu
+         loesen. Erst ein Abzug von vier Pixeln in der Abbildung selbst, der
+         alles mitverschob und den Spalt sogar auf beiden Achsen erzeugte.
+         Dann ein Zuschlag von 4% auf den Wertebereich, wie matplotlib ihn als
+         margins kennt: sauberer, aber am Spalt aendert das nichts, denn er
+         folgt daraus, dass das Band an den Daten endet und nicht am Rahmen.
+         Ein Band bis zum Rahmen zu ziehen hiesse, das Modell an x-Werten zu
+         zeigen, an denen es nicht ausgewertet wurde.
+
+         Die Randpunkte liegen damit wieder auf den Achsen und werden dort
+         angeschnitten, siehe die geclippte Gruppe bei den Kreisen. Ein halber
+         Kreis auf der Achse ist die ehrlichere Auskunft: er sagt, dass dieser
+         Punkt der aeusserste ist. */
       const px = (v) => pad + (v - xlo) / (xhi - xlo || 1) * (W - pad - 12);
       const py = (v) => H - pad - (v - ylo) / (yhi - ylo || 1) * (H - pad - 14);
       const band = (loA, hiA) => {
@@ -7798,18 +8195,23 @@
         return out.map((v) => ({ v: v, s: v.toFixed(Math.min(dec, 6)) }));
       };
       const xt = ticks(xlo, xhi, 5), yt = ticks(ylo, yhi, 5);
+      /* Die Achse traegt, was auf ihr steht. "yes" waere jetzt falsch, denn
+         gezeichnet ist nicht die Zahl der Ja, sondern ihr Anteil. */
+      const yLabel = trials ? outcome + ' (proportion)' : outcome;
       return html`
         <${React.Fragment}>
           <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H}>
-            <path d=${band(pred.sim.lo, pred.sim.hi)} fill="var(--tool-sig-info)" opacity="0.13" />
+            <path d=${band(simLo, simHi)} fill="var(--tool-sig-info)" opacity="0.13" />
             <path d=${band(pred.link.lo, pred.link.hi)} fill="var(--tool-sig-info)" opacity="0.30" />
             <path d=${line} fill="none" stroke="var(--tool-sig-info)" strokeWidth="1.8" />
-            ${order.map((i) => html`
-              <circle key=${i} cx=${px(x[i])} cy=${py(y[i])} r="2.6"
-                fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
-            <!-- Die Gitterlinien liegen VOR den Achsen und HINTER nichts:
-                 gezeichnet werden sie hier, also nach Baendern und Punkten,
-                 aber sehr blass, damit sie die Daten nicht ueberschreiben. -->
+            <!-- Die Gitterlinien liegen hinter den Datenpunkten. Sie standen
+                 bis 2026-09-10 davor, mit der Begruendung, dass sie blass
+                 genug seien, um nichts zu ueberschreiben. Das stimmte fuer
+                 die Linien knapp und fuer die beiden Achsen gar nicht: die
+                 sind in --tool-border und voll deckend, und ein Punkt am Rand
+                 bekam eine Linie quer durch den Kreis. Blass genug ist keine
+                 Reihenfolge. Die Daten liegen jetzt oben, wohin sie
+                 gehoeren. -->
             ${yt.map((t) => html`
               <line key=${'yg' + t.s} x1=${pad} y1=${py(t.v)} x2=${W - 10} y2=${py(t.v)}
                 stroke="var(--tool-hairline)" strokeWidth="1" opacity="0.5" />`)}
@@ -7838,10 +8240,43 @@
                  erkennt. -->
             <text x=${14} y=${(H - pad + 12) / 2} textAnchor="middle" fontSize="12"
               fill="var(--tool-label)"
-              transform=${'rotate(-90 14 ' + ((H - pad + 12) / 2) + ')'}>${outcome}</text>
+              transform=${'rotate(-90 14 ' + ((H - pad + 12) / 2) + ')'}>${yLabel}</text>
+            <!-- Die beobachteten Punkte ganz zuletzt, ueber Baendern, Gitter
+                 und Achsen: sie sind das, was gemessen wurde, und alles
+                 andere ist die Darstellung darum herum.
+
+                 Geclippt auf die Zeichenflaeche, weil die Skala exakt auf min
+                 und max liegt und der aeusserste Punkt seinen Mittelpunkt
+                 damit genau auf der Achse hat. Ohne das Clipping ragt sein
+                 Kreis zur Haelfte darueber hinaus und sieht aus wie ein
+                 Fehler; mit ihm steht ein halber Kreis an der Achse, was
+                 zutrifft und nebenbei sagt, dass hier der Rand der Daten
+                 ist. Der Bereich ist um den Strich des Kreises groesser als
+                 der Rahmen (0.5px), sonst schneidet das Clipping die
+                 Achslinie selbst mit an.
+
+                 Die id traegt den Namen des Werkzeugs, weil sie den
+                 SVG-Export ueberlebt: dort landet das clipPath mit im
+                 Dokument, und eine Datei mit einer generischen id wie "clip"
+                 kollidiert, sobald jemand zwei davon in dasselbe Dokument
+                 legt. -->
+            <clipPath id="qp-pred-clip">
+              <rect x=${pad - 0.5} y=${11.5} width=${W - 12 - pad + 1}
+                height=${H - pad - 11} />
+            </clipPath>
+            <g clipPath="url(#qp-pred-clip)">
+              ${order.map((i) => html`
+                <circle key=${i} cx=${px(x[i])} cy=${py(y[i])} r="2.6"
+                  fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
+            </g>
           </svg>
           <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
-            Circles are the observed data. The dark band is the uncertainty in ${pred.node} itself, the
+            ${trials
+              ? html`Circles are the observed data as a proportion, ${outcome} divided by the number of
+                  trials in that row, because ${pred.node} is a probability and the column counts
+                  successes. `
+              : 'Circles are the observed data. '}
+            The dark band is the uncertainty in ${pred.node} itself, the
             pale one adds the observation noise, so about ${(pred.link.prob * 100).toFixed(0)} percent of
             real points should fall inside it. A band too narrow for its own data is the honest sign of a
             model that is too sure of itself.
@@ -8196,9 +8631,12 @@
         return RTH.compareFits(fits, cmpCrit);
       }, [models, cmpCrit]);
 
-      /* Der Reiterinhalt, damit die Speicherleiste darunter das Diagramm
-         darin finden kann, ohne dass jede Diagrammkomponente davon weiss. */
+      /* Der Reiterinhalt, damit die Speicherleiste das Diagramm darin finden
+         kann, ohne dass jede Diagrammkomponente davon weiss. */
       const panelRef = useRef(null);
+      /* Der Ausweg fuer den einen Reiter, dessen Bild nicht im DOM steht:
+         siehe PlotSaveBar. */
+      const drawnRef = useRef(null);
 
       /* Der Modellname als Dateiname: Kleinbuchstaben, alles andere zu
          Unterstrichen. Alle Downloads teilen ihn, damit die Dateien im Ordner
@@ -8611,7 +9049,7 @@
 
               ${tab === 'shape' ? html`
                 <${PairsView} pairs=${res.pairs} precis=${res.precis} isNuts=${isNuts}
-                  prob=${prob} />` : null}
+                  prob=${prob} drawnRef=${drawnRef} />` : null}
 
               ${tab === 'grid' && res.grid ? html`<${GridCheck} grid=${res.grid} />` : null}
 
@@ -8782,14 +9220,22 @@
                       question: a new row in a group already seen.
                     <//>` : null}
                 <//>` : null}
-              </div>
               <!-- Die Bilder herausholen. Eine Leiste fuer jeden Reiter, die
                    sich selbst versteckt, wenn in dem Reiter kein Diagramm
-                   steht: das ist der Grund, warum sie NACH dem Panel steht und
-                   dessen Inhalt abfragt, statt in jeder der drei
-                   Diagrammkomponenten einzeln zu sitzen. Ein neuer Plot bekommt
-                   den Knopf dadurch von allein. -->
-              <${PlotSaveBar} panelRef=${panelRef} tab=${tab} baseName=${baseName} />
+                   steht. Sie fragt den Panelinhalt ab, statt in jeder
+                   Diagrammkomponente einzeln zu sitzen; ein neuer Plot
+                   bekommt den Knopf dadurch von allein.
+
+                   Sie steht IM Panel, seit dieses einen Rahmen hat. Davor
+                   sass sie darunter und damit ausserhalb, was sie wie eine
+                   Aktion auf dem ganzen Ergebnis aussehen liess statt wie
+                   eine auf dem Bild, das gerade zu sehen ist. Der Knopf
+                   gehoert zum Reiter, also in dessen Rahmen. Das Abfragen
+                   des Panelinhalts stoert das nicht: sie steht als letztes
+                   Kind darin und zaehlt die SVGs ihrer Geschwister. -->
+              <${PlotSaveBar} panelRef=${panelRef} tab=${tab} baseName=${baseName}
+                drawnRef=${drawnRef} />
+              </div>
             </div>` : null}
 
           <details className="fold" style=${{ marginTop: 26 }}>
