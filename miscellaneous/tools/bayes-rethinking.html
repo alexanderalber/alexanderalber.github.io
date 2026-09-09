@@ -6,10 +6,10 @@
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Quap Lab - Bayesian Model Fitting in the Browser</title>
-  <meta name="description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, prior and posterior predictive simulation, WAIC and PSIS-LOO. Nothing leaves the browser.">
+  <meta name="description" content="Write a Bayesian model as a formula list, paste your data as CSV or JSON, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, prior and posterior predictive simulation, WAIC and PSIS-LOO. Nothing leaves the browser.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
   <meta property="og:title" content="Quap Lab - Bayesian Model Fitting in the Browser">
-  <meta property="og:description" content="Write a Bayesian model as a formula list, paste your CSV, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, predictive simulation, WAIC and PSIS-LOO.">
+  <meta property="og:description" content="Write a Bayesian model as a formula list, paste your data as CSV or JSON, and fit it by quadratic approximation or by NUTS. Posterior summaries, convergence diagnostics, predictive simulation, WAIC and PSIS-LOO.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/bayes-rethinking.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -76,6 +76,15 @@
       max-height: 420px; overflow: auto; font-size: 11.5px; line-height: 1.5;
       background: var(--tool-surface); border: 1px solid var(--tool-border);
       border-radius: 8px; padding: 12px; margin-top: 14px; white-space: pre;
+    }
+
+    /* Zwei Ausgaben in einem Reiter, getrennt wie die Abschnitte einer
+       ctl-card: durch eine Haarlinie und nicht durch einen zweiten Kasten.
+       Dieselbe Absicht wie dort, aber .ctl-sec haengt an .ctl-card und der
+       Reiterinhalt ist keine, also eine eigene Klasse mit denselben Werten. */
+    .qp-exsec + .qp-exsec {
+      border-top: 1px solid var(--tool-hairline);
+      margin-top: 18px; padding-top: 16px;
     }
 
     /* The results table. Numbers right-aligned and tabular so a column of
@@ -165,7 +174,17 @@
     .qp-segs { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
     .qp-seggrp { display: flex; flex-direction: column; gap: 4px; }
     .qp-seglbl { font-size: 11px; color: var(--tool-note); margin: 0; }
-    .qp-chips .lang-seg { border-radius: 4px; margin-left: 0; }
+    /* Der dokumentierte Opt-out fuer Reihen mit gap: eine Chipreihe besteht aus
+       einzelnen Schaltern, und die Adjazenzregeln von .lang-seg sehen den gap
+       nicht, wuerden also Ecken abschneiden, die frei stehen.
+
+       Nur die DIREKTEN Kinder, seit hier eine echte .seg-row in einer
+       Chipreihe steht (der Hintergrundschalter am SVG-Export). Als
+       Nachfahrenselektor traf die Regel auch die, und die zusammengehoerenden
+       Segmente darin fielen mit runden Ecken und ohne den ueberlappenden Rand
+       auseinander: sichtbar als Kerbe zwischen zwei Schaltern, die eigentlich
+       ein Element sind. */
+    .qp-chips > .lang-seg { border-radius: 4px; margin-left: 0; }
 
     /* Die Entwarnung nach einem sauberen Lauf. Bewusst klein und ohne Kasten:
        eine Warnung soll im Weg stehen, eine Entwarnung nicht. Der Punkt davor
@@ -295,7 +314,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Quap Lab</h1>
-        <p style="color:var(--tool-label);max-width:70ch">Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it, either by a Gaussian at the posterior mode or by Hamiltonian Monte Carlo.</p>
+        <p style="color:var(--tool-label);max-width:70ch">Write a Bayesian model the way you would write it on paper, paste your data, and fit it, either by a Gaussian at the posterior mode or by Hamiltonian Monte Carlo.</p>
         <p style="color:var(--tool-note);max-width:70ch;font-size:13.5px">The approach is not mine. The formula-list notation, quadratic approximation as the way in, and the examples this is built around all come from <a href="https://xcelab.net/rm/" target="_blank" rel="noopener noreferrer">Statistical Rethinking</a> by Richard McElreath. This is an independent browser implementation of ideas that book teaches, written because working through them without an R install seemed useful. If the subject interests you, read the book.</p>
         <ul style="color:var(--tool-label);max-width:70ch">
           <li>A formula list with <code>~</code> for stochastic and <code>&lt;-</code> for deterministic relations, twelve distributions.</li>
@@ -5244,6 +5263,299 @@
     }
 
     /* ================================================================
+       The session as a file
+
+       Everything a reload destroys: the models, the data, and the settings the
+       numbers were produced under. This exists because the tool had no memory
+       at all. Four models written, a sampler tuned and a CSV pasted were gone
+       on a refresh, and there was no way to hand any of it to someone else.
+
+       What is deliberately NOT in the file is the RESULTS. A quap fit takes
+       milliseconds, so storing its posterior would trade a much larger file for
+       nothing; and a stored result is a result that can disagree with the model
+       text next to it, which is the most expensive kind of wrong this tool can
+       produce. Reopening a session means refitting it, and that is the honest
+       behaviour: what you get is what the current code makes of that model.
+
+       No localStorage either, on purpose. Data pasted here stays in the tab and
+       nothing writes it to disk without the user saying so. An explicit save to
+       a file they choose is that saying-so; a background copy in the browser
+       profile is not, and the promise under the drop zone would stop being
+       true.
+       ================================================================ */
+
+    var SESSION_KIND = 'quap-lab-session';
+    var SESSION_VERSION = 1;
+
+    function serializeSession(st) {
+      st = st || {};
+      var models = (st.models || []).map(function (m) {
+        /* The name only travels when the user set one. A generated "model 2"
+           is a function of the position and would come back as a real name
+           that no longer matches after a reorder. */
+        var out = { src: String(m.src === undefined ? '' : m.src) };
+        if (m.name) out.name = String(m.name);
+        return out;
+      });
+      return JSON.stringify({
+        kind: SESSION_KIND,
+        version: SESSION_VERSION,
+        saved: new Date().toISOString(),
+        /* The tool's own address, so a file found in a downloads folder in two
+           years says where it came from. */
+        tool: 'https://alber.me/miscellaneous/tools/bayes-rethinking.html',
+        csv: String(st.csv === undefined ? '' : st.csv),
+        models: models,
+        active: st.active | 0,
+        settings: {
+          mode: st.mode === 'nuts' ? 'nuts' : 'quap',
+          prob: +st.prob, draws: st.draws | 0,
+          nChains: st.nChains | 0, nIter: st.nIter | 0,
+          adaptDelta: +st.adaptDelta, nonCentred: !!st.nonCentred,
+          cmpCrit: st.cmpCrit === 'psis' ? 'psis' : 'waic'
+        }
+      }, null, 2) + '\n';
+    }
+
+    /* Returns { session } or { why }. Every field is checked rather than
+       trusted: this file has been on a disk, through an editor and possibly
+       through someone else's script, and a plausible-looking session with
+       prob = 0 or 900000 draws would fail somewhere deep instead of here.
+
+       Unknown fields are dropped and missing ones fall back to the defaults the
+       caller passes, so a hand-written file with nothing but a CSV and one
+       model in it is a perfectly good session. */
+    function parseSession(text, defaults) {
+      var d = defaults || {};
+      var doc;
+      try { doc = JSON.parse(text); }
+      catch (e) { return { why: 'this is not valid JSON: ' + (e && e.message ? e.message : 'parse error') }; }
+      if (Array.isArray(doc)) {
+        /* An array is what a JSON DATA file looks like, and dropping one here
+           instead of on the data panel is the mistake worth naming outright. */
+        return { why: 'this JSON is an array, so it looks like a data file rather than a session. ' +
+          'Data goes into the data panel above.' };
+      }
+      if (!doc || typeof doc !== 'object') {
+        return { why: 'this JSON is a single value, not a session.' };
+      }
+      if (doc.kind !== SESSION_KIND) {
+        /* Named explicitly, because the mistake this catches is the likely one:
+           dropping a DATA json onto the session button, or the other way
+           round. Both are JSON, both are plausible, and the difference is one
+           field. */
+        return { why: 'this file is not a Quap Lab session (its "kind" is ' +
+          (doc.kind === undefined ? 'missing' : '"' + String(doc.kind) + '"') +
+          '). A data file in JSON goes into the data panel, not here.' };
+      }
+      if (doc.version > SESSION_VERSION) {
+        return { why: 'this session was saved by a newer version of the tool (version ' +
+          doc.version + ', this one reads ' + SESSION_VERSION + ').' };
+      }
+
+      var models = [];
+      if (doc.models !== undefined) {
+        if (!Array.isArray(doc.models)) return { why: 'the "models" field is not an array.' };
+        for (var i = 0; i < doc.models.length; i++) {
+          var m = doc.models[i];
+          if (!m || typeof m !== 'object' || typeof m.src !== 'string') {
+            return { why: 'model ' + (i + 1) + ' in this session has no source text.' };
+          }
+          models.push({ name: typeof m.name === 'string' && m.name ? m.name : null, src: m.src });
+        }
+      }
+      if (!models.length) return { why: 'this session contains no models.' };
+
+      var s = doc.settings && typeof doc.settings === 'object' ? doc.settings : {};
+
+      /* Warnungen, nicht Fehler. Die Unterscheidung ist der Punkt: die Datei
+         ist brauchbar, also wird sie geladen, aber der Nutzer erfaehrt, was
+         daran nicht angekommen ist.
+
+         Das kam von einem versteckten Tippfehler ("drfaws" statt "draws"), der
+         vorher restlos still verschwand: unbekannte Schluessel wurden ignoriert
+         und fehlende fielen auf die Vorgabe zurueck, und beides zusammen heisst,
+         dass ein vertippter Schluessel BEIDE Regeln trifft und deshalb nichts
+         sagt. Die Datei ist zum Bearbeiten gedacht und klein genug, um sie von
+         Hand zu tippen, also ist ein Tippfehler darin kein Sonderfall, sondern
+         der Normalfall. */
+      var warnings = [];
+      var KNOWN = ['mode', 'prob', 'draws', 'nChains', 'nIter', 'adaptDelta',
+        'nonCentred', 'cmpCrit'];
+      var unknown = Object.keys(s).filter(function (k) { return KNOWN.indexOf(k) < 0; });
+      if (unknown.length) {
+        /* Nur benennen, nicht raten. Der Name steht in der Meldung und die
+           erlaubten stehen daneben, und damit hat der Nutzer alles, was er
+           braucht, um es selbst zu sehen. */
+        warnings.push('ignored ' + (unknown.length === 1 ? 'the setting ' : 'the settings ') +
+          unknown.map(function (k) { return '"' + k + '"'; }).join(', ') +
+          ': not something this tool knows. It reads ' + KNOWN.join(', ') + '.');
+      }
+
+      /* One clamp for every number. A value out of range is not worth refusing
+         a file over, it is worth putting back inside the range the UI can
+         express, and saying so. */
+      var pick = function (v, lo, hi, fb, what) {
+        if (v === undefined) return fb;
+        var n = +v;
+        if (isFinite(n) && n >= lo && n <= hi) return n;
+        warnings.push('the setting "' + what + '" was ' + JSON.stringify(v) +
+          ', which is outside ' + lo + ' to ' + hi + '. Using ' + fb + ' instead.');
+        return fb;
+      };
+      var enumOf = function (v, allowed, fb, what) {
+        if (v === undefined) return fb;
+        if (allowed.indexOf(v) >= 0) return v;
+        warnings.push('the setting "' + what + '" was ' + JSON.stringify(v) +
+          ', which is not one of ' + allowed.join(' or ') + '. Using ' + fb + ' instead.');
+        return fb;
+      };
+
+      var active = doc.active | 0;
+      if (active < 0 || active >= models.length) {
+        if (doc.active !== undefined) {
+          warnings.push('"active" was ' + JSON.stringify(doc.active) + ', but this session has ' +
+            models.length + ' model' + (models.length === 1 ? '' : 's') + '. Showing the first.');
+        }
+        active = 0;
+      }
+      if (doc.csv !== undefined && typeof doc.csv !== 'string') {
+        warnings.push('"csv" is not a string, so this session was loaded without any data.');
+      }
+
+      return { session: {
+        csv: typeof doc.csv === 'string' ? doc.csv : '',
+        models: models,
+        active: active,
+        mode: enumOf(s.mode, ['quap', 'nuts'], 'quap', 'mode'),
+        prob: pick(s.prob, 0.5, 0.99, d.prob === undefined ? 0.8 : d.prob, 'prob'),
+        draws: Math.round(pick(s.draws, 100, 100000, d.draws === undefined ? 4000 : d.draws, 'draws')),
+        nChains: Math.round(pick(s.nChains, 1, 8, d.nChains === undefined ? 4 : d.nChains, 'nChains')),
+        nIter: Math.round(pick(s.nIter, 100, 20000, d.nIter === undefined ? 1000 : d.nIter, 'nIter')),
+        adaptDelta: pick(s.adaptDelta, 0.5, 0.999,
+          d.adaptDelta === undefined ? 0.8 : d.adaptDelta, 'adaptDelta'),
+        nonCentred: s.nonCentred === undefined ? true : !!s.nonCentred,
+        cmpCrit: enumOf(s.cmpCrit, ['waic', 'psis'], 'waic', 'cmpCrit'),
+        saved: typeof doc.saved === 'string' ? doc.saved : null,
+        warnings: warnings
+      } };
+    }
+
+    /* ================================================================
+       The posterior draws as a CSV
+
+       One row per draw, one column per parameter. This is the least clever
+       export in the file and the one most likely to be used: every other tool
+       that does anything with a posterior reads a table of draws, so this is
+       the seam to R, to ArviZ (az.from_dict over the columns), to pandas and to
+       a spreadsheet, without any of them having to know this page exists.
+
+       In NATURAL units, that is the numbers the user named: sigma, not
+       log(sigma). The fitted scale is available too, because Rhat and ESS are
+       statements about it, but it is not the default: someone who asks for the
+       draws of a standard deviation and silently gets its logarithm ends up
+       reporting a wrong number that looks entirely plausible.
+
+       Chain and draw index come along under NUTS and only there. They are what
+       makes the file re-diagnosable elsewhere: a table of draws with the chain
+       structure thrown away cannot be checked for convergence by anyone, and
+       ArviZ in particular wants exactly this pair. Under quap there are no
+       chains, and inventing a column of ones would suggest a structure the
+       draws do not have (they are independent draws from a fitted Gaussian).
+       ================================================================ */
+
+    /* Evenly spaced thinning down to at most `cap` draws, keeping both scales
+       and the chain count so that whatever comes out is still a samples object.
+
+       Thinning is the right move here and would be the wrong move upstream:
+       these draws are going into a text file, where the difference between
+       2000 and 8000 of them is megabytes against the third decimal of a
+       percentile. Nothing that computes a diagnostic gets thinned draws,
+       because Rhat and ESS are about the sequence.
+
+       Evenly spaced rather than the first 2000: taking a prefix would drop
+       whole chains, and a file that claims four chains and contains one is
+       worse than a smaller file. */
+    function thinSamples(samples, cap) {
+      var S = samples.S, P = samples.P;
+      if (!cap || S <= cap) {
+        return { S: S, P: P, raw: samples.raw, natural: samples.natural,
+          names: samples.names, nChains: samples.nChains };
+      }
+      /* Per chain, so the result still divides evenly into chains and the
+         chain/draw columns of the CSV stay meaningful. */
+      var nC = samples.nChains && samples.nChains > 1 ? samples.nChains : 1;
+      var per = S / nC, keepPer = Math.max(1, Math.floor(cap / nC));
+      if (!Number.isInteger(per)) { nC = 1; per = S; keepPer = Math.max(1, cap); }
+      var useS = keepPer * nC;
+      var raw = new Float64Array(useS * P), nat = new Float64Array(useS * P);
+      var at = 0, c, k, i;
+      for (c = 0; c < nC; c++) {
+        for (k = 0; k < keepPer; k++) {
+          var src = c * per + (keepPer === 1 ? 0 : Math.round(k * (per - 1) / (keepPer - 1)));
+          for (i = 0; i < P; i++) {
+            raw[at * P + i] = samples.raw[src * P + i];
+            nat[at * P + i] = samples.natural[src * P + i];
+          }
+          at++;
+        }
+      }
+      return { S: useS, P: P, raw: raw, natural: nat,
+        names: samples.names, nChains: samples.nChains };
+    }
+
+    function drawsCSV(samples, opts) {
+      opts = opts || {};
+      var scale = opts.scale === 'raw' ? 'raw' : 'natural';
+      var src = scale === 'raw' ? samples.raw : samples.natural;
+      var P = samples.P, S = samples.S, i, s;
+      var names = samples.names || [];
+      /* A display name can be "a[Bremen]", which contains no comma but does
+         contain brackets, and under a hand-built model it could be anything.
+         Quote whatever needs it and double an inner quote, which is the same
+         rule parseCSV reads back. */
+      var q = function (t) {
+        t = String(t);
+        return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+      };
+      /* Enough digits that a round trip through the file changes nothing:
+         a double needs 17 significant digits in the worst case, and this is
+         data going into someone else's analysis, not a display. */
+      var num = function (v) {
+        if (v === null || v === undefined || !isFinite(v)) return Number.isNaN(v) ? 'NA' : String(v);
+        return String(v);
+      };
+
+      var head = [];
+      var chainOf = null, drawOf = null;
+      if (samples.nChains && samples.nChains > 1) {
+        /* chainsToSamples concatenates the chains in order and every chain has
+           the same length, so the position determines both indices. Recomputing
+           them here rather than carrying them keeps this readable, and it stays
+           correct as long as that concatenation does, which the header of
+           chainsToSamples promises. */
+        var per = S / samples.nChains;
+        if (Number.isInteger(per) && per > 0) {
+          head.push('chain', 'draw');
+          chainOf = function (k) { return Math.floor(k / per) + 1; };
+          drawOf = function (k) { return (k % per) + 1; };
+        }
+      }
+      for (i = 0; i < P; i++) head.push(q(names[i] === undefined ? 'p' + (i + 1) : names[i]));
+
+      var out = [head.join(',')];
+      for (s = 0; s < S; s++) {
+        var row = [];
+        if (chainOf) { row.push(String(chainOf(s))); row.push(String(drawOf(s))); }
+        for (i = 0; i < P; i++) row.push(num(src[s * P + i]));
+        out.push(row.join(','));
+      }
+      /* A trailing newline, because a text file without one is the kind of
+         thing that makes some other tool drop the last row. */
+      return out.join('\n') + '\n';
+    }
+
+    /* ================================================================
        CSV
        ================================================================ */
 
@@ -5256,9 +5568,128 @@
       return best;
     }
 
+    /* JSON as a second input shape, handled by rewriting it into the rows of
+       fields the CSV path already knows how to type.
+
+       Two shapes are accepted, because both are what an API or a script hands
+       you without being asked: an array of row objects, and an object of
+       columns. Nothing else, and in particular nothing nested: a value that is
+       itself an object or an array has no column to be, and guessing one (JSON
+       "flattening") invents names the user never wrote.
+
+       The values become STRINGS here rather than numbers, which looks like a
+       detour and is the point: everything after this shares one typing pass, so
+       a JSON column and a CSV column cannot end up categorical in one format
+       and numeric in the other. null and JSON's absent key both become '', the
+       missing marker the CSV path already uses. */
+    function jsonRows(text) {
+      var shapes = 'Expected either an array of row objects ([{"x":1,"y":2}, ...]) ' +
+        'or an object of equally long columns ({"x":[1,2],"y":[3,4]}).';
+      var doc;
+      try { doc = JSON.parse(text); }
+      catch (e) { return { why: 'this is not valid JSON: ' + (e && e.message ? e.message : 'parse error') }; }
+      if (!doc || typeof doc !== 'object') {
+        return { why: 'this JSON is a single value, not a table. ' + shapes };
+      }
+
+      var names = [], body = [], i, k;
+      /* The first offending value wins and stops the walk. A file with a nested
+         object in it usually has one everywhere, so listing them all would be a
+         wall of text saying one thing. */
+      var bad = null;
+      var scalar = function (v, where) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'object') {
+          bad = bad || (where + ' holds ' + (Array.isArray(v) ? 'an array' : 'an object') +
+            ', and a column cannot. Flatten it before importing: a nested value has no column ' +
+            'name of its own, and inventing one would name a variable you never wrote.');
+          return '';
+        }
+        /* true/false are the one case worth a word: they arrive as a real type
+           and would stringify to "true", which types as categorical with two
+           levels. Coding them 1/0 makes them the numeric indicator they mean,
+           and an indicator is the form a model can use directly. */
+        if (typeof v === 'boolean') return v ? '1' : '0';
+        return String(v);
+      };
+
+      if (Array.isArray(doc)) {
+        if (!doc.length) return { why: 'this JSON is an empty array, so there is nothing to fit.' };
+        for (i = 0; i < doc.length; i++) {
+          if (!doc[i] || typeof doc[i] !== 'object' || Array.isArray(doc[i])) {
+            return { why: 'element ' + (i + 1) + ' of this array is not a row object. ' + shapes };
+          }
+        }
+        /* The union of the keys, in the order they are first seen. A row that
+           is missing a key is not an error, it is a missing value, which is
+           exactly what a partly filled export looks like. */
+        var seen = {};
+        for (i = 0; i < doc.length; i++) {
+          for (k in doc[i]) {
+            if (Object.prototype.hasOwnProperty.call(doc[i], k) && !seen[k]) { seen[k] = true; names.push(k); }
+          }
+        }
+        if (!names.length) return { why: 'the row objects in this JSON have no keys, so there are no columns.' };
+        for (i = 0; i < doc.length; i++) {
+          var row = [];
+          for (var j = 0; j < names.length; j++) {
+            row.push(scalar(doc[i][names[j]], 'row ' + (i + 1) + ', key "' + names[j] + '",'));
+            if (bad) return { why: bad };
+          }
+          body.push(row);
+        }
+        return { rows: [names].concat(body) };
+      }
+
+      /* An object of arrays. Ragged is rejected rather than padded: columns of
+         different lengths mean the file does not agree with itself about how
+         many observations there are, and padding would silently invent rows. */
+      var len = -1, lenOf = null;
+      for (k in doc) {
+        if (!Object.prototype.hasOwnProperty.call(doc, k)) continue;
+        if (!Array.isArray(doc[k])) {
+          return { why: 'the value of "' + k + '" is not an array, so it is not a column. ' + shapes };
+        }
+        if (len < 0) { len = doc[k].length; lenOf = k; }
+        else if (doc[k].length !== len) {
+          return { why: 'the columns have different lengths ("' + lenOf + '" has ' + len + ', "' + k +
+            '" has ' + doc[k].length + '), so the file does not agree with itself about how many ' +
+            'observations there are. Pad the short ones with null if those rows really are missing.' };
+        }
+        names.push(k);
+      }
+      if (!names.length) return { why: 'this JSON object has no keys, so there are no columns.' };
+      if (len <= 0) return { why: 'the columns in this JSON are empty, so there is nothing to fit.' };
+      for (i = 0; i < len; i++) {
+        var r2 = [];
+        for (var j2 = 0; j2 < names.length; j2++) {
+          r2.push(scalar(doc[names[j2]][i], 'column "' + names[j2] + '", position ' + (i + 1) + ','));
+          if (bad) return { why: bad };
+        }
+        body.push(r2);
+      }
+      return { rows: [names].concat(body) };
+    }
+
     function parseCSV(text) {
       var src = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
       if (!src.trim()) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
+      /* JSON first, and only when the text actually starts like JSON, so a CSV
+         is never handed to JSON.parse and a bracket in a header cannot send a
+         perfectly good file down the wrong path.
+
+         Text that LOOKS like JSON and cannot be used stops here with a reason,
+         instead of falling through to the CSV path. Falling through was the
+         first version and it was worse than an error: the delimiter guesser
+         cheerfully turns "[{" into column names, and the user gets a table of
+         garbage with zero rows rather than the sentence "this JSON is not a
+         shape I can read". */
+      if (/^\s*[[{]/.test(src)) {
+        var jr = jsonRows(src);
+        if (jr.rows) return typeRows(jr.rows, 'json');
+        return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [],
+          numeric: [], notes: [], error: jr.why };
+      }
       var firstNl = src.indexOf('\n');
       var delim = detectDelim(firstNl < 0 ? src : src.slice(0, firstNl));
       var rows = [], field = '', row = [], inQ = false, i;
@@ -5276,7 +5707,15 @@
       }
       row.push(field); rows.push(row);
       if (!rows.length) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
+      return typeRows(rows, 'csv');
+    }
 
+    /* Header plus body of string fields to typed columns. Split out of parseCSV
+       when JSON became a second input shape, so that both shapes share one
+       decision about what is numeric, what is categorical and what is missing.
+       `kind` only reaches the notes, where "column" beats "field" for JSON. */
+    function typeRows(rows, kind) {
+      var i;
       var header = rows[0].map(function (h, k) {
         var t = h.trim().replace(/^"|"$/g, '');
         /* A name that cannot be written in the model notation is useless, so
@@ -5292,7 +5731,11 @@
         if (orig && orig !== header[i]) notes.push('Column "' + orig + '" is available as ' + header[i] + '.');
       }
 
-      var body = rows.slice(1).filter(function (r) { return r.length > 1 || (r[0] || '').trim() !== ''; });
+      /* Blank lines are a CSV problem only. In JSON every row came from a real
+         object, so a one-column row whose only value is null is data (a missing
+         observation) and the CSV filter would throw it away. */
+      var body = kind === 'json' ? rows.slice(1)
+        : rows.slice(1).filter(function (r) { return r.length > 1 || (r[0] || '').trim() !== ''; });
       var numeric = header.map(function () { return true; });
       var levels = header.map(function () { return null; });
       for (i = 0; i < body.length; i++) {
@@ -5678,6 +6121,13 @@
               prob: msg.opts && msg.opts.prob, demo: data.columns });
           } catch (e) { pyerr = e && e.message ? e.message : String(e); }
 
+          /* The draws travel for the CSV export, thinned the same way and for
+             the same reason as the ones in the Python file. What travels is the
+             NUMBERS and not the finished text: the app offers a choice of scale,
+             and building both strings here would mean building the larger one
+             twice over for a button nobody may press. */
+          var qdr = thinSamples(samples, 2000);
+
           post({ type: 'progress', stage: 'shape', frac: 0.85 });
           /* No divergences here: quap has no sampler that could diverge, and the
              draws are exact draws from the reported Gaussian. */
@@ -5687,8 +6137,18 @@
           var pred = null;
           if (model.detNames.length) {
             var nd = model.detNames[model.detNames.length - 1];
-            var lk = linkNode(model, samples, nd, null, 400);
-            var sm = simOutcome(model, samples, null, 400, msg.opts && msg.opts.seed);
+            /* 2000 und nicht 400 (seit 2026-09-10). Die Zahl ist die Genauigkeit
+               der BAENDER, nicht die des Fits, und bei 400 Ziehungen war das
+               aeussere Band sichtbar ausgefranst: seine Enden sind Perzentile,
+               die Ziehung des Rauschens laeuft je Datenzeile unabhaengig, und
+               das Zittern von Zeile zu Zeile war groesser als die Linienbreite.
+               Das innere Band war davon nie betroffen, weil dort kein neues
+               Rauschen dazukommt, und genau diese Diskrepanz sah nach einem
+               Fehler aus. Die Zacken schrumpfen mit der Wurzel, also um etwa
+               2.2, und kosten ein paar Millisekunden. Ganz weg sind sie damit
+               nicht, und das ist richtig so: das Band ist eine Schaetzung. */
+            var lk = linkNode(model, samples, nd, null, 2000);
+            var sm = simOutcome(model, samples, null, 2000, msg.opts && msg.opts.seed);
             if (lk && sm) {
               pred = {
                 node: nd,
@@ -5711,7 +6171,7 @@
               waic: { WAIC: w.WAIC, lppd: w.lppd, pWAIC: w.pWAIC, n: w.n, se: w.se, parts: w.parts },
               psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK,
                 maxK: Math.max.apply(null, Array.from(ps.k)), parts: ps.parts },
-              python: pysrc, pythonError: pyerr,
+              python: pysrc, pythonError: pyerr, draws: qdr,
               messages: fit.messages, names: model.displayNames, links: fit.links,
               slotGroup: model.slotGroup, nonCentred: model.nonCentred,
               nObs: model.nObs, nDropped: model.nDropped, rows: model.rows,
@@ -5809,6 +6269,15 @@
                 prob: msg.opts && msg.opts.prob, demo: mcols });
           } catch (e) { pyerr = e && e.message ? e.message : String(e); }
 
+          /* The same draws again for the CSV export, and thinned by a different
+             function than the block above on purpose: the Python file has no
+             notion of chains and takes an even sweep over the pooled draws,
+             while the CSV carries a chain column and therefore has to thin
+             PER chain or that column would come out ragged. Two callers, two
+             requirements, and the Python path is verified against real numpy,
+             so it keeps the code it was verified with. */
+          var mdr = thinSamples(msamples, 2000);
+
           post({ type: 'progress', stage: 'shape', frac: 0.85 });
           /* The divergence flags have to be concatenated in exactly the order
              chainsToSamples walks the chains, or the marked points land on
@@ -5824,8 +6293,11 @@
           var mpred = null;
           if (mmodel.detNames.length) {
             var mnd = mmodel.detNames[mmodel.detNames.length - 1];
-            var mlk = linkNode(mmodel, msamples, mnd, null, 400);
-            var msm = simOutcome(mmodel, msamples, null, 400, msg.opts && msg.opts.seed);
+            /* Dieselben 2000 wie im quap-Pfad, aus demselben Grund. Die beiden
+               Modi muessen hier gleich genau sein, sonst waere ein Band im
+               NUTS-Reiter zackiger als dasselbe Band daneben. */
+            var mlk = linkNode(mmodel, msamples, mnd, null, 2000);
+            var msm = simOutcome(mmodel, msamples, null, 2000, msg.opts && msg.opts.seed);
             if (mlk && msm) {
               mpred = {
                 node: mnd,
@@ -5854,7 +6326,7 @@
                 parts: mw.parts },
               psis: { PSIS: mps.PSIS, se: mps.se, nBadK: mps.nBadK,
                 maxK: Math.max.apply(null, Array.from(mps.k)), parts: mps.parts },
-              python: pysrc, pythonError: pyerr,
+              python: pysrc, pythonError: pyerr, draws: mdr,
               messages: mmsgs, names: mmodel.displayNames,
               slotGroup: mmodel.slotGroup, nonCentred: mmodel.nonCentred,
               links: mmodel.params.map(function (pp) { return pp.linkName; }),
@@ -5921,6 +6393,10 @@
       pyExpr: pyExpr, pyInvLink: pyInvLink, toPython: toPython,
       PYFUNCS: PYFUNCS, PYRNG: PYRNG,
       parseCSV: parseCSV, detectDelim: detectDelim, describeColumns: describeColumns,
+      jsonRows: jsonRows, typeRows: typeRows,
+      drawsCSV: drawsCSV, thinSamples: thinSamples,
+      serializeSession: serializeSession, parseSession: parseSession,
+      SESSION_KIND: SESSION_KIND, SESSION_VERSION: SESSION_VERSION,
       exampleData: exampleData, EXAMPLES: EXAMPLES,
       rbinom1: rbinom1, rpois1: rpois1,
       runJob: runJob, workerMain: workerMain
@@ -6172,6 +6648,124 @@
       return levels.slice(0, max).join(', ') + ', and ' + (levels.length - max) + ' more';
     }
 
+    /* ---- Das Diagramm des Reiters herausholen ----
+
+       Sucht die SVGs im Reiterinhalt, statt sie sich geben zu lassen. Das ist
+       die unuebliche Richtung und hier die richtige: es gibt drei
+       Diagrammreiter, einer davon (die Traces) enthaelt beliebig viele Plots,
+       und die Alternative waere derselbe Knopf in jeder Komponente plus ein
+       Weg, das jeweilige Element nach oben zu reichen.
+
+       Der Zaehler laeuft ueber ein Layouteffekt und nicht ueber den Render, weil
+       zum Renderzeitpunkt der Panelinhalt des NEUEN Reiters noch nicht steht:
+       gezaehlt wuerde der alte, und die Leiste waere immer einen Reiter im
+       Rueckstand. */
+    function PlotSaveBar({ panelRef, tab, baseName }) {
+      const [plots, setPlots] = useState(0);
+      /* Vorgabe: mit Flaeche. Der Grund steht bei svgSource, kurz: diese Plots
+         zeichnen im dunklen Skin hell, und durchsichtig auf Weiss ist dann
+         nicht zu lesen. */
+      const [transparent, setTransparent] = useState(false);
+      React.useLayoutEffect(() => {
+        const el = panelRef.current;
+        setPlots(el ? el.querySelectorAll('svg.qp-plot').length : 0);
+      }, [panelRef, tab]);
+      if (!plots) return null;
+
+      const save = () => {
+        const el = panelRef.current;
+        if (!el) return;
+        const svgs = el.querySelectorAll('svg.qp-plot');
+        if (!svgs.length) return;
+        /* Bei mehreren Diagrammen im Reiter (die Traces) je eine Datei,
+           durchnummeriert. Ein zusammengesetztes Bild waere die andere
+           Moeglichkeit, aber die Traces sind untereinander gestapelte
+           Einzelbilder und kein Gitter, und wer sie in Folien legt, legt
+           ohnehin eine davon. */
+        for (let i = 0; i < svgs.length; i++) {
+          const suffix = svgs.length > 1 ? '-' + (i + 1) : '';
+          download(svgSource(svgs[i], { transparent: transparent }),
+            baseName() + '-' + tab + suffix + '.svg', 'image/svg+xml');
+        }
+      };
+
+      return html`
+        <div className="qp-chips" style=${{ marginTop: 12 }}>
+          <button className="tool-btn tool-btn-sm" onClick=${save}>
+            ${ToolIcons.el('download')} ${plots > 1 ? 'Save ' + plots + ' plots (SVG)' : 'Save plot (SVG)'}
+          </button>
+          <!-- Der Hintergrund als segmentierte Wahl und nicht als Haken: es
+               sind zwei Zustaende, die beide einen Namen verdienen, und
+               "transparent" als Haken laesst offen, was der andere Fall ist. -->
+          <div className="seg-row">
+            ${[[false, 'on a background'], [true, 'transparent']].map(([v, l]) => html`
+              <button key=${l} className=${'lang-seg' + (transparent === v ? ' active' : '')}
+                onClick=${() => setTransparent(v)}>${l}</button>`)}
+          </div>
+          <${Lead} label="the SVG file" style=${{ margin: 0 }} help=${html`
+            <p>Vector, so it stays sharp at any size, and the text in it stays text. Every drawing
+              program and every document format reads SVG; Inkscape or a browser will turn it into a
+              PNG if something insists on pixels.</p>
+            <p>The colors are baked in from the theme that is active right now, because the plots
+              draw in the page's CSS variables and a file without them would come out black on
+              black. To export the light version, switch the theme and click again.</p>
+            <p>An SVG is transparent by nature, which is what you want when it goes into a document
+              that has a background of its own. The catch is that these plots draw light on dark:
+              the axes and the labels are pale, so a transparent export of the dark theme is nearly
+              invisible on white paper. Hence the default, and hence the choice. Exporting the light
+              theme transparent is safe.</p>`}>
+            ${plots > 1 ? 'One file per plot, in the current theme.' : 'Vector, in the current theme.'}
+          <//>
+        </div>`;
+    }
+
+    /* ---- Sitzung speichern und laden ----
+
+       Eigene Komponente wegen des versteckten file-Inputs: der braucht ein ref
+       und damit einen eigenen Zustand, und den in App() zu legen hiesse, ihn
+       neben fuenfzehn andere Dinge zu legen, mit denen er nichts zu tun hat. */
+    function SessionBar({ onSave, onLoad, nModels }) {
+      const fileRef = useRef(null);
+      return html`
+        <${React.Fragment}>
+          <div className="qp-chips">
+            <button className="tool-btn tool-btn-sm" onClick=${onSave}>
+              ${ToolIcons.el('download')} Save session
+            </button>
+            <button className="tool-btn tool-btn-sm"
+              onClick=${() => fileRef.current && fileRef.current.click()}>
+              ${ToolIcons.el('upload')} Load session
+            </button>
+            <input ref=${fileRef} type="file" accept=".json,application/json"
+              style=${{ display: 'none' }}
+              onChange=${(e) => {
+                const f = e.target.files && e.target.files[0];
+                /* Der Input wird sofort geleert, sonst loest dieselbe Datei
+                   ein zweites Mal kein change-Ereignis aus und "nochmal laden"
+                   tut wortlos nichts. */
+                e.target.value = '';
+                if (!f) return;
+                const r = new FileReader();
+                r.onload = () => onLoad(String(r.result));
+                r.readAsText(f);
+              }} />
+          </div>
+          <${Lead} label="the session file" style=${{ margin: '8px 0 0' }} help=${html`
+            <p>A JSON file with the model text of ${nModels === 1 ? 'the model' : 'all ' + nModels +
+              ' models'}, the data, and the settings the fit runs under. It is the only way anything
+              here survives a reload: this page writes nothing to your browser storage, so a refresh
+              starts empty.</p>
+            <p>The results are deliberately not in it. Loading a session gives you the models and the
+              data back, unfitted, and you press Fit. A stored posterior would be a number that can
+              quietly disagree with the model text printed next to it, and refitting costs
+              milliseconds in the quadratic mode.</p>
+            <p>The file is plain JSON and small enough to read. If you edit it by hand, the tool
+              checks every field on the way back in and says what it did not like.</p>`}>
+            Models, data and settings as a file. Results are not stored: a loaded session is refitted.
+          <//>
+        <//>`;
+    }
+
     /* ---- the data panel ---- */
     function DataPanel({ csv, setCsv, data, onExample }) {
       const [over, setOver] = useState(false);
@@ -6191,7 +6785,7 @@
             <p className="ctl-sec-h">Data</p>
             <div className="qp-chips" style=${{ marginBottom: 8 }}>
               <button className="tool-btn tool-btn-sm" onClick=${() => fileRef.current && fileRef.current.click()}>
-                ${ToolIcons.el('upload')} Load CSV
+                ${ToolIcons.el('upload')} Load data
               </button>
               <!-- Ein select und kein Chip je Beispiel: es sind fuenf, und sie
                    waeren eine zweite Zeile Knoepfe neben denen, die etwas TUN.
@@ -6206,7 +6800,8 @@
               <button className="tool-btn tool-btn-sm tool-danger" onClick=${() => setCsv('')}>
                 ${ToolIcons.el('remove')} Clear
               </button>
-              <input ref=${fileRef} type="file" accept=".csv,.txt,text/csv" style=${{ display: 'none' }}
+              <input ref=${fileRef} type="file" accept=".csv,.tsv,.txt,.json,text/csv,application/json"
+                style=${{ display: 'none' }}
                 onChange=${(e) => { const f = e.target.files && e.target.files[0]; if (f) readFile(f); e.target.value = ''; }} />
             </div>
             <div className=${'qp-drop' + (over ? ' qp-over' : '')}
@@ -6217,10 +6812,32 @@
                 const f = e.dataTransfer.files && e.dataTransfer.files[0];
                 if (f) readFile(f);
               }}>
-              Drop a CSV here, or paste one below. It stays in this browser tab.
+              Drop a CSV or JSON file here, or paste one below. It stays in this browser tab.
             </div>
             <textarea className="qp-mono qp-csv" style=${{ marginTop: 8 }} spellCheck=${false}
               placeholder="x,y" value=${csv} onChange=${(e) => setCsv(e.target.value)}></textarea>
+            <!-- Ein JSON, das nicht zu lesen war, sagt hier warum. Direkt unter
+                 dem Feld und nicht im grossen Fehlerkasten der Seite: der
+                 gehoert dem Fit, und dieser Fehler entsteht beim Tippen. -->
+            ${data && data.error ? html`
+              <div style=${{ marginTop: 8 }}><${Msg} kind="err">${data.error}<//></div>` : null}
+            ${!(data && data.error) ? html`
+              <${Lead} label="the data formats" style=${{ margin: '8px 0 0' }} help=${html`
+                <p>CSV with a comma, a semicolon, a tab or a pipe as the separator, detected from the
+                  first line. Quoted fields are understood, so a comma inside a value is safe. A
+                  column pasted straight out of a spreadsheet arrives tab separated and works as is.</p>
+                <p>JSON in either of the two shapes a script hands you without being asked: an array
+                  of row objects, <code>[{"x":1,"y":2}, ...]</code>, or an object of equally long
+                  columns, <code>{"x":[1,2],"y":[3,4]}</code>. Nested values are refused rather than
+                  flattened, because a flattened name is a variable you never wrote. true and false
+                  become 1 and 0.</p>
+                <p>Empty, <code>NA</code>, <code>NaN</code>, <code>null</code> and a missing JSON key
+                  all count as missing. Missing values are kept here and dropped per model, for the
+                  columns that model actually uses.</p>
+                <p>A text column becomes an index: the levels are numbered in the order they first
+                  appear, which is what <code>a[group]</code> in a model needs.</p>`}>
+                CSV or JSON, both pasted or dropped.
+              <//>` : null}
           </div>
           ${cols.length ? html`
             <div className="ctl-sec">
@@ -7147,7 +7764,9 @@
       }
       const n = Math.min(x.length, pred.link.mean.length);
       const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => x[a] - x[b]);
-      const W = 560, H = 330, pad = 42;
+      /* pad traegt jetzt die Zahlen UND den gedrehten Achsentitel daneben, also
+         ein paar Pixel mehr als die 42, die fuer die Zahlen allein reichten. */
+      const W = 560, H = 330, pad = 54;
       let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
       for (let i = 0; i < n; i++) {
         xlo = Math.min(xlo, x[i]); xhi = Math.max(xhi, x[i]);
@@ -7211,7 +7830,15 @@
                   fill="var(--tool-note)">${t.s}</text>
               <//>`)}
             <text x=${(W + pad) / 2} y=${H - 10} textAnchor="middle" fontSize="12" fill="var(--tool-label)">${xname}</text>
-            <text x=${12} y=${16} fontSize="12" fill="var(--tool-label)">${outcome}</text>
+            <!-- Der Titel der y-Achse steht gedreht NEBEN ihr und nicht mehr
+                 waagerecht darueber: dort lag er auf der Achse und auf dem
+                 obersten Tick, und bei einem langen Namen ("weight_kg") lief
+                 er in die Zeichenflaeche hinein. Gedreht ist ausserdem die
+                 Konvention, an der ein Leser den Achsentitel als solchen
+                 erkennt. -->
+            <text x=${14} y=${(H - pad + 12) / 2} textAnchor="middle" fontSize="12"
+              fill="var(--tool-label)"
+              transform=${'rotate(-90 14 ' + ((H - pad + 12) / 2) + ')'}>${outcome}</text>
           </svg>
           <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
             Circles are the observed data. The dark band is the uncertainty in ${pred.node} itself, the
@@ -7220,6 +7847,70 @@
             model that is too sure of itself.
           </p>
         <//>`;
+    }
+
+    /* ---- Herunterladen ----
+
+       Eine Stelle fuer den Blob-Tanz, den vier Knoepfe brauchen. Der Link muss
+       wirklich im Dokument haengen, damit der Klick in jedem Browser zaehlt,
+       und die URL wird sofort wieder freigegeben, sonst haelt jeder Download
+       seine Kopie im Speicher bis zum Reload. */
+    function download(text, filename, mime) {
+      const blob = new Blob([text], { type: mime || 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    /* Ein Diagramm als SVG, so wie es auf dem Bildschirm steht.
+
+       Der Haken ist, dass auf dem Bildschirm fast keine Farbe im SVG selbst
+       steht: die Plots hier zeichnen in var(--tool-*), und die Variablen leben
+       im Stylesheet der Seite. Eine herausgeschnittene Datei waere deshalb
+       schwarz auf schwarz. Also werden die benutzten Variablen am Wurzelknoten
+       als konkrete Werte eingesetzt, aus dem GERADE aktiven Skin, was auch die
+       ehrliche Lesart von "so wie es dasteht" ist: wer das helle Thema
+       exportieren will, schaltet um und klickt erneut.
+
+       Nur die Variablen, die das Dokument wirklich kennt, und nur auf dem
+       Wurzelelement: eine Regel je Element waere kuerzer zu schreiben und
+       wuerde die Vererbung zerschneiden, an der die Plots haengen.
+
+       Der Hintergrund ist eine Wahl und keine Vorgabe, weil beide Faelle echt
+       sind und sich nicht versoehnen lassen. Ein SVG ist von sich aus
+       durchsichtig, was richtig ist, wenn es in ein Dokument mit eigenem
+       Hintergrund wandert. Nur zeichnen diese Plots hell auf dunkel: Achsen in
+       --tool-border, Beschriftungen in --tool-note, beides hell. Durchsichtig
+       auf weissem Papier ist damit hellgrau auf weiss und praktisch nicht zu
+       lesen. Also: mit Flaeche als Vorgabe, weil sie im dunklen Skin das
+       Ergebnis ueberhaupt sichtbar haelt, und ohne auf Wunsch. Wer den hellen
+       Skin exportiert, kann die Flaeche gefahrlos weglassen. */
+    function svgSource(svg, opts) {
+      const clone = svg.cloneNode(true);
+      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      const cs = getComputedStyle(document.documentElement);
+      /* Die Namen aus dem Markup einsammeln, statt eine Liste zu pflegen, die
+         beim naechsten neuen Plot veraltet ist. */
+      const names = new Set();
+      const re = /var\((--[a-z0-9-]+)\)/g;
+      let m;
+      while ((m = re.exec(clone.outerHTML)) !== null) names.add(m[1]);
+      let decl = '';
+      names.forEach((n) => {
+        const v = cs.getPropertyValue(n).trim();
+        if (v) decl += n + ':' + v + ';';
+      });
+      if (decl) clone.setAttribute('style', decl);
+      let src = clone.outerHTML;
+      if (!(opts && opts.transparent)) {
+        const bg = cs.getPropertyValue('--tool-surface').trim()
+          || cs.getPropertyValue('--pico-background-color').trim() || '#fff';
+        /* Als erstes Kind, damit die Flaeche HINTER dem Diagramm liegt. */
+        src = src.replace(/(<svg[^>]*>)/, '$1<rect width="100%" height="100%" fill="' + bg + '"/>');
+      }
+      return '<?xml version="1.0" encoding="UTF-8"?>\n' + src + '\n';
     }
 
     /* ---- the app ---- */
@@ -7428,7 +8119,13 @@
          also genau bei dem, was der Nutzer ohnehin eingestellt hat. Bei quap
          ist die Frage ohnehin akademisch, dort dauert ein Fit Millisekunden. */
       const runThese = useCallback((which) => {
-        if (!data || !data.n) { setErr({ message: 'Load or paste a CSV first.' }); return; }
+        if (!data || !data.n) {
+          /* Steht ein Grund im Datenpaneel, dann ist es nicht "keine Daten",
+             sondern "diese Daten waren unlesbar", und der Grund ist die
+             nuetzlichere Meldung. */
+          setErr({ message: (data && data.error) || 'Load or paste some data first, as CSV or JSON.' });
+          return;
+        }
         const list = which.map((i) => models[i]).filter(Boolean);
         if (!list.length) return;
         setErr(null);
@@ -7499,19 +8196,80 @@
         return RTH.compareFits(fits, cmpCrit);
       }, [models, cmpCrit]);
 
-      /* Das Python-Skript liegt schon im Ergebnis, erzeugt im Worker, wo das
-         compilierte Modell lebt. Hier bleibt nur der Download. */
+      /* Der Reiterinhalt, damit die Speicherleiste darunter das Diagramm
+         darin finden kann, ohne dass jede Diagrammkomponente davon weiss. */
+      const panelRef = useRef(null);
+
+      /* Der Modellname als Dateiname: Kleinbuchstaben, alles andere zu
+         Unterstrichen. Alle Downloads teilen ihn, damit die Dateien im Ordner
+         erkennbar zusammengehoeren. */
+      const baseName = useCallback(() => (
+        (models[active] ? models[active].name : 'model')
+          .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'model'
+      ), [models, active]);
+
       const downloadPython = useCallback(() => {
         if (!res || !res.python) return;
-        const name = (models[active] ? models[active].name : 'model')
-          .toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'model';
-        const blob = new Blob([res.python], { type: 'text/x-python' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = name + '.py';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, [res, models, active]);
+        download(res.python, baseName() + '.py', 'text/x-python');
+      }, [res, baseName]);
+
+      /* Die Sitzung als Datei. Bewusst OHNE Ergebnisse, siehe den Kommentar
+         am Serialisierer: ein gespeichertes Ergebnis kann dem Modelltext
+         daneben widersprechen. */
+      const saveSession = useCallback(() => {
+        const txt = RTH.serializeSession({
+          csv: csv,
+          models: models.map((m) => ({ name: m.rawName, src: m.src })),
+          active: active, mode: mode, prob: prob, draws: draws,
+          nChains: nChains, nIter: nIter, adaptDelta: adaptDelta,
+          nonCentred: nonCentred, cmpCrit: cmpCrit
+        });
+        download(txt, baseName() + '.quaplab.json', 'application/json');
+      }, [csv, models, active, mode, prob, draws, nChains, nIter, adaptDelta,
+        nonCentred, cmpCrit, baseName]);
+
+      /* Und zurueck. Ein Fehler landet im normalen Fehlerkasten, weil das die
+         Stelle ist, an der der Nutzer ohnehin nach Fehlern sucht.
+
+         Die Ergebnisse aller Modelle fallen weg, auch die des aktiven: nichts
+         von dem, was hier ankommt, wurde mit diesen Einstellungen gefittet. */
+      const loadSession = useCallback((text) => {
+        const out = RTH.parseSession(text, { prob, draws, nChains, nIter, adaptDelta });
+        if (!out.session) { setErr({ message: 'This session could not be read: ' + out.why }); return; }
+        const s = out.session;
+        /* Eine geladene Sitzung mit Beanstandungen wird geladen UND gemeldet.
+           Der Kasten ist derselbe, den ein Fitfehler benutzt, nur ohne
+           Fehlerzeile darin: sonst waere ein Tippfehler in der Datei
+           vollkommen still, was er bis 2026-09-10 war. */
+        setErr(s.warnings && s.warnings.length
+          ? { kind: 'warn',
+            message: 'This session was loaded, with ' + (s.warnings.length === 1
+              ? 'one thing worth mentioning:' : s.warnings.length + ' things worth mentioning:'),
+            messages: s.warnings.map((w) => ({ kind: 'warn', text: w })) }
+          : null);
+        setRes(null);
+        setBusy(null);
+        setCsv(s.csv);
+        setMode(s.mode); setProb(s.prob); setDraws(s.draws);
+        setNChains(s.nChains); setNIter(s.nIter); setAdaptDelta(s.adaptDelta);
+        setNonCentred(s.nonCentred); setCmpCrit(s.cmpCrit);
+        /* Erst das aktive Modell, dann die anderen, in derselben Aufteilung,
+           die `models` oben wieder zusammensetzt. */
+        setModel(s.models[s.active].src);
+        setActive(s.active);
+        setOthers(s.models.filter((m, i) => i !== s.active)
+          .map((m) => ({ name: m.name, src: m.src, res: null })));
+        setTab('precis');
+      }, [prob, draws, nChains, nIter, adaptDelta]);
+
+      /* Die Ziehungen als CSV. Erzeugt erst beim Klick: der Text ist bei
+         2000 Ziehungen und vielen Parametern ein paar Megabyte, und die
+         Zahlen dafuer liegen ohnehin schon da. */
+      const downloadDraws = useCallback((scale) => {
+        if (!res || !res.draws) return;
+        const txt = RTH.drawsCSV(res.draws, { scale: scale });
+        download(txt, baseName() + (scale === 'raw' ? '-draws-fitted' : '-draws') + '.csv', 'text/csv');
+      }, [res, baseName]);
 
       const copyPrecis = useCallback(() => {
         if (!res) return;
@@ -7565,7 +8323,7 @@
         <div className="container">
           <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-text)', marginBottom: 8 }}>Quap Lab</h1>
           <p style=${{ color: 'var(--tool-label)', maxWidth: '70ch' }}>
-            Write a Bayesian model the way you would write it on paper, paste a CSV, and fit it, either
+            Write a Bayesian model the way you would write it on paper, paste your data, and fit it, either
             by a Gaussian at the posterior mode or by Hamiltonian Monte Carlo.
           </p>
           <!-- Die Zuschreibung steht OBEN und nicht nur in der Fusszeile. Der
@@ -7775,12 +8533,25 @@
                     </span>` : null}
                 </div>
               </div>
+              <!-- Die Sitzung. Eigene Sektion und nicht in der Fitleiste, weil
+                   das hier nichts rechnet: es ist der Griff nach dem, was ein
+                   Reload sonst wegwirft. Ganz unten, weil man erst speichert,
+                   wenn etwas da ist, das sich zu speichern lohnt. -->
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Session</p>
+                <${SessionBar} onSave=${saveSession} onLoad=${loadSession}
+                  nModels=${models.length} />
+              </div>
             </div>
           </div>
 
           ${err ? html`
             <div style=${{ marginTop: 14 }}>
-              <${Msg} kind="err">
+              <!-- Vorgabe "err", denn das ist dieser Kasten in fast allen
+                   Faellen. Eine geladene Sitzung mit Beanstandungen benutzt
+                   denselben Platz und setzt kind selbst: sie ist geladen, also
+                   waere Rot eine Luege ueber das, was gerade passiert ist. -->
+              <${Msg} kind=${err.kind || 'err'}>
                 ${err.line ? html`<strong>Line ${err.line}: </strong>` : null}${err.message}
               <//>
               ${(err.messages || []).map((m, i) => html`
@@ -7803,7 +8574,7 @@
                    dort .qp-plot mitbrachte; die Tabellenreiter standen nackt
                    auf der Seite und die Leiste sass ueber dem Nichts. Hier
                    gesetzt, gilt er fuer jeden Reiter, auch fuer einen neuen. -->
-              <div className="qp-panel">
+              <div className="qp-panel" ref=${panelRef}>
               ${tab === 'precis' ? html`
                 <${React.Fragment}>
                   <${PrecisTable} precis=${res.precis} links=${res.links} grid=${res.grid} />
@@ -7872,6 +8643,7 @@
 
               ${tab === 'py' ? html`
                 <${React.Fragment}>
+                  <div className="qp-exsec">
                   ${res.python ? html`
                     <${React.Fragment}>
                       <div className="qp-chips" style=${{ marginBottom: 12 }}>
@@ -7918,6 +8690,53 @@
                     : html`<${Msg} kind="warn">
                         This fit could not be exported as Python${res.pythonError ? ': ' + res.pythonError : '.'}
                       <//>`}
+                  </div>
+
+                  <!-- Die Ziehungen. Zweiter Abschnitt und kein eigener Reiter:
+                       es ist dieselbe Frage ("wie kommt das hier raus"), nur die
+                       andere Antwort, und ein Reiter mit zwei Knoepfen darin
+                       waere ein Reiter zu viel. -->
+                  ${res.draws ? html`
+                    <div className="qp-exsec">
+                      <div className="qp-chips" style=${{ marginBottom: 12 }}>
+                        <button className="tool-btn" onClick=${() => downloadDraws('natural')}>
+                          ${ToolIcons.el('download')} Download draws (CSV)
+                        </button>
+                        <!-- Dieselbe Groesse wie der Knopf links: es sind zwei
+                             gleichrangige Downloads derselben Ziehungen, und
+                             ein kleinerer Zwilling daneben sah nach einer
+                             Nebensache aus, die er nicht ist. -->
+                        <button className="tool-btn" onClick=${() => downloadDraws('raw')}>
+                          ${ToolIcons.el('download')} On the fitted scale
+                        </button>
+                        <span style=${{ fontSize: 12, color: 'var(--tool-note)' }}>
+                          ${res.draws.S} draws, ${res.draws.P} parameter${res.draws.P === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                      <${Lead} label="the draws file" style=${{ marginTop: 0 }} help=${html`
+                        <p>One row per draw, one column per parameter, in the units you named them in:
+                          sigma, not log(sigma). This is the form every other tool reads, so it is the
+                          way out to R, to pandas, to ArviZ (<code>az.from_dict</code> over the
+                          columns) or to a spreadsheet, none of which need to know this page
+                          exists.</p>
+                        <p>The second button writes the same draws on the scale the sampler moved in,
+                          where a bounded parameter lives as its log or its logit. That is the scale
+                          Rhat and the effective sample sizes are statements about, so it is the one
+                          to use for checking convergence elsewhere, and the wrong one for reporting a
+                          number.</p>
+                        <p>${isNuts
+                          ? 'A chain and a draw column come first, because a table of draws with the '
+                            + 'chain structure thrown away cannot be checked for convergence by '
+                            + 'anyone. Thinned to at most 2000 draws, evenly and per chain.'
+                          : 'No chain column: a quadratic fit has no chains. These are independent '
+                            + 'draws from the fitted Gaussian, so any subset of them is as good as '
+                            + 'any other.'}</p>
+                        <p>Written with full precision, so reading the file back changes no digit.</p>`}>
+                        ${isNuts
+                          ? 'One row per draw, chain and draw index included, in natural units.'
+                          : 'One row per draw, one column per parameter, in natural units.'}
+                      <//>
+                    </div>` : null}
                 <//>` : null}
 
               ${tab === 'ic' ? html`
@@ -7964,6 +8783,13 @@
                     <//>` : null}
                 <//>` : null}
               </div>
+              <!-- Die Bilder herausholen. Eine Leiste fuer jeden Reiter, die
+                   sich selbst versteckt, wenn in dem Reiter kein Diagramm
+                   steht: das ist der Grund, warum sie NACH dem Panel steht und
+                   dessen Inhalt abfragt, statt in jeder der drei
+                   Diagrammkomponenten einzeln zu sitzen. Ein neuer Plot bekommt
+                   den Knopf dadurch von allein. -->
+              <${PlotSaveBar} panelRef=${panelRef} tab=${tab} baseName=${baseName} />
             </div>` : null}
 
           <details className="fold" style=${{ marginTop: 26 }}>
