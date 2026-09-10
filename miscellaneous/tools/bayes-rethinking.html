@@ -4322,6 +4322,81 @@
       return out;
     }
 
+    /* Die Dichte eines Stapels Werte, als halbe Breite je Rasterzeile.
+
+       Das Gegenstueck zu beeswarm() fuer grosse Datensaetze. Ab einigen
+       tausend Punkten je Stufe hat ein Schwarm keinen Platz mehr: die
+       Zeichenflaeche fasst bei 6 Pixeln Mindestabstand rund siebenhundert
+       Punkte, alles darueber stapelt sich am Rand und ueberlappt. Zugleich
+       kippt das Argument gegen eine Dichte. Bei zwanzig Punkten zeichnet eine
+       Kerndichte vor allem ihre eigene Bandbreite, bei zwanzigtausend ist sie
+       exzellent gestuetzt, und dann ist sie die ehrlichere Darstellung: der
+       Schwarm behauptet, jeder Punkt sei einzeln sichtbar, obwohl er es
+       laengst nicht mehr ist.
+
+       Histogramm mit Glaettung statt echter KDE. Bei 128 Feldern ueber
+       zwanzigtausend Punkte ist der Unterschied unsichtbar, das Verfahren
+       hat keine Bandbreite, ueber die sich streiten laesst, und es ist in
+       einem Satz pruefbar. Geglaettet wird mit dem Kern 1-2-1, mehrfach
+       angewandt: das ist ein Binomialfilter und laeuft gegen eine Gausssche
+       Glocke, ohne dass eine gerechnet werden muss.
+
+       Normiert wird JE STUFE auf dieselbe Maximalbreite. Damit ist die FORM
+       zweier Kategorien vergleichbar, auch wenn eine dreihundert und die
+       andere neunzigtausend Zeilen hat, und das ist bei unbalancierten Daten
+       die interessantere Frage als die Haeufigkeit. Die Zahl der Zeilen geht
+       dabei verloren, deshalb nennt der Plot sie daneben. */
+    /* Das Maximum einer Spalte, die so lang ist wie der Datensatz.
+
+       Stand bis 2026-09-11 zweimal als Math.max.apply(null, Array.from(k))
+       da und war bei grossen Daten ein Absturz statt einer Zahl: apply legt
+       JEDEN Eintrag als eigenes Argument auf den Stack, und der ist nach
+       einigen zehntausend voll. Die Grenze haengt an Browser und
+       Aufruftiefe, weshalb der Fehler ausgerechnet dort auftauchte, wo er
+       am teuersten ist, naemlich nach Minuten Rechenzeit im Worker.
+       Pareto-k hat einen Eintrag je Beobachtung, also faellt das genau bei
+       den Datensaetzen an, bei denen PSIS ohnehin lange braucht. */
+    function maxOf(a) {
+      var m = -Infinity;
+      for (var i = 0; i < a.length; i++) if (a[i] > m) m = a[i];
+      return m;
+    }
+
+    function violinShape(ys, lo, hi, opts) {
+      opts = opts || {};
+      var bins = opts.bins || 128;
+      var passes = opts.passes != null ? opts.passes : 4;
+      if (!(hi > lo) || !(bins > 2)) return null;
+      var h = new Float64Array(bins);
+      var inv = bins / (hi - lo);
+      var n = 0, i;
+      for (i = 0; i < ys.length; i++) {
+        var v = ys[i];
+        if (!(v >= lo && v <= hi)) continue;
+        var b = (v - lo) * inv | 0;
+        if (b >= bins) b = bins - 1;
+        h[b]++; n++;
+      }
+      if (!n) return null;
+      /* Der Rand wird gespiegelt statt mit Null aufgefuellt. Sonst zieht die
+         Glaettung die Dichte an beiden Enden nach unten und die Violine
+         laeuft spitz aus, wo die Daten in Wahrheit hart aufhoeren. */
+      var a = h, b2 = new Float64Array(bins), p, t;
+      for (p = 0; p < passes; p++) {
+        for (i = 0; i < bins; i++) {
+          var l = i > 0 ? a[i - 1] : a[0];
+          var r = i < bins - 1 ? a[i + 1] : a[bins - 1];
+          b2[i] = (l + 2 * a[i] + r) / 4;
+        }
+        t = a; a = b2; b2 = t;
+      }
+      var mx = 0;
+      for (i = 0; i < bins; i++) if (a[i] > mx) mx = a[i];
+      var w = new Float64Array(bins);
+      if (mx > 0) for (i = 0; i < bins; i++) w[i] = a[i] / mx;
+      return { w: w, n: n, bins: bins, lo: lo, hi: hi };
+    }
+
     /* The whole pairs figure, computed once in the worker.
 
        The parameter cap is a display decision, not a numerical one: a triangle
@@ -7309,7 +7384,7 @@
                 quapMean: g.quapMean, quapLo: g.quapLo, quapHi: g.quapHi }; }),
               waic: { WAIC: w.WAIC, lppd: w.lppd, pWAIC: w.pWAIC, n: w.n, se: w.se, parts: w.parts },
               psis: { PSIS: ps.PSIS, se: ps.se, nBadK: ps.nBadK,
-                maxK: Math.max.apply(null, Array.from(ps.k)), parts: ps.parts },
+                maxK: maxOf(ps.k), parts: ps.parts },
               python: pysrc, pythonError: pyerr, draws: qdr,
               messages: fit.messages, names: model.displayNames, links: fit.links,
               slotGroup: model.slotGroup, nonCentred: model.nonCentred,
@@ -7450,7 +7525,7 @@
               waic: { WAIC: mw.WAIC, lppd: mw.lppd, pWAIC: mw.pWAIC, n: mw.n, se: mw.se,
                 parts: mw.parts },
               psis: { PSIS: mps.PSIS, se: mps.se, nBadK: mps.nBadK,
-                maxK: Math.max.apply(null, Array.from(mps.k)), parts: mps.parts },
+                maxK: maxOf(mps.k), parts: mps.parts },
               python: pysrc, pythonError: pyerr, draws: mdr,
               messages: mmsgs, names: mmodel.displayNames,
               slotGroup: mmodel.slotGroup, nonCentred: mmodel.nonCentred,
@@ -7509,7 +7584,8 @@
       chainsToSamples: chainsToSamples, paramChains: paramChains, precisNuts: precisNuts,
       sampleCor: sampleCor, samplerDiagnostics: samplerDiagnostics, traceSeries: traceSeries,
       blurGrid: blurGrid, densRange: densRange, marginalDensity: marginalDensity,
-      roundToRange: roundToRange, beeswarm: beeswarm,
+      roundToRange: roundToRange, beeswarm: beeswarm, violinShape: violinShape,
+      maxOf: maxOf,
       jointDensity: jointDensity, hpdLevels: hpdLevels, pairsFigure: pairsFigure,
       posteriorCor: posteriorCor, gridCheck: gridCheck,
       linkNode: linkNode, levelDraws: levelDraws,
@@ -9356,25 +9432,99 @@
          Eindruck erweckt, er reiche in die Nachbarkategorie hinein. Bei einer
          einzelnen Stufe gibt es keinen Abstand, aus dem sich das ableiten
          liesse, und dann setzt die halbe Zeichenflaeche die Grenze. */
-      let swarm = null;
+      /* Schwarm oder Violine, entschieden an der Zahl der Zeilen.
+
+         Die Grenze ist eine Platzfrage und keine statistische. Die
+         Zeichenflaeche fasst bei 6 Pixeln Mindestabstand und der erlaubten
+         Breite rund siebenhundert Punkte je Stufe; ab etwa dem Dreifachen
+         sitzt so viel aufeinander, dass der Schwarm nichts mehr zeigt, was
+         eine Dichte nicht besser zeigte. Umgekehrt ist eine Dichte ueber
+         zwanzig Punkte vor allem ihre eigene Glaettung, weshalb kleine
+         Datensaetze beim Schwarm bleiben.
+
+         Entschieden wird ueber ALLE Zeilen und nicht je Stufe, damit in
+         einem Bild nicht zwei Darstellungen nebeneinander stehen: eine
+         Kategorie als Wolke, die daneben als Flaeche, waere kein Vergleich
+         mehr, sondern zwei Diagramme. */
+      const VIOLIN_FROM = 2000;
+      const useViolin = isCat && n >= VIOLIN_FROM;
+      /* Derselbe Gedanke fuer die stetige Achse, nur in zwei Dimensionen.
+         Dort hilft keine Violine: x traegt eine echte Messung, es gibt
+         keine Stufen, ueber denen sich eine Dichte auftragen liesse. Was
+         ueberdeckt wird, ist die Flaeche selbst, also wird sie gerastert.
+
+         Gerechnet wird das mit jointDensity, die es fuer den Pairs-Plot
+         ohnehin schon gibt. Eine zweite, eigene 2D-Dichte waere genau die
+         Kopie, die hier nicht entstehen soll. */
+      const useHeat = !isCat && n >= VIOLIN_FROM;
+      let swarm = null, violins = null, heat = null;
+      if (useHeat) {
+        const hx = [], hy = [];
+        for (let i = 0; i < n; i++) {
+          if (isFinite(x[i]) && isFinite(y[i])) { hx.push(x[i]); hy.push(y[i]); }
+        }
+        if (hx.length) {
+          /* Die Raender kommen aus der ACHSE und nicht aus densRange, damit
+             das Raster deckungsgleich mit dem Bild liegt: densRange schneidet
+             Ausreisser ab, und ein Raster, das enger steht als die Achse,
+             laesst am Rand einen Streifen frei, in dem Daten liegen. */
+          heat = RTH.jointDensity(hx, hy, 48,
+            { lo: xlo, hi: xhi }, { lo: ylo, hi: yhi }, 2);
+        }
+      }
       if (isCat) {
         const stepPx = gx.length > 1
           ? Math.abs(px(gx[1]) - px(gx[0]))
           : (W - pad - 12);
         const maxOff = stepPx * 0.4;
-        swarm = new Float64Array(n);
-        /* Je Stufe ein eigener Schwarm. Die Zuordnung laeuft ueber den
+        /* Je Stufe die Zeilen einsammeln. Die Zuordnung laeuft ueber den
            x-Wert der Zeile, der bei einer Kategorie die Codierung 1..K
            traegt, dieselbe, auf der auch das Gitter sitzt. */
-        for (let g = 0; g < gx.length; g++) {
-          const members = [];
-          for (let i = 0; i < n; i++) if (x[i] === gx[g]) members.push(i);
-          if (!members.length) continue;
-          const ys = Float64Array.from(members, (i) => py(y[i]));
-          const off = RTH.beeswarm(ys, { r: 2.6, gap: 0.5, step: 1, maxOffset: maxOff });
-          for (let m = 0; m < members.length; m++) swarm[members[m]] = off[m];
+        const byLevel = gx.map(() => []);
+        for (let i = 0; i < n; i++) {
+          for (let g = 0; g < gx.length; g++) {
+            if (x[i] === gx[g]) { byLevel[g].push(i); break; }
+          }
+        }
+        if (useViolin) {
+          /* Die Dichte laeuft ueber die PIXELACHSE und nicht ueber die
+             Datenwerte: gerastert wird, was gezeichnet wird, sonst haengt
+             die Glaettung an der Einheit der Spalte. */
+          const yTop = 12, yBot = H - pad;
+          violins = byLevel.map((members) => {
+            if (!members.length) return null;
+            const ys = Float64Array.from(members, (i) => py(y[i]));
+            const sh = RTH.violinShape(ys, yTop, yBot, { bins: 128, passes: 4 });
+            return sh ? { shape: sh, half: maxOff } : null;
+          });
+        } else {
+          swarm = new Float64Array(n);
+          for (let g = 0; g < gx.length; g++) {
+            const members = byLevel[g];
+            if (!members.length) continue;
+            const ys = Float64Array.from(members, (i) => py(y[i]));
+            const off = RTH.beeswarm(ys, { r: 2.6, gap: 0.5, step: 1, maxOffset: maxOff });
+            for (let m = 0; m < members.length; m++) swarm[members[m]] = off[m];
+          }
         }
       }
+      /* Der Umriss einer Violine als Pfad: rechte Flanke hinunter, linke
+         wieder hinauf. Die Rasterzeilen liegen in Pixeln, also wird hier
+         nichts mehr umgerechnet. */
+      const violinPath = (v, sh, half) => {
+        const bins = sh.bins, step = (sh.hi - sh.lo) / bins;
+        const cx = px(v);
+        let d = '';
+        for (let i = 0; i < bins; i++) {
+          const yy = sh.lo + (i + 0.5) * step;
+          d += (i ? 'L' : 'M') + (cx + sh.w[i] * half).toFixed(2) + ',' + yy.toFixed(2) + ' ';
+        }
+        for (let i = bins - 1; i >= 0; i--) {
+          const yy = sh.lo + (i + 0.5) * step;
+          d += 'L' + (cx - sh.w[i] * half).toFixed(2) + ',' + yy.toFixed(2) + ' ';
+        }
+        return d + 'Z';
+      };
       return html`
         <${React.Fragment}>
           <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H}>
@@ -9440,6 +9590,53 @@
                  Dokument, und eine Datei mit einer generischen id wie "clip"
                  kollidiert, sobald jemand zwei davon in dasselbe Dokument
                  legt. -->
+            <!-- Die Punktdichte im stetigen Fall, ganz hinten wie die
+                 Violine. Ein Raster aus 48x48 Zellen statt siebzigtausend
+                 Kreisen: die decken die Zeichenflaeche vollstaendig zu, das
+                 Band verschwindet darunter, und die Datei waere zweistellig
+                 in Megabyte.
+
+                 Die Deckkraft traegt die Dichte, nicht die Farbe. Ein
+                 Farbverlauf waere eine zweite Skala, die niemand abliest und
+                 die im dritten Skin anders wirkt; die Zelle wird einfach
+                 dichter, wo mehr Punkte liegen. Der Bezug ist das MAXIMUM
+                 und nicht die Summe, damit eine Wolke mit einem scharfen
+                 Gipfel nicht fast unsichtbar wird.
+
+                 Wurzel statt linear, weil die Dichte einen sehr grossen
+                 Bereich ueberstreicht: linear waere alles ausser dem Kern
+                 unsichtbar, und gerade die duennen Raender sind das, was
+                 eine Punktwolke sonst zeigt. -->
+            ${useHeat && heat ? (() => {
+              const cw = (W - 12 - pad) / heat.n, ch = (H - pad - 12) / heat.n;
+              const cells = [];
+              for (let r = 0; r < heat.n; r++) {
+                for (let c = 0; c < heat.n; c++) {
+                  const v = heat.v[r * heat.n + c];
+                  if (!(v > 0)) continue;
+                  const a = Math.sqrt(v / heat.max);
+                  if (a < 0.02) continue;
+                  cells.push(html`
+                    <rect key=${r + '_' + c} x=${pad + c * cw} y=${H - pad - (r + 1) * ch}
+                      width=${cw + 0.5} height=${ch + 0.5}
+                      fill="var(--tool-emph)" fillOpacity=${(a * 0.55).toFixed(3)} />`);
+                }
+              }
+              return cells;
+            })() : null}
+            <!-- Die Violine ganz hinten, noch hinter der Schaetzung. Sie
+                 ist die Flaeche, auf der alles andere liegt; ein schmales
+                 Band auf einer breiten Flaeche schneidet nichts durch, und
+                 genau daran scheiterte der Schwarm, als die Baender hinter
+                 ihm lagen.
+
+                 Umriss in --tool-emph wie die Kreise, die sie ersetzt, aber
+                 gefuellt und blass: gezeichnet ist hier nicht mehr die
+                 einzelne Beobachtung, sondern wo sie sich haeufen. -->
+            ${useViolin ? violins.map((vi, i) => (vi ? html`
+              <path key=${'v' + i} d=${violinPath(gx[i], vi.shape, vi.half)}
+                fill="var(--tool-emph)" fillOpacity="0.13"
+                stroke="var(--tool-emph)" strokeWidth="1" strokeOpacity="0.45" />` : null)) : null}
             <!-- Der kategoriale Fall, HINTER den Punkten: je Stufe zwei
                  senkrechte Baender, das blasse breite fuer die simulierte
                  Beobachtung und das kraeftigere darin fuer die Unsicherheit
@@ -9469,40 +9666,66 @@
                  Strichen vorher. Eine runde Kappe ragt um den halben Strich
                  ueber den Endpunkt hinaus, bei Breite 15 also um 7.5 Pixel an
                  jedem Ende, und behauptet damit ein Intervall, das laenger
-                 ist als die Zahlen dahinter. -->
+                 ist als die Zahlen dahinter.
+
+                 Der Mittelwert als waagerechter Strich und nicht als Punkt.
+                 Ein gefuellter Kreis zwischen zwanzig ungefuellten ist der
+                 FORM nach nur ein weiterer Kreis, und wer das Bild
+                 ueberfliegt, muss ihn an der Farbe suchen; die Waagerechte
+                 steht quer zu allem anderen hier. Breiter als das Band, weil
+                 ein Strich buendig mit dessen Kante sich als sein Abschluss
+                 laese, also als Ende des Intervalls statt als Wert darin.
+
+                 Auch er liegt hinter den Punkten. Er stand bis zuletzt als
+                 einziges Stueck der Schaetzung davor, aus Sorge, er
+                 verschwinde sonst im Schwarm; er tut es nicht, und mit ihm
+                 dahinter liegen die Daten geschlossen obenauf statt von einem
+                 Strich durchschnitten. Damit ist die Schichtung dieselbe wie
+                 im stetigen Fall nebenan: erst die Schaetzung, dann die
+                 Beobachtungen, ohne Ausnahme. -->
             ${isCat ? gx.map((v, i) => html`
               <${React.Fragment} key=${'c' + i}>
                 <line x1=${px(v)} y1=${py(simLo[i])} x2=${px(v)} y2=${py(simHi[i])}
                   stroke="var(--tool-sig-info)" strokeWidth="6" opacity="0.18" strokeLinecap="butt" />
                 <line x1=${px(v)} y1=${py(linkLo[i])} x2=${px(v)} y2=${py(linkHi[i])}
                   stroke="var(--tool-sig-info)" strokeWidth="15" opacity="0.38" strokeLinecap="butt" />
+                <line x1=${px(v) - 10.5} y1=${py(linkMean[i])}
+                  x2=${px(v) + 10.5} y2=${py(linkMean[i])}
+                  stroke="var(--tool-sig-info)" strokeWidth="3" strokeLinecap="butt" />
               <//>`) : null}
             <clipPath id="qp-pred-clip">
               <rect x=${pad - 0.5} y=${11.5} width=${W - 12 - pad + 1}
                 height=${H - pad - 11} />
             </clipPath>
             <g clipPath="url(#qp-pred-clip)">
-              ${order.map((i) => html`
+              ${useViolin || useHeat ? null : order.map((i) => html`
                 <circle key=${i} cx=${px(x[i]) + (swarm ? swarm[i] : 0)} cy=${py(y[i])} r="2.6"
                   fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
             </g>
-            <!-- Der Mittelwert bleibt als einziges Stueck der Schaetzung VOR
-                 den Punkten. Er ist ein Punkt und keine Flaeche, also traegt
-                 ihn die Breite nicht, und hinter dem Schwarm waere er bei
-                 dichten Stufen schlicht weg. Der helle Ring setzt ihn von den
-                 Kreisen ab, zwischen denen er sonst nur ein weiterer Kreis
-                 waere. -->
-            ${isCat ? gx.map((v, i) => html`
-              <circle key=${'m' + i} cx=${px(v)} cy=${py(linkMean[i])} r="3.2"
-                fill="var(--tool-sig-info)" stroke="var(--tool-surface)" strokeWidth="1" />`) : null}
           </svg>
           <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
             ${rowTrials
-              ? html`Circles are the observed data as a proportion, ${outcome} divided by the number of
-                  trials in that row, because ${grid.node} is a probability and the column counts
-                  successes. `
-              : 'Circles are the observed data. '}
-            ${isCat ? html`Within a level they are spread sideways only so that they do not cover
+              ? html`${useViolin ? 'The shapes are' : useHeat ? 'The shading is' : 'Circles are'} the observed data as a proportion,
+                  ${outcome} divided by the number of trials in that row, because ${grid.node} is a
+                  probability and the column counts successes. `
+              : (useViolin ? 'The shapes are the observed data. '
+                : useHeat ? 'The shading is the observed data. '
+                : 'Circles are the observed data. ')}
+            ${useHeat ? html`At ${n.toLocaleString('en-US')} rows the points would cover the whole
+                plot and hide the band underneath, so the cloud is drawn as a DENSITY instead:
+                darker where rows pile up, faint where they thin out. The shading is scaled to the
+                densest cell and drawn on a square-root scale, which keeps the sparse edges visible
+                rather than letting the core swallow everything. Below
+                ${VIOLIN_FROM.toLocaleString('en-US')} rows the plot draws the points themselves. `
+              : ''}
+            ${useViolin ? html`At ${n.toLocaleString('en-US')} rows there is no room left to draw
+                them one by one, so each level shows the DENSITY of its values instead: wide where
+                they pile up, narrow where they thin out. Every level is scaled to the same maximum
+                width, which makes their shapes comparable but says nothing about how many rows each
+                one holds${violins ? html` (${violins.map((vi) => vi ? vi.shape.n.toLocaleString('en-US') : '0').join(', ')}, in the order above)` : ''}.
+                Below ${VIOLIN_FROM.toLocaleString('en-US')} rows the plot draws the points
+                themselves. `
+              : isCat ? html`Within a level they are spread sideways only so that they do not cover
                 each other, so the WIDTH of a clump is the number of rows at that value and the
                 sideways position itself means nothing. ` : ''}
             The dark band is the uncertainty in ${grid.node} itself, the
