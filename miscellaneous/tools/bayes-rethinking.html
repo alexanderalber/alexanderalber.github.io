@@ -691,6 +691,20 @@
           });
         },
         rng: function (rng, mu, sd) { return Math.exp(mu + sd * rnorm1(rng)); },
+        /* onOutcomeScale: das Niveau ist hier meanlog und lebt im LOG der
+           Beobachtung. Der Vorhersageplot zeichnet die Linie in die Achse der
+           Daten, und ohne diese Umrechnung kriecht sie bei Werten um 4 als
+           Linie bei 1.4 am Boden entlang, unter einem Band, das korrekt in
+           natuerlichen Einheiten simuliert wurde. Genau so sah das
+           joint-Beispiel am 2026-09-11 aus.
+
+           Gerechnet wird exp(mu + sd^2/2), also der ERWARTUNGSWERT der
+           Lognormalen und nicht ihr Median exp(mu). Das ist die Groesse, die
+           "mean" in der Zusammenfassung verspricht, und sie liegt bei
+           schiefer Verteilung ueber dem Median. Die Umrechnung geschieht je
+           ZIEHUNG und vor den Perzentilen, damit auch die Bandenden echte
+           Perzentile der umgerechneten Groesse sind. */
+        onOutcomeScale: function (lv, a) { return Math.exp(lv + a[1] * a[1] / 2); },
         /* The -log(v) term of the density does not depend on either parameter,
            so these are the dnorm rules read on log(v). */
         d: [
@@ -732,6 +746,11 @@
           return eachSum(y, function (v) { return v < 0 ? -Infinity : lr - rate * v; });
         },
         rng: function (rng, rate) { return -Math.log(1 - rng()) / rate; },
+        /* Das Niveau ist die RATE, und der Erwartungswert ihr Kehrwert. Eine
+           Rate von 0.2 gegen Daten um 5 gezeichnet ergibt sonst dieselbe am
+           Boden klebende Linie wie bei dlnorm, nur aus dem umgekehrten
+           Grund. */
+        onOutcomeScale: function (lv) { return 1 / lv; },
         d: [
           function (y, rate) { var ir = 1 / rate; return eachSum(y, function (v) { return ir - v; }); }
         ],
@@ -764,7 +783,15 @@
         dy: function (y, x0, g) { var z = (y - x0) / g; return -2 * z / (g * (1 + z * z)); }
       },
       dbinom: {
-        args: ['size', 'prob'], support: 'count',
+        /* level: welches Argument ist das NIVEAU, also die Groesse, die der
+           Vorhersageplot als Linie zeichnet und die der Python-Export als
+           kind="mu" herausgibt. Fast ueberall ist das das erste Argument, und
+           wo das gilt, steht hier nichts. Bei dbinom ist das erste die
+           Versuchszahl: sie gegen die Daten zu zeichnen ergibt eine Linie bei
+           konstant 12, waehrend p in 0..1 lebt. Genau das war am 2026-09-11
+           kurzzeitig der Fall, als die Zuordnung des Knotens von "geraten" auf
+           "abgelesen" umgestellt wurde und dabei zu grob abgelesen hat. */
+        args: ['size', 'prob'], level: 1, support: 'count',
         lp: function (y, n, p) {
           if (!(p >= 0 && p <= 1) || !(n >= 0)) return -Infinity;
           /* At p exactly 0 or 1 the log terms are infinite but the density is
@@ -838,6 +865,9 @@
           var x = rgamma1(rng, a), y2 = rgamma1(rng, b);
           return x / (x + y2);
         },
+        /* Wie bei dgamma: shape1 ist eine Form, der Erwartungswert ist
+           a/(a+b). dbeta2 mit pbar braucht nichts. */
+        onOutcomeScale: function (lv, a) { return lv / (lv + a[1]); },
         d: [
           function (y, a, b) {
             var c = digamma(a + b) - digamma(a);
@@ -884,6 +914,13 @@
           });
         },
         rng: function (rng, sh, rate) { return rgamma1(rng, sh) / rate; },
+        /* shape ist kein Niveau, sondern eine Form; der Erwartungswert ist
+           shape/rate. Ohne die Umrechnung zeichnet der Plot eine Form gegen
+           eine Beobachtung, was nicht zu wenig oder zu viel ist, sondern
+           schlicht eine andere Groesse. Die mean-und-scale-Variante dgamma2
+           daneben braucht nichts, weil ihr erstes Argument bereits der
+           Erwartungswert ist. */
+        onOutcomeScale: function (lv, a) { return lv / a[1]; },
         d: [
           function (y, sh, rate) {
             var c = Math.log(rate) - digamma(sh);
@@ -911,7 +948,8 @@
         dy: function (y, mu, scale) { return DIST.dgamma.dy(y, mu / scale, 1 / scale); }
       },
       dstudent: {
-        args: ['nu', 'mu', 'sigma'], support: 'real',
+        /* nu ist die Form, mu das Niveau; siehe level bei dbinom. */
+        args: ['nu', 'mu', 'sigma'], level: 1, support: 'real',
         lp: function (y, nu, mu, sig) {
           if (!(nu > 0 && sig > 0)) return -Infinity;
           var c = lgamma((nu + 1) / 2) - lgamma(nu / 2) - 0.5 * Math.log(nu * Math.PI) - Math.log(sig);
@@ -2216,16 +2254,37 @@
       }
 
       /* Per-observation log-likelihood at one parameter vector. WAIC and PSIS
-         both need the full n by S matrix, and this is the row of it. */
+         both need the full n by S matrix, and this is the row of it.
+
+         Bei mehreren Ergebnissen wird je ZEILE summiert, nicht je Messung. Das
+         ist eine inhaltliche Festlegung und nicht bloss die bequemere Schleife,
+         also der Grund: PSIS-LOO fragt, wie gut das Modell eine ungesehene
+         EINHEIT vorhersagt, und die Einheit ist hier die Datenzeile. Am
+         joint-Beispiel sind die fuenf Masse ein und desselben Pilzes, die sich
+         Substrat und Feuchte teilen; sie einzeln zu zaehlen wuerde n
+         verfuenffachen, obwohl nicht fuenfmal so viel Unabhaengiges gemessen
+         wurde, und p_waic entsprechend verzerren. Pareto-k bleibt so ausserdem
+         das, was die Diagnostik meint: eine Aussage ueber eine Zeile.
+
+         Bis 2026-09-11 stand hier likeFns[0], also nur das erste Ergebnis. Der
+         Fit summierte da laengst ueber alle (siehe logp weiter oben), und genau
+         diese Diskrepanz war das Gefaehrliche daran: WAIC und PSIS beschrieben
+         ein Teilmodell, waren als Kennzahl des ganzen beschriftet, und die Zahl
+         sah dabei voellig unauffaellig aus. Ein zweites Ergebnis, das die
+         Anpassung mittraegt, kam in der Vorhersageguete schlicht nicht vor. */
       function logLikPerObs(theta, out) {
         pool.release();
         var fr = frameFor(theta);
-        var lf = likeFns[0], la = argVals(lf.args, fr), y = dataVals[lf.name].d;
-        var res = out || new Float64Array(y.length);
-        for (var r = 0; r < y.length; r++) {
-          var ra = new Array(la.length);
-          for (var j = 0; j < la.length; j++) ra[j] = typeof la[j] === 'number' ? la[j] : la[j][r];
-          res[r] = lf.dist.lp.apply(null, [y[r]].concat(ra));
+        var n0 = dataVals[likeFns[0].name].d.length;
+        var res = out || new Float64Array(n0);
+        for (var r = 0; r < n0; r++) res[r] = 0;
+        for (var i = 0; i < likeFns.length; i++) {
+          var lf = likeFns[i], la = argVals(lf.args, fr), y = dataVals[lf.name].d;
+          for (r = 0; r < y.length; r++) {
+            var ra = new Array(la.length);
+            for (var j = 0; j < la.length; j++) ra[j] = typeof la[j] === 'number' ? la[j] : la[j][r];
+            res[r] += lf.dist.lp.apply(null, [y[r]].concat(ra));
+          }
         }
         return res;
       }
@@ -2511,9 +2570,31 @@
          evaluate per draw. An argument that is a bare name resolves directly; a
          compound expression gets a hidden node so it can be evaluated the same
          way as any other. */
-      var hidden = 0;
-      function likeSpec() {
-        var st6 = stochByName[outcomes[0]];
+      /* Das Argument ist der NAME des Ergebnisses, nicht sein Index, und ohne
+         Angabe ist es das erste. Ein Modell mit mehreren "~"-Zeilen hat je
+         Ergebnis eine eigene Verteilung und einen eigenen Niveauknoten, und wer
+         zeichnet oder simuliert, muss sagen koennen, welches gemeint ist.
+
+         muNode ist dabei das Stueck, das vorher nirgends stand und stattdessen
+         geraten wurde: der Verbraucher nahm den LETZTEN deterministischen
+         Knoten, also den letzten einer topologischen Sortierung. Bei einem
+         Ergebnis stimmt das zufaellig, bei fuenf mit Wahrscheinlichkeit 1/5.
+         Hier ist die Zuordnung keine Vermutung, sondern abgelesen: das erste
+         Argument der Verteilung IST das Niveau, bei dnorm das mu, bei dlnorm
+         ebenso, bei dbinom das p. Ist es kein Knoten, sondern eine Zahl, gibt
+         es nichts zu zeichnen und muNode ist null.
+
+         Die Memoisierung ist nicht Sparsamkeit, sondern notwendig. Ein
+         zusammengesetztes Argument legt einen versteckten Knoten an und haengt
+         ihn in detFns und sorted; ohne Zwischenspeicher taete jeder Aufruf das
+         erneut, und da der Vorhersagepfad likeSpec je Ergebnis und je Modus
+         ruft, wuechse der Frame bei jedem Fit weiter. */
+      var hidden = 0, specCache = {};
+      function likeSpec(name) {
+        var key = name === undefined ? outcomes[0] : name;
+        if (specCache[key]) return specCache[key];
+        var st6 = stochByName[key];
+        if (!st6) throw new Error('"' + key + '" is not an outcome of this model');
         var nodes = st6.dist.args.map(function (a) {
           if (a.tag === 'num') return a.v;
           if (a.tag === 'var') return a.name;
@@ -2525,7 +2606,11 @@
           sorted.push(nm5);
           return nm5;
         });
-        return { dist: DIST[st6.dist.fn], distName: st6.dist.fn, argNodes: nodes };
+        var dd8 = DIST[st6.dist.fn], lvAt = dd8 && dd8.level ? dd8.level : 0;
+        specCache[key] = { outcome: key, dist: dd8, distName: st6.dist.fn,
+          argNodes: nodes, levelAt: lvAt,
+          muNode: typeof nodes[lvAt] === 'string' ? nodes[lvAt] : null };
+        return specCache[key];
       }
 
       return {
@@ -2609,10 +2694,19 @@
         spec: function () {
           return {
             outcome: outcomes[0],
+            outcomes: outcomes,
             like: (function () {
               var st = stochByName[outcomes[0]];
               return { dist: st.dist.fn, args: st.dist.args };
             })(),
+            /* Je Ergebnis eine Likelihood, in der Reihenfolge der "~"-Zeilen.
+               like (Einzahl) bleibt daneben stehen und ist der erste Eintrag:
+               der Python-Export hat es lange benutzt und wird hier nicht in
+               einem Zug umgebaut. */
+            likes: outcomes.map(function (o) {
+              var st = stochByName[o];
+              return { outcome: o, dist: st.dist.fn, args: st.dist.args };
+            }),
             /* In dependency order, which is the order they can be emitted. */
             det: sorted.map(function (nm) {
               return { name: nm, expr: detByName[nm].expr };
@@ -2737,9 +2831,34 @@
        result negated back on the way out. Doing it here rather than asking every
        caller to hand over a negated log-posterior keeps the sign convention in
        exactly one place, which is the only way it stays right. */
+    /* Das Iterationslimit skaliert mit der Zahl der Parameter, so wie es der
+       Nelder-Mead-Fallback weiter unten schon immer tat (400 * n). Die feste 200
+       stammt aus einer Zeit mit einstelligen Modellen; ein Modell mit mehreren
+       Ergebnissen hat leicht das Zehnfache, und dann ist die Zahl zu klein.
+
+       Gemessen am joint-Beispiel (38 Parameter), fuenf Startpunkte, Default 200:
+       vier davon reissen das Limit. Der Schaden ist dabei NICHT der, den man
+       erwartet. Drei der vier stehen bereits auf demselben Gipfel wie der
+       konvergierte Lauf (log posterior -952.969, auf drei Nachkommastellen
+       identisch) und kriechen dort nur noch entlang, ohne gtol zu erreichen.
+       Der Fit als ganzes gelingt also, weil ein Startpunkt durchkommt und best
+       gewinnt.
+
+       Verloren geht der ZWEITE Zweck der Restarts. Die Mehrgipfel-Pruefung in
+       fitQuap vergleicht ausdruecklich nur konvergierte Laeufe, und die drei
+       abgeschnittenen zaehlen dort nicht mit. Bei so einem Modell prueft sie
+       damit gar nichts mehr, und zwar lautlos: die Warnung, die bei mehreren
+       Moden erscheinen soll, kann nicht mehr erscheinen. Mit 40 * n konvergieren
+       alle fuenf, alle auf denselben Wert, und die Aussage "ein Modus" ist
+       wieder belegt statt bloss unwidersprochen.
+
+       40 und nicht mehr: der teuerste der fuenf Laeufe braucht 509 Iterationen,
+       also ein Drittel des Budgets. Der Preis sind ein paar hundert Millisekunden
+       bei einem Fit, der ohnehin ueber eine Sekunde laeuft. Der Boden von 200
+       haelt kleine Modelle exakt dort, wo sie vorher waren. */
     function bfgs(fMax, gradMax, x0, opts) {
       opts = opts || {};
-      var n = x0.length, maxIter = opts.maxIter || 200;
+      var n = x0.length, maxIter = opts.maxIter || Math.max(200, 40 * n);
       var gtol = opts.gtol || 1e-8, ftol = opts.ftol || 1e-12;
       var f = function (xx) { var v = fMax(xx); return isFinite(v) ? -v : Infinity; };
       var gradf = function (xx, out) {
@@ -4352,9 +4471,11 @@
        null fuer jede andere Verteilung, denn nur die binomiale hat ein n. Bei
        dpois ist lambda bereits der Erwartungswert der Zaehlung, und bei dnorm
        ist mu die Sache selbst; dort ist nichts umzurechnen. */
-    function binomTrials(model) {
-      var sp = model.likeSpec();
+    function binomTrials(model, outcome) {
+      var sp = model.likeSpec(outcome);
       if (sp.distName !== 'dbinom') return null;
+      /* Das ERSTE Argument, und zwar unabhaengig von level: bei dbinom ist das
+         die Versuchszahl, waehrend das Niveau p an Position 1 steht. */
       var a0 = sp.argNodes[0];
       var n = model.nObs, out = new Float64Array(n), i;
       if (typeof a0 === 'number') {
@@ -4369,10 +4490,10 @@
 
     /* Draws of the outcome itself, so observation noise is included. The
        equivalent of sim(). */
-    function simOutcome(model, samples, newCols, maxDraws, seed) {
+    function simOutcome(model, samples, newCols, maxDraws, seed, outcome) {
       var S = Math.min(samples.S, maxDraws || samples.S), P = samples.P;
       var rng = makeRng((seed === undefined ? 11 : seed) >>> 0);
-      var spec = model.likeSpec();
+      var spec = model.likeSpec(outcome);
       var th = new Float64Array(P), rows = [];
       for (var s = 0; s < S; s++) {
         for (var i = 0; i < P; i++) th[i] = samples.raw[s * P + i];
@@ -4394,12 +4515,66 @@
       return { S: S, n: rows.length ? rows[0].length : 0, rows: rows };
     }
 
+    /* Der Niveauknoten in den EINHEITEN DER BEOBACHTUNG, je Ziehung.
+
+       linkNode liefert den Knoten so, wie er im Modell steht, und das ist bei
+       einigen Verteilungen nicht die Skala, auf der die Datenpunkte liegen.
+       Bei `y ~ dlnorm(mu, s)` ist mu der Mittelwert des LOGARITHMUS: bei
+       Beobachtungen um 4 steht dort 1.4, und der Vorhersageplot zeichnete
+       diese 1.4 als Linie unter ein Band, das korrekt in natuerlichen
+       Einheiten simuliert war. Dasselbe in anderer Form bei dexp (das Niveau
+       ist die Rate, nicht der Erwartungswert) sowie dbeta und dgamma, deren
+       erstes Argument eine FORM ist und ueberhaupt kein Niveau.
+
+       Die Umrechnung steht bei der Verteilung als onOutcomeScale und bekommt
+       alle ihre Argumente, weil sie meist mehr als das Niveau braucht:
+       exp(mu + s^2/2) liest s mit, shape/rate die Rate. Wo nichts steht, ist
+       der Knoten bereits die richtige Groesse (dnorm, dpois, dbeta2, dgamma2,
+       dstudent), und dann wird hier nichts gerechnet.
+
+       dbinom ist absichtlich NICHT dabei. Sein Niveau p ist eine
+       Wahrscheinlichkeit, und der Plot loest den Unterschied zur Zaehlung auf
+       der anderen Seite auf, indem er das Outcome durch die Versuchszahl
+       teilt, siehe trials. Beides zugleich waere doppelt.
+
+       Gerechnet wird je Ziehung und vor den Perzentilen. Andersherum, also
+       erst zusammenfassen und dann umrechnen, waeren die Bandenden zwar bei
+       einer monotonen Umrechnung dieselben, der Mittelwert aber nicht: exp
+       eines Mittelwerts ist nicht der Mittelwert der exp. */
+    function levelDraws(model, samples, outcome, newCols, maxDraws) {
+      var spec = model.likeSpec(outcome);
+      if (!spec.muNode) return null;
+      var conv = spec.dist && spec.dist.onOutcomeScale;
+      if (!conv) return linkNode(model, samples, spec.muNode, newCols, maxDraws);
+      var S = Math.min(samples.S, maxDraws || samples.S), P = samples.P;
+      var th = new Float64Array(P), rows = [];
+      for (var s = 0; s < S; s++) {
+        for (var i = 0; i < P; i++) th[i] = samples.raw[s * P + i];
+        var args = spec.argNodes.map(function (nd) {
+          return typeof nd === 'number' ? nd : model.nodeValues(th, nd, newCols);
+        });
+        if (args.indexOf(null) >= 0) return null;
+        var n = 1;
+        args.forEach(function (a) { if (a && a.length > n) n = a.length; });
+        var row = new Float64Array(n);
+        for (var r = 0; r < n; r++) {
+          var ra = args.map(function (a) {
+            if (typeof a === 'number') return a;
+            return a.length === 1 ? a[0] : a[r];
+          });
+          row[r] = conv(ra[spec.levelAt], ra);
+        }
+        rows.push(row);
+      }
+      return { S: S, n: rows.length ? rows[0].length : 0, rows: rows };
+    }
+
     /* Draws from the prior alone: what the model believes before it sees the
        outcome. The single most useful thing to look at before fitting, and the
        reason a prior that looks harmless can imply negative heights. */
-    function priorPredictive(model, nDraws, newCols, seed) {
+    function priorPredictive(model, nDraws, newCols, seed, outcome) {
       var rng = makeRng((seed === undefined ? 23 : seed) >>> 0);
-      var P = model.nPar, spec = model.likeSpec(), rows = [], th = new Float64Array(P);
+      var P = model.nPar, spec = model.likeSpec(outcome), rows = [], th = new Float64Array(P);
       var got = 0, tries = 0;
       while (got < nDraws && tries < nDraws * 20) {
         tries++;
@@ -4837,7 +5012,17 @@
       W('import numpy as np');
       W('import pandas as pd');
       W();
-      W('__all__ = ["median", "mean", "interval", "percentiles", "samples",');
+      /* Die Likelihoods, je Ergebnis eine, in der Reihenfolge der "~"-Zeilen.
+         Steht hier oben, weil schon __all__ und OUTCOME davon abhaengen. */
+      var likes = sp.likes || [{ outcome: sp.outcome, dist: sp.like.dist, args: sp.like.args }];
+      var fnNames = ['median', 'mean', 'interval', 'percentiles', 'samples'];
+      var allNames = fnNames.slice();
+      if (likes.length > 1) {
+        likes.forEach(function (lk) {
+          fnNames.forEach(function (fn) { allNames.push(fn + '_' + lk.outcome); });
+        });
+      }
+      W('__all__ = [' + allNames.map(pyStr).join(', ') + ',');
       W('           "posterior", "natural", "PARAMS", "INPUTS"]');
       W();
       W();
@@ -4856,6 +5041,13 @@
       W('PARAMS = [' + shownNames.map(pyStr).join(', ') + ']');
       W('INPUTS = [' + sp.columns.map(pyStr).join(', ') + ']');
       W('OUTCOME = ' + pyStr(sp.outcome));
+      /* OUTCOME bleibt der Einzelwert, damit ein aelteres Skript ihn noch
+         findet, und meint wie eh und je das erste Ergebnis. OUTCOMES daneben ist
+         die vollstaendige Liste und der Grund, warum der Export bei mehreren
+         "~"-Zeilen nicht mehr so tut, als gaebe es nur eines. */
+      if (likes.length > 1) {
+        W('OUTCOMES = [' + likes.map(function (lk) { return pyStr(lk.outcome); }).join(', ') + ']');
+      }
       W();
 
       /* ---- the posterior, the one place the two modes differ ---- */
@@ -5006,10 +5198,18 @@
          samples(), because this is the scope where the computed nodes and the
          data columns exist. They go into the same dict under keys no model can
          collide with, since a name in the model language cannot contain a
-         colon. */
-      var likeArgs = sp.like.args.map(function (a) { return pyExpr(a, env); });
-      likeArgs.forEach(function (e, ai) {
-        W('    out[' + pyStr('arg:' + ai) + '] = np.broadcast_to(' + e + ', (th.shape[0], n))');
+         colon.
+
+         Der Schluessel traegt jetzt auch den Namen des Ergebnisses, denn bei
+         mehreren "~"-Zeilen gibt es je Ergebnis einen eigenen Satz Argumente,
+         und "arg:0" allein waere fuenfmal derselbe Schluessel. */
+      var likeArgsBy = {};
+      likes.forEach(function (lk) {
+        likeArgsBy[lk.outcome] = lk.args.map(function (a) { return pyExpr(a, env); });
+        likeArgsBy[lk.outcome].forEach(function (e, ai) {
+          W('    out[' + pyStr('arg:' + lk.outcome + ':' + ai) + '] = np.broadcast_to(' +
+            e + ', (th.shape[0], n))');
+        });
       });
       W('    return out');
       W();
@@ -5017,112 +5217,147 @@
 
       /* ---- the prediction kernel ----
 
+         Je Ergebnis eine Funktionsfamilie. Ein Modell mit einer "~"-Zeile
+         bekommt samples/median/mean/interval/percentiles wie bisher; hat es
+         mehrere, tragen sie zusaetzlich das Ergebnis im Namen (samples_cap,
+         median_stem, ...) und die unsuffigierten Namen zeigen auf das erste.
+         Damit bleibt ein bestehendes Skript gueltig, und der Export verschweigt
+         nicht mehr vier von fuenf Ergebnissen: bis 2026-09-11 nannte er OUTCOME
+         in der Einzahl und schrieb genau eine Familie, die stillschweigend die
+         des ersten Ergebnisses war.
+
          Which value is "the level"? The last computed node when there is one,
          since that is what an arrow line is for. When the model has no arrow
          line at all, as a multilevel model written straight into the
          likelihood does not, the level is the first argument of the outcome's
          distribution: y ~ dnorm(a[school], sigma) has its level in a[school]
          and nowhere else. Reporting nothing there would withhold exactly the
-         quantity such a model is fitted to find. */
-      var muNode = sp.det.length ? sp.det[sp.det.length - 1].name : null;
-      var muArg = muNode === null ? 0 : null;
-      var pr = PYRNG[sp.like.dist];
-      if (!pr) throw new Error('the distribution "' + sp.like.dist + '" has no Python form');
+         quantity such a model is fitted to find.
 
-      W('def samples(df, kind="y", n=None, seed=0):');
-      W('    """The raw draws behind every other function here.');
-      W();
-      W('    Returns an array of shape (draws, len(df)).');
-      W();
-      W('    kind="y"  a draw of the outcome itself: uncertainty about the');
-      W('              parameters AND the scatter of a single observation around');
-      W('              the level. This is the answer to "what will the next');
-      W('              measurement at these inputs be".');
-      var muLabel = muNode !== null ? muNode
-        : (sp.like.args[0] && sp.like.args[0].tag === 'index'
-          ? sp.like.args[0].name + '[' + (sp.like.args[0].idx.tag === 'var'
-            ? sp.like.args[0].idx.name : '...') + ']'
-          : DIST[sp.like.dist].args[0]);
-      W('    kind="mu" the level only (' + muLabel + '): uncertainty about the parameters');
-      W('              alone, so "where is the average". Narrower, and it keeps');
-      W('              shrinking as the data grow, which the other does not,');
-      W('              because observation scatter is a property of the world.');
-      W('    """');
-      W('    df = pd.DataFrame(df)');
-      W('    missing = [c for c in INPUTS if c not in df.columns]');
-      W('    if missing:');
-      W('        raise ValueError("these columns are needed and not in the input: "');
-      W('                         + ", ".join(missing))');
-      W('    th = posterior() if n is None else posterior(n, seed)');
-      W('    fr = _frame(df, th)');
-      W('    if kind == "mu":');
-      W('        return np.asarray(fr[' + pyStr(muNode !== null ? muNode : 'arg:' + muArg) +
-        '], dtype=float)');
-      W('    if kind != "y":');
-      W('        raise ValueError("kind has to be \'y\' or \'mu\', got %r" % (kind,))');
-      W('    rng = np.random.default_rng(seed + 1)');
-      W('    shape = (th.shape[0], len(df))');
-      W('    return np.asarray(' + pr(likeArgs.map(function (e, ai) {
-        return 'fr[' + pyStr('arg:' + ai) + ']';
-      })) + ', dtype=float)');
-      W();
-      W();
-      W('def median(df, kind="mu", n=None, seed=0):');
-      W('    """One number per input row: the median over the posterior.');
-      W();
-      W('    The median rather than the mean, because it passes through the');
-      W('    transformations in the model unchanged and therefore agrees with');
-      W('    the natural column in the tool.');
-      W();
-      W('    Defaults to kind="mu", the level. Where the outcome is symmetric the');
-      W('    point value of "y" is the same number with more Monte Carlo noise;');
-      W('    where it is a count or a probability the two are different');
-      W('    quantities and the choice is a real one.');
-      W('    """');
-      W('    return pd.Series(np.median(samples(df, kind, n, seed), axis=0),');
-      W('                     index=pd.DataFrame(df).index, name="median")');
-      W();
-      W();
-      W('def mean(df, kind="mu", n=None, seed=0):');
-      W('    """One number per input row: the mean over the posterior."""');
-      W('    return pd.Series(samples(df, kind, n, seed).mean(axis=0),');
-      W('                     index=pd.DataFrame(df).index, name="mean")');
-      W();
-      W();
-      W('def interval(df, prob=' + pyNum(opts.prob === undefined ? 0.8 : opts.prob) +
-        ', kind="y", n=None, seed=0):');
-      W('    """A lower and an upper bound per input row, as a DataFrame.');
-      W();
-      W('    The central interval of the draws, so it is free to be asymmetric,');
-      W('    and where it is that asymmetry is the finding rather than a defect.');
-      W();
-      W('    kind="y" by default: an interval is nearly always read as "where');
-      W('    will the next observation fall", and that reading needs the');
-      W('    observation scatter in it. Pass kind="mu" for the narrower band');
-      W('    around the average.');
-      W('    """');
-      W('    s = samples(df, kind, n, seed)');
-      W('    lo, hi = (1.0 - prob) / 2.0, 1.0 - (1.0 - prob) / 2.0');
-      W('    q = np.quantile(s, [lo, hi], axis=0)');
-      W('    return pd.DataFrame({"lo": q[0], "hi": q[1]},');
-      W('                        index=pd.DataFrame(df).index)');
-      W();
-      W();
-      W('def percentiles(df, step=5, kind="y", n=None, seed=0):');
-      W('    """The whole predictive distribution per row, in percentile steps.');
-      W();
-      W('    A DataFrame with one row per input row and columns p5, p10, ... p95');
-      W('    by default. This is the shape to reach for when you want the');
-      W('    distribution rather than a summary of it, without carrying the');
-      W('    draws around.');
-      W('    """');
-      W('    s = samples(df, kind, n, seed)');
-      W('    ps = np.arange(step, 100, step)');
-      W('    q = np.quantile(s, ps / 100.0, axis=0)');
-      W('    return pd.DataFrame({("p%d" % p): q[i] for i, p in enumerate(ps)},');
-      W('                        index=pd.DataFrame(df).index)');
-      W();
-      W();
+         Der Knoten wird dabei ABGELESEN statt geraten: er ist das erste
+         Argument der Verteilung DIESES Ergebnisses. Vorher stand hier der letzte
+         deterministische Knoten des ganzen Modells, was bei fuenf Ergebnissen
+         vier Familien den Knoten eines fremden Ergebnisses gegeben haette. */
+      var detNamesSet = {};
+      sp.det.forEach(function (d) { detNamesSet[d.name] = true; });
+      var multi = likes.length > 1;
+      var muLevels = [];
+      likes.forEach(function (lk, li) {
+        var sfx = multi ? '_' + lk.outcome : '';
+        var lvAt = DIST[lk.dist] && DIST[lk.dist].level ? DIST[lk.dist].level : 0;
+        var a0 = lk.args[lvAt];
+        var lvNode = a0 && a0.tag === 'var' && detNamesSet[a0.name] ? a0.name : null;
+        var lvKey = lvNode !== null ? lvNode : 'arg:' + lk.outcome + ':' + lvAt;
+        var lvLabel = lvNode !== null ? lvNode
+          : (a0 && a0.tag === 'index'
+            ? a0.name + '[' + (a0.idx && a0.idx.tag === 'var' ? a0.idx.name : '...') + ']'
+            : DIST[lk.dist].args[lvAt]);
+        muLevels.push(lvLabel);
+        var pr2 = PYRNG[lk.dist];
+        if (!pr2) throw new Error('the distribution "' + lk.dist + '" has no Python form');
+
+        W('def samples' + sfx + '(df, kind="y", n=None, seed=0):');
+        W('    """The raw draws behind every other function here' +
+          (multi ? ', for ' + lk.outcome + '.' : '.'));
+        W();
+        W('    Returns an array of shape (draws, len(df)).');
+        W();
+        W('    kind="y"  a draw of the outcome itself: uncertainty about the');
+        W('              parameters AND the scatter of a single observation around');
+        W('              the level. This is the answer to "what will the next');
+        W('              measurement at these inputs be".');
+        W('    kind="mu" the level only (' + lvLabel + '): uncertainty about the parameters');
+        W('              alone, so "where is the average". Narrower, and it keeps');
+        W('              shrinking as the data grow, which the other does not,');
+        W('              because observation scatter is a property of the world.');
+        W('    """');
+        W('    df = pd.DataFrame(df)');
+        W('    missing = [c for c in INPUTS if c not in df.columns]');
+        W('    if missing:');
+        W('        raise ValueError("these columns are needed and not in the input: "');
+        W('                         + ", ".join(missing))');
+        W('    th = posterior() if n is None else posterior(n, seed)');
+        W('    fr = _frame(df, th)');
+        W('    if kind == "mu":');
+        W('        return np.asarray(fr[' + pyStr(lvKey) + '], dtype=float)');
+        W('    if kind != "y":');
+        W('        raise ValueError("kind has to be \'y\' or \'mu\', got %r" % (kind,))');
+        W('    rng = np.random.default_rng(seed + ' + (li + 1) + ')');
+        W('    shape = (th.shape[0], len(df))');
+        W('    return np.asarray(' + pr2(likeArgsBy[lk.outcome].map(function (e, ai) {
+          return 'fr[' + pyStr('arg:' + lk.outcome + ':' + ai) + ']';
+        })) + ', dtype=float)');
+        W();
+        W();
+        W('def median' + sfx + '(df, kind="mu", n=None, seed=0):');
+        W('    """One number per input row: the median over the posterior.');
+        W();
+        W('    The median rather than the mean, because it passes through the');
+        W('    transformations in the model unchanged and therefore agrees with');
+        W('    the natural column in the tool.');
+        W();
+        W('    Defaults to kind="mu", the level. Where the outcome is symmetric the');
+        W('    point value of "y" is the same number with more Monte Carlo noise;');
+        W('    where it is a count or a probability the two are different');
+        W('    quantities and the choice is a real one.');
+        W('    """');
+        W('    return pd.Series(np.median(samples' + sfx + '(df, kind, n, seed), axis=0),');
+        W('                     index=pd.DataFrame(df).index, name="median")');
+        W();
+        W();
+        W('def mean' + sfx + '(df, kind="mu", n=None, seed=0):');
+        W('    """One number per input row: the mean over the posterior."""');
+        W('    return pd.Series(samples' + sfx + '(df, kind, n, seed).mean(axis=0),');
+        W('                     index=pd.DataFrame(df).index, name="mean")');
+        W();
+        W();
+        W('def interval' + sfx + '(df, prob=' + pyNum(opts.prob === undefined ? 0.8 : opts.prob) +
+          ', kind="y", n=None, seed=0):');
+        W('    """A lower and an upper bound per input row, as a DataFrame.');
+        W();
+        W('    The central interval of the draws, so it is free to be asymmetric,');
+        W('    and where it is that asymmetry is the finding rather than a defect.');
+        W();
+        W('    kind="y" by default: an interval is nearly always read as "where');
+        W('    will the next observation fall", and that reading needs the');
+        W('    observation scatter in it. Pass kind="mu" for the narrower band');
+        W('    around the average.');
+        W('    """');
+        W('    s = samples' + sfx + '(df, kind, n, seed)');
+        W('    lo, hi = (1.0 - prob) / 2.0, 1.0 - (1.0 - prob) / 2.0');
+        W('    q = np.quantile(s, [lo, hi], axis=0)');
+        W('    return pd.DataFrame({"lo": q[0], "hi": q[1]},');
+        W('                        index=pd.DataFrame(df).index)');
+        W();
+        W();
+        W('def percentiles' + sfx + '(df, step=5, kind="y", n=None, seed=0):');
+        W('    """The whole predictive distribution per row, in percentile steps.');
+        W();
+        W('    A DataFrame with one row per input row and columns p5, p10, ... p95');
+        W('    by default. This is the shape to reach for when you want the');
+        W('    distribution rather than a summary of it, without carrying the');
+        W('    draws around.');
+        W('    """');
+        W('    s = samples' + sfx + '(df, kind, n, seed)');
+        W('    ps = np.arange(step, 100, step)');
+        W('    q = np.quantile(s, ps / 100.0, axis=0)');
+        W('    return pd.DataFrame({("p%d" % p): q[i] for i, p in enumerate(ps)},');
+        W('                        index=pd.DataFrame(df).index)');
+        W();
+        W();
+      });
+      /* Die unsuffigierten Namen als Alias auf das erste Ergebnis. Ein Skript,
+         das gegen einen frueheren Export geschrieben wurde, laeuft damit weiter,
+         und wer nur ein Ergebnis hat, sieht den Unterschied nie. */
+      if (multi) {
+        W('# Ohne Suffix: das erste Ergebnis, ' + likes[0].outcome + '.');
+        ['samples', 'median', 'mean', 'interval', 'percentiles'].forEach(function (fn) {
+          W(fn + ' = ' + fn + '_' + likes[0].outcome);
+        });
+        W();
+        W();
+      }
+
       W('if __name__ == "__main__":');
       W('    # A few rows from the data the model was fitted on, which is the one');
       W('    # input that is certainly available. Replace with your own.');
@@ -5145,13 +5380,24 @@
       /* Printed as two tables rather than one joined one, because the point
          value and the interval are not on the same scale unless the outcome is
          continuous: for a count model median() is a rate and interval() is a
-         range of counts. Side by side in one table that looks like a bug. */
-      W('    print("the level (' + muLabel + '), per row:")');
-      W('    print(pd.DataFrame({"median": median(demo), "mean": mean(demo)}))');
-      W('    print()');
-      W('    print("where the next ' + sp.outcome + ' would fall, ' +
-        Math.round((opts.prob === undefined ? 0.8 : opts.prob) * 100) + ' percent of the time:")');
-      W('    print(interval(demo))');
+         range of counts. Side by side in one table that looks like a bug.
+
+         Und einmal je Ergebnis, denn ein Demolauf, der bei fuenf Ergebnissen
+         eines zeigt, laedt genau zu der Annahme ein, die der Export bis
+         2026-09-11 tatsaechlich nahelegte: dass das Modell nur dieses eine
+         habe. */
+      var pct = Math.round((opts.prob === undefined ? 0.8 : opts.prob) * 100);
+      likes.forEach(function (lk, li) {
+        var sfx = likes.length > 1 ? '_' + lk.outcome : '';
+        if (li) W('    print()');
+        W('    print("the level (' + muLevels[li] + '), per row:")');
+        W('    print(pd.DataFrame({"median": median' + sfx + '(demo),');
+        W('                        "mean": mean' + sfx + '(demo)}))');
+        W('    print()');
+        W('    print("where the next ' + lk.outcome + ' would fall, ' +
+          pct + ' percent of the time:")');
+        W('    print(interval' + sfx + '(demo))');
+      });
       W();
 
       return lines.join('\n');
@@ -5222,9 +5468,21 @@
         if (!fits[i] || !fits[i].ok) return { reason: 'notfit', which: i };
       }
       if (fits.length < 2) return { reason: 'toofew' };
+      /* Verglichen wird die MENGE der Ergebnisse, nicht nur das erste.
+
+         Bis 2026-09-11 stand hier fits[i].outcome gegen fits[0].outcome, also
+         je ein einziger Name. Zwei Modelle mit gleichem ersten und
+         verschiedenem zweiten Ergebnis kamen damit durch die Pruefung und
+         wurden gegeneinander gestellt, obwohl sie verschiedene Dinge erklaeren:
+         genau der Fehler, vor dem der Absatz darueber warnt, nur eine Ebene
+         tiefer. Die Reihenfolge zaehlt dabei mit, und das ist Absicht: sie ist
+         die Reihenfolge der "~"-Zeilen, sie ist stabil, und zwei Modelle, die
+         dieselben Ergebnisse in anderer Folge schreiben, sind ohnehin nicht das
+         naheliegende Missverstaendnis, das hier abgefangen werden soll. */
+      var outsOf = function (f) { return (f.outcomes || [f.outcome]).join(', '); };
       for (i = 1; i < fits.length; i++) {
-        if (fits[i].outcome !== fits[0].outcome) {
-          return { reason: 'outcome', which: i, a: fits[0].outcome, b: fits[i].outcome };
+        if (outsOf(fits[i]) !== outsOf(fits[0])) {
+          return { reason: 'outcome', which: i, a: outsOf(fits[0]), b: outsOf(fits[i]) };
         }
       }
       for (i = 1; i < fits.length; i++) {
@@ -5906,6 +6164,7 @@
          poisson   dpois and a log link                        a GLM with rates
          index     a[cat] with a fixed prior                   vector parameters
          multilevel a[cat] ~ dnorm(abar, tau)                  the hierarchy
+         joint     several outcomes, pooled slopes              several "~" lines
 
        The subjects are deliberately unrelated to each other and to anything on
        the rest of this site. An example is read as a statement about what the
@@ -6079,11 +6338,15 @@
         label: 'Index variables',
         build: function (rng) {
           var kinds = ['clay', 'loam', 'sand', 'peat'];
-          var eff = [0.0, 0.35, 0.7, 1.15], sigma = 0.28;
+          /* base und b stehen als Variablen da und nicht als Zahlen in der
+             Formel, damit truth sie exportieren kann, ohne dass jemand
+             dieselbe Zahl an zwei Stellen pflegen muss. Eine Wahrheit, die von
+             ihrem Generator abweichen kann, prueft nichts. */
+          var eff = [0.0, 0.35, 0.7, 1.15], sigma = 0.28, base = 1.2, b = 0.8;
           var lines = ['soil,water,growth'], n = 72;
           for (var i = 0; i < n; i++) {
             var k = i % kinds.length, ld = 0.3 + 0.6 * rng();
-            var v = 1.2 + eff[k] + 0.8 * (ld - 0.6) + sigma * rnorm1(rng);
+            var v = base + eff[k] + b * (ld - 0.6) + sigma * rnorm1(rng);
             lines.push(kinds[k] + ',' + ld.toFixed(3) + ',' + v.toFixed(3));
           }
           return {
@@ -6103,7 +6366,13 @@
               'b ~ dnorm(0, 1)',
               'sigma ~ dexp(2)'
             ].join('\n'),
-            truth: { n: n }
+            /* Die Stufen in der Reihenfolge, in der parseCSV sie nummeriert,
+               also nach erstem Auftreten: kinds[0] wird a[1]. Das gilt hier,
+               weil die Schleife die Boeden reihum durchgeht. */
+            truth: {
+              n: n, b: b, sigma: sigma,
+              a: eff.map(function (e) { return base + e; })
+            }
           };
         }
       },
@@ -6148,6 +6417,135 @@
             truth: { abar: abar, tau: tau, sigma: sigma, n: K * per }
           };
         }
+      },
+      {
+        id: 'joint',
+        /* Das einzige Beispiel mit mehr als einem Ergebnis links vom "~", und
+           es traegt deshalb zwei Dinge auf einmal, die sonst nirgends stehen:
+           dass mehrere Outcome-Zeilen erlaubt sind und gemeinsam zur Likelihood
+           beitragen, und dass ein Hyperprior nicht nur ueber Kategorien laufen
+           kann, sondern auch ueber die Ergebnisse selbst.
+
+           Zwei Ebenen teilen hier Information. tau_g sagt, wie stark das
+           Substrat ueberhaupt wirkt, und gilt fuer alle fuenf Teile. tau_b
+           sagt, wie aehnlich die fuenf Feuchte-Steigungen einander sind. Das
+           zweite ist der Grund fuer die fuenf Teile: mit zweien ist die
+           Streuung einer Steigungsverteilung nicht identifiziert, das Modell
+           laeuft trotzdem durch und die Zahl bedeutet nichts. Fuenf ist wenig,
+           aber es ist ehrlich wenig, und das Intervall von tau_b sagt das auch.
+
+           spores hat mit Absicht das Achtfache an Rauschen. Aus seinen eigenen
+           Zeilen ist seine Steigung kaum zu sehen, ungepoolt landet sie bei
+           1.14 statt 0.78; mit dem Hyperprior wird sie auf 0.89 gezogen,
+           waehrend die vier gut gemessenen Teile sich um hoechstens 0.05
+           bewegen. Genau das ist das Argument fuer partielles Pooling, und es
+           ist an einer einzelnen Zahl ablesbar statt nur behauptet.
+
+           dexp(10) und nicht dexp(4) fuer tau_b: mit fuenf Steigungen, die real
+           nur um 0.09 streuen, laesst ein weiter Prior tau_b auf 0.41 laufen,
+           und dann zieht nichts mehr. Der Prior TUT hier also etwas, was bei
+           fuenf Gruppen ehrlich gesagt sein muss statt versteckt.
+
+           Die Steigungen stehen von Hand nicht-zentriert da, als
+           (bbar + z*tau_b), und nicht als b_cap ~ dnorm(bbar, tau_b). Die
+           automatische Umschreibung in nonCentre greift nur bei VEKTOR-
+           Parametern mit Index; fuenf einzelne Skalare erkennt sie nicht. In
+           der zentrierten Form scheitert quap hier reproduzierbar an der
+           Liniensuche, und NUTS sammelt Divergenzen ein. */
+        label: 'Several outcomes at once',
+        build: function (rng) {
+          var subs = ['straw', 'sawdust', 'compost', 'coffee'];
+          var eff = [0.00, -0.22, 0.18, -0.40];
+          var parts = ['cap', 'stem', 'gills', 'ring', 'spores'];
+          var inter = [1.90, 1.30, 1.55, 0.95, 0.60];
+          var slope = [0.90, 0.72, 0.81, 0.66, 0.78];
+          /* spores achtmal so verrauscht wie der Rest: das ist der Teil, an dem
+             das Zusammenziehen sichtbar wird. */
+          var noise = [0.20, 0.24, 0.22, 0.26, 1.60];
+          var n = 120, lines = [['substrate', 'humidity'].concat(parts).join(',')];
+          var i, j, k, h, row;
+          for (i = 0; i < n; i++) {
+            k = i % subs.length;
+            /* Weite Spanne mit Absicht: bei einem schmalen Feuchtebereich ist
+               die Steigung aus 120 Zeilen nicht zu sehen, und ein Beispiel,
+               dessen Zahl neben der Wahrheit liegt, lehrt das Falsche. */
+            h = 0.35 + 0.75 * rng();
+            row = [subs[k], h.toFixed(3)];
+            for (j = 0; j < parts.length; j++) {
+              row.push(Math.exp(inter[j] + eff[k] + slope[j] * (h - 0.72) +
+                noise[j] * rnorm1(rng)).toFixed(2));
+            }
+            lines.push(row.join(','));
+          }
+          return {
+            csv: lines.join('\n'),
+            model: [
+              '# Several outcomes in one model. Each measured column gets its',
+              '# own "~" line, and all of them add to the same likelihood, so',
+              '# one fit estimates them together.',
+              '# Here: five parts of the same mushroom, on four substrates.',
+              '# TWO things are shared, and that sharing is the whole point:',
+              '#   tau_g = how strongly substrate matters at all, one value for',
+              '#     every part. A substrate with few rows borrows from the rest.',
+              '#   tau_b = how alike the five humidity slopes are. Each slope is',
+              '#     written (bbar + z*tau_b), so a part whose own rows barely',
+              '#     show a slope is pulled towards the average of the others.',
+              '# Watch "spores": it is eight times noisier than the rest. Its',
+              '# own rows put the slope near 1.14, well above the truth of 0.78.',
+              '# Pooling pulls it to about 0.89 while the other four move by less',
+              '# than 0.05. Replace it with a plain b_spores ~ dnorm(0, 1) to see',
+              '# the estimate drift back up, because nothing holds it any more.',
+              '# dlnorm because a size is positive and its spread grows with it.',
+              'cap    ~ dlnorm(mu_cap, s_cap)',
+              'stem   ~ dlnorm(mu_stem, s_stem)',
+              'gills  ~ dlnorm(mu_gills, s_gills)',
+              'ring   ~ dlnorm(mu_ring, s_ring)',
+              'spores ~ dlnorm(mu_spores, s_spores)',
+              'mu_cap    <- a_cap    + g_cap[substrate]    + (bbar + z_cap*tau_b)*(humidity - 0.72)',
+              'mu_stem   <- a_stem   + g_stem[substrate]   + (bbar + z_stem*tau_b)*(humidity - 0.72)',
+              'mu_gills  <- a_gills  + g_gills[substrate]  + (bbar + z_gills*tau_b)*(humidity - 0.72)',
+              'mu_ring   <- a_ring   + g_ring[substrate]   + (bbar + z_ring*tau_b)*(humidity - 0.72)',
+              'mu_spores <- a_spores + g_spores[substrate] + (bbar + z_spores*tau_b)*(humidity - 0.72)',
+              '# One substrate effect per part, all from one shared width.',
+              'g_cap[substrate]    ~ dnorm(0, tau_g)',
+              'g_stem[substrate]   ~ dnorm(0, tau_g)',
+              'g_gills[substrate]  ~ dnorm(0, tau_g)',
+              'g_ring[substrate]   ~ dnorm(0, tau_g)',
+              'g_spores[substrate] ~ dnorm(0, tau_g)',
+              '# The slopes, non-centred by hand. Each real slope is',
+              '# bbar + z*tau_b, so read them off that way, not from z alone.',
+              'z_cap ~ dnorm(0, 1)',
+              'z_stem ~ dnorm(0, 1)',
+              'z_gills ~ dnorm(0, 1)',
+              'z_ring ~ dnorm(0, 1)',
+              'z_spores ~ dnorm(0, 1)',
+              'bbar ~ dnorm(0, 1)',
+              'tau_b ~ dexp(10)',
+              'tau_g ~ dexp(3)',
+              'a_cap ~ dnorm(1.90, 0.5)',
+              'a_stem ~ dnorm(1.30, 0.5)',
+              'a_gills ~ dnorm(1.55, 0.5)',
+              'a_ring ~ dnorm(0.95, 0.5)',
+              'a_spores ~ dnorm(0.60, 0.5)',
+              's_cap ~ dexp(2)',
+              's_stem ~ dexp(2)',
+              's_gills ~ dexp(2)',
+              's_ring ~ dexp(2)',
+              's_spores ~ dexp(2)'
+            ].join('\n'),
+            /* parts und subs stehen mit drin, weil die Wahrheiten hier
+               Vektoren sind und ein Test sonst die Reihenfolge raten
+               muesste, in der a_cap, a_stem, ... zu inter[0], inter[1]
+               gehoeren. g[1] ist subs[0], nach erstem Auftreten.
+               Die Steigungen stehen nicht als Parameter im Modell: dort
+               steht (bbar + z_x*tau_b), und slope ist das, was diese
+               Summe treffen soll. */
+            truth: {
+              n: n, parts: parts, subs: subs,
+              inter: inter, slope: slope, eff: eff, noise: noise
+            }
+          };
+        }
       }
     ];
 
@@ -6163,6 +6561,357 @@
       var built = ex.build(makeRng((seed === undefined ? 20260909 + 7919 * at : seed) >>> 0));
       return { id: ex.id, label: ex.label,
         csv: built.csv, model: built.model, truth: built.truth };
+    }
+
+    /* Die Vorhersagen, je Ergebnis eines.
+
+       Bis 2026-09-11 gab es hier genau EINEN Eintrag, und sein Niveauknoten war
+       geraten: genommen wurde der letzte Eintrag von detNames, also der letzte
+       einer topologischen Sortierung. Bei einem Ergebnis geht das gut, weil es
+       dann nur einen Knoten gibt, der in Frage kommt. Bei fuenf traf es eines
+       von fuenfen, und der Fehler war nicht etwa unauffaellig: gezeichnet wurde
+       das Band des einen Ergebnisses gegen die Datenpunkte eines anderen, also
+       ein Bild, das nach einem voellig unbrauchbaren Modell aussieht, waehrend
+       das Modell in Ordnung ist und nur der Plot zwei Haelften falsch
+       zusammensetzt. Am joint-Beispiel war das reproduzierbar mu_spores gegen
+       cap, ausgerechnet das absichtlich verrauschteste Ergebnis gegen das
+       sauberste.
+
+       Die Zuordnung kommt jetzt aus likeSpec und ist damit abgelesen statt
+       vermutet. Der Preis ist linear in der Zahl der Ergebnisse und faellt nur
+       dort an, wo es mehr als eines gibt.
+
+       2000 Ziehungen und nicht 400 (seit 2026-09-10). Die Zahl ist die
+       Genauigkeit der BAENDER, nicht die des Fits, und bei 400 Ziehungen war das
+       aeussere Band sichtbar ausgefranst: seine Enden sind Perzentile, die
+       Ziehung des Rauschens laeuft je Datenzeile unabhaengig, und das Zittern
+       von Zeile zu Zeile war groesser als die Linienbreite. Das innere Band war
+       davon nie betroffen, weil dort kein neues Rauschen dazukommt, und genau
+       diese Diskrepanz sah nach einem Fehler aus. Die Zacken schrumpfen mit der
+       Wurzel, also um etwa 2.2, und kosten ein paar Millisekunden. Ganz weg sind
+       sie damit nicht, und das ist richtig so: das Band ist eine Schaetzung.
+
+       Beide Modi rufen dieselbe Funktion, damit ein Band im NUTS-Reiter nicht
+       anders genau ist als dasselbe Band daneben. */
+    function predictions(model, samples, opts) {
+      var out = [];
+      model.outcomes.forEach(function (o) {
+        var sp = model.likeSpec(o);
+        if (!sp.muNode) return;
+        var lk = levelDraws(model, samples, o, null, 2000);
+        var sm = simOutcome(model, samples, null, 2000, opts && opts.seed, o);
+        if (!lk || !sm) return;
+        var tr = binomTrials(model, o);
+        out.push({
+          outcome: o,
+          node: sp.muNode,
+          link: summarizeDraws(lk, opts && opts.prob),
+          sim: summarizeDraws(sm, opts && opts.prob),
+          /* Nur bei dbinom gesetzt, siehe binomTrials. */
+          trials: tr ? Array.prototype.slice.call(tr) : null,
+          /* Der NAME der Versuchszahl, sofern sie eine Spalte ist und keine
+             Konstante. Die Werte allein reichen dem Plot fuer die Umrechnung,
+             aber nicht fuer die Frage, welche Spalte als x-Achse angeboten
+             werden darf: die Versuchszahl steckt bereits im Nenner der
+             y-Achse, und sie gegen sich selbst zu zeichnen ergibt nichts.
+             null bei `dbinom(12, p)`, wo es gar keine Spalte gibt. */
+          trialsCol: (tr && typeof sp.argNodes[0] === 'string'
+            && model.cols && model.cols[sp.argNodes[0]]) ? sp.argNodes[0] : null
+        });
+      });
+      return out;
+    }
+
+    /* ----------------------------------------------------------------
+       Der Effektplot: EIN Praediktor variiert, die anderen nicht.
+
+       Bis 2026-09-11 zeichnete der Vorhersagereiter den angepassten Wert je
+       DATENZEILE und verband die Punkte in x-Sortierung. Bei genau einem
+       Praediktor ist das dasselbe wie eine Kurve; bei mehreren ist es keine.
+       Im Pilzbeispiel liegen benachbarte Zeilen auf vier verschiedenen
+       substrate-Niveaus, also sprang die Linie bei jedem Nachbarwechsel
+       zwischen ihnen hin und her, und das Band sprang mit. Jeder einzelne
+       Punkt war richtig, die Verbindung war die Aussage, die niemand gemeint
+       hat.
+
+       Stattdessen ein GITTER ueber den gewaehlten Praediktor. Was mit den
+       anderen geschieht, ist die eigentliche Frage, und darauf gibt es zwei
+       vertretbare Antworten, die hier beide angeboten werden:
+
+       "marginal" (Vorgabe): jeder Gitterpunkt wird ueber die BEOBACHTETEN
+         Zeilen gemittelt, die anderen Spalten behalten also ihre Werte. Die
+         Frage ist "wie sieht der Effekt in dieser Population aus". Das Band
+         traegt damit auch die Streuung der anderen Praediktoren und ist
+         breiter. Vorgabe, weil es keinen Referenzwert braucht: bei einer
+         Kategorie wie substrate ist "der Mittelwert" nicht definiert, und
+         eine Stufe zur Referenz zu erklaeren waere eine stille Setzung.
+
+       "fixed": die anderen Spalten stehen auf einem Referenzwert, numerisch
+         der Mittelwert, kategorisch die HAEUFIGSTE Stufe. Die Frage ist "wie
+         sieht der Effekt bei einem typischen Fall aus". Schmaleres Band, und
+         das ist kein Widerspruch: es beantwortet weniger.
+
+       Der Unterschied ist nicht kosmetisch. Bei einem nichtlinearen Link ist
+       der Mittelwert der Kurven nicht die Kurve des Mittelwerts, die beiden
+       Linien liegen also auch in der MITTE verschieden, nicht nur im Band.
+
+       Gerechnet wird ueber newCols, das levelDraws und simOutcome bereits
+       kennen und an nodeValues durchreichen; dort ersetzt es die Datenspalte
+       fuer die Dauer des Aufrufs. Der marginale Fall baut dafuer ein Gitter
+       der Laenge G*n: jeder Gitterwert einmal gegen jede beobachtete Zeile.
+       Das ist der Grund, warum G klein gehalten ist. */
+    function effectGrid(model, samples, outcome, xname, opts) {
+      opts = opts || {};
+      var mode = opts.mode === 'fixed' ? 'fixed' : 'marginal';
+      var cols = model.cols || {};
+      var xcol = cols[xname];
+      if (!xcol || !xcol.length) return null;
+      var sp = model.likeSpec(outcome);
+      if (!sp || !sp.muNode) return null;
+
+      var n = xcol.length, i, g, r, k;
+      var lvAll = model.spec ? model.spec().levels : null;
+      var lv = lvAll && lvAll[xname] ? lvAll[xname] : null;
+
+      /* Die Gitterwerte selbst. Eine Kategorie bekommt ihre Stufen und sonst
+         nichts: Zwischenwerte zwischen Stufe 2 und 3 gibt es nicht. */
+      var xs = [];
+      if (lv) {
+        for (i = 0; i < lv.length; i++) xs.push(i + 1);
+      } else {
+        /* Ganzzahlige Spalten mit wenigen Werten ebenfalls als Stufen, sonst
+           behauptet das Gitter Zwischenwerte, die die Spalte nicht annimmt
+           (eine Zaehlung 0..5 ist keine stetige Groesse). */
+        var uniq = [], seen = {};
+        for (i = 0; i < n; i++) {
+          var v = xcol[i];
+          if (!isFinite(v)) continue;
+          if (!seen[v]) { seen[v] = 1; uniq.push(v); }
+          if (uniq.length > 12) break;
+        }
+        var allInt = uniq.length <= 12 && uniq.every(function (u) { return u === Math.round(u); });
+        if (allInt && uniq.length > 1) {
+          uniq.sort(function (a, b) { return a - b; });
+          xs = uniq;
+        } else {
+          var lo = Infinity, hi = -Infinity;
+          for (i = 0; i < n; i++) {
+            if (!isFinite(xcol[i])) continue;
+            if (xcol[i] < lo) lo = xcol[i];
+            if (xcol[i] > hi) hi = xcol[i];
+          }
+          if (!isFinite(lo) || hi <= lo) return null;
+          var G = opts.grid || 40;
+          for (g = 0; g < G; g++) xs.push(lo + (hi - lo) * g / (G - 1));
+        }
+      }
+      var GN = xs.length;
+      if (!GN) return null;
+
+      var names = Object.keys(cols);
+      var draws = opts.draws || 800;
+      var lkG, smG;
+
+      if (mode === 'fixed') {
+        /* Eine einzige Auswertung ueber GN Zeilen. Jede vom Modell gelesene
+           Spalte bekommt einen Vektor, auch die unveraenderten: sonst behaelt
+           eine Spalte ihre n Zeilen, waehrend x schon GN lang ist, und die
+           beiden Laengen werden gegeneinander broadcastet. */
+        var nc = {};
+        names.forEach(function (c) {
+          var a = new Float64Array(GN), kk;
+          if (c === xname) {
+            for (kk = 0; kk < GN; kk++) a[kk] = xs[kk];
+          } else {
+            var ref = refValue(cols[c], lvAll && lvAll[c]);
+            for (kk = 0; kk < GN; kk++) a[kk] = ref;
+          }
+          nc[c] = a;
+        });
+        lkG = levelDraws(model, samples, outcome, nc, draws);
+        smG = simOutcome(model, samples, nc, draws, opts.seed, outcome);
+        if (!lkG || !smG) return null;
+        /* Auf die Gitterlaenge zuschneiden. Der Auswertungskontext ist fest
+           auf nObs dimensioniert (ctx.n und makePool(nObs) entstehen beim
+           Compilieren), und jede Vektoroperation schreibt genau so viele
+           Elemente. Ist das Gitter KUERZER als die Datenzeilen, kommen
+           entsprechend zu viele Werte zurueck, und alles hinter dem Gitter
+           ist uninitialisiert: 120 Werte statt 20, die letzten 100 als NaN.
+           Der marginale Zweig hat dieses Problem nicht, weil er ohnehin je
+           Block ueber genau n Zeilen auswertet. */
+        lkG = clipDraws(lkG, GN);
+        smG = clipDraws(smG, GN);
+      } else {
+        /* Marginal: JE GITTERPUNKT ein Aufruf ueber die n beobachteten Zeilen,
+           x auf den Gitterwert gesetzt, alles andere original.
+
+           Warum nicht ein einziger Aufruf ueber ein GN*n langes Gitter, was
+           deutlich weniger Schleifendurchlaeufe waeren: der Auswertungskontext
+           ist auf nObs dimensioniert. ctx.n und der Puffer-Pool entstehen
+           einmal beim Compilieren (makePool(nObs)), und jede Vektoroperation
+           schreibt genau ctx.n Elemente. Ein laengeres Gitter fuellt also nur
+           seine ersten n Werte, und der Rest bleibt uninitialisiert: der erste
+           Gitterpunkt kam heraus, alle weiteren als NaN. Das sah nach einem
+           Fehler in der Mittelung aus und lag eine Ebene tiefer.
+
+           ctx.n fuer diesen Zweck aufzubohren hiesse, den Fit-Pfad anzufassen,
+           damit ein Plot bequemer wird. Blockweise auszuwerten kostet GN
+           Aufrufe und laesst die Dimensionierung in Ruhe. */
+        var lkRows = [], smRows = [], gIdx, sIdx;
+        for (gIdx = 0; gIdx < GN; gIdx++) {
+          var ncb = {}, xv = xs[gIdx];
+          names.forEach(function (c) {
+            if (c === xname) {
+              var a = new Float64Array(n), rr;
+              for (rr = 0; rr < n; rr++) a[rr] = xv;
+              ncb[c] = a;
+            } else {
+              ncb[c] = cols[c];
+            }
+          });
+          var lkb = levelDraws(model, samples, outcome, ncb, draws);
+          var smb = simOutcome(model, samples, ncb, draws, opts.seed, outcome);
+          if (!lkb || !smb) return null;
+          lkRows.push(lkb);
+          smRows.push(smb);
+        }
+
+        /* Je Ziehung ueber die n Zeilen gemittelt, nicht erst am Ende ueber
+           die Perzentile. Das ist der Unterschied zwischen "die mittlere
+           Kurve dieser Population" und "das Mittel der Bandraender", und nur
+           das erste ist eine Kurve, die das Modell tatsaechlich glaubt. */
+        var S0 = lkRows[0].rows.length, lrows = [];
+        for (sIdx = 0; sIdx < S0; sIdx++) {
+          var orow = new Float64Array(GN);
+          for (gIdx = 0; gIdx < GN; gIdx++) {
+            var src = lkRows[gIdx].rows[sIdx], sum = 0, kk2 = 0;
+            for (var rr2 = 0; rr2 < src.length; rr2++) {
+              if (isFinite(src[rr2])) { sum += src[rr2]; kk2++; }
+            }
+            orow[gIdx] = kk2 ? sum / kk2 : NaN;
+          }
+          lrows.push(orow);
+        }
+        lkG = { S: S0, n: GN, rows: lrows };
+
+        /* Das simulierte Band wird NICHT gemittelt: es soll die Streuung
+           einzelner Beobachtungen zeigen, und ein Mittelwert ueber n Zeilen
+           haette sie per Wurzel-n schon weggerechnet. Die n Zeilen eines
+           Blocks werden stattdessen zu n zusaetzlichen Ziehungen desselben
+           Gitterpunkts. */
+        var S1 = smRows[0].rows.length, srows = [];
+        for (sIdx = 0; sIdx < S1; sIdx++) {
+          var nr = smRows[0].rows[sIdx].length;
+          for (var rr3 = 0; rr3 < nr; rr3++) {
+            var orow2 = new Float64Array(GN);
+            for (gIdx = 0; gIdx < GN; gIdx++) {
+              var sr = smRows[gIdx].rows[sIdx];
+              orow2[gIdx] = sr[rr3 < sr.length ? rr3 : sr.length - 1];
+            }
+            srows.push(orow2);
+          }
+        }
+        smG = { S: srows.length, n: GN, rows: srows };
+      }
+
+      /* Die Versuchszahl je Gitterpunkt. Der Plot teilt das simulierte Band
+         durch sie, also muss hier dieselbe Zahl stehen, mit der simuliert
+         wurde: im festen Modus der Referenzwert, im marginalen der
+         Mittelwert ueber die Zeilen. */
+      var tr = binomTrials(model, outcome), trG = null;
+      if (tr && tr.length) {
+        trG = new Float64Array(GN);
+        var tsum = 0, tk = 0;
+        for (i = 0; i < tr.length; i++) { if (isFinite(tr[i])) { tsum += tr[i]; tk++; } }
+        var tmean = tk ? tsum / tk : 1;
+        for (g = 0; g < GN; g++) trG[g] = tmean;
+      }
+
+      return {
+        outcome: outcome,
+        node: sp.muNode,
+        x: xs,
+        labels: lv ? lv.slice() : null,
+        mode: mode,
+        link: summarizeDraws(lkG, opts.prob),
+        sim: summarizeDraws(smG, opts.prob),
+        trials: trG ? Array.prototype.slice.call(trG) : null
+      };
+    }
+
+    /* Die ersten k Spalten jeder Ziehung, wenn die Auswertung mehr geliefert
+       hat als das Gitter lang ist. Siehe die Begruendung an der Aufrufstelle. */
+    function clipDraws(d, k) {
+      if (!d || d.n === k) return d;
+      var rows = [];
+      for (var s = 0; s < d.rows.length; s++) {
+        var src = d.rows[s], out = new Float64Array(k);
+        for (var i = 0; i < k; i++) out[i] = src[i];
+        rows.push(out);
+      }
+      return { S: d.S, n: k, rows: rows };
+    }
+
+    /* Der Referenzwert einer Spalte: bei einer Kategorie die haeufigste Stufe,
+       sonst der Mittelwert. Der Modus und nicht die erste Stufe, weil "erste"
+       nur heisst, dass sie in Zeile 1 stand. */
+    function refValue(a, levels) {
+      var i, s = 0, k = 0;
+      if (levels && levels.length) {
+        var cnt = {}, key;
+        for (i = 0; i < a.length; i++) {
+          if (!isFinite(a[i])) continue;
+          cnt[a[i]] = (cnt[a[i]] || 0) + 1;
+        }
+        var best = null, bn = -1;
+        for (key in cnt) {
+          if (cnt[key] > bn) { bn = cnt[key]; best = Number(key); }
+        }
+        return best === null ? 1 : best;
+      }
+      for (i = 0; i < a.length; i++) {
+        if (!isFinite(a[i])) continue;
+        s += a[i]; k++;
+      }
+      return k ? s / k : 0;
+    }
+
+    /* Alle Effektgitter, die der Vorhersagereiter anbieten kann: je Ergebnis,
+       je moeglicher x-Spalte, je Modus eines. Berechnet wird im Worker und
+       zusammen mit dem Fit, weil das Modell nur dort existiert und nach dem
+       Job verworfen wird. Auf Abruf zu rechnen hiesse, es neu zu compilieren
+       und neu zu fitten, und im NUTS-Modus den Sampler ein zweites Mal laufen
+       zu lassen: rund eine Sekunde fuer einen Klick auf einen Umschalter.
+
+       Der Preis dieser Richtung ist, dass auch Gitter entstehen, die niemand
+       ansieht. Deshalb ist das Gitter mit 25 Punkten und 200 Ziehungen
+       bewusst grob gehalten: es traegt ein Band, keine Tabelle, und die
+       Zacken, die dabei bleiben, sind kleiner als die Breite der Linie.
+
+       Die Schluessel sind "outcome|spalte|modus", damit die App ohne eigene
+       Suche nachschlagen kann. */
+    function effectGrids(model, samples, opts) {
+      var out = {}, cands;
+      try {
+        cands = model.spec().columns || [];
+      } catch (e) { return out; }
+      model.outcomes.forEach(function (o) {
+        var sp = model.likeSpec(o);
+        if (!sp.muNode) return;
+        cands.forEach(function (xn) {
+          ['marginal', 'fixed'].forEach(function (mode) {
+            var g;
+            try {
+              g = effectGrid(model, samples, o, xn, {
+                mode: mode, prob: opts && opts.prob, seed: opts && opts.seed,
+                draws: 200, grid: 25
+              });
+            } catch (e) { g = null; }
+            if (g) out[o + '|' + xn + '|' + mode] = g;
+          });
+        });
+      });
+      return out;
     }
 
     /* ================================================================
@@ -6229,32 +6978,8 @@
           var qpairs = pairsFigure(samples, { probs: [0.5, 0.8, 0.95] });
 
           post({ type: 'progress', stage: 'predictions', frac: 0.9 });
-          var pred = null;
-          if (model.detNames.length) {
-            var nd = model.detNames[model.detNames.length - 1];
-            /* 2000 und nicht 400 (seit 2026-09-10). Die Zahl ist die Genauigkeit
-               der BAENDER, nicht die des Fits, und bei 400 Ziehungen war das
-               aeussere Band sichtbar ausgefranst: seine Enden sind Perzentile,
-               die Ziehung des Rauschens laeuft je Datenzeile unabhaengig, und
-               das Zittern von Zeile zu Zeile war groesser als die Linienbreite.
-               Das innere Band war davon nie betroffen, weil dort kein neues
-               Rauschen dazukommt, und genau diese Diskrepanz sah nach einem
-               Fehler aus. Die Zacken schrumpfen mit der Wurzel, also um etwa
-               2.2, und kosten ein paar Millisekunden. Ganz weg sind sie damit
-               nicht, und das ist richtig so: das Band ist eine Schaetzung. */
-            var lk = linkNode(model, samples, nd, null, 2000);
-            var sm = simOutcome(model, samples, null, 2000, msg.opts && msg.opts.seed);
-            if (lk && sm) {
-              var qtr = binomTrials(model);
-              pred = {
-                node: nd,
-                link: summarizeDraws(lk, msg.opts && msg.opts.prob),
-                sim: summarizeDraws(sm, msg.opts && msg.opts.prob),
-                /* Nur bei dbinom gesetzt, siehe binomTrials. */
-                trials: qtr ? Array.prototype.slice.call(qtr) : null
-              };
-            }
-          }
+          var pred = predictions(model, samples, msg.opts);
+          var grids = effectGrids(model, samples, msg.opts);
 
           post({
             type: 'done',
@@ -6274,7 +6999,7 @@
               slotGroup: model.slotGroup, nonCentred: model.nonCentred,
               nObs: model.nObs, nDropped: model.nDropped, rows: model.rows,
               nPar: model.nPar, iters: fit.iters, logp: fit.logp,
-              outcome: model.outcome, pred: pred, pairs: qpairs,
+              outcome: model.outcome, outcomes: model.outcomes, pred: pred, grids: grids, pairs: qpairs,
               detNames: model.detNames
             }
           });
@@ -6388,24 +7113,8 @@
           var mpairs = pairsFigure(msamples, { divergent: mdiv, probs: [0.5, 0.8, 0.95] });
 
           post({ type: 'progress', stage: 'predictions', frac: 0.9 });
-          var mpred = null;
-          if (mmodel.detNames.length) {
-            var mnd = mmodel.detNames[mmodel.detNames.length - 1];
-            /* Dieselben 2000 wie im quap-Pfad, aus demselben Grund. Die beiden
-               Modi muessen hier gleich genau sein, sonst waere ein Band im
-               NUTS-Reiter zackiger als dasselbe Band daneben. */
-            var mlk = linkNode(mmodel, msamples, mnd, null, 2000);
-            var msm = simOutcome(mmodel, msamples, null, 2000, msg.opts && msg.opts.seed);
-            if (mlk && msm) {
-              var mtr = binomTrials(mmodel);
-              mpred = {
-                node: mnd,
-                link: summarizeDraws(mlk, msg.opts && msg.opts.prob),
-                sim: summarizeDraws(msm, msg.opts && msg.opts.prob),
-                trials: mtr ? Array.prototype.slice.call(mtr) : null
-              };
-            }
-          }
+          var mpred = predictions(mmodel, msamples, msg.opts);
+          var mgrids = effectGrids(mmodel, msamples, msg.opts);
           /* The trace plot gets its own thinned copy rather than the draws:
              sending a thousand points per chain per parameter back to the main
              thread would be the largest message this tool ever posts, for a plot
@@ -6432,7 +7141,8 @@
               links: mmodel.params.map(function (pp) { return pp.linkName; }),
               nObs: mmodel.nObs, nDropped: mmodel.nDropped, rows: mmodel.rows,
               nPar: mmodel.nPar,
-              outcome: mmodel.outcome, pred: mpred, detNames: mmodel.detNames,
+              outcome: mmodel.outcome, outcomes: mmodel.outcomes, pred: mpred, grids: mgrids,
+              detNames: mmodel.detNames,
               pairs: mpairs,
               diag: diag, traces: traces,
               chainInfo: chains.map(function (ch) {
@@ -6486,7 +7196,10 @@
       roundToRange: roundToRange,
       jointDensity: jointDensity, hpdLevels: hpdLevels, pairsFigure: pairsFigure,
       posteriorCor: posteriorCor, gridCheck: gridCheck,
-      linkNode: linkNode, simOutcome: simOutcome, priorPredictive: priorPredictive,
+      linkNode: linkNode, levelDraws: levelDraws,
+      simOutcome: simOutcome, priorPredictive: priorPredictive,
+      binomTrials: binomTrials, predictions: predictions,
+      effectGrid: effectGrid, effectGrids: effectGrids, refValue: refValue,
       summarizeDraws: summarizeDraws,
       logLikMatrix: logLikMatrix, waic: waic, waicParts: waicParts, psis: psis, gpdFit: gpdFit,
       comparable: comparable, compareFits: compareFits,
@@ -7949,10 +8662,10 @@
           ? 'Not every model has been fitted yet, or one of them failed. Fit them all, and if one '
             + 'refuses to fit, that is the finding: a comparison cannot include it.'
           : p.reason === 'outcome'
-          ? 'These models are not comparable: one has "' + p.a + '" on the left of the first tilde '
-            + 'and another has "' + p.b + '". Both criteria are on the scale of the outcome, so '
-            + 'comparing models of different outcomes would produce numbers that look perfectly '
-            + 'ordinary and mean nothing at all.'
+          ? 'These models are not comparable: one explains "' + p.a + '" and another explains "'
+            + p.b + '". Both criteria are on the scale of the outcome, so comparing models of '
+            + 'different outcomes would produce numbers that look perfectly ordinary and mean '
+            + 'nothing at all.'
           : p.reason === 'rowset'
           ? 'These models were fitted to ' + p.n + ' rows each, but not to the SAME ' + p.n + ' rows: '
             + 'they use columns with missing values in different places, so each dropped a different '
@@ -8091,8 +8804,8 @@
        know that a row is missing. Without this the plot would pair the i-th row
        of the FILE with the i-th fitted value and draw a quietly wrong picture,
        which is the worst kind. */
-    function PredPlot({ pred, data, outcome, xname, rows }) {
-      if (!pred || !data || !xname) return null;
+    function PredPlot({ pred, grid, data, outcome, xname, rows }) {
+      if (!pred || !grid || !data || !xname) return null;
       let x = data.columns[xname], y = data.columns[outcome];
       if (!x || !y) return null;
       if (rows && rows.length) {
@@ -8103,15 +8816,12 @@
       /* Nach der Zeilenauswahl, denn trials zaehlt die Zeilen des FITS und y
          ab hier ebenfalls. Vorher geteilt waere um die verworfenen Zeilen
          verschoben. */
-      const asProp = (arr, t) => Float64Array.from(arr, (v, i) => (
-        t[i] > 0 ? v / t[i] : NaN));
       /* Ein Binomialmodell wird als ANTEIL gezeichnet und nicht als Zahl der
          Erfolge. Der Grund ist der deterministische Knoten: bei
          `yes ~ dbinom(asked, p)` ist p eine Wahrscheinlichkeit in 0..1,
          waehrend die Spalte yes bis asked zaehlt. Zeichnet man beide in
          dieselbe Achse, kriecht die Linie bei zwoelf Versuchen zwoelfmal zu
          flach am Boden entlang und das Band um p liegt platt auf der Null.
-         Genau so sah es bis zum 2026-09-10 aus.
 
          Von den zwei Wegen, das geradezuziehen, ist dies der gewaehlte: das
          OUTCOME kommt auf die Skala von p, nicht p auf die des Outcomes. Die
@@ -8119,64 +8829,74 @@
          ist ("wie wahrscheinlich ist ja"), und p bleibt unangetastet die
          Groesse, die das Modell schaetzt.
 
-         Der Preis steht im Bild und ist nicht wegzurechnen: ein Anteil aus
-         zwoelf Versuchen sieht aus wie einer aus tausend, obwohl er sehr viel
-         unsicherer ist. Das aeussere Band traegt diese Information, denn es
-         wird bei genau dieser Versuchszahl simuliert und ist entsprechend
-         breit. Solange asked ueber alle Zeilen gleich ist, ist das exakt; wo
-         es sich unterscheidet, ist die Breite des Bandes je Zeile verschieden,
-         was ebenfalls stimmt.
+         Die Punkte werden je Zeile durch IHRE Versuchszahl geteilt, das Band
+         durch die des Gitters: pred.trials zaehlt die Zeilen des Fits,
+         grid.trials die Gitterpunkte, und die beiden sind seit dem Umbau auf
+         den Effektplot verschieden lang.
 
          trials ist null fuer jede andere Verteilung, und dann passiert hier
          nichts: dpois liefert mit lambda bereits den Erwartungswert der
          Zaehlung, dnorm mit mu die Sache selbst. */
-      const trials = pred.trials && pred.trials.length ? pred.trials : null;
+      const rowTrials = pred.trials && pred.trials.length ? pred.trials : null;
+      const gridTrials = grid.trials && grid.trials.length ? grid.trials : null;
 
-      /* Das simulierte Band zaehlt Erfolge und wird mitgeteilt; das Band um
-         den Knoten selbst ist schon eine Wahrscheinlichkeit und bleibt. */
-      let simLo = pred.sim.lo, simHi = pred.sim.hi;
-      if (trials) {
-        y = asProp(y, trials);
-        simLo = asProp(simLo, trials);
-        simHi = asProp(simHi, trials);
+      let simLo = grid.sim.lo, simHi = grid.sim.hi;
+      let linkLo = grid.link.lo, linkHi = grid.link.hi, linkMean = grid.link.mean;
+      if (rowTrials) {
+        y = Float64Array.from(y, (v, i) => (rowTrials[i] > 0 ? v / rowTrials[i] : NaN));
+      }
+      if (gridTrials) {
+        const gp = (arr) => Float64Array.from(arr, (v, i) => (
+          gridTrials[i] > 0 ? v / gridTrials[i] : NaN));
+        simLo = gp(simLo); simHi = gp(simHi);
       }
 
-      const n = Math.min(x.length, pred.link.mean.length);
-      const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => x[a] - x[b]);
+      /* Eine Kategorie bekommt keine Linie, sondern je Stufe einen Punkt mit
+         zwei Intervallen. Eine Verbindung zwischen "straw" und "sawdust"
+         wuerde einen Zwischenwert behaupten, den es nicht gibt, und die
+         Reihenfolge der Stufen ist ohnehin nur die ihres ersten Auftretens. */
+      const isCat = !!(grid.labels && grid.labels.length);
+      const gx = grid.x;
+      const n = x.length;
+      /* Die Punkte werden nicht mehr verbunden, also braucht es keine
+         Sortierung fuer die Linie. Sie bleibt fuer das Clipping der
+         Randpunkte und kostet nichts. */
+      const order = Array.from({ length: n }, (_, i) => i);
       /* pad traegt jetzt die Zahlen UND den gedrehten Achsentitel daneben, also
          ein paar Pixel mehr als die 42, die fuer die Zahlen allein reichten. */
       const W = 560, H = 330, pad = 54;
       let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
       for (let i = 0; i < n; i++) {
+        if (!isFinite(x[i])) continue;
         xlo = Math.min(xlo, x[i]); xhi = Math.max(xhi, x[i]);
-        ylo = Math.min(ylo, y[i], simLo[i]); yhi = Math.max(yhi, y[i], simHi[i]);
+        if (isFinite(y[i])) { ylo = Math.min(ylo, y[i]); yhi = Math.max(yhi, y[i]); }
       }
-      /* Die Skala liegt exakt auf min und max, ohne jeden Zuschlag. Das
-         Band ist ein Polygon durch die beobachteten x-Werte und kann deshalb
-         nie weiter reichen als diese; jede Luft am Rand wird damit
-         zwangslaeufig zu einem Spalt zwischen Band und Rahmen.
-
-         Am 2026-09-10 standen hier nacheinander zwei Versuche, das anders zu
-         loesen. Erst ein Abzug von vier Pixeln in der Abbildung selbst, der
-         alles mitverschob und den Spalt sogar auf beiden Achsen erzeugte.
-         Dann ein Zuschlag von 4% auf den Wertebereich, wie matplotlib ihn als
-         margins kennt: sauberer, aber am Spalt aendert das nichts, denn er
-         folgt daraus, dass das Band an den Daten endet und nicht am Rahmen.
-         Ein Band bis zum Rahmen zu ziehen hiesse, das Modell an x-Werten zu
-         zeigen, an denen es nicht ausgewertet wurde.
-
-         Die Randpunkte liegen damit wieder auf den Achsen und werden dort
-         angeschnitten, siehe die geclippte Gruppe bei den Kreisen. Ein halber
-         Kreis auf der Achse ist die ehrlichere Auskunft: er sagt, dass dieser
-         Punkt der aeusserste ist. */
+      /* Die Skala muss BEIDES fassen, die Daten und das Band. Frueher liefen
+         beide ueber dieselben x-Werte, sodass die Datengrenzen genuegten; das
+         Gitter kann jetzt an den Raendern darueber hinausragen, und ein Band,
+         das am Rahmen abgeschnitten wird, sieht aus wie ein Rechenfehler. */
+      for (let i = 0; i < gx.length; i++) {
+        xlo = Math.min(xlo, gx[i]); xhi = Math.max(xhi, gx[i]);
+        if (isFinite(simLo[i])) ylo = Math.min(ylo, simLo[i]);
+        if (isFinite(simHi[i])) yhi = Math.max(yhi, simHi[i]);
+      }
+      /* Bei einer Kategorie liegen die Stufen auf 1..K, und ein Punkt genau
+         auf der Achse waere halb abgeschnitten. Eine halbe Stufe Luft an
+         jedem Ende ist hier das Richtige, anders als im stetigen Fall: die
+         Achse zaehlt Faecher, sie misst nichts. */
+      if (isCat) { xlo -= 0.5; xhi += 0.5; }
       const px = (v) => pad + (v - xlo) / (xhi - xlo || 1) * (W - pad - 12);
       const py = (v) => H - pad - (v - ylo) / (yhi - ylo || 1) * (H - pad - 14);
+      /* Das Band laeuft ueber die GITTERPUNKTE, nicht mehr ueber die
+         Datenzeilen. Das ist der ganze Unterschied zum alten Bild: dort war
+         es ein Polygon durch n angepasste Werte, die in x-Sortierung
+         verbunden wurden und bei jedem Wechsel des Substrats sprangen. */
       const band = (loA, hiA) => {
-        const up = order.map((i) => px(x[i]) + ',' + py(hiA[i])).join(' L');
-        const dn = order.slice().reverse().map((i) => px(x[i]) + ',' + py(loA[i])).join(' L');
+        const up = gx.map((v, i) => px(v) + ',' + py(hiA[i])).join(' L');
+        const dn = gx.map((v, i) => px(v) + ',' + py(loA[i])).reverse().join(' L');
         return 'M' + up + ' L' + dn + ' Z';
       };
-      const line = order.map((i, k) => (k ? 'L' : 'M') + px(x[i]) + ',' + py(pred.link.mean[i])).join(' ');
+      const line = gx.map((v, i) => (i ? 'L' : 'M') + px(v) + ',' + py(linkMean[i])).join(' ');
       /* Runde Schrittweiten statt fester Teilung: eine Achse, die bei 0.8333
          beschriftet ist, ist zwar korrekt und trotzdem unlesbar. Aus 1, 2 und
          5 mal einer Zehnerpotenz wird die genommen, die ungefaehr auf die
@@ -8194,16 +8914,25 @@
         const dec = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
         return out.map((v) => ({ v: v, s: v.toFixed(Math.min(dec, 6)) }));
       };
-      const xt = ticks(xlo, xhi, 5), yt = ticks(ylo, yhi, 5);
+      /* Eine Kategorie beschriftet ihre Stufen und nicht die Zahlen, unter
+         denen sie intern laufen: "2" auf der Achse waere die Codierung und
+         nicht die Auskunft. */
+      const xt = isCat
+        ? grid.labels.map((lab, i) => ({ v: i + 1, s: lab }))
+        : ticks(xlo, xhi, 5);
+      const yt = ticks(ylo, yhi, 5);
       /* Die Achse traegt, was auf ihr steht. "yes" waere jetzt falsch, denn
          gezeichnet ist nicht die Zahl der Ja, sondern ihr Anteil. */
-      const yLabel = trials ? outcome + ' (proportion)' : outcome;
+      const yLabel = rowTrials ? outcome + ' (proportion)' : outcome;
       return html`
         <${React.Fragment}>
           <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H}>
-            <path d=${band(simLo, simHi)} fill="var(--tool-sig-info)" opacity="0.13" />
-            <path d=${band(pred.link.lo, pred.link.hi)} fill="var(--tool-sig-info)" opacity="0.30" />
-            <path d=${line} fill="none" stroke="var(--tool-sig-info)" strokeWidth="1.8" />
+            ${isCat ? null : html`
+              <${React.Fragment}>
+                <path d=${band(simLo, simHi)} fill="var(--tool-sig-info)" opacity="0.13" />
+                <path d=${band(linkLo, linkHi)} fill="var(--tool-sig-info)" opacity="0.30" />
+                <path d=${line} fill="none" stroke="var(--tool-sig-info)" strokeWidth="1.8" />
+              <//>`}
             <!-- Die Gitterlinien liegen hinter den Datenpunkten. Sie standen
                  bis 2026-09-10 davor, mit der Begruendung, dass sie blass
                  genug seien, um nichts zu ueberschreiben. Das stimmte fuer
@@ -8269,17 +8998,42 @@
                 <circle key=${i} cx=${px(x[i])} cy=${py(y[i])} r="2.6"
                   fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
             </g>
+            <!-- Der kategoriale Fall, ueber den Punkten: je Stufe ein dicker
+                 Strich fuer das Niveau und ein duenner fuer die simulierte
+                 Beobachtung, plus der Mittelwert als Punkt. Ueber den Daten,
+                 weil die Schaetzung hier die Aussage ist und sonst in der
+                 Punktwolke verschwindet. -->
+            ${isCat ? gx.map((v, i) => html`
+              <${React.Fragment} key=${'c' + i}>
+                <line x1=${px(v)} y1=${py(simLo[i])} x2=${px(v)} y2=${py(simHi[i])}
+                  stroke="var(--tool-sig-info)" strokeWidth="2" opacity="0.35" strokeLinecap="round" />
+                <line x1=${px(v)} y1=${py(linkLo[i])} x2=${px(v)} y2=${py(linkHi[i])}
+                  stroke="var(--tool-sig-info)" strokeWidth="5" strokeLinecap="round" />
+                <circle cx=${px(v)} cy=${py(linkMean[i])} r="3.2" fill="var(--tool-sig-info)"
+                  stroke="var(--tool-surface)" strokeWidth="1" />
+              <//>`) : null}
           </svg>
           <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
-            ${trials
+            ${rowTrials
               ? html`Circles are the observed data as a proportion, ${outcome} divided by the number of
-                  trials in that row, because ${pred.node} is a probability and the column counts
+                  trials in that row, because ${grid.node} is a probability and the column counts
                   successes. `
               : 'Circles are the observed data. '}
-            The dark band is the uncertainty in ${pred.node} itself, the
-            pale one adds the observation noise, so about ${(pred.link.prob * 100).toFixed(0)} percent of
-            real points should fall inside it. A band too narrow for its own data is the honest sign of a
-            model that is too sure of itself.
+            The dark ${isCat ? 'bar' : 'band'} is the uncertainty in ${grid.node} itself, the
+            pale one adds the observation noise, so about ${(grid.link.prob * 100).toFixed(0)} percent of
+            real points should fall inside it.
+            ${' '}
+            ${grid.mode === 'marginal'
+              ? html`Only ${xname} moves along the axis. The other predictors keep the values they
+                  actually have in the data, and each point on the curve averages over all of them, so
+                  the band carries their spread as well. This is the effect in THIS population.`
+              : html`Only ${xname} moves along the axis. The other predictors are pinned to one value,
+                  numeric ones at their mean and categorical ones at their most common level. This is
+                  the effect for a single average case, and the band is narrower because it answers
+                  less: it leaves out the variation in everything else.`}
+            ${' '}
+            The circles are the real rows and do not move with that choice, so points can sit well off
+            the curve wherever a predictor that is not on the axis pushes them.
           </p>
         <//>`;
     }
@@ -8726,14 +9480,95 @@
         navigator.clipboard.writeText([fmtRow(head)].concat(rows.map(fmtRow)).join('\n'));
       }, [res]);
 
-      /* The predictor for the plot: the first data column the model actually
-         mentions, which is the one worth putting on the x axis. */
-      const xname = useMemo(() => {
-        if (!res || !data) return null;
-        const inModel = Object.keys(data.columns).filter((c) => c !== res.outcome &&
+      /* Welches Ergebnis wird gezeichnet? Bei einem Modell mit mehreren
+         "~"-Zeilen ist das eine echte Frage, und bis 2026-09-11 wurde sie
+         stillschweigend mit "das erste" beantwortet. Gehalten wird der Index
+         und nicht der Name, damit ein Wechsel des Modells nicht auf ein
+         Ergebnis zeigt, das es dort nicht gibt; das Abschneiden unten faengt
+         genau den Fall ab. */
+      const [predAt, setPredAt] = useState(0);
+      const predList = (res && res.pred) || [];
+      const predOne = predList.length ? predList[Math.min(predAt, predList.length - 1)] : null;
+
+      /* Was mit den ANDEREN Praediktoren geschieht, waehrend einer auf der
+         Achse laeuft. Die Vorgabe ist marginal, siehe den Kommentar an
+         effectGrid: sie braucht keinen Referenzwert und ist damit auch fuer
+         eine kategoriale Spalte definiert. */
+      const [predMode, setPredMode] = useState('marginal');
+
+      /* Die Spalten, die als x-Achse in Frage kommen: was das Modell als
+         Eingabe liest, ohne die Ergebnisse selbst.
+
+         Kategoriale Spalten stehen hinten statt vorn. Der Plot traegt eine
+         stetige Achse und verbindet die Punkte zu einem Band; eine Spalte mit
+         vier Auspraegungen ergibt dort vier Saeulen mit einem Band dazwischen,
+         das ueber Zwischenwerte laeuft, die es nicht gibt. Am joint-Beispiel
+         war "substrate" genau deshalb der geratene Default, weil es in der CSV
+         zuerst steht. Ausgeschlossen sind sie nicht: wer sie sehen will, waehlt
+         sie, und eine Indexspalte gegen das Ergebnis ist als Streubild durchaus
+         lesbar. Sie sind nur nicht mehr die Vorgabe.
+
+         Zwei Arten von Spalte werden dagegen ganz ausgeschlossen, weil sie
+         als x-Achse kein Bild ergeben, das man lesen koennte:
+
+         KONSTANTE Spalten. Steht in allen Zeilen derselbe Wert, liegen alle
+         Punkte auf derselben x-Position, und der Plot wird zu einer
+         senkrechten Nadel am linken Rand, ohne eine einzige Beschriftung an
+         der x-Achse. Genau so sah das logistische Beispiel aus, wenn man dort
+         "asked" waehlte, wo in allen 80 Zeilen 12 steht. Kaputt ist dabei
+         nichts: die Skala faengt die Division durch die Spannweite null ab und
+         die Tick-Funktion liefert fuer hi <= lo nichts, beides richtig. Es
+         gibt nur nichts zu zeichnen, und das sieht nach einem Fehler aus.
+
+         Die VERSUCHSZAHL eines Binomialmodells, und zwar auch dann, wenn sie
+         variiert. Sie steckt bereits im Nenner der y-Achse, denn der Plot
+         zeichnet das Outcome als Anteil und teilt dafuer durch genau diese
+         Spalte. Sie zusaetzlich waagerecht aufzutragen hiesse, eine Groesse
+         gegen sich selbst zu zeichnen.
+
+         Beides faellt still weg statt mit einer Meldung. Die Leiste erscheint
+         ohnehin erst ab zwei Optionen, und im logistischen Beispiel bleibt
+         damit nur ad_spend uebrig, also gar keine Leiste: der Plot sieht dort
+         wieder aus wie ein Modell mit einem Praediktor, was er auch ist. */
+      const xopts = useMemo(() => {
+        if (!res || !data) return [];
+        const outs = res.outcomes || [res.outcome];
+        const cat = (c) => {
+          const li = data.names ? data.names.indexOf(c) : -1;
+          return li >= 0 && data.levels && data.levels[li] ? 1 : 0;
+        };
+        /* Ueber die BEOBACHTETEN Werte, denn eine Spalte aus einem Wert und
+           lauter Loechern ist genauso konstant wie eine ohne Loecher. */
+        const varies = (c) => {
+          const a = data.columns[c];
+          let seen = null;
+          for (let i = 0; i < a.length; i++) {
+            if (!isFinite(a[i])) continue;
+            if (seen === null) seen = a[i];
+            else if (a[i] !== seen) return true;
+          }
+          return false;
+        };
+        /* Je Ergebnis eine, und ausgeschlossen wird die Vereinigung: bei
+           mehreren Binomialergebnissen mit verschiedenen Versuchszahlen ist
+           jede davon fuer ihr eigenes Ergebnis der Nenner. */
+        const trialCols = {};
+        (res.pred || []).forEach((p) => { if (p.trialsCol) trialCols[p.trialsCol] = true; });
+        const inModel = Object.keys(data.columns).filter((c) => outs.indexOf(c) < 0 &&
+          !trialCols[c] && varies(c) &&
           new RegExp('\\b' + c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(model));
-        return inModel.length ? inModel[0] : null;
+        return inModel.slice().sort((a, b) => cat(a) - cat(b));
       }, [res, data, model]);
+      const [xat, setXat] = useState(0);
+      const xname = xopts.length ? xopts[Math.min(xat, xopts.length - 1)] : null;
+
+      /* Das vorberechnete Gitter zur aktuellen Auswahl. Fehlt es, war die
+         Sitzungsdatei aelter als der Effektplot oder das Modell hat fuer
+         diese Spalte keines hergegeben; der Reiter sagt das dann, statt eine
+         leere Flaeche zu zeigen. */
+      const predGrid = (res && res.grids && predOne && xname)
+        ? (res.grids[predOne.outcome + '|' + xname + '|' + predMode] || null)
+        : null;
 
       /* Der Cross-Check existiert nur im quap-Modus: seine Frage lautet "taugt
          die Gaussnaeherung hier", und im NUTS-Modus gibt es keine. An seine
@@ -9071,8 +9906,60 @@
                   <${SubsetPicker} blocks=${subset.blocks} on=${subset.on} setOn=${subset.setOn} />
                   <${CorMatrix} names=${res.names} cor=${res.cor} keep=${subset.keep} />
                 <//>` : null}
-              ${tab === 'pred' ? (res.pred
-                ? html`<${PredPlot} pred=${res.pred} data=${data} outcome=${res.outcome} xname=${xname} rows=${res.rows} />`
+              ${tab === 'pred' ? (predOne
+                ? html`
+                  <${React.Fragment}>
+                    <!-- Beide Leisten erscheinen nur, wenn es etwas zu waehlen
+                         gibt. Ein Modell mit einem Ergebnis und einem Praediktor
+                         sieht damit genauso aus wie vorher. -->
+                    ${predList.length > 1 ? html`
+                      <div style=${{ marginBottom: 10 }}>
+                        <p className="ctl-sec-h">Outcome</p>
+                        <div className="seg-row">
+                          ${predList.map((pp, i) => html`
+                            <button key=${pp.outcome}
+                              className=${'lang-seg' + (pp === predOne ? ' active' : '')}
+                              onClick=${() => setPredAt(i)}>${pp.outcome}</button>`)}
+                        </div>
+                      </div>` : null}
+                    ${xopts.length > 1 ? html`
+                      <div style=${{ marginBottom: 10 }}>
+                        <p className="ctl-sec-h">Predictor on the x axis</p>
+                        <div className="seg-row">
+                          ${xopts.map((c, i) => html`
+                            <button key=${c}
+                              className=${'lang-seg' + (c === xname ? ' active' : '')}
+                              onClick=${() => setXat(i)}>${c}</button>`)}
+                        </div>
+                      </div>` : null}
+                    <!-- Seit konstante Spalten und die Versuchszahl aus xopts
+                         fliegen, kann nichts uebrig bleiben: ein Modell, dessen
+                         einzige Eingabe in allen Zeilen denselben Wert traegt,
+                         hat keine waagerechte Achse. Ohne diesen Satz waere der
+                         Reiter dann einfach leer, was wie ein Fehler aussieht. -->
+                    <!-- Was mit den anderen Praediktoren geschieht. Zwei
+                         Lesarten, beide vertretbar, deshalb beide da: die
+                         Vorgabe mittelt ueber die Daten, die Alternative
+                         haelt sie auf einem typischen Wert fest. -->
+                    ${predGrid ? html`
+                      <div style=${{ marginBottom: 10 }}>
+                        <p className="ctl-sec-h">The other predictors</p>
+                        <div className="seg-row">
+                          <button className=${'lang-seg' + (predMode === 'marginal' ? ' active' : '')}
+                            onClick=${() => setPredMode('marginal')}>over their distribution</button>
+                          <button className=${'lang-seg' + (predMode === 'fixed' ? ' active' : '')}
+                            onClick=${() => setPredMode('fixed')}>at their average</button>
+                        </div>
+                      </div>` : null}
+                    ${xname && predGrid ? html`
+                      <${PredPlot} pred=${predOne} grid=${predGrid} data=${data}
+                        outcome=${predOne.outcome} xname=${xname} rows=${res.rows} />`
+                      : xname ? html`<p style=${{ color: 'var(--tool-note)' }}>
+                          This fit carries no effect grid for ${xname}. Refit the model to build one.</p>`
+                      : html`<p style=${{ color: 'var(--tool-note)' }}>
+                          No column varies across the rows, so there is nothing to put on the
+                          x axis. The summary tab has the estimates themselves.</p>`}
+                  <//>`
                 : html`<p style=${{ color: 'var(--tool-note)' }}>
                     This model has no deterministic node to plot against a predictor.</p>`) : null}
 
