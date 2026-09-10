@@ -159,6 +159,12 @@
    *    scalar calls. Values broadcast, length 1 against length n. The speed is
    *    welcome, but the real reason is that a reverse-mode derivative tape then
    *    has one node per expression instead of one per (expression, observation).
+   *    That tape now exists (compileTape, gradTape), which is why every
+   *    distribution carries its own partial derivatives and every function in
+   *    FUNCS has an entry in DFUNCS. The old central-difference gradient is kept
+   *    as gradFD: it is the fallback for a node with no rule, and it is what the
+   *    gradient tests measure the tape against, since a wrong derivative rule
+   *    does not crash, it just moves the answer.
    */
   var RTH = (function () {
     'use strict';
@@ -186,6 +192,19 @@
       var z = x - 1, a = LGAMMA_C[0], t = z + 7.5;
       for (var i = 1; i < 9; i++) a += LGAMMA_C[i] / (z + i);
       return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(a);
+    }
+    /* Digamma, the derivative of lgamma. Recurrence up to 6 and then the
+       asymptotic series, which is the standard construction and gives about
+       twelve digits over the positive axis. Only the derivative rules of dbeta,
+       dgamma, dbinom and dstudent need it, so it never runs on the hot path of a
+       normal linear model. Reflection below zero is not implemented because no
+       shape parameter here is ever negative. */
+    function digamma(x) {
+      var r = 0;
+      while (x < 6) { r -= 1 / x; x += 1; }
+      var f = 1 / (x * x);
+      return r + Math.log(x) - 0.5 / x +
+        f * (-1 / 12 + f * (1 / 120 + f * (-1 / 252 + f * (1 / 240 + f * (-1 / 132)))));
     }
     function lbeta(a, b) { return lgamma(a) + lgamma(b) - lgamma(a + b); }
     function lchoose(n, k) { return lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1); }
@@ -411,9 +430,16 @@
        RATE, dnorm by standard deviation and not variance.
 
        `support` drives the automatic change of variables for any parameter
-       declared with this distribution as its prior. `d` is the slot for analytic
-       partial derivatives; it stays null in this version, where gradients come
-       from finite differences, and it is what a Hamiltonian sampler would fill.
+       declared with this distribution as its prior. `d` holds the analytic
+       partial derivatives of the log-density with respect to each argument, in
+       the order of `args`, and it is what the reverse-mode tape reads. Each
+       entry has the same signature as `lp` and returns the SUMMED partial over
+       the outcome, so a vector y costs one pass and not one call per row.
+
+       There is deliberately no derivative with respect to y. The outcome is
+       data, never a parameter, and for dbinom and dpois it is not even
+       continuous. A distribution whose `d` is null falls back to finite
+       differences rather than being quietly skipped.
        ================================================================ */
 
     /* Each lp receives plain numbers for the parameters and either a number or a
@@ -436,7 +462,17 @@
           return eachSum(y, function (v) { var z = (v - mu) * inv; return c - 0.5 * z * z; });
         },
         rng: function (rng, mu, sd) { return mu + sd * rnorm1(rng); },
-        d: null
+        d: [
+          function (y, mu, sd) {
+            var iv2 = 1 / (sd * sd);
+            return eachSum(y, function (v) { return (v - mu) * iv2; });
+          },
+          function (y, mu, sd) {
+            var iv = 1 / sd, iv3 = iv * iv * iv;
+            return eachSum(y, function (v) { var e = v - mu; return -iv + e * e * iv3; });
+          }
+        ],
+        dy: function (y, mu, sd) { return -(y - mu) / (sd * sd); }
       },
       dlnorm: {
         args: ['meanlog', 'sdlog'], support: 'positive',
@@ -450,7 +486,19 @@
           });
         },
         rng: function (rng, mu, sd) { return Math.exp(mu + sd * rnorm1(rng)); },
-        d: null
+        /* The -log(v) term of the density does not depend on either parameter,
+           so these are the dnorm rules read on log(v). */
+        d: [
+          function (y, mu, sd) {
+            var iv2 = 1 / (sd * sd);
+            return eachSum(y, function (v) { return (Math.log(v) - mu) * iv2; });
+          },
+          function (y, mu, sd) {
+            var iv = 1 / sd, iv3 = iv * iv * iv;
+            return eachSum(y, function (v) { var e = Math.log(v) - mu; return -iv + e * e * iv3; });
+          }
+        ],
+        dy: function (y, mu, sd) { return (-(Math.log(y) - mu) / (sd * sd) - 1) / y; }
       },
       dunif: {
         args: ['min', 'max'], support: 'interval',
@@ -460,7 +508,14 @@
           return eachSum(y, function (v) { return (v < a || v > b) ? -Infinity : c; });
         },
         rng: function (rng, a, b) { return a + (b - a) * rng(); },
-        d: null
+        /* Constant in y, so the derivative is just the count over the width. At
+           the bounds themselves the density jumps and no derivative exists; the
+           value is -Infinity there and the caller has already bailed. */
+        d: [
+          function (y, a, b) { var w = 1 / (b - a); return eachSum(y, function () { return w; }); },
+          function (y, a, b) { var w = -1 / (b - a); return eachSum(y, function () { return w; }); }
+        ],
+        dy: function () { return 0; }
       },
       dexp: {
         /* Rate, as in R. Someone thinking in means will get this backwards and
@@ -472,7 +527,10 @@
           return eachSum(y, function (v) { return v < 0 ? -Infinity : lr - rate * v; });
         },
         rng: function (rng, rate) { return -Math.log(1 - rng()) / rate; },
-        d: null
+        d: [
+          function (y, rate) { var ir = 1 / rate; return eachSum(y, function (v) { return ir - v; }); }
+        ],
+        dy: function (y, rate) { return -rate; }
       },
       dcauchy: {
         args: ['location', 'scale'], support: 'real',
@@ -485,7 +543,20 @@
           });
         },
         rng: function (rng, x0, g) { return x0 + g * Math.tan(Math.PI * (rng() - 0.5)); },
-        d: null
+        d: [
+          function (y, x0, g) {
+            var iv = 1 / g;
+            return eachSum(y, function (v) { var z = (v - x0) * iv; return 2 * z * iv / (1 + z * z); });
+          },
+          function (y, x0, g) {
+            var iv = 1 / g;
+            return eachSum(y, function (v) {
+              var z = (v - x0) * iv, z2 = z * z;
+              return iv * (2 * z2 / (1 + z2) - 1);
+            });
+          }
+        ],
+        dy: function (y, x0, g) { var z = (y - x0) / g; return -2 * z / (g * (1 + z * z)); }
       },
       dbinom: {
         args: ['size', 'prob'], support: 'count',
@@ -508,7 +579,22 @@
           for (var i = 0; i < n; i++) if (rng() < p) k++;
           return k;
         },
-        d: null
+        /* Size is normally a constant or a data column, but nothing forbids a
+           model from computing it, so the rule is written out. It needs digamma
+           because lchoose is three lgammas. */
+        d: [
+          function (y, n, p) {
+            var dn = digamma(n + 1), lq = Math.log1p(-p);
+            return eachSum(y, function (v) { return dn - digamma(n - v + 1) + lq; });
+          },
+          function (y, n, p) {
+            var ip = 1 / p, iq = 1 / (1 - p);
+            return eachSum(y, function (v) { return v * ip - (n - v) * iq; });
+          }
+        ],
+        /* No dy: the outcome is a count. A parameter cannot be given a dbinom
+           prior, so nothing ever asks. */
+        dy: null
       },
       dpois: {
         args: ['lambda'], support: 'count',
@@ -528,7 +614,10 @@
           do { k++; p *= rng(); } while (p > L);
           return k - 1;
         },
-        d: null
+        d: [
+          function (y, lam) { var il = 1 / lam; return eachSum(y, function (v) { return v * il - 1; }); }
+        ],
+        dy: null
       },
       dbeta: {
         args: ['shape1', 'shape2'], support: 'unit',
@@ -544,7 +633,17 @@
           var x = rgamma1(rng, a), y2 = rgamma1(rng, b);
           return x / (x + y2);
         },
-        d: null
+        d: [
+          function (y, a, b) {
+            var c = digamma(a + b) - digamma(a);
+            return eachSum(y, function (v) { return c + Math.log(v); });
+          },
+          function (y, a, b) {
+            var c = digamma(a + b) - digamma(b);
+            return eachSum(y, function (v) { return c + Math.log1p(-v); });
+          }
+        ],
+        dy: function (y, a, b) { return (a - 1) / y - (b - 1) / (1 - y); }
       },
       dbeta2: {
         /* The mean-and-concentration parameterization the book uses whenever a
@@ -556,7 +655,18 @@
         rng: function (rng, pbar, theta) {
           return DIST.dbeta.rng(rng, pbar * theta, (1 - pbar) * theta);
         },
-        d: null
+        /* Chain rule through a = pbar*theta, b = (1-pbar)*theta. */
+        d: [
+          function (y, pbar, theta) {
+            var a = pbar * theta, b = (1 - pbar) * theta;
+            return theta * (DIST.dbeta.d[0](y, a, b) - DIST.dbeta.d[1](y, a, b));
+          },
+          function (y, pbar, theta) {
+            var a = pbar * theta, b = (1 - pbar) * theta;
+            return pbar * DIST.dbeta.d[0](y, a, b) + (1 - pbar) * DIST.dbeta.d[1](y, a, b);
+          }
+        ],
+        dy: function (y, pbar, theta) { return DIST.dbeta.dy(y, pbar * theta, (1 - pbar) * theta); }
       },
       dgamma: {
         args: ['shape', 'rate'], support: 'positive',
@@ -569,13 +679,31 @@
           });
         },
         rng: function (rng, sh, rate) { return rgamma1(rng, sh) / rate; },
-        d: null
+        d: [
+          function (y, sh, rate) {
+            var c = Math.log(rate) - digamma(sh);
+            return eachSum(y, function (v) { return c + Math.log(v); });
+          },
+          function (y, sh, rate) {
+            var sr = sh / rate;
+            return eachSum(y, function (v) { return sr - v; });
+          }
+        ],
+        dy: function (y, sh, rate) { return (sh - 1) / y - rate; }
       },
       dgamma2: {
         args: ['mu', 'scale'], support: 'positive',
         lp: function (y, mu, scale) { return DIST.dgamma.lp(y, mu / scale, 1 / scale); },
         rng: function (rng, mu, scale) { return DIST.dgamma.rng(rng, mu / scale, 1 / scale); },
-        d: null
+        /* Chain rule through shape = mu/scale, rate = 1/scale. */
+        d: [
+          function (y, mu, scale) { return DIST.dgamma.d[0](y, mu / scale, 1 / scale) / scale; },
+          function (y, mu, scale) {
+            var sh = mu / scale, rate = 1 / scale, is2 = 1 / (scale * scale);
+            return -mu * is2 * DIST.dgamma.d[0](y, sh, rate) - is2 * DIST.dgamma.d[1](y, sh, rate);
+          }
+        ],
+        dy: function (y, mu, scale) { return DIST.dgamma.dy(y, mu / scale, 1 / scale); }
       },
       dstudent: {
         args: ['nu', 'mu', 'sigma'], support: 'real',
@@ -592,7 +720,34 @@
           var g = rgamma1(rng, nu / 2) * 2 / nu;
           return mu + sig * rnorm1(rng) / Math.sqrt(g);
         },
-        d: null
+        d: [
+          function (y, nu, mu, sig) {
+            var k = (nu + 1) / 2, iv = 1 / sig;
+            var c = 0.5 * digamma(k) - 0.5 * digamma(nu / 2) - 0.5 / nu;
+            return eachSum(y, function (v) {
+              var z = (v - mu) * iv, z2 = z * z;
+              return c - 0.5 * Math.log1p(z2 / nu) + k * z2 / (nu * (nu + z2));
+            });
+          },
+          function (y, nu, mu, sig) {
+            var iv = 1 / sig, k = nu + 1;
+            return eachSum(y, function (v) {
+              var z = (v - mu) * iv;
+              return k * z * iv / (nu + z * z);
+            });
+          },
+          function (y, nu, mu, sig) {
+            var iv = 1 / sig, k = nu + 1;
+            return eachSum(y, function (v) {
+              var z = (v - mu) * iv, z2 = z * z;
+              return iv * (k * z2 / (nu + z2) - 1);
+            });
+          }
+        ],
+        dy: function (y, nu, mu, sig) {
+          var z = (y - mu) / sig;
+          return -(nu + 1) * z / (sig * (nu + z * z));
+        }
       }
     };
     /* rethinking calls the scaled-t dt2; accept both spellings. */
@@ -614,10 +769,11 @@
     }
 
     /* Deterministic functions usable inside expressions. Deliberately small:
-       everything here is smooth, because the Hessian is taken by finite
+       everything here is smooth, because the Hessian is still taken by finite
        differences and a kink produces curvature that is numerically real and
        statistically meaningless. abs() is the obvious omission and it is
-       omitted on purpose. */
+       omitted on purpose, and it is also the one function the derivative tape
+       below could not give an honest rule for. */
     var FUNCS = {
       log:    function (x) { return Math.log(x); },
       exp:    function (x) { return Math.exp(x); },
@@ -631,6 +787,28 @@
       tanh:   function (x) { return Math.tanh(x); }
     };
     FUNCS.logistic = FUNCS.inv_logit;
+
+    /* The derivative of each of them, by the same name. The reverse-mode tape
+       looks a rule up here; a function without an entry makes compileTape
+       refuse, which is what sends model.grad back to finite differences rather
+       than letting it return a silently wrong number.
+
+       Each rule gets both the input x and the already computed output y, so
+       exp, inv_logit and tanh cost nothing extra: their derivative is a
+       polynomial in the value they just produced. */
+    var DFUNCS = {
+      log:    function (x) { return 1 / x; },
+      exp:    function (x, y) { return y; },
+      sqrt:   function (x, y) { return 0.5 / y; },
+      logit:  function (x) { return 1 / (x * (1 - x)); },
+      inv_logit: function (x, y) { return y * (1 - y); },
+      log1p:  function (x) { return 1 / (1 + x); },
+      expm1:  function (x, y) { return y + 1; },
+      sin:    function (x) { return Math.cos(x); },
+      cos:    function (x) { return -Math.sin(x); },
+      tanh:   function (x, y) { return 1 - y * y; }
+    };
+    DFUNCS.logistic = DFUNCS.inv_logit;
 
     /* ================================================================
        Tokenizer
@@ -938,6 +1116,207 @@
       throw new Error('cannot compile node ' + node.tag);
     }
 
+    /* ================================================================
+       The reverse-mode tape
+
+       compileTape is compileExpr's twin: same node types, same broadcasting
+       rule, but the returned closure also pushes a backward step onto a list.
+       Running that list in reverse turns one forward plus one backward pass
+       into the derivative with respect to EVERY parameter at once, where
+       central differences need 2P full evaluations of the model.
+
+       A tape value is {n, d, g}: the forward values, and g the adjoint buffer
+       of the same length, which the backward pass accumulates into. Both come
+       from the tape's OWN pool, not from the pool logp uses. That is the one
+       thing that would have gone wrong quietly: logp starts with pool.release()
+       and would hand the same Float64Array to two live nodes, so the tape keeps
+       its forward values in a pool it releases exactly once, at the top of a
+       gradient call, when nothing from the previous call is alive any more.
+
+       Broadcasting is where implementations of this usually break. Forward, a
+       length-1 value against a length-n value repeats the scalar. Backward, the
+       adjoint of that scalar is the SUM over all n rows it was used in, not the
+       row-wise value. Every rule below that reads `as`/`bs` does that sum by
+       accumulating into index 0.
+       ================================================================ */
+
+    function makeTapeCtx(n) {
+      var vals = [], free = [];
+      return {
+        n: n,
+        /* A buffer is exactly as long as its value, not padded up to nObs the
+           way the forward pool does it. The pool gets away with the padding
+           because nothing ever reads past the real length; here the backward
+           pass of a broadcast SUMS over the whole buffer, and one NaN in the
+           padding poisons the sum even where the adjoint is zero. So: exact
+           lengths, pooled by length, and every loop counts to value.n.
+
+           A tape value carries its own zeroed adjoint. Reusing a buffer means
+           clearing g, because the previous gradient left partial sums in it. */
+        take: function (len) {
+          for (var i = 0; i < free.length; i++) {
+            if (free[i].d.length === len) {
+              var v = free.splice(i, 1)[0];
+              v.g.fill(0);
+              vals.push(v);
+              return v;
+            }
+          }
+          var nv = { n: len, d: new Float64Array(len), g: new Float64Array(len) };
+          vals.push(nv);
+          return nv;
+        },
+        /* Wraps a value the tape did not produce (a data column, a constant) so
+           it has an adjoint to write into and nothing downstream needs a case
+           distinction. Such an adjoint is simply never read. */
+        wrap: function (v) {
+          var t = this.take(v.n);
+          for (var k = 0; k < v.n; k++) t.d[k] = v.d[k];
+          return t;
+        },
+        release: function () {
+          for (var i = 0; i < vals.length; i++) free.push(vals[i]);
+          vals.length = 0;
+        }
+      };
+    }
+
+    /* Thrown when a node has no backward rule. compileModel catches it and
+       leaves model.grad on finite differences rather than shipping a wrong
+       derivative, which is the failure mode that matters here. */
+    function NoTapeRule(what) {
+      this.name = 'NoTapeRule';
+      this.message = 'no derivative rule for ' + what;
+    }
+    NoTapeRule.prototype = Object.create(Error.prototype);
+    NoTapeRule.prototype.constructor = NoTapeRule;
+
+    function compileTape(node, tctx) {
+      if (node.tag === 'num') {
+        var kv = node.v;
+        return function () {
+          var out = tctx.take(1);
+          out.d[0] = kv;
+          return out;
+        };
+      }
+      if (node.tag === 'var') {
+        var nm = node.name;
+        return function (fr) {
+          var v = fr[nm];
+          if (v === undefined) throw new Error('unknown symbol ' + nm);
+          /* Already a tape value (a parameter or an earlier det node): pass it
+             through, so its adjoint accumulates across every use. */
+          return v.g ? v : tctx.wrap(v);
+        };
+      }
+      if (node.tag === 'index') {
+        var inm = node.name, fidx = compileTape(node.idx, tctx);
+        return function (fr, tape) {
+          var baseRaw = fr[inm];
+          if (baseRaw === undefined) throw new Error('unknown symbol ' + inm);
+          var base = baseRaw.g ? baseRaw : tctx.wrap(baseRaw);
+          var ix = fidx(fr, tape);
+          var len = ix.n === 1 ? base.n : ix.n;
+          var cnt = len, out = tctx.take(len);
+          var pick = new Int32Array(cnt), k;
+          for (k = 0; k < cnt; k++) {
+            /* One-based, as in the notation this imitates. */
+            pick[k] = (ix.n === 1 ? ix.d[0] : ix.d[k]) - 1;
+            out.d[k] = base.d[pick[k]];
+          }
+          /* Scatter-add, the reverse of a gather. The += is the whole point: an
+             index column naming the same level twice sends both rows worth of
+             derivative to the same entry, and a plain assignment would keep only
+             the last one. The index is discrete, so it gets no adjoint. */
+          tape.push(function () {
+            for (var q = 0; q < cnt; q++) base.g[pick[q]] += out.g[q];
+          });
+          return out;
+        };
+      }
+      if (node.tag === 'neg') {
+        var fx = compileTape(node.x, tctx);
+        return function (fr, tape) {
+          var a = fx(fr, tape), cnt = a.n;
+          var out = tctx.take(cnt), k;
+          for (k = 0; k < cnt; k++) out.d[k] = -a.d[k];
+          tape.push(function () {
+            for (var q = 0; q < cnt; q++) a.g[q] -= out.g[q];
+          });
+          return out;
+        };
+      }
+      if (node.tag === 'bin') {
+        var fl = compileTape(node.l, tctx), frr = compileTape(node.r, tctx), op = node.op;
+        return function (fr, tape) {
+          var a = fl(fr, tape), b = frr(fr, tape);
+          var len = a.n === 1 ? b.n : (b.n === 1 ? a.n : (a.n === b.n ? a.n : -1));
+          if (len < 0) throw new Error('length mismatch: ' + a.n + ' against ' + b.n);
+          var cnt = len, out = tctx.take(len), k;
+          var as = a.n === 1, bs = b.n === 1;
+          if (op === '+') {
+            for (k = 0; k < cnt; k++) out.d[k] = a.d[as ? 0 : k] + b.d[bs ? 0 : k];
+            tape.push(function () {
+              for (var q = 0; q < cnt; q++) { a.g[as ? 0 : q] += out.g[q]; b.g[bs ? 0 : q] += out.g[q]; }
+            });
+          } else if (op === '-') {
+            for (k = 0; k < cnt; k++) out.d[k] = a.d[as ? 0 : k] - b.d[bs ? 0 : k];
+            tape.push(function () {
+              for (var q = 0; q < cnt; q++) { a.g[as ? 0 : q] += out.g[q]; b.g[bs ? 0 : q] -= out.g[q]; }
+            });
+          } else if (op === '*') {
+            for (k = 0; k < cnt; k++) out.d[k] = a.d[as ? 0 : k] * b.d[bs ? 0 : k];
+            tape.push(function () {
+              for (var q = 0; q < cnt; q++) {
+                var gq = out.g[q];
+                a.g[as ? 0 : q] += gq * b.d[bs ? 0 : q];
+                b.g[bs ? 0 : q] += gq * a.d[as ? 0 : q];
+              }
+            });
+          } else if (op === '/') {
+            for (k = 0; k < cnt; k++) out.d[k] = a.d[as ? 0 : k] / b.d[bs ? 0 : k];
+            tape.push(function () {
+              for (var q = 0; q < cnt; q++) {
+                var gq = out.g[q], bv = b.d[bs ? 0 : q];
+                a.g[as ? 0 : q] += gq / bv;
+                b.g[bs ? 0 : q] -= gq * a.d[as ? 0 : q] / (bv * bv);
+              }
+            });
+          } else {
+            for (k = 0; k < cnt; k++) out.d[k] = Math.pow(a.d[as ? 0 : k], b.d[bs ? 0 : k]);
+            tape.push(function () {
+              for (var q = 0; q < cnt; q++) {
+                var gq = out.g[q], av = a.d[as ? 0 : q], bv = b.d[bs ? 0 : q];
+                a.g[as ? 0 : q] += gq * bv * Math.pow(av, bv - 1);
+                /* The derivative with respect to the exponent is a^b log(a),
+                   which does not exist for a <= 0. Leaving the zero is honest
+                   there; the finite-difference oracle in the tests disagrees
+                   loudly if a model ever lands in that corner. */
+                if (av > 0) b.g[bs ? 0 : q] += gq * out.d[q] * Math.log(av);
+              }
+            });
+          }
+          return out;
+        };
+      }
+      if (node.tag === 'call') {
+        var fn = FUNCS[node.fn], dfn = DFUNCS[node.fn];
+        if (!fn || !dfn) throw new NoTapeRule('the function ' + node.fn);
+        var fa = compileTape(node.args[0], tctx);
+        return function (fr, tape) {
+          var a = fa(fr, tape), cnt = a.n;
+          var out = tctx.take(cnt), k;
+          for (k = 0; k < cnt; k++) out.d[k] = fn(a.d[k]);
+          tape.push(function () {
+            for (var q = 0; q < cnt; q++) a.g[q] += out.g[q] * dfn(a.d[q], out.d[q]);
+          });
+          return out;
+        };
+      }
+      throw new NoTapeRule('the node type ' + node.tag);
+    }
+
     /* Free symbols of an expression, used for the dependency sort and for
        telling the user which name is the one that does not resolve. */
     function freeVars(node, acc) {
@@ -962,12 +1341,16 @@
       identity: {
         to: function (x) { return x; },
         from: function (u) { return u; },
-        logJac: function () { return 0; }
+        logJac: function () { return 0; },
+        dFrom: function () { return 1; },
+        dLogJac: function () { return 0; }
       },
       log: {
         to: function (x) { return Math.log(x); },
         from: function (u) { return Math.exp(u); },
-        logJac: function (u) { return u; }
+        logJac: function (u) { return u; },
+        dFrom: function (u, x) { return x; },
+        dLogJac: function () { return 1; }
       },
       logit: {
         to: function (x) { return Math.log(x / (1 - x)); },
@@ -976,14 +1359,22 @@
           /* log(p) + log(1-p) written stably for large |u|. */
           var a = u > 0 ? -u : u;
           return a - 2 * Math.log1p(Math.exp(a)) + (u > 0 ? 0 : 0);
-        }
+        },
+        dFrom: function (u, x) { return x * (1 - x); },
+        /* d/du [log p + log(1-p)] = 1 - 2p, with p = from(u). */
+        dLogJac: function (u, x) { return 1 - 2 * x; }
       }
     };
+    /* dFrom takes the unconstrained u AND the already computed natural x, so the
+       chain rule at a parameter never recomputes an exp or a logistic that the
+       forward pass has just done. Same trick as DFUNCS. */
     function intervalLink(a, b) {
       return {
         to: function (x) { var u = (x - a) / (b - a); return Math.log(u / (1 - u)); },
         from: function (u) { return a + (b - a) / (1 + Math.exp(-u)); },
-        logJac: function (u) { return Math.log(b - a) + LINKS.logit.logJac(u); }
+        logJac: function (u) { return Math.log(b - a) + LINKS.logit.logJac(u); },
+        dFrom: function (u) { var p = LINKS.logit.from(u); return (b - a) * p * (1 - p); },
+        dLogJac: function (u) { return LINKS.logit.dLogJac(u, LINKS.logit.from(u)); }
       };
     }
 
@@ -1181,7 +1572,7 @@
           var v = fns[i](fr);
           /* Distribution parameters are scalars in this version: a vectorized
              parameter would need the per-observation loop to live inside the
-             distribution, which is exactly the generalization phase two brings. */
+             distribution, which is what vector parameters will bring. */
           out[i] = v.n === 1 ? v.d[0] : v.d;
         }
         return out;
@@ -1275,9 +1666,15 @@
 
       /* Central differences on the unconstrained scale. The cube root of machine
          epsilon is the classic balance for a first derivative: truncation grows
-         as h squared, roundoff falls as 1/h. Phase two replaces this with a
-         derivative tape and nothing around it has to change. */
-      function grad(theta, out) {
+         as h squared, roundoff falls as 1/h.
+
+         The tape below has replaced this on the fitting path, but it is kept
+         and exported, for two reasons that are both about not being able to
+         check a derivative by looking at it. It is the fallback when a model
+         contains a node the tape has no rule for, and it is the oracle the
+         gradient tests measure the tape against: slow and good for seven
+         digits, but independently right. */
+      function gradFD(theta, out) {
         var g = out || new Float64Array(P), x = Float64Array.from(theta);
         for (var i = 0; i < P; i++) {
           var h = 6.06e-6 * Math.max(1, Math.abs(theta[i]));
@@ -1289,6 +1686,117 @@
         }
         return g;
       }
+
+      /* ---------- the analytic gradient ----------
+
+         The same three sums as logp, run on the tape instead of on the pool.
+         The forward pass rebuilds the frame out of tape values; the seeds come
+         from the distributions' own `d` and `dy` slots; the backward pass then
+         walks the tape once, and every parameter's derivative falls out of its
+         adjoint. One forward plus one backward pass against 2P full evaluations
+         of the model.
+
+         The last step is the change of variables. A parameter is theta[i] on the
+         unconstrained scale but link.from(theta[i]) inside the model, so its
+         adjoint gets multiplied by dFrom, and the derivative of the log-Jacobian
+         is added on top. Dropping that second term is the classic silent error:
+         the gradient stays plausible and the mode quietly moves. */
+
+      var tapeOK = true, tctx = null, tDet = null, tPrior = null, tLike = null;
+      try {
+        tctx = makeTapeCtx(nObs || 1);
+        tDet = sorted.map(function (nm6) {
+          return { name: nm6, fn: compileTape(detByName[nm6].expr, tctx) };
+        });
+        tPrior = pinfo.map(function (pi3) {
+          var dd6 = DIST[pi3.dist];
+          if (!dd6.d || !dd6.dy) throw new NoTapeRule('the prior ' + pi3.dist);
+          return { name: pi3.name, dist: dd6, args: pi3.distArgs.map(function (a) { return compileTape(a, tctx); }) };
+        });
+        tLike = outcomes.map(function (o2) {
+          var st7 = stochByName[o2], dd7 = DIST[st7.dist.fn];
+          if (!dd7.d) throw new NoTapeRule('the likelihood ' + st7.dist.fn);
+          return { name: o2, dist: dd7, args: st7.dist.args.map(function (a) { return compileTape(a, tctx); }) };
+        });
+      } catch (e) {
+        if (!(e instanceof NoTapeRule)) throw e;
+        tapeOK = false;
+        /* Deliberately not "the answer is the same, it just takes longer": this
+           warning is shown next to a failed fit as often as next to a good one,
+           and next to a red error message that sentence reads as a contradiction. */
+        warnings.push('One part of this model has no analytic derivative (' + e.message +
+          '), so the gradient comes from finite differences instead. That is slower and ' +
+          'accurate to about seven digits rather than exactly.');
+      }
+
+      /* Seeds the adjoints of the arguments of one distribution call. `vals` are
+         tape values, `y` the outcome, which for a likelihood is data and gets no
+         adjoint. When every argument is a scalar, the whole sum over the outcome
+         is one call per argument; otherwise it is the same row-wise walk the
+         likelihood already does, because a `d` rule takes numbers, not tape
+         values. `yNode`, when given, is the tape value of the outcome itself:
+         that is the prior case, where the parameter IS the outcome and its
+         adjoint is where the prior enters the gradient at all. */
+      function seedDist(dist, y, vals, yNode) {
+        var i, j, r, scalarArgs = true;
+        for (i = 0; i < vals.length; i++) if (vals[i].n !== 1) scalarArgs = false;
+        if (scalarArgs) {
+          var sa = new Array(vals.length);
+          for (i = 0; i < vals.length; i++) sa[i] = vals[i].d[0];
+          for (i = 0; i < vals.length; i++) vals[i].g[0] += dist.d[i].apply(null, [y].concat(sa));
+          if (yNode) yNode.g[0] += dist.dy.apply(null, [y].concat(sa));
+          return;
+        }
+        var ra = new Array(vals.length);
+        for (r = 0; r < y.length; r++) {
+          for (j = 0; j < vals.length; j++) ra[j] = vals[j].d[vals[j].n === 1 ? 0 : r];
+          for (i = 0; i < vals.length; i++) {
+            vals[i].g[vals[i].n === 1 ? 0 : r] += dist.d[i].apply(null, [y[r]].concat(ra));
+          }
+        }
+      }
+
+      function gradTape(theta, out) {
+        var g = out || new Float64Array(P), i;
+        tctx.release();
+        var tape = [];
+
+        /* The frame of tape values. Parameters enter on their NATURAL scale,
+           with the link applied here, exactly as frameFor does. */
+        var fr = Object.create(null), c;
+        for (c in dataVals) fr[c] = dataVals[c];
+        var pnodes = new Array(P);
+        for (i = 0; i < P; i++) {
+          var pv = tctx.take(1);
+          pv.d[0] = pinfo[i].link.from(theta[i]);
+          pnodes[i] = pv;
+          fr[pinfo[i].name] = pv;
+        }
+        for (i = 0; i < tDet.length; i++) fr[tDet[i].name] = tDet[i].fn(fr, tape);
+
+        for (i = 0; i < tPrior.length; i++) {
+          var pf2 = tPrior[i], pav = new Array(pf2.args.length), a2;
+          for (a2 = 0; a2 < pf2.args.length; a2++) pav[a2] = pf2.args[a2](fr, tape);
+          seedDist(pf2.dist, pnodes[i].d[0], pav, pnodes[i]);
+        }
+        for (i = 0; i < tLike.length; i++) {
+          var lf2 = tLike[i], lav = new Array(lf2.args.length), a3;
+          for (a3 = 0; a3 < lf2.args.length; a3++) lav[a3] = lf2.args[a3](fr, tape);
+          seedDist(lf2.dist, dataVals[lf2.name].d, lav, null);
+        }
+
+        for (i = tape.length - 1; i >= 0; i--) tape[i]();
+
+        for (i = 0; i < P; i++) {
+          var lk = pinfo[i].link, pn = pnodes[i];
+          g[i] = pn.g[0] * lk.dFrom(theta[i], pn.d[0]) + lk.dLogJac(theta[i], pn.d[0]);
+        }
+        return g;
+      }
+
+      /* One name for whichever of the two the model can use. Everything
+         downstream, the optimizer above all, only ever sees this. */
+      var grad = tapeOK ? gradTape : gradFD;
 
       function initial(seed) {
         var rng = makeRng(seed >>> 0), th = new Float64Array(P);
@@ -1345,6 +1853,9 @@
         nPar: P,
         logp: logp,
         grad: grad,
+        gradFD: gradFD,
+        gradTape: tapeOK ? gradTape : null,
+        hasTape: tapeOK,
         logLikPerObs: logLikPerObs,
         nodeValues: nodeValues,
         initial: initial,
@@ -1397,9 +1908,12 @@
         if (i === maxIt - 1) { found = a; }
       }
       if (found < 0) {
-        /* Zoom. Bisection rather than interpolation: the objective here is a
-           log-posterior with finite-difference gradients, and a cubic fit
-           through noisy derivatives can propose a step outside the bracket. */
+        /* Zoom. Bisection rather than interpolation: a cubic fit through
+           derivatives can propose a step outside the bracket, and this objective
+           is a log-posterior, which is flat enough in places that the proposal
+           is occasionally far outside. Kept even now that the gradient is
+           analytic and no longer noisy, because the failure it avoids came from
+           the shape of the target, not from the accuracy of the derivative. */
         for (i = 0; i < maxIt; i++) {
           a = 0.5 * (alo + ahi);
           if (!(Math.abs(ahi - alo) > 1e-14)) break;
@@ -1478,10 +1992,9 @@
         if (Math.abs(dfx) <= ftol * Math.max(1, Math.abs(fPrev2))) {
           converged = true; reason = 'the posterior stopped changing'; break;
         }
-        /* Skip the update rather than corrupt it. With finite-difference
-           gradients the curvature condition fails occasionally on a flat stretch,
-           and forcing the update there is what turns a good inverse Hessian into
-           an indefinite one. */
+        /* Skip the update rather than corrupt it. The curvature condition fails
+           occasionally on a flat stretch, and forcing the update there is what
+           turns a good inverse Hessian into an indefinite one. */
         if (!(sy > 1e-10 * Math.sqrt(ss * yy))) continue;
 
         var rho = 1 / sy;
@@ -1706,6 +2219,15 @@
       var f = model.logp;
       var gf = function (x, out) { return model.grad(x, out); };
 
+      /* The warnings compileModel produced belong to the model, not to the
+         outcome of the fit, so they are collected before anything can fail and
+         handed back through EVERY exit below. They used to be appended at the
+         very end, which meant a model that did not converge silently lost them:
+         exactly the case in which "your prior has no change of variables" or
+         "this model has no analytic derivative" is most worth reading. */
+      var messages = [];
+      model.warnings.forEach(function (w) { messages.push({ kind: 'warn', text: w }); });
+
       var best = null, tried = [], i;
       for (i = 0; i <= restarts; i++) {
         var x0 = i === 0 && opts.start ? Float64Array.from(opts.start) : model.initial(seed + i * 7919);
@@ -1717,14 +2239,13 @@
         if (best && best.converged && i >= 1) break;
       }
       if (!best || !isFinite(best.fx)) {
-        return { ok: false, kind: 'nofit',
+        return { ok: false, kind: 'nofit', messages: messages,
           message: 'No starting point produced a finite posterior density. Check that the priors cover ' +
             'plausible values and that the data columns contain what the model expects.' };
       }
 
-      var messages = [];
       if (!best.converged) {
-        return { ok: false, kind: 'noconverge',
+        return { ok: false, kind: 'noconverge', messages: messages,
           message: 'The optimizer stopped without converging: ' + best.reason + '. ' +
             'The mode it reached is not reliable, so no summary is shown.' };
       }
@@ -1755,15 +2276,14 @@
       var H = numHessian(f, best.x, typ, opts);
       var cur = analyzeCurvature(H, model.names, !!opts.ridge);
       if (!cur.ok) {
-        return { ok: false, kind: cur.kind, message: cur.message, mode: best.x, logp: best.fx };
+        return { ok: false, kind: cur.kind, message: cur.message, messages: messages,
+          mode: best.x, logp: best.fx };
       }
       if (cur.warning) messages.push({ kind: 'warn', text: cur.warning });
       if (cur.ridged) messages.push({ kind: 'err', text: cur.message });
 
       var sd = new Float64Array(P);
       for (i = 0; i < P; i++) sd[i] = Math.sqrt(cur.cov[i * P + i]);
-
-      model.warnings.forEach(function (w) { messages.push({ kind: 'warn', text: w }); });
 
       return {
         ok: true,
@@ -2324,7 +2844,13 @@
 
           post({ type: 'progress', stage: 'optimizing', frac: 0.1 });
           var fit = fitQuap(model, msg.opts);
-          if (!fit.ok) { post({ type: 'done', res: { ok: false, kind: fit.kind, message: fit.message } }); return; }
+          if (!fit.ok) {
+            /* messages mitgeben: die Compile-Warnungen gehoeren zum Modell und
+               sind gerade dann interessant, wenn der Fit gescheitert ist. */
+            post({ type: 'done', res: { ok: false, kind: fit.kind, message: fit.message,
+              messages: fit.messages } });
+            return;
+          }
 
           post({ type: 'progress', stage: 'sampling', frac: 0.45 });
           var samples = extractSamples(model, fit, msg.opts && msg.opts.draws || 4000, msg.opts && msg.opts.seed);
@@ -2388,12 +2914,13 @@
     }
 
     return {
-      lgamma: lgamma, lbeta: lbeta, lchoose: lchoose, qnorm: qnorm,
+      lgamma: lgamma, digamma: digamma, lbeta: lbeta, lchoose: lchoose, qnorm: qnorm,
       makeRng: makeRng, rnorm1: rnorm1, rgamma1: rgamma1,
       quantileSorted: quantileSorted, meanOf: meanOf, sdOf: sdOf, logSumExp: logSumExp,
       cholesky: cholesky, cholSolve: cholSolve, cholInverse: cholInverse,
       mvnDraw: mvnDraw, jacobiEigen: jacobiEigen,
-      DIST: DIST, FUNCS: FUNCS, LINKS: LINKS,
+      DIST: DIST, FUNCS: FUNCS, DFUNCS: DFUNCS, LINKS: LINKS,
+      compileTape: compileTape, makeTapeCtx: makeTapeCtx, NoTapeRule: NoTapeRule,
       tokenize: tokenize, parseModel: parseModel, ParseError: ParseError,
       compileModel: compileModel,
       bfgs: bfgs, nelderMead: nelderMead, lineSearchWolfe: lineSearchWolfe,
@@ -2842,6 +3369,8 @@
               <${Msg} kind="err">
                 ${err.line ? html`<strong>Line ${err.line}: </strong>` : null}${err.message}
               <//>
+              ${(err.messages || []).map((m, i) => html`
+                <${Msg} key=${i} kind=${m.kind}>${m.text}<//>`)}
             </div>` : null}
 
           ${res ? html`
@@ -2931,9 +3460,10 @@
               <p>
                 Not here: multilevel models, varying effects, multivariate priors, mixtures, and anything
                 that needs Markov chain Monte Carlo. There are no chains, so there is no Rhat, no effective
-                sample size and no divergence count. Gradients and curvature come from finite differences,
-                giving roughly seven correct digits, and a model whose log posterior has a kink in it
-                produces curvature that is arithmetically real and statistically meaningless. Everything
+                sample size and no divergence count. Gradients are exact, from a reverse-mode derivative
+                tape, but the curvature still comes from finite differences, so a model whose log posterior
+                has a kink in it produces curvature that is arithmetically real and statistically
+                meaningless. Everything
                 runs in one browser tab on one core, which in practice means a few thousand rows and a few
                 dozen parameters.
               </p>
