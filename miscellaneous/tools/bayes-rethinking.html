@@ -1259,11 +1259,17 @@
        difference between this being instant and being sluggish.
        ================================================================ */
 
+    /* `n` is the width every non-scalar buffer gets. It is a PROPERTY and not a
+       closed-over constant because nodeValues evaluates the same compiled model
+       against a grid that can be longer than the data it was fitted on, and then
+       the buffers have to grow with it. See the comment there; the fit path never
+       touches it and keeps nObs throughout. */
     function makePool(n) {
       var free = [], used = [];
       return {
+        n: n,
         take: function (len) {
-          var want = len === 1 ? 1 : n;
+          var want = len === 1 ? 1 : this.n;
           for (var i = 0; i < free.length; i++) {
             if (free[i].length === want) {
               var a = free.splice(i, 1)[0];
@@ -2294,22 +2300,46 @@
       function nodeValues(theta, name, newCols) {
         pool.release();
         var saved = null, c;
+        /* Die Auswertungsbreite folgt den uebergebenen Spalten.
+
+           Sie war bis 2026-09-11 fest nObs, und ein Gitter mit MEHR Punkten als
+           die Daten Zeilen haben lief damit in eine stille Kuerzung: jede
+           Vektoroperation schrieb nur ctx.n Werte, der berechnete Knoten kam
+           entsprechend kurz zurueck, und der Aufrufer las per a[r] dahinter ins
+           Leere. In effectGrid hiess das, dass der feste Modus bei weniger als
+           25 Datenzeilen hinter der nObs-ten Stuetzstelle NaN lieferte: die
+           Linie brach mitten im Plot ab. Bei 8 Zeilen waren 17 der 25 Punkte
+           leer.
+
+           Breiter statt enger, denn ein Gitter, das KUERZER ist als die Daten,
+           darf die Breite nicht senken: die unveraenderten Spalten stehen dann
+           noch mit ihren n Zeilen im Rahmen, und eine kleinere Breite wuerde
+           die abschneiden. Das Zuschneiden auf die Gitterlaenge erledigt
+           clipDraws beim Aufrufer wie bisher. */
+        var widthSaved = ctx.n;
         if (newCols) {
           saved = {};
           for (c in newCols) {
             saved[c] = dataVals[c];
             dataVals[c] = { n: newCols[c].length === 1 ? 1 : newCols[c].length, d: newCols[c] };
+            if (newCols[c].length > ctx.n) ctx.n = newCols[c].length;
           }
+          if (ctx.n !== widthSaved) pool.n = ctx.n;
         }
         var fr = frameFor(theta);
         var v = fr[name];
         var res;
         if (!v) res = null;
         else {
-          res = new Float64Array(v.n === 1 ? 1 : (newCols ? v.d.length : ctx.n));
+          /* Nicht v.d.length: der Puffer ist auf die Auswertungsbreite gepolstert
+             und traegt hinter v.n nichts Gueltiges. v.n ist die Zahl der
+             tatsaechlich geschriebenen Werte. */
+          res = new Float64Array(v.n === 1 ? 1 : Math.min(v.n, ctx.n));
           for (var i = 0; i < res.length; i++) res[i] = v.d[v.n === 1 ? 0 : i];
         }
         if (saved) for (c in saved) dataVals[c] = saved[c];
+        ctx.n = widthSaved;
+        pool.n = widthSaved;
         return res;
       }
 
@@ -4186,6 +4216,112 @@
       return out;
     }
 
+    /* Beeswarm: die waagerechte Auslenkung fuer einen Stapel Punkte, die alle
+       auf derselben Kategorie sitzen.
+
+       Das Problem, das es loest, ist nicht Aesthetik. Im kategorialen
+       Vorhersageplot liegen alle Beobachtungen einer Stufe exakt auf deren
+       x-Position, und zwanzig Kreise auf einer Senkrechten sind eine Saeule,
+       aus der sich weder die Zahl der Punkte noch eine Luecke in der
+       Verteilung ablesen laesst.
+
+       Gewaehlt ist ein Schwarm und nicht der uebliche Jitter, weil Jitter
+       Zufall in ein Bild traegt, das sonst keinen enthaelt: zwei Exporte
+       desselben Fits saehen verschieden aus, und eine zufaellige Haeufung
+       laese sich von einer echten nicht unterscheiden. Der Schwarm ist
+       deterministisch und seine Breite an einer Stelle ist die Zahl der
+       Punkte dort, also selbst die Auskunft.
+
+       Auch bewusst keine Violine: eine Kerndichte ueber zwanzig Punkte
+       zeichnet vor allem ihre eigene Bandbreite, und deren Woelbungen liest
+       ein Betrachter als Struktur der Daten.
+
+       Die Werte kommen in PIXELN herein und gehen in Pixeln heraus. Der
+       Abstand zweier Punkte ist eine Frage der Kreise auf dem Schirm und
+       nicht der Einheit auf der Achse, und derselbe Datensatz braucht bei
+       einem groesseren Radius einen breiteren Schwarm. */
+    function beeswarm(ys, opts) {
+      opts = opts || {};
+      var r = opts.r != null ? opts.r : 2.6;
+      var gap = opts.gap != null ? opts.gap : 0.5;
+      var step = opts.step != null ? opts.step : 1;
+      var maxOff = opts.maxOffset != null ? opts.maxOffset : Infinity;
+      var n = ys.length;
+      var out = new Float64Array(n);
+      /* Der Mindestabstand zweier Mittelpunkte. Zwei Kreise beruehren sich
+         bei 2r, die Luecke haelt ihre Striche auseinander. */
+      var need = 2 * r + gap;
+      /* Sortiert wird nach y, und platziert wird in dieser Reihenfolge. Der
+         Grund ist die Nachbarschaft: nur Punkte, deren y sich um weniger als
+         need unterscheidet, koennen ueberhaupt kollidieren, und in einer
+         sortierten Liste stehen die beieinander. Ohne das waere jeder Punkt
+         gegen jeden zu pruefen.
+
+         Punkte ohne endliches y bekommen Auslenkung null und nehmen an der
+         Platzierung nicht teil: sie werden ohnehin nicht gezeichnet, wuerden
+         aber als Nachbarn Plaetze blockieren. */
+      var idx = [];
+      for (var i = 0; i < n; i++) if (isFinite(ys[i])) idx.push(i);
+      idx.sort(function (a, b) { return ys[a] - ys[b] || a - b; });
+      /* placed haelt die bereits gesetzten Punkte in derselben y-Ordnung,
+         damit das Fenster nach unten wandern kann statt jedes Mal von vorn zu
+         suchen. */
+      var placed = [];
+      var first = 0;
+      for (var k = 0; k < idx.length; k++) {
+        var ii = idx[k];
+        var yv = ys[ii];
+        /* Das Fenster nachziehen: alles, was weiter als need oberhalb liegt,
+           kann diesen und jeden folgenden Punkt nicht mehr stoeren. */
+        while (first < placed.length && yv - ys[placed[first]] >= need) first++;
+        /* Kandidaten abwechselnd nach rechts und links, von der Mitte nach
+           aussen. Die Abwechslung haelt den Schwarm symmetrisch; liefe die
+           Suche erst eine Seite ab, saessen die frueh platzierten Punkte alle
+           rechts. */
+        var off = 0, found = false;
+        for (var t = 0; !found; t++) {
+          off = (t === 0) ? 0 : (t % 2 === 1 ? 1 : -1) * Math.ceil(t / 2) * step;
+          /* Ueber die erlaubte Breite hinaus wird nicht gesucht. Der Punkt
+             bleibt dann am Rand stehen und ueberlappt dort, was ehrlicher ist
+             als ihn in die Nachbarkategorie laufen zu lassen oder ganz
+             wegzulassen. */
+          if (Math.abs(off) > maxOff) { off = (off > 0 ? 1 : -1) * maxOff; break; }
+          found = true;
+          for (var p = first; p < placed.length; p++) {
+            var jj = placed[p];
+            var dy = yv - ys[jj];
+            if (dy >= need) continue;
+            var dx = off - out[jj];
+            if (dx * dx + dy * dy < need * need) { found = false; break; }
+          }
+        }
+        out[ii] = off;
+        placed.push(ii);
+      }
+      /* Zentrieren. Die Suche geht zwar von der Mitte aus abwechselnd nach
+         beiden Seiten, aber sie nimmt den ERSTEN freien Platz, und der liegt
+         bei gleichen y-Werten systematisch rechts: die linke Haelfte
+         desselben Abstands wird erst danach geprueft und ist dann schon
+         besetzt. Ueber eine ganze Stufe summiert sich das zu einem Schwarm,
+         der neben seiner Kategorie haengt statt auf ihr.
+
+         Korrigiert wird um die MITTE der belegten Breite und nicht um den
+         Mittelwert der Auslenkungen: gemeint ist, dass der Schwarm als Form
+         mittig sitzt, und der Mittelwert zoege ihn dorthin, wo die meisten
+         Punkte liegen, also bei einer schiefen Verteilung wieder daneben. */
+      if (placed.length) {
+        var lo = Infinity, hi = -Infinity;
+        for (var q = 0; q < placed.length; q++) {
+          var v = out[placed[q]];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        var shift = (lo + hi) / 2;
+        if (shift) for (var q2 = 0; q2 < placed.length; q2++) out[placed[q2]] -= shift;
+      }
+      return out;
+    }
+
     /* The whole pairs figure, computed once in the worker.
 
        The parameter cap is a display decision, not a numerical one: a triangle
@@ -5614,6 +5750,15 @@
            years says where it came from. */
         tool: 'https://alber.me/miscellaneous/tools/bayes-rethinking.html',
         csv: String(st.csv === undefined ? '' : st.csv),
+        /* Die Trennzeichen gehoeren zum CSV-Text und nicht zu den
+           Einstellungen: ohne sie liest dieselbe Datei beim naechsten Oeffnen
+           Kategorien statt Zahlen, und die Sitzung waere nur fast
+           wiederherstellbar. */
+        separators: {
+          dec: st.sep && st.sep.dec ? String(st.sep.dec) : '',
+          delim: st.sep && st.sep.delim ? String(st.sep.delim) : '',
+          thou: st.sep && st.sep.thou ? String(st.sep.thou) : ''
+        },
         models: models,
         active: st.active | 0,
         settings: {
@@ -5732,8 +5877,29 @@
         warnings.push('"csv" is not a string, so this session was loaded without any data.');
       }
 
+      /* Die Trennzeichen. Ein unbekannter Wert wird verworfen und gemeldet,
+         nicht stillschweigend durch eine Vorgabe ersetzt: eine Sitzung, die
+         mit dem falschen Dezimalzeichen aufmacht, liest Zahlen als Kategorien,
+         und das faellt erst im Ergebnis auf. Fehlt der Block ganz (eine
+         Sitzung von vor dem 2026-09-11), bleiben die Felder leer und der
+         Nutzer waehlt sie einmal, wie bei jeder anderen Datei auch. */
+      var sepIn = doc.separators && typeof doc.separators === 'object' ? doc.separators : {};
+      function sepOf(v, allowed, what) {
+        if (v === undefined || v === '') return '';
+        if (allowed.indexOf(v) >= 0) return v;
+        warnings.push('ignored the separator ' + what + ' "' + String(v) + '"; it has to be one of ' +
+          allowed.map(function (k) { return '"' + k + '"'; }).join(', ') + '.');
+        return '';
+      }
+      var sep = {
+        dec: sepOf(sepIn.dec, ['.', ','], 'dec'),
+        delim: sepOf(sepIn.delim, [',', ';', 'tab', '|'], 'delim'),
+        thou: sepOf(sepIn.thou, ['none', '.', ',', ' ', "'"], 'thou')
+      };
+
       return { session: {
         csv: typeof doc.csv === 'string' ? doc.csv : '',
+        sep: sep,
         models: models,
         active: active,
         mode: enumOf(s.mode, ['quap', 'nuts'], 'quap', 'mode'),
@@ -5868,11 +6034,30 @@
        CSV
        ================================================================ */
 
+    /* Gezaehlt wird nur AUSSERHALB von Anfuehrungszeichen.
+
+       Ein Trennzeichen innerhalb eines zitierten Feldes ist Text und kein
+       Trennzeichen, und es mitzuzaehlen kippte die Wahl: die Kopfzeile
+       `"a,b";"c,d"` hat zwei Kommas und ein Semikolon, also gewann das Komma,
+       und die ganze Datei kam als EINE Spalte namens a_b_c_d heraus. Genau die
+       Dateien, die ihre Kopfzeile zitieren, tun das meist deshalb, weil ein
+       Komma darin steht. */
     function detectDelim(line) {
       var best = ',', bestN = 0;
+      var counts = { ',': 0, ';': 0, '\t': 0, '|': 0 };
+      var inQ = false;
+      for (var i = 0; i < line.length; i++) {
+        var ch = line[i];
+        if (ch === '"') {
+          /* Verdoppeltes Anfuehrungszeichen ist ein Zeichen, kein Wechsel. */
+          if (inQ && line[i + 1] === '"') { i++; continue; }
+          inQ = !inQ;
+          continue;
+        }
+        if (!inQ && counts[ch] !== undefined) counts[ch]++;
+      }
       [',', ';', '\t', '|'].forEach(function (d) {
-        var n = line.split(d).length - 1;
-        if (n > bestN) { bestN = n; best = d; }
+        if (counts[d] > bestN) { bestN = counts[d]; best = d; }
       });
       return best;
     }
@@ -5980,7 +6165,71 @@
       return { rows: [names].concat(body) };
     }
 
-    function parseCSV(text) {
+    /* ----------------------------------------------------------------
+       Zahlen in der Schreibweise, die der Nutzer ANGEGEBEN hat.
+
+       Warum das nicht geraten wird: `1.234` ist entweder Eintausendzwei-
+       hundertvierunddreissig oder eins Komma zwei drei vier, und die Datei
+       sagt nicht, welches. Jede Heuristik entscheidet das irgendwann
+       lautlos falsch, und der Fehler ist Faktor 1000. Vor dem 2026-09-11
+       stand hier schlicht Number(), also implizit "immer Punkt": ein
+       deutscher Excel-Export mit 1,75 wurde deshalb nicht etwa abgelehnt,
+       sondern als KATEGORIE mit einer Stufe je verschiedenem Wert gelesen.
+       Die Datei lud sauber, das Modell fittete, und es kamen Zahlen heraus,
+       nur waren es Rangplaetze der Erstnennung statt Koerpergroessen.
+
+       dec ist '.' oder ',', thou ist '.', ',', ' ', "'" oder '' (keines).
+       Beide kommen aus den Pflichtfeldern im Ladeblock, es gibt keine
+       Vorgabe und kein Raten.
+
+       Streng: was nach dem Entfernen der Tausendertrenner und dem
+       Vereinheitlichen des Dezimalzeichens nicht als Zahl durchgeht, ist
+       keine, und die Spalte wird kategorial. Ein durchgerutschtes
+       Trennzeichen darf nicht als Ziffer enden. */
+    function numberIn(txt, dec, thou) {
+      if (thou) {
+        /* Nur ZWISCHEN Ziffern, damit ein Minus oder ein Dezimalpunkt am
+           Rand nicht als Tausendertrenner verschwindet. */
+        var esc = thou.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        txt = txt.replace(new RegExp('(?<=\\d)' + esc + '(?=\\d)', 'g'), '');
+      }
+      if (dec === ',') {
+        if (txt.indexOf('.') >= 0) return NaN;
+        txt = txt.replace(',', '.');
+      } else if (txt.indexOf(',') >= 0) return NaN;
+      /* Number('') ist 0 und Number(' 1 ') ist 1: beides hier unerwuenscht,
+         also erst die Form pruefen. Exponenten bleiben erlaubt, weil sie in
+         Exporten wirklich vorkommen. */
+      if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(txt)) return NaN;
+      return Number(txt);
+    }
+
+    /* Sieht diese Spalte so aus, als waere sie mit ANDEREN Trennzeichen eine
+       Zahlenspalte? Treibt nur den Hinweis im Datenreiter, nie eine
+       Umdeutung: geraten wird nach wie vor nichts. */
+    function looksNumericElsewhere(vals, dec, thou) {
+      var combos = [['.', ''], [',', ''], ['.', ','], [',', '.'], ['.', ' '], [',', ' ']];
+      for (var c = 0; c < combos.length; c++) {
+        var d = combos[c][0], t = combos[c][1];
+        if (d === dec && t === thou) continue;
+        var all = vals.length > 0;
+        for (var i = 0; i < vals.length; i++) {
+          if (!isFinite(numberIn(vals[i], d, t))) { all = false; break; }
+        }
+        if (all) return { dec: d, thou: t };
+      }
+      return null;
+    }
+
+    /* opts.dec, opts.thou und opts.delim kommen aus dem Ladeblock, dessen drei
+       Felder immer gesetzt sind (Vorgabe Punkt, Komma, keiner). Fehlt trotzdem
+       eines, wird bewusst nicht geraten: dann wird KEINE Spalte numerisch und
+       needsFormat ist gesetzt. Der Aufrufer entscheidet, was er damit tut; die
+       Oberflaeche kommt an diesen Fall nicht heran, die Tests schon. */
+    function parseCSV(text, opts) {
+      opts = opts || {};
+      var dec = opts.dec, thou = opts.thou === undefined ? null : opts.thou;
+      var haveFmt = (dec === '.' || dec === ',') && thou !== null;
       var src = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
       if (!src.trim()) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
       /* JSON first, and only when the text actually starts like JSON, so a CSV
@@ -5995,12 +6244,17 @@
          shape I can read". */
       if (/^\s*[[{]/.test(src)) {
         var jr = jsonRows(src);
-        if (jr.rows) return typeRows(jr.rows, 'json');
+        /* JSON traegt seine Zahlen typisiert, also gibt es dort keine
+           Schreibweise zu waehlen: der Ladeblock bleibt fuer eine JSON-Datei
+           ohne Wirkung und der Fit ist nicht gesperrt. */
+        if (jr.rows) return typeRows(jr.rows, 'json', '.', '');
         return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [],
           numeric: [], notes: [], error: jr.why };
       }
       var firstNl = src.indexOf('\n');
-      var delim = detectDelim(firstNl < 0 ? src : src.slice(0, firstNl));
+      /* Der Spaltentrenner ist ebenfalls Pflicht; detectDelim dient nur noch
+         als VORSCHLAG fuer das Feld und nicht mehr als stille Entscheidung. */
+      var delim = opts.delim || detectDelim(firstNl < 0 ? src : src.slice(0, firstNl));
       var rows = [], field = '', row = [], inQ = false, i;
       for (i = 0; i < src.length; i++) {
         var c = src[i];
@@ -6016,15 +6270,24 @@
       }
       row.push(field); rows.push(row);
       if (!rows.length) return { columns: {}, names: [], n: 0, missing: [], nMissing: 0, levels: [], numeric: [], notes: [] };
-      return typeRows(rows, 'csv');
+      /* Ohne vollstaendige Angabe wird die Tabelle zwar in Felder zerlegt, aber
+         keine Zahl gelesen: die Vorschau kann so schon die Spalten zeigen,
+         waehrend der Fit gesperrt bleibt. */
+      var out = typeRows(rows, 'csv', haveFmt ? dec : null, haveFmt ? thou : '');
+      if (!haveFmt) out.needsFormat = true;
+      out.delim = delim;
+      return out;
     }
 
     /* Header plus body of string fields to typed columns. Split out of parseCSV
        when JSON became a second input shape, so that both shapes share one
        decision about what is numeric, what is categorical and what is missing.
        `kind` only reaches the notes, where "column" beats "field" for JSON. */
-    function typeRows(rows, kind) {
+    function typeRows(rows, kind, dec, thou) {
       var i;
+      /* dec === null heisst: die Schreibweise ist noch nicht gewaehlt. Dann
+         wird keine Spalte numerisch, und die Oberflaeche sperrt den Fit. */
+      var noFmt = dec === null;
       var header = rows[0].map(function (h, k) {
         var t = h.trim().replace(/^"|"$/g, '');
         /* A name that cannot be written in the model notation is useless, so
@@ -6034,6 +6297,27 @@
         if (!clean || /^[0-9]/.test(clean)) clean = 'v' + (k + 1) + (clean ? '_' + clean : '');
         return clean;
       });
+      /* Namen eindeutig machen. `columns` ist ein Objekt, also ueberschrieb bis
+         2026-09-11 die zweite Spalte gleichen Namens die erste still: "x,x"
+         ergab zwei Eintraege in `names`, die auf DASSELBE Array zeigten, und die
+         Werte der ersten Spalte waren weg. Der Datenreiter zeigte dieselbe
+         Spalte zweimal, und ein Modell ueber x fittete ungefragt die zweite.
+         Zwei verschiedene Namen koennen ausserdem erst durch die Normalisierung
+         oben kollidieren ("a b" und "a-b" werden beide a_b).
+
+         Angehaengt wird _2, _3, ...; der erste Traeger behaelt seinen Namen,
+         damit eine Datei mit genau einem Duplikat nicht beide Spalten umbenennt
+         und ein bestehendes Modell weiterlaeuft. */
+      var usedNames = {};
+      for (i = 0; i < header.length; i++) {
+        var base = header[i];
+        if (usedNames[base] === undefined) { usedNames[base] = 1; continue; }
+        var suffix = usedNames[base] + 1;
+        while (usedNames[base + '_' + suffix] !== undefined) suffix++;
+        usedNames[base] = suffix;
+        header[i] = base + '_' + suffix;
+        usedNames[header[i]] = 1;
+      }
       var notes = [];
       for (i = 0; i < header.length; i++) {
         var orig = (rows[0][i] || '').trim();
@@ -6051,7 +6335,7 @@
         for (var j = 0; j < header.length; j++) {
           var v = (body[i][j] || '').trim();
           if (v === '' || v === 'NA' || v === 'NaN' || v === 'null') continue;
-          if (!isFinite(Number(v))) numeric[j] = false;
+          if (noFmt || !isFinite(numberIn(v, dec, thou))) numeric[j] = false;
         }
       }
       /* Missing values are KEPT here, as NaN, and dropped later by compileModel
@@ -6082,7 +6366,7 @@
         for (i = 0; i < body.length; i++) {
           var raw = (body[i][j3] || '').trim();
           if (isMissing(raw)) { arr[i] = NaN; missCount[j3]++; continue; }
-          if (numeric[j3]) { arr[i] = Number(raw); continue; }
+          if (numeric[j3]) { arr[i] = numberIn(raw, dec, thou); continue; }
           /* Categorical columns become one-based integer codes, which is the
              form an index variable needs. The level table goes back to the UI so
              the user can see which number is which. */
@@ -6106,8 +6390,40 @@
             'and only for the columns that model uses.');
         }
       }
+      /* Der Hinweis auf eine vermutlich falsch gelesene Spalte.
+
+         Er deutet NICHTS um: die Spalte bleibt kategorial, genau wie gelesen.
+         Er sagt nur, dass sie mit einer anderen Schreibweise durchgehend eine
+         Zahlenspalte waere, und nennt die Einstellung, die das leistet. Ohne
+         ihn findet den Ladeblock nur, wer schon weiss, dass es ihn gibt, und
+         der Fehler faellt erst im Ergebnis auf, wo er nicht mehr nach einem
+         Formatproblem aussieht.
+
+         Eine Spalte mit echten Textstufen ("rot", "blau") loest ihn nicht aus,
+         weil die in keiner Schreibweise eine Zahl ist. */
+      var fmtHint = null;
+      if (!noFmt) {
+        for (i = 0; i < header.length; i++) {
+          if (numeric[i]) continue;
+          var lvI = levels[i];
+          if (!lvI || lvI.length < 2) continue;
+          var alt = looksNumericElsewhere(lvI, dec, thou);
+          if (!alt) continue;
+          var decName = alt.dec === ',' ? 'comma' : 'point';
+          var thouName = alt.thou === '' ? 'none'
+            : (alt.thou === '.' ? 'point' : (alt.thou === ',' ? 'comma'
+              : (alt.thou === ' ' ? 'space' : 'apostrophe')));
+          notes.push(header[i] + ' was read as a category with ' + lvI.length +
+            ' levels, but every value in it is a number when the decimal mark is ' +
+            'the ' + decName + ' and the thousands separator is ' + thouName +
+            ' (for example "' + lvI[0] + '"). Set those in the load block above, ' +
+            'or this column is modelled as arbitrary codes.');
+          if (!fmtHint) fmtHint = { column: header[i], dec: alt.dec, thou: alt.thou };
+        }
+      }
       return { columns: columns, names: header, n: body.length, missing: missCount,
-        nMissing: totalMissing, levels: levels, numeric: numeric, notes: notes };
+        nMissing: totalMissing, levels: levels, numeric: numeric, notes: notes,
+        fmtHint: fmtHint };
     }
 
     /* Column statistics for the data panel, and for the standardize helper. */
@@ -7193,7 +7509,7 @@
       chainsToSamples: chainsToSamples, paramChains: paramChains, precisNuts: precisNuts,
       sampleCor: sampleCor, samplerDiagnostics: samplerDiagnostics, traceSeries: traceSeries,
       blurGrid: blurGrid, densRange: densRange, marginalDensity: marginalDensity,
-      roundToRange: roundToRange,
+      roundToRange: roundToRange, beeswarm: beeswarm,
       jointDensity: jointDensity, hpdLevels: hpdLevels, pairsFigure: pairsFigure,
       posteriorCor: posteriorCor, gridCheck: gridCheck,
       linkNode: linkNode, levelDraws: levelDraws,
@@ -7206,6 +7522,7 @@
       pyExpr: pyExpr, pyInvLink: pyInvLink, toPython: toPython,
       PYFUNCS: PYFUNCS, PYRNG: PYRNG,
       parseCSV: parseCSV, detectDelim: detectDelim, describeColumns: describeColumns,
+      numberIn: numberIn, looksNumericElsewhere: looksNumericElsewhere,
       jsonRows: jsonRows, typeRows: typeRows,
       drawsCSV: drawsCSV, thinSamples: thinSamples,
       serializeSession: serializeSession, parseSession: parseSession,
@@ -7599,8 +7916,18 @@
         <//>`;
     }
 
+    /* Die Schreibweise der eingebauten Beispiele: sie bauen ihren Text selbst
+       aus toFixed und Kommas, also Punkt als Dezimalzeichen, Komma als
+       Spaltentrenner, kein Tausendertrenner. Gleich der Vorgabe, aber nicht
+       ueberfluessig: wer vorher auf eine deutsche Datei umgestellt hat, soll
+       ein Beispiel trotzdem sofort lesbar bekommen. */
+    const EXAMPLE_FMT = { dec: '.', delim: ',', thou: 'none' };
+
     /* ---- the data panel ---- */
-    function DataPanel({ csv, setCsv, data, onExample }) {
+    /* sep/setSep und nicht fmt: `fmt` ist weiter oben die Zahlenformatierung
+       der Tabellen, und eine Prop dieses Namens verdeckt sie genau hier, wo die
+       Spaltentabelle sie braucht. */
+    function DataPanel({ csv, setCsv, data, onExample, sep, setSep }) {
       const [over, setOver] = useState(false);
       const fileRef = useRef(null);
 
@@ -7612,10 +7939,55 @@
 
       const cols = data && data.names.length ? RTH.describeColumns(data) : [];
 
+      /* Die Vorschau: die ersten Zeilen SO, wie die Trennzeichen sie gerade
+         lesen. Sie ist der Grund, warum die drei Felder ueberhaupt bedienbar
+         sind: ohne sie waehlt man blind und erfaehrt erst am Ergebnis, ob 1,75
+         als Zahl angekommen ist. Zahlen stehen rechts, als Kategorie gelesene
+         Spalten tragen einen Vermerk im Kopf, und genau dieser Unterschied ist
+         das, was man pruefen will. */
+      const preview = useMemo(() => {
+        if (!data || data.error || !data.names.length) return null;
+        const rows = Math.min(5, data.n);
+        return {
+          names: data.names,
+          numeric: data.numeric,
+          levels: data.levels,
+          n: data.n,
+          cells: data.names.map((nm, ci) => {
+            const col = data.columns[nm], lv = data.levels[ci];
+            const out = [];
+            for (let r = 0; r < rows; r++) {
+              const v = col[r];
+              if (!isFinite(v)) { out.push('missing'); continue; }
+              /* Eine Kategorie zeigt ihren TEXT und nicht ihren Code: der Code
+                 ist eine Folge der Lesart und verraet nicht, was in der Datei
+                 stand. */
+              out.push(lv ? (lv[v - 1] === undefined ? String(v) : lv[v - 1]) : String(v));
+            }
+            return out;
+          })
+        };
+      }, [data]);
+
+      const SEL = (label, value, onChange, options, hint) => html`
+        <label style=${{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 12 }}>
+          <span style=${{ color: 'var(--tool-label)' }}>${label}</span>
+          <select className="qp-exsel" value=${value} aria-label=${label}
+            onChange=${(e) => onChange(e.target.value)}>
+            ${options.map((o) => html`<option key=${o[0]} value=${o[0]}>${o[1]}</option>`)}
+          </select>
+          ${hint ? html`<span style=${{ color: 'var(--tool-faint)', fontSize: 11 }}>${hint}</span>` : null}
+        </label>`;
+
       return html`
         <div className="ctl-card">
           <div className="ctl-sec">
-            <p className="ctl-sec-h">Data</p>
+            <p className="ctl-sec-h" style=${{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              Data
+              ${data && !data.error && data.names.length ? html`
+                <span style=${{ fontWeight: 400, fontSize: 12, color: 'var(--tool-note)' }}>
+                  ${data.n} rows, ${data.names.length} column${data.names.length === 1 ? '' : 's'}</span>` : null}
+            </p>
             <div className="qp-chips" style=${{ marginBottom: 8 }}>
               <button className="tool-btn tool-btn-sm" onClick=${() => fileRef.current && fileRef.current.click()}>
                 ${ToolIcons.el('upload')} Load data
@@ -7649,6 +8021,57 @@
             </div>
             <textarea className="qp-mono qp-csv" style=${{ marginTop: 8 }} spellCheck=${false}
               placeholder="x,y" value=${csv} onChange=${(e) => setCsv(e.target.value)}></textarea>
+
+            <!-- Die drei Trennzeichen. Vorgabe ist die internationale
+                 Schreibweise, und sie wird nicht erraten, sondern steht
+                 sichtbar da: eine Datei wird genau so gelesen, wie diese Felder
+                 es sagen. Sie stehen UNTER dem Textfeld und ueber der Vorschau,
+                 also zwischen der Eingabe und ihrer Wirkung. -->
+            <div style=${{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 10 }}>
+              ${SEL('Decimal mark', sep.dec, (v) => setSep({ ...sep, dec: v }),
+                [['.', 'point   1.75'], [',', 'comma   1,75']])}
+              ${SEL('Column separator', sep.delim, (v) => setSep({ ...sep, delim: v }),
+                [[',', 'comma   ,'], [';', 'semicolon   ;'], ['tab', 'tab'], ['|', 'pipe   |']],
+                data && data.delim && !sep.delim
+                  ? ('looks like ' + (data.delim === '	' ? 'tab'
+                    : data.delim === ';' ? 'semicolon' : data.delim === '|' ? 'pipe' : 'comma'))
+                  : null)}
+              ${SEL('Thousands separator', sep.thou, (v) => setSep({ ...sep, thou: v }),
+                [['none', 'none   1234'], ['.', 'point   1.234'], [',', 'comma   1,234'],
+                 [' ', 'space   1 234'], ["'", 'apostrophe   1’234']])}
+            </div>
+
+            <!-- Die Vorschau, live an denselben Einstellungen. -->
+            ${preview ? html`
+              <div style=${{ marginTop: 10 }}>
+                <p style=${{ fontSize: 12, color: 'var(--tool-label)', margin: '0 0 4px' }}>
+                  Preview: the first ${Math.min(5, preview.n)} of ${preview.n} row${preview.n === 1 ? '' : 's'},
+                  read the way the settings above say.</p>
+                <div className="qp-scroll">
+                  <table className="qp-tbl">
+                    <thead><tr>
+                      ${preview.names.map((nm, ci) => html`
+                        <th key=${nm} style=${{ textAlign: preview.numeric[ci] ? 'right' : 'left' }}>
+                          ${nm}
+                          <span style=${{ display: 'block', fontWeight: 400, fontSize: 10,
+                            color: preview.numeric[ci] ? 'var(--tool-faint)' : 'var(--tool-warn-text, var(--tool-note))' }}>
+                            ${preview.numeric[ci] ? 'number'
+                              : ('category, ' + (preview.levels[ci] ? preview.levels[ci].length : 0) + ' levels')}</span>
+                        </th>`)}
+                    </tr></thead>
+                    <tbody>
+                      ${(preview.cells[0] || []).map((_, r) => html`
+                        <tr key=${r}>
+                          ${preview.names.map((nm, ci) => html`
+                            <td key=${nm} style=${{ textAlign: preview.numeric[ci] ? 'right' : 'left',
+                              color: preview.cells[ci][r] === 'missing' ? 'var(--tool-faint)' : undefined,
+                              fontStyle: preview.cells[ci][r] === 'missing' ? 'italic' : undefined }}>
+                              ${preview.cells[ci][r]}</td>`)}
+                        </tr>`)}
+                    </tbody>
+                  </table>
+                </div>
+              </div>` : null}
             <!-- Ein JSON, das nicht zu lesen war, sagt hier warum. Direkt unter
                  dem Feld und nicht im grossen Fehlerkasten der Seite: der
                  gehoert dem Fit, und dieser Fehler entsteht beim Tippen. -->
@@ -8924,6 +9347,34 @@
       /* Die Achse traegt, was auf ihr steht. "yes" waere jetzt falsch, denn
          gezeichnet ist nicht die Zahl der Ja, sondern ihr Anteil. */
       const yLabel = rowTrials ? outcome + ' (proportion)' : outcome;
+      /* Die waagerechte Auslenkung der Beobachtungen, nur im kategorialen
+         Fall. Im stetigen traegt x eine echte Messung, und ein Punkt, der
+         dort zur Seite rueckt, behauptet einen Messwert, den es nicht gibt.
+
+         Die Breite ist auf 40 Prozent des Stufenabstands gedeckelt, damit
+         zwei benachbarte Schwaerme sich nicht beruehren und keiner den
+         Eindruck erweckt, er reiche in die Nachbarkategorie hinein. Bei einer
+         einzelnen Stufe gibt es keinen Abstand, aus dem sich das ableiten
+         liesse, und dann setzt die halbe Zeichenflaeche die Grenze. */
+      let swarm = null;
+      if (isCat) {
+        const stepPx = gx.length > 1
+          ? Math.abs(px(gx[1]) - px(gx[0]))
+          : (W - pad - 12);
+        const maxOff = stepPx * 0.4;
+        swarm = new Float64Array(n);
+        /* Je Stufe ein eigener Schwarm. Die Zuordnung laeuft ueber den
+           x-Wert der Zeile, der bei einer Kategorie die Codierung 1..K
+           traegt, dieselbe, auf der auch das Gitter sitzt. */
+        for (let g = 0; g < gx.length; g++) {
+          const members = [];
+          for (let i = 0; i < n; i++) if (x[i] === gx[g]) members.push(i);
+          if (!members.length) continue;
+          const ys = Float64Array.from(members, (i) => py(y[i]));
+          const off = RTH.beeswarm(ys, { r: 2.6, gap: 0.5, step: 1, maxOffset: maxOff });
+          for (let m = 0; m < members.length; m++) swarm[members[m]] = off[m];
+        }
+      }
       return html`
         <${React.Fragment}>
           <svg className="qp-plot" viewBox=${'0 0 ' + W + ' ' + H}>
@@ -8989,29 +9440,61 @@
                  Dokument, und eine Datei mit einer generischen id wie "clip"
                  kollidiert, sobald jemand zwei davon in dasselbe Dokument
                  legt. -->
+            <!-- Der kategoriale Fall, HINTER den Punkten: je Stufe zwei
+                 senkrechte Baender, das blasse breite fuer die simulierte
+                 Beobachtung und das kraeftigere darin fuer die Unsicherheit
+                 im Knoten selbst, plus der Mittelwert als Punkt.
+
+                 Bis 2026-09-11 waren das zwei duenne Striche VOR den Punkten,
+                 mit der Begruendung, die Schaetzung sei hier die Aussage und
+                 verschwinde sonst in der Punktwolke. Seit die Beobachtungen
+                 als Schwarm zur Seite ausweichen, stimmt die Rechnung nicht
+                 mehr: der Strich stand dann nicht neben der Wolke, sondern
+                 mitten hindurch, und ein senkrechter Balken quer durch die
+                 Punkte liest sich als Trennung zwischen zwei Haufen.
+
+                 Die Sichtbarkeit traegt jetzt die FLAECHE statt der
+                 Vordergrund. Dreimal so breit wie vorher ist die Schaetzung
+                 auch hinter den Kreisen nicht zu uebersehen, und die Punkte
+                 stehen davor, wo sie im stetigen Fall ohnehin schon stehen.
+                 Damit sehen beide Faelle gleich aus: zwei gestapelte Flaechen
+                 mit den Daten obenauf.
+
+                 Die Breiten sind absolut und nicht an den Schwarm gekoppelt.
+                 Ein Band, das mit der Zahl der Kategorien mitwaechst, wuerde
+                 seine Breite als Groesse lesbar machen, und breit heisst hier
+                 nichts: die Aussage steht in der LAENGE.
+
+                 butt statt round als Abschluss, anders als bei den duennen
+                 Strichen vorher. Eine runde Kappe ragt um den halben Strich
+                 ueber den Endpunkt hinaus, bei Breite 15 also um 7.5 Pixel an
+                 jedem Ende, und behauptet damit ein Intervall, das laenger
+                 ist als die Zahlen dahinter. -->
+            ${isCat ? gx.map((v, i) => html`
+              <${React.Fragment} key=${'c' + i}>
+                <line x1=${px(v)} y1=${py(simLo[i])} x2=${px(v)} y2=${py(simHi[i])}
+                  stroke="var(--tool-sig-info)" strokeWidth="6" opacity="0.18" strokeLinecap="butt" />
+                <line x1=${px(v)} y1=${py(linkLo[i])} x2=${px(v)} y2=${py(linkHi[i])}
+                  stroke="var(--tool-sig-info)" strokeWidth="15" opacity="0.38" strokeLinecap="butt" />
+              <//>`) : null}
             <clipPath id="qp-pred-clip">
               <rect x=${pad - 0.5} y=${11.5} width=${W - 12 - pad + 1}
                 height=${H - pad - 11} />
             </clipPath>
             <g clipPath="url(#qp-pred-clip)">
               ${order.map((i) => html`
-                <circle key=${i} cx=${px(x[i])} cy=${py(y[i])} r="2.6"
+                <circle key=${i} cx=${px(x[i]) + (swarm ? swarm[i] : 0)} cy=${py(y[i])} r="2.6"
                   fill="none" stroke="var(--tool-emph)" strokeWidth="1" opacity="0.75" />`)}
             </g>
-            <!-- Der kategoriale Fall, ueber den Punkten: je Stufe ein dicker
-                 Strich fuer das Niveau und ein duenner fuer die simulierte
-                 Beobachtung, plus der Mittelwert als Punkt. Ueber den Daten,
-                 weil die Schaetzung hier die Aussage ist und sonst in der
-                 Punktwolke verschwindet. -->
+            <!-- Der Mittelwert bleibt als einziges Stueck der Schaetzung VOR
+                 den Punkten. Er ist ein Punkt und keine Flaeche, also traegt
+                 ihn die Breite nicht, und hinter dem Schwarm waere er bei
+                 dichten Stufen schlicht weg. Der helle Ring setzt ihn von den
+                 Kreisen ab, zwischen denen er sonst nur ein weiterer Kreis
+                 waere. -->
             ${isCat ? gx.map((v, i) => html`
-              <${React.Fragment} key=${'c' + i}>
-                <line x1=${px(v)} y1=${py(simLo[i])} x2=${px(v)} y2=${py(simHi[i])}
-                  stroke="var(--tool-sig-info)" strokeWidth="2" opacity="0.35" strokeLinecap="round" />
-                <line x1=${px(v)} y1=${py(linkLo[i])} x2=${px(v)} y2=${py(linkHi[i])}
-                  stroke="var(--tool-sig-info)" strokeWidth="5" strokeLinecap="round" />
-                <circle cx=${px(v)} cy=${py(linkMean[i])} r="3.2" fill="var(--tool-sig-info)"
-                  stroke="var(--tool-surface)" strokeWidth="1" />
-              <//>`) : null}
+              <circle key=${'m' + i} cx=${px(v)} cy=${py(linkMean[i])} r="3.2"
+                fill="var(--tool-sig-info)" stroke="var(--tool-surface)" strokeWidth="1" />`) : null}
           </svg>
           <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: 8, maxWidth: '78ch' }}>
             ${rowTrials
@@ -9019,7 +9502,10 @@
                   trials in that row, because ${grid.node} is a probability and the column counts
                   successes. `
               : 'Circles are the observed data. '}
-            The dark ${isCat ? 'bar' : 'band'} is the uncertainty in ${grid.node} itself, the
+            ${isCat ? html`Within a level they are spread sideways only so that they do not cover
+                each other, so the WIDTH of a clump is the number of rows at that value and the
+                sideways position itself means nothing. ` : ''}
+            The dark band is the uncertainty in ${grid.node} itself, the
             pale one adds the observation noise, so about ${(grid.link.prob * 100).toFixed(0)} percent of
             real points should fall inside it.
             ${' '}
@@ -9111,7 +9597,7 @@
          den Test auf eine Weise, die wie ein Fehler in der Komponente aussieht.
          0 csv, 1 model, 2 res, 3 err, 4 busy, 5 tab, 6 prob, 7 draws,
          8 mode, 9 nChains, 10 nIter, 11 adaptDelta, 12 nonCentred,
-         13 others, 14 active, 15 cmpCrit.
+         13 others, 14 active, 15 cmpCrit, 16 sepFmt.
          (Bis 2026-09-10 lag auf 8 ein `note` fuer den Info-Streifen der
          Beispiele. Mit dem Streifen ist es weg, und alles danach ist um eins
          nach vorn gerueckt; die Seeds im Rendertest sind mitgezogen.)
@@ -9157,6 +9643,23 @@
       const [others, setOthers] = useState([]);
       const [active, setActive] = useState(0);
       const [cmpCrit, setCmpCrit] = useState('waic');
+      /* 16 sepFmt: die drei Trennzeichen des Ladeblocks. Nicht `fmt`, das ist
+         schon die Zahlenformatierung weiter oben.
+
+         Vorgabe ist die internationale Schreibweise, also Punkt als
+         Dezimalzeichen, Komma als Spaltentrenner, kein Tausendertrenner. Das
+         ist zugleich das Format der eingebauten Beispiele, die deshalb keine
+         Sonderbehandlung mehr brauchen.
+
+         Geraten wird trotzdem nichts: die Felder stehen sichtbar auf ihrer
+         Vorgabe und lesen die Datei genau so, wie sie es sagen. Wer eine
+         deutsche Datei laedt, stellt sie um, und bis dahin sagen die Vorschau
+         und der Hinweis im Datenreiter, dass die Spalte als Kategorie gelesen
+         wurde und welche Einstellung sie zu Zahlen macht.
+
+         thou 'none' heisst "es gibt keinen" und ist eine echte Wahl; der
+         Kern erwartet dafuer den Leerstring, umgerechnet wird in fmtOpts. */
+      const [sepFmt, setSepFmt] = useState({ dec: '.', thou: 'none', delim: ',' });
 
       /* Die Modelle als eine Liste, in Anzeigereihenfolge, mit dem aktiven an
          seiner Stelle. Alles unterhalb liest diese Sicht und nicht die beiden
@@ -9219,10 +9722,21 @@
         setActive(i);
       }, [models, active]);
 
+      /* 'none' ist die Wahl "es gibt keinen", der Kern erwartet dafuer den
+         Leerstring. Eine noch nicht getroffene Wahl kommt als undefined an,
+         und parseCSV liest dann keine Zahl. */
+      const fmtOpts = useMemo(() => ({
+        dec: sepFmt.dec || undefined,
+        thou: sepFmt.thou === 'none' ? '' : (sepFmt.thou || undefined),
+        delim: sepFmt.delim === 'tab' ? '	' : (sepFmt.delim || undefined)
+      }), [sepFmt]);
+
       const data = useMemo(() => {
         if (!csv.trim()) return null;
-        try { return RTH.parseCSV(csv); } catch (e) { return null; }
-      }, [csv]);
+        try { return RTH.parseCSV(csv, fmtOpts); } catch (e) { return null; }
+      }, [csv, fmtOpts]);
+
+
 
       /* Hat das Modell ueberhaupt einen hierarchischen Prior? Nur dann ist der
          Schalter unten sinnvoll, und nur dann soll er sichtbar sein. Geprueft
@@ -9238,6 +9752,12 @@
       const onExample = useCallback((id) => {
         const ex = RTH.exampleData(id);
         setCsv(ex.csv);
+        /* Die eingebauten Beispiele erzeugen ihren CSV-Text selbst, mit
+           toFixed und einem Komma dazwischen. Ihre Schreibweise ist also
+           bekannt und keine Frage an den Nutzer: sie setzen die drei Felder
+           mit, damit das Werkzeug in zwei Klicks ausprobierbar bleibt. Das
+           Gate gilt weiterhin fuer alles, was von aussen kommt. */
+        setSepFmt(EXAMPLE_FMT);
         setModel(ex.model);
         /* Kein Info-Streifen mehr. Der Kommentarkopf des Modells sagt
            dasselbe konkreter und steht im Editor, wohin der Blick nach dem
@@ -9411,13 +9931,14 @@
       const saveSession = useCallback(() => {
         const txt = RTH.serializeSession({
           csv: csv,
+          sep: sepFmt,
           models: models.map((m) => ({ name: m.rawName, src: m.src })),
           active: active, mode: mode, prob: prob, draws: draws,
           nChains: nChains, nIter: nIter, adaptDelta: adaptDelta,
           nonCentred: nonCentred, cmpCrit: cmpCrit
         });
         download(txt, baseName() + '.quaplab.json', 'application/json');
-      }, [csv, models, active, mode, prob, draws, nChains, nIter, adaptDelta,
+      }, [csv, sepFmt, models, active, mode, prob, draws, nChains, nIter, adaptDelta,
         nonCentred, cmpCrit, baseName]);
 
       /* Und zurueck. Ein Fehler landet im normalen Fehlerkasten, weil das die
@@ -9442,6 +9963,9 @@
         setRes(null);
         setBusy(null);
         setCsv(s.csv);
+        /* Fehlt der Block (alte Sitzung), bleibt es bei den leeren Feldern und
+           das Gate greift wie bei jeder anderen Datei. */
+        setSepFmt(s.sep || { dec: '', delim: '', thou: '' });
         setMode(s.mode); setProb(s.prob); setDraws(s.draws);
         setNChains(s.nChains); setNIter(s.nIter); setAdaptDelta(s.adaptDelta);
         setNonCentred(s.nonCentred); setCmpCrit(s.cmpCrit);
@@ -9619,7 +10143,8 @@
           </p>
 
           <div className="qp-grid2" style=${{ marginTop: 18 }}>
-            <${DataPanel} csv=${csv} setCsv=${setCsv} data=${data} onExample=${onExample} />
+            <${DataPanel} csv=${csv} setCsv=${setCsv} data=${data} onExample=${onExample}
+              sep=${sepFmt} setSep=${setSepFmt} />
             <div className="ctl-card">
               <div className="ctl-sec">
                 <p className="ctl-sec-h">Model</p>
