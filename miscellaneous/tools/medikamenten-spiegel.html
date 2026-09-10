@@ -119,6 +119,110 @@
     <script>(function(){if((localStorage.getItem('lang')||'en')!=='de')return;var r=document.getElementById('root');r.querySelector('h1').textContent='Medikamentenspiegel-Visualisierung';r.querySelector('p').textContent='Interaktive Visualisierung des Blutspiegel-Verlaufs von Wirkstoffen über den Tag (pharmakokinetisches Ein-Kompartiment-Modell, Bateman-Funktion): Einnahmezeitpunkte per Maus verschieben, Dosis und Darreichungsform (unretardiert/retardiert) kombinieren und die Tag-zu-Tag-Akkumulation im Steady State beobachten.';})()</script>
   </main>
 
+  <!-- Pure pharmacokinetics, no DOM and no React: this block is the seam the
+       Node tests in notes/dev/ read out and eval. Keep the id. -->
+  <script id="mscore">
+    const LN2 = Math.log(2);
+
+    /* ── Pharmacokinetics ────────────────────────────────────────────────── */
+    /* One-compartment oral disposition (elimination kₑ, mono-exponential tail).
+       The *shape* before the tail comes from the absorption/input function, which
+       is chosen per phase (`kind`); a form sums fraction-weighted phases, so
+       biphasic/retard profiles are just several phases added. Input kinds:
+       • firstorder: rate ∝ kₐ·e^(−kₐt); Bateman rise/decay (default).
+       • zeroorder:  constant release over a duration; the flat ER plateau.
+       • weibull:    release Fₐ(t)=1−e^(−(t/td)^ss); ss>1 gives an ascending,
+                      sigmoidal input (e.g. Concerta OROS). No closed form with
+                      the kₑ kernel, so its single-dose response is convolved
+                      numerically once per form onto a grid and interpolated.
+       All kinds are linear, so multi-dose superposition (and steady state) still
+       hold. Two-compartment disposition and saturable (non-linear) kinetics are
+       deliberately out of scope here. unitConc returns concentration for D=1 mg,
+       V=1 L; callers scale by (dose/V) to get mg/L. */
+    const WDT = 0.01, WMAX = 30, WN = Math.round(WMAX / WDT);   // weibull grid: 0…30 h
+
+    /* Single-dose Weibull input convolved with e^(−kₑt): S(t)=∫₀ᵗ Fₐ′(τ)e^(−kₑ(t−τ))dτ.
+       Trapezoidal integration of dS/dt = Fₐ′(t) − kₑ·S on a fixed grid. */
+    function weibullGrid(td, ss, ke) {
+    const S = new Float64Array(WN + 1), e = Math.exp(-ke * WDT);
+    const rate = t => t <= 0 ? 0 : (ss / td) * Math.pow(t / td, ss - 1) * Math.exp(-Math.pow(t / td, ss));
+    let s = 0, prev = 0;
+    for (let k = 1; k <= WN; k++) { const r = rate(k * WDT); s = s * e + 0.5 * WDT * (prev * e + r); prev = r; S[k] = s; }
+    return S;
+    }
+    function weibullEval(S, ke, tau) {
+    if (tau <= 0) return 0;
+    const x = tau / WDT, i = Math.floor(x);
+    if (i >= WN) return S[WN] * Math.exp(-ke * (tau - WN * WDT));   // release done → mono-exponential
+    const f = x - i;
+    return S[i] * (1 - f) + S[i + 1] * f;
+    }
+
+    /* Precompute per-form kinetics (weibull grids built once here, not per sample). */
+    function formPK(form) {
+    const ke = LN2 / form.half_life_h;
+    const phases = form.phases.map(ph => {
+      const kind = ph.kind || 'firstorder', lag = ph.lag_h || 0, frac = ph.frac;
+      if (kind === 'zeroorder') return { kind, frac, lag, dur: ph.dur_h };
+      if (kind === 'weibull')   return { kind, frac, lag, grid: weibullGrid(ph.td_h, ph.ss, ke) };
+      return { kind: 'firstorder', frac, lag, ka: ph.ka_per_h };
+    });
+    return { ke, hl: form.half_life_h, F: form.f, phases };
+    }
+
+    /* Single-dose concentration for D=1 mg, V=1 L at elapsed time tau (h). */
+    function unitConc(pk, tau) {
+    if (tau < 0) return 0;
+    const ke = pk.ke;
+    let v = 0;
+    for (let i = 0; i < pk.phases.length; i++) {
+      const ph = pk.phases[i], t = tau - ph.lag;
+      if (t < 0) continue;
+      let shape;
+      if (ph.kind === 'zeroorder') {
+        if (t <= ph.dur) shape = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * t));
+        else { const pk0 = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * ph.dur)); shape = pk0 * Math.exp(-ke * (t - ph.dur)); }
+      } else if (ph.kind === 'weibull') {
+        shape = weibullEval(ph.grid, ke, t);
+      } else {                                   // firstorder
+        const ka = ph.ka, dk = ka - ke;
+        shape = Math.abs(dk) < 1e-4 ? ke * t * Math.exp(-ke * t) : (ka / dk) * (Math.exp(-ke * t) - Math.exp(-ka * t));
+      }
+      v += ph.frac * shape;
+    }
+    return pk.F * v;
+    }
+
+    /* Total concentration (mg/L) at absolute time T (h). Intakes are a daily
+       schedule (hour ∈ [0,24)); with `repeat`, each recurs every 24 h so past
+       days accumulate. pkOf maps a formId to its precomputed formPK.
+       `mf` is the prodrug molar factor: the dose the user enters is the marketed
+       salt, while the curve is the active moiety, so the entered mg have to be
+       converted before they are divided by V. 1 for everything that is its own
+       active substance, which is every substance here except lisdexamfetamine. */
+    function concAt(T, intakes, pkOf, V, repeat, mf) {
+    let total = 0;
+    for (let i = 0; i < intakes.length; i++) {
+      const it = intakes[i], pk = pkOf(it.formId);
+      if (!pk) continue;
+      let contrib = 0;
+      if (repeat) {
+        let k = Math.floor((T - it.hour) / 24);
+        for (; k >= -60; k--) {
+          const occ = it.hour + 24 * k;
+          if (occ > T) continue;
+          const tau = T - occ;
+          if (tau > 25 * pk.hl) break;            // older doses are negligible
+          contrib += unitConc(pk, tau);
+        }
+      } else if (it.hour <= T) {
+        contrib += unitConc(pk, T - it.hour);
+      }
+      total += (it.mg * mf / V) * contrib;
+    }
+    return total;
+  }
+  </script>
   <script id="app">
     const { useState, useMemo, useRef, useEffect } = React;
     const html = htm.bind(React.createElement);
@@ -203,102 +307,6 @@
     const COL_AXIS  = 'var(--tool-note)';
     const COL_PIN   = '#0fb5ad';
     const COL_NIGHT = 'var(--tool-hairline)';
-    const LN2 = Math.log(2);
-
-    /* ── Pharmacokinetics ────────────────────────────────────────────────── */
-    /* One-compartment oral disposition (elimination kₑ, mono-exponential tail).
-       The *shape* before the tail comes from the absorption/input function, which
-       is chosen per phase (`kind`); a form sums fraction-weighted phases, so
-       biphasic/retard profiles are just several phases added. Input kinds:
-         • firstorder: rate ∝ kₐ·e^(−kₐt); Bateman rise/decay (default).
-         • zeroorder:  constant release over a duration; the flat ER plateau.
-         • weibull:    release Fₐ(t)=1−e^(−(t/td)^ss); ss>1 gives an ascending,
-                        sigmoidal input (e.g. Concerta OROS). No closed form with
-                        the kₑ kernel, so its single-dose response is convolved
-                        numerically once per form onto a grid and interpolated.
-       All kinds are linear, so multi-dose superposition (and steady state) still
-       hold. Two-compartment disposition and saturable (non-linear) kinetics are
-       deliberately out of scope here. unitConc returns concentration for D=1 mg,
-       V=1 L; callers scale by (dose/V) to get mg/L. */
-    const WDT = 0.01, WMAX = 30, WN = Math.round(WMAX / WDT);   // weibull grid: 0…30 h
-
-    /* Single-dose Weibull input convolved with e^(−kₑt): S(t)=∫₀ᵗ Fₐ′(τ)e^(−kₑ(t−τ))dτ.
-       Trapezoidal integration of dS/dt = Fₐ′(t) − kₑ·S on a fixed grid. */
-    function weibullGrid(td, ss, ke) {
-      const S = new Float64Array(WN + 1), e = Math.exp(-ke * WDT);
-      const rate = t => t <= 0 ? 0 : (ss / td) * Math.pow(t / td, ss - 1) * Math.exp(-Math.pow(t / td, ss));
-      let s = 0, prev = 0;
-      for (let k = 1; k <= WN; k++) { const r = rate(k * WDT); s = s * e + 0.5 * WDT * (prev * e + r); prev = r; S[k] = s; }
-      return S;
-    }
-    function weibullEval(S, ke, tau) {
-      if (tau <= 0) return 0;
-      const x = tau / WDT, i = Math.floor(x);
-      if (i >= WN) return S[WN] * Math.exp(-ke * (tau - WN * WDT));   // release done → mono-exponential
-      const f = x - i;
-      return S[i] * (1 - f) + S[i + 1] * f;
-    }
-
-    /* Precompute per-form kinetics (weibull grids built once here, not per sample). */
-    function formPK(form) {
-      const ke = LN2 / form.half_life_h;
-      const phases = form.phases.map(ph => {
-        const kind = ph.kind || 'firstorder', lag = ph.lag_h || 0, frac = ph.frac;
-        if (kind === 'zeroorder') return { kind, frac, lag, dur: ph.dur_h };
-        if (kind === 'weibull')   return { kind, frac, lag, grid: weibullGrid(ph.td_h, ph.ss, ke) };
-        return { kind: 'firstorder', frac, lag, ka: ph.ka_per_h };
-      });
-      return { ke, hl: form.half_life_h, F: form.f, phases };
-    }
-
-    /* Single-dose concentration for D=1 mg, V=1 L at elapsed time tau (h). */
-    function unitConc(pk, tau) {
-      if (tau < 0) return 0;
-      const ke = pk.ke;
-      let v = 0;
-      for (let i = 0; i < pk.phases.length; i++) {
-        const ph = pk.phases[i], t = tau - ph.lag;
-        if (t < 0) continue;
-        let shape;
-        if (ph.kind === 'zeroorder') {
-          if (t <= ph.dur) shape = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * t));
-          else { const pk0 = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * ph.dur)); shape = pk0 * Math.exp(-ke * (t - ph.dur)); }
-        } else if (ph.kind === 'weibull') {
-          shape = weibullEval(ph.grid, ke, t);
-        } else {                                   // firstorder
-          const ka = ph.ka, dk = ka - ke;
-          shape = Math.abs(dk) < 1e-4 ? ke * t * Math.exp(-ke * t) : (ka / dk) * (Math.exp(-ke * t) - Math.exp(-ka * t));
-        }
-        v += ph.frac * shape;
-      }
-      return pk.F * v;
-    }
-
-    /* Total concentration (mg/L) at absolute time T (h). Intakes are a daily
-       schedule (hour ∈ [0,24)); with `repeat`, each recurs every 24 h so past
-       days accumulate. pkOf maps a formId to its precomputed formPK. */
-    function concAt(T, intakes, pkOf, V, repeat) {
-      let total = 0;
-      for (let i = 0; i < intakes.length; i++) {
-        const it = intakes[i], pk = pkOf(it.formId);
-        if (!pk) continue;
-        let contrib = 0;
-        if (repeat) {
-          let k = Math.floor((T - it.hour) / 24);
-          for (; k >= -60; k--) {
-            const occ = it.hour + 24 * k;
-            if (occ > T) continue;
-            const tau = T - occ;
-            if (tau > 25 * pk.hl) break;            // older doses are negligible
-            contrib += unitConc(pk, tau);
-          }
-        } else if (it.hour <= T) {
-          contrib += unitConc(pk, T - it.hour);
-        }
-        total += (it.mg / V) * contrib;
-      }
-      return total;
-    }
 
     /* ── Small helpers ───────────────────────────────────────────────────── */
     const pad2 = n => (n < 10 ? '0' : '') + n;
@@ -436,12 +444,12 @@
         let dmax = 1e-9;
         for (let i = 0; i <= N; i++) {
           const T = windowH * i / N;
-          const c = concAt(T, intakes, pkOf, V, repeat);
+          const c = concAt(T, intakes, pkOf, V, repeat, MF);
           tot.push([T, c]);
           if (c > dmax) dmax = c;
         }
         return { series: tot, dataMax: dmax };
-      }, [intakes, pkOf, V, repeat, windowH]);
+      }, [intakes, pkOf, V, repeat, windowH, MF]);
 
       const axis = niceAxis(dataMax, 4);
       const yMax = axis.max;
@@ -586,6 +594,8 @@
         return fid => m[fid] || m[sub.forms[0].id];
       }, [sub]);
       const V = sub ? sub.vd_l_per_kg * weight : 1;
+      // prodrugs: entered dose is the salt, the curve is the active moiety
+      const MF = sub && sub.molar_factor != null ? sub.molar_factor : 1;
 
       function selectSubstance(id) {
         const s = data.substances.find(x => x.id === id);
@@ -618,11 +628,11 @@
         let mn = Infinity, mx = -Infinity, sum = 0, n = 0;
         for (let i = 0; i <= 240; i++) {
           const T = t0 + (t1 - t0) * i / 240;
-          const c = concAt(T, intakes, pkOf, V, repeat);
+          const c = concAt(T, intakes, pkOf, V, repeat, MF);
           if (c < mn) mn = c; if (c > mx) mx = c; sum += c; n++;
         }
         return { cmin: mn, cmax: mx, cavg: sum / n };
-      }, [sub, intakes, pkOf, V, repeat, windowH]);
+      }, [sub, intakes, pkOf, V, repeat, windowH, MF]);
 
       if (err) return html`<div className="container"><p style=${{ color: '#e05260' }}>${t.loadError}</p></div>`;
       if (!data || !sub) return html`<div className="container"><p style=${{ color: 'var(--tool-label)' }}>${t.loading}</p></div>`;
