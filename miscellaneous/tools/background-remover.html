@@ -701,6 +701,236 @@
     })();
   </script>
 
+  <script id="wscore">
+    /* Marker watershed: the only mode here that decides by EDGES rather than by
+       colour. Every other mode asks "how far is this pixel from the background
+       colour"; this one lets a front rise from the marks and stop where the
+       image gradient is steepest, so no tolerance is involved at all.
+
+       Ported from notes/dev/bgstudy-watershed-lib.mjs, the library the sounding
+       measured with (notes/tools/background-remover-dino/WATERSHED.md).
+
+       Read that file before trusting this mode: it LOST the measurement. On the
+       36-image set it beat nothing, and the finding was not its average but its
+       variance. Twenty valid placements of the same four marks on one photo gave
+       full-image MAE between 0.101 and 0.799, a factor of eight. The reason is
+       structural and cannot be tuned away: watershed has no model of a region,
+       every pixel goes to whichever mark reaches it by the cheapest path, so one
+       leak through a weak stretch of outline sends the front into the wrong
+       territory where nothing stops it any more. The mode ships anyway because
+       the variance is exactly what a person can steer by adding a mark and
+       looking, which a single-shot benchmark cannot measure.
+
+       Beucher/Meyer priority-queue flooding, not Vincent/Soille immersion:
+       marker-based by construction, no minima search, O(n log n) on a heap. */
+    (function () {
+      /* Exact, not the interpolated 1024-entry LUT that bgremove-core uses. That
+         table exists there because the flatten step feeds it FRACTIONAL channel
+         values; here the input is always an 8-bit canvas buffer, so there are
+         only 256 possible arguments and the table buys nothing. It also costs:
+         interpolating it drifts about 2e-7 from the real transfer function,
+         which is invisible in an image and fatal for the parity test that binds
+         this block to the study library. */
+      function lin(v) {
+        var c = v / 255;
+        return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      }
+
+      /* OKLab L, not the usual 0.299/0.587/0.114 luma: bgremove-core works in
+         OKLab throughout, and a gradient on a perceptually linear axis puts its
+         edge where a person sees one. On a dark subject against a dark ground
+         that is not cosmetic, L spreads a contrast that gamma-coded luma
+         squashes into nothing. */
+      function oklabL(rgba, w, h) {
+        var n = w * h, out = new Float32Array(n);
+        for (var i = 0, k = 0; i < n; i++, k += 4) {
+          var R = lin(rgba[k]), G = lin(rgba[k + 1]), B = lin(rgba[k + 2]);
+          var l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+          var m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+          var s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+          out[i] = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+        }
+        return out;
+      }
+
+      /* Separable gauss. Not cosmetic but the actual control of the method:
+         without it every speck of sensor noise is a watershed ridge and the
+         front stops at once, which is the classic oversegmentation. */
+      function blurGauss(src, w, h, sigma) {
+        if (!(sigma > 0)) return Float32Array.from(src);
+        var r = Math.max(1, Math.ceil(sigma * 3));
+        var ker = new Float32Array(2 * r + 1), sum = 0, i;
+        for (i = -r; i <= r; i++) {
+          var v = Math.exp(-(i * i) / (2 * sigma * sigma));
+          ker[i + r] = v; sum += v;
+        }
+        for (i = 0; i < ker.length; i++) ker[i] /= sum;
+        var tmp = new Float32Array(w * h), out = new Float32Array(w * h), x, y, acc, xi, yi;
+        for (y = 0; y < h; y++) {
+          for (x = 0; x < w; x++) {
+            acc = 0;
+            for (i = -r; i <= r; i++) {
+              xi = x + i; if (xi < 0) xi = 0; else if (xi >= w) xi = w - 1;
+              acc += src[y * w + xi] * ker[i + r];
+            }
+            tmp[y * w + x] = acc;
+          }
+        }
+        for (y = 0; y < h; y++) {
+          for (x = 0; x < w; x++) {
+            acc = 0;
+            for (i = -r; i <= r; i++) {
+              yi = y + i; if (yi < 0) yi = 0; else if (yi >= h) yi = h - 1;
+              acc += tmp[yi * w + x] * ker[i + r];
+            }
+            out[y * w + x] = acc;
+          }
+        }
+        return out;
+      }
+
+      /* Sobel magnitude on the smoothed luminance: the height map the water
+         rises in. */
+      function gradientMag(lum, w, h) {
+        var out = new Float32Array(w * h);
+        function at(x, y) {
+          return lum[(y < 0 ? 0 : y >= h ? h - 1 : y) * w + (x < 0 ? 0 : x >= w ? w - 1 : x)];
+        }
+        for (var y = 0; y < h; y++) {
+          for (var x = 0; x < w; x++) {
+            var gx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1))
+                   - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1));
+            var gy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1))
+                   - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1));
+            out[y * w + x] = Math.sqrt(gx * gx + gy * gy);
+          }
+        }
+        return out;
+      }
+
+      /* Binary min-heap over (priority, index) in parallel typed arrays. At four
+         megapixels a heap of objects would be millions of short-lived
+         allocations and GC pressure would dominate the runtime.
+
+         The insertion counter breaks ties FIFO. Without it the order among equal
+         gradients depends on heap structure, and on a smooth area (where very
+         many pixels share a value exactly) the region then grows in an arbitrary
+         direction instead of evenly. That is the difference between a plausible
+         boundary and a frayed one. */
+      function Heap(cap) {
+        this.pri = new Float32Array(cap);
+        this.idx = new Int32Array(cap);
+        this.ord = new Int32Array(cap);
+        this.n = 0; this.seq = 0;
+      }
+      Heap.prototype._less = function (a, b) {
+        return this.pri[a] < this.pri[b] || (this.pri[a] === this.pri[b] && this.ord[a] < this.ord[b]);
+      };
+      Heap.prototype._swap = function (a, b) {
+        var t = this.pri[a]; this.pri[a] = this.pri[b]; this.pri[b] = t;
+        var u = this.idx[a]; this.idx[a] = this.idx[b]; this.idx[b] = u;
+        var v = this.ord[a]; this.ord[a] = this.ord[b]; this.ord[b] = v;
+      };
+      Heap.prototype.push = function (p, i) {
+        var k = this.n++;
+        this.pri[k] = p; this.idx[k] = i; this.ord[k] = this.seq++;
+        while (k > 0) {
+          var par = (k - 1) >> 1;
+          if (this._less(k, par)) { this._swap(k, par); k = par; } else break;
+        }
+      };
+      Heap.prototype.pop = function () {
+        var top = this.idx[0];
+        this.n--;
+        if (this.n > 0) {
+          this.pri[0] = this.pri[this.n]; this.idx[0] = this.idx[this.n]; this.ord[0] = this.ord[this.n];
+          var k = 0;
+          for (;;) {
+            var l = 2 * k + 1, r = l + 1, s = k;
+            if (l < this.n && this._less(l, s)) s = l;
+            if (r < this.n && this._less(r, s)) s = r;
+            if (s === k) break;
+            this._swap(k, s); k = s;
+          }
+        }
+        return top;
+      };
+
+      var WS_BG = 1, WS_FG = 2;
+
+      /* The water rises from all marks at once. Each neighbour of an assigned
+         pixel enters the queue at the gradient height AT THAT PIXEL, and the
+         globally lowest is always served next, so the front crosses flat ground
+         first and only climbs a ridge once no cheaper path remains. That is why
+         the boundary snaps to the edge without a tolerance anywhere.
+
+         Deliberate departure from the textbook: no WSHED pixels are handed out.
+         A one-pixel divide line would be a hole in an alpha mask, so every pixel
+         gets a label and the boundary lies between two of them. Where two
+         labels meet, background wins: a mask that takes too much is obvious at a
+         glance and one more mark fixes it, while an over-generous rim stays as a
+         dirty fringe and is harder to spot. */
+      function watershed(grad, w, h, seeds) {
+        var n = w * h, i;
+        var label = new Uint8Array(n), queued = new Uint8Array(n);
+        var heap = new Heap(n + 1);
+        for (i = 0; i < n; i++) if (seeds[i]) { label[i] = seeds[i]; queued[i] = 1; }
+
+        function offer(j) {
+          if (!queued[j]) { heap.push(grad[j], j); queued[j] = 1; }
+        }
+        for (i = 0; i < n; i++) {
+          if (!label[i]) continue;
+          var x0 = i % w, y0 = (i / w) | 0;
+          if (x0 > 0) offer(i - 1);
+          if (x0 < w - 1) offer(i + 1);
+          if (y0 > 0) offer(i - w);
+          if (y0 < h - 1) offer(i + w);
+        }
+
+        while (heap.n > 0) {
+          i = heap.pop();
+          if (label[i]) continue;
+          var x = i % w, y = (i / w) | 0, lab = 0;
+          if (x > 0 && label[i - 1]) lab = label[i - 1];
+          if (x < w - 1 && label[i + 1]) lab = lab === 0 ? label[i + 1] : (lab === label[i + 1] ? lab : WS_BG);
+          if (y > 0 && label[i - w]) lab = lab === 0 ? label[i - w] : (lab === label[i - w] ? lab : WS_BG);
+          if (y < h - 1 && label[i + w]) lab = lab === 0 ? label[i + w] : (lab === label[i + w] ? lab : WS_BG);
+          if (!lab) continue;
+          label[i] = lab;
+          if (x > 0) offer(i - 1);
+          if (x < w - 1) offer(i + 1);
+          if (y > 0) offer(i - w);
+          if (y < h - 1) offer(i + w);
+        }
+        /* Anything never reached (fully cut-off territory) counts as background. */
+        for (i = 0; i < n; i++) if (!label[i]) label[i] = WS_BG;
+        return label;
+      }
+
+      /* Image plus marks to an alpha plane in 0..1. feather softens the binary
+         decision; watershed has no notion of a partial pixel, and a perfectly
+         hard edge costs more than it looks like it should. */
+      function segment(rgba, w, h, seeds, opts) {
+        var o = opts || {};
+        var sigma = o.sigma == null ? 1.5 : o.sigma;
+        var feather = o.feather == null ? 1 : o.feather;
+        var lum = oklabL(rgba, w, h);
+        var grad = gradientMag(blurGauss(lum, w, h, sigma), w, h);
+        var label = watershed(grad, w, h, seeds);
+        var n = w * h, a = new Float32Array(n);
+        for (var i = 0; i < n; i++) a[i] = label[i] === WS_FG ? 1 : 0;
+        return { alpha: feather > 0 ? blurGauss(a, w, h, feather) : a, label: label };
+      }
+
+      window.WsCore = {
+        WS_BG: WS_BG, WS_FG: WS_FG,
+        oklabL: oklabL, blurGauss: blurGauss, gradientMag: gradientMag,
+        watershed: watershed, segment: segment
+      };
+    })();
+  </script>
+
   <script id="app">
     // Markup is htm, not JSX: backticks tagged with `html`, ${...} for values,
     // style always an object. All image logic lives in /assets/js/bgremove-core.js.
@@ -739,8 +969,10 @@
     /* One short text per control, shown in a floating box behind a round "i".
        Keyed by the same id the popover state uses. */
     const INFO = {
-      bg: 'Auto reads the colour from a border strip of the image. Pick takes the colour of the pixel you click in the preview. Sample lets you paint over the background with a brush and builds a small colour model from what you painted, so a background made of several shades still counts as one background. Object (AI) is the only one that does not work on colour at all: a vision model looks at the picture, you mark what the object is and what it is not, and the colour engine is then left with nothing but the exact position of the edge.',
+      bg: 'Auto reads the colour from a border strip of the image. Pick takes the colour of the pixel you click in the preview. Sample lets you paint over the background with a brush and builds a small colour model from what you painted, so a background made of several shades still counts as one background. Object (AI) is the only one that does not work on colour at all: a vision model looks at the picture, you mark what the object is and what it is not, and the colour engine is then left with nothing but the exact position of the edge. Edges works on neither colour nor meaning but on contrast: you mark the object and the background, and the boundary is drawn where the picture changes most sharply between the two.',
       dinomode: 'Colour alone fails on three things: a textured background, a background colour that also appears inside the subject, and a background the flood fill cannot reach from the border. All three are questions about what the picture shows, so this mode answers them with a vision model (DINOv3, 15 MB, downloaded once and run in this tab). It replaces the flood fill, it does not assist it. Two limits worth knowing before you start: half-transparent things come out as a silhouette, so a wine bottle loses its glass, and the model separates classes rather than individuals, so two marks on one person can bring every person in the picture with them.',
+      wsmode: 'A front rises from each mark and spreads through the picture, always taking the flattest route first, so the two fronts meet along the steepest edge between them. That is a different question from the one every other mode here asks: not "what colour is the background" but "where does this picture actually change". It therefore does not care that the background colour also appears in the subject, and it does not care whether the background can be reached from the border. What it does care about, a lot, is where you put the marks. Measured on a 36-image test set it was the weakest mode on every class, and the reason was not its average but its spread: the same four marks placed differently on one photo gave results a factor of eight apart. It is here because that spread is steerable by hand, which a one-shot measurement cannot see, and because a boundary that snaps to a real edge is worth having when it works. Two things it cannot do: half-transparent things come out as a silhouette, and where subject and background share both colour and brightness there is no edge to find, so the front walks straight through.',
+      wssigma: 'How much the image is blurred before the edges are measured. This is the real control of this mode, not a cosmetic one. Too little and every speck of sensor noise counts as an edge, so the fronts stop almost immediately and the mask breaks into fragments. Too much and genuine thin structures stop being edges at all. Textured backgrounds such as foliage or gravel are the hard case here: they are edges everywhere, and no setting fixes that.',
       dinobrush: 'Mark the object with a click or a stroke, and the background the same way. A stroke wins on subjects with several parts, holes or difficult edges, since it asks the model at more places along the shape. A click wins where the object touches its surroundings or is see-through, because a stroke there collects the ground or whatever is behind the glass and hands it in as part of the object. Both go into one average per class, so the two are the same operation, not two engines.',
       dinothresh: 'Where the model has to be sure before a pixel counts as decided. Towards the right the edge gets finer on fur and blur, towards the left holes and closed surfaces stay safer. Neither end wins both, which is why this is a slider and not a better default. The range stops where the measurements stopped: left is the tested default, right is the best setting a threshold sweep found.',
       dinorefine: 'Runs a guided filter along the mask edge, which sharpens the cut against the picture itself. On composed images this is a clear win. On ordinary photographs it is a trade: the edge gets visibly cleaner, and any background that stayed behind turns into a haze instead of a hard patch. Off by default for that reason.',
@@ -871,6 +1103,10 @@
       const [mode, setMode] = useState('edges');
       const [tolerance, setTolerance] = useState(DEFAULTS.tolerance);
       const [colorWeight, setColorWeight] = useState(DEFAULTS.colorWeight);
+      const [wsClass, setWsClass] = useState('fg');
+      const [wsPts, setWsPts] = useState({ fg: [], bg: [] });
+      const [wsBrush, setWsBrush] = useState(26);
+      const [wsSigma, setWsSigma] = useState(1.5);
       const [softEdges, setSoftEdges] = useState(true);
       const [expand, setExpand] = useState(DEFAULTS.expand);
       const [smooth, setSmooth] = useState(DEFAULTS.smooth);
@@ -922,13 +1158,15 @@
 
       const core = typeof BgCore !== 'undefined' ? BgCore : null;
       const dino = typeof DinoBg !== 'undefined' ? DinoBg : null;
+      const ws = typeof WsCore !== 'undefined' ? WsCore : null;
+      const wsReady = !!ws && !!wsPts.fg.length && !!wsPts.bg.length;
       const featsReady = !!feats && feats.img === image;
       const softReady = !!dinoSoft && dinoSoft.img === image;
       const canCopy = typeof ClipboardItem !== 'undefined' && !!(navigator.clipboard && navigator.clipboard.write);
       const activeBg = bgMode === 'pick' ? (picked || autoBg) : autoBg;
       const usingModel = bgMode === 'sample' && !!bgModel;
       // In the AI mode no colour is picked at all, so there is nothing to show.
-      const hideSwatch = usingModel || bgMode === 'dino';
+      const hideSwatch = usingModel || bgMode === 'dino' || bgMode === 'watershed';
       const centers = usingModel && Array.isArray(bgModel.centersRgb) ? bgModel.centersRgb.slice(0, 8) : null;
 
       const options = useCallback(() => ({
@@ -1145,10 +1383,68 @@
         return dino.composite(buf, r, alpha);
       }, [dino, dinoT, dinoRefine, options]);
 
+      /* Marks live in PREVIEW pixels, the space the overlay canvas is drawn in.
+         The export runs on the full image, so both centre and radius scale by
+         image.scale. Same pattern as the DINO path, which addresses its marks in
+         the patch grid for the same reason. */
+      const wsCompose = useCallback((buf) => {
+        const k = buf.width / image.preview.width;
+        const seeds = new Uint8Array(buf.width * buf.height);
+        const stamp = (pts, val) => {
+          const r = Math.max(1, Math.round(wsBrush * k));
+          for (const p of pts) {
+            const cx = Math.round(p[0] * k), cy = Math.round(p[1] * k);
+            for (let dy = -r; dy <= r; dy++) {
+              for (let dx = -r; dx <= r; dx++) {
+                if (dx * dx + dy * dy > r * r) continue;
+                const x = cx + dx, y = cy + dy;
+                if (x < 0 || y < 0 || x >= buf.width || y >= buf.height) continue;
+                seeds[y * buf.width + x] = val;
+              }
+            }
+          }
+        };
+        /* Background first, so an overlapping object mark wins: the object is
+           what the user is aiming at, the background is context. */
+        stamp(wsPts.bg, ws.WS_BG);
+        stamp(wsPts.fg, ws.WS_FG);
+
+        const o = options();
+        const r = ws.segment(buf.data, buf.width, buf.height, seeds,
+          { sigma: wsSigma, feather: o.feather });
+        /* The shape passes belong to the colour engine, so only the ones that
+           work on a finished alpha are reused here. Tolerance and soft edges
+           have no meaning in this mode and are deliberately not applied. */
+        const n = buf.width * buf.height;
+        const out = new Uint8ClampedArray(n * 4);
+        for (let i = 0, m = 0; i < n; i++, m += 4) {
+          out[m] = buf.data[m]; out[m + 1] = buf.data[m + 1]; out[m + 2] = buf.data[m + 2];
+          const a = r.alpha[i];
+          out[m + 3] = Math.round(255 * (a < 0 ? 0 : a > 1 ? 1 : a));
+        }
+        return { width: buf.width, height: buf.height, data: out };
+      }, [ws, image, wsPts, wsBrush, wsSigma, options]);
+
       // Debounced preview recompute.
       useEffect(() => {
         if (!image) { setResult(null); return; }
         if (!core) { setError('The processing engine did not load.'); return; }
+        if (bgMode === 'watershed') {
+          if (!wsReady) { setResult(null); return; }
+          /* Same two-step as the DINO path: the flood is a fraction of a second
+             on a preview, long enough that the status must be painted first. */
+          setDinoBusy(true);
+          const id = setTimeout(() => {
+            try {
+              setResult(wsCompose(image.preview));
+              setError('');
+            } catch (e) {
+              setError(e && e.message ? e.message : 'Processing failed.');
+            }
+            setDinoBusy(false);
+          }, 30);
+          return () => clearTimeout(id);
+        }
         if (bgMode === 'dino') {
           if (!dino || !softReady) { setResult(null); return; }
           /* The guided filter is a third of a second on a preview-sized image,
@@ -1175,7 +1471,8 @@
           }
         }, 150);
         return () => clearTimeout(id);
-      }, [image, core, options, bgMode, dino, dinoSoft, softReady, dinoCompose]);
+      }, [image, core, options, bgMode, dino, dinoSoft, softReady, dinoCompose,
+          wsReady, wsCompose]);
 
       // Paint whatever the view asks for.
       useEffect(() => {
@@ -1224,6 +1521,15 @@
               ctx.fill();
             }
           }
+        } else if (bgMode === 'watershed') {
+          for (const cls of ['bg', 'fg']) {
+            ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
+            for (const p of wsPts[cls]) {
+              ctx.beginPath();
+              ctx.arc(p[0], p[1], wsBrush, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
         } else if (bgMode === 'sample') {
           ctx.fillStyle = BG_PAINT;
           for (const c of trailRef.current) {
@@ -1232,7 +1538,7 @@
             ctx.fill();
           }
         }
-      }, [bgMode, image, dinoPts, dinoBrush]);
+      }, [bgMode, image, dinoPts, dinoBrush, wsPts, wsBrush]);
 
       // One place for display pixels to image pixels. The canvas is laid out with
       // width:100% and height:auto, so the two axes share a factor, but they are
@@ -1287,13 +1593,13 @@
 
       // The AI marks are stored in preview pixels, which is the space the patch
       // grid is addressed in and the space the overlay canvas is drawn in.
-      function paintMark(x, y, cls) {
+      function paintMark(x, y, cls, radius) {
         const ov = overlayRef.current;
         if (!ov) return;
         const ctx = ov.getContext('2d');
         ctx.fillStyle = cls === 'fg' ? FG_PAINT : BG_PAINT;
         ctx.beginPath();
-        ctx.arc(x, y, dinoBrush, 0, Math.PI * 2);
+        ctx.arc(x, y, radius == null ? dinoBrush : radius, 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -1307,12 +1613,15 @@
           setPicked([image.full.data[i], image.full.data[i + 1], image.full.data[i + 2]]);
           return;
         }
-        if (bgMode === 'dino') {
+        if (bgMode === 'dino' || bgMode === 'watershed') {
           e.preventDefault();
           if (e.target.setPointerCapture) { try { e.target.setPointerCapture(e.pointerId); } catch (x) {} }
           const p = [dx * m.px, dy * m.py];
-          strokeRef.current = { x: dx, y: dy, dino: true, cls: dinoClass, pts: [p] };
-          paintMark(p[0], p[1], dinoClass);
+          const isWs = bgMode === 'watershed';
+          const cls = isWs ? wsClass : dinoClass;
+          const r = isWs ? wsBrush : dinoBrush;
+          strokeRef.current = { x: dx, y: dy, mark: true, ws: isWs, cls: cls, radius: r, pts: [p] };
+          paintMark(p[0], p[1], cls, r);
           return;
         }
         if (bgMode !== 'sample') return;
@@ -1332,18 +1641,18 @@
         const dist = Math.hypot(dx - stroke.x, dy - stroke.y);
         // Half a brush width apart, measured in the space the brush lives in:
         // display pixels for the sampling brush, preview pixels for the AI one.
-        const spacing = stroke.dino
-          ? Math.max(2, (dinoBrush / (m.px || 1)) * 0.5)
+        const spacing = stroke.mark
+          ? Math.max(2, (stroke.radius / (m.px || 1)) * 0.5)
           : Math.max(2, brush * 0.5);
         const steps = Math.floor(dist / spacing);
         for (let s = 1; s <= steps; s++) {
           const t = s / steps;
           const ix = stroke.x + (dx - stroke.x) * t;
           const iy = stroke.y + (dy - stroke.y) * t;
-          if (stroke.dino) {
+          if (stroke.mark) {
             const p = [ix * m.px, iy * m.py];
             stroke.pts.push(p);
-            paintMark(p[0], p[1], stroke.cls);
+            paintMark(p[0], p[1], stroke.cls, stroke.radius);
           } else {
             stampSamples(m, ix, iy, stroke.buf);
             paintStroke(m, ix, iy);
@@ -1356,10 +1665,11 @@
         const stroke = strokeRef.current;
         strokeRef.current = null;
         if (!stroke) return;
-        if (stroke.dino) {
+        if (stroke.mark) {
           if (!stroke.pts.length) return;
           const cls = stroke.cls, pts = stroke.pts;
-          setDinoPts((p) => {
+          const setter = stroke.ws ? setWsPts : setDinoPts;
+          setter((p) => {
             const next = { fg: p.fg, bg: p.bg };
             next[cls] = p[cls].concat(pts);
             return next;
@@ -1400,6 +1710,12 @@
         setDinoSoft(null);
       }
 
+      function clearWsMarks() {
+        setWsPts({ fg: [], bg: [] });
+        const ov = overlayRef.current;
+        if (ov) ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
+      }
+
       /* Reset puts every control back to its default and forgets the picked and
          sampled colours. The loaded image stays, since re-opening it is the one
          thing the button next to it already does. */
@@ -1415,6 +1731,10 @@
         setMode('edges');
         setTolerance(DEFAULTS.tolerance);
         setColorWeight(DEFAULTS.colorWeight);
+        clearWsMarks();
+        setWsClass('fg');
+        setWsBrush(26);
+        setWsSigma(1.5);
         setSoftEdges(true);
         setExpand(DEFAULTS.expand);
         setSmooth(DEFAULTS.smooth);
@@ -1448,13 +1768,17 @@
            changes one of them simply misses on the next call, so there is no
            invalidation to keep in sync. */
         const key = JSON.stringify([bgMode, picked, mode, tolerance, colorWeight, softEdges,
-          expand, smooth, feather, despeckle, dinoT, dinoRefine]);
+          expand, smooth, feather, despeckle, dinoT, dinoRefine,
+          wsPts, wsBrush, wsSigma]);
         const hit = exportRef.current;
         if (hit && hit.key === key && hit.image === image
             && hit.bgModel === bgModel && hit.dinoSoft === dinoSoft) return hit.canvas;
 
         let out;
-        if (bgMode === 'dino') {
+        if (bgMode === 'watershed') {
+          if (!wsReady) throw new Error('Mark the object and the background first.');
+          out = wsCompose(image.full);
+        } else if (bgMode === 'dino') {
           if (!dino || !softReady) throw new Error('Mark the object and the background first.');
           const full = image.full;
           const soft = full === image.preview
@@ -1591,7 +1915,7 @@
                       onPointerUp=${onPointerUp}
                       onPointerCancel=${onPointerUp}></canvas>
                     <canvas ref=${overlayRef} className="bg-overlay"
-                      style=${{ opacity: bgMode === 'sample' || bgMode === 'dino' ? 1 : 0 }}></canvas>
+                      style=${{ opacity: bgMode === 'sample' || bgMode === 'dino' || bgMode === 'watershed' ? 1 : 0 }}></canvas>
                   </div>
                 ` : html`
                   <div className=${'bg-drop' + (dragOver ? ' over' : '')}
@@ -1640,7 +1964,8 @@
                     { value: 'auto', label: 'Auto' },
                     { value: 'pick', label: 'Pick' },
                     { value: 'sample', label: 'Sample' },
-                    { value: 'dino', label: 'Object (AI)' }
+                    { value: 'dino', label: 'Object (AI)' },
+                    { value: 'watershed', label: 'Edges' }
                   ]} />
                 </div>
                 ${centers ? html`
@@ -1740,12 +2065,51 @@
                     ` : null}
                   </div>
                 ` : null}
+
+                ${bgMode === 'watershed' ? html`
+                  <div className="bg-dino">
+                    <p className="bg-expl" style=${{ marginTop: 0 }}>
+                      <span className="bg-anchor">The boundary is found from edges, not from colour${info('wsmode', 'the edges mode')}</span>,
+                      so nothing here uses the background colour or the tolerance.
+                    </p>
+                    <div className="bg-row" style=${{ marginTop: 10 }}>
+                      <span className="bg-val">Brush</span>
+                      <${Seg} value=${wsClass} onChange=${setWsClass} options=${[
+                        { value: 'fg', label: 'Object' },
+                        { value: 'bg', label: 'Background' }
+                      ]} />
+                    </div>
+                    <${Slider} label="Brush size" value=${wsBrush} min=${8} max=${48} step=${1} unit=" px"
+                      onChange=${setWsBrush} />
+                    <div className="bg-row" style=${{ marginTop: 6 }}>
+                      <span className="bg-val">
+                        <span className="bg-dot" style=${{ background: FG_DOT }}></span>${wsPts.fg.length} object
+                        <span className="bg-dot" style=${{ background: BG_DOT, marginLeft: 10 }}></span>${wsPts.bg.length} background
+                      </span>
+                      <button className="tool-btn" type="button"
+                        disabled=${!wsPts.fg.length && !wsPts.bg.length}
+                        style=${{ padding: '.2rem .6rem', fontSize: '.72rem' }}
+                        onClick=${clearWsMarks}>Clear marks</button>
+                    </div>
+                    <${Slider} label="Smoothing" value=${wsSigma} min=${0.5} max=${8} step=${0.5} unit=" px"
+                      onChange=${setWsSigma} info=${info('wssigma', 'smoothing')} />
+                    <p className="bg-expl">Mark the object and the background, then add another mark wherever the boundary went wrong. Expect to need a few: this mode is the most sensitive to where exactly the marks sit, which is also what makes it steerable.</p>
+                    ${!wsReady ? html`
+                      <p className="bg-expl">Both brushes are needed: the boundary is where the two fronts meet, so a single one has nothing to meet.</p>
+                    ` : null}
+                  </div>
+                ` : null}
               </div>
 
               ${bgMode === 'dino' ? html`
                 <div className="bg-group">
                   <div className="bg-glabel">Mode</div>
                   <p className="bg-expl" style=${{ marginTop: 0 }}>Continuous and Global do not apply here. The flood fill from the border is what the model replaces, which is exactly why a hole inside the subject or a background that never touches the border stops being a problem.</p>
+                </div>
+              ` : bgMode === 'watershed' ? html`
+                <div className="bg-group">
+                  <div className="bg-glabel">Mode</div>
+                  <p className="bg-expl" style=${{ marginTop: 0 }}>Continuous and Global do not apply here either. Both describe how a colour fill spreads, and this mode spreads from your marks instead, so a background that never touches the border is reached as soon as you mark it.</p>
                 </div>
               ` : html`
                 <div className="bg-group">
@@ -1757,14 +2121,21 @@
                 </div>
               `}
 
-              <div className="bg-group">
-                <div className="bg-glabel">Matching</div>
-                <${Slider} label="Tolerance" value=${tolerance} min=${0} max=${0.35} step=${0.005}
-                  onChange=${setTolerance} info=${info('tolerance', 'tolerance')} />
-                <${Slider} label="Judge by" value=${colorWeight} min=${-1} max=${1} step=${0.25}
-                  readout=${WEIGHT_LABELS[String(colorWeight)] || String(colorWeight)}
-                  onChange=${setColorWeight} info=${info('colorWeight', 'what to judge by')} />
-              </div>
+              ${bgMode === 'watershed' ? html`
+                <div className="bg-group">
+                  <div className="bg-glabel">Matching</div>
+                  <p className="bg-expl" style=${{ marginTop: 0 }}>Nothing is matched against a colour in this mode, so tolerance has no meaning here. Smoothing above is its counterpart.</p>
+                </div>
+              ` : html`
+                <div className="bg-group">
+                  <div className="bg-glabel">Matching</div>
+                  <${Slider} label="Tolerance" value=${tolerance} min=${0} max=${0.35} step=${0.005}
+                    onChange=${setTolerance} info=${info('tolerance', 'tolerance')} />
+                  <${Slider} label="Judge by" value=${colorWeight} min=${-1} max=${1} step=${0.25}
+                    readout=${WEIGHT_LABELS[String(colorWeight)] || String(colorWeight)}
+                    onChange=${setColorWeight} info=${info('colorWeight', 'what to judge by')} />
+                </div>
+              `}
 
               <!-- Cleanup sits above Edges because that is when it runs: the
                    speck filter works on the raw mask, before the alpha passes. -->
