@@ -480,7 +480,7 @@ const SCORE_GEWICHTE = {
   ueberlappung: 3,     // pro gemeinsamer nicht-optionaler Komponenten-id mit einem gewaehlten Rezept
   zutatDa: 2,          // pro Chip-Zutat 'da', die im Rezept vorkommt
   zutatWeg: 5,         // pro Chip-Zutat 'weg', die im Rezept vorkommt (staerker als 'da')
-  brassica: 1,         // pro Eintrag in rezept.brassica
+  brassica: 1,         // einmalig, wenn rezept.brassica nicht leer ist
   ausrichtung: 3,      // Bonus bei chips.ausrichtung.stufe 'eher' und passendem Rezept
   weniger: -2,         // pro zutreffendem Eintrag in chips.weniger (mild, kein Verbot)
   gleicheKueche: -2,   // pro Rezept gleicher Kueche JENSEITS des Freibetrags (Kappe wie Ueberlappung)
@@ -758,11 +758,16 @@ function scoreRezept(rezept, kontext) {
 
   const weniger = chips.weniger || [];
 
-  // Brassica-Anteil. Unterdrueckt, sobald 'brassica' unter chips.weniger steht:
-  // sonst frisst der Bonus die Haelfte des Malus wieder weg und ein Rezept mit
-  // zwei Kohlsorten stuende besser da als eines mit einer.
-  if (weniger.indexOf('brassica') === -1) {
-    score += (rezept.brassica || []).length * G.brassica;
+  // Brassica-Anteil, gedeckelt auf einen Punkt pro Rezept: Kohl im Gericht gibt
+  // den Bonus, zwei Kohlsorten geben nicht mehr. Vorher zaehlte die Laenge der
+  // Liste, und weil der intrinsische Score sonst nur zwischen 0 und 1 liegt, war
+  // dieser eine Zusatzpunkt der staerkste Treiber im unkonfigurierten Plan: bei
+  // temperature 2 ist er Faktor exp(0.5) = 1.6 auf das Ziehgewicht. Die drei
+  // Rezepte mit zwei Eintraegen standen deshalb dauerhaft oben (Owner 2026-09-12:
+  // "tendenziell werden immer die selben vorgeschlagen"). Unterdrueckt, sobald
+  // 'brassica' unter chips.weniger steht, sonst frisst der Bonus den Malus weg.
+  if (weniger.indexOf('brassica') === -1 && (rezept.brassica || []).length > 0) {
+    score += G.brassica;
   }
 
   // Ausrichtung: Bonus nur bei der weichen Stufe 'eher'. Bei 'hart' filtert
@@ -2438,6 +2443,15 @@ globalThis.VP = {
           for (const k of (o.komponenten || [])) if (!k.optional) andere.add(k.id);
         });
         const geteilt = eigene.filter(function (k) { return andere.has(k.id); });
+        // Komponenten mit typ 'fresh' werden am Esstag gekocht, nicht am Kochtag:
+        // planTasks laesst sie aus der Sonntags-Zeitleiste heraus, und die
+        // Haltbarkeitsrechnung uebergeht sie. Bis 2026-09-12 stand das nirgends,
+        // weshalb der Eindruck entstand, Reis wuerde tagelang gelagert (er wird
+        // es nicht) und Hirse sei die batchfreundlichere Wahl (sie ist es nicht).
+        // Nur bei vorgekochten Slots, bei 'frisch' ist ohnehin alles frisch.
+        const amTag = s.art === 'vorgekocht'
+          ? eigene.filter(function (k) { return k.typ === 'fresh' && k.geraet !== 'keins'; })
+          : [];
         // Extras: die optionalen Komponenten des Gerichts. Ihre Reihenfolge ist
         // die Bit-Reihenfolge im Plan-Code, deshalb kommt sie aus dem Kern.
         const extras = VP.optionaleKomponenten(r).map(function (k, j) {
@@ -2460,6 +2474,14 @@ globalThis.VP = {
                   })}
                 </div>`
               : html`<span className="vp-faint">Keine Komponente mit einem anderen Gericht gemeinsam.</span>`}
+            ${amTag.length > 0
+              ? html`<p className="vp-faint" style=${{ margin: '6px 0 0' }}>
+                  Am Esstag frisch: ${amTag.map(function (k) {
+                    const min = (k.aktivMin || 0) + (k.passivMin || 0);
+                    return k.label + (min > 0 ? ' (' + min + ' Min)' : '');
+                  }).join(', ')}
+                </p>`
+              : null}
             <!-- Extras sind die optionalen Komponenten des Rezepts (Toppings,
                  Bohnen, das andockbare Hack). Bis hierher standen ihre Zutaten
                  ungefragt auf dem Einkaufszettel; jetzt entscheidet der Nutzer
