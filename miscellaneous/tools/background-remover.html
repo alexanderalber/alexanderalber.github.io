@@ -709,7 +709,16 @@
 
     const PREVIEW_LIMIT = 1600000;
     const MAX_SAMPLES = 20000;
-    const DEFAULTS = { tolerance: 0.12, expand: 0, smooth: 0, feather: 0, despeckle: 0 };
+    const DEFAULTS = { tolerance: 0.12, expand: 0, smooth: 0, feather: 0, despeckle: 0,
+                       colorWeight: 0 };
+
+    /* The slider reads out in words, because the number carries no meaning. Even
+       steps of 0.25 so every label below corresponds to exactly one position. */
+    const WEIGHT_LABELS = {
+      '-1': 'lightness only', '-0.75': 'lightness', '-0.5': 'more lightness',
+      '-0.25': 'slight lightness', '0': 'balanced', '0.25': 'slight colour',
+      '0.5': 'more colour', '0.75': 'colour', '1': 'colour only'
+    };
 
     /* The AI mode. The worker and the model file are shared with the patch
        similarity tool, so a visitor who has used that one pays nothing here. */
@@ -737,6 +746,7 @@
       dinorefine: 'Runs a guided filter along the mask edge, which sharpens the cut against the picture itself. On composed images this is a clear win. On ordinary photographs it is a trade: the edge gets visibly cleaner, and any background that stayed behind turns into a haze instead of a hard patch. Off by default for that reason.',
       mode: 'Continuous removes only background that hangs together with the image border, so an enclosed area of the same colour inside the subject survives. Global removes the colour wherever in the image it appears.',
       tolerance: 'How far a pixel may differ from the background colour and still count as background.',
+      colorWeight: 'Tolerance measures one distance, and this decides what that distance is made of. Balanced weighs brightness and colour equally. Lean towards colour when the background is one colour lit unevenly: a shadow or a fold changes the brightness a lot and the hue barely at all, so ignoring brightness keeps it all counting as one background. Lean towards lightness for the opposite case, a background whose colour drifts across the frame, from a colour cast or two different lights, while the subject is clearly darker or brighter. Neither end helps when subject and background are genuinely the same colour AND the same brightness, and no setting of this can invent a difference that the picture does not contain.',
       despeckle: 'Drops leftover fragments smaller than this area, for JPEG noise and scanner dust. It runs on the raw mask, before any of the edge steps below.',
       edges: 'These four run top to bottom in the order listed here.',
       soft: 'Gives border pixels fractional transparency and unmixes their colour, which avoids a white fringe and keeps thin hair and soft shadows.',
@@ -837,8 +847,10 @@
       `;
     }
 
-    function Slider({ label, value, min, max, step, unit, signed, onChange, info }) {
-      const shown = (signed && value > 0 ? '+' : '') + value;
+    /* readout overrides the numeric value on the right: a signed weight reads as
+       "colour" or "lightness", not as -0.6, which would mean nothing to anyone. */
+    function Slider({ label, value, min, max, step, unit, signed, onChange, info, readout }) {
+      const shown = readout != null ? readout : (signed && value > 0 ? '+' : '') + value;
       return html`
         <div>
           <div className="bg-row">
@@ -858,6 +870,7 @@
       const [bgMode, setBgMode] = useState('auto');
       const [mode, setMode] = useState('edges');
       const [tolerance, setTolerance] = useState(DEFAULTS.tolerance);
+      const [colorWeight, setColorWeight] = useState(DEFAULTS.colorWeight);
       const [softEdges, setSoftEdges] = useState(true);
       const [expand, setExpand] = useState(DEFAULTS.expand);
       const [smooth, setSmooth] = useState(DEFAULTS.smooth);
@@ -923,12 +936,14 @@
         bgModel: bgMode === 'sample' ? bgModel : null,
         mode,
         tolerance,
+        colorWeight,
         softEdges,
         expand,
         smooth,
         feather,
         despeckle
-      }), [bgMode, picked, bgModel, mode, tolerance, softEdges, expand, smooth, feather, despeckle]);
+      }), [bgMode, picked, bgModel, mode, tolerance, colorWeight, softEdges, expand, smooth,
+           feather, despeckle]);
 
       const loadFile = useCallback((file) => {
         if (!file) return;
@@ -1122,7 +1137,7 @@
         const o = options();
         const r = dino.applyThresholds(buf, soft, {
           lo: th.lo, hi: th.hi,
-          tolerance: o.tolerance, softEdges: o.softEdges,
+          tolerance: o.tolerance, colorWeight: o.colorWeight, softEdges: o.softEdges,
           expand: o.expand, smooth: o.smooth, feather: o.feather, despeckle: o.despeckle
         });
         const refining = dinoRefine && buf.width * buf.height <= REFINE_LIMIT;
@@ -1399,6 +1414,7 @@
         setPicked(null);
         setMode('edges');
         setTolerance(DEFAULTS.tolerance);
+        setColorWeight(DEFAULTS.colorWeight);
         setSoftEdges(true);
         setExpand(DEFAULTS.expand);
         setSmooth(DEFAULTS.smooth);
@@ -1431,7 +1447,7 @@
            three heavy objects by identity, the rest as a string. Anything that
            changes one of them simply misses on the next call, so there is no
            invalidation to keep in sync. */
-        const key = JSON.stringify([bgMode, picked, mode, tolerance, softEdges,
+        const key = JSON.stringify([bgMode, picked, mode, tolerance, colorWeight, softEdges,
           expand, smooth, feather, despeckle, dinoT, dinoRefine]);
         const hit = exportRef.current;
         if (hit && hit.key === key && hit.image === image
@@ -1745,6 +1761,9 @@
                 <div className="bg-glabel">Matching</div>
                 <${Slider} label="Tolerance" value=${tolerance} min=${0} max=${0.35} step=${0.005}
                   onChange=${setTolerance} info=${info('tolerance', 'tolerance')} />
+                <${Slider} label="Judge by" value=${colorWeight} min=${-1} max=${1} step=${0.25}
+                  readout=${WEIGHT_LABELS[String(colorWeight)] || String(colorWeight)}
+                  onChange=${setColorWeight} info=${info('colorWeight', 'what to judge by')} />
               </div>
 
               <!-- Cleanup sits above Edges because that is when it runs: the
