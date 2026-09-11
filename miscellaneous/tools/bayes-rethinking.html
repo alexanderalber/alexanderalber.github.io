@@ -7148,21 +7148,83 @@
            ctx.n fuer diesen Zweck aufzubohren hiesse, den Fit-Pfad anzufassen,
            damit ein Plot bequemer wird. Blockweise auszuwerten kostet GN
            Aufrufe und laesst die Dimensionierung in Ruhe. */
+
+        /* Bei vielen Zeilen wird ueber eine STICHPROBE gemittelt statt ueber
+           alle. Der marginale Zweig kostet sonst GN Auswertungen ueber je n
+           Zeilen mal draws Ziehungen, und das waechst linear mit dem
+           Datensatz: bei siebzigtausend Zeilen sind es einige hundert
+           Millionen Auswertungen fuer ein Bild aus fuenfundzwanzig Punkten.
+
+           Der Mittelwert ueber zweitausend zufaellig gezogene Zeilen
+           unterscheidet sich davon um Groessenordnungen weniger, als die
+           Baender breit sind: der Fehler des Mittelwerts faellt mit der
+           Wurzel aus der Stichprobe, und zweitausend heisst rund zwei Prozent
+           der Streuung einer einzelnen Zeile. Das ist auf keiner Achse
+           sichtbar, auf der auch das Band sichtbar ist.
+
+           Gezogen wird OHNE Zuruecklegen und deterministisch aus opts.seed.
+           Ohne festen Seed saehe derselbe Fit bei jedem Aufruf anders aus und
+           der SVG-Export waere nicht reproduzierbar; Math.random scheidet
+           damit aus, unabhaengig von seiner Qualitaet.
+
+           Die Auswahl gilt fuer ALLE Spalten gemeinsam, denn eine Zeile ist
+           eine Beobachtung: zoege man je Spalte eigene Zeilen, waeren die
+           Praediktoren gegeneinander verwuerfelt und die Mittelung liefe
+           ueber Kombinationen, die nie beobachtet wurden. */
+        var MARG_MAX = 2000;
+        var pick = null, nUse = n;
+        if (n > MARG_MAX) {
+          var rngS = makeRng((opts.seed || 1) ^ 0x9E3779B9);
+          /* Fisher-Yates auf einem Indexfeld, abgebrochen nach MARG_MAX
+             Schritten. Nicht "ziehen und auf Dubletten pruefen", das wird
+             gegen Ende quadratisch, und nicht sort() mit Zufallsvergleich,
+             was keine Gleichverteilung liefert. */
+          var idxAll = new Int32Array(n), ii;
+          for (ii = 0; ii < n; ii++) idxAll[ii] = ii;
+          for (ii = 0; ii < MARG_MAX; ii++) {
+            var jj = ii + ((rngS() * (n - ii)) | 0);
+            if (jj >= n) jj = n - 1;
+            var tmp = idxAll[ii]; idxAll[ii] = idxAll[jj]; idxAll[jj] = tmp;
+          }
+          pick = idxAll.subarray(0, MARG_MAX);
+          /* Sortiert, damit die Spalten der Reihe nach gelesen werden. Das
+             Ergebnis ist dasselbe, der Speicherzugriff aber der des
+             Originals statt siebzigtausend Spruenge je Spalte. */
+          pick = Int32Array.from(pick);
+          pick.sort();
+          nUse = MARG_MAX;
+        }
+        /* Die Spalten einmal zusammenstellen, nicht je Gitterpunkt: nur die
+           x-Spalte aendert sich im Lauf der Schleife. */
+        var baseCols = {};
+        names.forEach(function (c) {
+          if (c === xname) return;
+          var src = cols[c];
+          if (!pick) { baseCols[c] = src; return; }
+          var a = new Float64Array(nUse), kk;
+          for (kk = 0; kk < nUse; kk++) a[kk] = src[pick[kk]];
+          baseCols[c] = a;
+        });
         var lkRows = [], smRows = [], gIdx, sIdx;
         for (gIdx = 0; gIdx < GN; gIdx++) {
           var ncb = {}, xv = xs[gIdx];
           names.forEach(function (c) {
             if (c === xname) {
-              var a = new Float64Array(n), rr;
-              for (rr = 0; rr < n; rr++) a[rr] = xv;
+              var a = new Float64Array(nUse), rr;
+              for (rr = 0; rr < nUse; rr++) a[rr] = xv;
               ncb[c] = a;
             } else {
-              ncb[c] = cols[c];
+              ncb[c] = baseCols[c];
             }
           });
           var lkb = levelDraws(model, samples, outcome, ncb, draws);
           var smb = simOutcome(model, samples, ncb, draws, opts.seed, outcome);
           if (!lkb || !smb) return null;
+          /* Der Auswertungskontext bleibt auf nObs dimensioniert und liefert
+             deshalb weiter n Werte je Ziehung, auch wenn nur nUse davon
+             gefuellt sind. Der Rest ist uninitialisiert und muss weg, sonst
+             mittelt die Schleife darunter ueber Nullen oder NaN. */
+          if (pick) { lkb = clipDraws(lkb, nUse); smb = clipDraws(smb, nUse); }
           lkRows.push(lkb);
           smRows.push(smb);
         }
@@ -9608,7 +9670,22 @@
                  unsichtbar, und gerade die duennen Raender sind das, was
                  eine Punktwolke sonst zeigt. -->
             ${useHeat && heat ? (() => {
-              const cw = (W - 12 - pad) / heat.n, ch = (H - pad - 12) / heat.n;
+              /* Die Kanten werden aus den RAENDERN der Zelle gerechnet und
+                 nicht aus Ursprung plus Breite. Der Unterschied ist der
+                 Grund, warum hier vorher ein Gitternetz ueber dem Bild lag:
+                 mit einer um einen halben Pixel vergroesserten Breite (gegen
+                 Luecken durch Rundung) ueberlappten benachbarte Zellen, und
+                 zwei halbtransparente Flaechen uebereinander sind an der
+                 Naht deutlich dichter, bei diesen Werten um 45 bis 90
+                 Prozent. Das Raster war damit als helles Netz sichtbar und
+                 sah nach Struktur in den Daten aus.
+
+                 So stossen die Zellen exakt aneinander: die rechte Kante
+                 einer Zelle IST die linke der naechsten, weil beide aus
+                 derselben Formel kommen. Keine Luecke, kein Ueberlapp. */
+              const x0 = pad, x1 = W - 12, y0 = 12, y1 = H - pad;
+              const ex = (c) => x0 + (x1 - x0) * c / heat.n;
+              const ey = (r) => y1 - (y1 - y0) * r / heat.n;
               const cells = [];
               for (let r = 0; r < heat.n; r++) {
                 for (let c = 0; c < heat.n; c++) {
@@ -9616,9 +9693,12 @@
                   if (!(v > 0)) continue;
                   const a = Math.sqrt(v / heat.max);
                   if (a < 0.02) continue;
+                  const xa = ex(c), xb = ex(c + 1);
+                  const yb = ey(r), ya = ey(r + 1);
                   cells.push(html`
-                    <rect key=${r + '_' + c} x=${pad + c * cw} y=${H - pad - (r + 1) * ch}
-                      width=${cw + 0.5} height=${ch + 0.5}
+                    <rect key=${r + '_' + c} x=${xa.toFixed(2)} y=${ya.toFixed(2)}
+                      width=${(xb - xa).toFixed(2)} height=${(yb - ya).toFixed(2)}
+                      shapeRendering="crispEdges"
                       fill="var(--tool-emph)" fillOpacity=${(a * 0.55).toFixed(3)} />`);
                 }
               }
