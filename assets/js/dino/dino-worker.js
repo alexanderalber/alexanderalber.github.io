@@ -24,12 +24,21 @@
  *   { type: "extract", id, rgba: Uint8ClampedArray|Uint8Array (S*S*4), size: S }
  * Messages out:
  *   { type: "progress", stage: "model", got, total }   (both files combined)
+ *   { type: "progress", stage: "init" }                (download done, session building)
  *   { type: "features", id, size, grid, dim, data: Float32Array }  (transferred)
  *   { type: "error", id, message }
  */
 
 const MODEL_URL = "/assets/files/dinov3/dinov3-vits16-q4.onnx";
 const WEIGHTS_URL = "/assets/files/dinov3/dinov3-vits16-q4.onnx_data";
+
+/* Exact byte sizes of the two files above, fixed ahead of time. Do not derive
+ * the progress denominator from Content-Length: while only one of the two
+ * fetches has its header back, the other slot's total is still 0, so the sum
+ * of gots can exceed the sum of totals and the bar overshoots 100%. */
+const MODEL_BYTES = 152401;
+const WEIGHTS_BYTES = 14684160;
+const TOTAL_BYTES = MODEL_BYTES + WEIGHTS_BYTES;
 
 /* The external-data reference as it is stored in the graph. The served file
  * name may differ from it; onnxruntime matches on this string. */
@@ -47,19 +56,21 @@ let ortReady = null;   /* Promise of { ort, session, inputName, outputName } */
 
 function post(m, transfer) { self.postMessage(m, transfer || []); }
 
-/* Same shape as the OMR worker's loader. onPart reports bytes for ONE file;
- * the caller adds them up across the two. */
+/* Same shape as the OMR worker's loader. onPart reports bytes received so far
+ * for ONE file; the caller adds them up across the two. The denominator is
+ * NOT taken from here: Content-Length is per-file and only known once that
+ * file's response headers arrive, so summing it across the two in-flight
+ * fetches produces a moving, temporarily-too-small total. The known, fixed
+ * byte counts (MODEL_BYTES/WEIGHTS_BYTES) are used instead. */
 function fetchWithProgress(url, onPart) {
   return fetch(url).then((res) => {
     if (!res.ok) throw new Error("HTTP " + res.status + " for " + url);
-    const total = Number(res.headers.get("Content-Length")) || 0;
-    if (!res.body || !total) {
+    if (!res.body) {
       return res.arrayBuffer().then((buf) => {
-        onPart(buf.byteLength, buf.byteLength);
+        onPart(buf.byteLength);
         return buf;
       });
     }
-    onPart(0, total);
     const reader = res.body.getReader();
     const chunks = [];
     let got = 0;
@@ -72,7 +83,7 @@ function fetchWithProgress(url, onPart) {
       }
       chunks.push(value);
       got += value.length;
-      onPart(got, total);
+      onPart(got);
       return pump();
     });
     return pump();
@@ -87,21 +98,27 @@ function ensureModel() {
       ort.env.wasm.numThreads = 1;
 
       /* Two downloads, one bar: the graph is a rounding error next to the
-       * weights, but a bar that jumps back to zero halfway looks broken. */
-      const seen = [{ got: 0, total: 0 }, { got: 0, total: 0 }];
-      const report = (slot) => (got, total) => {
-        seen[slot].got = got;
-        seen[slot].total = total;
+       * weights, but a bar that jumps back to zero halfway looks broken. The
+       * total is the known, fixed byte count of both files, not a sum of
+       * Content-Length headers (see fetchWithProgress). */
+      const seen = [0, 0];
+      const report = (slot) => (got) => {
+        seen[slot] = got;
         post({
           type: "progress", stage: "model",
-          got: seen[0].got + seen[1].got,
-          total: seen[0].total + seen[1].total,
+          got: seen[0] + seen[1],
+          total: TOTAL_BYTES,
         });
       };
       const [graphBuf, weightsBuf] = await Promise.all([
         fetchWithProgress(MODEL_URL, report(0)),
         fetchWithProgress(WEIGHTS_URL, report(1)),
       ]);
+
+      /* The download is done but the bar would otherwise sit at its last
+       * value for a few seconds while the WASM graph is built: report a
+       * distinct stage so the UI can say so instead of looking stalled. */
+      post({ type: "progress", stage: "init" });
 
       const session = await ort.InferenceSession.create(new Uint8Array(graphBuf), {
         executionProviders: ["wasm"],
