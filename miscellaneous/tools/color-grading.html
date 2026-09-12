@@ -63,7 +63,6 @@
        and usable with no raw loaded, so the feature is discoverable rather than
        appearing out of nowhere once a file is dropped. */
     .cg-tabs { margin-bottom: 14px; }
-    .cg-rawbadge { font-size: .68rem; color: var(--tool-note); margin-left: 6px; }
 
     /* Raw intake. Same stage-plus-controls geometry as the grading tab, so
        switching between the two does not move the picture. */
@@ -810,6 +809,40 @@
       return [g / r, 1, g / b];
     }
 
+    /* Rescales a set of multipliers so they change the colour of the light
+       without changing how bright the picture is.
+
+       Every white balance in here pins green to 1, which keeps the three
+       sources interchangeable but leaves the overall gain riding on the
+       temperature: at 2000 K the blue multiplier is around 4.3, so the frame
+       does not just go blue, it goes blue AND much brighter, and the blue
+       channel clips against the top while red is squeezed to nothing. It looks
+       like a wildly exaggerated effect and it is really an exposure change
+       wearing a costume. A camera does not show it that way, and neither
+       should this.
+
+       Normalised against the reference daylight balance rather than against
+       the largest multiplier: the reference is the one setting that has to
+       leave a daylight frame exactly as the decoder produced it, so tying the
+       scale to it means a picture shot in daylight and left at daylight is
+       untouched, and every other temperature is a pure colour move away from
+       that. The exposure slider stays the one control that changes brightness,
+       which is the point.
+
+       The comparison is on the green channel because green carries most of the
+       luminance and is the channel all these multipliers are pinned to, so the
+       ratio is a clean scalar rather than a choice of weighting. */
+    function normaliseGain(mul, camXyz) {
+      if (!mul) return mul;
+      var ref = camToSrgbMatrix(camXyz || CAM_XYZ_ILCE).preMul;
+      /* geometric mean of how much each channel is boosted relative to the
+         reference: a scale, not a colour, so dividing it out moves nothing on
+         the hue circle */
+      var k = Math.cbrt((mul[0] / ref[0]) * (mul[1] / ref[1]) * (mul[2] / ref[2]));
+      if (!(k > 0)) return mul;
+      return [mul[0] / k, mul[1] / k, mul[2] / k];
+    }
+
     /* Applies white balance then the camera matrix, in place. Values may exceed
        1: highlights above the neutral point are real headroom, and clamping
        here would throw away the main reason to read raw at all. */
@@ -980,6 +1013,7 @@
       decodeARW2: decodeARW2, demosaic: demosaic, previewFromRaw: previewFromRaw,
       camToSrgbMatrix: camToSrgbMatrix, estimateWhiteBalance: estimateWhiteBalance,
       whiteBalanceFromPatch: whiteBalanceFromPatch,
+      normaliseGain: normaliseGain,
       kelvinToXy: kelvinToXy, whiteBalanceFromKelvin: whiteBalanceFromKelvin,
       kelvinFromWhiteBalance: kelvinFromWhiteBalance,
       applyColor: applyColor, applyOrientation: applyOrientation,
@@ -3343,7 +3377,12 @@
         /* applyColor works in place, so the stored buffer is copied rather than
            consumed: the next white balance has to start from camera RGB again. */
         let img = { data: prev.data.slice(), width: prev.width, height: prev.height };
-        AC.applyColor(img, wb, cm.rgbCam);
+        /* normalised here rather than in wb itself: the multipliers stay pinned
+           to green so the pipette, the estimator and the sliders keep producing
+           the same thing, and only the moment of application takes the overall
+           gain out. Without it a cold setting does not just tint the picture,
+           it brightens it until the blue channel clips. */
+        AC.applyColor(img, AC.normaliseGain(wb, AC.CAM_XYZ_ILCE), cm.rgbCam);
         img = AC.applyOrientation(img, meta.orientation);
         return img;
       }, [raw, wb]);
@@ -3434,7 +3473,7 @@
 
         setRawBusy({ label: 'Applying white balance and colour', pct: 45 });
         await yieldUI();
-        AC.applyColor(img, wb, AC.camToSrgbMatrix(AC.CAM_XYZ_ILCE).rgbCam);
+        AC.applyColor(img, AC.normaliseGain(wb, AC.CAM_XYZ_ILCE), AC.camToSrgbMatrix(AC.CAM_XYZ_ILCE).rgbCam);
         img = AC.applyOrientation(img, meta.orientation);
 
         setRawBusy({ label: 'Encoding', pct: 75 });
@@ -3756,8 +3795,7 @@
 
         <div className="tabstrip cg-tabs" role="tablist">
           <button role="tab" aria-selected=${tab === 'raw'} className=${tab === 'raw' ? 'active' : ''}
-            onClick=${() => setTab('raw')}>RAW Intake
-            ${raw && html`<span className="cg-rawbadge">${raw.name}</span>`}<//>
+            onClick=${() => setTab('raw')}>RAW Intake<//>
           <button role="tab" aria-selected=${tab === 'grade'} className=${tab === 'grade' ? 'active' : ''}
             onClick=${() => setTab('grade')}>Color Grading<//>
         <//>
