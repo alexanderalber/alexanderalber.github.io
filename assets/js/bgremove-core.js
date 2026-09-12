@@ -31,6 +31,12 @@
  *              border, so background-coloured areas enclosed by foreground
  *              survive; 'global' removes every matching pixel.
  *   tolerance  0..1, default 0.12   euclidean distance in OKLab
+ *   colorWeight -1..+1, default 0   tilts that distance between lightness and
+ *              colour. -1 = lightness only (ignore colour, so a coloured wall
+ *              with a brightness falloff still counts as one background),
+ *              +1 = colour only (ignore lightness, so shadows and folds on a
+ *              single-coloured backdrop stop mattering), 0 = the plain metric.
+ *              Normalised so the tolerance keeps its meaning at every setting.
  *   flatten    px radius, 0 = off   uneven-lighting correction for scans
  *   softEdges  boolean, default true  fractional alpha plus colour unmixing
  *   despeckle  min area in px, default 0
@@ -45,7 +51,7 @@
  * unmixed colour.
  *
  * Helpers are exported as well, for the tests and for the vectorizer:
- *   srgbToOklab, dist2, toLabPlane, distanceField, globalMask, floodMask,
+ *   srgbToOklab, dist2, axisWeights, toLabPlane, distanceField, globalMask, floodMask,
  *   backgroundField, flattenImage, despeckle, boxBlur, expandAlpha, smoothAlpha,
  *   featherAlpha.
  * globalMask and floodMask take either one [L,a,b] triple or a list of them.
@@ -359,9 +365,47 @@
     return Array.isArray(bgLab[0]) ? bgLab : [bgLab];
   }
 
-  /* Minimum distance to any center, plus the index of that center. */
-  function distanceField(labs, n, centers) {
+  /* Lightness against colour, as a pair of multipliers on the OKLab axes.
+     -1 = lightness only, 0 = the plain euclidean metric, +1 = colour only.
+
+     Why this axis and not hue against saturation: OKLab has no separate hue and
+     saturation axes. L is lightness, a and b are the two opponent-colour axes;
+     hue is the ANGLE in the a-b plane and chroma is the RADIUS. Weighting L
+     against chroma is therefore one clean multiplier per axis and stays a plain
+     euclidean distance. Weighting hue against chroma would need a cylindrical
+     metric, and hue is numerically meaningless at low chroma: on a near-grey
+     background the angle is pure noise, so a "hue matters more" setting would
+     behave randomly exactly where backgrounds most often sit.
+
+     The weights are normalised so that the mean of the three multipliers stays
+     1 (wL + 2*wC = 3). Without that, moving the slider would silently rescale
+     every distance in the image, and `tolerance` (which is compared against
+     these distances directly, and which also sets the soft-edge ramp) would
+     mean something different at every slider position. With it, neutral is
+     bit-identical to the old metric and the tolerance keeps its meaning.
+
+     t = 0 must reproduce the old code exactly, which is why this returns the
+     literal 1s rather than computing them. */
+  function axisWeights(t) {
+    var u = t == null ? 0 : (t < -1 ? -1 : t > 1 ? 1 : +t);
+    if (!(u < 0 || u > 0)) return { wL: 1, wC: 1 };
+    /* One end of the slider must not switch an axis off completely: a weight of
+       exactly 0 makes every pixel of some colour identical to the background and
+       the mask degenerates into "everything". FLOOR keeps the weaker axis at a
+       twentieth of neutral, which reads as "ignored" without being singular. */
+    var FLOOR = 0.05;
+    var wL, wC;
+    if (u > 0) { wL = 1 - u * (1 - FLOOR); wC = 1; }
+    else { wL = 1; wC = 1 + u * (1 - FLOOR); }
+    var s = 3 / (wL + 2 * wC);
+    return { wL: wL * s, wC: wC * s };
+  }
+
+  /* Minimum distance to any center, plus the index of that center. weight is
+     the pair from axisWeights, or absent for the plain metric. */
+  function distanceField(labs, n, centers, weight) {
     var k = centers.length;
+    var wL = weight ? weight.wL : 1, wC = weight ? weight.wC : 1;
     var flat = new Float64Array(k * 3);
     for (var c = 0; c < k; c++) {
       flat[c * 3] = centers[c][0];
@@ -374,7 +418,7 @@
       var bd = Infinity, bi = 0;
       for (var q = 0; q < k; q++) {
         var dl = L - flat[q * 3], da = A - flat[q * 3 + 1], db = B - flat[q * 3 + 2];
-        var d = dl * dl + da * da + db * db;
+        var d = wL * dl * dl + wC * (da * da + db * db);
         if (d < bd) { bd = d; bi = q; }
       }
       dist[i] = Math.sqrt(bd);
@@ -389,16 +433,16 @@
     return out;
   }
 
-  function globalMask(labs, w, h, bgLab, tol) {
+  function globalMask(labs, w, h, bgLab, tol, weight) {
     var n = w * h;
-    return maskFromDist(distanceField(labs, n, asCenters(bgLab)).dist, n, tol);
+    return maskFromDist(distanceField(labs, n, asCenters(bgLab), weight).dist, n, tol);
   }
 
   /* Scanline seed fill (Heckbert, Graphics Gems I) seeded from every border
      pixel: an explicit span stack, never recursion, so a 4000x4000 uniform
      image floods without touching the JS call stack. 4-connectivity. */
-  function floodMask(labs, w, h, bgLab, tol) {
-    return floodFromOk(globalMask(labs, w, h, bgLab, tol), w, h);
+  function floodMask(labs, w, h, bgLab, tol, weight) {
+    return floodFromOk(globalMask(labs, w, h, bgLab, tol, weight), w, h);
   }
 
   function floodFromOk(ok, w, h) {
@@ -672,6 +716,7 @@
     var feather = Math.max(0, Math.round(opts.feather || 0));
     var minArea = Math.max(0, Math.round(opts.despeckle || 0));
     var flatR = Math.max(0, Math.round(opts.flatten || 0));
+    var weight = axisWeights(opts.colorWeight);
 
     var est = estimateBgColor(img);
     var model = normalizeBgModel(opts.bgModel);
@@ -693,7 +738,7 @@
     var centersLab = model ? model.centersLab : [srgbToOklab(bg[0], bg[1], bg[2])];
     var centersRgb = model && model.centersRgb ? model.centersRgb : [bg];
     var labs = toLabPlane(work);
-    var df = distanceField(labs, n, centersLab);
+    var df = distanceField(labs, n, centersLab, weight);
     var dist = df.dist, near = df.near;
     var okBg = maskFromDist(dist, n, tol);
     var mask0 = mode === 'global' ? okBg : floodFromOk(okBg, w, h);
@@ -752,6 +797,7 @@
     version: VERSION,
     srgbToOklab: srgbToOklab,
     dist2: dist2,
+    axisWeights: axisWeights,
     toLabPlane: toLabPlane,
     estimateBgColor: estimateBgColor,
     buildBgModel: buildBgModel,
