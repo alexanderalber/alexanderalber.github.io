@@ -66,6 +66,9 @@
        invariant. For "roll again": a new random seed, not a reset. */
     dice: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8h.01"/><path d="M16 8h.01"/><path d="M12 12h.01"/><path d="M8 16h.01"/><path d="M16 16h.01"/>',
     /* sliders, for "advanced" or "settings" triggers */
+    /* eyedropper: the slanted barrel with its tip at the lower left, the
+       standard glyph for "sample a color from what is on screen" */
+    pipette: '<path d="M15 4l5 5"/><path d="M17.5 3.5a2.1 2.1 0 0 1 3 3l-2 2-3-3z"/><path d="M15.5 7.5L6 17v3h3l9.5-9.5z"/>',
     tune: '<path d="M4 6h10"/><path d="M18 6h2"/><path d="M4 12h4"/><path d="M12 12h8"/><path d="M4 18h10"/><path d="M18 18h2"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/>'
   };
 
