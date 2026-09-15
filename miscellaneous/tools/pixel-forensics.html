@@ -1,0 +1,3057 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pixel Forensics - Maps Over an Image</title>
+  <meta name="description" content="Lay maps over a photograph that show what the eye does not: the JPEG block grid, the quantisation table recovered from the pixels, a noise map, resampling traces, and a line profile that says how far a faint feature rises above the noise. No verdicts, no percentages, entirely in your browser.">
+  <link rel="canonical" href="https://alber.me/miscellaneous/tools/pixel-forensics.html">
+  <meta property="og:title" content="Pixel Forensics">
+  <meta property="og:description" content="Maps over an image: block grid, quantisation table estimated from the pixels, noise, resampling, and a line profile with an honest noise band. The tool measures; the reading is yours.">
+  <meta property="og:url" content="https://alber.me/miscellaneous/tools/pixel-forensics.html">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/icons.js"></script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Pixel Forensics",
+    "description": "Lay maps over a photograph that show what the eye does not: block grid, quantisation table from the pixels, noise, resampling, and a line profile with a noise band. Runs entirely in the browser.",
+    "url": "https://alber.me/miscellaneous/tools/pixel-forensics.html",
+    "applicationCategory": "MultimediaApplication",
+    "inLanguage": "en",
+    "author": { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+    "copyrightHolder": [
+      { "@type": "Person", "@id": "https://alber.me/alexander/#person", "name": "Alexander Alber", "url": "https://alber.me/alexander/" },
+      { "@type": "Person", "@id": "https://alber.me/franziska/#person", "name": "Franziska Alber", "url": "https://alber.me/franziska/" }
+    ],
+    "isAccessibleForFree": true,
+    "browserRequirements": "Requires JavaScript"
+  }
+  </script>
+  <style>
+    /* Own width: the stage wants room for a large photograph
+       next to a control column that holds real parameters, so
+       the page runs wider than Pico's steps and caps header
+       and footer with itself. Wrapper padding 16 + inner 1360
+       gives the header cap of 1392, the same shape the colour
+       grader uses. */
+    .pf-wrap { padding: 16px; }
+    .pf-inner { max-width: 1360px; margin: 0 auto; }
+    header.container, body > footer.container { max-width: 1392px; padding-left: 16px; padding-right: 16px; }
+
+    h1.pf-h1 { font-size: 1.5rem; font-weight: 700; color: var(--tool-emph); margin: 0 0 6px; }
+    p.pf-sub { font-size: .84rem; color: var(--tool-note); margin: 0 0 12px; max-width: 78ch; line-height: 1.6; }
+
+    /* Stage left, parameters right. Desktop is the target
+       device, so this is the primary shape and the single
+       column below 1100px is only a courtesy. */
+    .pf-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+    @media (max-width: 1099px) { .pf-layout { grid-template-columns: 1fr; } }
+
+    .pf-stage { min-width: 0; }
+    .pf-canvaswrap { position: relative; line-height: 0; touch-action: none; }
+    .pf-canvas { display: block; width: auto; height: auto; max-width: 100%; max-height: 76vh;
+      margin-inline: auto; border: 1px solid var(--tool-border); border-radius: 8px;
+      box-shadow: var(--tool-panel-shadow); }
+    .pf-canvas.busy { opacity: .55; cursor: progress; }
+    .pf-canvas.pick { cursor: crosshair; }
+
+    .pf-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+      min-height: 320px; padding: 26px 20px; text-align: center; cursor: pointer;
+      border: 2px dashed var(--pico-muted-border-color); border-radius: 12px; background: var(--tool-subtle);
+      color: var(--tool-label); font-size: .84rem; line-height: 1.6; }
+    .pf-drop:hover, .pf-drop.over { border-color: var(--tool-sig-info); color: var(--tool-text); }
+    .pf-drophint { font-size: .72rem; color: var(--tool-faint); }
+
+    .pf-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; min-height: 30px; }
+    .pf-file { font-size: .72rem; color: var(--tool-faint); overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; max-width: 30ch; }
+    .pf-spacer { margin-left: auto; }
+
+    /* Chips of separate actions, deliberately not segments:
+       adjacency cannot see a gap, so this row opts out of the
+       joined-corner rule on its own class. */
+    .pf-chips { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+    .pf-chips .lang-seg { border-radius: 4px; margin-left: 0; }
+
+    .pf-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .pf-val { font-size: .72rem; color: var(--tool-label); font-variant-numeric: tabular-nums; }
+    .pf-hint { font-size: .68rem; color: var(--tool-faint); line-height: 1.5; margin: 6px 0 0; }
+    .pf-lab { font-size: .78rem; color: var(--tool-text); }
+    input.pf-slider { width: 100%; margin: 4px 0 0; }
+    .pf-check { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: var(--tool-text); margin: 0; }
+    .pf-check input { margin: 0; }
+
+    .pf-status { font-size: .72rem; color: var(--tool-note); line-height: 1.5; }
+    .pf-progress { height: 8px; border-radius: 4px; background: var(--tool-subtle); overflow: hidden; margin-top: 6px; }
+    .pf-progress > div { height: 100%; background: var(--tool-sig-info); transition: width .2s; }
+
+    .pf-note { margin-top: 10px; padding: 8px 12px; border-radius: 8px; font-size: .72rem; line-height: 1.55; }
+    .pf-note.info { background: var(--tool-info-bg); border: 1px solid var(--tool-info-border); color: var(--tool-info-text); }
+    .pf-note.warn { background: var(--tool-warn-bg); border: 1px solid var(--tool-warn-border); color: var(--tool-warn-text); }
+    .pf-note.ok { background: var(--tool-ok-bg); border: 1px solid var(--tool-ok-border); color: var(--tool-ok-text); }
+
+    /* The verdict line of a map: one number with its own
+       caption, so the map never speaks without its scale. */
+    .pf-figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; margin: 10px 0 0; }
+    .pf-fig { border: 1px solid var(--tool-hairline); border-radius: 8px; padding: 7px 9px; background: var(--tool-subtle); }
+    .pf-fignum { font-size: 1.02rem; color: var(--tool-emph); font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .pf-figcap { font-size: .64rem; color: var(--tool-note); text-transform: uppercase; letter-spacing: .04em; margin-top: 2px; }
+
+    .pf-legend { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: .68rem; color: var(--tool-note); }
+    .pf-legendbar { flex: 1 1 auto; height: 8px; border-radius: 4px; border: 1px solid var(--tool-hairline); }
+    .pf-swatches { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .pf-swatch { display: inline-flex; align-items: center; gap: 5px; font-size: .66rem; color: var(--tool-note); }
+    .pf-dot { width: 11px; height: 11px; border-radius: 3px; border: 1px solid var(--tool-hairline); }
+
+    /* The quantisation tables, side by side. Tabular numbers
+       and a fixed cell so the two grids line up and a
+       disagreement is visible as a column, not hunted for. */
+    .pf-tables { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+    table.pf-qt { border-collapse: collapse; font-size: .62rem; font-variant-numeric: tabular-nums; }
+    table.pf-qt td { width: 26px; height: 20px; text-align: center; border: 1px solid var(--tool-hairline);
+      color: var(--tool-label); padding: 0; }
+    table.pf-qt td.hit { background: var(--tool-ok-bg); color: var(--tool-ok-text); }
+    table.pf-qt td.miss { background: var(--tool-danger-bg); color: var(--tool-danger-text); font-weight: 600; }
+    table.pf-qt td.mute { color: var(--tool-faint); }
+    .pf-qtcap { font-size: .66rem; color: var(--tool-note); margin: 0 0 4px; }
+
+    /* The line profile plot. Its own frame, like every other
+       thing that shows something. */
+    .pf-plot { width: 100%; height: 220px; display: block; border: 1px solid var(--tool-border);
+      border-radius: 8px; background: var(--tool-subtle); }
+
+    .pf-fold { margin-top: 20px; }
+    p.pf-src { font-size: 11px; color: var(--tool-note); line-height: 1.6; margin-top: 18px; max-width: 78ch; }
+  </style>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+        <li><a href="/miscellaneous/" id="nav-misc">Miscellaneous</a></li>
+        <li><a href="/miscellaneous/#images" id="nav-cat">Images</a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="pf-wrap"><div class="pf-inner">
+        <h1 class="pf-h1">Pixel Forensics</h1>
+        <p class="pf-sub">Lay maps over a photograph that show what the eye does not. Every map here is arithmetic on the pixels: where the JPEG block grid sits, which quantisation table the pixels remember, how the noise is distributed, whether a region was scaled, and how far a faint feature rises above the noise along a line you draw. The tool measures and shows its scale. It never decides what the measurement means.</p>
+        <ul style="color:var(--tool-label);max-width:78ch;font-size:0.95rem">
+          <li>The maps read the last step of a compression chain, not the origin of the picture. A screenshot is a PNG with a JPEG frozen inside it, a messenger image is a recompression whose own history has overwritten most of what came before, and an empty map is therefore never a proof of innocence.</li>
+          <li>The strongest statement the tool can make needs no interpretation at all: the quantisation table in a JPEG header either is a scaled standard table, in which case the exact quality number comes out, or it is not, in which case the file did not pass through an ordinary library at that step.</li>
+          <li>The same table can be estimated from the pixels alone, without decoding a single Huffman symbol. When that estimate contradicts the header, the pixels are remembering an earlier compression than the one the file admits to.</li>
+          <li>The line profile averages across a width you choose, so the noise falls with the square root of it, fits the background away and reports a feature as a multiple of the local noise. Whether a bump at 3.2 times the noise means anything is a question about your picture, not about this arithmetic.</li>
+          <li>Everything runs in your browser. The image is never uploaded, and there is no server to upload it to.</li>
+        </ul>
+      </div></div>
+    </div>
+  </main>
+
+  <script id="pfcore">
+    /* ============================================================ *
+     * pixel-forensics core, part 1: JPEG container, block grid,
+     * and the cross-difference kernel both the grid map and the
+     * noise map read.
+     *
+     * Nothing here touches the DOM. Pure functions over typed
+     * arrays, so the Node tests can evaluate this block as a
+     * string and feed it synthetic images with a known answer.
+     * ============================================================ */
+
+    /* ---------------- JPEG header ----------------
+     *
+     * Marker walk only, no entropy decoding: everything the tool
+     * says about the container comes from DQT (quantisation
+     * tables) and SOF (size, components, subsampling). That is
+     * about eighty lines and needs no library.
+     *
+     * Segment structure: 0xFF 0xD8 starts the stream, then
+     * segments of 0xFF <marker> <len-hi> <len-lo> <payload>. The
+     * standalone markers (D0..D9, 01) carry no length. We stop at
+     * SOS (DA), because after it comes entropy-coded data with
+     * byte stuffing, which we deliberately do not walk. */
+
+    // Zigzag order: index i of the stored table is coefficient
+    // ZIGZAG[i] in row-major 8x8 order.
+    const ZIGZAG = [
+      0, 1, 8, 16, 9, 2, 3, 10,
+      17, 24, 32, 25, 18, 11, 4, 5,
+      12, 19, 26, 33, 40, 48, 41, 34,
+      27, 20, 13, 6, 7, 14, 21, 28,
+      35, 42, 49, 56, 57, 50, 43, 36,
+      29, 22, 15, 23, 30, 37, 44, 51,
+      58, 59, 52, 45, 38, 31, 39, 46,
+      53, 60, 61, 54, 47, 55, 62, 63
+    ];
+
+    /* The two IJG base tables (libjpeg jcparam.c, Annex K of the
+       JPEG standard). Row-major, not zigzag. These are the tables
+       every libjpeg-derived encoder scales, which is what makes
+       the quality inversion below possible at all. */
+    const IJG_LUMA = [
+      16, 11, 10, 16, 24, 40, 51, 61,
+      12, 12, 14, 19, 26, 58, 60, 55,
+      14, 13, 16, 24, 40, 57, 69, 56,
+      14, 17, 22, 29, 51, 87, 80, 62,
+      18, 22, 37, 56, 68, 109, 103, 77,
+      24, 35, 55, 64, 81, 104, 113, 92,
+      49, 64, 78, 87, 103, 121, 120, 101,
+      72, 92, 95, 98, 112, 100, 103, 99
+    ];
+    const IJG_CHROMA = [
+      17, 18, 24, 47, 99, 99, 99, 99,
+      18, 21, 26, 66, 99, 99, 99, 99,
+      24, 26, 56, 99, 99, 99, 99, 99,
+      47, 66, 99, 99, 99, 99, 99, 99,
+      99, 99, 99, 99, 99, 99, 99, 99,
+      99, 99, 99, 99, 99, 99, 99, 99,
+      99, 99, 99, 99, 99, 99, 99, 99,
+      99, 99, 99, 99, 99, 99, 99, 99
+    ];
+
+    /* Parse a JPEG byte stream down to (not including) the scan.
+       Returns null if the file is not a JPEG at all; otherwise an
+       object that may still have empty tables, because a stream
+       can legally carry its DQT after some other segment we do
+       not understand. */
+    function parseJpeg(bytes) {
+      if (!bytes || bytes.length < 4) return null;
+      if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null;
+
+      const out = {
+        tables: [],            // { id, values[64] (row-major), precision }
+        components: [],        // { id, h, v, tq }
+        width: 0, height: 0,
+        progressive: false,
+        markers: [],           // segment markers seen, for the "who wrote this" hints
+        app: []                // { marker, id } for APP0..APP15
+      };
+
+      let p = 2;
+      while (p + 1 < bytes.length) {
+        if (bytes[p] !== 0xFF) { p++; continue; }        // resync on padding
+        let m = bytes[p + 1];
+        if (m === 0xFF) { p++; continue; }               // fill byte
+        if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { p += 2; continue; }
+        if (m === 0xD9 || m === 0xDA) { out.markers.push(m); break; }
+        if (p + 3 >= bytes.length) break;
+        const len = (bytes[p + 2] << 8) | bytes[p + 3];
+        if (len < 2) break;
+        const seg = p + 4, end = Math.min(bytes.length, p + 2 + len);
+        out.markers.push(m);
+
+        if (m === 0xDB) {                                 // DQT
+          let q = seg;
+          while (q < end) {
+            const pq = bytes[q] >> 4, tq = bytes[q] & 15;
+            q++;
+            const n = pq ? 128 : 64;
+            if (q + n > end) break;
+            const vals = new Array(64);
+            for (let i = 0; i < 64; i++) {
+              const v = pq ? ((bytes[q + i * 2] << 8) | bytes[q + i * 2 + 1]) : bytes[q + i];
+              vals[ZIGZAG[i]] = v;
+            }
+            out.tables.push({ id: tq, values: vals, precision: pq ? 16 : 8 });
+            q += n;
+          }
+        } else if ((m >= 0xC0 && m <= 0xCF) && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {  // SOF
+          out.progressive = (m === 0xC2 || m === 0xC6 || m === 0xCA || m === 0xCE);
+          out.height = (bytes[seg + 1] << 8) | bytes[seg + 2];
+          out.width = (bytes[seg + 3] << 8) | bytes[seg + 4];
+          const nc = bytes[seg + 5];
+          for (let i = 0; i < nc; i++) {
+            const b = seg + 6 + i * 3;
+            if (b + 2 >= end) break;
+            out.components.push({ id: bytes[b], h: bytes[b + 1] >> 4, v: bytes[b + 1] & 15, tq: bytes[b + 2] });
+          }
+        } else if (m >= 0xE0 && m <= 0xEF) {              // APPn
+          let id = '';
+          for (let i = seg; i < end && i < seg + 16 && bytes[i] !== 0; i++) id += String.fromCharCode(bytes[i]);
+          out.app.push({ marker: m, id });
+        }
+        p = p + 2 + len;
+      }
+      return out;
+    }
+
+    /* Chroma subsampling as the usual J:a:b string, from the SOF
+       sampling factors. 4:2:0 is almost always a camera or a
+       messenger recompression, 4:4:4 an editor at high quality.
+       Only meaningful for three-component (YCbCr) images. */
+    function subsamplingLabel(components) {
+      if (!components || components.length !== 3) {
+        return components && components.length === 1 ? 'Greyscale' : '';
+      }
+      const hMax = Math.max(...components.map((c) => c.h));
+      const vMax = Math.max(...components.map((c) => c.v));
+      const c = components[0];
+      const hr = hMax / c.h, vr = vMax / c.v;
+      // The luma component carries the largest factors in every
+      // normal file, so the ratio is 1 and the chroma components
+      // are the ones divided down.
+      const ch = components[1];
+      const sx = c.h / ch.h, sy = c.v / ch.v;
+      if (hr !== 1 || vr !== 1) return 'unusual (' + components.map((q) => q.h + 'x' + q.v).join(' ') + ')';
+      if (sx === 1 && sy === 1) return '4:4:4';
+      if (sx === 2 && sy === 1) return '4:2:2';
+      if (sx === 2 && sy === 2) return '4:2:0';
+      if (sx === 1 && sy === 2) return '4:4:0';
+      if (sx === 4 && sy === 1) return '4:1:1';
+      return components.map((q) => q.h + 'x' + q.v).join(' ');
+    }
+
+    /* ---------------- IJG quality inversion ----------------
+     *
+     * libjpeg builds a table from a quality Q as
+     *
+     *   S = Q < 50 ? 5000 / Q : 200 - 2Q          (the scale factor)
+     *   q[i] = clamp( floor( (base[i] * S + 50) / 100 ), 1, 255 )
+     *
+     * That floor is invertible as an interval: a stored value v
+     * constrains S to a half-open range, and the intersection over
+     * all 64 entries is typically a single integer quality. This
+     * is Cogranne's interval method (arXiv:1802.00992); the point
+     * of doing it as an interval rather than a least-squares fit
+     * is that the answer is either exact or provably empty.
+     *
+     * The empty intersection is the interesting output: the table
+     * is then NOT a scaled IJG table, so the file did not come
+     * out of a libjpeg-style pipeline at that step. A camera or
+     * Photoshop (own 12-step scale) gives exactly that. */
+
+    // Which S values are compatible with base b quantised to v?
+    // floor((b*S + 50)/100) == v  and the clamp to [1,255].
+    function scaleRangeFor(b, v) {
+      if (b <= 0) return null;
+      if (v < 1 || v > 255) return null;
+      // The clamp makes the extreme values one-sided: v == 1 also
+      // accepts anything that floored below 1, v == 255 anything
+      // that floored above.
+      const loTarget = (v === 1) ? -Infinity : (100 * v - 50) / b;
+      const hiTarget = (v === 255) ? Infinity : (100 * (v + 1) - 50) / b;
+      return [loTarget, hiTarget];     // S in [lo, hi)
+    }
+
+    /* Returns { quality, exact, sMin, sMax } or null when no
+       quality is compatible. `exact` is true when a single
+       integer quality survives. */
+    function ijgQuality(values, base) {
+      let lo = -Infinity, hi = Infinity;
+      for (let i = 0; i < 64; i++) {
+        const r = scaleRangeFor(base[i], values[i]);
+        if (!r) return null;
+        if (r[0] > lo) lo = r[0];
+        if (r[1] < hi) hi = r[1];
+        if (lo >= hi) return null;
+      }
+      // S back to Q. S = 200 - 2Q for Q >= 50, S = 5000/Q below.
+      const qOf = (s) => (s <= 100 ? (200 - s) / 2 : 5000 / s);
+      // qOf is decreasing in S, so the S interval maps to a Q
+      // interval with the ends swapped.
+      const qHi = isFinite(lo) ? qOf(Math.max(lo, 1e-9)) : 100;
+      const qLo = isFinite(hi) ? qOf(hi) : 1;
+      const cands = [];
+      for (let q = Math.max(1, Math.floor(qLo)); q <= Math.min(100, Math.ceil(qHi)); q++) {
+        const s = q < 50 ? 5000 / q : 200 - 2 * q;
+        if (s >= lo && s < hi) cands.push(q);
+      }
+      if (!cands.length) return null;
+      return {
+        quality: cands.length === 1 ? cands[0] : cands[Math.floor(cands.length / 2)],
+        candidates: cands,
+        exact: cands.length === 1,
+        sMin: lo, sMax: hi
+      };
+    }
+
+    /* Build an IJG table for a quality, so the tool can show what
+       a standard encoder would have written next to what the file
+       actually carries. */
+    function ijgTable(quality, base) {
+      const q = Math.max(1, Math.min(100, quality));
+      const s = q < 50 ? 5000 / q : 200 - 2 * q;
+      const out = new Array(64);
+      for (let i = 0; i < 64; i++) {
+        let v = Math.floor((base[i] * s + 50) / 100);
+        out[i] = v < 1 ? 1 : v > 255 ? 255 : v;
+      }
+      return out;
+    }
+
+    /* The whole container verdict in one object. This is the only
+       statement in the tool that needs no interpretation, so it
+       gets to be a plain data structure. */
+    function describeJpeg(bytes) {
+      const j = parseJpeg(bytes);
+      if (!j) return null;
+      const tables = j.tables.map((t, i) => {
+        const base = (i === 0) ? IJG_LUMA : IJG_CHROMA;
+        const fit = ijgQuality(t.values, base);
+        return {
+          id: t.id, values: t.values, precision: t.precision,
+          role: i === 0 ? 'luma' : 'chroma',
+          ijg: fit,
+          sum: t.values.reduce((a, b) => a + b, 0)
+        };
+      });
+      // One quality for the file: the luma table decides, because
+      // it is the one every encoder scales and the one the
+      // estimator in part 2 measures.
+      const lumaFit = tables.length ? tables[0].ijg : null;
+      return {
+        width: j.width, height: j.height,
+        progressive: j.progressive,
+        components: j.components,
+        subsampling: subsamplingLabel(j.components),
+        tables,
+        quality: lumaFit ? lumaFit.quality : null,
+        standard: !!(lumaFit && lumaFit.exact),
+        app: j.app
+      };
+    }
+
+    /* ---------------- the shared kernel ----------------
+     *
+     * [[1,-1],[-1,1]] applied to a 2x2 neighbourhood is at once
+     * the Haar HH1 detail coefficient (noise map, part 2) and the
+     * cross-difference of Nikoukhah et al. (block grid map). One
+     * pass over the image, two consumers, which is why it lives
+     * here and not inside either of them.
+     *
+     *   cross(x,y) = I(x,y) + I(x+1,y+1) - I(x+1,y) - I(x,y+1)
+     *
+     * The grid map wants the absolute value at full resolution and
+     * looks for local maxima; the noise map wants it halved to a
+     * quarter-size HH plane and takes a median. Both read the same
+     * luma buffer. */
+
+    // BT.601 luma, the same one JPEG itself uses, as Float32.
+    function lumaOf(data, w, h) {
+      const out = new Float32Array(w * h);
+      for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+        out[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+      }
+      return out;
+    }
+
+    // |cross| at every position where the 2x2 fits, indexed
+    // (w-1) x (h-1). Float32 so the noise path can take a median
+    // without a second pass.
+    function crossDifference(luma, w, h) {
+      const cw = w - 1, ch = h - 1;
+      const out = new Float32Array(Math.max(0, cw * ch));
+      for (let y = 0; y < ch; y++) {
+        const r0 = y * w, r1 = r0 + w, o = y * cw;
+        for (let x = 0; x < cw; x++) {
+          const v = luma[r0 + x] + luma[r1 + x + 1] - luma[r0 + x + 1] - luma[r1 + x];
+          out[o + x] = v < 0 ? -v : v;
+        }
+      }
+      return { data: out, w: cw, h: ch };
+    }
+
+    /* ============================================================ *
+     * pixel-forensics core, part 2: the block grid map and the
+     * noise map. Both read the cross-difference field from part 1.
+     * ============================================================ */
+
+    /* ---------------- block grid (BAG) ----------------
+     *
+     * After Nikoukhah et al., IPOL 2020, implemented from the
+     * paper rather than ported from their C (which is AGPL).
+     *
+     * Idea: JPEG quantises each 8x8 block on its own, so the
+     * discontinuity between two blocks is systematically larger
+     * than inside one. The cross-difference responds to a corner
+     * step and, unlike a first or second derivative, not to a
+     * smooth edge, which is the reason the authors give for
+     * choosing it: gradient kernels fire on image content and
+     * produce false grids.
+     *
+     * Per tile we vote: every local maximum of the cross field
+     * votes for its own (x mod 8) and (y mod 8). The winning
+     * residue is the grid origin, 0..7 in each axis. A tile whose
+     * votes are flat has no grid.
+     *
+     * The tile size must be a multiple of 8, otherwise the eight
+     * possible origins are not equally represented inside it and
+     * the argmax is biased before a single pixel is read.
+     *
+     * Two maps come out of one pass:
+     *   origin   the winning (gx, gy) per tile, as a colour. One
+     *            flat colour over the whole image is a consistent
+     *            grid; a differently coloured patch is a crop or
+     *            an inserted region.
+     *   strength k/n, how dominant the winner was. Low means no
+     *            grid is visible at all, which is the right answer
+     *            for a PNG that was never a JPEG, or for Q >= 95.
+     */
+
+    // Local maxima of the cross field along one axis, counted into
+    // 8 residue bins. Separate per axis on purpose: a vertical
+    // block edge tells us about the x grid and says nothing about
+    // the y grid, so mixing them halves the signal.
+    function voteGrid(cross, cw, ch, x0, y0, tw, th) {
+      const vx = new Int32Array(8), vy = new Int32Array(8);
+      const xEnd = Math.min(cw - 1, x0 + tw), yEnd = Math.min(ch - 1, y0 + th);
+      for (let y = Math.max(1, y0); y < yEnd; y++) {
+        const r = y * cw;
+        for (let x = Math.max(1, x0); x < xEnd; x++) {
+          const v = cross[r + x];
+          // Strict on one side, non-strict on the other: a plateau
+          // of two equal values then votes once, not twice or
+          // never. Flat regions give v == 0 everywhere and are
+          // excluded by the > 0 test.
+          if (v > 0 && v >= cross[r + x - 1] && v > cross[r + x + 1]) vx[x % 8]++;
+          if (v > 0 && v >= cross[r - cw + x] && v > cross[r + cw + x]) vy[y % 8]++;
+        }
+      }
+      return { vx, vy };
+    }
+
+    function argmaxOf(v) {
+      let bi = 0, bv = v[0], sum = v[0];
+      for (let i = 1; i < v.length; i++) { sum += v[i]; if (v[i] > bv) { bv = v[i]; bi = i; } }
+      return { index: bi, value: bv, sum, share: sum > 0 ? bv / sum : 0 };
+    }
+
+    /* The whole map. `tile` is in cross-field pixels and is
+       rounded to a multiple of 8. Returns tile-resolution arrays,
+       not pixel-resolution ones: the map has tile resolution by
+       construction and upsampling it here would only pretend
+       otherwise. */
+    function blockGridMap(cross, cw, ch, tile) {
+      const t = Math.max(8, Math.round(tile / 8) * 8);
+      const tx = Math.max(1, Math.floor(cw / t)), ty = Math.max(1, Math.floor(ch / t));
+      const gx = new Int8Array(tx * ty), gy = new Int8Array(tx * ty);
+      const strength = new Float32Array(tx * ty);
+      const votes = new Int32Array(tx * ty);
+      for (let j = 0; j < ty; j++) {
+        for (let i = 0; i < tx; i++) {
+          const v = voteGrid(cross, cw, ch, i * t, j * t, t, t);
+          const ax = argmaxOf(v.vx), ay = argmaxOf(v.vy);
+          const k = j * tx + i;
+          // Same +1 shift as the global origin below, so the tile
+          // colours and the reported origin speak one language.
+          gx[k] = (ax.index + 1) & 7; gy[k] = (ay.index + 1) & 7;
+          // Both axes have to agree that there is a grid, so the
+          // weaker one decides. An image with strong vertical
+          // stripes and no grid otherwise should not read as a
+          // grid, and it would if we took the maximum.
+          strength[k] = Math.min(ax.share, ay.share);
+          votes[k] = Math.min(ax.sum, ay.sum);
+        }
+      }
+      // The global origin is the majority over tiles that have a
+      // grid at all, weighted by how sure each tile was. Unvoted
+      // tiles (flat sky) must not drag the vote.
+      const hist = new Float64Array(64);
+      for (let k = 0; k < gx.length; k++) {
+        if (votes[k] < 8) continue;
+        hist[gy[k] * 8 + gx[k]] += strength[k];
+      }
+      let best = 0, bestV = -1, total = 0;
+      for (let i = 0; i < 64; i++) { total += hist[i]; if (hist[i] > bestV) { bestV = hist[i]; best = i; } }
+      /* Origin convention: cross index x spans pixels x and x+1,
+         so a block boundary before pixel 8 peaks at cross index 7.
+         Shifting by +1 (mod 8) makes an aligned JPEG read 0,0,
+         which is the only form anyone can check by eye. Verified
+         against a crop that drops 3 columns and 5 rows: the next
+         block boundary then arrives that much earlier, so the
+         origin reads (8-3, 8-5) = (5,3), which is what it does.
+         The per-tile gx/gy above already carry the shift, so the
+         histogram votes in shifted coordinates and `best` needs
+         no second correction. */
+      return {
+        tx, ty, tile: t,
+        gx, gy, strength, votes,
+        originX: best % 8, originY: Math.floor(best / 8),
+        // How much of the weighted vote the winning origin holds.
+        // 1/64 is chance level, so anything near that is no grid.
+        consensus: total > 0 ? bestV / total : 0,
+        // Mean strength over tiles that voted, the honest "is
+        // there a grid in this picture at all" number.
+        meanStrength: (function () {
+          let s = 0, n = 0;
+          for (let k = 0; k < gx.length; k++) if (votes[k] >= 8) { s += strength[k]; n++; }
+          return n ? s / n : 0;
+        })()
+      };
+    }
+
+    /* ---------------- noise map ----------------
+     *
+     * sigma per tile from the median absolute value of the Haar
+     * HH1 detail, the Donoho-Johnstone estimator:
+     *
+     *   sigma = median(|HH|) / 0.6745
+     *
+     * with HH the same 2x2 kernel as above, halved and divided by
+     * 2 so it is a proper wavelet coefficient rather than a sum of
+     * four samples.
+     *
+     * The part that decides whether the map is honest: MAD does
+     * not measure noise, it measures high-frequency energy, and
+     * texture IS high-frequency energy. A meadow reads sigma 15
+     * and a sky sigma 1.5 in the same untouched photograph. The
+     * answer taken from Gardella et al. (IPOL 2024) is block
+     * SELECTION rather than block estimation: compute a texture
+     * proxy per tile, and only colour the tiles that are smooth
+     * enough for the estimate to mean anything. The rest is
+     * greyed out, not painted.
+     */
+
+    // HH1 plane at half resolution. Non-overlapping 2x2 blocks, so
+    // neighbouring coefficients are independent, which the median
+    // assumes.
+    function haarHH(luma, w, h) {
+      const hw = w >> 1, hh = h >> 1;
+      const out = new Float32Array(hw * hh);
+      for (let y = 0; y < hh; y++) {
+        const r0 = (y * 2) * w, r1 = r0 + w, o = y * hw;
+        for (let x = 0; x < hw; x++) {
+          const c = x * 2;
+          const v = (luma[r0 + c] - luma[r0 + c + 1] - luma[r1 + c] + luma[r1 + c + 1]) / 2;
+          out[o + x] = v < 0 ? -v : v;
+        }
+      }
+      return { data: out, w: hw, h: hh };
+    }
+
+    /* Median over a histogram instead of sort(): O(n) per tile and
+       no allocation. Values above the last bin land in it, which
+       only matters for tiles that are pure edge, and those are
+       excluded by the texture test anyway.
+     *
+     * The bin width is the whole accuracy of the estimate, and a
+     * quarter of a grey level is not enough: real photographs sit
+     * at sigma 1 to 5, so a coarse histogram returns the same two
+     * or three values for every tile in the picture and the map
+     * looks quantised because it is. 1024 bins at 1/16 of a grey
+     * level covers 0..64 with resolution to spare, and the linear
+     * interpolation inside the containing bin removes the last of
+     * the staircase. Found by a flat-noise fixture reading exactly
+     * 2.41 in 62 tiles out of 64. */
+    function histMedian(values, idx, count, scale) {
+      const N = 1024;
+      const bins = new Int32Array(N + 1);
+      for (let i = 0; i < count; i++) {
+        let b = (values[idx[i]] * scale) | 0;
+        if (b > N) b = N;
+        bins[b]++;
+      }
+      const half = count / 2;
+      let acc = 0;
+      for (let b = 0; b <= N; b++) {
+        const c = bins[b];
+        if (acc + c >= half) {
+          // Where inside this bin the half-way sample falls.
+          const frac = c > 0 ? (half - acc) / c : 0.5;
+          return (b + frac) / scale;
+        }
+        acc += c;
+      }
+      return 0;
+    }
+
+    /* Texture proxy, and the trap that makes or breaks this map.
+     *
+     * The obvious proxy is the mean absolute Laplacian of the
+     * tile. It does not work, and the failure is instructive:
+     * NOISE IS ALSO HIGH-FREQUENCY ENERGY, so the tile with the
+     * most noise scores as the most textured and gets masked
+     * out. A fixture with a deliberately noisier square in the
+     * middle had exactly that square greyed away, which is the
+     * one region the map exists to show.
+     *
+     * Low-passing first helps but does not settle it: a 3x3 box
+     * divides independent noise by about three, so a tile at
+     * sigma 25 still scores above a tile of real stripes and is
+     * still excluded. Measured: noise 4 / 12 / 25 gave 2.0 /
+     * 6.0 / 12.7, against 8.1 for a hard 16 pixel stripe
+     * pattern.
+     *
+     * So the proxy is normalised by the tile's OWN noise level:
+     * what matters is structure RELATIVE to the grain, which is
+     * what "can this tile's noise be measured" actually asks,
+     * and which is scale free. A noisy but smooth tile then
+     * reads low however loud it is, and a quiet tile with an
+     * edge in it reads high however faint the edge is.
+     *
+     * Gardella et al. reach the same separation through
+     * low-frequency DCT energy; this is the cheap version in
+     * the spatial domain.
+     *
+     * Also returned: the intensity variance, because Farid's
+     * rule of excluding tiles below about 2.5 grey levels of
+     * variance removes flat clipped regions where sigma is zero
+     * for a boring reason. */
+    function tileStats(luma, w, h, x0, y0, tw, th, sigmaHint) {
+      let sum = 0, sum2 = 0, lap = 0, n = 0, m = 0;
+      const xe = Math.min(w, x0 + tw), ye = Math.min(h, y0 + th);
+      // 3x3 box mean, clamped at the image edge.
+      const blur = (x, y) => {
+        let s = 0, c = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            s += luma[yy * w + xx]; c++;
+          }
+        }
+        return c ? s / c : 0;
+      };
+      for (let y = y0; y < ye; y++) {
+        const r = y * w;
+        for (let x = x0; x < xe; x++) {
+          const v = luma[r + x];
+          sum += v; sum2 += v * v; n++;
+          if (x > x0 && x < xe - 1 && y > y0 && y < ye - 1) {
+            lap += Math.abs(4 * blur(x, y) - blur(x - 1, y) - blur(x + 1, y) - blur(x, y - 1) - blur(x, y + 1));
+            m++;
+          }
+        }
+      }
+      const mean = n ? sum / n : 0;
+      const raw = m ? lap / m : 0;
+      /* The residual noise after a 3x3 box is sigma/3, and the
+         five-tap Laplacian of it sums about sqrt(20) of those,
+         so an unstructured tile lands near sigma * 1.5 whatever
+         sigma is. Dividing by that leaves a number near 1 for
+         pure grain and well above it for real structure. */
+      const floor = Math.max(0.35, (sigmaHint || 0) * 1.5);
+      return {
+        mean,
+        variance: n ? Math.max(0, sum2 / n - mean * mean) : 0,
+        texture: raw / floor,
+        textureRaw: raw
+      };
+    }
+
+/* The map. `tile` is in HH pixels, so 32 means 64x64 in the
+       original, which is where the ~1024 samples the median wants
+       come from. */
+    function noiseMap(luma, w, h, opts) {
+      const o = opts || {};
+      const tile = Math.max(8, Math.round(o.tile || 32));
+      const hh = haarHH(luma, w, h);
+      const tx = Math.max(1, Math.floor(hh.w / tile)), ty = Math.max(1, Math.floor(hh.h / tile));
+      const sigma = new Float32Array(tx * ty);
+      const texture = new Float32Array(tx * ty);
+      const variance = new Float32Array(tx * ty);
+      const idx = new Int32Array(tile * tile);
+
+      for (let j = 0; j < ty; j++) {
+        for (let i = 0; i < tx; i++) {
+          let c = 0;
+          for (let y = 0; y < tile; y++) {
+            const r = (j * tile + y) * hh.w + i * tile;
+            for (let x = 0; x < tile; x++) idx[c++] = r + x;
+          }
+          // 16 bins per grey level over 0..64 HH units, which
+          // covers every realistic noise level with resolution to
+          // spare at the low end where photographs actually sit.
+          const med = histMedian(hh.data, idx, c, 16);
+          const k = j * tx + i;
+          sigma[k] = med / 0.6745;
+          // The sigma of this very tile normalises its texture
+          // score, so the two are computed together rather than
+          // the texture being a quantity of its own.
+          const st = tileStats(luma, w, h, i * tile * 2, j * tile * 2, tile * 2, tile * 2, sigma[k]);
+          texture[k] = st.texture;
+          variance[k] = st.variance;
+        }
+      }
+      return { tx, ty, tile, sigma, texture, variance };
+    }
+
+    /* Which tiles are allowed to be coloured, and the honest
+       spread number that goes next to the map.
+     *
+     * A percentile-scaled false-colour map glows somewhere by
+     * construction: that is the built-in self-deception of every
+     * heat map. So the ratio p98/p2 over the SELECTED tiles is
+     * reported as a number. Near 1.2 the colourful map is pure
+     * amplification of nothing; at 6 there is something there. */
+    function noiseSelection(map, opts) {
+      const o = opts || {};
+      const texMax = o.textureMax != null ? o.textureMax : 2.2;
+      const varMin = o.varianceMin != null ? o.varianceMin : 2.5;
+      const n = map.tx * map.ty;
+      const keep = new Uint8Array(n);
+      const vals = [];
+      for (let k = 0; k < n; k++) {
+        if (map.texture[k] <= texMax && map.variance[k] >= varMin) {
+          keep[k] = 1;
+          vals.push(map.sigma[k]);
+        }
+      }
+      vals.sort((a, b) => a - b);
+      const pick = (p) => {
+        if (!vals.length) return 0;
+        const i = Math.min(vals.length - 1, Math.max(0, Math.round((vals.length - 1) * p)));
+        return vals[i];
+      };
+      const p2 = pick(0.02), p98 = pick(0.98);
+      /* The spread is the headline number, so it must not be
+         decided by a single degenerate tile. A heavily denoised or
+         clipped region can read sigma ~0.07 while the rest of the
+         picture sits at 1.2, and the raw ratio then announces 34
+         for a perfectly ordinary photograph. Flooring the
+         denominator at a sixteenth of a grey level (below that the
+         Haar median is quantisation noise, not a measurement)
+         keeps the number honest in both directions: it still goes
+         high when a real region differs, and it stops reporting a
+         dramatic ratio against an absence of signal. */
+      const floor = 1 / 16;
+      const denom = Math.max(p2, floor);
+      return {
+        keep, kept: vals.length, total: n,
+        p2, p98, median: pick(0.5),
+        spread: p98 / denom,
+        // True when the floor had to step in, so the UI can say
+        // the low end is "below what this estimator resolves"
+        // instead of printing a fake precise number.
+        floored: p2 < floor
+      };
+    }
+
+    /* ============================================================ *
+     * pixel-forensics core, part 3: the quantisation table
+     * estimated from the pixels alone.
+     *
+     * After Nikoukhah et al., IPOL 2022, implemented from the
+     * paper. Their reference C is AGPL-3.0-or-later, so it is
+     * deliberately not consulted line by line: algorithms are not
+     * copyrightable, a translation of their source would be.
+     *
+     * Why this exists at all: a JPEG's header says which table the
+     * LAST encoder used. It says nothing about the one before it.
+     * But if the image was quantised with step q at some earlier
+     * stage, the decoded pixels still carry that: recompute the
+     * DCT on the same 8x8 grid and the coefficients pile up on
+     * multiples of q rather than spreading out. So the table can
+     * be measured from the pixels and compared against the header,
+     * and two numbers that disagree are a clearer statement than a
+     * rectangle somebody has to spot in a heat map.
+     *
+     * No entropy decoder is needed for this, which was the
+     * surprise of the plan: the DCT is recomputed, not read back
+     * out of the file.
+     * ============================================================ */
+
+    /* Separable 8-point DCT-II, the JPEG one (orthonormal, with
+       the 1/sqrt(2) on the DC term). Straightforward O(8) per row
+       and column rather than a butterfly: this runs once per
+       block, and the loop below runs 63*255 times per block, so
+       this is not where the time goes. */
+    const DCT_COS = (function () {
+      const t = new Float32Array(64);
+      for (let u = 0; u < 8; u++) {
+        for (let x = 0; x < 8; x++) {
+          t[u * 8 + x] = Math.cos(((2 * x + 1) * u * Math.PI) / 16) * (u === 0 ? Math.SQRT1_2 : 1) * 0.5;
+        }
+      }
+      return t;
+    })();
+
+    // block: 64 samples, level-shifted by -128 like JPEG does.
+    // out: 64 coefficients, row-major (NOT zigzag).
+    function dct8x8(block, out) {
+      const tmp = new Float32Array(64);
+      for (let y = 0; y < 8; y++) {
+        const r = y * 8;
+        for (let u = 0; u < 8; u++) {
+          let s = 0;
+          for (let x = 0; x < 8; x++) s += block[r + x] * DCT_COS[u * 8 + x];
+          tmp[r + u] = s;
+        }
+      }
+      for (let u = 0; u < 8; u++) {
+        for (let v = 0; v < 8; v++) {
+          let s = 0;
+          for (let y = 0; y < 8; y++) s += tmp[y * 8 + u] * DCT_COS[v * 8 + y];
+          out[v * 8 + u] = s;
+        }
+      }
+      return out;
+    }
+
+    /* All DCT coefficients of the image on a given grid origin,
+       one Float32Array per frequency so the test loop below reads
+       contiguous memory. Sampling every `step`-th block is the
+       only legitimate way to make this cheaper: shrinking the
+       image first destroys the very alignment being measured
+       (Nikoukhah measure that a single pixel of grid offset
+       already costs most of the significance). */
+    function blockDct(luma, w, h, originX, originY, step) {
+      const st = Math.max(1, step | 0);
+      const bx = Math.floor((w - originX) / 8), by = Math.floor((h - originY) / 8);
+      const nx = Math.ceil(bx / st), ny = Math.ceil(by / st);
+      const count = Math.max(0, nx * ny);
+      const coef = [];
+      for (let c = 0; c < 64; c++) coef.push(new Float32Array(count));
+      const block = new Float32Array(64);
+      const out = new Float32Array(64);
+      let k = 0;
+      for (let j = 0; j < by; j += st) {
+        for (let i = 0; i < bx; i += st) {
+          const px = originX + i * 8, py = originY + j * 8;
+          for (let y = 0; y < 8; y++) {
+            const r = (py + y) * w + px;
+            for (let x = 0; x < 8; x++) block[y * 8 + x] = luma[r + x] - 128;
+          }
+          dct8x8(block, out);
+          for (let c = 0; c < 64; c++) coef[c][k] = out[c];
+          k++;
+        }
+      }
+      return { coef, count: k };
+    }
+
+    /* The a-contrario test, equation 11 of the paper.
+     *
+     * If a frequency really was quantised with step q, then every
+     * coefficient v sits near a multiple of q and the residual
+     * |v/q - round(v/q)| is near 0. If it was not, that residual
+     * is uniform on [0, 1/2] and its doubled sum S_n behaves like
+     * a sum of n uniforms on [0,1].
+     *
+     * So the question "how surprising is a residual sum this
+     * small" has a closed-form answer, and the number of false
+     * alarms is that probability times the number of tests. Only
+     * log10(NFA) <= 0 counts as a detection: one expected false
+     * alarm over the whole search.
+     *
+     * MUST be computed in log10 throughout. The probabilities
+     * involved reach 1e-300 and underflow to zero in double
+     * precision, at which point every frequency looks equally and
+     * infinitely significant. */
+    const LOG10E = Math.LOG10E;
+
+    function log10ProbSumBelow(s, n) {
+      if (n <= 0) return 0;
+      if (s >= n / 2) return 0;                  // not surprising at all
+      if (s <= 0) return -Infinity;
+      // Stirling bound on the volume of the simplex, sharp for
+      // small s; Hoeffding bound, sharp near n/2. The minimum of
+      // the two covers the whole range.
+      const stirling = n * Math.log10((s * Math.E) / n) - 0.5 * Math.log10(2 * Math.PI * n);
+      const d = n / 2 - s;
+      const hoeffding = -2 * ((d * d) / n) * LOG10E;
+      return Math.min(stirling, hoeffding);
+    }
+
+    /* Estimate the step for one frequency. Returns the best q and
+       its log10(NFA), or q = 0 when nothing is significant.
+     *
+     * The zero coefficients are skipped on purpose. In a strongly
+     * compressed block most high frequencies quantise to exactly
+     * zero, and zero is a multiple of every q: including them
+     * makes every step look perfect and the estimator returns 1 or
+     * the largest q tested, depending on which way the tie breaks.
+     * Skipping them costs statistical power on flat images (which
+     * is honest: there is genuinely no information there) and is
+     * what makes the estimator work on everything else. */
+    function estimateStep(values, count, qMax, nTests) {
+      let bestQ = 0, bestLog = 0;
+      const qTop = Math.max(2, qMax | 0);
+      for (let q = 1; q <= qTop; q++) {
+        let s = 0, n = 0;
+        for (let i = 0; i < count; i++) {
+          const v = values[i] / q;
+          const r = Math.round(v);
+          if (r === 0) continue;                 // skip the central peak
+          const d = v - r;
+          s += 2 * (d < 0 ? -d : d);
+          n++;
+        }
+        if (n < 16) continue;                    // too little to say anything
+        const logNfa = Math.log10(nTests) + log10ProbSumBelow(s, n);
+        if (logNfa < bestLog) { bestLog = logNfa; bestQ = q; }
+      }
+      return { q: bestQ, logNfa: bestLog };
+    }
+
+    /* The whole table. `qMax` 64 is enough for quality >= 50 and
+       thirds the work; raise it when the image is known to be
+       badly compressed.
+     *
+     * The DC term (c = 0) is left out: its distribution is not
+     * centred and not comparable to the AC ones, and the paper
+     * excludes it for the same reason. */
+    function estimateQuantTable(luma, w, h, opts) {
+      const o = opts || {};
+      const step = o.blockStep || 1;
+      const qMax = o.qMax || 64;
+      const d = blockDct(luma, w, h, o.originX || 0, o.originY || 0, step);
+      const nTests = 64 * 63 * 255;              // as in the paper
+      const table = new Array(64).fill(0);
+      const logNfa = new Array(64).fill(0);
+      let found = 0;
+      for (let c = 1; c < 64; c++) {
+        const r = estimateStep(d.coef[c], d.count, qMax, nTests);
+        table[c] = r.q;
+        logNfa[c] = r.logNfa;
+        if (r.q > 0) found++;
+      }
+      return { table, logNfa, found, blocks: d.count };
+    }
+
+    /* Compare an estimated table against the one in the header.
+     *
+     * The interesting outcome is a disagreement in the low
+     * frequencies, where both estimates are reliable: the header
+     * describes the last compression, the pixels remember an
+     * earlier one. Nikoukhah measure that a Q90-then-Q98 sequence
+     * mostly returns the Q90 table from the pixels, which is
+     * exactly the case a single header cannot reveal.
+     *
+     * Only frequencies where the estimate is significant AND the
+     * header has a value are compared; everything else is
+     * "no statement", which is a third outcome and not a match. */
+    /* Is the estimate allowed to say anything at all?
+     *
+     * The estimator assumes the DCT is computed on the same 8x8
+     * grid the encoder used. When the grid map found no grid, the
+     * origin passed in is whatever the argmax of a flat histogram
+     * happened to be, the DCT is computed on a misaligned lattice,
+     * and the comparison produces disagreements that mean nothing.
+     * Measured on a Q92 fixture: grid consensus 0.08, and the
+     * comparison duly invented two contradictions out of fifteen.
+     *
+     * So the grid map is a precondition, not a nicety, and the
+     * tool says "no statement" rather than printing the number it
+     * could print. */
+    function qualifiesForEstimate(grid, opts) {
+      const o = opts || {};
+      const minConsensus = o.minConsensus != null ? o.minConsensus : 0.35;
+      const minStrength = o.minStrength != null ? o.minStrength : 0.16;
+      const ok = grid && grid.consensus >= minConsensus && grid.meanStrength >= minStrength;
+      return {
+        ok: !!ok,
+        reason: !grid ? 'no grid map'
+          : grid.consensus < minConsensus ? 'block grid not consistent enough to fix an origin'
+            : grid.meanStrength < minStrength ? 'no block structure found in this image'
+              : ''
+      };
+    }
+
+    function compareTables(estimated, header, opts) {
+      const o = opts || {};
+      // Low frequencies only by default: the high ones quantise to
+      // zero in any real photograph and carry no information.
+      const zone = o.zone || 4;
+      let agree = 0, disagree = 0, silent = 0;
+      const marks = new Array(64).fill(0);       // 1 agree, -1 disagree, 0 silent
+      for (let v = 0; v < 8; v++) {
+        for (let u = 0; u < 8; u++) {
+          const c = v * 8 + u;
+          if (c === 0) continue;
+          if (u >= zone || v >= zone) continue;
+          const e = estimated[c], hq = header ? header[c] : 0;
+          if (!e || !hq) { silent++; continue; }
+          if (e === hq) { agree++; marks[c] = 1; }
+          else { disagree++; marks[c] = -1; }
+        }
+      }
+      return {
+        agree, disagree, silent, marks,
+        tested: agree + disagree,
+        // A single mismatch in a sea of agreement is noise; the
+        // statement is about the balance, so the UI gets the
+        // fraction and decides its own wording.
+        disagreeRatio: (agree + disagree) > 0 ? disagree / (agree + disagree) : 0
+      };
+    }
+
+    /* ============================================================ *
+     * pixel-forensics core, part 4: the line profile.
+     *
+     * Two points define a line; the intensity along it is
+     * averaged over a width perpendicular to it, the slow
+     * background is fitted away, and what remains is compared
+     * against the local noise. The output is deliberately "there
+     * is a bump here, 3.2 times the local noise", never what the
+     * bump means.
+     *
+     * The method is the standard lateral-flow / gel densitometry
+     * pipeline, which is also what ImageJ's plot profile does in
+     * its simple form. Each step below earns its place by an
+     * amount of signal-to-noise, and the comments say how much,
+     * because every one of them is exposed as a control and the
+     * user deserves to know what turning it off costs.
+     * ============================================================ */
+
+    /* sRGB to linear. The camera transfer function is flat in the
+       highlights, so a faint feature on a bright background is
+       compressed into very few code values; undoing the encoding
+       costs nothing and gives that contrast back. This is the one
+       step with no downside, hence on by default. */
+    const SRGB_LIN = (function () {
+      const t = new Float32Array(256);
+      for (let i = 0; i < 256; i++) {
+        const c = i / 255;
+        t[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      }
+      return t;
+    })();
+
+    /* Channel choice.
+     *
+     * Green is the default, and not for aesthetic reasons: it is
+     * the channel with the best signal-to-noise in a Bayer sensor
+     * (twice as many green photosites, about 1.4x after
+     * demosaicing), and in 4:2:0 JPEG it is the only colour
+     * information that was not halved in both directions. A
+     * difference channel like CIELAB a* looks more colourful and
+     * is measurably worse: a difference ADDS the noise of both
+     * terms while red contributes little signal.
+     *
+     * Perceptual uniformity is the wrong objective for a signal
+     * below the perception threshold, which is the whole point.
+     * a* stays available because the house rule is to offer both
+     * readings, with the default set deliberately. */
+    function channelValue(data, p, mode, linear) {
+      const L = linear ? SRGB_LIN : null;
+      const g = (i) => (L ? L[data[i]] * 255 : data[i]);
+      switch (mode) {
+        case 'red': return g(p);
+        case 'blue': return g(p + 2);
+        case 'luma': return 0.299 * g(p) + 0.587 * g(p + 1) + 0.114 * g(p + 2);
+        case 'astar': {
+          // The a* axis in spirit: red minus green, the opponent
+          // direction a faint pink or red feature lives on. Not
+          // full CIELAB, because the non-linearity there buys
+          // nothing for a small difference and costs clarity.
+          return g(p) - g(p + 1);
+        }
+        case 'green':
+        default: return g(p + 1);
+      }
+    }
+
+    // Bilinear sample, so the profile does not jitter with the
+    // line's angle. Out-of-bounds returns null and the caller
+    // drops the sample rather than clamping, which would invent a
+    // flat run at the image edge.
+    function sampleAt(data, w, h, x, y, mode, linear) {
+      if (x < 0 || y < 0 || x > w - 1 || y > h - 1) return null;
+      const x0 = Math.floor(x), y0 = Math.floor(y);
+      const x1 = Math.min(w - 1, x0 + 1), y1 = Math.min(h - 1, y0 + 1);
+      const fx = x - x0, fy = y - y0;
+      const v = (xx, yy) => channelValue(data, (yy * w + xx) * 4, mode, linear);
+      const a = v(x0, y0), b = v(x1, y0), c = v(x0, y1), d = v(x1, y1);
+      return a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) + c * (1 - fx) * fy + d * fx * fy;
+    }
+
+    /* The profile itself.
+     *
+     * Averaging V samples perpendicular to the line divides the
+     * noise by sqrt(V), which is the single largest gain in the
+     * whole pipeline: 60 rows is a factor of 7.7. The catch, and
+     * the reason the averaging follows the LINE and not the image
+     * axes: a 2 degree tilt over 60 pixels smears a 3 pixel
+     * feature across 2 extra pixels and costs a third of its
+     * amplitude. Averaging along the true axis has no such cost,
+     * and the two clicked points define that axis for free.
+     *
+     * Returns one sample per pixel of length along the line. */
+    function lineProfile(data, w, h, p0, p1, opts) {
+      const o = opts || {};
+      const width = Math.max(1, Math.round(o.width || 1));
+      const mode = o.channel || 'green';
+      const linear = o.linear !== false;
+
+      const dx = p1.x - p0.x, dy = p1.y - p0.y;
+      const len = Math.hypot(dx, dy);
+      if (!(len >= 1)) return { values: new Float32Array(0), n: 0, length: 0, width, counts: new Int32Array(0) };
+      const ux = dx / len, uy = dy / len;      // along the line
+      const nx = -uy, ny = ux;                 // perpendicular
+      const n = Math.max(2, Math.round(len));
+      const values = new Float32Array(n);
+      const counts = new Int32Array(n);
+      const half = (width - 1) / 2;
+
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        const cx = p0.x + dx * t, cy = p0.y + dy * t;
+        let s = 0, c = 0;
+        for (let k = 0; k < width; k++) {
+          const off = k - half;
+          const v = sampleAt(data, w, h, cx + nx * off, cy + ny * off, mode, linear);
+          if (v != null) { s += v; c++; }
+        }
+        values[i] = c ? s / c : NaN;
+        counts[i] = c;
+      }
+      return { values, n, length: len, width, ux, uy, nx, ny };
+    }
+
+    /* ---------------- baseline ----------------
+     *
+     * Asymmetric least squares (Eilers & Boelens): fit a smooth
+     * curve that is pulled towards points below it far more
+     * strongly than towards points above it, so peaks are left
+     * sticking out instead of being averaged into the baseline.
+     *
+     * The system is pentadiagonal and solved by a banded Cholesky
+     * in O(n), which is microseconds at these lengths.
+     *
+     * THE TRAP, and the reason for the mask argument: AsLS will
+     * happily run its baseline straight through a weak peak and
+     * subtract it away, which is precisely the signal being looked
+     * for. Excluding the peak region from the fit and
+     * interpolating across it is the standard defence and is why
+     * `detectPeaks` runs first on a provisional baseline. */
+    function asls(y, lambda, p, iterations, mask) {
+      const n = y.length;
+      if (n < 5) return Float32Array.from(y);
+      const w = new Float64Array(n).fill(1);
+      const z = new Float64Array(n);
+      const iter = Math.max(1, iterations || 10);
+      // Second-difference penalty: D'D is pentadiagonal with the
+      // familiar [1,-4,6,-4,1] stencil in the interior.
+      for (let it = 0; it < iter; it++) {
+        // Banded matrix (w + lambda*D'D), lower bandwidth 2.
+        const d0 = new Float64Array(n), d1 = new Float64Array(n), d2 = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          let c0 = 6, c1 = -4, c2 = 1;
+          if (i === 0 || i === n - 1) { c0 = 1; }
+          else if (i === 1 || i === n - 2) { c0 = 5; }
+          d0[i] = w[i] + lambda * c0;
+          if (i < n - 1) d1[i] = lambda * ((i === 0 || i === n - 2) ? -2 : c1);
+          if (i < n - 2) d2[i] = lambda * c2;
+        }
+        // Cholesky of the banded system.
+        const l1 = new Float64Array(n), l2 = new Float64Array(n), dd = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          let s = d0[i];
+          if (i >= 1) s -= l1[i - 1] * l1[i - 1] * dd[i - 1];
+          if (i >= 2) s -= l2[i - 2] * l2[i - 2] * dd[i - 2];
+          dd[i] = s > 1e-12 ? s : 1e-12;
+          if (i < n - 1) {
+            let t = d1[i];
+            if (i >= 1) t -= l1[i - 1] * l2[i - 1] * dd[i - 1];
+            l1[i] = t / dd[i];
+          }
+          if (i < n - 2) l2[i] = d2[i] / dd[i];
+        }
+        // Forward / backward substitution.
+        const b = new Float64Array(n);
+        for (let i = 0; i < n; i++) b[i] = w[i] * y[i];
+        const u = new Float64Array(n);
+        for (let i = 0; i < n; i++) {
+          let s = b[i];
+          if (i >= 1) s -= l1[i - 1] * dd[i - 1] * u[i - 1];
+          if (i >= 2) s -= l2[i - 2] * dd[i - 2] * u[i - 2];
+          u[i] = s / dd[i];
+        }
+        for (let i = n - 1; i >= 0; i--) {
+          let s = u[i];
+          if (i <= n - 2) s -= l1[i] * z[i + 1];
+          if (i <= n - 3) s -= l2[i] * z[i + 2];
+          z[i] = s;
+        }
+        for (let i = 0; i < n; i++) {
+          // Masked samples get a tiny weight: the baseline is
+          // interpolated across them by the smoothness penalty
+          // alone, which is exactly the defence against fitting
+          // the peak.
+          if (mask && mask[i]) { w[i] = 1e-6; continue; }
+          w[i] = y[i] > z[i] ? p : 1 - p;
+        }
+      }
+      return Float32Array.from(z);
+    }
+
+    /* Robust sigma from the median absolute deviation. The plain
+       standard deviation is not usable here: one dust particle,
+       one hot pixel, one dark speck and the noise estimate doubles,
+       which silently raises the detection threshold and hides the
+       thing being looked for. */
+    function madSigma(values, mask) {
+      const v = [];
+      for (let i = 0; i < values.length; i++) {
+        if (mask && mask[i]) continue;
+        if (Number.isFinite(values[i])) v.push(values[i]);
+      }
+      if (v.length < 4) return 0;
+      v.sort((a, b) => a - b);
+      const med = v[v.length >> 1];
+      const dev = v.map((x) => Math.abs(x - med));
+      dev.sort((a, b) => a - b);
+      return dev[dev.length >> 1] / 0.6745;
+    }
+
+    /* Peak detection on the flattened profile.
+     *
+     * The criterion is the IUPAC 3 sigma, which is the convention
+     * this entire literature uses. Two refinements matter:
+     *
+     * - sigma is the robust MAD estimate, not the SD (above).
+     * - the amplitude is not read off the highest sample but fitted
+     *   as a Gaussian of KNOWN width. That is a matched filter: it
+     *   gains another factor of two to three in SNR, and it means a
+     *   single bright pixel cannot produce a detection, because it
+     *   has no width. Reading the maximum instead is the single
+     *   most common way these measurements go wrong.
+     */
+    /* The kernel has to be ZERO-MEAN, and this is the second trap
+     * of the measurement.
+     *
+     * A plain Gaussian-weighted average is not a matched filter
+     * against an unknown background: it responds to any local
+     * level offset, so every gentle wobble the baseline did not
+     * catch produces a bump, and its output is so autocorrelated
+     * that the bumps arrive as long runs of local maxima. On a
+     * fixture containing no feature at all it invented seventeen
+     * detections above 3 sigma.
+     *
+     * Subtracting the kernel's own mean makes it blind to a
+     * constant and to any offset that survived the baseline fit,
+     * which is what "detect a bump of this shape, whatever the
+     * level around it" actually requires. The amplitude it returns
+     * is then the height of the feature above its immediate
+     * surroundings, which is also the quantity anyone reading the
+     * plot would call the peak height. */
+    function gaussianKernel(sigmaPx) {
+      const span = Math.max(2, Math.round(sigmaPx * 3));
+      const n = span * 2 + 1;
+      const k = new Float64Array(n);
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const d = (i - span) / sigmaPx;
+        k[i] = Math.exp(-0.5 * d * d);
+        sum += k[i];
+      }
+      const mean = sum / n;
+      let energy = 0;
+      for (let i = 0; i < n; i++) { k[i] -= mean; energy += k[i] * k[i]; }
+      // Normalised so the response to a unit-amplitude feature of
+      // exactly this shape is 1.
+      let peak = 0;
+      for (let i = 0; i < n; i++) {
+        const d = (i - span) / sigmaPx;
+        peak += k[i] * Math.exp(-0.5 * d * d);
+      }
+      return { k, span, energy, scale: peak > 0 ? 1 / peak : 0 };
+    }
+
+    function gaussianAmplitude(values, centre, sigmaPx, kern) {
+      const K = kern || gaussianKernel(sigmaPx);
+      const n = values.length;
+      let s = 0;
+      for (let j = 0; j < K.k.length; j++) {
+        const i = centre - K.span + j;
+        if (i < 0 || i >= n || !Number.isFinite(values[i])) continue;
+        s += K.k[j] * values[i];
+      }
+      return s * K.scale;
+    }
+
+    /* The SNR of a matched-filter amplitude is NOT the amplitude
+     * divided by the noise of the raw profile, and getting this
+     * wrong is what makes naive versions of this measurement
+     * report a detection every twenty samples.
+     *
+     * The fitted amplitude is a weighted sum of the samples, so
+     * its own standard error is sigma_raw * sqrt(sum g^2) / sum g^2
+     * = sigma_raw / sqrt(sum g^2). For a Gaussian of width s that
+     * is roughly sigma_raw / (pi^(1/4) * sqrt(s)), i.e. the filter
+     * buys a factor sqrt of its width. Comparing the amplitude
+     * against the RAW sigma instead pretends the filter did
+     * nothing and is off by exactly that factor.
+     *
+     * Measured before the fix, on a fixture containing no feature
+     * whatsoever: nine detections above 3 sigma in 300 samples,
+     * where the criterion promises about one in 370. */
+    function detectPeaks(flat, opts) {
+      const o = opts || {};
+      const sigmaPx = Math.max(0.8, o.featureWidth || 2);
+      const threshold = o.threshold || 3;
+      const noise = o.noise != null ? o.noise : madSigma(flat, null);
+      const n = flat.length;
+      const peaks = [];
+      /* A profile with no measurable noise at all is not a
+         profile with infinite sensitivity, it is a profile
+         where the estimate has broken down: a synthetic or
+         heavily posterised image gives MAD exactly 0, and every
+         departure from flat then divides by it and reports an
+         SNR in the hundreds of thousands. Measured on a flat
+         profile with a single dark sample in it: SNR 603891.
+         Refusing to measure is the correct answer. */
+      if (!(noise > 1e-6)) return { peaks, noise: 0, ampNoise: 0, degenerate: true };
+      const K = gaussianKernel(sigmaPx);
+      /* Standard error of the amplitude, straight from the kernel:
+         the response is sum(k_j * y_j) * scale, so for independent
+         samples of sigma its own sigma is sqrt(sum k^2) * scale.
+         This is the quantity the 3 sigma threshold applies to, not
+         the noise of the raw profile. */
+      const ampNoise = noise * Math.sqrt(K.energy) * K.scale;
+      const resp = new Float32Array(n);
+      for (let i = 0; i < n; i++) resp[i] = gaussianAmplitude(flat, i, sigmaPx, K);
+      const minSep = Math.max(2, Math.round(sigmaPx * 2));
+      /* The threshold has to pay for the search.
+       *
+       * Three sigma is a statement about ONE test. Looking for
+       * a peak everywhere along the profile is many tests, and
+       * the filter makes neighbouring samples dependent, so the
+       * number of independent looks is roughly the length
+       * divided by the filter width. Applying a bare 3 sigma to
+       * all of them produced 0.28 false peaks per profile on
+       * pure noise, i.e. a spurious feature on about a fifth of
+       * all measurements, which for this tool is the expensive
+       * direction of error.
+       *
+       * The correction is the standard one for a maximum over
+       * k independent looks: ask for the level that a single
+       * look would exceed with probability p/k instead of p.
+       * The Gaussian tail near 3 sigma is well approximated by
+       * sqrt(2 ln(k/p)), which costs about one extra sigma for
+       * a typical profile and puts the measured false-alarm
+       * rate where the number on the slider claims it is. */
+      const looks = Math.max(1, n / Math.max(1, sigmaPx * 2.5));
+      const pSingle = Math.exp(-0.5 * threshold * threshold);
+      const effective = Math.max(threshold, Math.sqrt(2 * Math.log(Math.max(1.0001, looks / Math.max(1e-12, pSingle)))));
+      for (let i = 1; i < n - 1; i++) {
+        if (!(resp[i] >= resp[i - 1] && resp[i] > resp[i + 1])) continue;
+        const snr = resp[i] / ampNoise;
+        if (snr < effective) continue;
+        if (peaks.length && i - peaks[peaks.length - 1].index < minSep) {
+          if (snr > peaks[peaks.length - 1].snr) peaks[peaks.length - 1] = { index: i, amplitude: resp[i], snr };
+          continue;
+        }
+        peaks.push({ index: i, amplitude: resp[i], snr });
+      }
+      return { peaks, noise, ampNoise, effective };
+    }
+
+    /* The whole measurement, in the order the reasoning runs:
+     * provisional baseline, find where the peaks are, refit the
+     * baseline with those regions masked out, then measure. */
+    /* A sensible lambda depends on how long the profile is, which
+       is why a single constant out of the literature does not
+       transfer. The published ranges (1e4 to 1e6) are quoted for
+       spectra of a few thousand points; a 300 pixel profile at
+       1e5 is so stiff that the baseline misses a gentle background
+       by up to 10 units and inflates the noise estimate by 60
+       percent, which raises the detection limit and hides exactly
+       the faint feature the tool exists to find. Measured on a
+       fixture with a known background and known noise 2.0:
+       residual MAD 3.28 at 1e5 against 2.04 at 1e3.
+     *
+     * Scaling with (n/300)^3 keeps the stiffness per unit length
+     * constant, since the penalty acts on second differences. The
+     * slider stays, because how much background is "background"
+     * is a real judgement about the picture. */
+    function defaultLambda(n) {
+      const s = Math.max(16, n) / 300;
+      return 1e3 * s * s * s;
+    }
+
+    function analyseProfile(values, opts) {
+      const o = opts || {};
+      const lambda = o.lambda != null ? o.lambda : defaultLambda(values.length);
+      const p = o.p != null ? o.p : 0.01;
+      const sigmaPx = Math.max(0.8, o.featureWidth || 2);
+      const polarity = o.polarity || 'dark';       // which way a feature points
+
+      const n = values.length;
+      if (n < 8) return null;
+      // Work on a copy with the sign chosen so a feature is always
+      // a positive bump: a dark line on a light ground is the
+      // normal case and would otherwise need every test inverted.
+      const y = new Float32Array(n);
+      for (let i = 0; i < n; i++) y[i] = polarity === 'dark' ? -values[i] : values[i];
+
+      const base0 = asls(y, lambda, p, o.iterations || 10, null);
+      const flat0 = new Float32Array(n);
+      for (let i = 0; i < n; i++) flat0[i] = y[i] - base0[i];
+
+      const first = detectPeaks(flat0, { featureWidth: sigmaPx, threshold: o.threshold || 3 });
+      // Mask the neighbourhood of every provisional peak, then fit
+      // the baseline again without them.
+      const mask = new Uint8Array(n);
+      const span = Math.max(2, Math.round(sigmaPx * 3));
+      for (const pk of first.peaks) {
+        for (let i = Math.max(0, pk.index - span); i <= Math.min(n - 1, pk.index + span); i++) mask[i] = 1;
+      }
+      const base = asls(y, lambda, p, o.iterations || 10, mask);
+      const flat = new Float32Array(n);
+      for (let i = 0; i < n; i++) flat[i] = y[i] - base[i];
+
+      const noise = madSigma(flat, mask);
+      /* Degeneracy guard, and it has to be RELATIVE.
+       *
+       * A flat synthetic profile with one stray sample in it
+       * does not give MAD exactly zero: the baseline fit leaves
+       * numerical residue, and the measured noise came out at
+       * 4.5e-5 while the feature was 15 units tall. An absolute
+       * epsilon lets that through and the tool reports an SNR of
+       * six hundred thousand, which is not a measurement but a
+       * division by nothing.
+       *
+       * So the question is whether the noise is a plausible
+       * fraction of the amplitude range at all. Below a
+       * millionth of the profile's own span there is nothing
+       * left to compare against, and refusing is the honest
+       * answer. Real photographs never come close to this:
+       * even a heavily denoised phone JPEG keeps a MAD around a
+       * hundredth of its range. */
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < n; i++) {
+        if (!Number.isFinite(values[i])) continue;
+        if (values[i] < lo) lo = values[i];
+        if (values[i] > hi) hi = values[i];
+      }
+      const valueSpan = (isFinite(hi) && isFinite(lo)) ? hi - lo : 0;
+      if (!(noise > 1e-6) || !(noise > valueSpan * 1e-6)) {
+        return {
+          raw: values, flat, baseline: base, masked: mask,
+          noise: 0, peaks: [], polarity, featureWidth: sigmaPx,
+          limit: 0, degenerate: true
+        };
+      }
+      const final = detectPeaks(flat, { featureWidth: sigmaPx, threshold: o.threshold || 3, noise });
+
+      return {
+        raw: values, flat, baseline: base, masked: mask,
+        noise, peaks: final.peaks,
+        polarity, featureWidth: sigmaPx,
+        // Detection limit in the units of the profile, the honest
+        // "anything smaller than this could not have been seen".
+        limit: noise * (o.threshold || 3)
+      };
+    }
+
+    /* ============================================================ *
+     * pixel-forensics core, part 5: resampling, the error level
+     * pictures, and the false-colour rendering everything shares.
+     * ============================================================ */
+
+    /* ---------------- resampling (Kirchner 2008) ----------------
+     *
+     * Scaling or rotating an image interpolates: every output
+     * pixel becomes a fixed linear combination of its neighbours,
+     * and that correlation is periodic with the resampling factor.
+     * Kirchner's insight is that the expensive part of
+     * Popescu/Farid (an EM loop estimating the predictor) can be
+     * skipped entirely, because the PERIODICITY shows up with a
+     * fixed predictor just as well, two orders of magnitude
+     * faster and with comparable reliability.
+     *
+     * The fixed kernel and the constants are his:
+     *   [-0.25 0.5 -0.25 ; 0.5 0 0.5 ; -0.25 0.5 -0.25]
+     *   lambda = 1, sigma = 1, tau = 2
+     *
+     * What comes out is the p-map; its spectrum carries peaks at
+     * frequencies that depend on the resampling factor.
+     *
+     * THE TRAP: JPEG's own 8x8 block structure produces peaks at
+     * multiples of 1/8 in exactly the same spectrum. Without
+     * masking those, every JPEG ever saved reports "resampled",
+     * which is how this detector gets a bad name. */
+    const RESAMPLE_KERNEL = [
+      -0.25, 0.5, -0.25,
+      0.5, 0, 0.5,
+      -0.25, 0.5, -0.25
+    ];
+
+    function pMap(luma, w, h, opts) {
+      const o = opts || {};
+      const sigma = o.sigma != null ? o.sigma : 1;
+      const tau = o.tau != null ? o.tau : 2;
+      const out = new Float32Array(w * h);
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          let pred = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              pred += RESAMPLE_KERNEL[(dy + 1) * 3 + (dx + 1)] * luma[(y + dy) * w + x + dx];
+            }
+          }
+          const e = luma[y * w + x] - pred;
+          // Kirchner's p-map: exp(-|e|^tau / sigma), so a small
+          // residual (the pixel WAS predictable from its
+          // neighbours, as an interpolated pixel is) maps near 1.
+          out[y * w + x] = Math.exp(-Math.pow(Math.abs(e), tau) / sigma);
+        }
+      }
+      return out;
+    }
+
+    /* Radial spectrum of the p-map, with the JPEG frequencies
+       masked out. Full 2D FFT is not needed: the periodicity of
+       interest is visible in the 1D spectra of the row and column
+       means, which is where a uniform scaling puts it, and that is
+       an O(n log n) the browser does not notice. */
+    function dft1d(signal) {
+      const n = signal.length;
+      const mag = new Float32Array(n >> 1);
+      // Direct DFT. n here is a few hundred at most (one value per
+      // row or column of the image), so the O(n^2) is a few tens
+      // of thousands of operations, not worth an FFT.
+      for (let k = 1; k < (n >> 1); k++) {
+        let re = 0, im = 0;
+        const c = (-2 * Math.PI * k) / n;
+        for (let t = 0; t < n; t++) {
+          re += signal[t] * Math.cos(c * t);
+          im += signal[t] * Math.sin(c * t);
+        }
+        mag[k] = Math.sqrt(re * re + im * im) / n;
+      }
+      return mag;
+    }
+
+    /* Is there a periodic peak that is NOT a JPEG block harmonic?
+     *
+     * Returns the strongest such peak with its frequency and how
+     * far above the local median of the spectrum it stands. The
+     * masking of k/8 is what separates "this was resampled" from
+     * "this is a JPEG", and without it the answer is always the
+     * latter. */
+    function resamplingPeak(map, w, h, opts) {
+      const o = opts || {};
+      const maskJpeg = o.maskJpeg !== false;
+      // Column means and row means of the p-map, mean-removed.
+      const col = new Float32Array(w), row = new Float32Array(h);
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const v = map[y * w + x];
+          col[x] += v; row[y] += v;
+        }
+      }
+      const demean = (a, n, div) => {
+        let m = 0;
+        for (let i = 0; i < n; i++) { a[i] /= div; m += a[i]; }
+        m /= n;
+        for (let i = 0; i < n; i++) a[i] -= m;
+        return a;
+      };
+      demean(col, w, Math.max(1, h - 2));
+      demean(row, h, Math.max(1, w - 2));
+
+      const analyse = (sig, n, axis) => {
+        const mag = dft1d(sig);
+        const half = mag.length;
+        // Robust background: median of the whole spectrum.
+        const sorted = Array.from(mag.slice(1)).sort((a, b) => a - b);
+        const med = sorted.length ? sorted[sorted.length >> 1] : 0;
+        let best = null;
+        for (let k = 2; k < half - 1; k++) {
+          const f = k / n;                       // cycles per pixel
+          if (maskJpeg) {
+            // Mask a neighbourhood of every multiple of 1/8.
+            const nearest = Math.round(f * 8) / 8;
+            if (nearest > 0 && Math.abs(f - nearest) < 1.2 / n) continue;
+          }
+          if (!(mag[k] >= mag[k - 1] && mag[k] >= mag[k + 1])) continue;
+          const ratio = med > 0 ? mag[k] / med : 0;
+          if (!best || ratio > best.ratio) best = { axis, k, frequency: f, ratio, magnitude: mag[k] };
+        }
+        return best;
+      };
+
+      const bx = analyse(col, w, 'x'), by = analyse(row, h, 'y');
+      const best = (!bx) ? by : (!by) ? bx : (bx.ratio >= by.ratio ? bx : by);
+      return { x: bx, y: by, best };
+    }
+
+    /* ---------------- error level pictures ----------------
+     *
+     * Both the ghost map and ELA are "recompress and compare", and
+     * the difference between them is the entire lesson, so they
+     * share one function and differ only in what is done with the
+     * stack of differences.
+     *
+     * ELA:     ONE quality, absolute difference, shown directly.
+     * Ghosts:  MANY qualities, and each pixel normalised over its
+     *          own curve across q (Farid 2009, equations 2-5):
+     *
+     *   delta(x,y,q) = mean over channels and a bxb window of
+     *                  (f - f_q)^2
+     *   d(x,y,q)     = [delta - min_q delta] / [max_q delta - min_q delta]
+     *
+     * The min and max run PER PIXEL OVER q, not per q over the
+     * image, and that is the step nearly every reimplementation
+     * gets wrong. Dividing by each pixel's own range is what
+     * removes the texture bias: what survives is only WHERE along
+     * the q axis the minimum sits. Without it the result is ELA
+     * thirteen times over, which is to say the texture of the
+     * picture.
+     *
+     * Because the normalisation needs every q before any of them
+     * can be shown, the whole stack is computed at tile
+     * resolution (b=16), which is also the only resolution the map
+     * honestly has: 47k tiles times 13 qualities is 2.4 MB, while
+     * the same thing per pixel would be 1.5 GB at 12 MP.
+     */
+
+    // Mean squared difference between two RGBA buffers, averaged
+    // over channels and over b x b tiles.
+    function tileMsd(a, b, w, h, tileSize) {
+      const t = Math.max(2, tileSize | 0);
+      const tx = Math.max(1, Math.ceil(w / t)), ty = Math.max(1, Math.ceil(h / t));
+      const out = new Float32Array(tx * ty);
+      const cnt = new Int32Array(tx * ty);
+      for (let y = 0; y < h; y++) {
+        const ti = Math.floor(y / t) * tx;
+        for (let x = 0; x < w; x++) {
+          const p = (y * w + x) * 4;
+          const d0 = a[p] - b[p], d1 = a[p + 1] - b[p + 1], d2 = a[p + 2] - b[p + 2];
+          const k = ti + Math.floor(x / t);
+          out[k] += (d0 * d0 + d1 * d1 + d2 * d2) / 3;
+          cnt[k]++;
+        }
+      }
+      for (let k = 0; k < out.length; k++) if (cnt[k]) out[k] /= cnt[k];
+      return { data: out, tx, ty, tile: t };
+    }
+
+    /* Given the stack of per-q tile differences, Farid's
+       normalisation. `stack` is an array of Float32Array, one per
+       quality, all the same length. Returns one normalised map per
+       quality plus, per tile, which q minimised it. */
+    function ghostNormalise(stack) {
+      const q = stack.length;
+      if (!q) return { maps: [], argmin: new Int8Array(0), range: new Float32Array(0) };
+      const n = stack[0].length;
+      const maps = [];
+      for (let i = 0; i < q; i++) maps.push(new Float32Array(n));
+      const argmin = new Int8Array(n);
+      const range = new Float32Array(n);
+      for (let k = 0; k < n; k++) {
+        let lo = Infinity, hi = -Infinity, ai = 0;
+        for (let i = 0; i < q; i++) {
+          const v = stack[i][k];
+          if (v < lo) { lo = v; ai = i; }
+          if (v > hi) hi = v;
+        }
+        const span = hi - lo;
+        argmin[k] = ai;
+        range[k] = span;
+        for (let i = 0; i < q; i++) {
+          maps[i][k] = span > 1e-9 ? (stack[i][k] - lo) / span : 0;
+        }
+      }
+      return { maps, argmin, range };
+    }
+
+    /* ELA scaling. The common implementations divide by the
+       maximum, so one outlier pixel (a specular highlight, a hot
+       pixel) makes the entire picture black and the map useless.
+       Scaling to a high percentile fixes THAT defect, and only
+       that one: it does nothing about the conceptual problem that
+       a single quality has no normalisation at all, which is why
+       this map is shown next to the ghost stack rather than on its
+       own. */
+    function percentile(values, p) {
+      const v = Array.from(values).filter(Number.isFinite).sort((a, b) => a - b);
+      if (!v.length) return 0;
+      const i = Math.min(v.length - 1, Math.max(0, Math.round((v.length - 1) * p)));
+      return v[i];
+    }
+
+    /* ---------------- false colour ----------------
+     *
+     * Sequential data wants a sequential map. These are the
+     * matplotlib tables, sampled at nine stops, exactly as
+     * ripple-tank holds them: they are NOT written from memory,
+     * because an eyeballed viridis is a different map that merely
+     * looks similar in a swatch.
+     *
+     * The site's diverging set is deliberately not used here: a
+     * quantity that only goes up spends a diverging map's
+     * strongest contrast on a middle that means nothing. */
+    const PF_RAMPS = [
+      { id: 'viridis', name: 'Viridis', stops: [
+        [0.267, 0.005, 0.329], [0.278, 0.176, 0.482], [0.231, 0.322, 0.545],
+        [0.173, 0.447, 0.557], [0.129, 0.565, 0.549], [0.153, 0.678, 0.506],
+        [0.365, 0.784, 0.388], [0.667, 0.863, 0.196], [0.992, 0.906, 0.145]
+      ] },
+      { id: 'magma', name: 'Magma', stops: [
+        [0.000, 0.000, 0.016], [0.114, 0.067, 0.278], [0.318, 0.071, 0.486],
+        [0.510, 0.149, 0.506], [0.714, 0.212, 0.475], [0.902, 0.318, 0.392],
+        [0.984, 0.533, 0.380], [0.996, 0.761, 0.529], [0.988, 0.992, 0.749]
+      ] },
+      { id: 'grey', name: 'Grey', stops: [
+        [0.000, 0.000, 0.000], [0.125, 0.125, 0.125], [0.250, 0.250, 0.250],
+        [0.375, 0.375, 0.375], [0.500, 0.500, 0.500], [0.625, 0.625, 0.625],
+        [0.750, 0.750, 0.750], [0.875, 0.875, 0.875], [1.000, 1.000, 1.000]
+      ] }
+    ];
+
+    // Eight hues for the eight block-grid origins. Qualitative
+    // data, so only the hue varies: sampling a sequential ramp
+    // would imply that origin 6 is "more" than origin 2.
+    function originColor(i) {
+      const h = ((i & 7) * 360) / 8 + 15;
+      const s = 0.62, l = (i & 1) ? 0.46 : 0.58;
+      const k = (n) => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n) => l - a * Math.max(-1, Math.min(Math.min(k(n) - 3, 9 - k(n)), 1));
+      return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+    }
+
+    function rampById(id) {
+      for (let i = 0; i < PF_RAMPS.length; i++) if (PF_RAMPS[i].id === id) return PF_RAMPS[i];
+      return PF_RAMPS[0];
+    }
+
+    /* 256 x 3 bytes, flat. Allocating a colour per pixel per frame
+       is the documented way to make a megapixel repaint crawl, so
+       every map paints through this table. */
+    function rampTable(id) {
+      const stops = rampById(id).stops;
+      const t = new Uint8Array(256 * 3);
+      const k = stops.length - 1;
+      for (let i = 0; i < 256; i++) {
+        const x = (i / 255) * k;
+        const lo = Math.min(k, Math.floor(x)), hi = Math.min(k, lo + 1);
+        const f = x - lo;
+        for (let c = 0; c < 3; c++) {
+          const v = stops[lo][c] + f * (stops[hi][c] - stops[lo][c]);
+          t[i * 3 + c] = Math.max(0, Math.min(255, Math.round(v * 255)));
+        }
+      }
+      return t;
+    }
+
+    function rampCss(id) {
+      const stops = rampById(id).stops;
+      const parts = stops.map((s, i) =>
+        'rgb(' + Math.round(s[0] * 255) + ',' + Math.round(s[1] * 255) + ',' + Math.round(s[2] * 255) + ') ' +
+        ((100 * i) / (stops.length - 1)).toFixed(1) + '%');
+      return 'linear-gradient(90deg, ' + parts.join(', ') + ')';
+    }
+
+    /* Robust percentile scaling of a tile map to 0..255, with the
+       selection mask honoured. Returns the scaling actually used,
+       because a map whose scale is not shown is a map that can
+       claim anything. */
+    function scaleMap(values, keep, loP, hiP) {
+      const v = [];
+      for (let i = 0; i < values.length; i++) {
+        if (keep && !keep[i]) continue;
+        if (Number.isFinite(values[i])) v.push(values[i]);
+      }
+      v.sort((a, b) => a - b);
+      const pick = (p) => {
+        if (!v.length) return 0;
+        const i = Math.min(v.length - 1, Math.max(0, Math.round((v.length - 1) * p)));
+        return v[i];
+      };
+      const lo = pick(loP != null ? loP : 0.02), hi = pick(hiP != null ? hiP : 0.98);
+      const span = hi - lo;
+      const out = new Uint8Array(values.length);
+      for (let i = 0; i < values.length; i++) {
+        if (keep && !keep[i]) { out[i] = 0; continue; }
+        const t = span > 1e-9 ? (values[i] - lo) / span : 0;
+        out[i] = Math.max(0, Math.min(255, Math.round(t * 255)));
+      }
+      return { out, lo, hi, span };
+    }
+
+
+    /* One namespace for the app and for the Node tests. The
+       test suite pulls this block out of the HTML by its id
+       and evaluates it, so everything it checks has to be
+       reachable from here. */
+    globalThis.PFCore = {
+      // container
+      parseJpeg, describeJpeg, subsamplingLabel, ijgQuality, ijgTable,
+      IJG_LUMA, IJG_CHROMA, ZIGZAG,
+      // shared kernel
+      lumaOf, crossDifference,
+      // maps
+      blockGridMap, haarHH, noiseMap, noiseSelection, tileStats,
+      estimateQuantTable, compareTables, qualifiesForEstimate, dct8x8, blockDct,
+      log10ProbSumBelow, estimateStep,
+      pMap, resamplingPeak, dft1d,
+      tileMsd, ghostNormalise, percentile,
+      // profile
+      lineProfile, analyseProfile, asls, madSigma, detectPeaks,
+      gaussianKernel, gaussianAmplitude, defaultLambda, channelValue, SRGB_LIN,
+      // rendering
+      PF_RAMPS, rampById, rampTable, rampCss, originColor, scaleMap
+    };
+
+  </script>
+
+  <script id="app">
+    /* Markup is htm, not JSX: backticks tagged with `html`,
+       ${...} for values, style always an object, no HTML
+       entities. All the arithmetic lives in the pfcore block
+       above; everything here is loading, painting and
+       controls. */
+    const { useState, useEffect, useRef, useCallback, useMemo } = React;
+    const html = htm.bind(React.createElement);
+    const C = PFCore;
+
+    /* Desktop is the target device, so the backstop is
+       generous: the quantisation estimator is the expensive
+       map and it is linear in the number of blocks, about 60
+       ms per megapixel measured. Eight megapixels of working
+       buffer keeps a 12 MP phone photo usable while bounding
+       the ghost stack, which is the one map whose cost is
+       thirteen encodes of the whole picture. */
+    const WORK_LIMIT = 8000000;
+
+    const TABS = [
+      { id: 'container', label: 'Container' },
+      { id: 'grid', label: 'Block grid' },
+      { id: 'quant', label: 'Quantisation' },
+      { id: 'profile', label: 'Line profile' },
+      { id: 'noise', label: 'Noise' },
+      { id: 'resample', label: 'Resampling' },
+      { id: 'ghost', label: 'Ghosts' }
+    ];
+
+    const OVERLAYS = [
+      { value: 'map', label: 'Map' },
+      { value: 'blend', label: 'Blend' },
+      { value: 'orig', label: 'Original' }
+    ];
+
+    const CHANNELS = [
+      { value: 'green', label: 'Green' },
+      { value: 'luma', label: 'Luma' },
+      { value: 'astar', label: 'Red - Green' },
+      { value: 'red', label: 'Red' },
+      { value: 'blue', label: 'Blue' }
+    ];
+
+    function decode(file) {
+      if (typeof createImageBitmap === 'function') return createImageBitmap(file);
+      return new Promise((res, rej) => {
+        const url = URL.createObjectURL(file);
+        const im = new Image();
+        im.onload = () => { URL.revokeObjectURL(url); res(im); };
+        im.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Could not decode this file.')); };
+        im.src = url;
+      });
+    }
+
+    function fitCanvas(src, w, h, cap) {
+      const scale = Math.min(1, Math.sqrt(cap / (w * h)));
+      const cw = Math.max(1, Math.round(w * scale));
+      const ch = Math.max(1, Math.round(h * scale));
+      const cv = document.createElement('canvas');
+      cv.width = cw; cv.height = ch;
+      cv.getContext('2d', { willReadFrequently: true }).drawImage(src, 0, 0, cw, ch);
+      return cv;
+    }
+
+    function Seg({ value, options, onChange, disabled }) {
+      return html`
+        <div className="seg-row">
+          ${options.map((o) => html`
+            <button key=${o.value} type="button" disabled=${!!disabled}
+              className=${'lang-seg' + (o.value === value ? ' active' : '')}
+              onClick=${() => onChange(o.value)}>${o.label}</button>
+          `)}
+        </div>`;
+    }
+
+    function Slider({ label, value, min, max, step, onChange, format, hint }) {
+      return html`
+        <div style=${{ marginBottom: 12 }}>
+          <div className="pf-row">
+            <span className="pf-lab">${label}</span>
+            <span className="pf-val">${format ? format(value) : value}</span>
+          </div>
+          <input type="range" className="pf-slider" min=${min} max=${max} step=${step}
+            value=${value} onInput=${(e) => onChange(parseFloat(e.target.value))} />
+          ${hint ? html`<p className="pf-hint">${hint}</p>` : null}
+        </div>`;
+    }
+
+    function Figure({ value, caption }) {
+      return html`
+        <div className="pf-fig">
+          <div className="pf-fignum">${value}</div>
+          <div className="pf-figcap">${caption}</div>
+        </div>`;
+    }
+
+    /* A quantisation table as an 8x8 grid. `marks` colours the
+       cells the comparison actually tested, so agreement and
+       contradiction are visible as a shape rather than as a
+       number somebody has to trust. */
+    function QuantTable({ values, marks, caption, zone }) {
+      const z = zone || 8;
+      return html`
+        <div>
+          <p className="pf-qtcap">${caption}</p>
+          <table className="pf-qt"><tbody>
+            ${[0, 1, 2, 3, 4, 5, 6, 7].map((v) => html`
+              <tr key=${v}>
+                ${[0, 1, 2, 3, 4, 5, 6, 7].map((u) => {
+                  const i = v * 8 + u;
+                  const m = marks ? marks[i] : 0;
+                  const inZone = u < z && v < z;
+                  const cls = m === 1 ? 'hit' : m === -1 ? 'miss' : inZone ? '' : 'mute';
+                  const val = values && values[i] ? values[i] : (values ? '-' : '');
+                  return html`<td key=${u} className=${cls}>${val}</td>`;
+                })}
+              </tr>`)}
+          </tbody></table>
+        </div>`;
+    }
+
+    function App() {
+      const [tab, setTab] = useState('container');
+      const [img, setImg] = useState(null);          // { canvas, data, w, h, name, bytes, full }
+      const [error, setError] = useState('');
+      const [dragOver, setDragOver] = useState(false);
+      const [overlay, setOverlay] = useState('blend');
+      const [compare, setCompare] = useState(false); // hold-to-compare
+      const [ramp, setRamp] = useState('viridis');
+      const [busy, setBusy] = useState('');
+      const [hoverInfo, setHoverInfo] = useState(null);
+
+      // Per-map parameters. Deliberately many: these are real
+      // trade-offs from the methods, not implementation
+      // details, and the house style is one control more
+      // rather than one fewer.
+      const [gridTile, setGridTile] = useState(64);
+      const [noiseTile, setNoiseTile] = useState(32);
+      const [textureMax, setTextureMax] = useState(2.2);
+      const [qZone, setQZone] = useState(4);
+      const [qMax, setQMax] = useState(64);
+      const [blockStep, setBlockStep] = useState(1);
+      const [profWidth, setProfWidth] = useState(16);
+      const [profChannel, setProfChannel] = useState('green');
+      const [profLinear, setProfLinear] = useState(true);
+      const [profFeature, setProfFeature] = useState(2);
+      const [profThreshold, setProfThreshold] = useState(3);
+      const [profPolarity, setProfPolarity] = useState('dark');
+      const [maskJpeg, setMaskJpeg] = useState(true);
+      const [ghostLo, setGhostLo] = useState(30);
+      const [ghostHi, setGhostHi] = useState(90);
+      const [ghostStep, setGhostStep] = useState(5);
+      const [ghostQ, setGhostQ] = useState(0);       // index into the stack
+
+      // Results, each computed on demand and kept so a tab
+      // switch never recomputes. This is the difference from
+      // the grader, where a tab switch is free.
+      const [container, setContainer] = useState(null);
+      const [grid, setGrid] = useState(null);
+      const [quant, setQuant] = useState(null);
+      const [noise, setNoise] = useState(null);
+      const [resample, setResample] = useState(null);
+      const [ghost, setGhost] = useState(null);
+      const [profile, setProfile] = useState(null);
+      const [line, setLine] = useState(null);        // { a:{x,y}, b:{x,y} } in image pixels
+      const [dragPoint, setDragPoint] = useState(null);
+
+      const canvasRef = useRef(null);
+      const plotRef = useRef(null);
+      const fileRef = useRef(null);
+      const lumaRef = useRef(null);
+      const crossRef = useRef(null);
+
+      /* ---------------- loading ---------------- */
+
+      const load = useCallback(async (file) => {
+        if (!file) return;
+        setError(''); setBusy('Decoding');
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          const bmp = await decode(file);
+          const w = bmp.width || bmp.naturalWidth, h = bmp.height || bmp.naturalHeight;
+          const cv = fitCanvas(bmp, w, h, WORK_LIMIT);
+          const ctx = cv.getContext('2d', { willReadFrequently: true });
+          const data = ctx.getImageData(0, 0, cv.width, cv.height);
+          if (bmp.close) bmp.close();
+          lumaRef.current = null; crossRef.current = null;
+          setImg({
+            canvas: cv, data, w: cv.width, h: cv.height,
+            name: file.name, bytes, fullW: w, fullH: h,
+            scaled: cv.width !== w || cv.height !== h
+          });
+          setContainer(C.describeJpeg(bytes));
+          setGrid(null); setQuant(null); setNoise(null); setResample(null);
+          setGhost(null); setProfile(null); setLine(null);
+        } catch (e) {
+          setError(String(e && e.message ? e.message : e));
+        } finally { setBusy(''); }
+      }, []);
+
+      const lumaOf = useCallback(() => {
+        if (!img) return null;
+        if (!lumaRef.current) lumaRef.current = C.lumaOf(img.data.data, img.w, img.h);
+        return lumaRef.current;
+      }, [img]);
+
+      const crossOf = useCallback(() => {
+        if (!img) return null;
+        if (!crossRef.current) {
+          const L = lumaOf();
+          crossRef.current = C.crossDifference(L, img.w, img.h);
+        }
+        return crossRef.current;
+      }, [img, lumaOf]);
+
+      /* ---------------- the maps ----------------
+         Each returns the shape the painter understands:
+         { tx, ty, bytes (0..255 per tile), keep, kind }. The
+         painter does not know which map it is drawing, which
+         is what keeps the overlay modes in one place. */
+
+      const runGrid = useCallback(() => {
+        if (!img) return;
+        setBusy('Block grid');
+        setTimeout(() => {
+          const cr = crossOf();
+          const g = C.blockGridMap(cr.data, cr.w, cr.h, gridTile);
+          setGrid(g);
+          setBusy('');
+        }, 0);
+      }, [img, crossOf, gridTile]);
+
+      const runNoise = useCallback(() => {
+        if (!img) return;
+        setBusy('Noise');
+        setTimeout(() => {
+          const m = C.noiseMap(lumaOf(), img.w, img.h, { tile: noiseTile });
+          const sel = C.noiseSelection(m, { textureMax, varianceMin: 2.5 });
+          setNoise({ map: m, sel });
+          setBusy('');
+        }, 0);
+      }, [img, lumaOf, noiseTile, textureMax]);
+
+      const runQuant = useCallback(() => {
+        if (!img) return;
+        setBusy('Quantisation');
+        setTimeout(() => {
+          const cr = crossOf();
+          const g = grid || C.blockGridMap(cr.data, cr.w, cr.h, gridTile);
+          if (!grid) setGrid(g);
+          const q = C.qualifiesForEstimate(g);
+          if (!q.ok) { setQuant({ blocked: q.reason }); setBusy(''); return; }
+          const est = C.estimateQuantTable(lumaOf(), img.w, img.h, {
+            originX: g.originX % 8, originY: g.originY % 8, qMax, blockStep
+          });
+          const header = container && container.tables && container.tables.length
+            ? container.tables[0].values : null;
+          const cmp = C.compareTables(est.table, header, { zone: qZone });
+          setQuant({ est, header, cmp, origin: [g.originX % 8, g.originY % 8] });
+          setBusy('');
+        }, 0);
+      }, [img, crossOf, lumaOf, grid, gridTile, qMax, blockStep, container, qZone]);
+
+      const runResample = useCallback(() => {
+        if (!img) return;
+        setBusy('Resampling');
+        setTimeout(() => {
+          const m = C.pMap(lumaOf(), img.w, img.h, {});
+          const r = C.resamplingPeak(m, img.w, img.h, { maskJpeg });
+          setResample({ peak: r, map: m });
+          setBusy('');
+        }, 0);
+      }, [img, lumaOf, maskJpeg]);
+
+      /* Ghosts: the one map that has to encode. Every quality
+         must be present before any of them can be shown,
+         because the normalisation runs per pixel across q. */
+      const runGhost = useCallback(async () => {
+        if (!img) return;
+        const qs = [];
+        for (let q = ghostLo; q <= ghostHi; q += ghostStep) qs.push(q);
+        if (!qs.length) return;
+        setBusy('Ghosts 0/' + qs.length);
+        const stack = [];
+        let tx = 0, ty = 0;
+        const src = img.data.data;
+        for (let i = 0; i < qs.length; i++) {
+          setBusy('Ghosts ' + (i + 1) + '/' + qs.length);
+          const blob = await new Promise((res) => img.canvas.toBlob(res, 'image/jpeg', qs[i] / 100));
+          if (!blob) continue;
+          const bmp = await decode(blob);
+          const cv = document.createElement('canvas');
+          cv.width = img.w; cv.height = img.h;
+          cv.getContext('2d').drawImage(bmp, 0, 0);
+          if (bmp.close) bmp.close();
+          const re = cv.getContext('2d').getImageData(0, 0, img.w, img.h).data;
+          const d = C.tileMsd(src, re, img.w, img.h, 16);
+          tx = d.tx; ty = d.ty;
+          stack.push(d.data);
+          // Let the browser breathe: thirteen encodes of a
+          // large picture otherwise freeze the tab entirely
+          // and the progress text never paints.
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        const norm = C.ghostNormalise(stack);
+        setGhost({ qs, tx, ty, norm, stack });
+        setGhostQ(0);
+        setBusy('');
+      }, [img, ghostLo, ghostHi, ghostStep]);
+
+      /* ---------------- line profile ---------------- */
+
+      const runProfile = useCallback(() => {
+        if (!img || !line) { setProfile(null); return; }
+        const pr = C.lineProfile(img.data.data, img.w, img.h, line.a, line.b, {
+          width: profWidth, channel: profChannel, linear: profLinear
+        });
+        if (!pr.n) { setProfile(null); return; }
+        const an = C.analyseProfile(pr.values, {
+          polarity: profPolarity, featureWidth: profFeature, threshold: profThreshold
+        });
+        setProfile(an ? { pr, an } : null);
+      }, [img, line, profWidth, profChannel, profLinear, profPolarity, profFeature, profThreshold]);
+
+      useEffect(() => { runProfile(); }, [runProfile]);
+
+      /* ---------------- painting ----------------
+         One painter for every map. It takes a tile-resolution
+         byte map plus an optional keep mask and composites it
+         over the picture; the map itself never knows about
+         overlay modes or ramps. */
+
+      const rampBytes = useMemo(() => C.rampTable(ramp), [ramp]);
+
+      const activeMap = useMemo(() => {
+        if (!img) return null;
+        if (compare || overlay === 'orig') return null;
+        if (tab === 'grid' && grid) {
+          // Origin as colour, strength as the keep mask: a tile
+          // with no grid gets no colour rather than a confident
+          // wrong one.
+          const n = grid.tx * grid.ty;
+          const rgb = new Uint8Array(n * 3);
+          const keep = new Uint8Array(n);
+          for (let k = 0; k < n; k++) {
+            const cc = C.originColor((grid.gx[k] + grid.gy[k]) & 7);
+            rgb[k * 3] = cc[0]; rgb[k * 3 + 1] = cc[1]; rgb[k * 3 + 2] = cc[2];
+            keep[k] = grid.strength[k] > 0.18 && grid.votes[k] >= 8 ? 1 : 0;
+          }
+          return { tx: grid.tx, ty: grid.ty, rgb, keep, kind: 'rgb' };
+        }
+        if (tab === 'noise' && noise) {
+          const s = C.scaleMap(noise.map.sigma, noise.sel.keep, 0.02, 0.98);
+          return { tx: noise.map.tx, ty: noise.map.ty, bytes: s.out, keep: noise.sel.keep, kind: 'ramp', scale: s };
+        }
+        if (tab === 'ghost' && ghost && ghost.norm.maps.length) {
+          const i = Math.min(ghost.norm.maps.length - 1, Math.max(0, ghostQ));
+          const m = ghost.norm.maps[i];
+          const bytes = new Uint8Array(m.length);
+          // The ghost map is a distance that is LOW where the
+          // image matches this quality, so it is inverted for
+          // display: bright means "this region looks like it
+          // was compressed here".
+          for (let k = 0; k < m.length; k++) bytes[k] = Math.max(0, Math.min(255, Math.round((1 - m[k]) * 255)));
+          return { tx: ghost.tx, ty: ghost.ty, bytes, keep: null, kind: 'ramp' };
+        }
+        return null;
+      }, [img, tab, grid, noise, ghost, ghostQ, compare, overlay]);
+
+      const paint = useCallback(() => {
+        const cv = canvasRef.current;
+        if (!cv || !img) return;
+        if (cv.width !== img.w || cv.height !== img.h) { cv.width = img.w; cv.height = img.h; }
+        const ctx = cv.getContext('2d');
+        ctx.putImageData(img.data, 0, 0);
+
+        const m = activeMap;
+        if (m) {
+          const out = ctx.getImageData(0, 0, img.w, img.h);
+          const d = out.data;
+          const src = img.data.data;
+          const sx = m.tx / img.w, sy = m.ty / img.h;
+          const showMap = overlay === 'map';
+          for (let y = 0; y < img.h; y++) {
+            const ty = Math.min(m.ty - 1, (y * sy) | 0);
+            for (let x = 0; x < img.w; x++) {
+              const k = ty * m.tx + Math.min(m.tx - 1, (x * sx) | 0);
+              const p = (y * img.w + x) * 4;
+              let r, g, b;
+              if (m.keep && !m.keep[k]) {
+                // Not measurable here: grey it out rather than
+                // paint a colour that would be read as a value.
+                const l = (0.299 * src[p] + 0.587 * src[p + 1] + 0.114 * src[p + 2]) * 0.55 + 40;
+                r = g = b = l;
+              } else if (m.kind === 'rgb') {
+                r = m.rgb[k * 3]; g = m.rgb[k * 3 + 1]; b = m.rgb[k * 3 + 2];
+              } else {
+                const v = m.bytes[k];
+                r = rampBytes[v * 3]; g = rampBytes[v * 3 + 1]; b = rampBytes[v * 3 + 2];
+              }
+              if (showMap) { d[p] = r; d[p + 1] = g; d[p + 2] = b; }
+              else {
+                d[p] = r * 0.62 + src[p] * 0.38;
+                d[p + 1] = g * 0.62 + src[p + 1] * 0.38;
+                d[p + 2] = b * 0.62 + src[p + 2] * 0.38;
+              }
+              d[p + 3] = 255;
+            }
+          }
+          ctx.putImageData(out, 0, 0);
+        }
+
+        /* The profile line belongs to the profile tab only. It
+           is a tool for taking a measurement, not a finding
+           about the picture, so leaving it lying across the
+           noise or grid map just adds a white streak to a map
+           that is trying to show something else. */
+        if (line && tab === 'profile') {
+          const lw = Math.max(1, img.w / 600);
+          ctx.lineWidth = lw * 3;
+          ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+          ctx.beginPath(); ctx.moveTo(line.a.x, line.a.y); ctx.lineTo(line.b.x, line.b.y); ctx.stroke();
+          ctx.lineWidth = lw;
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+          ctx.beginPath(); ctx.moveTo(line.a.x, line.a.y); ctx.lineTo(line.b.x, line.b.y); ctx.stroke();
+          // The averaging band, so the width slider is visible
+          // on the picture and not only in the plot.
+          if (profWidth > 1) {
+            const dx = line.b.x - line.a.x, dy = line.b.y - line.a.y;
+            const L = Math.hypot(dx, dy) || 1;
+            const nx = -dy / L * (profWidth / 2), ny = dx / L * (profWidth / 2);
+            ctx.lineWidth = lw;
+            ctx.setLineDash([lw * 4, lw * 4]);
+            ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+            for (const s of [1, -1]) {
+              ctx.beginPath();
+              ctx.moveTo(line.a.x + nx * s, line.a.y + ny * s);
+              ctx.lineTo(line.b.x + nx * s, line.b.y + ny * s);
+              ctx.stroke();
+            }
+            ctx.setLineDash([]);
+          }
+          for (const p of [line.a, line.b]) {
+            ctx.beginPath(); ctx.arc(p.x, p.y, lw * 3, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
+            ctx.lineWidth = lw; ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.stroke();
+          }
+        }
+      }, [img, activeMap, overlay, rampBytes, line, profWidth, tab]);
+
+      useEffect(() => { paint(); }, [paint]);
+
+      /* ---------------- the profile plot ---------------- */
+
+      useEffect(() => {
+        const cv = plotRef.current;
+        if (!cv) return;
+        const rect = cv.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const W = Math.max(120, Math.round(rect.width * dpr)), H = Math.round(220 * dpr);
+        if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, W, H);
+        const css = getComputedStyle(document.documentElement);
+        const col = (n, f) => (css.getPropertyValue(n) || f).trim() || f;
+        const ink = col('--tool-text', '#e2e8f0');
+        const faint = col('--tool-faint', '#64748b');
+        const okc = col('--tool-ok-text', '#4ade80');
+        if (!profile) {
+          ctx.fillStyle = faint;
+          ctx.font = (12 * dpr) + 'px system-ui, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('Drag a line across the image to measure along it.', W / 2, H / 2);
+          return;
+        }
+        const f = profile.an.flat;
+        const n = f.length;
+        const pad = 26 * dpr;
+        let lo = Infinity, hi = -Infinity;
+        for (let i = 0; i < n; i++) { if (f[i] < lo) lo = f[i]; if (f[i] > hi) hi = f[i]; }
+        const band = profile.an.limit;
+        hi = Math.max(hi, band * 1.3); lo = Math.min(lo, -band * 1.3);
+        const span = (hi - lo) || 1;
+        const X = (i) => pad + (i / Math.max(1, n - 1)) * (W - pad * 1.4);
+        const Y = (v) => H - pad - ((v - lo) / span) * (H - pad * 1.8);
+
+        // The noise band is the point of the plot: anything
+        // inside it could be noise, and drawing it removes the
+        // temptation to read a wiggle as a feature.
+        ctx.fillStyle = 'rgba(148,163,184,0.16)';
+        ctx.fillRect(pad, Y(band), W - pad * 1.4, Math.max(1, Y(-band) - Y(band)));
+        ctx.strokeStyle = faint; ctx.lineWidth = dpr;
+        ctx.beginPath(); ctx.moveTo(pad, Y(0)); ctx.lineTo(W - pad * 0.4, Y(0)); ctx.stroke();
+
+        ctx.strokeStyle = ink; ctx.lineWidth = 1.4 * dpr;
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) { const x = X(i), y = Y(f[i]); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+        ctx.stroke();
+
+        for (const pk of profile.an.peaks) {
+          ctx.strokeStyle = okc; ctx.lineWidth = dpr;
+          ctx.beginPath(); ctx.moveTo(X(pk.index), Y(0)); ctx.lineTo(X(pk.index), Y(pk.amplitude)); ctx.stroke();
+          ctx.fillStyle = okc;
+          ctx.font = (10 * dpr) + 'px system-ui, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(pk.snr.toFixed(1) + 'x', X(pk.index), Y(pk.amplitude) - 4 * dpr);
+        }
+        ctx.fillStyle = faint;
+        ctx.font = (10 * dpr) + 'px system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('band = ' + profThreshold + ' x noise', pad, H - 8 * dpr);
+        ctx.textAlign = 'right';
+        ctx.fillText(Math.round(profile.pr.length) + ' px', W - pad * 0.4, H - 8 * dpr);
+      }, [profile, profThreshold, tab]);
+
+      /* ---------------- pointer ---------------- */
+
+      const toImage = (e) => {
+        const cv = canvasRef.current;
+        const r = cv.getBoundingClientRect();
+        return {
+          x: Math.max(0, Math.min(img.w - 1, ((e.clientX - r.left) / r.width) * img.w)),
+          y: Math.max(0, Math.min(img.h - 1, ((e.clientY - r.top) / r.height) * img.h))
+        };
+      };
+
+      const onDown = (e) => {
+        if (!img) return;
+        if (tab !== 'profile') return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        const p = toImage(e);
+        setLine({ a: p, b: p });
+        setDragPoint('b');
+      };
+      const onMove = (e) => {
+        if (!img) return;
+        if (dragPoint && tab === 'profile') {
+          const p = toImage(e);
+          setLine((L) => (L ? { a: L.a, b: p } : L));
+          return;
+        }
+        // Hover readout: on the noise map the value under the
+        // cursor matters more than the colour, which is a map
+        // that always looks like something.
+        const m = activeMap;
+        if (!m || !noise || tab !== 'noise') { setHoverInfo(null); return; }
+        const p = toImage(e);
+        const k = Math.min(noise.map.ty - 1, (p.y / img.h * noise.map.ty) | 0) * noise.map.tx
+          + Math.min(noise.map.tx - 1, (p.x / img.w * noise.map.tx) | 0);
+        setHoverInfo({
+          sigma: noise.map.sigma[k], texture: noise.map.texture[k], kept: !!noise.sel.keep[k]
+        });
+      };
+      const onUp = (e) => { setDragPoint(null); };
+
+      useEffect(() => {
+        const down = (e) => { if (e.key === 'c' || e.key === 'C') setCompare(true); };
+        const up = (e) => { if (e.key === 'c' || e.key === 'C') setCompare(false); };
+        window.addEventListener('keydown', down);
+        window.addEventListener('keyup', up);
+        return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); };
+      }, []);
+
+      /* ---------------- drop zone ---------------- */
+
+      const onDrop = (e) => {
+        e.preventDefault(); setDragOver(false);
+        const f = e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) load(f);
+      };
+
+      if (!img) {
+        return html`
+          <div className="pf-wrap"><div className="pf-inner">
+            <h1 className="pf-h1">Pixel Forensics</h1>
+            <p className="pf-sub">
+              Lay maps over a photograph that show what the eye does not. Every map here is arithmetic
+              on the pixels: where the JPEG block grid sits, which quantisation table the pixels
+              remember, how the noise is distributed, whether a region was scaled, and how far a faint
+              feature rises above the noise along a line you draw. The tool measures and shows its
+              scale. It never decides what the measurement means.
+            </p>
+            ${error ? html`<div className="pf-note warn">${error}</div>` : null}
+            <div className=${'pf-drop' + (dragOver ? ' over' : '')}
+              onClick=${() => fileRef.current && fileRef.current.click()}
+              onDragOver=${(e) => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave=${() => setDragOver(false)}
+              onDrop=${onDrop}>
+              <strong>Drop an image here</strong>
+              <span className="pf-drophint">or click to choose. JPEG, PNG and WebP. Nothing leaves your browser.</span>
+            </div>
+            <input ref=${fileRef} type="file" accept="image/*" style=${{ display: 'none' }}
+              onChange=${(e) => load(e.target.files && e.target.files[0])} />
+            <p className="pf-src">
+              The maps read the last step of a compression chain, not the origin of the picture.
+              A screenshot is a PNG with a JPEG frozen inside it; a messenger image is a
+              recompression whose own history has overwritten most of what came before. An empty
+              map is never a proof of innocence.
+            </p>
+          </div></div>`;
+      }
+
+      return html`
+        <div className="pf-wrap"><div className="pf-inner">
+          <!-- The title stays once a picture is loaded. It is the
+               page's h1 and its only heading, so dropping it on
+               load would leave the document without one, and the
+               tool without a name on screen. -->
+          <h1 className="pf-h1">Pixel Forensics</h1>
+          <p className="pf-sub">
+            Every map here is arithmetic on the pixels, and none of them is a verdict. A map that
+            stays empty says the trace is not there, which is not the same as saying nothing
+            happened.
+          </p>
+          <div className="pf-bar">
+            <div className="tabstrip" role="tablist">
+              ${TABS.map((t) => html`
+                <button key=${t.id} type="button" role="tab" aria-selected=${t.id === tab}
+                  className=${t.id === tab ? 'active' : ''}
+                  onClick=${() => setTab(t.id)}>${t.label}</button>`)}
+            </div>
+            <span className="pf-spacer"></span>
+            <span className="pf-file" title=${img.name}>${img.name}</span>
+            <div className="pf-chips">
+              <button type="button" className="lang-seg" onClick=${() => fileRef.current && fileRef.current.click()}>
+                ${ToolIcons.el('upload')} Replace
+              </button>
+            </div>
+            <input ref=${fileRef} type="file" accept="image/*" style=${{ display: 'none' }}
+              onChange=${(e) => load(e.target.files && e.target.files[0])} />
+          </div>
+
+          <div className="pf-layout">
+            <div className="pf-stage">
+              <div className="pf-canvaswrap">
+                <canvas ref=${canvasRef}
+                  className=${'pf-canvas' + (busy ? ' busy' : '') + (tab === 'profile' ? ' pick' : '')}
+                  onPointerDown=${onDown} onPointerMove=${onMove} onPointerUp=${onUp}
+                  onPointerLeave=${() => setHoverInfo(null)} />
+              </div>
+              <div className="pf-bar" style=${{ marginTop: 10 }}>
+                <${Seg} value=${compare ? 'orig' : overlay} options=${OVERLAYS} onChange=${setOverlay} />
+                <button type="button" className="tool-btn tool-btn-sm"
+                  onPointerDown=${() => setCompare(true)} onPointerUp=${() => setCompare(false)}
+                  onPointerLeave=${() => setCompare(false)}>Hold to compare (C)</button>
+                <span className="pf-spacer"></span>
+                ${busy ? html`<span className="pf-status">${busy}...</span>` : null}
+              </div>
+              ${img.scaled ? html`
+                <p className="pf-hint">
+                  Working at ${img.w} x ${img.h} instead of ${img.fullW} x ${img.fullH}. The maps are
+                  computed on these pixels, so the block grid of the original is preserved only if the
+                  scaling was by an integer factor. For grid and quantisation work, a smaller original
+                  is better than a scaled large one.
+                </p>` : null}
+              ${tab === 'profile' ? html`
+                <canvas ref=${plotRef} className="pf-plot" style=${{ marginTop: 10 }} />` : null}
+            </div>
+
+            <div className="ctl-card">
+              ${renderPanel()}
+            </div>
+          </div>
+
+          <p className="pf-src">
+            Methods, in the order they are trusted: quantisation tables inverted per Cogranne
+            (arXiv:1802.00992); block grid after Nikoukhah et al., IPOL 2020; the table estimated from
+            pixels after Nikoukhah et al., IPOL 2022; noise per Donoho-Johnstone with the block
+            selection of Gardella et al., IPOL 2024; resampling after Kirchner 2008; ghosts after
+            Farid 2009. All implemented from the papers. Private hobby project, non-commercial.
+          </p>
+        </div></div>`;
+
+      /* The parameter column. One function rather than seven
+         components: every panel is a handful of controls and a
+         verdict, and splitting them would spread one screen of
+         markup over seven definitions. */
+      function renderPanel() {
+        if (tab === 'container') return panelContainer();
+        if (tab === 'grid') return panelGrid();
+        if (tab === 'quant') return panelQuant();
+        if (tab === 'profile') return panelProfile();
+        if (tab === 'noise') return panelNoise();
+        if (tab === 'resample') return panelResample();
+        if (tab === 'ghost') return panelGhost();
+        return null;
+      }
+
+      function panelContainer() {
+        const c = container;
+        if (!c) {
+          return html`
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Container</p>
+              <div className="pf-note info">
+                This file is not a JPEG, so there is no header to read. The pixel maps still work:
+                a PNG can carry a JPEG history frozen in its pixels, and the block grid is the map
+                that finds it.
+              </div>
+            </div>`;
+        }
+        const t0 = c.tables && c.tables.length ? c.tables[0] : null;
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">What the file says</p>
+              <div className="pf-figures">
+                <${Figure} value=${c.width + ' x ' + c.height} caption="Size in header" />
+                <${Figure} value=${c.subsampling || '-'} caption="Chroma" />
+                <${Figure} value=${c.progressive ? 'Progressive' : 'Baseline'} caption="Mode" />
+                <${Figure} value=${c.tables.length} caption="Tables" />
+              </div>
+            </div>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Quantisation table</p>
+              ${c.standard ? html`
+                <div className="pf-note ok">
+                  The luma table is exactly a standard IJG table scaled to
+                  <strong> quality ${c.quality}</strong>. The inversion is exact rather than a
+                  best fit: every one of the 64 entries constrains the scale factor to an interval,
+                  and here the 64 intervals intersect in a single quality. So this file passed
+                  through an ordinary libjpeg-style encoder at its last save.
+                </div>` : html`
+                <div className="pf-note info">
+                  The luma table is <strong>not</strong> a scaled standard table: the 64 intervals
+                  have no common quality. That is a real statement, not a failure. Cameras ship
+                  their own tables, and Photoshop uses its own twelve-step scale, so this file did
+                  not come out of a plain libjpeg pipeline at its last save.
+                </div>`}
+              ${t0 ? html`<div className="pf-tables">
+                <${QuantTable} values=${t0.values} caption="Luma, as stored" />
+              </div>` : null}
+            </div>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Reading it</p>
+              <p className="pf-hint">
+                4:2:0 chroma is almost always a camera or a messenger recompression; 4:4:4 points at
+                an editor saving at high quality. ${c.app && c.app.length ? 'Application markers present: ' + c.app.map((a) => a.id || '?').filter(Boolean).join(', ') + '.' : 'No application markers.'}
+              </p>
+            </div>
+          <//>`;
+      }
+
+      function panelGrid() {
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Block grid</p>
+              <p className="pf-hint">
+                JPEG quantises every 8x8 block on its own, so block borders are a systematic
+                discontinuity. This counts local maxima of a corner difference and asks which
+                residue modulo 8 they prefer. A uniform colour is one consistent grid; a patch of a
+                different colour is a crop or an inserted region.
+              </p>
+              <${Slider} label="Tile size" value=${gridTile} min=${32} max=${192} step=${8}
+                onChange=${setGridTile} format=${(v) => v + ' px'}
+                hint="Must be a multiple of 8, or the eight possible origins are not equally represented inside a tile and the answer is biased before a pixel is read." />
+              <button type="button" className="tool-btn tool-btn-primary" onClick=${runGrid} disabled=${!!busy}>
+                ${ToolIcons.el('play')} Compute
+              </button>
+            </div>
+            ${grid ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Result</p>
+                <div className="pf-figures">
+                  <${Figure} value=${grid.originX + ', ' + grid.originY} caption="Grid origin" />
+                  <${Figure} value=${(grid.consensus * 100).toFixed(0) + '%'} caption="Consensus" />
+                  <${Figure} value=${grid.meanStrength.toFixed(2)} caption="Mean strength" />
+                </div>
+                ${grid.consensus < 0.35 ? html`
+                  <div className="pf-note info">
+                    No consistent grid. For a PNG that was never a JPEG, or a JPEG saved at quality
+                    95 and up, this is the correct answer rather than a failure: there is nothing
+                    there to find. Chance level for the consensus is about 2 percent.
+                  </div>` : html`
+                  <div className="pf-note ok">
+                    A consistent 8x8 grid with origin (${grid.originX}, ${grid.originY}).
+                    ${(grid.originX === 0 && grid.originY === 0)
+                      ? ' That is the aligned position, so the image has not been cropped by a number of pixels that is not a multiple of eight since it was compressed.'
+                      : ' That is off the aligned position, so the image was cropped after the compression that left this grid.'}
+                  </div>`}
+                <div className="pf-swatches">
+                  ${[0, 1, 2, 3, 4, 5, 6, 7].map((i) => {
+                    const c = C.originColor(i);
+                    return html`<span key=${i} className="pf-swatch">
+                      <span className="pf-dot" style=${{ background: 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')' }}></span>
+                      ${i}</span>`;
+                  })}
+                </div>
+                <p className="pf-hint">
+                  Colour is the sum of the two origin components, so neighbouring shades are
+                  neighbouring grids. Grey tiles had too few votes to say anything, which is the
+                  honest state for flat sky.
+                </p>
+              </div>` : null}
+          <//>`;
+      }
+
+      function panelQuant() {
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Table from the pixels</p>
+              <p className="pf-hint">
+                The header names the table of the last save. The pixels remember the one before it:
+                recompute the DCT on the block grid and the coefficients still pile up on multiples
+                of the earlier step. No Huffman decoding is involved, the transform is recomputed
+                from the decoded image.
+              </p>
+              <${Slider} label="Compared frequencies" value=${qZone} min=${2} max=${8} step=${1}
+                onChange=${setQZone} format=${(v) => v + ' x ' + v}
+                hint="Only the low frequencies carry information in a real photograph: the high ones quantise to zero and the estimator correctly says nothing about them." />
+              <details className="ctl-adv">
+                <summary>Expert</summary>
+                <${Slider} label="Largest step tested" value=${qMax} min=${16} max=${255} step=${1}
+                  onChange=${setQMax} format=${(v) => String(v)}
+                  hint="64 covers quality 50 and up and is three times faster than the full range. Raise it for a heavily compressed image." />
+                <${Slider} label="Block sampling" value=${blockStep} min=${1} max=${4} step=${1}
+                  onChange=${setBlockStep} format=${(v) => 'every ' + (v === 1 ? 'block' : v + 'th block')}
+                  hint="Sampling blocks is the only legitimate way to make this cheaper. Shrinking the image first destroys the very grid alignment being measured: a single pixel of offset already costs most of the significance." />
+              </details>
+              <button type="button" className="tool-btn tool-btn-primary" onClick=${runQuant} disabled=${!!busy}>
+                ${ToolIcons.el('play')} Estimate
+              </button>
+            </div>
+            ${quant && quant.blocked ? html`
+              <div className="ctl-sec">
+                <div className="pf-note info">
+                  No estimate: ${quant.blocked}. The estimator needs to know where the 8x8 grid
+                  starts, and without a grid the transform would be computed on the wrong lattice and
+                  would produce contradictions that mean nothing. Run the block grid map first.
+                </div>
+              </div>` : null}
+            ${quant && quant.est ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Result</p>
+                <div className="pf-figures">
+                  <${Figure} value=${quant.est.found + '/63'} caption="Steps found" />
+                  <${Figure} value=${quant.cmp.agree} caption="Agree" />
+                  <${Figure} value=${quant.cmp.disagree} caption="Contradict" />
+                  <${Figure} value=${quant.est.blocks} caption="Blocks used" />
+                </div>
+                ${!quant.header ? html`
+                  <div className="pf-note info">
+                    No header table to compare against, so the estimate stands alone. For a PNG that
+                    is the only access to its JPEG past there is.
+                  </div>`
+                  : quant.cmp.disagree > quant.cmp.agree && quant.cmp.tested >= 4 ? html`
+                  <div className="pf-note warn">
+                    The pixels contradict the header in ${quant.cmp.disagree} of
+                    ${quant.cmp.tested} compared frequencies. The pixels remember a coarser
+                    quantisation than the file admits to, which is what a second compression at a
+                    higher quality looks like: the first save is still in the data, the header only
+                    describes the second.
+                  </div>`
+                  : quant.cmp.agree > 0 ? html`
+                  <div className="pf-note ok">
+                    The estimate agrees with the header in ${quant.cmp.agree} of
+                    ${quant.cmp.tested} compared frequencies. One compression, or a second one that
+                    erased the first completely.
+                  </div>` : html`
+                  <div className="pf-note info">
+                    Too few frequencies were significant to say anything. Flat or small images do not
+                    give the statistic enough to work with, and that is a limit of the measurement,
+                    not a property of the picture.
+                  </div>`}
+                <div className="pf-tables">
+                  <${QuantTable} values=${quant.est.table} marks=${quant.cmp.marks}
+                    caption="Estimated from pixels" zone=${qZone} />
+                  ${quant.header ? html`
+                    <${QuantTable} values=${quant.header} marks=${quant.cmp.marks}
+                      caption="From the header" zone=${qZone} />` : null}
+                </div>
+                <p className="pf-hint">
+                  Green cells agree, red contradict, dim cells were outside the compared block or
+                  carried no significant estimate. A zero in the estimate means the statistic found
+                  no step it could justify at that frequency.
+                </p>
+              </div>` : null}
+          <//>`;
+      }
+
+      function panelProfile() {
+        const an = profile && profile.an;
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Line profile</p>
+              <p className="pf-hint">
+                Drag a line across the image. The intensity along it is averaged over the width
+                below, the slow background is fitted away, and a feature is reported as a multiple
+                of the local noise. Useful for faded writing, a scratch, a band, an embossing:
+                anything that might be there and might be wishful thinking.
+              </p>
+              <${Slider} label="Averaging width" value=${profWidth} min=${1} max=${160} step=${1}
+                onChange=${setProfWidth} format=${(v) => v + ' px'}
+                hint="The most instructive control here. Noise falls with the square root of the width, so 64 rows is an eightfold gain, but a line that is not quite parallel to the feature smears it, and past that point more width makes things worse." />
+              <div style=${{ marginBottom: 12 }}>
+                <span className="pf-lab">Channel</span>
+                <div style=${{ marginTop: 5 }}>
+                  <${Seg} value=${profChannel} options=${CHANNELS} onChange=${setProfChannel} />
+                </div>
+                <p className="pf-hint">
+                  Green by default, and not for looks: a sensor has twice as many green photosites,
+                  and 4:2:0 JPEG halves the colour difference channels in both directions. A
+                  difference channel adds the noise of both terms while red contributes little
+                  signal, so it loses even though it looks more colourful.
+                </p>
+              </div>
+            </div>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Measurement</p>
+              <div style=${{ marginBottom: 10 }}>
+                <span className="pf-lab">Feature is</span>
+                <div style=${{ marginTop: 5 }}>
+                  <${Seg} value=${profPolarity}
+                    options=${[{ value: 'dark', label: 'Darker' }, { value: 'light', label: 'Lighter' }]}
+                    onChange=${setProfPolarity} />
+                </div>
+              </div>
+              <${Slider} label="Expected feature width" value=${profFeature} min=${0.8} max=${12} step=${0.2}
+                onChange=${setProfFeature} format=${(v) => v.toFixed(1) + ' px'}
+                hint="The amplitude is fitted as a shape of this width rather than read off the highest sample. That is a matched filter: it gains a factor of two to three, and a single bright pixel can no longer produce a detection because it has no width." />
+              <${Slider} label="Detection threshold" value=${profThreshold} min=${2} max=${6} step=${0.5}
+                onChange=${setProfThreshold} format=${(v) => v + ' x noise'}
+                hint="Three times the noise is the convention this literature uses. The noise itself is the median absolute deviation, not the standard deviation, so one dust particle cannot raise the bar and hide what you are looking for." />
+              <label className="pf-check" style=${{ marginTop: 8 }}>
+                <input type="checkbox" checked=${profLinear} onChange=${(e) => setProfLinear(e.target.checked)} />
+                <span>Linearise sRGB first</span>
+              </label>
+              <p className="pf-hint">
+                The camera transfer function is flat in the highlights, so a faint feature on a bright
+                background is squeezed into very few code values. Undoing the encoding costs nothing
+                and gives that contrast back.
+              </p>
+            </div>
+            ${an ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Result</p>
+                <div className="pf-figures">
+                  <${Figure} value=${an.peaks.length} caption="Above threshold" />
+                  <${Figure} value=${an.noise.toFixed(2)} caption="Noise (MAD)" />
+                  <${Figure} value=${an.limit.toFixed(2)} caption="Detection limit" />
+                </div>
+                ${an.peaks.length ? html`
+                  <div className="pf-note ok">
+                    ${an.peaks.length === 1 ? 'One feature' : an.peaks.length + ' features'} above
+                    ${profThreshold} times the noise, the strongest at
+                    ${' '}${Math.max.apply(null, an.peaks.map((p) => p.snr)).toFixed(1)} times.
+                    What that means about the object in the picture is not something this arithmetic
+                    can tell you.
+                  </div>` : html`
+                  <div className="pf-note info">
+                    Nothing rises ${profThreshold} times above the local noise along this line.
+                    Anything smaller than ${an.limit.toFixed(2)} in these units could not have been
+                    distinguished from noise, which is a statement about the measurement and not
+                    about the object.
+                  </div>`}
+              </div>` : null}
+          <//>`;
+      }
+
+      function panelNoise() {
+        const sel = noise && noise.sel;
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Noise</p>
+              <p className="pf-hint">
+                An estimate of the noise level per tile, from the median of a wavelet detail band.
+                A region pasted in from another picture often carries a different noise level, and
+                that difference is visible here even where the seam is not.
+              </p>
+              <${Slider} label="Tile size" value=${noiseTile} min=${16} max=${64} step=${8}
+                onChange=${setNoiseTile} format=${(v) => (v * 2) + ' px'}
+                hint="A compromise between spatial resolution and a stable median: the default takes the median of about a thousand values." />
+              <${Slider} label="Texture limit" value=${textureMax} min=${0.5} max=${12} step=${0.1}
+                onChange=${setTextureMax} format=${(v) => v.toFixed(1) + 'x grain'}
+                hint="The control that decides whether this map is honest. Structure is measured relative to the tile's own grain, so the number is a ratio: pure noise sits near 0.3 whatever its level, and real structure runs from 20 upwards. Tiles above the limit are greyed out rather than coloured with a value that would be wrong." />
+              <button type="button" className="tool-btn tool-btn-primary" onClick=${runNoise} disabled=${!!busy}>
+                ${ToolIcons.el('play')} Compute
+              </button>
+            </div>
+            ${sel ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Result</p>
+                <div className="pf-figures">
+                  <${Figure} value=${sel.spread === Infinity ? '-' : sel.spread.toFixed(1) + 'x'} caption="Spread p98/p2" />
+                  <${Figure} value=${sel.median.toFixed(2)} caption="Median sigma" />
+                  <${Figure} value=${sel.kept + '/' + sel.total} caption="Tiles measurable" />
+                </div>
+                ${sel.spread < 1.6 ? html`
+                  <div className="pf-note info">
+                    The spread is ${sel.spread.toFixed(1)}, which means the colours below are a
+                    percentile stretch of almost nothing. A false-colour map always glows somewhere,
+                    because it rescales whatever it is given; this number is what keeps that honest.
+                  </div>` : html`
+                  <div className="pf-note ok">
+                    The noise level differs by a factor of ${sel.spread.toFixed(1)} across the
+                    measurable tiles, so the structure in the map is a real difference rather than a
+                    stretched one.
+                  </div>`}
+                ${sel.floored ? html`
+                  <div className="pf-note warn">
+                    The low end sits below what this estimator resolves, so the spread is computed
+                    against that floor rather than against a number that would be noise itself.
+                  </div>` : null}
+                ${hoverInfo ? html`
+                  <p className="pf-hint">
+                    Under the cursor: sigma ${hoverInfo.sigma.toFixed(2)}, texture
+                    ${' '}${hoverInfo.texture.toFixed(1)}${hoverInfo.kept ? '' : ', not measurable here'}.
+                  </p>` : html`<p className="pf-hint">Hover the image for the value under the cursor.</p>`}
+                <div className="pf-legend">
+                  <span>low</span>
+                  <span className="pf-legendbar" style=${{ background: C.rampCss(ramp) }}></span>
+                  <span>high</span>
+                </div>
+              </div>
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">What this cannot do</p>
+                <p className="pf-hint">
+                  The map assumes the image still contains sensor noise. Modern phones denoise hard,
+                  often across several fused exposures, and what is left is not sensor noise but the
+                  residue of an algorithm with other goals. On such a picture this map shows the
+                  decisions of that algorithm, which is a different subject from the one you came for.
+                </p>
+              </div>` : null}
+          <//>`;
+      }
+
+      function panelResample() {
+        const r = resample && resample.peak;
+        const best = r && r.best;
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">Resampling</p>
+              <p className="pf-hint">
+                Scaling or rotating interpolates, and interpolation makes every pixel a fixed
+                combination of its neighbours. That correlation is periodic, and the period depends
+                on the scale factor. This is the one map here that answers whether a region was
+                resized rather than recompressed.
+              </p>
+              <label className="pf-check">
+                <input type="checkbox" checked=${maskJpeg} onChange=${(e) => setMaskJpeg(e.target.checked)} />
+                <span>Mask the JPEG block frequencies</span>
+              </label>
+              <p className="pf-hint">
+                Leave this on. JPEG's own 8x8 structure puts peaks at multiples of one eighth in the
+                same spectrum, and without masking them every JPEG ever saved reports as resampled.
+                Turn it off once to see that happen: on a plain JPEG fixture the unmasked peak is
+                fifty times the background and completely spurious.
+              </p>
+              <button type="button" className="tool-btn tool-btn-primary" onClick=${runResample} disabled=${!!busy}>
+                ${ToolIcons.el('play')} Compute
+              </button>
+            </div>
+            ${best ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Result</p>
+                <div className="pf-figures">
+                  <${Figure} value=${best.ratio.toFixed(1) + 'x'} caption="Peak over background" />
+                  <${Figure} value=${'1/' + (1 / best.frequency).toFixed(2)} caption="Period" />
+                  <${Figure} value=${best.axis} caption="Axis" />
+                </div>
+                ${best.ratio > 12 ? html`
+                  <div className="pf-note warn">
+                    A strong periodic correlation at a period of
+                    ${' '}${(1 / best.frequency).toFixed(2)} pixels along the ${best.axis} axis.
+                    That is the signature of interpolation, so this image, or a part of it, was
+                    probably scaled or rotated after it was captured.
+                  </div>` : html`
+                  <div className="pf-note info">
+                    No convincing periodicity: the strongest peak is only
+                    ${' '}${best.ratio.toFixed(1)} times the background. Either the image was not
+                    resampled, or it was resampled by a factor this method cannot see.
+                  </div>`}
+                <p className="pf-hint">
+                  The blind spot is honest and worth knowing: an exact doubling puts its peak at the
+                  very edge of the spectrum, where there is no room left to see it. A negative answer
+                  is weaker evidence than a positive one.
+                </p>
+              </div>` : null}
+          <//>`;
+      }
+
+      function panelGhost() {
+        const qs = ghost && ghost.qs;
+        return html`
+          <${React.Fragment}>
+            <div className="ctl-sec">
+              <p className="ctl-sec-h">JPEG ghosts</p>
+              <p className="pf-hint">
+                Recompress the image at a range of qualities and measure, per tile, which quality it
+                matches best. A region that was saved at a different quality than the rest reaches
+                its minimum somewhere else, and appears as a rectangle at that setting. Farid's
+                normalisation runs per tile across the quality axis, which is what divides the
+                texture of the picture out.
+              </p>
+              <${Slider} label="Lowest quality" value=${ghostLo} min=${20} max=${85} step=${5} onChange=${setGhostLo} />
+              <${Slider} label="Highest quality" value=${ghostHi} min=${40} max=${90} step=${5} onChange=${setGhostHi}
+                hint="Deliberately stops at 90. Firefox turns chroma subsampling off above quality 90 and Chrome at 100, and that mode switch produces a jump in the difference curve that looks exactly like a ghost and is not one." />
+              <${Slider} label="Step" value=${ghostStep} min=${1} max=${10} step=${1} onChange=${setGhostStep}
+                hint="The minimum is broad, so a step of five finds what a step of one finds, at a fifth of the cost. Narrow the range and the step together once you have a suspect quality." />
+              <button type="button" className="tool-btn tool-btn-primary" onClick=${runGhost} disabled=${!!busy}>
+                ${ToolIcons.el('play')} Compute ${Math.max(0, Math.floor((ghostHi - ghostLo) / ghostStep) + 1)} encodings
+              </button>
+              ${grid && grid.consensus >= 0.35 && (grid.originX !== 0 || grid.originY !== 0) ? html`
+                <div className="pf-note warn">
+                  The block grid sits at (${grid.originX}, ${grid.originY}), not at the aligned
+                  position. Ghosts are computed on the aligned grid, so this map is unreliable for
+                  this image. Testing all 64 possible shifts would take tens of minutes, and the grid
+                  map answered the same question in a fraction of a second.
+                </div>` : null}
+            </div>
+            ${qs && qs.length ? html`
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Quality shown</p>
+                <${Slider} label="Quality" value=${ghostQ} min=${0} max=${qs.length - 1} step=${1}
+                  onChange=${setGhostQ} format=${(v) => String(qs[Math.min(qs.length - 1, Math.max(0, Math.round(v)))])}
+                  hint="Step through it. A region that lights up at one setting and not at its neighbours is the thing this map exists to show." />
+                <div className="pf-legend">
+                  <span>poor match</span>
+                  <span className="pf-legendbar" style=${{ background: C.rampCss(ramp) }}></span>
+                  <span>best match</span>
+                </div>
+              </div>
+              <div className="ctl-sec">
+                <p className="ctl-sec-h">Error level analysis, and why it is here</p>
+                <p className="pf-hint">
+                  ELA is this same computation at a single quality, without the normalisation. With
+                  only one quality there is no axis to normalise along, so the texture of the picture
+                  stays in the result entirely: edges are bright because they are edges. That is why
+                  it labels untouched images as altered and altered images as untouched at about the
+                  same rate, which is the same as carrying no information. It is shown here as the
+                  contrast to the stack above rather than as a tool, and the difference between the
+                  two is the lesson.
+                </p>
+              </div>` : null}
+          <//>`;
+      }
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+
+  </script>
+
+  <footer class="container">
+    <small>&#169; 2026 Franziska and Alexander Alber &#183; feedback@alber.me &#183; <a href="/datenschutz.html">Privacy</a> &#183; <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
