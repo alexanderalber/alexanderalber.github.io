@@ -153,6 +153,10 @@
     .ec-fdir { color: var(--tool-note); flex: 0 5 auto; min-width: 0;
       overflow: hidden; text-overflow: ellipsis; }
     .ec-fbase { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    /* Reordering the volumes of an omnibus. Bare arrows on purpose: the icon
+       set has none, and next/previous does not take an icon anyway. */
+    .ec-order { flex: 0 0 auto; display: flex; gap: 4px; }
+    .ec-order button { padding: 1px 7px; line-height: 1.3; }
     .ec-skipped { color: var(--tool-note); font-size: 12px; margin: -8px 0 12px; }
     .ec-fstat { flex: 0 0 auto; color: var(--tool-note); font-size: 12px; }
     .ec-fstat.done { color: #0fb5ad; }
@@ -163,6 +167,12 @@
       border-radius: 4px; margin-top: 4px; }
     .ec-cover { text-align: center; margin: 0; }
     .ec-cover img { max-width: 100%; height: auto; }
+    /* The half-title merge puts before each volume. Styles the preview only:
+       like .ec-cover, no stylesheet for it travels into the exported book, so
+       a reader renders the plain h1 in its own type. */
+    .ec-sep { text-align: center; padding: 2em 0; }
+    .ec-sep-title { font-size: 1.6em; margin-bottom: .4em; }
+    .ec-sep-author { color: var(--tool-label); }
   </style>
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
@@ -209,7 +219,7 @@
     <div id="root" style="padding-top:var(--pico-spacing)">
       <div class="container">
         <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">E-Book Converter</h1>
-        <p style="color:var(--tool-label);max-width:70ch">Convert EPUB, MOBI, AZW3, Markdown, HTML and plain text to EPUB, MOBI, Markdown, HTML, a self-contained HTML reader, LaTeX, DOCX, a Pandoc bundle or plain text. Everything runs in your browser: the file is never uploaded. A free, private alternative to upload-based converter sites, with no account and no tracking; DRM-protected books are detected and rejected.</p>
+        <p style="color:var(--tool-label);max-width:70ch">Convert EPUB, MOBI, AZW3, Markdown, HTML and plain text to EPUB, MOBI, Markdown, HTML, a self-contained HTML reader, LaTeX, DOCX, a Pandoc bundle or plain text. Everything runs in your browser: the file is never uploaded. A free, private alternative to upload-based converter sites, with no account and no tracking; DRM-protected books are detected and rejected. Several books can also be merged into a single volume, each one a chapter group of its own.</p>
       </div>
     </div>
   </main>
@@ -926,13 +936,52 @@
 
     // ══ EPUB reader ══════════════════════════════════════════════════════════
 
+    // An encryption.xml does not have to mean DRM. By far the most common case
+    // is font obfuscation: the IDPF and Adobe schemes scramble the first bytes
+    // of an embedded font so the licence cannot be lifted out of the book, and
+    // the text sits in the archive in plain sight. A book like that is entirely
+    // readable, and refusing it would be refusing a whole series because one
+    // volume embeds a typeface.
+    //
+    // So the file is read rather than merely detected: what matters is which
+    // entries it names. Fonts are dropped and the book goes through; anything
+    // else encrypted is real DRM and still ends the conversion.
+    const FONT_EXT_RE = /\.(?:ttf|otf|woff2?|ttc|dfont|eot)$/i;
+
+    function encryptedPaths(xml) {
+      const out = [];
+      const root = parseXML(xml);
+      // parseXML lower-cases element and attribute names, so this is
+      // 'cipherreference' and 'uri', not the spelling the spec uses.
+      for (const ref of findAll(root, 'cipherreference')) {
+        const uri = ref.attrs && ref.attrs.uri;
+        if (!uri) continue;
+        // The URI is relative to the container root and may be percent-encoded.
+        let path = String(uri).replace(/^\.?\//, '');
+        try { path = decodeURIComponent(path); } catch (e) { /* keep it raw */ }
+        out.push(path);
+      }
+      return out;
+    }
+
     async function readEpub(bytes, log) {
       const files = await zipRead(bytes);
 
       const containerRaw = files.get('META-INF/container.xml');
       if (!containerRaw) throw new Error('This ZIP file is not an EPUB (META-INF/container.xml is missing).');
-      if (files.has('META-INF/encryption.xml')) {
-        throw new Error('This EPUB is encrypted and cannot be converted.');
+      // Which entries are encrypted decides whether this book can be read.
+      const encrypted = new Set();
+      const encRaw = files.get('META-INF/encryption.xml');
+      if (encRaw) {
+        const listed = encryptedPaths(decodeEpubFile(encRaw));
+        // An encryption.xml naming nothing we can identify is not worth a
+        // guess: it is treated as DRM, as it was before.
+        if (!listed.length) throw new Error('This EPUB is encrypted and cannot be converted.');
+        const hard = listed.filter(function (path) { return !FONT_EXT_RE.test(path); });
+        if (hard.length) {
+          throw new Error('This EPUB is encrypted and cannot be converted.');
+        }
+        for (const path of listed) encrypted.add(path);
       }
       const rootfile = findOne(parseXML(decodeEpubFile(containerRaw)), 'rootfile');
       const opfPath = rootfile && rootfile.attrs['full-path'];
@@ -994,11 +1043,15 @@
       const pathMap = {};
       const NAV_MIME = { 'application/x-dtbncx+xml': 1, 'application/oebps-package+xml': 1 };
       let imageCount = 0;
+      let fontsDropped = 0;
       for (const id of Object.keys(manifest)) {
         const it = manifest[id];
         if (spinePaths.has(it.path)) continue;
         if (NAV_MIME[it.mime]) continue;
         if (/\bnav\b/.test(it.properties)) continue;
+        // A scrambled font is bytes no renderer can use, so it is left out
+        // rather than carried into the new file as a broken resource.
+        if (encrypted.has(it.path)) { fontsDropped++; continue; }
         const data = files.get(it.path);
         if (!data) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
         const flat = addResource(book, it.path, it.mime, data);
@@ -1046,6 +1099,10 @@
       book.toc = readEpubToc(files, opf, manifest, opfDir, secIdByPath);
       log.info('EPUB: ' + book.sections.length + ' sections, ' + imageCount + ' images, '
         + book.toc.length + ' TOC entries');
+      if (fontsDropped) {
+        log.warn(fontsDropped + ' obfuscated font' + (fontsDropped === 1 ? '' : 's')
+          + ' left out. The text is unaffected; only the embedded typeface is gone.');
+      }
       return book;
     }
 
@@ -6617,6 +6674,245 @@
       return next;
     }
 
+    // ══ merge ════════════════════════════════════════════════════════════════
+    // Several books in, one book out. The whole trick is that there is nothing
+    // format-specific here: every reader has already produced the intermediate
+    // form, so merging is surgery on that form alone, and every writer then
+    // gets the omnibus for free. No writer knows this function exists.
+    //
+    // Three things collide when books are put side by side, and each has its
+    // own answer:
+    //   ids        section ids restart at sec-0001 in every book, so they are
+    //              renumbered into one continuous sequence. Ids are opaque to
+    //              the writers (sec-cover proves it), so the shape is free; a
+    //              continuous run is chosen because it keeps the files of an
+    //              unpacked EPUB in reading order.
+    //   resources  flat names like image1.jpg collide, so every resource goes
+    //              through addResource, whose existing dedupe turns the second
+    //              one into image1-2.jpg. The rename map then drives the
+    //              rewriting of the markup that refers to it.
+    //   fragments  #anchor ids may repeat across books and that is harmless:
+    //              each section becomes its own file and readers resolve a
+    //              fragment within the file. The writers that concatenate
+    //              everything into one document (txt, md, html, latex) have
+    //              that same duplication inside a single book already, since
+    //              real EPUBs reuse ids per chapter. Merge adds no new case.
+
+    const MERGE_SEP_ID_PREFIX = 'sec-sep-';
+
+    // Repoint url(...) in a stylesheet at the renamed resources. Deliberately
+    // narrow: it only repairs names this merge itself changed, matching on the
+    // base name. It is not a path resolver, and the pre-existing breakage of a
+    // url(../images/x.jpg) in a flattened EPUB is neither fixed nor worsened.
+    const CSS_URL_RE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)/g;
+
+    function rewriteCssUrls(css, map) {
+      return String(css).replace(CSS_URL_RE, function (m, dq, sq, bare) {
+        const raw = dq !== undefined ? dq : (sq !== undefined ? sq : bare);
+        if (!raw || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return m; // data:, http:
+        const sf = splitFrag(raw);
+        const q = sf.path.indexOf('?');
+        const path = q < 0 ? sf.path : sf.path.slice(0, q);
+        const target = map[baseOf(path)];
+        if (!target) return m;
+        const dir = path.slice(0, path.length - baseOf(path).length);
+        return 'url("' + dir + target + '")';
+      });
+    }
+
+    // The half-title before each volume. A real <h1> on purpose: that is what
+    // lets a later tocRebuild pick the volumes up as top-level entries, so the
+    // omnibus structure survives rebuilding the table of contents.
+    function separatorSection(id, title, author) {
+      let inner = '<h1 class="ec-sep-title">' + escapeXml(title) + '</h1>';
+      if (author) inner += '<p class="ec-sep-author">' + escapeXml(author) + '</p>';
+      return { id: id, title: title, html: '<div class="ec-sep">' + inner + '</div>', css: [] };
+    }
+
+    // The one value they all share, or '' when they disagree.
+    function commonValue(values) {
+      const seen = [];
+      for (const v of values) {
+        const t = String(v || '').trim();
+        if (t && seen.indexOf(t) < 0) seen.push(t);
+      }
+      return seen.length === 1 ? seen[0] : '';
+    }
+
+    function mergeBooks(books, opts) {
+      opts = opts || {};
+      const log = opts.log;
+      const src = (books || []).filter(function (b) { return b && b.sections && b.sections.length; });
+      if (books) {
+        books.forEach(function (b, i) {
+          if (src.indexOf(b) < 0 && log) {
+            log.warn('Book ' + (i + 1) + ' has no readable sections and was left out.');
+          }
+        });
+      }
+      if (!src.length) throw new Error('Merging needs at least one book with content.');
+
+      const separators = opts.separators !== false;
+      const merged = emptyBook();
+
+      // Volume titles, for the separator pages and the top level of the TOC.
+      const volTitle = src.map(function (b, i) {
+        const given = opts.titles && opts.titles[i];
+        return String(given || b.meta.title || '').trim() || ('Book ' + (i + 1));
+      });
+
+      // Pass 1: resources. Every book's names are allocated afresh, so a
+      // collision becomes image1-2.jpg rather than one book silently winning.
+      // addResource also normalises the extension against the mime type, which
+      // is why the map is needed even where nothing collides.
+      const resMap = src.map(function (b) {
+        const map = {};
+        b.resources.forEach(function (r, name) {
+          map[name] = addResource(merged, name, r.mime, r.bytes);
+        });
+        return map;
+      });
+
+      // Pass 2: section ids. Allocated for the whole merged book before any
+      // rewriting, because a link may point forward.
+      let n = 0;
+      const idMap = src.map(function (b) {
+        const map = {};
+        b.sections.forEach(function (s) {
+          n += 1;
+          map[s.id] = 'sec-' + String(n).padStart(4, '0');
+        });
+        return map;
+      });
+
+      // Pass 3: sections, rewritten through the existing link machinery. The
+      // pathMap keys are what resolvePath('', href) yields, so "../res/x.jpg"
+      // arrives here as "res/x.jpg" with the .. already collapsed.
+      src.forEach(function (b, bi) {
+        const pathMap = {};
+        for (const old in idMap[bi]) pathMap[old + '.xhtml'] = idMap[bi][old] + '.xhtml';
+        for (const old in resMap[bi]) pathMap['res/' + old] = '../res/' + resMap[bi][old];
+
+        if (separators) {
+          const sepId = MERGE_SEP_ID_PREFIX + String(bi + 1).padStart(2, '0');
+          merged.sections.push(separatorSection(sepId, volTitle[bi], String(b.meta.author || '').trim()));
+        }
+        b.sections.forEach(function (s) {
+          merged.sections.push({
+            id: idMap[bi][s.id],
+            title: s.title,
+            html: rewriteLinks(s.html, '', pathMap),
+            css: (s.css || []).map(function (c) { return resMap[bi][c] || c; }),
+          });
+        });
+      });
+
+      // Pass 4: stylesheets. Their url() references need the same rename map,
+      // and it is only complete now.
+      src.forEach(function (b, bi) {
+        b.resources.forEach(function (r, name) {
+          if (r.mime !== 'text/css') return;
+          const entry = merged.resources.get(resMap[bi][name]);
+          if (entry) entry.bytes = encodeUtf8(rewriteCssUrls(decodeUtf8(r.bytes), resMap[bi]));
+        });
+      });
+
+      // Metadata. The identifier is deliberately left empty: writeEpub derives
+      // a stable one from title and author, whereas inheriting the first book's
+      // identifier would have two different omnibuses claim to be the same book.
+      // The language is one value by construction; representing the minority
+      // languages would need xml:lang per section and is out of scope.
+      const commonTitle = commonValue(src.map(function (b) { return b.meta.title; }));
+      const authors = [];
+      for (const b of src) {
+        const a = String(b.meta.author || '').trim();
+        if (a && authors.indexOf(a) < 0) authors.push(a);
+      }
+      merged.meta = {
+        title: String(opts.title || '').trim() || commonTitle || 'Collection',
+        author: String(opts.author || '').trim()
+          || (authors.length === 1 ? authors[0] : (authors.length ? 'Various' : '')),
+        language: String(opts.language || '').trim()
+          || commonValue(src.map(function (b) { return b.meta.language; })) || 'en',
+        publisher: commonValue(src.map(function (b) { return b.meta.publisher; })),
+        date: '',
+        identifier: String(opts.identifier || '').trim(),
+        coverRes: '',
+      };
+
+      // The cover of the first book that has one. A cover section the tool once
+      // generated loses its sec-cover id in the renumbering, which is correct:
+      // after a merge there is no generated cover, and the cover panel can make
+      // a fresh one for the omnibus.
+      if (opts.cover !== 'none') {
+        for (let i = 0; i < src.length; i++) {
+          const c = src[i].meta.coverRes;
+          if (c && resMap[i][c]) { merged.meta.coverRes = resMap[i][c]; break; }
+        }
+      }
+
+      // The table of contents: one level-0 entry per volume, everything the
+      // book brought pushed one level down beneath it.
+      const entries = [];
+      src.forEach(function (b, bi) {
+        const anchor = separators
+          ? MERGE_SEP_ID_PREFIX + String(bi + 1).padStart(2, '0')
+          : idMap[bi][b.sections[0].id];
+        entries.push({ title: volTitle[bi], href: tocHref(anchor, ''), level: 0 });
+
+        const own = (b.toc && b.toc.length) ? b.toc : tocFromSections(b);
+        for (const e of own) {
+          const sf = splitFrag(String(e.href || ''));
+          const m = /(?:^|\/)([^\/]+)\.xhtml$/.exec(sf.path);
+          const id = m && idMap[bi][m[1]];
+          if (!id) continue; // pointed nowhere in the source, points nowhere here
+          entries.push({
+            title: e.title,
+            href: 'text/' + id + '.xhtml' + sf.frag,
+            level: (Number(e.level) || 0) + 1,
+          });
+        }
+      });
+      merged.toc = normalizeToc(merged, entries);
+
+      if (log) {
+        log.info('Merged ' + src.length + ' books into one, '
+          + merged.sections.length + ' sections and '
+          + merged.resources.size + ' resources.');
+      }
+      return merged;
+    }
+
+    // Read a pile of files into books, for merging. Same shape and the same
+    // laziness as convertMany: bytes are fetched only when a file's turn comes.
+    async function readMany(items, opts, onProgress) {
+      opts = opts || {};
+      const books = [];
+      const results = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (onProgress) onProgress({ index: i, total: items.length, name: it.name, phase: 'start' });
+        try {
+          let bytes = await it.getBytes();
+          const log = makeLog();
+          if (opts.repair) {
+            const rep = repairForConversion(bytes, it.name);
+            if (rep.notes.length) {
+              bytes = rep.bytes;
+              log.info('Repaired: ' + rep.notes.join(' '));
+            }
+          }
+          const book = await read(bytes, log, it.name);
+          books.push(book);
+          results.push({ name: it.name, ok: true, log: log.lines });
+        } catch (e) {
+          results.push({ name: it.name, ok: false, error: String((e && e.message) || e) });
+        }
+        if (onProgress) onProgress({ index: i, total: items.length, name: it.name, phase: 'done' });
+      }
+      return { books: books, results: results };
+    }
+
     // ══ batch ════════════════════════════════════════════════════════════════
     // Many files in, one zip out. Sequential on purpose: running the readers in
     // parallel would multiply peak memory by the number of files and win
@@ -6813,6 +7109,8 @@
       tocDepthChoices: tocDepthChoices,
       buildTocFromHeadings: buildTocFromHeadings, tocFromSections: tocFromSections,
       tocRebuild: tocRebuild,
+      mergeBooks: mergeBooks, mergeSeparatorId: MERGE_SEP_ID_PREFIX,
+      rewriteCssUrls: rewriteCssUrls, readMany: readMany,
       drawCover: drawCover, setGeneratedCover: setGeneratedCover,
       removeGeneratedCover: removeGeneratedCover,
       coverThemes: COVER_THEMES, coverSize: { width: COVER_W, height: COVER_H },
@@ -8086,6 +8384,16 @@
       // weight here. State rather than a ref, because the section has to
       // re-render when a file arrives or is repaired.
       const [srcBytes, setSrcBytes] = useState(null);
+      // What several files mean: convert each of them, or merge them into one
+      // book. 'each' is the default, so dropping a folder behaves as it always
+      // did. Merging is an input-side operation: it hands the normal
+      // single-book flow a book, and every tab and every writer works from
+      // there without knowing where it came from.
+      const [mergeMode, setMergeMode] = useState('each');
+      const [mergeOpts, setMergeOpts] = useState({ separators: true });
+      // Set when a book was merged rather than loaded, so the download is not
+      // named after a file that does not exist.
+      const [mergedFrom, setMergedFrom] = useState(0);
       const [bopts, setBopts] = useState({
         query: '', replacement: '', regex: false, matchCase: false, wholeWord: true, typo: '',
         // On by default: a broken cover is a defect, not a preference, and the
@@ -8104,11 +8412,15 @@
         { id: 'images', label: 'Images (' + imageCount + ')' },
       ];
       const isConvert = tab === 'convert';
-      const base = fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book';
+      const merging = !!batch && mergeMode === 'merge';
+      const base = mergedFrom
+        ? (Core.safeSegment(book ? book.meta.title : '') || 'omnibus')
+        : (fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book');
 
       const reset = () => {
         setBook(null); setLog([]); setError(''); clearResult();
         setFileName(''); setFileSize(0); setBatch(null); setSrcBytes(null);
+        setMergeMode('each'); setMergeOpts({ separators: true }); setMergedFrom(0);
         // The tab row is only rendered once a book is loaded; whoever drops a
         // new file while on Preview must land on a tab that shows it.
         setTab('convert');
@@ -8246,6 +8558,92 @@
           });
       };
 
+      // Move a file up or down the reading order of the omnibus.
+      const moveFile = (i, d) => {
+        setBatch((b) => {
+          if (!b || b.running) return b;
+          const j = i + d;
+          if (j < 0 || j >= b.files.length) return b;
+          const files = b.files.slice();
+          const t = files[i]; files[i] = files[j]; files[j] = t;
+          return Object.assign({}, b, { files: files });
+        });
+        clearResult();
+      };
+
+      const dropFile = (i) => {
+        setBatch((b) => {
+          if (!b || b.running) return b;
+          return Object.assign({}, b, { files: b.files.filter((_, k) => k !== i) });
+        });
+        clearResult();
+      };
+
+      // Read every file, merge, and hand the result to the single-book flow.
+      // From setBook on, nothing downstream knows this book had five sources.
+      const runMerge = () => {
+        if (!batch || batch.running || batch.files.length < 2) return;
+        setError('');
+        clearResult();
+        setBatch((b) => b && Object.assign({}, b, { running: true, done: 0, current: '',
+          files: b.files.map((f) => Object.assign({}, f, { status: 'queued', error: '' })) }));
+        const items = batch.files.map((f) => ({
+          name: f.name,
+          getBytes: () => f.file.arrayBuffer().then((buf) => new Uint8Array(buf)),
+        }));
+        const totalSize = batch.files.reduce((n, f) => n + f.size, 0);
+        Core.readMany(items, { repair: !!bopts.repair }, (p) => {
+          setBatch((b) => {
+            if (!b) return b;
+            const files = b.files.slice();
+            files[p.index] = Object.assign({}, files[p.index],
+              { status: p.phase === 'start' ? 'working' : 'done' });
+            return Object.assign({}, b, { files: files, current: p.name,
+              done: p.phase === 'done' ? p.index + 1 : b.done });
+          });
+        })
+          .then((out) => {
+            const bad = out.results.filter((r) => !r.ok);
+            setBatch((b) => {
+              if (!b) return b;
+              const files = b.files.map((f, i) => out.results[i] && !out.results[i].ok
+                ? Object.assign({}, f, { status: 'failed', error: out.results[i].error })
+                : f);
+              return Object.assign({}, b, { files: files, running: false, current: '' });
+            });
+            if (out.books.length < 2) {
+              setError(out.books.length
+                ? 'Only one of those files could be read, so there is nothing to merge.'
+                : 'None of those files could be read.');
+              return;
+            }
+            const log = Core.makeLog();
+            const merged = Core.mergeBooks(out.books, {
+              separators: !!mergeOpts.separators, log: log,
+            });
+            for (const r of out.results) if (r.ok && r.log) log.lines.unshift(...r.log);
+            // Name the file and the reason: "1 file could not be read" in a
+            // stack of five is a dead end, and the usual cause (a DRM-locked
+            // volume in an otherwise fine series) is worth saying out loud.
+            for (const r of bad) log.warn('Left out, ' + r.name + ': ' + r.error);
+            setBook(merged);
+            setLog(log.lines);
+            setMergedFrom(out.books.length);
+            setFileName('');
+            setFileSize(totalSize);
+            // No single source file any more, so the byte-level repair panel
+            // has nothing to work on.
+            setSrcBytes(null);
+            setBatch(null);
+            setMergeMode('each');
+            setTab('convert');
+          })
+          .catch((e) => {
+            setError(e && e.message ? e.message : String(e));
+            setBatch((b) => b && Object.assign({}, b, { running: false, current: '' }));
+          });
+      };
+
       const setMeta = (key, value) => {
         setBook((b) => {
           if (!b) return b;
@@ -8291,7 +8689,8 @@
                   Drop an e-book here, or click to choose one
                 </div>
                 <div style=${{ color: 'var(--tool-note)', fontSize: 13 }}>
-                  EPUB, MOBI, AZW3, TXT, Markdown or HTML · several at once for batch mode ·
+                  EPUB, MOBI, AZW3, TXT, Markdown or HTML · several at once to convert them
+                  all or merge them into one book ·
                   drop a whole folder and the output keeps its structure
                 </div>
               <//>
@@ -8330,13 +8729,24 @@
 
           ${batch && html`
             <div className="ec-card" style=${{ marginBottom: 18 }}>
-              <dl className="ec-kv" style=${{ marginBottom: 14 }}>
-                <dt>Batch</dt>
+              <dl className="ec-kv" style=${{ marginBottom: 10 }}>
+                <dt>${merging ? 'Omnibus' : 'Batch'}</dt>
                 <dd>
                   ${batch.files.length} files ·${' '}
                   ${fmtSize(batch.files.reduce((n, f) => n + f.size, 0))}
                 </dd>
               </dl>
+
+              <!-- A setting, not a view: this decides what the button will do,
+                   so it is a segmented control and not a tab strip. -->
+              <div className="seg-row" style=${{ display: 'flex', marginBottom: 14 }}>
+                ${[['each', 'Convert each'], ['merge', 'Merge into one']].map((o) => html`
+                  <button key=${o[0]}
+                    className=${'lang-seg' + (mergeMode === o[0] ? ' active' : '')}
+                    disabled=${batch.running}
+                    onClick=${() => { setMergeMode(o[0]); clearResult(); }}>${o[1]}</button>
+                `)}
+              </div>
 
               ${batch.skipped > 0 && html`
                 <p className="ec-skipped">
@@ -8361,12 +8771,35 @@
                           : f.status === 'failed' ? 'failed' : fmtSize(f.size)}
                     </span>
                     ${f.error && html`<span className="ec-ferr">${f.error}</span>`}
+                    ${merging && html`
+                      <span className="ec-order">
+                        <button className="tool-btn tool-btn-sm" title="Move up"
+                          aria-label=${'Move ' + f.name + ' up'}
+                          disabled=${batch.running || i === 0}
+                          onClick=${() => moveFile(i, -1)}>↑</button>
+                        <button className="tool-btn tool-btn-sm" title="Move down"
+                          aria-label=${'Move ' + f.name + ' down'}
+                          disabled=${batch.running || i === batch.files.length - 1}
+                          onClick=${() => moveFile(i, 1)}>↓</button>
+                        <button className="tool-btn tool-btn-sm tool-danger" title="Remove"
+                          aria-label=${'Remove ' + f.name}
+                          disabled=${batch.running || batch.files.length < 3}
+                          onClick=${() => dropFile(i)}>${ToolIcons.el('remove')}</button>
+                      </span>
+                    `}
                   </li>
                 `)}
               </ul>
 
+              ${merging && html`
+                <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -8, marginBottom: 12 }}>
+                  The books are joined in this order, each one a top-level entry in the table of
+                  contents with its own chapters beneath it.
+                </p>
+              `}
+
               <label style=${{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
-                Convert all to
+                ${merging ? 'Merge, then convert to' : 'Convert all to'}
               </label>
               <div className="seg-row" style=${{ display: 'flex', flexWrap: 'wrap', marginBottom: 14 }}>
                 ${BATCH_TARGETS.map((t) => html`
@@ -8380,7 +8813,30 @@
                 `)}
               </div>
 
-              ${target === 'images' ? html`
+              ${merging ? html`<${React.Fragment}>
+                <div className="ctl-card" style=${{ marginBottom: 14 }}>
+                  <div className="ctl-sec">
+                    <label style=${{ display: 'flex', alignItems: 'center', gap: 8,
+                        fontSize: 13, color: 'var(--tool-text)', marginBottom: 0 }}>
+                      <input type="checkbox" checked=${!!mergeOpts.separators}
+                        onChange=${(e) => setMergeOpts({ separators: e.target.checked })}
+                        style=${{ marginBottom: 0 }} />
+                      Separator page before each book
+                    </label>
+                    <p style=${{ fontSize: 12, color: 'var(--tool-note)', margin: '6px 0 0' }}>
+                      A half-title carrying the title and author of each book, the way a printed
+                      omnibus separates its volumes.
+                    </p>
+                  </div>
+                </div>
+
+                <${BatchEdits} opts=${bopts} onOpts=${setBopts} />
+
+                <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
+                  The merged book opens as a single book, so the cover, the table of contents,
+                  the preview and the images are all available afterwards.
+                </p>
+              <//>` : target === 'images' ? html`
                 <p style=${{ fontSize: 12, color: 'var(--tool-note)', marginTop: -6, marginBottom: 12 }}>
                   No conversion: one folder per book, holding its images as they are in the file,
                   cover first. Books without images are listed in the log and take up no folder.
@@ -8394,8 +8850,9 @@
                 </p>
               <//>`}
 
-              <button className="tool-btn tool-btn-primary" onClick=${runBatch} disabled=${batch.running}>
-                Convert all
+              <button className="tool-btn tool-btn-primary"
+                onClick=${merging ? runMerge : runBatch} disabled=${batch.running}>
+                ${merging ? 'Merge into one book' : 'Convert all'}
               </button>
 
               ${batch.running && html`
@@ -8426,9 +8883,16 @@
           ${book && html`
             <div className="ec-card" style=${{ marginBottom: 18 }}>
               <dl className="ec-kv" style=${{ marginBottom: 14 }}>
-                <dt>File</dt><dd>${fileName} (${fmtSize(fileSize)})</dd>
-                <dt>Detected</dt>
-                <dd>${FORMATS[book.sourceFormat] ? FORMATS[book.sourceFormat].label : book.sourceFormat}</dd>
+                ${mergedFrom ? html`<${React.Fragment}>
+                  <dt>Source</dt>
+                  <dd>Merged from ${mergedFrom} books (${fmtSize(fileSize)})</dd>
+                <//>` : html`<${React.Fragment}>
+                  <dt>File</dt><dd>${fileName} (${fmtSize(fileSize)})</dd>
+                  <dt>Detected</dt>
+                  <dd>
+                    ${FORMATS[book.sourceFormat] ? FORMATS[book.sourceFormat].label : book.sourceFormat}
+                  </dd>
+                <//>`}
                 <dt>Content</dt>
                 <dd>${book.sections.length} sections · ${imageCount} images · ${book.toc.length} TOC entries</dd>
               </dl>
