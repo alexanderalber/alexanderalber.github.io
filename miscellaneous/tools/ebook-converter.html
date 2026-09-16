@@ -6729,6 +6729,97 @@
       return { id: id, title: title, html: '<div class="ec-sep">' + inner + '</div>', css: [] };
     }
 
+    // Words that are series scaffolding rather than the series name. They are
+    // trimmed off the ends of a candidate, so "cradle book" becomes "cradle".
+    const SERIES_FILLER_RE =
+      /^(?:book|books|bk|vol|volume|part|the|a|an|edition|german|novel|roman|complete|omnibus|series|saga|chronicles?|of|and)$/;
+
+    // What the books have in common, taken from their titles. Publishers put
+    // the series name wherever they like: in front ("Portal to Nova Roma:
+    // Venice"), in brackets ("Blackflame (Cradle Book 3)") or behind a colon
+    // ("... : Dungeon Crawler Carl Book 5"). So this looks for the longest run
+    // of words that most of the titles share, at word boundaries and anywhere
+    // in the string, rather than for a common prefix, which in practice only
+    // catches the first of those three shapes.
+    //
+    // A majority rather than all of them: a series usually has one volume whose
+    // title does not name it. Requiring every title would drop back to a stray
+    // word they happen to share, or to nothing at all.
+    // Does the phrase sit where a series name sits, rather than merely occur in
+    // the sentence? A series names itself structurally: alone, in front of a
+    // separator, inside brackets, or right before a volume number. "War" in
+    // "War and Peace" does none of that, which is what tells the two apart,
+    // since no rule about length or frequency can: "Dune" and "War" are the
+    // same size and both appear in every title of their set.
+    function looksStructural(phrase, titles) {
+      let hits = 0;
+      for (const t of titles) {
+        const raw = String(t || '');
+        const i = raw.toLowerCase().indexOf(phrase);
+        if (i < 0) continue;
+        const before = raw.slice(0, i).replace(/\s+$/, '');
+        const after = raw.slice(i + phrase.length);
+        if ((before === '' && after.trim() === '')            // the whole title
+          || (before === '' && /^\s*[:\-\u2013\u2014(\[]/.test(after))  // "Cradle: Unsouled"
+          || /[(\[]$/.test(before)                             // "(Cradle Book 3)"
+          || /^\s*(?:book|bk|vol|volume|part|#)?\s*\d/i.test(after)) {  // "Wool 2"
+          hits++;
+        }
+      }
+      return hits;
+    }
+
+    function seriesName(titles) {
+      const words = titles.map(function (t) {
+        return String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ')
+          .filter(Boolean);
+      }).filter(function (w) { return w.length; });
+      if (words.length < 2) return '';
+      const padded = words.map(function (w) { return ' ' + w.join(' ') + ' '; });
+      const need = Math.max(2, Math.ceil(words.length * 0.6));
+      let best = '';
+      let bestHits = 0;
+      for (const w of words) {
+        for (let i = 0; i < w.length; i++) {
+          for (let j = i + 1; j <= w.length; j++) {
+            let cand = w.slice(i, j);
+            while (cand.length && SERIES_FILLER_RE.test(cand[0])) cand = cand.slice(1);
+            while (cand.length && SERIES_FILLER_RE.test(cand[cand.length - 1])) cand = cand.slice(0, -1);
+            if (cand.length === 0) continue;
+            const phrase = cand.join(' ');
+            // Two characters is a coincidence, not a series.
+            if (phrase.length < 3) continue;
+            // A single word is weak evidence on its own, so it additionally has
+            // to sit where a series name sits in at least one title. Two words
+            // or more are already past coincidence: three unrelated books do not
+            // share "Dungeon Crawler Carl" by accident.
+            if (cand.length === 1 && !looksStructural(phrase, titles)) continue;
+            if (phrase.length < best.length && bestHits >= words.length) continue;
+            let hits = 0;
+            for (const t of padded) if (t.indexOf(' ' + phrase + ' ') >= 0) hits++;
+            if (hits < need) continue;
+            if (hits > bestHits || (hits === bestHits && phrase.length > best.length)) {
+              best = phrase;
+              bestHits = hits;
+            }
+          }
+        }
+      }
+      if (!best) return '';
+      // Give the words back the capitalisation the titles used, so the result
+      // reads like a title and not like a search key.
+      const want = best.split(' ');
+      for (const t of titles) {
+        const raw = String(t || '').split(/\s+/);
+        for (let i = 0; i + want.length <= raw.length; i++) {
+          const slice = raw.slice(i, i + want.length);
+          const flat = slice.join(' ').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          if (flat === best) return slice.join(' ').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+        }
+      }
+      return best;
+    }
+
     // The one value they all share, or '' when they disagree.
     function commonValue(values) {
       const seen = [];
@@ -6822,7 +6913,10 @@
       // identifier would have two different omnibuses claim to be the same book.
       // The language is one value by construction; representing the minority
       // languages would need xml:lang per section and is out of scope.
-      const commonTitle = commonValue(src.map(function (b) { return b.meta.title; }));
+      // An identical title beats everything; otherwise the series name the
+      // titles have in common, and only failing that a neutral placeholder.
+      const titles = src.map(function (b) { return b.meta.title; });
+      const commonTitle = commonValue(titles) || seriesName(titles);
       const authors = [];
       for (const b of src) {
         const a = String(b.meta.author || '').trim();
@@ -7109,7 +7203,7 @@
       tocDepthChoices: tocDepthChoices,
       buildTocFromHeadings: buildTocFromHeadings, tocFromSections: tocFromSections,
       tocRebuild: tocRebuild,
-      mergeBooks: mergeBooks, mergeSeparatorId: MERGE_SEP_ID_PREFIX,
+      mergeBooks: mergeBooks, mergeSeparatorId: MERGE_SEP_ID_PREFIX, seriesName: seriesName,
       rewriteCssUrls: rewriteCssUrls, readMany: readMany,
       drawCover: drawCover, setGeneratedCover: setGeneratedCover,
       removeGeneratedCover: removeGeneratedCover,
@@ -8413,8 +8507,13 @@
       ];
       const isConvert = tab === 'convert';
       const merging = !!batch && mergeMode === 'merge';
+      // A merged book is named after itself, not after a file that never
+      // existed. The suffix keeps it apart from the single volume it was built
+      // from, which usually sits in the same download folder.
+      const mergedBase = Core.safeSegment(book ? book.meta.title : '');
       const base = mergedFrom
-        ? (Core.safeSegment(book ? book.meta.title : '') || 'omnibus')
+        ? ((mergedBase && !/omnibus/i.test(mergedBase) ? mergedBase + ' omnibus' : mergedBase)
+          || 'omnibus')
         : (fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book');
 
       const reset = () => {
@@ -8504,7 +8603,9 @@
         clearResult();
         Core.write(book, target)
           .then((out) => {
-            const base = fileName.replace(/\.[A-Za-z0-9]+$/, '') || 'book';
+            // `base` comes from the component, so that a merged book is named
+            // after itself. Recomputing it from fileName here would fall back to
+            // "book" for an omnibus, which has no source file to be named after.
             makeResult(out.bytes, out.mime, base + '.' + out.ext);
             setBusy(false);
           })
