@@ -30,17 +30,28 @@
       .wt-mapcol { position: sticky; top: 12px; }
     }
 
+    /* Since touch-action: none makes the map swallow vertical swipes, the map
+       must never be tall enough to leave the page unscrollable. Capping it at
+       62vh keeps the controls under it and a piece of the first stop card on
+       screen, and those scroll the page as usual. The svg keeps its own aspect
+       ratio, so this shrinks the width with it rather than distorting it. */
+    @media (max-width: 899px) {
+      .wt-map { max-height: 62vh; margin: 0 auto; }
+    }
+
     /* The frame convention: anything that SHOWS something gets this border,
        radius and shadow. It sits on the svg itself, not on a wrapper. */
     .wt-map {
       display: block; width: 100%; cursor: grab;
-      /* pan-y, not none: on a phone the map fills the width, and touch-action:
-         none would swallow the vertical swipe that scrolls the page, so the
-         stop texts below became unreachable. Vertical scroll therefore stays
-         with the page and a horizontal drag pans the map; for north-south
-         panning there are the zoom buttons, Fit route, and tapping a stop,
-         which centres on it. */
-      touch-action: pan-y;
+      /* none, not pan-y: the map handles every touch gesture itself, so a
+         vertical drag pans north-south and two fingers pinch to zoom. The
+         earlier pan-y left both of those to the browser, which meant the map
+         could only be panned east-west and not zoomed by touch at all.
+         What pan-y bought was a scrollable page, since a map filling the
+         viewport would otherwise trap the finger. That is paid for below
+         instead: max-height keeps a strip of page beside and under the map on
+         a phone, and that strip scrolls normally. */
+      touch-action: none;
       /* var(--tool-border), nicht das alte Literal #334155: der helle Skin hat
          die Variable schon immer benutzt, der dunkle nicht, und der graue fiel
          damit auf den dunklen Wert zurueck. Dort tragen die Umrisse die ganze
@@ -100,6 +111,23 @@
     .wt-row .lang-seg { border-radius: 4px; margin-left: 0; }
 
     .wt-status { font-size: 12px; color: var(--tool-note); margin: 8px 0 0; }
+
+    /* Shown only when the user is outside the tour's area, where the map alone
+       cannot answer "which way". The arrow is rotated by the true bearing, so
+       it is read against north, not against the screen: the map is north-up
+       and never rotates, which is what makes that honest. */
+    .wt-far {
+      display: flex; align-items: center; gap: 12px; cursor: pointer;
+      margin: 10px 0 0; padding: 10px 12px;
+      border: 1px solid var(--tool-info-border);
+      border-radius: 8px; background: var(--tool-info-bg);
+    }
+    .wt-far p { margin: 0; font-size: 13px; color: var(--tool-info-text); }
+    .wt-arrow {
+      flex: 0 0 auto; width: 26px; height: 26px;
+      fill: none; stroke: var(--tool-sig-info); stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round;
+    }
 
     .wt-card { border: 1px solid var(--tool-border); border-radius: 8px; padding: 12px 14px;
       margin: 0 0 12px; background: color-mix(in srgb, var(--tool-panel) 55%, transparent);
@@ -371,6 +399,28 @@ var TC = (function () {
     return (m / 1000).toFixed(1) + ' km';
   }
 
+  /* Initial great-circle bearing from a to b, degrees clockwise from north.
+     Over a few kilometres the difference to a plain planar angle is far below
+     the arrow's own resolution, but this costs nothing and does not degrade
+     when a tour happens to sit at a high latitude. */
+  function bearing(a, b) {
+    const r = Math.PI / 180;
+    const phi1 = a[0] * r, phi2 = b[0] * r;
+    const dl = (b[1] - a[1]) * r;
+    const y = Math.sin(dl) * Math.cos(phi2);
+    const x = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dl);
+    return (Math.atan2(y, x) / r + 360) % 360;
+  }
+
+  const COMPASS = ['north', 'north-east', 'east', 'south-east',
+                   'south', 'south-west', 'west', 'north-west'];
+
+  // Eight points, not sixteen: "west-north-west" is precision the user cannot
+  // act on while standing on a street with two possible directions.
+  function compassName(deg) {
+    return COMPASS[Math.round(((deg % 360) + 360) % 360 / 45) % 8];
+  }
+
   return {
     project: project,
     unproject: unproject,
@@ -385,7 +435,9 @@ var TC = (function () {
     clampView: clampView,
     lerpView: lerpView,
     easeInOut: easeInOut,
-    formatDistance: formatDistance
+    formatDistance: formatDistance,
+    bearing: bearing,
+    compassName: compassName
   };
 })();
 
@@ -446,7 +498,21 @@ function TourMap(props) {
 
   const svgRef = useRef(null);
   const dragRef = useRef(null);
+  const ptsRef = useRef(new Map());
   const [dragging, setDragging] = useState(false);
+
+  /* The centroid of the pointers currently down, plus their spread. One
+     pointer gives d = 0, which is what turns the shared gesture maths into a
+     plain pan. Returns null when nothing is down. */
+  const anchorOf = useCallback(function () {
+    const pts = Array.from(ptsRef.current.values());
+    if (!pts.length) return null;
+    let sx = 0, sy = 0;
+    for (let i = 0; i < pts.length; i++) { sx += pts[i].x; sy += pts[i].y; }
+    const cx = sx / pts.length, cy = sy / pts.length;
+    const d = pts.length > 1 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0;
+    return { x: cx, y: cy, d: d };
+  }, []);
 
   const lat0 = geo.center[0];
   const lon0 = geo.center[1];
@@ -604,6 +670,12 @@ function TourMap(props) {
     return function () { el.removeEventListener('wheel', onWheel); };
   }, [onWheel]);
 
+  /* Pan and pinch share one pointer book. ptsRef holds every pointer currently
+     down on the map, keyed by pointerId; one entry pans, two pinch. Keeping
+     them in one place is what makes the transition between the two gestures
+     seamless: lifting one finger of a pinch leaves a valid one-finger pan
+     behind without a jump, because the anchor is recomputed from whatever
+     pointers remain rather than from the gesture that just ended. */
   const onPointerDown = useCallback(function (e) {
     const el = svgRef.current;
     if (!el) return;
@@ -615,27 +687,56 @@ function TourMap(props) {
     if (e.target && e.target.closest && e.target.closest('.wt-stop')) return;
     stopGlide();
     el.setPointerCapture(e.pointerId);
-    dragRef.current = { x: e.clientX, y: e.clientY };
+    ptsRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    dragRef.current = anchorOf();
     setDragging(true);
-  }, [stopGlide]);
+  }, [stopGlide, anchorOf]);
 
   const onPointerMove = useCallback(function (e) {
-    if (!dragRef.current) return;
-    const k = perPixel();
-    const dx = (e.clientX - dragRef.current.x) * k;
-    const dy = (e.clientY - dragRef.current.y) * k;
-    dragRef.current = { x: e.clientX, y: e.clientY };
+    const pts = ptsRef.current;
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const prev = dragRef.current;
+    const now = anchorOf();
+    dragRef.current = now;
+    if (!prev || !now) return;
+    const el = svgRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0) return;
+
     setView(function (v) {
-      return TC.clampView({ cx: v.cx - dx, cy: v.cy + dy, span: v.span }, geom.box, limits.min, limits.max);
+      /* Zoom first, then pan, both expressed against the CURRENT view. The
+         scale factor is the ratio of the two finger spreads; with one pointer
+         down prev.d and now.d are both 0 and the ratio collapses to 1, so the
+         same code path is a pure pan. */
+      const ratio = (prev.d > 8 && now.d > 8) ? prev.d / now.d : 1;
+      const span = Math.min(limits.max, Math.max(limits.min, v.span * ratio));
+      const h = v.span / geom.aspect;
+      const hn = span / geom.aspect;
+      // Hold the midpoint between the fingers fixed under them while scaling,
+      // the same correction the wheel handler applies at the cursor.
+      const fx = (now.x - r.left) / r.width - 0.5;
+      const fy = (now.y - r.top) / r.height - 0.5;
+      const k = span / r.width;
+      return TC.clampView({
+        cx: v.cx + fx * (v.span - span) - (now.x - prev.x) * k,
+        cy: v.cy - fy * (h - hn) + (now.y - prev.y) * k,
+        span: span
+      }, geom.box, limits.min, limits.max);
     });
-  }, [perPixel, geom, limits]);
+  }, [geom, limits, anchorOf]);
 
   const onPointerUp = useCallback(function (e) {
-    dragRef.current = null;
-    setDragging(false);
+    const pts = ptsRef.current;
+    pts.delete(e.pointerId);
+    // Re-anchor on the survivors so releasing one finger of a pinch does not
+    // register as a large jump on the next move.
+    dragRef.current = anchorOf();
+    if (pts.size === 0) setDragging(false);
     const el = svgRef.current;
     if (el && el.hasPointerCapture && el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
-  }, []);
+  }, [anchorOf]);
 
   // The buttons glide too. A stepped zoom that teleports is as disorienting as
   // a stepped pan, and the wheel already gives the immediate variant.
@@ -722,7 +823,7 @@ function Stop(props) {
         </div>
       </div>
       ${s.dates ? html`<p className="wt-dates">${s.dates}</p>` : null}
-      ${props.distance != null ? html`<p className="wt-dist">${TC.formatDistance(props.distance)} away</p>` : null}
+      ${props.distance != null ? html`<p className="wt-dist">${TC.formatDistance(props.distance) + ' away'}</p>` : null}
       ${s.stand_here ? html`<p className="wt-stand">${s.stand_here}</p>` : null}
       ${hasText
         ? html`<p className="wt-text">${s.text}</p>`
@@ -841,9 +942,24 @@ function App() {
 
   const stops = (tour && tour.stops) || [];
 
+  /* Nearest stop, plus the direction to it. The bearing only becomes an arrow
+     once the user is far enough away that the blue dot is off the map or too
+     close to its edge to read; within the tour the map itself already answers
+     "which way", and an arrow there would just be noise. 600 m is roughly the
+     point where a walking tour's own extent stops being the frame of
+     reference. */
   const near = useMemo(function () {
     if (!here || !stops.length) return null;
-    return TC.nearestStop([here.lat, here.lon], stops);
+    const n = TC.nearestStop([here.lat, here.lon], stops);
+    if (n.index < 0) return n;
+    const deg = TC.bearing([here.lat, here.lon], stops[n.index].coord);
+    return {
+      index: n.index,
+      meters: n.meters,
+      bearing: deg,
+      compass: TC.compassName(deg),
+      far: n.meters > 600
+    };
   }, [here, stops]);
 
   const pick = useCallback(function (i) {
@@ -935,9 +1051,23 @@ function App() {
                   </button>`}` : null}
           <//>
           ${geoError ? html`<p className="wt-status">${geoError}</p>` : null}
-          ${near && near.index >= 0 ? html`
-            <p className="wt-status">Nearest stop: ${stops[near.index].n}. ${stops[near.index].name},
-               ${TC.formatDistance(near.meters)} away.</p>` : null}
+          ${near && near.index >= 0 && near.far ? html`
+            <div className="wt-far" onClick=${function () { pick(near.index); }}>
+              <svg className="wt-arrow" viewBox="0 0 24 24" aria-hidden="true"
+                   style=${{ transform: 'rotate(' + near.bearing.toFixed(0) + 'deg)' }}>
+                <path d="M12 3 L12 21 M12 3 L6 10 M12 3 L18 10"/>
+              </svg>
+              <p>
+                ${'The tour is ' + TC.formatDistance(near.meters) + ' to the ' + near.compass
+                  + '. Nearest stop: ' + stops[near.index].n + '. '
+                  + stops[near.index].name + '.'}
+              </p>
+            </div>` : null}
+          ${near && near.index >= 0 && !near.far ? html`
+            <p className="wt-status">
+              ${'Nearest stop: ' + stops[near.index].n + '. ' + stops[near.index].name + ', '
+                + TC.formatDistance(near.meters) + ' away.'}
+            </p>` : null}
           ${cached > 0 ? html`
             <p className="wt-status">Saved for offline use. ${cached} files stored on this device.</p>` : null}
         </div>
