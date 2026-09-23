@@ -10658,14 +10658,21 @@ var PCB = (function () {
        painted opaque, but twice: once in the over-bare shade across the whole
        opening pattern, then once in the over-copper shade, clipped to the
        copper layer with destination-in on its own canvas. */
-    ctx.drawImage(maskCanvas(W, H, L[mkName] || [], V, fab.maskOnBare, outline), 0, 0);
+    const maskBare = maskCanvas(W, H, L[mkName] || [], V, fab.maskOnBare, outline);
+    ctx.drawImage(maskBare, 0, 0);
     const maskCu = maskCanvas(W, H, L[mkName] || [], V, fab.maskOnCopper, outline);
     const mg = maskCu.getContext('2d');
     mg.globalCompositeOperation = 'destination-in';
     mg.drawImage(cuCanvas, 0, 0);
     ctx.drawImage(maskCu, 0, 0);
-    ctx.drawImage(entriesCanvas(W, H, L[skName] || [], V, fab.silk), 0, 0);
+    const silkCanvas = entriesCanvas(W, H, L[skName] || [], V, fab.silk);
+    ctx.drawImage(silkCanvas, 0, 0);
     ctx.restore();
+    /* This runs on every repaint of every preview, so the four full size
+       scratches are given back at once instead of piling up until a
+       collection; see releaseCanvases in bakeSide for why that matters on a
+       phone. */
+    releaseCanvases([cuCanvas, maskBare, maskCu, silkCanvas]);
 
     /* The cutouts, punched out of the finished stack in the page background and
        outlined with a hairline. Painting them here rather than clipping them out
@@ -11457,7 +11464,7 @@ var PCB = (function () {
      a fixed number of millimetres and the UV mapping is a scale and an offset
      (see applyUV). The BACK side is baked unmirrored too: the mirroring is what
      the geometry does by being looked at from the other side. */
-  function bakeSide(THREE, derived, doc, side, opts) {
+  function bakeSide(derived, doc, side, opts) {
     const t0 = (typeof performance === 'object' && performance.now) ? performance.now() : 0;
     const ext = PCB.derivedExtent(derived);
     const extW = ext.widthMm, extH = ext.heightMm;
@@ -11602,6 +11609,30 @@ var PCB = (function () {
     for (let i = 0; i < W2 * H2; i++) hf[i] = hid[i * 4] / 255;
     const nrm = PCB.heightToNormal(hf, W2, H2, { scale: 1 });
 
+    /* Everything but the four maps and the normal array is scratch, and it is
+       given back HERE rather than left to the garbage collector. A bake makes
+       about a dozen canvases per side at up to 2048 px, and iOS Safari counts
+       canvas memory against a hard ceiling that only a collection frees; a few
+       visits to the 3D tab in a row used to fill it on a phone. Setting the
+       size to zero releases the backing store at once. */
+    releaseCanvases([outCov, cuCov, mkCov, skCov, cov.maskOnCopper, bareCov,
+      tmpFull, tmpHalf, cH, blurA]);
+
+    const t1 = (typeof performance === 'object' && performance.now) ? performance.now() : 0;
+    return {
+      map: cMap, orm: cOrm, coat: cCoat, emissive: cEm, normal: nrm, W2: W2, H2: H2,
+      W: W, H: H, pxPerMm: ts.pxPerMm, clamped: !!ts.clamped, ms: Math.round(t1 - t0)
+    };
+  }
+
+  function releaseCanvases(list) {
+    list.forEach((c) => { if (c) { c.width = 0; c.height = 0; } });
+  }
+
+  /* The GPU half of a bake: textures over the baked canvases. Split off from
+     bakeSide because the canvases outlive a visit to the 3D tab (see
+     BAKE_CACHE) while the textures belong to one renderer and die with it. */
+  function bakedTextures(THREE, b) {
     const mk = (canvas, srgb) => {
       const t = new THREE.CanvasTexture(canvas);
       t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -11613,19 +11644,55 @@ var PCB = (function () {
       t.needsUpdate = true;
       return t;
     };
-    const nTex = new THREE.DataTexture(nrm, W2, H2, THREE.RGBAFormat);
+    const nTex = new THREE.DataTexture(b.normal, b.W2, b.H2, THREE.RGBAFormat);
     nTex.wrapS = THREE.ClampToEdgeWrapping;
     nTex.wrapT = THREE.ClampToEdgeWrapping;
     nTex.generateMipmaps = true;
     nTex.minFilter = THREE.LinearMipmapLinearFilter;
     nTex.needsUpdate = true;
-
-    const t1 = (typeof performance === 'object' && performance.now) ? performance.now() : 0;
     return {
-      map: mk(cMap, true), orm: mk(cOrm, false), coat: mk(cCoat, false),
-      emissive: mk(cEm, true), normal: nTex,
-      W: W, H: H, pxPerMm: ts.pxPerMm, clamped: !!ts.clamped, ms: Math.round(t1 - t0)
+      map: mk(b.map, true), orm: mk(b.orm, false), coat: mk(b.coat, false),
+      emissive: mk(b.emissive, true), normal: nTex
     };
+  }
+
+  /* The last bake and the last photographed environment, kept across visits
+     to the 3D tab. The tab tears its renderer down on leaving (see effect A),
+     and before this cache it also threw away everything computed on the CPU,
+     so every visit re-baked both sides and re-decoded and re-blurred the
+     panorama: measured at about 3.5 s of blocked main thread per visit at a
+     phone's CPU speed, which is what made the tool hang when a phone user
+     tapped back and forth. Only the CPU half is kept; textures, PMREM and
+     shaders are per renderer and still rebuilt, which is the cheap part.
+
+     One bake, keyed on the identity of `derived` plus everything else the
+     bake reads, since any edit makes a new `derived` anyway. Held canvases
+     cost roughly 80 MB on the default board; a stale entry is released the
+     moment it is replaced. */
+  const BAKE_CACHE = { key: null, maps: null };
+  const HDR_CACHE = {};
+
+  function bakeBoth(derived, doc, weave) {
+    const b = doc.board;
+    const key = [derived, b.fab, b.maskColor, b.silkColor, b.finish, !!weave];
+    const hit = BAKE_CACHE.key && BAKE_CACHE.key.length === key.length &&
+      BAKE_CACHE.key.every((v, i) => v === key[i]);
+    if (hit) return BAKE_CACHE.maps;
+    if (BAKE_CACHE.maps) {
+      ['front', 'back'].forEach((sd) => {
+        const m = BAKE_CACHE.maps[sd];
+        if (m) releaseCanvases([m.map, m.orm, m.coat, m.emissive]);
+      });
+    }
+    BAKE_CACHE.key = null;
+    BAKE_CACHE.maps = null;
+    const maps = {
+      front: bakeSide(derived, doc, 'front', { weave: weave }),
+      back: bakeSide(derived, doc, 'back', { weave: weave })
+    };
+    BAKE_CACHE.key = key;
+    BAKE_CACHE.maps = maps;
+    return maps;
   }
 
   /* The default UV generators of ShapeGeometry and ExtrudeGeometry hand the
@@ -12349,14 +12416,13 @@ var PCB = (function () {
 
       const maps = { front: null, back: null };
       try {
-        maps.front = bakeSide(THREE, derived, doc, 'front', { weave: weave });
-        maps.back = bakeSide(THREE, derived, doc, 'back', { weave: weave });
+        const baked = bakeBoth(derived, doc, weave);
+        maps.front = bakedTextures(THREE, baked.front);
+        maps.back = bakedTextures(THREE, baked.back);
+        setInfo({ px: baked.front.pxPerMm, W: baked.front.W, H: baked.front.H,
+          clamped: baked.front.clamped, ms: baked.front.ms + baked.back.ms });
       } catch (e) {
         maps.front = null; maps.back = null;
-      }
-      if (maps.front) {
-        setInfo({ px: maps.front.pxPerMm, W: maps.front.W, H: maps.front.H,
-          clamped: maps.front.clamped, ms: maps.front.ms + maps.back.ms });
       }
 
       /* The glow field: its own small canvas at six pixels per millimetre, fine
@@ -12547,24 +12613,44 @@ var PCB = (function () {
         return;
       }
 
+      /* The decoded panorama and its blurs from an earlier visit, see
+         HDR_CACHE. What the loader would hand back is rebuilt from them with
+         the loader's own flags, so both paths below see the same texture. */
+      const cached = HDR_CACHE[env];
+      const fromCache = () => {
+        const t = new THREE.DataTexture(cached.data, cached.width, cached.height,
+          THREE.RGBAFormat, THREE.FloatType);
+        t.colorSpace = THREE.LinearSRGBColorSpace;
+        t.minFilter = THREE.LinearFilter;
+        t.magFilter = THREE.LinearFilter;
+        t.generateMipmaps = false;
+        t.flipY = true;
+        t.needsUpdate = true;
+        return t;
+      };
+
       /* The old environment stays up while the new one is in flight, so
          switching does not flash an unlit board over a slow line. */
       setEnvLoading(true);
       /* FloatType, not the default HalfFloat: the blur below reads the pixels
          in JS, and half floats would have to be unpacked by hand first. The
-         raw texture is thrown away right after, so the extra memory is
-         momentary. */
-      new Loader().setDataType(THREE.FloatType).loadAsync(source.url).then((data) => {
+         pixels stay in HDR_CACHE (8 MB for the workshop panorama, plus the two
+         blurs), which is the price of not decoding them again next visit. */
+      (cached ? Promise.resolve(fromCache())
+        : new Loader().setDataType(THREE.FloatType).loadAsync(source.url)).then((data) => {
         if (!alive || S.current !== s) { data.dispose(); return; }
         data.mapping = THREE.EquirectangularReflectionMapping;
         const pmrem = new THREE.PMREMGenerator(s.renderer);
         const tex = pmrem.fromEquirectangular(data).texture;
         pmrem.dispose();
 
+        const blurs = cached ? cached.blurs : {};
+        HDR_CACHE[env] = { data: data.image.data, width: data.image.width,
+          height: data.image.height, blurs: blurs };
         const bgs = {};
         BACKDROP_KEYS.forEach((k) => {
-          const b = PCB.blurEquirect(data.image.data, data.image.width, data.image.height,
-            { scale: BACKDROP_SCALE, sigma: BACKDROP_SIGMAS[k] });
+          const b = blurs[k] || (blurs[k] = PCB.blurEquirect(data.image.data, data.image.width,
+            data.image.height, { scale: BACKDROP_SCALE, sigma: BACKDROP_SIGMAS[k] }));
           const bg = new THREE.DataTexture(b.data, b.width, b.height, THREE.RGBAFormat, THREE.FloatType);
           bg.mapping = THREE.EquirectangularReflectionMapping;
           /* Copy the loader's own flags rather than invent them. flipY is the
@@ -13745,12 +13831,20 @@ var PCB = (function () {
        copper), so it follows the document while the tab is open, 300 ms after
        the derivation it needs has caught up. The DRC does not: see the note at
        runDrc. */
+    /* The derivation the current `conn` was computed from. Coming back to the
+       tab without an edit in between used to label the copper again for the
+       identical answer: about 0.6 s of blocked thread per visit at phone speed,
+       and a new result object that also repainted the island overlay. */
+    const connForRef = useRef(null);
     useEffect(() => {
       if (tab !== 'check' || !derived || !bundles) { return undefined; }
+      if (connForRef.current === derived) return undefined;
       const id = setTimeout(() => {
         try {
           setConn(PCB.connectivity(doc, { derived: derived }));
+          connForRef.current = derived;
         } catch (e) {
+          connForRef.current = null;
           setConn(null);
           setErr('The connectivity check failed: ' + (e && e.message ? e.message : 'unknown error'));
         }
