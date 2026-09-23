@@ -116,7 +116,7 @@
      The e-book readers, lifted out of miscellaneous/tools/ebook-converter.html
      (its <script id="ebookcore"> block) by notes/dev/extract-reader.mjs, which
      keeps whatever the reader entry points reach and drops every writer.
-     Kept 133 declarations.
+     Kept 135 declarations.
 
      To re-sync after the converter changes: run the script again and commit
      the diff. Never patch this block in place, or the next run silently
@@ -771,13 +771,52 @@
 
     // ══ EPUB reader ══════════════════════════════════════════════════════════
 
+    // An encryption.xml does not have to mean DRM. By far the most common case
+    // is font obfuscation: the IDPF and Adobe schemes scramble the first bytes
+    // of an embedded font so the licence cannot be lifted out of the book, and
+    // the text sits in the archive in plain sight. A book like that is entirely
+    // readable, and refusing it would be refusing a whole series because one
+    // volume embeds a typeface.
+    //
+    // So the file is read rather than merely detected: what matters is which
+    // entries it names. Fonts are dropped and the book goes through; anything
+    // else encrypted is real DRM and still ends the conversion.
+    const FONT_EXT_RE = /\.(?:ttf|otf|woff2?|ttc|dfont|eot)$/i;
+
+    function encryptedPaths(xml) {
+      const out = [];
+      const root = parseXML(xml);
+      // parseXML lower-cases element and attribute names, so this is
+      // 'cipherreference' and 'uri', not the spelling the spec uses.
+      for (const ref of findAll(root, 'cipherreference')) {
+        const uri = ref.attrs && ref.attrs.uri;
+        if (!uri) continue;
+        // The URI is relative to the container root and may be percent-encoded.
+        let path = String(uri).replace(/^\.?\//, '');
+        try { path = decodeURIComponent(path); } catch (e) { /* keep it raw */ }
+        out.push(path);
+      }
+      return out;
+    }
+
     async function readEpub(bytes, log) {
       const files = await zipRead(bytes);
 
       const containerRaw = files.get('META-INF/container.xml');
       if (!containerRaw) throw new Error('This ZIP file is not an EPUB (META-INF/container.xml is missing).');
-      if (files.has('META-INF/encryption.xml')) {
-        throw new Error('This EPUB is encrypted and cannot be converted.');
+      // Which entries are encrypted decides whether this book can be read.
+      const encrypted = new Set();
+      const encRaw = files.get('META-INF/encryption.xml');
+      if (encRaw) {
+        const listed = encryptedPaths(decodeEpubFile(encRaw));
+        // An encryption.xml naming nothing we can identify is not worth a
+        // guess: it is treated as DRM, as it was before.
+        if (!listed.length) throw new Error('This EPUB is encrypted and cannot be converted.');
+        const hard = listed.filter(function (path) { return !FONT_EXT_RE.test(path); });
+        if (hard.length) {
+          throw new Error('This EPUB is encrypted and cannot be converted.');
+        }
+        for (const path of listed) encrypted.add(path);
       }
       const rootfile = findOne(parseXML(decodeEpubFile(containerRaw)), 'rootfile');
       const opfPath = rootfile && rootfile.attrs['full-path'];
@@ -839,11 +878,15 @@
       const pathMap = {};
       const NAV_MIME = { 'application/x-dtbncx+xml': 1, 'application/oebps-package+xml': 1 };
       let imageCount = 0;
+      let fontsDropped = 0;
       for (const id of Object.keys(manifest)) {
         const it = manifest[id];
         if (spinePaths.has(it.path)) continue;
         if (NAV_MIME[it.mime]) continue;
         if (/\bnav\b/.test(it.properties)) continue;
+        // A scrambled font is bytes no renderer can use, so it is left out
+        // rather than carried into the new file as a broken resource.
+        if (encrypted.has(it.path)) { fontsDropped++; continue; }
         const data = files.get(it.path);
         if (!data) { log.warn('Missing in archive, skipped: ' + it.path); continue; }
         const flat = addResource(book, it.path, it.mime, data);
@@ -891,6 +934,10 @@
       book.toc = readEpubToc(files, opf, manifest, opfDir, secIdByPath);
       log.info('EPUB: ' + book.sections.length + ' sections, ' + imageCount + ' images, '
         + book.toc.length + ' TOC entries');
+      if (fontsDropped) {
+        log.warn(fontsDropped + ' obfuscated font' + (fontsDropped === 1 ? '' : 's')
+          + ' left out. The text is unaffected; only the embedded typeface is gone.');
+      }
       return book;
     }
 
@@ -2705,6 +2752,7 @@
       ENDS_P: ENDS_P,
       EXTH_AUTHOR: EXTH_AUTHOR,
       EXT_BY_MIME: EXT_BY_MIME,
+      FONT_EXT_RE: FONT_EXT_RE,
       HEADING_RE: HEADING_RE,
       HEAD_LV: HEAD_LV,
       INDEX_STOPPERS: INDEX_STOPPERS,
@@ -2752,6 +2800,7 @@
       elClass: elClass,
       emptyBook: emptyBook,
       encodeUtf8: encodeUtf8,
+      encryptedPaths: encryptedPaths,
       escChar: escChar,
       escapeAttr: escapeAttr,
       escapeText: escapeText,
