@@ -254,21 +254,22 @@ var TRCORE = (function () {
      rOf(z) gives the radius of the surface, aOf(z) the section half-size.
      The azimuth rate is chosen so that the horizontal speed
      sqrt(r'^2 + (r theta')^2) + max(0, a') never exceeds K. */
-  function strandPath(z0, z1, n, rOf, aOf, phase, dir, twist, K, rFloor) {
+  function strandPath(z0, z1, n, rOf, aOf, phase, dir, twist, K, rFloor, rateCap) {
     var zs = new Float64Array(n), rs = new Float64Array(n), as = new Float64Array(n);
     var i;
     for (i = 0; i < n; i++) {
       zs[i] = z0 + (z1 - z0) * i / (n - 1);
       rs[i] = rOf(zs[i]); as[i] = aOf(zs[i]);
     }
-    var th = new Float64Array(n), prevRate = 0;
+    var th = new Float64Array(n), w = new Float64Array(n), prevRate = 0;
     for (i = 0; i < n; i++) {
       var ia = Math.max(0, i - 1), ib = Math.min(n - 1, i + 1);
       var dz = zs[ib] - zs[ia];
       var dr = (rs[ib] - rs[ia]) / dz, da = (as[ib] - as[ia]) / dz;
       var budget = K - Math.max(0, da);
       var v = twist * Math.sqrt(Math.max(0, budget * budget - dr * dr));
-      var rate = v / Math.max(rs[i], rFloor);
+      var rate = w[i] = v / Math.max(rs[i], rFloor);
+      if (rateCap) rate = Math.min(rate, rateCap(zs[i]));
       if (i > 0) th[i] = th[i - 1] + 0.5 * (rate + prevRate) * (zs[i] - zs[i - 1]);
       prevRate = rate;
     }
@@ -279,7 +280,7 @@ var TRCORE = (function () {
       pts[3 * i + 1] = rs[i] * Math.sin(a);
       pts[3 * i + 2] = zs[i];
     }
-    return { pts: pts, r: rs, a: as, z: zs };
+    return { pts: pts, r: rs, a: as, z: zs, w: w };
   }
 
   // largest |dr/dz| of a sampled profile
@@ -499,29 +500,45 @@ var TRCORE = (function () {
       R = rb + (R - rb) * K * 0.97 / worst;
     }
     if (R < Rreq - 0.5) notes.push('Flame width held to ' + Math.round(2 * R) + ' mm (asked for ' + Math.round(2 * Rreq) + ') so the flanks stay within the overhang limit.');
+    // thickness thins towards the tip; the width is round at the common root
+    // (so neighbours do not overlap there and fight over the colour), full
+    // in the belly and narrower again at the tip. The width is what the
+    // overhang budget has to pay for where it grows.
+    var mkThick = function (Hi) {
+      return function (z) {
+        var u = clamp((z - z0) / Hi, 0, 1);
+        return F.thick * (1 - (1 - F.tip) * Math.pow(u, 1.4));
+      };
+    };
+    var mkWidth = function (Hi) {
+      var thickOf = mkThick(Hi);
+      return function (z) {
+        var u = clamp((z - z0) / Hi, 0, 1), ru = clamp(u / 0.3, 0, 1);
+        return thickOf(z) * (1 + (F.ribbon - 1) * (1 - u * u) * ru * ru * (3 - 2 * ru));
+      };
+    };
+    // Every ribbon turns at the slowest rate any ribbon alive at that height
+    // may take. On their own, the tall ribbons turn faster low down (their
+    // flanks are still shallow) and with steep tip steps the tallest caught
+    // up with the shortest, its neighbour across the seam of the staircase.
+    // A common rate keeps the ribbons at even angles all the way up.
+    var dzc = 0.5, nc = Math.ceil(Hmax / dzc) + 1, cap = new Float64Array(nc).fill(Infinity), c;
+    for (i = 0; i < N; i++) {
+      var Hp = heights[i], np = Math.max(40, Math.ceil(Hp / 1.5));
+      var probe = strandPath(z0, z0 + Hp, np, mk(R, Hp), mkWidth(Hp), 0, 1, F.twist, K, rb);
+      for (c = 0; c < nc && c * dzc <= Hp; c++) {
+        var t = c * dzc / Hp * (np - 1), j0 = Math.min(np - 2, Math.floor(t));
+        cap[c] = Math.min(cap[c], probe.w[j0] + (probe.w[j0 + 1] - probe.w[j0]) * (t - j0));
+      }
+    }
+    var capOf = function (z) { return cap[clamp(Math.round((z - z0) / dzc), 0, nc - 1)]; };
     var maxR = 0;
     for (i = 0; i < N; i++) {
-      var Hi = heights[i], rOf = mk(R, Hi);
+      var Hi = heights[i], rOf = mk(R, Hi), thickOf = mkThick(Hi), widthOf = mkWidth(Hi);
       var slopeOf = (function (f) { return function (z) { return (f(z + 0.05) - f(z - 0.05)) / 0.1; }; })(rOf);
-      // thickness thins towards the tip; the width is round at the common root
-      // (so neighbours do not overlap there and fight over the colour), full
-      // in the belly and narrower again at the tip. The width is what the
-      // overhang budget has to pay for where it grows.
-      var thickOf = (function (z0_, Hi_) {
-        return function (z) {
-          var u = clamp((z - z0_) / Hi_, 0, 1);
-          return F.thick * (1 - (1 - F.tip) * Math.pow(u, 1.4));
-        };
-      })(z0, Hi);
-      var widthOf = (function (z0_, Hi_) {
-        return function (z) {
-          var u = clamp((z - z0_) / Hi_, 0, 1), ru = clamp(u / 0.3, 0, 1);
-          return thickOf(z) * (1 + (F.ribbon - 1) * (1 - u * u) * ru * ru * (3 - 2 * ru));
-        };
-      })(z0, Hi);
       var n = Math.max(40, Math.ceil(Hi / 1.5));
       var dir = F.counter ? (i % 2 ? -1 : 1) : 1;
-      var path = strandPath(z0, z0 + Hi, n, rOf, widthOf, 2 * Math.PI * i / N, dir, F.twist, K, rb);
+      var path = strandPath(z0, z0 + Hi, n, rOf, widthOf, 2 * Math.PI * i / N, dir, F.twist, K, rb, capOf);
       var wa = new Float64Array(n), wb = new Float64Array(n);
       for (var j = 0; j < n; j++) {
         wa[j] = path.a[j]; wb[j] = thickOf(path.z[j]);
