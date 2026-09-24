@@ -9807,8 +9807,63 @@ var PCB = (function () {
     return { width: w, height: h, data: out };
   }
 
+  /* ------------------------------------------------------ the pipeline step */
+
+  /* One job of the expensive chain, in the form the page's worker runs it:
+     region flood, then the plain derivation, then the copper solve with the
+     derivation that uses it. On a phone the three together blocked the page
+     for ten seconds and more after every edit, so the page hands them to a
+     worker and this is the whole of what runs there.
+
+     `st` is what the worker keeps between jobs: the regions and the plain
+     derivation of the last run, each under the id of the job that made it.
+     They stay on this side so that a derive or solve job does not have to
+     ship 2.7 megapixel label planes back in. A job that names an id the
+     worker no longer holds answers `missing`, and the page starts over from
+     the regions. Never throws: an exception becomes `error` in the reply. */
+  function pipeStep(st, job) {
+    var out = { id: job.id, op: job.op };
+    try {
+      if (job.op === 'regions') {
+        var r = {
+          front: regionsForSide(job.doc, 'front', {}),
+          back: regionsForSide(job.doc, 'back', {})
+        };
+        st.regionsId = job.id;
+        st.regions = r;
+        st.baseId = null;
+        st.base = null;
+        out.regions = r;
+      } else if (job.op === 'derive') {
+        if (st.regionsId !== job.regionsId || !st.regions) { out.missing = true; return out; }
+        st.base = deriveLayers(job.doc, { regions: st.regions });
+        st.baseId = job.id;
+        out.derived = st.base;
+      } else if (job.op === 'solve') {
+        if (st.regionsId !== job.regionsId || st.baseId !== job.baseId || !st.base) {
+          out.missing = true;
+          return out;
+        }
+        out.sol = solvePartition(job.doc, { derived: st.base });
+        /* A derivation that fails with the partition falls back to the plain
+           one on the page, as it always did, so it is not an error here. */
+        try {
+          out.derived = deriveLayers(job.doc, { regions: st.regions, partition: out.sol });
+        } catch (e) {
+          out.derived = null;
+        }
+      } else {
+        out.error = 'unknown job ' + job.op;
+      }
+    } catch (e) {
+      out.error = (e && e.message) ? e.message : 'unknown error';
+    }
+    return out;
+  }
+
   return {
     VERSION: VERSION,
+    pipeStep: pipeStep,
     TEMPLATES: TEMPLATES,
     DEFAULT_TEMPLATE: DEFAULT_TEMPLATE,
     VOID_TEMPLATE: VOID_TEMPLATE,
@@ -10037,6 +10092,74 @@ var PCB = (function () {
     blurEquirect: blurEquirect
   };
 })();
+  </script>
+
+  <script id="pcbrun">
+  /* Worker plumbing for PCB.pipeStep, kept out of both the core (which has to
+     stay evaluable in Node) and the app. The worker is built from the text of
+     the pcbcore block plus trace-core.js, so there is one copy of the code and
+     no second file to keep in step.
+
+     One job at a time: the page asks again only when the answer is in, and
+     then for whatever the document needs NOW, so a burst of edits costs one
+     run and not one per edit. A job cannot be interrupted once it runs, which
+     is the price; the answer for an outdated document is recognised as such
+     on the page and simply not shown as current.
+
+     If a worker cannot be had (no Worker, a blocked blob URL, a failed
+     importScripts), the same step runs on the page as before, one macrotask
+     later, and the tool is exactly as slow as it used to be but still works. */
+  var PCBRun = (function () {
+    var worker = null, url = null, inflight = null, handler = null, local = null;
+
+    function deliver(msg) {
+      inflight = null;
+      if (handler) handler(msg);
+    }
+    function runLocal(job) {
+      if (!local) local = {};
+      setTimeout(function () { deliver(PCB.pipeStep(local, job)); }, 0);
+    }
+    function giveUp() {
+      if (worker) { try { worker.terminate(); } catch (e) { /* gone already */ } }
+      if (url) URL.revokeObjectURL(url);
+      worker = null; url = null;
+      if (!local) local = {};
+      /* The job in flight dies with the worker. Rerun it here; a derive or
+         solve job then answers `missing`, and the page starts over. */
+      if (inflight) runLocal(inflight);
+    }
+    function start() {
+      if (worker || local) return;
+      try {
+        var tc = document.querySelector('script[src*="trace-core.js"]');
+        var core = document.getElementById('pcbcore');
+        if (typeof Worker !== 'function' || !tc || !core) throw new Error('no worker');
+        var src = 'importScripts(' + JSON.stringify(tc.src) + ');\n' + core.textContent +
+          '\nvar st = {};\nonmessage = function (e) { postMessage(PCB.pipeStep(st, e.data)); };';
+        url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        worker = new Worker(url);
+        worker.onmessage = function (e) { deliver(e.data); };
+        worker.onerror = function (e) {
+          if (e && e.preventDefault) e.preventDefault();
+          giveUp();
+        };
+      } catch (e) {
+        worker = null;
+        local = {};
+      }
+    }
+    return {
+      onReply: function (fn) { handler = fn; },
+      busy: function () { return !!inflight; },
+      post: function (job) {
+        start();
+        inflight = job;
+        if (worker) worker.postMessage(job);
+        else runLocal(job);
+      }
+    };
+  })();
   </script>
 
   <script id="app">
@@ -13194,6 +13317,15 @@ var PCB = (function () {
     { v: 'bone', label: 'Bone', title: 'Grey to white. Survives printing and colour blindness, at the price of a much shorter contrast range.' }
   ];
 
+  /* What the region flood reads, as a list of identities: the dividing lines,
+     the seeds and the board size. Not the parts, not the holes. */
+  function regionKeyOf(d) {
+    return [d.objects, d.seeds, d.board.widthMm, d.board.heightMm];
+  }
+  function sameKey(a, b) {
+    return !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
+  }
+
   function limitDraftOf(fab, finish) {
     const src = PCB.fabLimits(fab, finish);
     const out = {};
@@ -13522,56 +13654,137 @@ var PCB = (function () {
        back a new array only when it changed one. */
     const regionKey = [doc.objects, doc.seeds, doc.board.widthMm, doc.board.heightMm];
 
+    /* ---- the pipeline, in a worker ----
+
+       The three stages (region flood, plain derivation, copper solve plus its
+       derivation) run in PCBRun's worker, one job at a time, and `pump`
+       decides after every answer and every edit what the CURRENT document
+       still needs. Measured on an emulated phone before this: twelve seconds
+       of frozen page after loading an EMPTY board, and around twenty per edit
+       on a real one, with every tap on a tab lost in between.
+
+       Everything below that compares documents does so by identity, exactly
+       as before: an answer belongs to the document its job was sent with, and
+       one for an older document is kept for display but never passed off as
+       current. The refs mirror the three results so that pump, which runs
+       from the worker's callback between renders, sees what was just set. */
+    const [partition, setPartition] = useState(null);
+    const [solving, setSolving] = useState(false);
+    const [baseRes, setBaseRes] = useState(null);
+    const bundlesRef = useRef(null);
+    const baseRef = useRef(null);
+    const partRef = useRef(null);
+    const jobRef = useRef(null);
+    const jobSeq = useRef(0);
+    /* The two debounces of the old synchronous version, kept as flags the
+       pump reads. The region flood waits 200 ms after the last change to the
+       lines, the solve 600 ms after the last change to anything: a part drag
+       changes the document thirty times a second, and a solve queued per
+       frame is stale before it is painted. The plain derivation has no
+       debounce any more: one job at a time already makes a drag cost one run
+       per answer, not one per frame. */
+    const regionDueRef = useRef(false);
+    const solveDueRef = useRef(false);
+
+    const pump = useCallback(() => {
+      if (PCBRun.busy()) return;
+      const d = docRef.current;
+      const b = bundlesRef.current;
+      const post = (job) => {
+        job.id = ++jobSeq.current;
+        jobRef.current = Object.assign({}, job);
+        PCBRun.post(job);
+      };
+      if (!b || !sameKey(b.rk, regionKeyOf(d))) {
+        if (!regionDueRef.current) return;
+        regionDueRef.current = false;
+        post({ op: 'regions', doc: d });
+        return;
+      }
+      const br = baseRef.current;
+      if (!br || br.doc !== d || br.regionsId !== b.id) {
+        post({ op: 'derive', doc: d, regionsId: b.id });
+        return;
+      }
+      if (d.board.autoCopper === false || !br.derived) return;
+      const pr = partRef.current;
+      if (pr && pr.doc === d) return;
+      if (!solveDueRef.current) return;
+      solveDueRef.current = false;
+      setSolving(true);
+      post({ op: 'solve', doc: d, regionsId: b.id, baseId: br.id });
+    }, []);
+
     useEffect(() => {
-      const id = setTimeout(() => {
-        try {
-          const d = docRef.current;
-          const front = PCB.regionsForSide(d, 'front', {});
-          const back = PCB.regionsForSide(d, 'back', {});
-          /* `key` records WHICH region input this bundle was built from, not
-             the whole document. Comparing the document would call the bundle
-             stale after a part moved, which is wrong twice over: the areas did
-             not change, and the derivation downstream has to use the CURRENT
-             document, or the pads would lag a frame behind the copper. */
-          setBundles({ front: front, back: back, key: d.objects, seedKey: d.seeds });
-        } catch (e) {
-          setErr('The area pass failed: ' + (e && e.message ? e.message : 'unknown error'));
+      PCBRun.onReply((msg) => {
+        const job = jobRef.current;
+        jobRef.current = null;
+        if (!job || job.id !== msg.id) { pump(); return; }
+        if (msg.missing) {
+          /* The worker lost what the job builds on (it was replaced by the
+             in-page fallback). Start over from the areas. */
+          bundlesRef.current = null;
+          baseRef.current = null;
+          regionDueRef.current = true;
+          solveDueRef.current = true;
+          if (job.op === 'solve') setSolving(false);
+        } else if (job.op === 'regions') {
+          if (msg.error) {
+            setErr('The area pass failed: ' + msg.error);
+          } else {
+            /* `key` records WHICH region input this bundle was built from, not
+               the whole document. Comparing the document would call the bundle
+               stale after a part moved, which is wrong twice over: the areas
+               did not change, and the derivation downstream has to use the
+               CURRENT document, or the pads would lag behind the copper. */
+            const nb = {
+              front: msg.regions.front, back: msg.regions.back,
+              key: job.doc.objects, seedKey: job.doc.seeds, rk: regionKeyOf(job.doc), id: msg.id
+            };
+            bundlesRef.current = nb;
+            setBundles(nb);
+          }
+        } else if (job.op === 'derive') {
+          /* A failed derivation is stored as a null result for its document,
+             not dropped, or the pump would ask for it again at once. */
+          const r = { doc: job.doc, derived: msg.error ? null : msg.derived, id: msg.id, regionsId: job.regionsId };
+          baseRef.current = r;
+          setBaseRes(r);
+        } else if (job.op === 'solve') {
+          setSolving(false);
+          let r;
+          if (msg.error) {
+            r = { doc: job.doc, sol: null, derived: null };
+            setErr('The copper solver failed: ' + msg.error);
+          } else {
+            r = { doc: job.doc, sol: msg.sol, derived: msg.derived };
+          }
+          partRef.current = r;
+          setPartition(r);
         }
-      }, 200);
+        pump();
+      });
+      return () => PCBRun.onReply(null);
+    }, [pump]);
+
+    useEffect(() => {
+      regionDueRef.current = false;
+      const id = setTimeout(() => { regionDueRef.current = true; pump(); }, 200);
       return () => clearTimeout(id);
       /* eslint-disable-next-line react-hooks/exhaustive-deps */
     }, regionKey);
 
-    /* Stale means "the AREAS are one edit behind", which is the only thing the
-       bundle carries. Moving a part does not make it stale, because the areas
-       do not depend on the parts; drawing a line does. */
-    const stale = !bundles || bundles.key !== doc.objects || bundles.seedKey !== doc.seeds;
+    useEffect(() => {
+      solveDueRef.current = false;
+      pump();
+      const id = setTimeout(() => { solveDueRef.current = true; pump(); }, 600);
+      return () => clearTimeout(id);
+    }, [doc, pump]);
 
-    /* The PLAIN derivation: a solid back plane, exactly what this tool produced
-       before the solver existed. The solver reads its copper mask, and it is
-       also what the preview falls back to while a solve is running, which is
-       honest rather than blank: the back really is one sheet until the channels
-       are milled. */
-    const baseDerived = useMemo(() => {
-      if (!bundles) return null;
-      try {
-        return PCB.deriveLayers(doc, { regions: { front: bundles.front, back: bundles.back } });
-      } catch (e) {
-        return null;
-      }
-    }, [bundles, doc]);
-
-    /* ---- the back copper solver ----
-
-       Second expensive stage, after the region flood and depending on it. About
-       a second on a 70x95 board at 20 px/mm, so it runs behind its own flag and
-       the page says it is working rather than freezing without explanation.
-
-       autoCopper === false is the off switch: the board then keeps the solid
-       back plane and the user wires it by hand, which is what this tool did
-       before and what a board whose solve fails can still be ordered as. */
-    const [partition, setPartition] = useState(null);
-    const [solving, setSolving] = useState(false);
+    /* autoCopper === false is the off switch for the solver: the board then
+       keeps the solid back plane and the user wires it by hand, which is what
+       this tool did before and what a board whose solve fails can still be
+       ordered as. The pump reads the same flag off the document. */
     const autoCopper = doc.board.autoCopper !== false;
     const thermals = doc.board.thermals !== false;
     const padHull = !!doc.board.padHull;
@@ -13585,70 +13798,25 @@ var PCB = (function () {
       ? Math.max(PCB.DEFAULT_CLEARANCE_MM, limits.spaceMm || 0)
       : +doc.board.clearanceMm;
 
-    useEffect(() => {
-      if (!bundles || !baseDerived || !autoCopper) { setPartition(null); return undefined; }
-      let cancelled = false;
-      let raf = 0;
-      /* Its own debounce, and a much longer one than the region flood's 200 ms.
+    /* The derivation for THIS document, or null while it is being made: the
+       solved one if the solve is in, the plain back plane before that, which is
+       honest rather than blank, since the back really is one sheet until the
+       channels are milled. The check, the DRC and both exports read only this,
+       so nothing is ever checked or written against a board that no longer
+       exists. */
+    const baseFresh = (baseRes && baseRes.doc === doc) ? baseRes : null;
+    const partFresh = (autoCopper && partition && partition.doc === doc) ? partition : null;
+    const freshDerived = baseFresh ? ((partFresh && partFresh.derived) || baseFresh.derived) : null;
+    /* What the previews draw: the current derivation, or the last one there
+       was while the worker catches up, so a canvas never goes blank between
+       two answers. The pages say so through `stale`. */
+    const lastDerivedRef = useRef(null);
+    if (freshDerived) lastDerivedRef.current = freshDerived;
+    const derived = freshDerived || lastDerivedRef.current;
 
-         The reason is a gesture: dragging a part fires one setParts per pointer
-         frame, so the document changes thirty times a second, and each change
-         would otherwise queue a second of copper solving whose result is stale
-         before it is painted. The tool became unusable on the parts tab exactly
-         that way. 600 ms is comfortably longer than the gap between two frames
-         of a drag and short enough not to feel like waiting after a click.
-
-         The flag goes up only when the timer fires, so the status line says
-         "working" while it IS working and not during the whole drag. */
-      const id = setTimeout(() => {
-        if (cancelled) return;
-        setSolving(true);
-        /* Two frames of slack before the work starts, so the "working" line is
-           painted before the main thread is taken. One rAF is not enough: the
-           first only schedules the paint. No worker, because the core block has
-           to stay evaluable for the tests and this file has no worker
-           plumbing. */
-        raf = requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (cancelled) return;
-          try {
-            const p = PCB.solvePartition(docRef.current, { derived: baseDerived });
-            if (!cancelled) setPartition({ sol: p, doc: docRef.current });
-          } catch (e) {
-            if (!cancelled) {
-              setPartition(null);
-              setErr('The copper solver failed: ' + (e && e.message ? e.message : 'unknown error'));
-            }
-          }
-          if (!cancelled) setSolving(false);
-        }));
-      }, 600);
-      return () => {
-        cancelled = true;
-        clearTimeout(id);
-        if (raf) cancelAnimationFrame(raf);
-        setSolving(false);
-      };
-      /* Both flags are named even though baseDerived already changes with any
-         edit to the document: it is memoised on `doc`, so a new board object
-         re-runs this anyway. Named for the same reason autoCopper always was,
-         that a reader should not have to trace a memo two hooks up to see that
-         a switch on the config tab takes effect. */
-    }, [baseDerived, autoCopper, thermals, padHull]);
-
-    /* The derivation everything downstream sees. Falls back to the plain one
-       while the solve runs, so the preview never goes blank. */
-    const derived = useMemo(() => {
-      if (!baseDerived) return null;
-      if (!partition || partition.doc !== doc) return baseDerived;
-      try {
-        return PCB.deriveLayers(doc, {
-          regions: { front: bundles.front, back: bundles.back },
-          partition: partition.sol
-        });
-      } catch (e) {
-        return baseDerived;
-      }
-    }, [baseDerived, partition, bundles, doc]);
+    /* Stale means the picture is at least one edit behind: the areas, or the
+       derivation drawn from them. */
+    const stale = !bundles || !sameKey(bundles.rk, regionKey) || !freshDerived;
 
     /* The solve belongs to the document it was made from. After any edit it is
        one step behind, and everything downstream then shows the plain plane and
@@ -13837,12 +14005,12 @@ var PCB = (function () {
        and a new result object that also repainted the island overlay. */
     const connForRef = useRef(null);
     useEffect(() => {
-      if (tab !== 'check' || !derived || !bundles) { return undefined; }
-      if (connForRef.current === derived) return undefined;
+      if (tab !== 'check' || !freshDerived || !bundles) { return undefined; }
+      if (connForRef.current === freshDerived) return undefined;
       const id = setTimeout(() => {
         try {
-          setConn(PCB.connectivity(doc, { derived: derived }));
-          connForRef.current = derived;
+          setConn(PCB.connectivity(doc, { derived: freshDerived }));
+          connForRef.current = freshDerived;
         } catch (e) {
           connForRef.current = null;
           setConn(null);
@@ -13850,7 +14018,7 @@ var PCB = (function () {
         }
       }, 300);
       return () => clearTimeout(id);
-    }, [tab, derived, bundles]);
+    }, [tab, freshDerived, bundles]);
 
     /* A DRC result belongs to the document it was run on. Once that document
        changes the result is a claim about something that no longer exists, so
@@ -14884,7 +15052,7 @@ var PCB = (function () {
        button with its "checking" label BEFORE the loop starts, or the only sign
        of life would arrive together with the result. */
     function runDrc() {
-      if (!derived || !bundles || drcBusy) return;
+      if (!freshDerived || !bundles || drcBusy) return;
       setDrcBusy(true);
       setMarkSel(null);
       /* A frame, then a task: the animation frame gets the re-rendered button
@@ -14894,7 +15062,7 @@ var PCB = (function () {
          one moment it is no longer needed. */
       requestAnimationFrame(() => setTimeout(() => {
         try {
-          setDrcRes(PCB.drc(doc, limitsFromDraft(limDraft), { derived: derived }));
+          setDrcRes(PCB.drc(doc, limitsFromDraft(limDraft), { derived: freshDerived }));
           setErr('');
         } catch (e) {
           setErr('The design checks failed: ' + (e && e.message ? e.message : 'unknown error'));
@@ -15144,11 +15312,11 @@ var PCB = (function () {
     const projName = PCB.projectSlug(doc.board.name);
 
     function exportGerber() {
-      if (!derived) { setErr('The area pass is still running. One moment.'); return; }
+      if (!freshDerived) { setErr('The board is still being worked out after the last change. One moment.'); return; }
       try {
         const files = PCB.exportFileSet(doc, {
           project: projName, date: isoStamp(),
-          derived: derived, regions: { front: bundles.front, back: bundles.back }
+          derived: freshDerived, regions: { front: bundles.front, back: bundles.back }
         });
         const bytes = PCB.buildZip(files);
         const zipName = projName + '-gerber.zip';
@@ -15157,7 +15325,7 @@ var PCB = (function () {
            thing to receive at a fab, so say it out loud at the moment the zip
            leaves rather than letting the fab's audit be the one to mention it.
            The empty drill file is in the archive either way. */
-        const noHoles = !derived.drills.plated.length && !derived.drills.nonPlated.length;
+        const noHoles = !freshDerived.drills.plated.length && !freshDerived.drills.nonPlated.length;
         setMsg(Object.keys(files).length + ' files written to ' + zipName + '.'
           + (noHoles ? ' This board has no drilled holes, so the drill file is empty. That is a valid archive, but some fabs query it.' : ''));
         setErr('');
@@ -15170,11 +15338,11 @@ var PCB = (function () {
        one more file in the Gerber zip: one is what you send to a fab, the other
        is what you keep, and mixing them invites sending the wrong one. */
     function exportKicad() {
-      if (!derived) { setErr('The area pass is still running. One moment.'); return; }
+      if (!freshDerived) { setErr('The board is still being worked out after the last change. One moment.'); return; }
       try {
         const files = PCB.kicadFileSet(doc, {
           project: projName, date: isoStamp(),
-          derived: derived, regions: { front: bundles.front, back: bundles.back }
+          derived: freshDerived, regions: { front: bundles.front, back: bundles.back }
         });
         const bytes = PCB.buildZip(files);
         const zipName = projName + '-kicad.zip';
@@ -17451,10 +17619,10 @@ var PCB = (function () {
               <div className="ctl-sec">
                 <p className="ctl-sec-h">Design checks</p>
                 <div className="pcb-row">
-                  <button type="button" className="tool-btn tool-btn-primary" disabled=${!derived || drcBusy}
+                  <button type="button" className="tool-btn tool-btn-primary" disabled=${!freshDerived || drcBusy}
                     title=${'Runs every rule against the ' + fabLabel + ' numbers below. It takes a few seconds and the page does not respond while it runs.'}
                     onClick=${runDrc}>${ToolIcons.el('play')}${drcBusy ? 'checking...' : 'Run design checks (' + fabLabel + ')'}</button>
-                  ${!derived ? html`<span className="pcb-note">The area pass is still running.</span>` : null}
+                  ${!freshDerived ? html`<span className="pcb-note">The board is still being worked out after the last change.</span>` : null}
                 </div>
                 ${drcRes ? html`<${React.Fragment}>
                   <p className="pcb-note" style=${{ marginTop: 8 }}>
@@ -17577,8 +17745,8 @@ var PCB = (function () {
           </div>
         </div>
         <div className="pcb-row" style=${{ marginTop: 12 }}>
-          <button type="button" className="tool-btn tool-btn-primary" disabled=${!derived} onClick=${exportGerber}>${ToolIcons.el('download')}Download Gerber zip</button>
-          <button type="button" className="tool-btn" disabled=${!derived} onClick=${exportKicad}>${ToolIcons.el('download')}Download KiCad project</button>
+          <button type="button" className="tool-btn tool-btn-primary" disabled=${!freshDerived} onClick=${exportGerber}>${ToolIcons.el('download')}Download Gerber zip</button>
+          <button type="button" className="tool-btn" disabled=${!freshDerived} onClick=${exportKicad}>${ToolIcons.el('download')}Download KiCad project</button>
           <button type="button" className="tool-btn" onClick=${exportJson}>${ToolIcons.el('download')}Download project JSON</button>
           <button type="button" className="tool-btn" onClick=${() => jsonRef.current && jsonRef.current.click()}>${ToolIcons.el('upload')}Load project JSON</button>
         </div>
