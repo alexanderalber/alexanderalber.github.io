@@ -1750,9 +1750,25 @@ var TRCORE = (function () {
     return k0 * (k0 - 1) / Math.sqrt(u2 * u2 + v2 * v2 + w2 * w2);
   }
 
+  /* An object is splatted only as far out as its own blend reaches, and
+     beyond that the grid holds BIG. The plinth's fillet blends much further,
+     and against BIG it has nothing to blend with: it stopped wherever the
+     stem's box and distance cutoff ran out, an octagon with a lip. So in a
+     slab around the plinth top every object reaches as far as the fillet
+     needs: the fillet's surface stays within k/4 of the top, and there the
+     sculpture's distance is below 1.25 k. */
+  function reachSlab(g, zTop, k) {
+    if (!(k > 0)) return null;
+    return { lo: zTop - 2 * g.h - 0.5, hi: zTop + 0.5 * k + 2 * g.h + 0.5, pad: 1.25 * k + 2 * g.h + 0.5 };
+  }
+  function padAt(g, pad, z0, z1) {
+    var r = g.reach;
+    return r && r.pad > pad && z0 <= r.hi && z1 >= r.lo ? r.pad : pad;
+  }
+
   function splatSweep(g, o) {
-    var pad = o.k + 2 * g.h + 0.5;
-    var I = idxRange(g, o.bbox[0] - pad, o.bbox[3] + pad, 0), J = idxRange(g, o.bbox[1] - pad, o.bbox[4] + pad, 1), Kr = idxRange(g, o.bbox[2] - pad, o.bbox[5] + pad, 2);
+    var pad = o.k + 2 * g.h + 0.5, wide = padAt(g, pad, o.bbox[2] - pad, o.bbox[5] + pad);
+    var I = idxRange(g, o.bbox[0] - wide, o.bbox[3] + wide, 0), J = idxRange(g, o.bbox[1] - wide, o.bbox[4] + wide, 1), Kr = idxRange(g, o.bbox[2] - pad, o.bbox[5] + pad, 2);
     var sx = I[1] - I[0] + 1, sy = J[1] - J[0] + 1, sz = Kr[1] - Kr[0] + 1;
     var S = new Float32Array(sx * sy * sz); S.fill(BIG);
     var pts = o.pts, n = pts.length / 3, h = g.h;
@@ -1761,15 +1777,17 @@ var TRCORE = (function () {
       var bx = pts[3 * s + 3], by = pts[3 * s + 4], bz = pts[3 * s + 5];
       // box around the segment: a ribbon is thin across, so bound each axis
       // by the section's actual reach instead of its widest radius
-      var ex = [0, 0, 0];
+      var ex = [0, 0, 0], zs0 = Math.min(az, bz), zs1 = Math.max(az, bz);
+      var rs = Math.max(o.ra[s], o.ra[s + 1], o.rb ? Math.max(o.rb[s], o.rb[s + 1]) : 0);
+      var ps = padAt(g, pad, zs0 - rs - pad, zs1 + rs + pad);
       if (o.W) {
         var ra = Math.max(o.ra[s], o.ra[s + 1]), rb = Math.max(o.rb[s], o.rb[s + 1]), s3 = 3 * s;
         for (var c = 0; c < 3; c++) {
           ex[c] = ra * Math.max(Math.abs(o.W[s3 + c]), Math.abs(o.W[s3 + 3 + c])) + rb * Math.max(Math.abs(o.B[s3 + c]), Math.abs(o.B[s3 + 3 + c]));
           // frames are orthonormalised against the segment at evaluation, so allow some slack
-          ex[c] = Math.min(Math.max(ra, rb), ex[c] * 1.15 + 0.15 * Math.max(ra, rb)) + pad;
+          ex[c] = Math.min(Math.max(ra, rb), ex[c] * 1.15 + 0.15 * Math.max(ra, rb)) + (c < 2 ? ps : pad);
         }
-      } else ex[0] = ex[1] = ex[2] = Math.max(o.ra[s], o.ra[s + 1]) + pad;
+      } else { ex[0] = ex[1] = Math.max(o.ra[s], o.ra[s + 1]) + ps; ex[2] = Math.max(o.ra[s], o.ra[s + 1]) + pad; }
       var i0 = Math.max(I[0], Math.floor((Math.min(ax, bx) - ex[0] - g.x0) / h)), i1 = Math.min(I[1], Math.ceil((Math.max(ax, bx) + ex[0] - g.x0) / h));
       var j0 = Math.max(J[0], Math.floor((Math.min(ay, by) - ex[1] - g.y0) / h)), j1 = Math.min(J[1], Math.ceil((Math.max(ay, by) + ex[1] - g.y0) / h));
       var k0 = Math.max(Kr[0], Math.floor((Math.min(az, bz) - ex[2] - g.z0) / h)), k1 = Math.min(Kr[1], Math.ceil((Math.max(az, bz) + ex[2] - g.z0) / h));
@@ -1795,14 +1813,15 @@ var TRCORE = (function () {
 
   function splatSdf(g, o) {
     var pad = o.k + 2 * g.h + 0.5;
-    var I = idxRange(g, o.bbox[0] - pad, o.bbox[3] + pad, 0), J = idxRange(g, o.bbox[1] - pad, o.bbox[4] + pad, 1), Kr = idxRange(g, o.bbox[2] - pad, o.bbox[5] + pad, 2);
+    var Kr = idxRange(g, o.bbox[2] - pad, o.bbox[5] + pad, 2);
     for (var k = Kr[0]; k <= Kr[1]; k++) {
-      var z = g.z0 + k * g.h, Ly = o.layer ? o.layer(z) : null;
+      var z = g.z0 + k * g.h, Ly = o.layer ? o.layer(z) : null, pk = padAt(g, pad, z, z);
+      var I = idxRange(g, o.bbox[0] - pk, o.bbox[3] + pk, 0), J = idxRange(g, o.bbox[1] - pk, o.bbox[4] + pk, 1);
       for (var j = J[0]; j <= J[1]; j++) {
         var y = g.y0 + j * g.h, row = (k * g.ny + j) * g.nx;
         for (var i = I[0]; i <= I[1]; i++) {
           var d = o.f(g.x0 + i * g.h, y, z, Ly);
-          if (d < pad + 1) combine(g, row + i, d, o);
+          if (d < pk + 1) combine(g, row + i, d, o);
         }
       }
     }
@@ -2428,6 +2447,7 @@ var TRCORE = (function () {
     var ordered = D.objects.filter(function (o) { return !o.last; }).concat(D.objects.filter(function (o) { return o.last; }));
     var plinth = D.objects.filter(function (o) { return o.label === 0 && o.last; })[0];
     var zc = D.P.plinthH, foot = null, flange = null;
+    if (plinth) g.reach = reachSlab(g, zc, plinth.k);
     ordered.forEach(function (o, n) {
       if (o === plinth && D.fill) coneFill(g, zc, D.K);
       if (o === plinth && D.P.parts === 'flange') {
