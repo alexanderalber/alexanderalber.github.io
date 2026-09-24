@@ -1338,11 +1338,26 @@ var TRCORE = (function () {
   }
 
   var LINE_PITCH = 32;
-  // lines of text -> segments [x1, y1, x2, y2, ...] in font units, each line centred on x = 0
-  function layoutText(lines) {
+  /* A glyph narrowed to share k of its width: the ink squeezes about its
+     left edge and the bearings keep their width, because the gap between two
+     letters has to hold a groove whatever the letters do. A word space has
+     no ink and narrows as a whole. */
+  function condense(g, k) {
+    if (k === 1) return g;
+    if (!g.strokes.length) return { w: g.w * k, strokes: [] };
+    var lo = Infinity, hi = -Infinity;
+    g.strokes.forEach(function (st) { for (var i = 0; i < st.length; i += 2) { lo = Math.min(lo, st[i]); hi = Math.max(hi, st[i]); } });
+    return {
+      w: g.w - (1 - k) * (hi - lo),
+      strokes: g.strokes.map(function (st) { return st.map(function (c, i) { return i % 2 ? c : lo + k * (c - lo); }); })
+    };
+  }
+  // lines of text -> segments [x1, y1, x2, y2, ...] in font units, each line centred on x = 0; k narrows the letters
+  function layoutText(lines, k) {
     var segs = [], bb = [Infinity, Infinity, -Infinity, -Infinity];
+    k = k == null ? 1 : k;
     lines.forEach(function (line, li) {
-      var adv = 0, gl = Array.from(line).map(function (c) { var g = glyph(c); adv += g.w; return g; });
+      var adv = 0, gl = Array.from(line).map(function (c) { var g = condense(glyph(c), k); adv += g.w; return g; });
       var x = -adv / 2, y0 = -li * LINE_PITCH;
       gl.forEach(function (g) {
         g.strokes.forEach(function (st) {
@@ -1364,6 +1379,8 @@ var TRCORE = (function () {
      from vertical. So alpha follows from the overhang limit and the
      engraving prints without support like everything else. */
   var MIN_GROOVE = 1.0;
+  // narrowest the letters get when a long line would otherwise leave the band half empty
+  var MIN_CONDENSE = 0.6;
   function engraving(P, Rf, box, cr, hp, rt, notes) {
     var E = P.engrave || {}, lines = [E.line1, E.line2].map(function (s) { return String(s || '').trim(); }).filter(Boolean);
     if (!lines.length) return null;
@@ -1371,8 +1388,22 @@ var TRCORE = (function () {
     if (!T.segs.length) return null;
     var zb = Math.max(1.2, hp * 0.1), zt = hp - rt - Math.max(0.8, hp * 0.05), bandH = zt - zb;
     var availW = box ? 2 * (Rf - cr) - 2 * Math.max(2, Rf * 0.08) : Rf * 0.75 * Math.PI;
-    var wU = 3, bw = T.bbox[2] - T.bbox[0], bh = T.bbox[3] - T.bbox[1];
-    var sc = Math.min(bandH / (bh + wU), availW / (bw + wU)) * clamp(E.size == null ? 0.85 : E.size, 0.3, 1);
+    var wU = 3, bh = T.bbox[3] - T.bbox[1], scH = bandH / (bh + wU);
+    var fitW = function (L) { return availW / (L.bbox[2] - L.bbox[0] + wU); };
+    /* A long line runs out of width long before the band runs out of height.
+       Then the letters narrow, just far enough for the height to become the
+       limit, and no further than MIN_CONDENSE. */
+    var cond = 1;
+    if (fitW(T) < scH) {
+      var Tn = layoutText(lines, MIN_CONDENSE);
+      if (fitW(Tn) <= scH) { cond = MIN_CONDENSE; T = Tn; }
+      else {
+        var lo = MIN_CONDENSE, hi = 1;
+        for (var it = 0; it < 24; it++) { var mid = (lo + hi) / 2; if (fitW(layoutText(lines, mid)) >= scH) lo = mid; else hi = mid; }
+        cond = lo; T = layoutText(lines, lo);
+      }
+    }
+    var sc = Math.min(scH, fitW(T)) * clamp(E.size == null ? 0.85 : E.size, 0.3, 1);
     if (!(sc > 0)) return null;
     var w = Math.max(MIN_GROOVE, wU * sc), capH = 21 * sc;
     if (capH < 4) notes.push('The lettering is only ' + capH.toFixed(1) + ' mm tall and may not print legibly. Fewer letters or a taller plinth help.');
@@ -1406,7 +1437,7 @@ var TRCORE = (function () {
       return Math.sqrt(best);
     }
     return {
-      capH: capH, groove: w, depth: d0, lines: lines.length,
+      capH: capH, groove: w, depth: d0, lines: lines.length, condense: cond,
       zLo: v0, zHi: v1, uLo: u0, uHi: u1,
       // the wall frame at a point: u along the wall, t depth into it
       frame: function (x, y) {
@@ -2533,7 +2564,7 @@ var TRCORE = (function () {
     var E = plinth && plinth.engraving;
     return {
       mesh: mesh, parts: parts, view: view, stats: st, support: sup, notes: D.notes, params: D.P, joint: joint, pins: pins, flange: flange, glue: glue,
-      engraving: E ? { capH: E.capH, groove: E.groove, depth: E.depth, lines: E.lines } : null,
+      engraving: E ? { capH: E.capH, groove: E.groove, depth: E.depth, lines: E.lines, condense: E.condense } : null,
       plinth: { height: zc, radius: plinth.radius },
       grid: [g.nx, g.ny, g.nz], ms: { field: tField - t0, check: tCheck - tField, mesh: tMesh - tCheck }
     };
@@ -3187,7 +3218,7 @@ var TRCORE = (function () {
               value=${P.engrave.line2} onChange=${(e) => setEng('line2')(e.target.value)}/>
             ${hasText && html`<${Slider} label="Lettering size" value=${P.engrave.size} min=${0.3} max=${1} step=${0.01} fmt=${pct} onChange=${setEng('size')}/>`}
             <p className="tr-hint">${eng
-              ? html`Letters ${eng.capH.toFixed(1)} mm tall, cut ${eng.groove.toFixed(1)} mm wide and ${eng.depth.toFixed(1)} mm deep into the front of the plinth. Fine preview shows them best.`
+              ? html`Letters ${eng.capH.toFixed(1)} mm tall, cut ${eng.groove.toFixed(1)} mm wide and ${eng.depth.toFixed(1)} mm deep into the front of the plinth${eng.condense < 0.995 ? ', narrowed to ' + Math.round(eng.condense * 100) + '% of their width so a long line can grow' : ''}. Fine preview shows them best.`
               : 'Cut into the front of the plinth, sized to the largest lettering that fits. Umlauts and ß work.'}</p>
           <//>
           <${Sec} k="parts" title="Parts and colours" aside=${JOINT_LABEL[P.parts]} open=${openSec} onToggle=${toggleSec}>
