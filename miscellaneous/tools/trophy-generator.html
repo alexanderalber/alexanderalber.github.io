@@ -113,7 +113,7 @@
       <h1>Trophy Sculptor</h1>
       <p>Award sculptures for the 3D printer. Set the height first; everything else scales with it. Then pick one of six families, engrave the plinth and download an STL that prints upright without support material.</p>
       <ul>
-        <li>Six families: a crossed lattice cage, a flame of turning ribbons, a twisted and leaning stele, a cluster of quartz crystals in a rock half sunk into the plinth, a pile of bismuth hopper crystals with their stepped, spiralling faces, a gnarled tree whose branches thin by Murray's law.</li>
+        <li>Six families: a crossed lattice cage, alone or with smaller cages nested inside, a flame of turning ribbons, a twisted and leaning stele, a cluster of quartz crystals in a rock half sunk into the plinth, a pile of bismuth hopper crystals with their stepped, spiralling faces, a gnarled tree whose branches thin by Murray's law.</li>
         <li>Printability is part of the construction: no surface leans past the overhang limit you set, and a layer-by-layer check confirms it.</li>
         <li>Engraving on the front of the plinth, cut at an angle that also prints without support.</li>
         <li>One part as a single STL, or plinth and sculpture as two parts in two colours, joined by steel dowel pins, a keyed boss and socket, or a wide foot.</li>
@@ -174,7 +174,9 @@ var TRCORE = (function () {
     engrave: { line1: '', line2: '', size: 0.85 },  // size: share of the largest lettering that fits
     lattice: {
       strands: 12, width: 0.62, waist: 0.5, pole: 1.3, twist: 0.85,
-      thick: 2.4, ribbon: 1.0, stem: 8, core: 0.7, finial: true, counter: true
+      thick: 2.4, ribbon: 1.0, stem: 8, core: 0.7, finial: true, counter: true,
+      inside: 'core',     // core: a drop on a stalk inside the cage; shells: nested cages sharing both poles
+      shells: 3           // cages in all, the outer one included, when inside is 'shells'
     },
     flame: {
       strands: 5, width: 0.36, bulge: 0.42, base: 6, twist: 0.7, thick: 3.4,
@@ -372,7 +374,10 @@ var TRCORE = (function () {
   /* ---------- family: lattice ----------
      Strands climb a spindle from a lower pole to an upper one, half of them
      turning left and half right, so they cross into a cage. A printable drop
-     sits inside on the lower pole, another one crowns the upper pole. */
+     sits inside on the lower pole, another one crowns the upper pole.
+     Instead of the drop the inside can hold smaller cages, the same spindle
+     scaled down, all running out of the same two poles, so every one of them
+     is tied in at the top as well as at the bottom. */
   function designLattice(P, K, notes) {
     var L = P.lattice, hp = P.plinthH, objs = [];
     var thick = L.thick;
@@ -394,30 +399,53 @@ var TRCORE = (function () {
       notes.push('Cage width held to ' + Math.round(2 * R) + ' mm (asked for ' + Math.round(2 * Rreq) + ') so the flanks stay within the overhang limit.');
     }
     var rOf = function (z) { return R * prof(z); };
-    var slopeOf = function (z) { return (rOf(z + 0.05) - rOf(z - 0.05)) / 0.1; };
     var aOf = function () { return thick; };
     var n = Math.max(40, Math.ceil(span / 1.5));
     var N = Math.max(2, Math.round(L.strands));
     var counter = !!L.counter;
-    var perDir = counter ? Math.max(1, Math.round(N / 2)) : N;
-    for (var s = 0; s < N; s++) {
-      var dir = counter ? (s % 2 ? -1 : 1) : 1;
-      var idx = counter ? Math.floor(s / 2) : s;
-      var phase = 2 * Math.PI * idx / perDir + (counter && dir < 0 ? Math.PI / perDir : 0);
-      var path = strandPath(z0, z1, n, rOf, aOf, phase, dir, L.twist, K, thick * 1.5);
-      var wa = new Float64Array(n), wb = new Float64Array(n);
-      for (var i = 0; i < n; i++) {
-        /* ribbons turn round towards the poles: there the frame spins fast,
-           and a wide section spinning about the strand sweeps its edges
-           sideways faster than any overhang allows */
-        var fr0 = clamp(path.r[i] / (3 * thick * L.ribbon), 0, 1);
-        wa[i] = thick * (1 + (L.ribbon - 1) * fr0 * fr0 * (3 - 2 * fr0)); wb[i] = thick;
+    /* one cage of radius share f. Its strands keep the outer cage's spacing
+       along the circumference, so an inner cage has fewer of them, and it is
+       turned by half a spacing per level so the strands of neighbouring cages
+       do not line up behind each other. */
+    var cage = function (f, level) {
+      var rOfF = function (z) { return f * rOf(z); };
+      var slopeOf = function (z) { return (rOfF(z + 0.05) - rOfF(z - 0.05)) / 0.1; };
+      var Nf = Math.round(N * f);
+      Nf = counter ? Math.max(4, 2 * Math.round(Nf / 2)) : Math.max(3, Nf);
+      var perDir = counter ? Math.max(1, Math.round(Nf / 2)) : Nf;
+      for (var s = 0; s < Nf; s++) {
+        var dir = counter ? (s % 2 ? -1 : 1) : 1;
+        var idx = counter ? Math.floor(s / 2) : s;
+        var phase = 2 * Math.PI * (idx + 0.5 * level) / perDir + (counter && dir < 0 ? Math.PI / perDir : 0);
+        var path = strandPath(z0, z1, n, rOfF, aOf, phase, dir, L.twist, K, thick * 1.5);
+        var wa = new Float64Array(n), wb = new Float64Array(n);
+        for (var i = 0; i < n; i++) {
+          /* ribbons turn round towards the poles: there the frame spins fast,
+             and a wide section spinning about the strand sweeps its edges
+             sideways faster than any overhang allows */
+          var fr0 = clamp(path.r[i] / (3 * thick * L.ribbon), 0, 1);
+          wa[i] = thick * (1 + (L.ribbon - 1) * fr0 * fr0 * (3 - 2 * fr0)); wb[i] = thick;
+        }
+        var fr = L.ribbon !== 1 ? surfaceFrames(path.pts, slopeOf) : null;
+        var li = leadIn(path, fr, wa, wb, thick * 1.5);
+        objs.push(sweepObject(li.path, li.fr, li.wa, li.wb, counter && dir < 0 ? 2 : 1, P.blend));
       }
-      var fr = L.ribbon !== 1 ? surfaceFrames(path.pts, slopeOf) : null;
-      var li = leadIn(path, fr, wa, wb, thick * 1.5);
-      objs.push(sweepObject(li.path, li.fr, li.wa, li.wb, counter && dir < 0 ? 2 : 1, P.blend));
+    };
+    var shells = L.inside === 'shells' ? Math.max(1, Math.round(L.shells)) : 1;
+    if (shells > 1) {
+      /* evenly spaced radii, R, (k-1)/k R, ... R/k. At the widest point
+         neighbouring cages must leave a gap the blend does not close, or
+         they print as one wall; that caps how many fit. */
+      var gapMin = 2 * thick + 1.5 * P.blend + 1;
+      var fit = Math.max(1, Math.floor(R / gapMin));
+      if (fit < shells) {
+        notes.push(fit > 1 ? 'Only ' + fit + ' cages fit inside each other at this width and strand thickness (asked for ' + shells + ').'
+          : 'No second cage fits inside at this width and strand thickness.');
+        shells = fit;
+      }
     }
-    if (L.core > 0) {
+    for (var c = 0; c < shells; c++) cage((shells - c) / shells, c);
+    if (shells === 1 && L.inside !== 'shells' && L.core > 0) {
       /* The drop's 45 degree cone is wider than the cage near its pole, so
          the drop cannot sit on the pole itself. It stands on a vertical
          stalk instead, at the height where the biggest drop fits. */
@@ -2581,7 +2609,6 @@ var TRCORE = (function () {
       { k: 'twist', label: 'Twist', min: 0, max: 1, step: 0.01, rnd: [0.4, 1], fmt: pct },
       { k: 'thick', label: 'Strand thickness', min: 1.4, max: 4.5, step: 0.1, rnd: [1.8, 3.4], fmt: (v) => mm(2 * v) },
       { k: 'ribbon', label: 'Ribbon width', min: 1, max: 3, step: 0.05, rnd: [1, 2.6], fmt: (v) => v.toFixed(2) + '×' },
-      { k: 'core', label: 'Core', min: 0, max: 1, step: 0.01, rnd: [0, 1], fmt: pct },
       { k: 'stem', label: 'Stem', min: 0, max: 40, step: 1, rnd: [0, 25], fmt: mm }
     ],
     flame: [
@@ -2637,6 +2664,11 @@ var TRCORE = (function () {
       { k: 'align', label: 'Alignment', min: 0, max: 1, step: 0.01, rnd: [0.4, 1], fmt: pct },
       { k: 'seed', label: 'Arrangement', min: 1, max: 50, step: 1, rnd: [1, 50] }
     ]
+  };
+  // what fills the lattice cage, chosen like the torsion's section
+  const INSIDE_SLIDERS = {
+    core: [{ k: 'core', label: 'Core', min: 0, max: 1, step: 0.01, rnd: [0, 1], fmt: pct }],
+    shells: [{ k: 'shells', label: 'Cages', min: 2, max: 4, step: 1, rnd: [2, 4] }]
   };
   const SECTION_SLIDERS = {
     star: [
@@ -3040,6 +3072,10 @@ var TRCORE = (function () {
           f.section = Math.random() < 0.6 ? 'star' : 'slab';
           SECTION_SLIDERS[f.section].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
         }
+        if (fam === 'lattice') {
+          f.inside = Math.random() < 0.6 ? 'core' : 'shells';
+          INSIDE_SLIDERS[f.inside].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
+        }
         TOGGLES[fam].forEach((t) => { f[t.k] = Math.random() < 0.6; });
         if (fam === 'lattice' && f.counter === false && f.strands > 10) f.strands = 8;
         return { ...p, [fam]: f, plinthShape: fam === 'torsion' ? 'box' : (Math.random() < 0.5 ? 'round' : 'box') };
@@ -3072,7 +3108,7 @@ var TRCORE = (function () {
     }
 
     const F = P[fam], RF = R[fam];
-    const secSliders = fam === 'torsion' ? SECTION_SLIDERS[F.section] : [];
+    const secSliders = fam === 'torsion' ? SECTION_SLIDERS[F.section] : fam === 'lattice' ? INSIDE_SLIDERS[F.inside] : [];
     const st = res && res.stats;
     const supVol = res ? res.support.volume : 0;
     const eng = res && res.engraving;
@@ -3123,11 +3159,12 @@ var TRCORE = (function () {
             <${Slider} label="Total height" value=${P.height} min=${80} max=${300} step=${5} fmt=${(v) => v + ' mm'} onChange=${setTop('height')}/>
             <p className="tr-hint">Everything else scales with the height${st ? html`: this one stands on a footprint of ${st.size[0].toFixed(0)} × ${st.size[1].toFixed(0)} mm` : ''}. The sliders below show millimetres at this size.</p>
           </div>
-          <${Sec} k="shape" title="Shape" aside=${FAMILY_LABEL[fam] + (fam === 'torsion' ? ', ' + F.section : '')} open=${openSec} onToggle=${toggleSec}>
+          <${Sec} k="shape" title="Shape" aside=${FAMILY_LABEL[fam] + (fam === 'torsion' ? ', ' + F.section : fam === 'lattice' && F.inside === 'shells' ? ', nested' : '')} open=${openSec} onToggle=${toggleSec}>
             <select className="tr-family" aria-label="Family" value=${fam} onChange=${(e) => setTop('family')(e.target.value)}>
               ${Object.entries(FAMILY_LABEL).map(([k, l]) => html`<option key=${k} value=${k}>${l}</option>`)}
             </select>
             ${fam === 'torsion' && html`<${Seg} value=${F.section} onChange=${setFam('section')} options=${[['star', 'Star section'], ['slab', 'Slab section']]}/>`}
+            ${fam === 'lattice' && html`<${Seg} value=${F.inside} onChange=${setFam('inside')} options=${[['core', 'Drop inside'], ['shells', 'Nested cages']]}/>`}
             ${FAMILY_SLIDERS[fam].concat(secSliders).map((s) => html`<${Slider} key=${fam + s.k} label=${s.label} value=${F[s.k]} shown=${RF[s.k]}
               min=${s.min} max=${s.max} step=${s.step} fmt=${s.fmt} onChange=${setFam(s.k)}/>`)}
             ${TOGGLES[fam].map((t) => html`<label key=${t.k} className="tr-tog">
