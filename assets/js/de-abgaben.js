@@ -301,6 +301,7 @@
       est: (estEff - kgYear) / 12, soli: soliY / 12, kist: kistY / 12,
       rvAN: an.rv, kvAN: an.kv, pvAN: an.pv, avAN: an.av,
       ag: agSum, agParts: ag,
+      agByAdult: sv.map((s) => sum(s.ag) + s.ag.umlage + s.ag.pausch),
       gs: 0, wg: 0, kiz: 0,
       kindergeld: kgM, netLohn, disposable: netLohn + kgM,
       regime: 'none', kinds: sv.map((s) => s.kind), zvE,
