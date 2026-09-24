@@ -6,10 +6,10 @@
   <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Trophy Sculptor: Award Sculptures That Print Without Supports</title>
-  <meta name="description" content="Design an award sculpture for your 3D printer: set the height, shape a lattice, flame, twisted stele or crystal cluster, engrave the plinth, and download an STL that prints upright without support material. One colour or two, entirely in the browser.">
+  <meta name="description" content="Design an award sculpture for your 3D printer: set the height, shape a lattice, flame, twisted stele, crystal cluster or gnarled tree, engrave the plinth, and download an STL that prints upright without support material. One colour or two, entirely in the browser.">
   <link rel="canonical" href="https://alber.me/miscellaneous/tools/trophy-sculptor.html">
   <meta property="og:title" content="Trophy Sculptor: award sculptures that print without supports">
-  <meta property="og:description" content="Set the height, shape a lattice, flame, twisted stele or crystal cluster, engrave the plinth, and download an STL that prints upright without support material.">
+  <meta property="og:description" content="Set the height, shape a lattice, flame, twisted stele, crystal cluster or gnarled tree, engrave the plinth, and download an STL that prints upright without support material.">
   <meta property="og:url" content="https://alber.me/miscellaneous/tools/trophy-sculptor.html">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
@@ -72,7 +72,7 @@
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "Trophy Sculptor",
-    "description": "Designs award sculptures for 3D printing that print upright without support material: set the height, shape a lattice, flame, twisted stele or crystal cluster, engrave the plinth, and export an STL, or plinth and sculpture as two parts that are glued together.",
+    "description": "Designs award sculptures for 3D printing that print upright without support material: set the height, shape a lattice, flame, twisted stele, crystal cluster or gnarled tree, engrave the plinth, and export an STL, or plinth and sculpture as two parts that are glued together.",
     "url": "https://alber.me/miscellaneous/tools/trophy-sculptor.html",
     "applicationCategory": "DesignApplication",
     "inLanguage": "en",
@@ -110,9 +110,9 @@
   <main class="container">
     <div id="root" style="padding-top:var(--pico-spacing)">
       <h1>Trophy Sculptor</h1>
-      <p>Award sculptures for the 3D printer. Set the height first; everything else scales with it. Then pick one of four families, engrave the plinth and download an STL that prints upright without support material.</p>
+      <p>Award sculptures for the 3D printer. Set the height first; everything else scales with it. Then pick one of five families, engrave the plinth and download an STL that prints upright without support material.</p>
       <ul>
-        <li>Four families: a crossed lattice cage, a flame of turning ribbons, a twisted and leaning stele, a cluster of quartz crystals in a rock half sunk into the plinth.</li>
+        <li>Five families: a crossed lattice cage, a flame of turning ribbons, a twisted and leaning stele, a cluster of quartz crystals in a rock half sunk into the plinth, a gnarled tree whose branches thin by Murray's law.</li>
         <li>Printability is part of the construction: no surface leans past the overhang limit you set, and a layer-by-layer check confirms it.</li>
         <li>Engraving on the front of the plinth, cut at an angle that also prints without support.</li>
         <li>One part as a single STL, or plinth and sculpture as two parts in two colours, joined by steel dowel pins, a keyed boss and socket, or a wide foot.</li>
@@ -178,6 +178,9 @@ var TRCORE = (function () {
     },
     crystal: {
       count: 9, spread: 0.75, falloff: 0.5, thick: 11, cluster: 14, point: 1, seed: 1, rock: true, rockSize: 38
+    },
+    tree: {
+      depth: 6, forks: 2, fork: 1.3, asym: 0.3, ratio: 0.8, trunk: 0.25, thick: 7, upturn: 0.1, gnarl: 0.75, seed: 2, drops: false
     }
   };
 
@@ -774,6 +777,165 @@ var TRCORE = (function () {
     return { objects: objs, maxR: maxR, foot: foot, crease: true, rough: rough };
   }
 
+  /* ---------- family: tree ----------
+     A trunk forks, and each branch forks again, a few generations deep. A
+     round branch tilted by some angle has its underside leaning by exactly
+     that angle, so the overhang limit is simply the steepest a branch may
+     lean, as with the crystals; branches that would lean further are raised
+     to it, which is what gives the crown its goblet shape. Thicknesses follow
+     Murray's law: at every fork the cube of the parent's radius is the sum of
+     the children's cubes, the rule that holds for blood vessels and, roughly,
+     for trees. The fork angles come from the same principle (Murray 1926):
+     the children pull like forces proportional to their cross-sections, and
+     the pulls balance along the parent. A symmetric fork then opens by
+     2 × 37.5 degrees, and the thinner child of an uneven one swerves further.
+     Gnarl lets branches wander, swell and thin, break off early and now and
+     then fork three ways. Two things escape the tilt rule: a branch that
+     swells along its length leans its underside a little further, and the
+     blend in a crotch under a leaning fork faces further down than either
+     branch. So the tree is also made printable afterwards, by the rock's
+     cone fill on the whole grid (fill: true), which adds a sliver of
+     material wherever a layer would reach out too far. */
+  var TREE_TIP = 0.75;  // a twig's end radius relative to its start
+  function designTree(P, K, notes) {
+    var T = P.tree, hp = P.plinthH, objs = [];
+    var seed = Math.round(T.seed);
+    // shape and noise draw from separate streams, so gnarl roughens a tree rather than swapping it for another
+    var rng = mulberry32(3 + seed * 7919), rnd = mulberry32(11 + seed * 104729);
+    var tmax = Math.atan(K), sa = Math.sin(tmax);
+    var G = clamp(Math.round(T.depth), 1, 7), N = clamp(Math.round(T.forks), 2, 3);
+    var up = clamp(T.upturn, 0, 1), gn = clamp(T.gnarl, 0, 1), rMin = MIN_STRAND, floored = false;
+    var neck = NECK * P.scale, r0 = Math.max(T.thick, neck);
+    var norm = function (d) { var l = Math.hypot(d[0], d[1], d[2]) || 1; return [d[0] / l, d[1] / l, d[2] / l]; };
+    var cap = function (d) {
+      if (d[2] >= Math.cos(tmax)) return d;
+      var hl = Math.hypot(d[0], d[1]) || 1;
+      return [Math.sin(tmax) * d[0] / hl, Math.sin(tmax) * d[1] / hl, Math.cos(tmax)];
+    };
+    // a smooth random swelling along a branch, in [-1, 1]
+    var swell = function () {
+      var f1 = 2 + 3 * rnd(), f2 = 4 + 4 * rnd(), p1 = 6.283 * rnd(), p2 = 6.283 * rnd();
+      return function (t) { return 0.65 * Math.sin(f1 * t + p1) + 0.35 * Math.sin(f2 * t + p2); };
+    };
+    /* the children at a fork of a branch that starts with radius r: their
+       radii, their shares of its cross-section cubed, their angles and on
+       which side of the fork plane they go */
+    function kidsOf(r) {
+      var a = clamp(T.asym, 0, 0.9) * (0.7 + 0.6 * rng()), kids;
+      var n = rnd() < gn * 0.3 ? 5 - N : N;
+      if (n === 2) {
+        var w1 = (1 + a) / 2, r1 = r * Math.cbrt(w1), r2 = r * Math.cbrt(1 - w1);
+        // Murray's balance of the two pulls, solved for each child's angle
+        var q0 = r * r * r * r, q1 = r1 * r1 * r1 * r1, q2 = r2 * r2 * r2 * r2;
+        kids = [[r1, w1, Math.acos(clamp((q0 + q1 - q2) / (2 * r * r * r1 * r1), -1, 1)), 0],
+                [r2, 1 - w1, Math.acos(clamp((q0 + q2 - q1) / (2 * r * r * r2 * r2), -1, 1)), Math.PI]];
+      } else {
+        // a leader straight on, two laterals balancing each other
+        var wl = clamp((1 + 2 * a) / 3, 1 / 3, 0.9), rl = r * Math.cbrt(wl), rs = r * Math.cbrt((1 - wl) / 2);
+        var ts = Math.acos(clamp((r * r - rl * rl) / (2 * rs * rs), -1, 1));
+        kids = [[rl, wl, 0.08 * rng(), 0], [rs, (1 - wl) / 2, ts, 0], [rs, (1 - wl) / 2, ts, Math.PI]];
+      }
+      // held at the printable minimum; worth a note only where Murray asks for markedly less
+      kids.forEach(function (c) { if (c[0] < 0.75 * rMin) floored = true; if (c[0] < rMin) c[0] = rMin; });
+      return kids;
+    }
+    var widest = function (kids) { return Math.max.apply(null, kids.map(function (c) { return c[0]; })); };
+    /* The branches in crown units, grown from the top of the trunk. A branch
+       tapers from its own radius to that of its thicker child, so the leader
+       carries on without a step, as a real branch does between two forks. */
+    var br = [];
+    function grow(base, dir, len, r, gen, roll, stub) {
+      var n = up > 0 || gn > 0 ? 12 : 1, pts = [base], d = dir, p = base;
+      /* The wander is a smooth sideways swing, not a random walk: a walk
+         kinks the branch at every node, and the blend turns each kink into
+         a bump, a stack of vertebrae. The swing is added to the path first
+         and the cap then holds every segment to the limit. */
+      var u = Math.hypot(dir[0], dir[1]) > 1e-6 ? norm([-dir[1], dir[0], 0]) : [1, 0, 0];
+      var v = [dir[1] * u[2] - dir[2] * u[1], dir[2] * u[0] - dir[0] * u[2], dir[0] * u[1] - dir[1] * u[0]];
+      var f1 = 6.283 * (0.6 + rnd()), f2 = 6.283 * (0.6 + rnd()), p1 = 6.283 * rnd(), p2 = 6.283 * rnd(), amp = gn * 0.14 * len;
+      var off = function (t) {
+        var e = Math.sin(Math.PI * t) * amp, a = e * Math.sin(f1 * t + p1), b = e * Math.sin(f2 * t + p2);
+        return [a * u[0] + b * v[0], a * u[1] + b * v[1], a * u[2] + b * v[2]];
+      };
+      var q = base, prev = off(0);
+      for (var j = 1; j <= n; j++) {
+        // bending upwards only ever lowers the tilt
+        d = cap(norm([d[0], d[1], d[2] + up * 0.35 * j / n]));
+        q = [q[0] + d[0] * len / n, q[1] + d[1] * len / n, q[2] + d[2] * len / n];
+        var o = off(j / n), sg = [d[0] * len / n + o[0] - prev[0], d[1] * len / n + o[1] - prev[1], d[2] * len / n + o[2] - prev[2]];
+        prev = o;
+        var sl = Math.hypot(sg[0], sg[1], sg[2]), sd = cap(norm([sg[0], sg[1], Math.max(sg[2], 0.2 * sl)]));
+        p = [p[0] + sd[0] * sl, p[1] + sd[1] * sl, p[2] + sd[2] * sl];
+        pts.push(p);
+      }
+      if (n > 1) d = norm([p[0] - pts[n - 1][0], p[1] - pts[n - 1][1], p[2] - pts[n - 1][2]]);
+      var tip = gen === G || stub, kids = tip ? null : kidsOf(r);
+      br.push({ pts: pts, r0: r, r1: tip ? Math.max(rMin, r * TREE_TIP) : widest(kids), tip: tip, sw: swell() });
+      if (kids) spawn(p, d, kids, len, gen, roll);
+    }
+    function spawn(p, d, kids, len, gen, roll) {
+      // a basis across the branch's end direction
+      var u = Math.hypot(d[0], d[1]) > 1e-6 ? norm([-d[1], d[0], 0]) : [1, 0, 0];
+      var v = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
+      var phi = roll + 2.39996 + (rng() - 0.5) * 0.5;
+      kids.forEach(function (c, i) {
+        var th = c[2] * T.fork * (0.9 + 0.2 * rng()), ph = phi + c[3];
+        var e = [0, 1, 2].map(function (k) { return Math.cos(ph) * u[k] + Math.sin(ph) * v[k]; });
+        var cd = cap(norm([0, 1, 2].map(function (k) { return Math.cos(th) * d[k] + Math.sin(th) * e[k]; })));
+        // a thinner child is also a shorter one; now and then a gnarled one breaks off early
+        var stub = gen + 1 < G && gen >= 2 && i > 0 && rnd() < gn * 0.22, jit = 1 + gn * 0.6 * (rnd() - 0.5);
+        grow(p, cd, len * T.ratio * Math.pow(2 * c[1], 0.3) * (0.9 + 0.2 * rng()) * jit * (stub ? 0.5 : 1), c[0], gen + 1, ph, stub);
+      });
+    }
+    var kids0 = kidsOf(r0), rTop = widest(kids0);
+    spawn([0, 0, 0], [0, 0, 1], kids0, 1, 0, rng() * 2 * Math.PI);
+    /* The trunk takes its share of the height, the crown is scaled to end at
+       the top, tips and drops included; only lengths scale, not radii. */
+    var zt = hp + T.trunk * (P.height - hp), dropR = function (b) { return Math.max(b.r1 * 2.2, 1.5 * rMin); };
+    var ext = function (b) { return T.drops ? dropHeight(dropR(b), sa) - 0.5 * b.r1 : b.r1; };
+    var top = function (s) {
+      var m = 0;
+      br.forEach(function (b) { if (b.tip) m = Math.max(m, s * b.pts[b.pts.length - 1][2] + ext(b)); });
+      return zt + m;
+    };
+    var lo = 0, hi = 1;
+    while (top(hi) < P.height && hi < 1e4) hi *= 2;
+    for (var it = 0; it < 40; it++) { var mid = 0.5 * (lo + hi); if (top(mid) < P.height) lo = mid; else hi = mid; }
+    var s = lo, maxR = 0;
+    /* The trunk flares into the plinth like roots into the ground, and with
+       gnarl it swells, but it is never thinner than the neck the crown hangs on */
+    var nt = 16, tp = new Float64Array(3 * (nt + 1)), tr = new Float64Array(nt + 1), tsw = swell(), fl = 0.25 + 0.5 * gn;
+    for (var q = 0; q <= nt; q++) {
+      var tq = q / nt, zq = hp - 2 + (zt - hp + 2) * tq;
+      tp[3 * q + 2] = zq;
+      var rq = (r0 + (rTop - r0) * tq) * (1 + fl * Math.exp(-Math.max(0, zq - hp) / (0.1 * (zt - hp) + 1)) + 0.12 * gn * tsw(tq) * Math.sin(Math.PI * tq));
+      tr[q] = Math.max(rq, Math.min(neck, rTop));
+    }
+    objs.push(sweepObject({ pts: tp }, null, tr, tr, 1, P.blend * 2));
+    br.forEach(function (b) {
+      var n = b.pts.length, pts = new Float64Array(3 * n), ra = new Float64Array(n);
+      for (var j = 0; j < n; j++) {
+        pts[3 * j] = s * b.pts[j][0]; pts[3 * j + 1] = s * b.pts[j][1]; pts[3 * j + 2] = zt + s * b.pts[j][2];
+        var t = j / (n - 1);
+        // the swelling fades out at both ends, so forks still meet at their Murray radii
+        ra[j] = Math.max(rMin, (b.r0 + (b.r1 - b.r0) * t) * (1 + 0.3 * gn * b.sw(t) * Math.sin(Math.PI * t)));
+        maxR = Math.max(maxR, Math.hypot(pts[3 * j], pts[3 * j + 1]) + ra[j]);
+      }
+      // the blend grows with the branch, so crotches stay in proportion
+      objs.push(sweepObject({ pts: pts }, null, ra, ra, 1, Math.max(P.blend, 0.5 * b.r0)));
+      if (b.tip && T.drops) {
+        var R = dropR(b), cx = pts[3 * n - 3], cy = pts[3 * n - 2], tz = pts[3 * n - 1] - 0.5 * b.r1;
+        objs.push({ type: 'sdf', label: 3, k: Math.max(P.blend, b.r1),
+          bbox: [cx - R, cy - R, tz, cx + R, cy + R, tz + dropHeight(R, sa)],
+          f: function (x, y, z) { return dropSdf(Math.hypot(x - cx, y - cy), z, tz, R, sa); } });
+        maxR = Math.max(maxR, Math.hypot(cx, cy) + R);
+      }
+    });
+    if (floored) notes.push('The finest twigs are kept at ' + (2 * rMin).toFixed(1) + ' mm across; by Murray\'s law they would be thinner.');
+    // the plinth is sized for the trunk and the middle of the crown, not its full spread
+    return { objects: objs, maxR: Math.max(3 * r0, 0.6 * maxR), foot: tr[0], fill: true };
+  }
+
   /* ---------- lettering ----------
      Hershey's Simplex, the single-stroke font A. V. Hershey drew at the US
      National Bureau of Standards in 1967, public domain. One string per
@@ -1130,6 +1292,7 @@ var TRCORE = (function () {
     P.flame.base *= s;
     P.torsion.width *= s; P.torsion.sway *= s;
     P.crystal.thick *= s; P.crystal.cluster *= s; P.crystal.rockSize *= s;
+    P.tree.thick *= s;
     var lt = P.lattice.thick * s, ft = P.flame.thick * s;
     P.lattice.thick = Math.max(MIN_STRAND, lt);
     P.flame.thick = Math.max(MIN_STRAND * 1.2, ft);
@@ -1147,9 +1310,10 @@ var TRCORE = (function () {
     if (P.family === 'flame') d = designFlame(P, K, notes);
     else if (P.family === 'torsion') d = designTorsion(P, K, notes, rng);
     else if (P.family === 'crystal') d = designCrystal(P, K, notes);
+    else if (P.family === 'tree') d = designTree(P, K, notes);
     else d = designLattice(P, K, notes);
     d.objects.push(plinthObject(P, d.maxR, notes, d.foot));
-    return { P: P, objects: d.objects, notes: notes, K: K, crease: !!d.crease, rough: d.rough || null };
+    return { P: P, objects: d.objects, notes: notes, K: K, crease: !!d.crease, rough: d.rough || null, fill: !!d.fill };
   }
 
   /* ---------- distance field ---------- */
@@ -1569,6 +1733,26 @@ var TRCORE = (function () {
     return out;
   }
 
+  /* The rock's cone fill on the main grid, top down to zFrom: a layer is
+     widened to hold at least the layer above shrunk by what a layer may
+     overhang. Its distances are whole voxels, so it catches most slivers but
+     not every last one: the design limit sits only 8 % of a layer's reach
+     inside the checked one. A sub-voxel version (field over its in-layer
+     gradient) was tried and left more behind, not less. The hard union
+     follows, or a smooth union splatted afterwards (the plinth's fillet)
+     would lift the field back. */
+  function coneFill(g, zFrom, K) {
+    var sxy = g.nx * g.ny, lean = g.h * K, slice = new Float32Array(sxy), F = g.F, H = g.H;
+    for (var k = g.nz - 2; k >= 0 && g.z0 + k * g.h > zFrom; k--) {
+      slice.set(F.subarray(sxy * (k + 1), sxy * (k + 2)));
+      var inner = footField(slice, g.nx, g.ny, g.h), o = sxy * k;
+      for (var q = 0; q < sxy; q++) if (inner[q] < 0) {
+        var e = inner[q] + lean;
+        if (e < F[o + q]) { F[o + q] = e; if (H && e < H[o + q]) H[o + q] = e; }
+      }
+    }
+  }
+
   function jointSizes(P) {
     var c = clamp(P.clearance == null ? JOINT.clearance : P.clearance, 0, 0.6);
     return { depth: clamp(JOINT.depth * P.scale, 2, 8), wall: Math.max(0.8, JOINT.wall * P.scale), toe: JOINT.toe, c: c, cz: c + 0.1 };
@@ -1872,6 +2056,7 @@ var TRCORE = (function () {
     var plinth = D.objects.filter(function (o) { return o.label === 0 && o.last; })[0];
     var zc = D.P.plinthH, foot = null, flange = null;
     ordered.forEach(function (o, n) {
+      if (o === plinth && D.fill) coneFill(g, zc, D.K);
       if (o === plinth && D.P.parts === 'flange') {
         var fl = flangeObject(g, D.P, sliceAt(g.F, g, zc), plinth);
         if (fl) { splatSdf(g, fl); flange = fl.flange; }
@@ -2032,6 +2217,18 @@ var TRCORE = (function () {
       { k: 'point', label: 'Point length', min: 0.5, max: 2.5, step: 0.05, rnd: [0.8, 1.8], fmt: (v) => v.toFixed(2) + '× quartz' },
       { k: 'seed', label: 'Arrangement', min: 1, max: 50, step: 1, rnd: [1, 50] },
       { k: 'rockSize', label: 'Rock size', min: 12, max: 45, step: 0.5, rnd: [20, 40], fmt: (v) => mm(2 * v) }
+    ],
+    tree: [
+      { k: 'depth', label: 'Generations', min: 2, max: 7, step: 1, rnd: [3, 6] },
+      { k: 'forks', label: 'Branches per fork', min: 2, max: 3, step: 1, rnd: [2, 3] },
+      { k: 'fork', label: 'Fork angle', min: 0.4, max: 1.5, step: 0.05, rnd: [0.6, 1.3], fmt: (v) => v.toFixed(2) + '× Murray' },
+      { k: 'asym', label: 'Unevenness', min: 0, max: 0.8, step: 0.01, rnd: [0, 0.6], fmt: pct },
+      { k: 'ratio', label: 'Branch length', min: 0.5, max: 1, step: 0.01, rnd: [0.6, 0.92], fmt: pct },
+      { k: 'trunk', label: 'Trunk', min: 0.1, max: 0.6, step: 0.01, rnd: [0.15, 0.45], fmt: pct },
+      { k: 'thick', label: 'Trunk thickness', min: 4.5, max: 12, step: 0.1, rnd: [5.5, 10], fmt: (v) => mm(2 * v) },
+      { k: 'upturn', label: 'Upturn', min: 0, max: 1, step: 0.01, rnd: [0, 0.7], fmt: pct },
+      { k: 'gnarl', label: 'Gnarl', min: 0, max: 1, step: 0.01, rnd: [0.2, 1], fmt: pct },
+      { k: 'seed', label: 'Arrangement', min: 1, max: 50, step: 1, rnd: [1, 50] }
     ]
   };
   const SECTION_SLIDERS = {
@@ -2049,10 +2246,11 @@ var TRCORE = (function () {
     lattice: [{ k: 'counter', label: 'Crossed strands' }, { k: 'finial', label: 'Crown drop' }],
     flame: [{ k: 'counter', label: 'Crossed ribbons' }],
     torsion: [],
-    crystal: [{ k: 'rock', label: 'Rock base' }]
+    crystal: [{ k: 'rock', label: 'Rock base' }],
+    tree: [{ k: 'drops', label: 'Drop tips' }]
   };
 
-  const FAMILY_LABEL = { lattice: 'Lattice', flame: 'Flame', torsion: 'Torsion', crystal: 'Crystal' };
+  const FAMILY_LABEL = { lattice: 'Lattice', flame: 'Flame', torsion: 'Torsion', crystal: 'Crystal', tree: 'Tree' };
   const JOINT_LABEL = { one: 'One part', pin: 'Steel pins', socket: 'Socket', flange: 'Wide foot' };
 
   // what the filaments look like in the preview; the export carries no colour
@@ -2574,7 +2772,7 @@ var TRCORE = (function () {
       </div>
       <div className="tr-body">
         <details className="fold"><summary>How printability is built in</summary><div className="fold-body">
-          <p>A printer lays each layer on top of the one below, and a surface that leans too far from vertical has nothing underneath to rest on. The usual answer is support material, which leaves scars exactly where a trophy should be smooth. Here the overhang limit is a construction rule instead: every strand climbs no faster sideways than the limit allows, round shapes sit on a cone at that angle, and the twisted stele gives up some of its twist until no face leans too far. The crystals need no bargaining: a prism tilted by some angle has its lowest face leaning by exactly that angle, so each crystal leans no further than the limit, and the faces of its point, set at the 38° of real quartz, face upwards at any tilt that passes. The rock they grow from is an asteroid by the same generator as the <a href="/miscellaneous/tools/asteroid-corridor.html">Asteroid Corridor</a>, and noise and craters pay no attention to overhang limits. So the rock is checked layer by layer from the top down, and wherever a layer would reach out further than the one below can carry, a small cone grows underneath it. A layer-by-layer check on the finished solid then marks anything that still hangs in the air in red.</p>
+          <p>A printer lays each layer on top of the one below, and a surface that leans too far from vertical has nothing underneath to rest on. The usual answer is support material, which leaves scars exactly where a trophy should be smooth. Here the overhang limit is a construction rule instead: every strand climbs no faster sideways than the limit allows, round shapes sit on a cone at that angle, and the twisted stele gives up some of its twist until no face leans too far. The crystals need no bargaining: a prism tilted by some angle has its lowest face leaning by exactly that angle, so each crystal leans no further than the limit, and the faces of its point, set at the 38° of real quartz, face upwards at any tilt that passes. The rock they grow from is an asteroid by the same generator as the <a href="/miscellaneous/tools/asteroid-corridor.html">Asteroid Corridor</a>, and noise and craters pay no attention to overhang limits. So the rock is checked layer by layer from the top down, and wherever a layer would reach out further than the one below can carry, a small cone grows underneath it. The tree works like the crystals: a round branch tilted by some angle has an underside that leans by exactly that angle, so no branch may lean further than the limit, and the ones that would are raised to it, which is what gives the crown its shape. How thick each branch is follows Murray's law, the rule for blood vessels and, roughly, for trees: at every fork the cube of the parent's radius equals the sum of the cubes of its children. The fork angles come from the same principle, and a symmetric fork opens by twice 37.5°. Two things escape the tilt rule: a gnarled branch that swells as it rises, and the blend in a crotch under a leaning fork, which faces further down than either branch. So the tree gets the rock's cone fill as well, and it catches most of these slivers. A layer-by-layer check on the finished solid then marks anything that still hangs in the air in red.</p>
           <p>The engraving follows the same rule. It is cut as if by a V-shaped bit whose flanks lean at the overhang limit, so the ceiling of a horizontal stroke prints like any other slope.</p>
         </div></details>
         <details className="fold"><summary>Two parts</summary><div className="fold-body">
