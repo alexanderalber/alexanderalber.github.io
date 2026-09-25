@@ -98,18 +98,19 @@
 
   /* ===== Einkommensteuer ===== */
 
-  // § 32a Abs. 1 EStG 2026, Grundtarif; Ergebnis auf volle Euro abgerundet
-  function estTarif(x) {
-    x = Math.floor(x);
+  // § 32a Abs. 1 EStG 2026, Grundtarif; Ergebnis auf volle Euro abgerundet.
+  // smooth laesst beide Abrundungen weg (siehe household, h.smooth).
+  function estTarif(x, smooth) {
+    if (!smooth) x = Math.floor(x);
     let t;
     if (x <= 12348) t = 0;
     else if (x <= 17799) { const y = (x - 12348) / 10000; t = (914.51 * y + 1400) * y; }
     else if (x <= 69878) { const z = (x - 17799) / 10000; t = (173.10 * z + 2397) * z + 1034.87; }
     else if (x <= 277825) t = 0.42 * x - 11135.63;
     else t = 0.45 * x - 19470.38;
-    return Math.floor(t);
+    return smooth ? t : Math.floor(t);
   }
-  const estSplit = (x) => 2 * estTarif(x / 2);
+  const estSplit = (x, smooth) => 2 * estTarif(x / 2, smooth);
 
   // SolZG: 5,5 % oberhalb der Freigrenze, in der Milderungszone hoechstens
   // 11,9 % des Ueberhangs. Das erzeugt die Zacke im Grenzsteuersatz.
@@ -198,7 +199,7 @@
   }
 
   /* ===== Wohngeld, § 19 WoGG, Monatswert ===== */
-  function wohngeld(n, rentCold, Ymonth, stufe, P) {
+  function wohngeld(n, rentCold, Ymonth, stufe, P, smooth) {
     if (n < 1) return 0;
     const k = Math.min(n, 12);
     const s = Math.max(1, Math.min(7, stufe)) - 1;
@@ -214,7 +215,7 @@
     if (Y < mY) Y = mY;
     const [a, b, c] = P.wgCoeff[k - 1];
     const w = 1.15 * (M - (a + b * M + c * Y) * Y);
-    const r = Math.floor(w + 0.5);
+    const r = smooth ? w : Math.floor(w + 0.5);
     if (r < P.wgMinPayout) return 0;
     return Math.min(r, M);
   }
@@ -229,11 +230,19 @@
        parentPV: bool               Elterneigenschaft auch ohne Kind in der Liste
        miniRvExempt: bool
        transfers: bool, rentCold, heat, stufe
+       smooth:   bool               ohne die Rundung auf volle Euro
      }
      Rueckgabe in Euro pro Monat. est ist die Einkommensteuer NACH
      Familienleistungsausgleich, also abzueglich Kindergeld: der Gesetzgeber
      behandelt das Kindergeld als Steuerverguetung (§ 31 EStG), und nur so
-     bleibt die Guenstigerpruefung eine stetige Groesse statt zwei Kurven. */
+     bleibt die Guenstigerpruefung eine stetige Groesse statt zwei Kurven.
+
+     smooth: Einkommensteuer (zvE und Steuer je auf volle Euro abgerundet) und
+     Wohngeld (kaufmaennisch auf volle Euro) werden ungerundet gerechnet. Die
+     Betraege aendern sich um weniger als einen Euro im Monat, aber ein
+     Differenzenquotient ueber wenige Euro misst sonst die Rundungstreppe:
+     12 Euro Jahresbrutto mehr bringen je nach Lage 3 oder 4 Euro Steuer, also
+     einen Grenzsatz, der zwischen 25 und 33 % springt. */
   function household(h, P) {
     P = P || P2026;
     const kids = (h.kids || []).filter((a) => a >= 0 && a <= 24);
@@ -242,6 +251,7 @@
     const adults = h.adults.slice(0, nA);
     const married = nA === 2 && !!h.married;
     const single = nA === 1;
+    const sm = !!h.smooth;
     const kvZusatz = h.kvZusatz == null ? P.kvZusatzAvg : h.kvZusatz;
     const parent = nK > 0 || !!h.parentPV;
     const pvAbate = nK >= 2 ? Math.min(P.pvAbateMaxChildren, nK - 1) * P.pvAbatePerChild : 0;
@@ -261,7 +271,7 @@
     if (married) {
       splitting = true;
       const z = Math.max(0, zvE[0] + zvE[1]);
-      const no = estSplit(z), withK = estSplit(Math.max(0, z - nK * P.kfbPerChild));
+      const no = estSplit(z, sm), withK = estSplit(Math.max(0, z - nK * P.kfbPerChild), sm);
       estEff = Math.min(no, withK + kgYear);
       estKfb = withK;
       soliY = soli(withK, true, P);
@@ -274,8 +284,8 @@
         let z = z0;
         if (single && nK > 0) z -= P.entlastungAE + (nK - 1) * P.entlastungAEPlus;
         z = Math.max(0, z);
-        const no = estTarif(z);
-        const withK = estTarif(Math.max(0, z - kfbShare * nK * P.kfbPerChild));
+        const no = estTarif(z, sm);
+        const withK = estTarif(Math.max(0, z - kfbShare * nK * P.kfbPerChild), sm);
         estEff += Math.min(no, withK + kfbShare * kgYear);
         estKfb += withK;
         soliY += soli(withK, false, P);
@@ -331,7 +341,7 @@
       yYear += Math.max(0, gy - Math.min(P.wgWK, gy)) * (1 - pct);
     });
     if (single && minors > 0) yYear -= P.wgFbAE;
-    const wg = wohngeld(nA + nK, rentCold, Math.max(0, yYear) / 12, h.stufe || 4, P);
+    const wg = wohngeld(nA + nK, rentCold, Math.max(0, yYear) / 12, h.stufe || 4, P, sm);
 
     // Kinderzuschlag, § 6a BKGG
     let kiz = 0;
