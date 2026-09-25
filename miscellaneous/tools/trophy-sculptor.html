@@ -769,12 +769,20 @@ var TRCORE = (function () {
     };
   }
 
-  /* Surface nets place a vertex from the sampled field, which rounds off the
-     V-grooves of the lettering at any practical voxel size. The plinth's
-     field is analytic, so vertices near the lettering are moved onto its
-     exact surface with two Newton steps. */
-  function refineEngraving(mesh, o, h) {
-    if (!o || !o.engraving) return;
+  /* Surface nets place one vertex per cell somewhere on the surface, so the
+     edges of a groove (where the wall meets a flank, and the valley where
+     the flanks meet) run from cell to cell in a staircase. The plinth's field
+     is analytic, so near the lettering each vertex is placed as in dual
+     contouring instead: the exact crossing points and normals on the cell's
+     edges define planes, and the vertex goes to the point closest to all of
+     them. Where two planes meet that is on the crease, where one plane is
+     alone it stays at the mean of the crossings.
+     That needs a groove at least two cells wide. In a narrower one a single
+     cell holds both rims and the valley, the wall's planes win and the groove
+     closes up, so there the vertices only take two Newton steps onto the
+     exact surface, which keeps the groove but not its edges. */
+  var LAMBDA = 0.02;
+  function newtonOnto(mesh, o, h) {
     var p = mesh.positions, nm = mesh.normals, nv = p.length / 3, e = 0.02;
     for (var v = 0; v < nv; v++) {
       var x = p[3 * v], y = p[3 * v + 1], z = p[3 * v + 2];
@@ -793,6 +801,122 @@ var TRCORE = (function () {
         nm[3 * v] = gx / gl; nm[3 * v + 1] = gy / gl; nm[3 * v + 2] = gz / gl;
       }
       p[3 * v] = x; p[3 * v + 1] = y; p[3 * v + 2] = z;
+    }
+  }
+  function refineEngraving(mesh, o) {
+    if (!o || !o.engraving || !mesh.cells) return;
+    if (o.engraving.groove < 2 * mesh.grid.h) { newtonOnto(mesh, o, mesh.grid.h); return; }
+    var p = mesh.positions, nm = mesh.normals, nv = p.length / 3, G = mesh.grid, h = G.h, e = h * 0.01;
+    var CO = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
+    var EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+    var cv = new Float64Array(8), A = new Float64Array(9), bv = new Float64Array(3);
+    var P0 = p.slice(), N0 = nm.slice();
+    for (var v = 0; v < nv; v++) {
+      if (!o.inText(p[3 * v], p[3 * v + 1], p[3 * v + 2])) continue;
+      var c = mesh.cells[v], ci = c % G.nx, cj = Math.floor(c / G.nx) % G.ny, ck = Math.floor(c / (G.nx * G.ny));
+      var X0 = G.x0 + ci * h, Y0 = G.y0 + cj * h, Z0 = G.z0 + ck * h;
+      for (var q = 0; q < 8; q++) cv[q] = o.f(X0 + CO[q][0] * h, Y0 + CO[q][1] * h, Z0 + CO[q][2] * h);
+      A.fill(0); bv.fill(0);
+      var mx = 0, my = 0, mz = 0, cnt = 0, sx = 0, sy = 0, sz = 0;
+      for (var k = 0; k < 12; k++) {
+        var ea = EDGES[k][0], eb = EDGES[k][1], fa = cv[ea], fb = cv[eb];
+        if ((fa < 0) === (fb < 0)) continue;
+        // the crossing on this edge: bisection, the field is not linear across a crease
+        var lo = 0, hi = 1, flo = fa;
+        for (var it = 0; it < 12; it++) {
+          var mid = (lo + hi) / 2, fm = o.f(X0 + (CO[ea][0] + mid * (CO[eb][0] - CO[ea][0])) * h,
+            Y0 + (CO[ea][1] + mid * (CO[eb][1] - CO[ea][1])) * h, Z0 + (CO[ea][2] + mid * (CO[eb][2] - CO[ea][2])) * h);
+          if ((fm < 0) === (flo < 0)) { lo = mid; flo = fm; } else hi = mid;
+        }
+        var t = (lo + hi) / 2;
+        var px = X0 + (CO[ea][0] + t * (CO[eb][0] - CO[ea][0])) * h, py = Y0 + (CO[ea][1] + t * (CO[eb][1] - CO[ea][1])) * h, pz = Z0 + (CO[ea][2] + t * (CO[eb][2] - CO[ea][2])) * h;
+        var gx = o.f(px + e, py, pz) - o.f(px - e, py, pz), gy = o.f(px, py + e, pz) - o.f(px, py - e, pz), gz = o.f(px, py, pz + e) - o.f(px, py, pz - e);
+        var gl = Math.sqrt(gx * gx + gy * gy + gz * gz);
+        if (!(gl > 0)) continue;
+        gx /= gl; gy /= gl; gz /= gl;
+        var dn = gx * px + gy * py + gz * pz;
+        A[0] += gx * gx; A[1] += gx * gy; A[2] += gx * gz; A[4] += gy * gy; A[5] += gy * gz; A[8] += gz * gz;
+        bv[0] += gx * dn; bv[1] += gy * dn; bv[2] += gz * dn;
+        mx += px; my += py; mz += pz; sx += gx; sy += gy; sz += gz; cnt++;
+      }
+      if (!cnt) continue;
+      mx /= cnt; my /= cnt; mz /= cnt;
+      /* Relative to the mass point, with a light pull towards it: along a
+         crease no plane fixes the vertex, and where the planes are nearly
+         parallel it would otherwise shoot off to wherever they happen to
+         cross. The pull damps those directions instead of cutting them off,
+         which measured better than a truncated pseudo-inverse. */
+      var lam = LAMBDA * cnt;
+      var r0 = bv[0] - (A[0] * mx + A[1] * my + A[2] * mz), r1 = bv[1] - (A[1] * mx + A[4] * my + A[5] * mz), r2 = bv[2] - (A[2] * mx + A[5] * my + A[8] * mz);
+      var a = A[0] + lam, b = A[1], cc = A[2], d = A[4] + lam, f = A[5], i2 = A[8] + lam;
+      var c0 = d * i2 - f * f, c1 = cc * f - b * i2, c2 = b * f - cc * d, det = a * c0 + b * c1 + cc * c2;
+      if (!(Math.abs(det) > 1e-12)) continue;
+      var ox = (c0 * r0 + c1 * r1 + c2 * r2) / det;
+      var oy = (c1 * r0 + (a * i2 - cc * cc) * r1 + (cc * b - a * f) * r2) / det;
+      var oz = (c2 * r0 + (b * cc - a * f) * r1 + (a * d - b * b) * r2) / det;
+      // stay in the cell, with the same slack surface nets allows
+      p[3 * v] = clamp(mx + ox, X0 - 0.1 * h, X0 + 1.1 * h);
+      p[3 * v + 1] = clamp(my + oy, Y0 - 0.1 * h, Y0 + 1.1 * h);
+      p[3 * v + 2] = clamp(mz + oz, Z0 - 0.1 * h, Z0 + 1.1 * h);
+      var sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      if (sl > 0) { nm[3 * v] = sx / sl; nm[3 * v + 1] = sy / sl; nm[3 * v + 2] = sz / sl; }
+    }
+    /* Where a groove is barely wider than a cell, one cell holds both rims
+       and the valley, and the closest point to all of them can fold a
+       triangle over. Such triangles get their surface nets vertices back. */
+    var I = mesh.indices;
+    function turned(t, Q) {
+      var a = 3 * I[t], b = 3 * I[t + 1], c = 3 * I[t + 2];
+      var ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2], wx = p[c] - p[a], wy = p[c + 1] - p[a + 1], wz = p[c + 2] - p[a + 2];
+      var Ux = Q[b] - Q[a], Uy = Q[b + 1] - Q[a + 1], Uz = Q[b + 2] - Q[a + 2], Wx = Q[c] - Q[a], Wy = Q[c + 1] - Q[a + 1], Wz = Q[c + 2] - Q[a + 2];
+      return (uy * wz - uz * wy) * (Uy * Wz - Uz * Wy) + (uz * wx - ux * wz) * (Uz * Wx - Ux * Wz) + (ux * wy - uy * wx) * (Ux * Wy - Uy * Wx) < 0;
+    }
+    for (var pass = 0; pass < 3; pass++) {
+      var reverted = 0;
+      for (var t = 0; t < I.length; t += 3) {
+        if (!turned(t, P0)) continue;
+        for (var s = 0; s < 3; s++) {
+          var w = 3 * I[t + s];
+          if (p[w] === P0[w] && p[w + 1] === P0[w + 1] && p[w + 2] === P0[w + 2]) continue;
+          p[w] = P0[w]; p[w + 1] = P0[w + 1]; p[w + 2] = P0[w + 2];
+          nm[w] = N0[w]; nm[w + 1] = N0[w + 1]; nm[w + 2] = N0[w + 2];
+          reverted++;
+        }
+      }
+      if (!reverted) break;
+    }
+    /* Surface nets split each quad along its shorter diagonal, chosen before
+       the vertices moved. Along a crease the right diagonal is the one that
+       follows it, i.e. whose midpoint lies on the surface. Triangles come in
+       pairs from one quad each, (P, u, Q) and (P, Q, w) up to rotation. */
+    function faceDot(a, b, c, a2, b2, c2) {
+      var n1 = cross(a, b, c), n2 = cross(a2, b2, c2);
+      return n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+    }
+    function cross(a, b, c) {
+      a *= 3; b *= 3; c *= 3;
+      var ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2], wx = p[c] - p[a], wy = p[c + 1] - p[a + 1], wz = p[c + 2] - p[a + 2];
+      return [uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx];
+    }
+    function midF(a, b) {
+      a *= 3; b *= 3;
+      return Math.abs(o.f((p[a] + p[b]) / 2, (p[a + 1] + p[b + 1]) / 2, (p[a + 2] + p[b + 2]) / 2));
+    }
+    for (var t2 = 0; t2 + 5 < I.length; t2 += 6) {
+      var T1 = [I[t2], I[t2 + 1], I[t2 + 2]], T2 = [I[t2 + 3], I[t2 + 4], I[t2 + 5]];
+      var ui = -1;
+      for (var r = 0; r < 3; r++) if (T2.indexOf(T1[r]) < 0) ui = r;
+      if (ui < 0) continue;
+      var Pv = T1[(ui + 2) % 3], U = T1[ui], Qv = T1[(ui + 1) % 3], W = -1;
+      for (var r2 = 0; r2 < 3; r2++) if (T2[r2] !== Pv && T2[r2] !== Qv) W = T2[r2];
+      if (W < 0) continue;
+      var um = 3 * U, wm = 3 * W;
+      if (!o.inText((p[um] + p[wm]) / 2, (p[um + 1] + p[wm + 1]) / 2, (p[um + 2] + p[wm + 2]) / 2)) continue;
+      if (midF(U, W) >= midF(Pv, Qv)) continue;
+      // the new pair must face the way the old one did
+      if (faceDot(Pv, U, W, Pv, U, Qv) <= 0 || faceDot(U, Qv, W, Pv, U, Qv) <= 0 || faceDot(Pv, U, W, Pv, Qv, W) <= 0 || faceDot(U, Qv, W, Pv, Qv, W) <= 0) continue;
+      I[t2] = Pv; I[t2 + 1] = U; I[t2 + 2] = W;
+      I[t2 + 3] = U; I[t2 + 4] = Qv; I[t2 + 5] = W;
     }
   }
 
@@ -961,6 +1085,7 @@ var TRCORE = (function () {
     var nx = g.nx, ny = g.ny, nz = g.nz, F = g.F, h = g.h;
     var cx = nx - 1, cy = ny - 1, sxy = nx * ny;
     var cap = 1 << 18, pos = new Float32Array(cap * 3), nrm = new Float32Array(cap * 3), lab = new Uint8Array(cap), nv = 0;
+    var cell = new Int32Array(cap);  // the grid cell of each vertex, for refineEngraving
     var icap = 1 << 19, ind = new Uint32Array(icap * 3), nt = 0;
     var prev = new Int32Array(cx * cy), cur = new Int32Array(cx * cy);
     var EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
@@ -1031,12 +1156,14 @@ var TRCORE = (function () {
             var p2 = new Float32Array(cap * 3); p2.set(pos); pos = p2;
             var n2 = new Float32Array(cap * 3); n2.set(nrm); nrm = n2;
             var l2 = new Uint8Array(cap); l2.set(lab); lab = l2;
+            var c2a = new Int32Array(cap); c2a.set(cell); cell = c2a;
           }
           pos[3 * nv] = g.x0 + (i + fx) * h; pos[3 * nv + 1] = g.y0 + (j + fy) * h; pos[3 * nv + 2] = g.z0 + (k + fz) * h;
           // label of the most interior corner
           var best = 0;
           for (var c3 = 1; c3 < 8; c3++) if (v[c3] < v[best]) best = c3;
           lab[nv] = g.L[base + CO[best][0] + nx * CO[best][1] + sxy * CO[best][2]];
+          cell[nv] = base;
           cur[i + cx * j] = nv++;
         }
       }
@@ -1064,7 +1191,8 @@ var TRCORE = (function () {
     }
     return {
       positions: pos.slice(0, 3 * nv), normals: nrm.slice(0, 3 * nv), labels: lab.slice(0, nv),
-      indices: ind.slice(0, 3 * nt)
+      indices: ind.slice(0, 3 * nt),
+      cells: cell.slice(0, nv), grid: { x0: g.x0, y0: g.y0, z0: g.z0, h: h, nx: nx, ny: ny }
     };
   }
 
@@ -1491,7 +1619,8 @@ var TRCORE = (function () {
       var nIn = 0;
       for (var fi = 0; fi < foot.length; fi++) if (foot[fi] < 0) nIn++;
       glue = nIn * g.h * g.h;
-      refineEngraving(parts[0], plinth, voxel);
+      refineEngraving(parts[0], plinth);
+      parts.forEach(function (m) { delete m.cells; delete m.grid; });
       sup = joinSupport(B.support[0], B.support[1]);
       var s0 = meshStats(parts[0]), s1 = meshStats(parts[1]), bb = [];
       for (var c = 0; c < 3; c++) { bb[c] = Math.min(s0.bbox[c], s1.bbox[c]); bb[c + 3] = Math.max(s0.bbox[c + 3], s1.bbox[c + 3]); }
@@ -1501,7 +1630,8 @@ var TRCORE = (function () {
       sup = supportCheck(g, D.P.overhang);
       tCheck = Date.now();
       mesh = surfaceNets(g, progress);
-      refineEngraving(mesh, plinth, voxel);
+      refineEngraving(mesh, plinth);
+      delete mesh.cells; delete mesh.grid;
       st = meshStats(mesh);
     }
     var tMesh = Date.now();
