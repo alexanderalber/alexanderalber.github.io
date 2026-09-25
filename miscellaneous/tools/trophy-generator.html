@@ -196,8 +196,9 @@ var TRCORE = (function () {
       tip: 0.35, ribbon: 2.2, spread: 0.4, tipIn: 0.25, counter: false
     },
     torsion: {
-      section: 'star', width: 50, aspect: 0.32, squareness: 4, arms: 3, depth: 0.6,
-      sharp: 1.6, twist: 240, taper: 0.55, sway: 6, slant: 18
+      section: 'star', width: 50, aspect: 0.32, arms: 3, depth: 0.6,
+      sharp: 1.6, twist: 240, taper: 0.55, sway: 6, slant: 18,
+      curl: 0.75, wall: 0.3, slit: 50, strands: 3, strand: 0.36, core: 0.6
     },
     crystal: {
       count: 9, spread: 0.75, falloff: 0.5, thick: 11, cluster: 14, point: 1, seed: 1, rock: true, rockSize: 38
@@ -249,7 +250,9 @@ var TRCORE = (function () {
       climb: 10,          // bank: nose above the horizontal, degrees
       sweep: 50, teSweep: 35,    // climb: leading edge swept back, trailing edge forward, degrees
       pitch: 20,          // climb: nose from vertical, degrees
-      cut: 0.65           // f22: where it stands, metres of the real aircraft behind the wingtips' trailing corners
+      cut: 0.65,          // f22 on its tail: where it is cut, metres of the real aircraft behind the wingtips' trailing corners
+      stand: 'tail',      // f22: tail on the plinth, nose up | nose: nose down in the ground, tail up
+      sink: 1.7           // f22 nose down: metres of the nose, from its tip, that are in the ground
     },
     lasso: {
       prefix: 2,          // states on the stem
@@ -473,7 +476,8 @@ var TRCORE = (function () {
     /* one cage of radius share f. Its strands keep the outer cage's spacing
        along the circumference, so an inner cage has fewer of them, and it is
        turned by half a spacing per level so the strands of neighbouring cages
-       do not line up behind each other. */
+       do not line up behind each other. Without crossed strands the cages
+       turn in alternate directions, the outer one as a single cage would. */
     var cage = function (f, level) {
       var rOfF = function (z) { return f * rOf(z); };
       var slopeOf = function (z) { return (rOfF(z + 0.05) - rOfF(z - 0.05)) / 0.1; };
@@ -481,7 +485,7 @@ var TRCORE = (function () {
       Nf = counter ? Math.max(4, 2 * Math.round(Nf / 2)) : Math.max(3, Nf);
       var perDir = counter ? Math.max(1, Math.round(Nf / 2)) : Nf;
       for (var s = 0; s < Nf; s++) {
-        var dir = counter ? (s % 2 ? -1 : 1) : 1;
+        var dir = counter ? (s % 2 ? -1 : 1) : (level % 2 ? -1 : 1);
         var idx = counter ? Math.floor(s / 2) : s;
         var phase = 2 * Math.PI * (idx + 0.5 * level) / perDir + (counter && dir < 0 ? Math.PI / perDir : 0);
         var path = strandPath(z0, z1, n, rOfF, aOf, phase, dir, L.twist, K, thick * 1.5);
@@ -495,7 +499,7 @@ var TRCORE = (function () {
         }
         var fr = L.ribbon !== 1 ? surfaceFrames(path.pts, slopeOf) : null;
         var li = leadIn(path, fr, wa, wb, thick * 1.5);
-        objs.push(sweepObject(li.path, li.fr, li.wa, li.wb, counter && dir < 0 ? 2 : 1, P.blend));
+        objs.push(sweepObject(li.path, li.fr, li.wa, li.wb, dir < 0 ? 2 : 1, P.blend));
       }
     };
     var shells = L.inside === 'shells' ? Math.max(1, Math.round(L.shells)) : 1;
@@ -645,25 +649,75 @@ var TRCORE = (function () {
   }
 
   /* ---------- family: torsion ----------
-     A stele with a star or slab section, twisted, tapered and leaning,
-     cut off by an inclined plane at the top. */
+     A stele with a star section or one of the field sections below, twisted,
+     tapered and leaning, cut off by an inclined plane at the top. */
+
+  /* The rim of a section given only by its field: the zero crossings on a
+     grid edge, each with the field's gradient as its outward normal. Sections
+     that are not star-shaped around the axis, or come in several pieces,
+     have no single angle parameter, so the overhang check and the foot read
+     this instead. */
+  function sectionRim(d, ext) {
+    var n = 100, h = 2 * ext / n, e = h * 0.25, v = [], rim = [];
+    for (var j = 0; j <= n; j++) for (var i = 0; i <= n; i++) v.push(d(-ext + i * h, -ext + j * h));
+    var push = function (x, y) {
+      var gx = d(x + e, y) - d(x - e, y), gy = d(x, y + e) - d(x, y - e), gl = Math.hypot(gx, gy) || 1;
+      rim.push([x, y, gx / gl, gy / gl]);
+    };
+    for (var j2 = 0; j2 <= n; j2++) for (var i2 = 0; i2 <= n; i2++) {
+      var a = v[j2 * (n + 1) + i2], x0 = -ext + i2 * h, y0 = -ext + j2 * h;
+      if (i2 < n) { var b = v[j2 * (n + 1) + i2 + 1]; if ((a < 0) !== (b < 0)) push(x0 + h * a / (a - b), y0); }
+      if (j2 < n) { var c = v[(j2 + 1) * (n + 1) + i2]; if ((a < 0) !== (c < 0)) push(x0, y0 + h * a / (a - c)); }
+    }
+    return rim;
+  }
+  function fieldSection(d, R) {
+    var rim = sectionRim(d, 1.15 * R), rmax = 0;
+    rim.forEach(function (p) { rmax = Math.max(rmax, Math.hypot(p[0], p[1])); });
+    return { rmax: rmax, d: d, rim: rim };
+  }
+
   function sectionSdf(T) {
-    if (T.section === 'slab') {
-      var a = T.width / 2, b = a * clamp(T.aspect, 0.08, 1), n = clamp(T.squareness, 2, 10);
-      return {
-        rmax: Math.hypot(a, b),
-        d: function (x, y) {
-          var X = Math.abs(x) / a + 1e-9, Y = Math.abs(y) / b + 1e-9;
-          var S = Math.pow(X, n) + Math.pow(Y, n), G = Math.pow(S, 1 / n);
-          var k = Math.pow(G, 1 - n);
-          var gx = Math.pow(X, n - 1) * k / a, gy = Math.pow(Y, n - 1) * k / b;
-          return (G - 1) / Math.hypot(gx, gy);
-        },
-        boundary: function (t) {
-          var c = Math.cos(t), s = Math.sin(t);
-          return [a * Math.sign(c) * Math.pow(Math.abs(c), 2 / n), b * Math.sign(s) * Math.pow(Math.abs(s), 2 / n)];
+    var R0 = T.width / 2, thin = 1 / Math.min(1, clamp(T.taper, 0.2, 1.6));
+    if (T.section === 'crescent') {
+      /* a sickle: a disc with a bigger disc bitten out of one side. The back is
+         Thickness thick; Curl moves the bite in, so the horns reach further
+         round. Horns rounded, and the whole centred on the axis. */
+      var tb = R0 * clamp(T.aspect, 0.1, 1), ec = Math.max(R0 * (0.95 - 0.75 * clamp(T.curl, 0, 1)), 0.5 * tb + 0.1 * R0);
+      var rb = R0 + ec - tb, kc = Math.min(0.8 + 0.02 * R0, 0.3 * tb);
+      var ra2 = R0 - kc, rb2 = rb + kc;
+      var am = (ra2 * ra2 - rb2 * rb2 + ec * ec) / (2 * ec), bm = Math.sqrt(Math.max(ra2 * ra2 - am * am, 0));
+      // the horn tips' x: the section spans -R0 to xh, and its middle goes onto the axis
+      var xh = (R0 * R0 - rb * rb + ec * ec) / (2 * ec), sh = 0.5 * (xh - R0);
+      return fieldSection(function (x, y) {
+        var px = x + sh, py = Math.abs(y);
+        if (ec * (px * bm - py * am) > ec * ec * Math.max(bm - py, 0)) return Math.hypot(px - am, py - bm) - kc;
+        return Math.max(Math.hypot(px, py) - ra2, rb2 - Math.hypot(px - ec, py)) - kc;
+      }, R0);
+    }
+    if (T.section === 'tube') {
+      // a pipe with one slit along it, the slit's edges rounded; the twist winds the slit up
+      var wt = Math.max(R0 * clamp(T.wall, 0.1, 0.6), 2.4 * thin), ra = R0 - wt / 2, rw = wt / 2;
+      var th = Math.max(0.3 * Math.PI, Math.PI - clamp(T.slit, 10, 150) * Math.PI / 360 - rw / ra);
+      var sx = Math.sin(th), cy = Math.cos(th);
+      return fieldSection(function (x, y) {
+        var px = Math.abs(x);
+        return (cy * px > sx * y ? Math.hypot(px - sx * ra, y - cy * ra) : Math.abs(Math.hypot(px, y) - ra)) - rw;
+      }, R0);
+    }
+    if (T.section === 'strands') {
+      /* round strands on a circle, melted into a core if there is one: a rope,
+         or with no core free helices that only meet the plinth */
+      var ns = Math.max(2, Math.round(T.strands)), rs = Math.max(R0 * clamp(T.strand, 0.15, 0.5), 2 * thin), rc = R0 - rs;
+      var rco = rc * clamp(T.core, 0, 1), ks = 0.4 * rs;
+      return fieldSection(function (x, y) {
+        var d = rco > 0.5 ? Math.hypot(x, y) - rco : Infinity;
+        for (var q = 0; q < ns; q++) {
+          var aq = 2 * Math.PI * q / ns;
+          d = smin(d, Math.hypot(x - rc * Math.cos(aq), y - rc * Math.sin(aq)) - rs, ks);
         }
-      };
+        return d;
+      }, R0);
     }
     var R = T.width / 2, m = Math.max(2, Math.round(T.arms)), dep = clamp(T.depth, 0, 0.9), p = clamp(T.sharp, 0.5, 4);
     var rf = function (ph) { return R * (1 - dep + dep * Math.pow((1 + Math.cos(m * ph)) / 2, p)); };
@@ -698,19 +752,27 @@ var TRCORE = (function () {
         cy: function (s) { return sw * Math.sin(Math.PI * s) * Math.sin(swayDir); }
       };
     };
+    // rim points with their outward normals: from the field, or along the boundary curve
+    var rimPts = sec.rim;
+    if (!rimPts) {
+      var bp0 = [];
+      for (var b0 = 0; b0 < 180; b0++) bp0.push(sec.boundary(2 * Math.PI * b0 / 180));
+      rimPts = bp0.map(function (p, b) {
+        var q = bp0[(b + 1) % 180], o = bp0[(b + 179) % 180];
+        var tx = q[0] - o[0], ty = q[1] - o[1], tl = Math.hypot(tx, ty) || 1;
+        return [p[0], p[1], ty / tl, -tx / tl];
+      });
+    }
     // worst outward speed of the boundary per mm of rise
     var worstOut = function (M) {
-      var ns = 120, nb = 180, worst = -Infinity, ds = 1 / ns;
-      var bpts = [];
-      for (var b = 0; b < nb; b++) bpts.push(sec.boundary(2 * Math.PI * b / nb));
+      var ns = 120, worst = -Infinity, ds = 1 / ns;
+      var bpts = rimPts, nb = bpts.length;
       for (var i = 0; i < ns; i++) {
         var s = i / ns, s2 = s + ds;
         var ph1 = M.phi(s), ph2 = M.phi(s2), S1 = M.S(s), S2 = M.S(s2);
         var c1 = Math.cos(ph1), n1 = Math.sin(ph1), c2 = Math.cos(ph2), n2 = Math.sin(ph2);
         for (var b2 = 0; b2 < nb; b2++) {
-          var p = bpts[b2], q = bpts[(b2 + 1) % nb], o = bpts[(b2 + nb - 1) % nb];
-          var tx = q[0] - o[0], ty = q[1] - o[1], tl = Math.hypot(tx, ty) || 1;
-          var nx0 = ty / tl, ny0 = -tx / tl;
+          var p = bpts[b2], nx0 = p[2], ny0 = p[3];
           var X1 = M.cx(s) + S1 * (c1 * p[0] - n1 * p[1]), Y1 = M.cy(s) + S1 * (n1 * p[0] + c1 * p[1]);
           var X2 = M.cx(s2) + S2 * (c2 * p[0] - n2 * p[1]), Y2 = M.cy(s2) + S2 * (n2 * p[0] + c2 * p[1]);
           var nx = c1 * nx0 - n1 * ny0, ny = n1 * nx0 + c1 * ny0;
@@ -749,9 +811,9 @@ var TRCORE = (function () {
     };
     // the section where it stands on the plinth, which the plinth must clear however small it is set
     var foot = 0, c0 = Math.cos(M.phi(0)), n0 = Math.sin(M.phi(0)), S0 = M.S(0);
-    for (var b = 0; b < 180; b++) {
-      var bp = sec.boundary(2 * Math.PI * b / 180);
-      foot = Math.max(foot, Math.hypot(M.cx(0) + S0 * (c0 * bp[0] - n0 * bp[1]), M.cy(0) + S0 * (n0 * bp[0] + c0 * bp[1])));
+    for (var b = 0; b < rimPts.length; b++) {
+      var bp = rimPts[b];
+      foot =Math.max(foot, Math.hypot(M.cx(0) + S0 * (c0 * bp[0] - n0 * bp[1]), M.cy(0) + S0 * (n0 * bp[0] + c0 * bp[1])));
     }
     return { objects: [obj], maxR: rmaxAll, foot: foot };
   }
@@ -2201,6 +2263,13 @@ var TRCORE = (function () {
      trailing edge still runs above the cut, the tip is filled down to it
      with an edge at the limit. Every field is taken within the layer, which
      is exact for the upright walls that make up nearly all of it.
+     Nose down, stuck in the ground, it is the other way round: the
+     trailing edges are harmless, and what grows upwards is the nose, the
+     leading edges and the fins, whose leading edge leans 67 degrees with
+     the tail up. Every profile along the aircraft is then filled from
+     above at the limit, so the plan view and the fins get gussets under
+     their leading edges, and the airfoil's round nose, now its underside,
+     thickens no faster than the limit either.
      Lengths are pixels of a plan view 1310 px long, nose at x = 30, about
      1.45 cm of the real aircraft each; y is the half span, n points out of
      the top skin. */
@@ -2212,10 +2281,18 @@ var TRCORE = (function () {
     top: [30, 0, 45, 7, 70, 13, 100, 18, 150, 25, 200, 30, 300, 37, 365, 41, 430, 43, 600, 38, 900, 33, 2000, 33],
     // the ducts behind the intakes swell into the engines: centre off the axis, half width, height
     nacelle: [58, 60, 420, 0, 520, 28, 760, 42, 2000, 42],
-    bottom: [30, 0, 45, 6, 70, 11, 100, 15, 150, 20, 200, 23, 300, 27, 365, 30, 430, 36, 520, 50, 2000, 50],
+    bottom: [30, 0, 45, 6, 70, 11, 100, 15, 150, 20, 200, 23, 300, 27, 365, 30, 430, 36, 520, 55, 850, 55, 1050, 48, 1190, 36, 2000, 36],
     canopy: [195, 445, 36, 44],                 // from, to, height, half width
-    intake: [420, 58, 118, 68],                 // lip, inner and outer side, depth below
-    fin: [932, 1030, 99, 230, 28]               // leading edge at root and tip, root, span along the fin, cant
+    intake: [420, 58, 118, 68, 760, 560],     // lip, inner and outer side, depth below; the ducts run into the flat belly between 560 and 760
+    fin: [932, 1030, 99, 230, 28],              // leading edge at root and tip, root, span along the fin, cant
+    /* Only nose down is the tail printed: the stabilator's leading edge at
+       root and tip, its tip's trailing corner, the outer corner of the
+       trailing edge and its root, and the fins' trailing edge at tip and
+       root. The nozzles end flat at x = 1190, where the rear fuselage has
+       narrowed to 85; the tail stinger between them is left off. */
+    stab: [1125, 205, 1212, 302, 1305, 302, 1333, 180, 1240, 90],
+    finTE: [1110, 1210],
+    rear: [1000, 1190, 85]                      // the rear fuselage narrows from, to, down to this half width
   };
   function table(T, x) {
     if (x <= T[0]) return T[1];
@@ -2224,24 +2301,73 @@ var TRCORE = (function () {
     }
     return T[T.length - 1];
   }
+  /* The least profile at or above the table T that grows towards larger x
+     by no more than k per unit: every vertex casts a line back down at the
+     limit, and the profile is the highest of them and T. Its corners are
+     T's own and where such a line meets a segment of T. */
+  function fillUp(T, k) {
+    var xs = [], i, j;
+    for (i = 0; i < T.length; i += 2) xs.push(T[i]);
+    for (j = 0; j < T.length; j += 2) for (i = 0; i + 2 < T.length && T[i] < T[j]; i += 2) {
+      var sl = (T[i + 3] - T[i + 1]) / (T[i + 2] - T[i]), den = sl - k;
+      if (Math.abs(den) < 1e-12) continue;
+      var x = (T[j + 1] - k * T[j] - T[i + 1] + sl * T[i]) / den;
+      if (x > T[i] && x < T[i + 2]) xs.push(x);
+    }
+    xs.sort(function (a, b) { return a - b; });
+    var out = [];
+    xs.forEach(function (x) {
+      if (out.length && x - out[out.length - 2] < 1e-9) return;
+      var g = table(T, x);
+      for (var v = 0; v < T.length; v += 2) if (T[v] >= x) g = Math.max(g, T[v + 1] - k * (T[v] - x));
+      out.push(x, g);
+    });
+    return out;
+  }
   function designF22(P, K, notes) {
-    var Wg = P.wing, s = P.scale, hp = P.plinthH, H = P.height, Ke = K * 0.97, A = F22;
-    var cut = A.tipX + clamp(Wg.cut, 0, 1.4) / 0.01445;
-    var sc = (H - hp) / (cut - 30), hmin = Math.max(0.8, s) / sc, D2R = Math.PI / 180;
-    // behind the tip corner the span shrinks at the trailing edge's rate or at the limit, whichever is slower
-    var drop = Math.min(A.te, Ke);
+    var Wg = P.wing, s = P.scale, hp = P.plinthH, H = P.height, Ke = K * 0.97, A = F22, nose = Wg.stand === 'nose';
+    var cut = nose ? A.stab[6] : A.tipX + clamp(Wg.cut, 0, 1.4) / 0.01445, x0 = nose ? 30 + clamp(Wg.sink, 1, 8) / 0.01445 : 30;
+    var sc = (H - hp) / (cut - x0), hmin = Math.max(0.8, s) / sc, D2R = Math.PI / 180, i, x, u;
+    // tail down: behind the tip corner the span shrinks at the trailing edge's rate or at the limit, whichever is slower
+    var drop = nose ? A.te : Math.min(A.te, Ke);
     if (drop < A.te && cut > A.tipX) notes.push('Wingtips filled down to the cut at ' + Math.round(Math.atan(drop) / D2R) + '°: the real trailing edge leans ' + Math.round(Math.atan(A.te) / D2R) + '° on the tail.');
-    var edgeAt = function (x) { return x <= A.tipX ? table(A.edge, x) : Math.max(0, A.tipY - (x - A.tipX) * drop); };
-    var leS = (A.le[2] - A.le[0]) / (A.le[3] - A.le[1]);
+    // nose down every profile that grows aft is filled from above at the limit
+    var fill = function (T) { return nose ? fillUp(T, Ke) : T; };
+    var outline = A.edge, St = A.stab;
+    if (nose) {
+      // behind the tip the wing's trailing edge runs into the stabilator's leading edge, then round its tip
+      var sl = (St[3] - St[1]) / (St[2] - St[0]), xm = (A.tipY + A.te * A.tipX - St[1] + sl * St[0]) / (A.te + sl);
+      outline = A.edge.concat([xm, St[1] + sl * (xm - St[0])], St.slice(2, 8));
+    }
+    var edgeT = fill(outline), topT = fill(A.top), botT = fill(A.bottom), nacT = fill(A.nacelle.slice(2)), canT = null;
+    if (nose) {
+      canT = [];
+      for (x = A.canopy[0]; x <= A.canopy[1] + 1e-9; x += 5) {
+        u = (x - A.canopy[0]) / (A.canopy[1] - A.canopy[0]);
+        canT.push(x, A.canopy[2] * Math.pow(Math.sin(Math.PI * Math.pow(u, 0.8)), 1.5));
+      }
+      // the canopy sits on a skin that rises as well, so it gets a little less than the limit
+      canT = fillUp(canT, 0.8 * Ke);
+    }
+    var edgeAt = nose ? function (x) { return x <= cut ? table(edgeT, x) : 0; }
+      : function (x) { return x <= A.tipX ? table(edgeT, x) : Math.max(0, A.tipY - (x - A.tipX) * drop); };
+    var Rr = A.rear;
+    var leS = (A.le[2] - A.le[0]) / (A.le[3] - A.le[1]), ramp = nose ? Math.max(70, A.intake[3] / (0.9 * Ke)) : 70;
     var cant = A.fin[4] * D2R, fsn = Math.sin(cant), fcs = Math.cos(cant), ft = Math.max(1.25 * hmin, 6);
+    if (nose) {
+      var lim = Math.atan(Ke) / D2R, leanW = Math.atan(1 / leS) / D2R, leanF = Math.atan(A.fin[3] / (A.fin[1] - A.fin[0])) / D2R;
+      if (lim < leanF) notes.push('Leading edges filled from above at ' + Math.round(lim) + '°: nose down the fins\' lean ' + Math.round(leanF) + '°' + (lim < leanW ? ', wings and stabilators ' + Math.round(leanW) + '°' : '') + '.');
+    }
     // everything that depends on the station x alone, once per layer
     var layer = function (z) {
-      var x = Math.max(30, cut - (z - hp) / sc), t = clamp((x - 365) / 115, 0, 1), e = edgeAt(x);
+      var x = Math.max(30, nose ? x0 + (z - hp) / sc : cut - (z - hp) / sc), t = clamp((x - 365) / 115, 0, 1), e = edgeAt(x);
       var u = (x - A.canopy[0]) / (A.canopy[1] - A.canopy[0]);
       return {
-        x: x, e: e, wc: x <= 365 ? e : 62 + 48 * t, p: 2, q: 0.6 + 0.4 * t, nac: table(A.nacelle.slice(2), x),
-        top: table(A.top, x), bot: table(A.bottom, x),
-        can: u > 0 && u < 1 ? A.canopy[2] * Math.pow(Math.sin(Math.PI * Math.pow(u, 0.8)), 1.5) : 0,
+        x: x, e: e, wc: x <= 365 ? table(A.edge, x) : 62 + 48 * t, p: 2, pb: 2 + 4 * t,
+        // nose down the rear fuselage narrows to the nozzles: body and ducts are measured across a squeezed span
+        sq: nose ? 110 / (110 - (110 - Rr[2]) * clamp((x - Rr[0]) / (Rr[1] - Rr[0]), 0, 1)) : 1, q: 0.6 + 0.4 * t, nac: table(nacT, x),
+        top: table(topT, x), bot: table(botT, x),
+        can: !(u > 0 && u < 1) ? 0 : nose ? table(canT, x) : A.canopy[2] * Math.pow(Math.sin(Math.PI * Math.pow(u, 0.8)), 1.5),
         fin: clamp((x - A.fin[0]) / (A.fin[1] - A.fin[0]), 0, 1) * A.fin[3],
         hmax: 0
       };
@@ -2253,12 +2379,13 @@ var TRCORE = (function () {
       else {
         var c = xt - xl, r = Math.min(1, ay / A.tipY);
         h = c > 0 ? c * nacaHalf((L.x - xl) / c, 0.06 - 0.015 * r) : 0;
+        if (nose) h = Math.min(h, hmin + 0.6 * Ke * (L.x - xl));
       }
       return Math.max(hmin, h);
     };
-    var body = function (L, ay, h) {
-      var v = ay / L.wc;
-      return v < 1 ? h * Math.pow(1 - Math.pow(v, L.p), L.q) : 0;
+    var body = function (L, ay, h, p) {
+      var v = ay * L.sq / L.wc;
+      return v < 1 ? h * Math.pow(1 - Math.pow(v, p || L.p), L.q) : 0;
     };
     /* The parts meet in a smooth maximum, so fuselage, ducts and wing flow
        into each other as on the real skin instead of meeting in creases. */
@@ -2266,7 +2393,7 @@ var TRCORE = (function () {
     var hT = function (L, ay) {
       var h = smax(body(L, ay, L.top), plate(L, ay), BL), Nc = A.nacelle;
       if (L.nac > 0) {
-        var m = (ay - Nc[0]) / Nc[1];
+        var m = (ay * L.sq - Nc[0]) / Nc[1];
         if (m > -1 && m < 1) h = smax(h, L.nac * (1 - m * m), BL);
       }
       // the canopy sits on the skin and runs out into it tangentially
@@ -2274,10 +2401,10 @@ var TRCORE = (function () {
       return h;
     };
     var hB = function (L, ay) {
-      var h = smax(body(L, ay, L.bot), plate(L, ay), BL), I = A.intake;
+      var h = smax(body(L, ay, L.bot, L.pb), plate(L, ay), BL), I = A.intake;
       // the lip is swept in plan and in profile, so the intake deepens behind it as a caret does
       var lip = I[0] + 0.4 * (ay - I[1]), w = 0.5 * (I[2] - I[1]), m = (ay - I[1] - w) / w;
-      if (L.x > lip && m > -1 && m < 1) h = smax(h, I[3] * Math.min(1, (L.x - lip) / 70) * Math.pow(1 - m * m * m * m, 0.35), BL);
+      if (L.x > lip && m > -1 && m < 1) h = smax(h, I[3] * Math.min(1, (L.x - lip) / ramp, (I[4] - L.x) / (I[4] - I[5])) * Math.pow(1 - m * m * m * m, 0.35), BL);
       return h;
     };
     // distance in the layer to the section, the thickness band's measure divided by its slope
@@ -2289,9 +2416,17 @@ var TRCORE = (function () {
        width of the blend. */
     var far = (P.fillet + 3) / sc, xB = cut + 60;
     var plan = [0, 30];
-    for (i = 2; i < A.edge.length; i += 2) plan.push(A.edge[i + 1], A.edge[i]);
-    plan.push(edgeAt(cut), cut, edgeAt(cut), xB, 0, xB);
-    var FV = [-40, A.fin[0], 0, A.fin[0], A.fin[3], A.fin[1], A.fin[3], xB, -40, xB];
+    for (i = 2; i < edgeT.length; i += 2) plan.push(edgeT[i + 1], edgeT[i]);
+    // nose down: in from the stabilator's trailing edge to its root, along it to the nozzles, across their end
+    if (nose) plan.push(St[9], St[8], Rr[2], Rr[1], 0, Rr[1]);
+    else plan.push(edgeAt(cut), cut, edgeAt(cut), xB, 0, xB);
+    // nose down the fin's leading edge runs from its tip back into the skin at the limit
+    var finAt = function (fs) { return nose ? Math.min(A.fin[0], A.fin[1] - (A.fin[3] - fs) / Ke) : A.fin[0]; };
+    /* and it has a trailing edge. Its root stays on the skin instead of
+       reaching 40 below it, since aft of the nozzles there is only the
+       stabilator under it. */
+    var FV = nose ? [-2, finAt(-2), 0, finAt(0), A.fin[3], A.fin[1], A.fin[3], A.finTE[0], 0, A.finTE[1], -2, A.finTE[1] + 2 * (A.finTE[1] - A.finTE[0]) / A.fin[3]]
+      : [-40, finAt(-40), 0, finAt(0), A.fin[3], A.fin[1], A.fin[3], xB, -40, xB];
     var section = function (L, y, n) {
       var ay = Math.abs(y), q1 = ay - L.e;
       var lo = Math.max(q1, Math.abs(n) - L.hmax);
@@ -2304,20 +2439,23 @@ var TRCORE = (function () {
       }
       var d = Math.min(Math.max(q1, q2), 0) + Math.hypot(Math.max(q1, 0), Math.max(q2, 0));
       // the fins, canted outwards from the top of the engines: a plate with a rounded rim
-      if (L.x > A.fin[0] - far) {
+      if (L.x > FV[1] - far) {
         var fy = ay - A.fin[2], fs = fy * fsn + n * fcs, fw = n * fsn - fy * fcs, dp = polyDist(FV, fs, L.x);
         d = smin(d, (dp > 0 ? Math.hypot(dp, fw) : Math.abs(fw)) - ft, 4);
       }
       return d;
     };
     // the footprint on the plinth, and how thick the aircraft gets anywhere, for the box
-    var Lc = layer(hp), nHi = -Infinity, nLo = Infinity, hmaxAll = 0, i, x;
-    for (x = 30; x <= cut; x += 5) {
-      var Lx = layer(hp + (cut - x) * sc), hm = 0;
-      for (i = 0; i <= 120; i++) { var yy = Lx.e * i / 120; hm = Math.max(hm, hT(Lx, yy), hB(Lx, yy)); }
-      hmaxAll = Math.max(hmaxAll, hm);
+    /* Tail down the plinth is centred on the footprint. Nose down the
+       footprint is a neck, so it is centred under the whole aircraft. */
+    var Lc = layer(hp), nHi = -Infinity, nLo = Infinity, tAll = 0, bAll = 0;
+    for (x = x0; x <= cut; x += 5) {
+      var Lx = layer(hp + (nose ? x - x0 : cut - x) * sc);
+      for (i = 0; i <= 120; i++) { var yy = Lx.e * i / 120; tAll = Math.max(tAll, hT(Lx, yy)); bAll = Math.max(bAll, hB(Lx, yy)); }
     }
-    for (i = 0; i <= 200; i++) { var ys = Lc.e * i / 200; nHi = Math.max(nHi, hT(Lc, ys)); nLo = Math.min(nLo, -hB(Lc, ys)); }
+    var hmaxAll = Math.max(tAll, bAll);
+    if (nose) { nHi = tAll; nLo = -bAll; }
+    else for (i = 0; i <= 200; i++) { var ys = Lc.e * i / 200; nHi = Math.max(nHi, hT(Lc, ys)); nLo = Math.min(nLo, -hB(Lc, ys)); }
     nHi = Math.max(nHi, A.fin[3] * fcs + ft);
     var nc = 0.5 * (nHi + nLo), eMax = A.tipY, hx = hmaxAll + A.fin[3] + ft;
     /* In print the span runs along x and the top skin faces the front, where
@@ -2327,7 +2465,7 @@ var TRCORE = (function () {
       bbox: [-eMax * sc, -(nHi - nc) * sc - 1, hp - 2, eMax * sc, -(nLo - nc) * sc + 1, H],
       layer: function (z) { var L = layer(z); L.hmax = hx; return L; },
       f: function (px, py, pz, Ly) {
-        var L = Ly || obj.layer(pz), zTop = hp + (cut - 30) * sc;
+        var L = Ly || obj.layer(pz), zTop = hp + (cut - x0) * sc;
         var d = section(L, px / sc, nc - py / sc) * sc;
         return Math.max(d, pz - zTop, hp - 2 - pz);
       }
@@ -4050,8 +4188,12 @@ var TRCORE = (function () {
     ],
     f22: [
       { k: 'cut', label: 'Cut behind the wingtips', min: 0, max: 1.4, step: 0.05, rnd: [0, 1.2], fmt: (v) => v.toFixed(2) + ' m' }
+    ],
+    f22nose: [
+      { k: 'sink', label: 'Nose in the ground', min: 1.6, max: 7.5, step: 0.05, rnd: [1.6, 7], fmt: (v) => v.toFixed(2) + ' m' }
     ]
   };
+  const attitudeKey = (F) => F.attitude === 'f22' && F.stand === 'nose' ? 'f22nose' : F.attitude;
   // what fills the lattice cage, chosen like the torsion's section
   const INSIDE_SLIDERS = {
     core: [{ k: 'core', label: 'Core', min: 0, max: 1, step: 0.01, rnd: [0, 1], fmt: pct }],
@@ -4064,11 +4206,23 @@ var TRCORE = (function () {
       { k: 'depth', label: 'Arm depth', min: 0, max: 0.85, step: 0.01, rnd: [0.3, 0.8], fmt: pct },
       { k: 'sharp', label: 'Arm slimness', min: 0.6, max: 3, step: 0.05, rnd: [0.8, 2.6] }
     ],
-    slab: [
-      { k: 'aspect', label: 'Thickness', min: 0.1, max: 1, step: 0.01, rnd: [0.15, 0.6], fmt: pct },
-      { k: 'squareness', label: 'Squareness', min: 2, max: 8, step: 0.1, rnd: [2, 6] }
+    crescent: [
+      { k: 'aspect', label: 'Thickness', min: 0.15, max: 0.8, step: 0.01, rnd: [0.2, 0.55], fmt: pct },
+      { k: 'curl', label: 'Curl', min: 0, max: 1, step: 0.01, rnd: [0.1, 0.9], fmt: pct }
+    ],
+    tube: [
+      { k: 'wall', label: 'Wall', min: 0.15, max: 0.5, step: 0.01, rnd: [0.2, 0.45], fmt: pct },
+      { k: 'slit', label: 'Slit', min: 15, max: 140, step: 1, rnd: [25, 110], fmt: (v) => v + '°' }
+    ],
+    strands: [
+      { k: 'strands', label: 'Strands', min: 2, max: 6, step: 1, rnd: [2, 5] },
+      { k: 'strand', label: 'Strand size', min: 0.2, max: 0.5, step: 0.01, rnd: [0.25, 0.45], fmt: pct },
+      { k: 'core', label: 'Core', min: 0, max: 1, step: 0.01, rnd: [0, 1], fmt: pct }
     ]
   };
+  const SECTION_LABEL = { star: 'Star', crescent: 'Crescent', tube: 'Slit tube', strands: 'Strands' };
+  // a shared link from before a section was dropped falls back to the star, as the core does
+  const sectionOf = (F) => (SECTION_LABEL[F.section] ? F.section : 'star');
   const TOGGLES = {
     lattice: [{ k: 'counter', label: 'Crossed strands' }, { k: 'finial', label: 'Crown drop' }],
     flame: [{ k: 'counter', label: 'Crossed ribbons' }],
@@ -4083,7 +4237,8 @@ var TRCORE = (function () {
     lasso: [{ k: 'accept', label: 'Accepting state (double ring)' }]
   };
 
-  const FAMILY_LABEL = { lattice: 'Lattice', flame: 'Flame', torsion: 'Torsion', crystal: 'Quartz', tree: 'Tree', bismuth: 'Bismuth', transformer: 'Transformer', cup: 'Cup', cone: 'Slit cone', wing: 'Aircraft', lasso: 'Lasso' };
+  // the dropdown's order: the classic cup first, then the abstract forms, the ones with a subject last
+  const FAMILY_LABEL = { cup: 'Cup', cone: 'Slit cone', lattice: 'Lattice', flame: 'Flame', torsion: 'Torsion', crystal: 'Quartz', tree: 'Tree', bismuth: 'Bismuth', transformer: 'Transformer', wing: 'Aircraft', lasso: 'Lasso' };
   const JOINT_LABEL = { one: 'One part', pin: 'Steel pins', socket: 'Socket', flange: 'Wide foot' };
 
   // what the filaments look like in the preview; the export carries no colour
@@ -4412,7 +4567,7 @@ var TRCORE = (function () {
   }
 
   function App() {
-    const [P, setP] = useState(() => TRCORE.merge(D, START));
+    const [P, setP] = useState(() => TRCORE.merge(D, { family: 'cup', ...START }));
     const [colours, setColoursKey] = useState({ one: 'gold', plinth: 'black', sculpture: 'gold' });
     const [quality, setQuality] = useState('draft');
     const [spin, setSpin] = useState(false);
@@ -4513,7 +4668,8 @@ var TRCORE = (function () {
         const f = { ...p[fam] };
         FAMILY_SLIDERS[fam].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
         if (fam === 'torsion') {
-          f.section = Math.random() < 0.6 ? 'star' : 'slab';
+          const secs = Object.keys(SECTION_LABEL);
+          f.section = secs[Math.floor(Math.random() * secs.length)];
           SECTION_SLIDERS[f.section].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
         }
         if (fam === 'lattice') {
@@ -4527,7 +4683,8 @@ var TRCORE = (function () {
         }
         if (fam === 'wing') {
           f.attitude = ['bank', 'climb', 'f22'][Math.floor(Math.random() * 3)];
-          ATTITUDE_SLIDERS[f.attitude].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
+          if (f.attitude === 'f22') f.stand = Math.random() < 0.5 ? 'tail' : 'nose';
+          ATTITUDE_SLIDERS[attitudeKey(f)].forEach((s) => { f[s.k] = randIn(s.rnd, s.step); });
         }
         TOGGLES[fam].forEach((t) => { f[t.k] = Math.random() < 0.6; });
         if (fam === 'lasso') f.accept = Math.random() < 0.85;
@@ -4563,9 +4720,9 @@ var TRCORE = (function () {
     }
 
     const F = P[fam], RF = R[fam];
-    const secSliders = fam === 'torsion' ? SECTION_SLIDERS[F.section] : fam === 'lattice' ? INSIDE_SLIDERS[F.inside]
+    const secSliders = fam === 'torsion' ? SECTION_SLIDERS[sectionOf(F)] : fam === 'lattice' ? INSIDE_SLIDERS[F.inside]
       : fam === 'cup' && F.section !== 'round' ? [{ ...SIDES, label: F.section === 'facet' ? 'Facets' : 'Flutes' }]
-      : fam === 'wing' ? ATTITUDE_SLIDERS[F.attitude] : [];
+      : fam === 'wing' ? ATTITUDE_SLIDERS[attitudeKey(F)] : [];
     // the F-22 has its own outline and stands on a rectangular plinth around its footprint
     const f22 = fam === 'wing' && F.attitude === 'f22', rectPlinth = fam === 'transformer' || f22;
     const st = res && res.stats;
@@ -4620,19 +4777,24 @@ var TRCORE = (function () {
             <${Slider} label=${html`Overhang limit <${Info} label="the overhang limit"><p>How far a surface may lean out before your printer needs support under it. The piece is built to this angle, so it changes the shape as well: a higher limit gives flatter, wider forms, and on the transformer flatter sheds, lower radiator tips and a shallower saddle, on the flying wing a steeper pose and on the F-22 fuller wingtips. Anything that still leans past it is marked red.</p><p>45° prints on any printer, a well-cooled modern one manages 60° and more; towards 80° a surface is nearly flat, and a test print of an overhang sample first is cheap.</p><//>`}
               value=${P.overhang} min=${35} max=${80} step=${1} fmt=${(v) => v + '° from vertical'} onChange=${setTop('overhang')}/>
           </div>
-          <${Sec} k="shape" title="Shape" aside=${FAMILY_LABEL[fam] + (fam === 'torsion' ? ', ' + F.section : fam === 'lattice' && F.inside === 'shells' ? ', nested' : fam === 'cup' ? ', ' + F.bowl + (F.section === 'round' ? '' : F.section === 'facet' ? ', faceted' : ', fluted') : fam === 'wing' ? (F.attitude === 'bank' ? ', banked flying wing' : F.attitude === 'climb' ? ', climbing flying wing' : ', F-22') : '')} open=${openSec} onToggle=${toggleSec}>
+          <${Sec} k="shape" title="Shape" aside=${FAMILY_LABEL[fam] + (fam === 'torsion' ? ', ' + SECTION_LABEL[sectionOf(F)].toLowerCase() : fam === 'lattice' && F.inside === 'shells' ? ', nested' : fam === 'cup' ? ', ' + F.bowl + (F.section === 'round' ? '' : F.section === 'facet' ? ', faceted' : ', fluted') : fam === 'wing' ? (F.attitude === 'bank' ? ', banked flying wing' : F.attitude === 'climb' ? ', climbing flying wing' : F.stand === 'nose' ? ', F-22 nose down' : ', F-22') : '')} open=${openSec} onToggle=${toggleSec}>
             <select className="tr-family" aria-label="Family" value=${fam} onChange=${(e) => setTop('family')(e.target.value)}>
               ${Object.entries(FAMILY_LABEL).map(([k, l]) => html`<option key=${k} value=${k}>${l}</option>`)}
             </select>
-            ${fam === 'torsion' && html`<${Seg} value=${F.section} onChange=${setFam('section')} options=${[['star', 'Star section'], ['slab', 'Slab section']]}/>`}
+            ${fam === 'torsion' && html`<select className="tr-family" aria-label="Section" value=${sectionOf(F)} onChange=${(e) => setFam('section')(e.target.value)}>
+              ${Object.entries(SECTION_LABEL).map(([k, l]) => html`<option key=${k} value=${k}>${l + ' section'}</option>`)}
+            </select>`}
             ${fam === 'lattice' && html`<${Seg} value=${F.inside} onChange=${setFam('inside')} options=${[['core', 'Drop inside'], ['shells', 'Nested cages']]}/>`}
             ${fam === 'cup' && html`<${Seg} value=${F.bowl} onChange=${setFam('bowl')} options=${[['goblet', 'Goblet'], ['tulip', 'Tulip'], ['beaker', 'Beaker']]}/>
               <${Seg} value=${F.section} onChange=${setFam('section')} options=${[['round', 'Round'], ['facet', 'Faceted'], ['flute', 'Fluted']]}/>`}
             ${fam === 'wing' && html`<${Seg} value=${F.attitude} onChange=${setFam('attitude')} options=${[['bank', 'Banked'], ['climb', 'Climbing'], ['f22', 'F-22']]}/>
+              ${f22 && html`<${Seg} value=${F.stand} onChange=${setFam('stand')} options=${[['tail', 'On its tail'], ['nose', 'Nose in the ground']]}/>`}
               <p className="tr-hint">${F.attitude === 'bank'
                 ? 'A flying wing with a B-2 outline, standing on one wingtip. On its side every edge leans by its sweep, so the sawtooth prints.'
                 : F.attitude === 'climb'
                 ? 'A flying wing nose up. The trailing edge has to climb from the centre to both tips, or its low points would start in mid-air. That makes a kite, closer to the X-47A than to the B-2.'
+                : F.stand === 'nose'
+                ? 'An F-22 that came straight down, its nose in the plinth. Tail up, every trailing edge narrows upwards and the nozzles end in a flat top, so the whole tail prints, stabilators included. What widens upwards are the leading edges and the fins, the fins at 67°. So they get gussets underneath, filled at the overhang limit, and the round leading edge of the wing is kept as sharp as the limit allows. The tail stinger between the nozzles is left off.'
                 : 'An F-22 standing on its tail, cut off behind the wingtips. Nose up it prints along its own axis: nose, canopy, leading edges and fins all widen downwards. Only the trailing edge, swept forward, would hang in the air, so the tips are filled down to the cut at the overhang limit.'}</p>`}
             ${fam === 'lasso' && html`<p className="tr-hint">A counterexample, cast. The stem is the run up to the loop, the loop is what then repeats forever, the beads are states. Why anyone would want one is under "Why a lasso" below.</p>`}
             ${(f22 ? [] : FAMILY_SLIDERS[fam]).concat(secSliders).map((s) => html`<${Slider} key=${fam + s.k} label=${s.label} value=${F[s.k]} shown=${RF[s.k]}
@@ -4649,7 +4811,7 @@ var TRCORE = (function () {
             <${Slider} label="Plinth height" value=${P.plinthH} shown=${R.plinthH} min=${8} max=${40} step=${1} fmt=${mm} onChange=${setTop('plinthH')}/>
             <${Slider} label="Plinth size" value=${P.plinthSize} min=${0.6} max=${1.6} step=${0.01} fmt=${pct} onChange=${setTop('plinthSize')}/>
             ${fam !== 'transformer' && html`<${Slider} label="Fillet" value=${P.fillet} shown=${R.fillet} min=${0} max=${12} step=${0.5} fmt=${mm} onChange=${setTop('fillet')}/>`}
-            ${f22 && html`<p className="tr-hint">The F-22 gets a rectangular plinth around its footprint, with the plan view facing the front.</p>`}
+            ${f22 && html`<p className="tr-hint">The F-22 gets a rectangular plinth around its footprint, with the plan view facing the front. Nose down the footprint is only a neck, so the plinth takes the size of the whole aircraft.</p>`}
             ${fam === 'transformer' && html`<p className="tr-hint">A transformer gets a rectangular plinth around its footprint, and no cast fillet at its foot: it stands on its skid.</p>`}
           <//>
           <${Sec} k="engrave" title="Engraving" aside=${hasText ? [P.engrave.line1, P.engrave.line2].map((s) => (s || '').trim()).filter(Boolean).join(' / ') : 'none'} open=${openSec} onToggle=${toggleSec}>
