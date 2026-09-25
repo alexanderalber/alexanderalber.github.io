@@ -281,18 +281,85 @@ var TRCORE = (function () {
     return out;
   }
 
-  /* The shareable code: the setting as JSON, base64url, behind a version
-     prefix. Only the chosen family goes in, and every value in full rather
-     than as a difference from DEFAULTS, so a code keeps its meaning when a
-     default moves. Reading one back keeps only the keys DEFAULTS knows, each
-     with the type DEFAULTS gives it; anything else falls back to the default. */
-  var CODE_PREFIX = 'T1.';
+  /* The shareable code, for passing a trophy to a friend this week, not for
+     keeping. Only values, in a fixed order, separated by ~:
+
+       cup-2su~200~~1~~~~~~~1~~~.3
+
+     The first field is the family and a short hash of that family's layout:
+     the field order, the choice lists and the defaults. An empty field is the
+     default, and trailing empty fields are dropped, so a code only carries
+     what was changed. Any change to the layout or a default changes the hash,
+     and an older code is then refused rather than read into the wrong
+     sliders. Choices are written as their index in CODE_ENUMS; one missing
+     from that list is written out as a word, so a list that drifts from the
+     page costs length, not correctness. The engraving comes last because it
+     is usually empty. The long JSON codes of the first version (T1.) and bare
+     JSON still load. */
+  var CODE_TOP = ['height', 'overhang', 'parts', 'clearance', 'pin', 'plinthShape', 'plinthH', 'plinthSize', 'fillet'];
+  var CODE_COLOURS = { one: 'gold', plinth: 'black', sculpture: 'gold' };
+  var CODE_ENUMS = {
+    parts: ['one', 'pin', 'socket', 'flange'], plinthShape: ['round', 'box'],
+    colour: ['gold', 'silver', 'bronze', 'black', 'white', 'shift'],
+    'cup.bowl': ['goblet', 'tulip', 'beaker'], 'cup.section': ['round', 'facet', 'flute'],
+    'torsion.section': ['star', 'crescent', 'tube', 'strands'], 'lattice.inside': ['core', 'shells'],
+    'wing.attitude': ['bank', 'climb', 'f22'], 'wing.stand': ['tail', 'nose']
+  };
   function isFamily(k) { return k !== 'engrave' && !!DEFAULTS[k] && typeof DEFAULTS[k] === 'object'; }
-  function b64uEncode(s) {
-    var b = new TextEncoder().encode(s), t = '';
-    for (var i = 0; i < b.length; i++) t += String.fromCharCode(b[i]);
-    return btoa(t).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  // [path, default, choice list] for every field after the first, in code order
+  function codeFields(fam) {
+    var f = [];
+    CODE_TOP.forEach(function (k) { f.push([[k], DEFAULTS[k], CODE_ENUMS[k] || null]); });
+    Object.keys(DEFAULTS[fam]).forEach(function (k) { f.push([[fam, k], DEFAULTS[fam][k], CODE_ENUMS[fam + '.' + k] || null]); });
+    Object.keys(CODE_COLOURS).forEach(function (k) { f.push([['colours', k], CODE_COLOURS[k], CODE_ENUMS.colour]); });
+    ['size', 'line1', 'line2'].forEach(function (k) { f.push([['engrave', k], DEFAULTS.engrave[k], null]); });
+    return f;
   }
+  function codeHash(fam) {
+    var s = JSON.stringify([fam, codeFields(fam)]), h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return ('00' + ((h >>> 0) % 46656).toString(36)).slice(-3);
+  }
+  function encodeConfig(p, colours) {
+    var P = merge(DEFAULTS, p), C = Object.assign({}, CODE_COLOURS, colours || {}), fam = P.family;
+    var out = codeFields(fam).map(function (fd) {
+      var path = fd[0], v = path[0] === 'colours' ? C[path[1]] : path.length === 2 ? P[path[0]][path[1]] : P[path[0]];
+      if (v === fd[1] || v === undefined) return '';
+      if (typeof v === 'number') return String(v).replace(/^(-?)0\./, '$1.');
+      if (typeof v === 'boolean') return v ? '1' : '0';
+      var i = fd[2] ? fd[2].indexOf(v) : -1;
+      return i >= 0 ? String(i) : String(v).replace(/%/g, '%25').replace(/~/g, '%7E');
+    });
+    while (out.length && out[out.length - 1] === '') out.pop();
+    return [fam + '-' + codeHash(fam)].concat(out).join('~');
+  }
+  function decodeCompact(s) {
+    var parts = s.split('~'), head = /^([a-z0-9]+)-([0-9a-z]{3})$/.exec(parts[0]);
+    if (!head) throw new Error('This is not a trophy code.');
+    var fam = head[1];
+    if (!isFamily(fam)) throw new Error('Unknown family "' + fam + '".');
+    if (head[2] !== codeHash(fam)) throw new Error('This code comes from an older version of this page and no longer fits its sliders.');
+    var fields = codeFields(fam);
+    if (parts.length - 1 > fields.length) throw new Error('This code has more fields than this family has settings.');
+    var params = { family: fam }, colours = Object.assign({}, CODE_COLOURS);
+    params[fam] = {}; params.engrave = {};
+    fields.forEach(function (fd, i) {
+      var t = parts[i + 1], d = fd[1], path = fd[0], v;
+      if (t === undefined || t === '') return;
+      if (typeof d === 'number') { v = Number(t); if (!isFinite(v)) throw new Error('"' + t + '" is not a number.'); }
+      else if (typeof d === 'boolean') v = t === '1';
+      else if (fd[2] && /^\d+$/.test(t)) { v = fd[2][+t]; if (v === undefined) throw new Error('Choice ' + t + ' does not exist.'); }
+      else {
+        try { v = decodeURIComponent(t).slice(0, 40); } catch (e) { throw new Error('This is not a trophy code.'); }
+      }
+      if (path[0] === 'colours') colours[path[1]] = v;
+      else if (path.length === 2) params[path[0]][path[1]] = v;
+      else params[path[0]] = v;
+    });
+    return { params: params, colours: colours };
+  }
+
+  // the long first version: JSON, base64url behind T1.
   function b64uDecode(s) {
     s = s.replace(/-/g, '+').replace(/_/g, '/');
     while (s.length % 4) s += '=';
@@ -300,31 +367,13 @@ var TRCORE = (function () {
     for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i);
     return new TextDecoder('utf-8', { fatal: true }).decode(b);
   }
-  function encodeConfig(p, colours) {
-    var P = merge(DEFAULTS, p), out = {};
-    Object.keys(DEFAULTS).forEach(function (k) { if (!isFamily(k) || k === P.family) out[k] = P[k]; });
-    if (colours) out.colours = colours;
-    return CODE_PREFIX + b64uEncode(JSON.stringify(out));
-  }
   function sane(v, d) {
     if (typeof d === 'number') return typeof v === 'number' && isFinite(v) ? v : undefined;
     if (typeof d === 'string') return typeof v === 'string' ? v.slice(0, 40) : undefined;
     if (typeof d === 'boolean') return typeof v === 'boolean' ? v : undefined;
     return undefined;
   }
-  // a code, a link carrying ?c= (or the older ?p= JSON), or bare JSON -> { params, colours }
-  function decodeConfig(text) {
-    var s = String(text || '').trim(), raw;
-    if (!s) throw new Error('Nothing to load.');
-    if (/^https?:\/\/|[?&][cp]=/.test(s)) {
-      var q = new URLSearchParams(s.slice(s.indexOf('?') + 1).split('#')[0]);
-      if (q.get('c')) s = q.get('c').trim();
-      else if (q.get('p')) s = q.get('p').trim();
-      else throw new Error('This link carries no trophy.');
-    }
-    try {
-      raw = JSON.parse(s.charAt(0) === '{' ? s : b64uDecode(s.indexOf(CODE_PREFIX) === 0 ? s.slice(CODE_PREFIX.length) : s));
-    } catch (e) { throw new Error('This is not a trophy code.'); }
+  function decodeJson(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('This is not a trophy code.');
     var params = {};
     Object.keys(DEFAULTS).forEach(function (k) {
@@ -343,8 +392,24 @@ var TRCORE = (function () {
     if (params.family !== undefined && !isFamily(params.family)) throw new Error('Unknown family "' + params.family + '".');
     var colours = {};
     if (raw.colours && typeof raw.colours === 'object')
-      ['one', 'plinth', 'sculpture'].forEach(function (k) { if (typeof raw.colours[k] === 'string') colours[k] = raw.colours[k]; });
+      Object.keys(CODE_COLOURS).forEach(function (k) { if (typeof raw.colours[k] === 'string') colours[k] = raw.colours[k]; });
     return { params: params, colours: colours };
+  }
+
+  // a code, a link carrying ?c= (or ?p= with JSON), or bare JSON -> { params, colours }
+  function decodeConfig(text) {
+    var s = String(text || '').trim(), raw;
+    if (!s) throw new Error('Nothing to load.');
+    if (/^(https?:\/\/|\?)/.test(s)) {
+      var q = new URLSearchParams(s.slice(s.indexOf('?') + 1).split('#')[0]);
+      if (q.get('c')) s = q.get('c').trim();
+      else if (q.get('p')) s = q.get('p').trim();
+      else throw new Error('This link carries no trophy.');
+    }
+    if (s.charAt(0) !== '{' && s.indexOf('T1.') !== 0) return decodeCompact(s);
+    try { raw = JSON.parse(s.charAt(0) === '{' ? s : b64uDecode(s.slice(3))); }
+    catch (e) { throw new Error('This is not a trophy code.'); }
+    return decodeJson(raw);
   }
 
   function mulberry32(a) {
@@ -4791,7 +4856,7 @@ var TRCORE = (function () {
     }
 
     const code = useMemo(() => TRCORE.encodeConfig(P, colours), [P, colours]);
-    const link = location.origin + location.pathname + '?c=' + code;
+    const link = location.origin + location.pathname + '?c=' + encodeURIComponent(code);
     function copy(text, what) {
       const done = () => setShareMsg({ text: what + ' copied.' });
       if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, () => setShareMsg({ bad: true, text: 'The clipboard refused. Select the code and copy it by hand.' }));
@@ -4953,7 +5018,7 @@ var TRCORE = (function () {
               <button className="tool-btn tool-btn-sm" disabled=${!pasted.trim()} onClick=${loadCode}>${ToolIcons.el('check')} Load</button>
             </div>
             ${shareMsg && html`<p className=${'tr-hint' + (shareMsg.bad ? ' tr-bad' : '')} role="status">${shareMsg.text}</p>`}
-            <p className="tr-hint">The code holds every setting of the chosen family, the plinth, the engraving and the colours. The link opens the page with it.</p>
+            <p className="tr-hint">The code holds whatever differs from the defaults: shape, plinth, parts, engraving and colours. The link opens the page with it. It is meant for passing a trophy on now, not for keeping: once the tool changes, an older code is refused.</p>
           <//>
           <div className="ctl-sec">
             <div className="tr-actions">
