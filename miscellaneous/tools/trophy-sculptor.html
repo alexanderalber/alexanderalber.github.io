@@ -1590,6 +1590,43 @@ var TRCORE = (function () {
     return { bbox: bb, size: [bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]], volume: vol, triangles: I.length / 3, vertices: p.length / 3 };
   }
 
+  /* The preview shades smoothly, with one normal per vertex. Across the
+     sharp edges of the lettering that blends wall and flank over whole
+     triangles, and a clean groove looks frayed. So the vertices of the
+     lettering are flagged, and flatView gives their triangles their own
+     corners with the face normal. The mesh itself, and so the STL, is not
+     touched. */
+  function markLettering(mesh, o) {
+    var p = mesh.positions, nv = p.length / 3, f = new Uint8Array(nv), any = false;
+    if (o && o.engraving) for (var v = 0; v < nv; v++) if (o.inText(p[3 * v], p[3 * v + 1], p[3 * v + 2])) { f[v] = 1; any = true; }
+    if (any) mesh.sharp = f;
+  }
+  function flatView(m) {
+    var P = m.positions, N = m.normals, I = m.indices, S = m.sharp, nv = P.length / 3, extra = 0;
+    if (!S) return m;
+    for (var t = 0; t < I.length; t += 3) if (S[I[t]] && S[I[t + 1]] && S[I[t + 2]]) extra += 3;
+    var pos = new Float32Array(3 * (nv + extra)), nrm = new Float32Array(3 * (nv + extra)), ind = new Uint32Array(I.length);
+    pos.set(P); nrm.set(N);
+    var k = nv;
+    for (var t2 = 0; t2 < I.length; t2 += 3) {
+      var a = I[t2], b = I[t2 + 1], c = I[t2 + 2];
+      if (!(S[a] && S[b] && S[c])) { ind[t2] = a; ind[t2 + 1] = b; ind[t2 + 2] = c; continue; }
+      var ux = P[3 * b] - P[3 * a], uy = P[3 * b + 1] - P[3 * a + 1], uz = P[3 * b + 2] - P[3 * a + 2];
+      var wx = P[3 * c] - P[3 * a], wy = P[3 * c + 1] - P[3 * a + 1], wz = P[3 * c + 2] - P[3 * a + 2];
+      var nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx, nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      // the winding says which side is out, the vertex normals say it too: follow them
+      var sx = N[3 * a] + N[3 * b] + N[3 * c], sy = N[3 * a + 1] + N[3 * b + 1] + N[3 * c + 1], sz = N[3 * a + 2] + N[3 * b + 2] + N[3 * c + 2];
+      if (!(nl > 0)) { nx = sx; ny = sy; nz = sz; nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1; }
+      else if (nx * sx + ny * sy + nz * sz < 0) nl = -nl;
+      [a, b, c].forEach(function (v, j) {
+        pos[3 * k] = P[3 * v]; pos[3 * k + 1] = P[3 * v + 1]; pos[3 * k + 2] = P[3 * v + 2];
+        nrm[3 * k] = nx / nl; nrm[3 * k + 1] = ny / nl; nrm[3 * k + 2] = nz / nl;
+        ind[t2 + j] = k++;
+      });
+    }
+    return { positions: pos, normals: nrm, indices: ind };
+  }
+
   // opts.noView skips the preview's view of the one-part mesh
   function build(params, voxel, progress, opts) {
     opts = opts || {};
@@ -1620,6 +1657,7 @@ var TRCORE = (function () {
       for (var fi = 0; fi < foot.length; fi++) if (foot[fi] < 0) nIn++;
       glue = nIn * g.h * g.h;
       refineEngraving(parts[0], plinth);
+      markLettering(parts[0], plinth);
       parts.forEach(function (m) { delete m.cells; delete m.grid; });
       sup = joinSupport(B.support[0], B.support[1]);
       var s0 = meshStats(parts[0]), s1 = meshStats(parts[1]), bb = [];
@@ -1631,11 +1669,12 @@ var TRCORE = (function () {
       tCheck = Date.now();
       mesh = surfaceNets(g, progress);
       refineEngraving(mesh, plinth);
+      markLettering(mesh, plinth);
       delete mesh.cells; delete mesh.grid;
       st = meshStats(mesh);
     }
     var tMesh = Date.now();
-    var view = mesh && !opts.noView ? { positions: mesh.positions, normals: mesh.normals, groups: [mesh.indices] } : null;
+    var view = mesh && !opts.noView ? { positions: mesh.positions, normals: mesh.normals, groups: [mesh.indices], sharp: mesh.sharp } : null;
     var E = plinth && plinth.engraving;
     return {
       mesh: mesh, parts: parts, view: view, stats: st, support: sup, notes: D.notes, params: D.P, joint: joint, pins: pins, flange: flange, glue: glue,
@@ -1672,7 +1711,7 @@ var TRCORE = (function () {
       var r = build(job.params, job.voxel, function (p) { self.postMessage({ id: job.id, progress: p }); }, { noView: !!job.noView });
       var bufs = new Set([r.support.points.buffer]);
       [r.mesh].concat(r.parts || []).forEach(function (m) {
-        if (m) [m.positions, m.normals, m.labels, m.indices].forEach(function (a) { bufs.add(a.buffer); });
+        if (m) [m.positions, m.normals, m.labels, m.indices, m.sharp].forEach(function (a) { if (a) bufs.add(a.buffer); });
       });
       if (r.view) {
         bufs.add(r.view.positions.buffer); bufs.add(r.view.normals.buffer);
@@ -1686,7 +1725,7 @@ var TRCORE = (function () {
 
   return {
     workerMain: workerMain,
-    DEFAULTS: DEFAULTS, REF_H: REF_H, merge: merge, resolve: resolve, design: design, build: build, writeSTL: writeSTL,
+    DEFAULTS: DEFAULTS, REF_H: REF_H, merge: merge, resolve: resolve, design: design, build: build, writeSTL: writeSTL, flatView: flatView,
     layoutText: layoutText, glyph: glyph, jointSizes: jointSizes,
     smin: smin, dropSdf: dropSdf, dropRadiusAt: dropRadiusAt, sectionSdf: sectionSdf,
     makeGrid: makeGrid, segDist: segDist, splatSweep: splatSweep, splatSdf: splatSdf, surfaceNets: surfaceNets, supportCheck: supportCheck, meshStats: meshStats
@@ -1919,7 +1958,8 @@ var TRCORE = (function () {
   function showResult(V, r, showSupport) {
     const { THREE } = V;
     // one mesh per printed part: the whole piece, or plinth and sculpture
-    const bodies = r.parts ? r.parts.map((m, i) => ({ m, mat: i })) : [{ m: { positions: r.view.positions, normals: r.view.normals, indices: r.view.groups[0] }, mat: 0 }];
+    const bodies = (r.parts ? r.parts.map((m, i) => ({ m, mat: i })) : [{ m: { positions: r.view.positions, normals: r.view.normals, indices: r.view.groups[0], sharp: r.view.sharp }, mat: 0 }])
+      .map(({ m, mat }) => ({ m: TRCORE.flatView(m), mat }));
     V.meshes.forEach((o) => { V.scene.remove(o); o.geometry.dispose(); });
     V.meshes = bodies.map(({ m, mat }) => {
       const geo = new THREE.BufferGeometry();
