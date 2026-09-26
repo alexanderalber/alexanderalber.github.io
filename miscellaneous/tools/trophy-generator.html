@@ -282,20 +282,20 @@ var TRCORE = (function () {
   }
 
   /* The shareable code, for passing a trophy to a friend this week, not for
-     keeping. Only values, in a fixed order, separated by ~:
+     keeping. Only the settings that differ from the default, separated by ~,
+     each as one letter naming the field and its value:
 
-       cup-2su~200~~1~~~~~~~1~~~.3
+       cup-7a7~a200~c1~j1~m.3
 
      The first field is the family and a short hash of that family's layout:
-     the field order, the choice lists and the defaults. An empty field is the
-     default, and trailing empty fields are dropped, so a code only carries
-     what was changed. Any change to the layout or a default changes the hash,
-     and an older code is then refused rather than read into the wrong
-     sliders. Choices are written as their index in CODE_ENUMS; one missing
-     from that list is written out as a word, so a list that drifts from the
-     page costs length, not correctness. The engraving comes last because it
-     is usually empty. The long JSON codes of the first version (T1.) and bare
-     JSON still load. */
+     the field order, the choice lists and the defaults. The letter is the
+     field's place in that order (a-z, then A-Z). Any change to the layout or
+     a default changes the hash, and an older code is then refused rather
+     than read into the wrong sliders. Choices are written as their index in
+     CODE_ENUMS; one missing from that list is written out as a word, so a
+     list that drifts from the page costs length, not correctness. The long
+     JSON codes of the first version (T1.) and bare JSON still load. */
+  var CODE_LETTERS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
   var CODE_TOP = ['height', 'overhang', 'parts', 'clearance', 'pin', 'plinthShape', 'plinthH', 'plinthSize', 'fillet'];
   var CODE_COLOURS = { one: 'gold', plinth: 'black', sculpture: 'gold' };
   var CODE_ENUMS = {
@@ -316,22 +316,25 @@ var TRCORE = (function () {
     return f;
   }
   function codeHash(fam) {
-    var s = JSON.stringify([fam, codeFields(fam)]), h = 2166136261;
+    var s = JSON.stringify(['lettered', fam, codeFields(fam)]), h = 2166136261;
     for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
     return ('00' + ((h >>> 0) % 46656).toString(36)).slice(-3);
   }
   function encodeConfig(p, colours) {
     var P = merge(DEFAULTS, p), C = Object.assign({}, CODE_COLOURS, colours || {}), fam = P.family;
-    var out = codeFields(fam).map(function (fd) {
-      var path = fd[0], v = path[0] === 'colours' ? C[path[1]] : path.length === 2 ? P[path[0]][path[1]] : P[path[0]];
-      if (v === fd[1] || v === undefined) return '';
-      if (typeof v === 'number') return String(v).replace(/^(-?)0\./, '$1.');
-      if (typeof v === 'boolean') return v ? '1' : '0';
-      var i = fd[2] ? fd[2].indexOf(v) : -1;
-      return i >= 0 ? String(i) : String(v).replace(/%/g, '%25').replace(/~/g, '%7E');
+    var out = [fam + '-' + codeHash(fam)];
+    codeFields(fam).forEach(function (fd, n) {
+      var path = fd[0], v = path[0] === 'colours' ? C[path[1]] : path.length === 2 ? P[path[0]][path[1]] : P[path[0]], t;
+      if (v === fd[1] || v === undefined) return;
+      if (typeof v === 'number') t = String(v).replace(/^(-?)0\./, '$1.');
+      else if (typeof v === 'boolean') t = v ? '1' : '0';
+      else {
+        var i = fd[2] ? fd[2].indexOf(v) : -1;
+        t = i >= 0 ? String(i) : String(v).replace(/%/g, '%25').replace(/~/g, '%7E');
+      }
+      out.push(CODE_LETTERS[n] + t);
     });
-    while (out.length && out[out.length - 1] === '') out.pop();
-    return [fam + '-' + codeHash(fam)].concat(out).join('~');
+    return out.join('~');
   }
   function decodeCompact(s) {
     var parts = s.split('~'), head = /^([a-z0-9]+)-([0-9a-z]{3})$/.exec(parts[0]);
@@ -340,13 +343,14 @@ var TRCORE = (function () {
     if (!isFamily(fam)) throw new Error('Unknown family "' + fam + '".');
     if (head[2] !== codeHash(fam)) throw new Error('This code comes from an older version of this page and no longer fits its sliders.');
     var fields = codeFields(fam);
-    if (parts.length - 1 > fields.length) throw new Error('This code has more fields than this family has settings.');
     var params = { family: fam }, colours = Object.assign({}, CODE_COLOURS);
     params[fam] = {}; params.engrave = {};
-    fields.forEach(function (fd, i) {
-      var t = parts[i + 1], d = fd[1], path = fd[0], v;
-      if (t === undefined || t === '') return;
-      if (typeof d === 'number') { v = Number(t); if (!isFinite(v)) throw new Error('"' + t + '" is not a number.'); }
+    parts.slice(1).forEach(function (part) {
+      if (!part) return;
+      var fd = fields[CODE_LETTERS.indexOf(part.charAt(0))];
+      if (!fd) throw new Error('"' + part.charAt(0) + '" names no setting of this family.');
+      var t = part.slice(1), d = fd[1], path = fd[0], v;
+      if (typeof d === 'number') { v = t === '' ? NaN : Number(t); if (!isFinite(v)) throw new Error('"' + t + '" is not a number.'); }
       else if (typeof d === 'boolean') v = t === '1';
       else if (fd[2] && /^\d+$/.test(t)) { v = fd[2][+t]; if (v === undefined) throw new Error('Choice ' + t + ' does not exist.'); }
       else {
