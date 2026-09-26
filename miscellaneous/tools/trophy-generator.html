@@ -25,6 +25,7 @@
     .tr-bar{position:absolute;left:0;top:0;height:3px;background:var(--pico-primary);transition:width .15s,opacity .3s}
     .tr-stats{display:flex;flex-wrap:wrap;gap:.3rem 1.4rem;color:var(--tool-label);font-size:.85em;margin:.7rem 0 .3rem}
     .tr-stats b{color:var(--tool-emph);font-weight:600}
+    .tr-stats2{margin-top:0}
     .tr-check{font-size:.85em;margin:.2rem 0 .6rem;color:var(--tool-label)}
     .tr-check.ok b{color:var(--tool-ok-text)}
     .tr-check.bad b{color:var(--tool-danger-text)}
@@ -36,6 +37,7 @@
     .tr-tog{display:flex;align-items:center;gap:.45rem;font-size:.85em;margin:.2rem 0 .5rem;color:var(--tool-label)}
     .tr-tog input{margin:0}
     .tr-segs{margin-bottom:.7rem}
+    .tr-segpair{display:flex;flex-wrap:wrap;column-gap:.8rem}
     .tr-sub{font-size:.78em;color:var(--tool-label);margin:0 0 .25rem}
     .tr-text{margin:0 0 .45rem}
     input.tr-text{--pico-form-element-spacing-vertical:.35rem;--pico-form-element-spacing-horizontal:.6rem;font-size:.9em}
@@ -132,6 +134,7 @@
         <li>Printability is part of the construction: no surface leans past the overhang limit you set, and a layer-by-layer check confirms it.</li>
         <li>Engraving on the front of the plinth, cut at an angle that also prints without support.</li>
         <li>One part as a single STL, or plinth and sculpture as two parts in two colours, joined by steel dowel pins, a keyed boss and socket, or a wide foot.</li>
+        <li>A print-time and filament estimate for a Bambu Lab A1, fitted to Bambu Studio's own, for a 0.4, 0.6 or 0.8 mm nozzle and the volumetric speed your filament manages.</li>
       </ul>
     </div>
   </main>
@@ -3664,9 +3667,9 @@ var TRCORE = (function () {
      halves are printed apart, then glued. The plinth keeps everything below
      the cut plus a boss; the sculpture keeps everything above, stands on the
      flat cut face while it prints, and has a matching socket in that face.
-     The boss has the shape of the sculpture's own foot, shrunk by a wall and
-     the fit clearance, so it centres the sculpture and, unless the foot is
-     round, also fixes which way it faces.
+     The boss has the shape of the sculpture's own foot, shrunk by half its
+     inner radius and the fit clearance, so it centres the sculpture and,
+     unless the foot is round, also fixes which way it faces.
 
      Both boss and socket end in a roof that rises at the overhang limit
      instead of a flat ceiling, so the socket prints without support. The
@@ -3677,7 +3680,7 @@ var TRCORE = (function () {
      Each body is the field edited on the few layers around the cut, meshed
      on a slab of the same grid, and the layers are put back afterwards, so
      this costs no second grid. */
-  var JOINT = { depth: 4, wall: 1.2, toe: 0.6, clearance: 0.2 };
+  var JOINT = { depth: 4, wall: 1.2, toe: 0.6, clearance: 0.2, rest: 0.5 };
   function subGrid(g, k0, k1) {
     var sxy = g.nx * g.ny;
     return { x0: g.x0, y0: g.y0, z0: g.z0 + k0 * g.h, h: g.h, nx: g.nx, ny: g.ny, nz: k1 - k0,
@@ -3851,7 +3854,13 @@ var TRCORE = (function () {
     // the socket's roof rises until it meets itself over the widest part of the foot
     var inner = 0;
     for (var q = 0; q < sxy; q++) if (-foot[q] > inner) inner = -foot[q];
-    var roofTop = zc + Math.max(0, inner - J.wall) * cT / sT;
+    /* The socket is inset from the foot's outline by half the foot's inner
+       radius, not just by a wall: the sculpture prints standing on what is
+       left of its foot, and a socket that took all of it but a wall's width
+       left a hairline rim to stand on (the transformer at 120 mm kept 4 % of
+       its foot). Half the radius keeps at least half the area on the bed. */
+    var inset = Math.max(J.wall, JOINT.rest * inner);
+    var roofTop = zc + Math.max(0, inner - inset) * cT / sT;
     var inside = new Float32Array(sxy), rt = Math.min(P.plinthRound, zc * 0.4);
     for (var j = 0; j < g.ny; j++) for (var i = 0; i < g.nx; i++) {
       inside[i + g.nx * j] = plinth.f(g.x0 + i * h, g.y0 + j * h, zc - rt - 0.05);
@@ -3874,7 +3883,7 @@ var TRCORE = (function () {
         var z = g.z0 + k * h, o = (k - ka) * sxy;
         if (z <= zc) continue;
         for (var i = 0; i < sxy; i++) {
-          if (foot[i] < -J.wall && (z - zc + drop) * sT + (foot[i] + J.wall) * cT < 0 && saved[o + i] > -J.wall * 0.5) return true;
+          if (foot[i] < -inset && (z - zc + drop) * sT + (foot[i] + inset) * cT < 0 && saved[o + i] > -J.wall * 0.5) return true;
         }
       }
       return false;
@@ -3899,15 +3908,15 @@ var TRCORE = (function () {
           if (sculpt) {
             v = F0 > zc - z ? F0 : zc - z;
             if (z < zc + J.toe && toeCol[i2] > v) v = toeCol[i2];
-            if (!noBoss && S < -J.wall) {
+            if (!noBoss && S < -inset) {
               // no flat ceiling: the roof alone closes the socket, however wide the foot
-              var hole = (z - zc + drop) * sT + (S + J.wall) * cT;
+              var hole = (z - zc + drop) * sT + (S + inset) * cT;
               if (-hole > v) v = -hole;
             }
           } else {
             v = F0 > z - zc ? F0 : z - zc;
-            if (!noBoss && k >= kJ && S < -J.wall - J.c) {
-              var cb = Math.max(z - zc - J.depth + J.cz, (z - zc + drop + J.cz) * sT + (S + J.wall + J.c) * cT);
+            if (!noBoss && k >= kJ && S < -inset - J.c) {
+              var cb = Math.max(z - zc - J.depth + J.cz, (z - zc + drop + J.cz) * sT + (S + inset + J.c) * cT);
               var boss = Math.max(cb, inside[i2] + J.wall);
               if (boss < v) { v = boss; if (boss < 0 && z > zc) { hasJoint = true; if (z > bossTop) bossTop = z; } }
             }
@@ -4001,6 +4010,262 @@ var TRCORE = (function () {
       vol += (p[a] * (p[b + 1] * p[c2 + 2] - p[b + 2] * p[c2 + 1]) - p[a + 1] * (p[b] * p[c2 + 2] - p[b + 2] * p[c2]) + p[a + 2] * (p[b] * p[c2 + 1] - p[b + 1] * p[c2])) / 6;
     }
     return { bbox: bb, size: [bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]], volume: vol, triangles: I.length / 3, vertices: p.length / 3 };
+  }
+
+  /* What a slicer sees of a mesh, on a fixed 0.1 mm raster in z, so any
+     layer height can be binned from it later. At each sample height the mesh
+     is cut: every triangle crossing it gives one segment of the outline, and
+     the segments add up to the perimeter and, by the shoelace formula, to the
+     cross-section's area. The perimeter is also split by how far its face
+     leans out below it (tangent of the lean, in quarters up to 3, the rest
+     above), which is what makes a slicer slow down for overhangs. Upward and
+     downward faces are collected as horizontal area per bin, the top and
+     bottom skins. Every millimetre the outline's closed loops are counted,
+     islands and holes alike, by joining segments that share a mesh edge:
+     each loop is a travel move and a retraction. At the same heights each
+     segment casts a ray inwards to the far side of the solid, and the
+     perimeter is binned by that thickness (0.2 mm steps to 6 mm, the last
+     bin is anything thicker): a wall narrower than two lines is not drawn as
+     walls at all but as one line down its middle. */
+  var PF_DZ = 0.1, PF_BINS = 13, PF_LOOP = 10, PF_TSTEP = 0.2, PF_TB = 31;
+  function printFeatures(mesh) {
+    var p = mesh.positions, I = mesh.indices, z0 = Infinity, z1 = -Infinity;
+    for (var i = 2; i < p.length; i += 3) { if (p[i] < z0) z0 = p[i]; if (p[i] > z1) z1 = p[i]; }
+    var n = Math.max(1, Math.ceil((z1 - z0) / PF_DZ));
+    var per = new Float32Array(n), area = new Float32Array(n), up = new Float32Array(n), down = new Float32Array(n);
+    var lean = new Float32Array(n * PF_BINS), loops = new Float32Array(n), nv = p.length / 3, seg = [];
+    var geo = [], nq = Math.ceil(n / PF_LOOP), thick = new Float32Array(nq * PF_TB);
+    for (var q = 0; q < n; q += PF_LOOP) { seg[q] = []; geo[q] = []; }
+    for (var t = 0; t < I.length; t += 3) {
+      var a = 3 * I[t], b = 3 * I[t + 1], c = 3 * I[t + 2];
+      var ax = p[a], ay = p[a + 1], az = p[a + 2], bx = p[b], by = p[b + 1], bz = p[b + 2], cx = p[c], cy = p[c + 1], cz = p[c + 2];
+      var ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+      var nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx, nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (!(nl > 0)) continue;
+      // horizontal area of the face, to the bin of its centre
+      var kc = Math.min(n - 1, Math.max(0, Math.floor(((az + bz + cz) / 3 - z0) / PF_DZ)));
+      if (nz > 0) up[kc] += nz / 2; else down[kc] -= nz / 2;
+      var zl = Math.min(az, bz, cz), zh = Math.max(az, bz, cz);
+      var k0 = Math.max(0, Math.ceil((zl - z0) / PF_DZ - 0.5)), k1 = Math.min(n - 1, Math.floor((zh - z0) / PF_DZ - 0.5));
+      if (k1 < k0) continue;
+      // lean of a downward face from vertical, as its tangent
+      var hz = Math.sqrt(nx * nx + ny * ny), tn = nz < 0 && hz > 0 ? -nz / hz : 0;
+      var bin = nz < 0 ? (hz > 0 ? Math.min(PF_BINS - 1, Math.floor(tn * 4)) : PF_BINS - 1) : 0;
+      for (var k = k0; k <= k1; k++) {
+        var z = z0 + (k + 0.5) * PF_DZ;
+        // the two points where the plane cuts the triangle's edges
+        var px = [], py = [], ek = [];
+        var e = [[ax, ay, az, bx, by, bz], [bx, by, bz, cx, cy, cz], [cx, cy, cz, ax, ay, az]], vi = [I[t], I[t + 1], I[t + 2]];
+        for (var j = 0; j < 3; j++) {
+          var E = e[j];
+          if ((E[2] < z) !== (E[5] < z)) { var s = (z - E[2]) / (E[5] - E[2]); px.push(E[0] + s * (E[3] - E[0])); py.push(E[1] + s * (E[4] - E[1])); var v0 = vi[j], v1 = vi[(j + 1) % 3]; ek.push(v0 < v1 ? v0 * nv + v1 : v1 * nv + v0); }
+        }
+        if (px.length !== 2) continue;
+        var dx = px[1] - px[0], dy = py[1] - py[0], len = Math.sqrt(dx * dx + dy * dy);
+        if (seg[k]) { seg[k].push(ek[0], ek[1]); if (hz > 0) geo[k].push(px[0], py[0], px[1], py[1], -nx / hz, -ny / hz); }
+        per[k] += len;
+        lean[k * PF_BINS + bin] += len;
+        // shoelace, the segment oriented so the solid lies to its left: (dx, dy) × up points along the outward normal
+        area[k] += (dx * ny - dy * nx > 0 ? -1 : 1) * (px[0] * py[1] - px[1] * py[0]) / 2;
+      }
+    }
+    // loops per sampled height by union-find over the cut edges, held until the next sample
+    for (var q2 = 0; q2 < n; q2 += PF_LOOP) {
+      var S = seg[q2], id = new Map(), par = [], cnt = 0;
+      var find = function (x) { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+      for (var m = 0; m < S.length; m++) if (!id.has(S[m])) { id.set(S[m], par.length); par.push(par.length); cnt++; }
+      for (var m2 = 0; m2 < S.length; m2 += 2) { var ra = find(id.get(S[m2])), rb = find(id.get(S[m2 + 1])); if (ra !== rb) { par[ra] = rb; cnt--; } }
+      for (var m3 = q2; m3 < Math.min(n, q2 + PF_LOOP); m3++) loops[m3] = cnt;
+      wallThickness(geo[q2], thick, (q2 / PF_LOOP) * PF_TB);
+    }
+    return { dz: PF_DZ, z0: z0, n: n, bins: PF_BINS, per: per, area: area, up: up, down: down, lean: lean, loops: loops,
+      loop: PF_LOOP, thick: thick, tb: PF_TB, tstep: PF_TSTEP };
+  }
+
+  /* The thickness histogram of one cut: segments (x0, y0, x1, y1, inward
+     normal) go into a 1 mm hash, and each casts a ray from its middle along
+     the normal, stepping cell by cell until a hit nearer than the cells
+     still ahead. Its length goes to the bin of the distance to that hit. */
+  function wallThickness(G, out, o) {
+    var m = G.length / 6, C = 1, cells = new Map(), tmax = (PF_TB - 1) * PF_TSTEP;
+    var key = function (ix, iy) { return (ix + 32768) * 65536 + iy + 32768; };
+    for (var i = 0; i < m; i++) {
+      var g = 6 * i, xa = Math.floor(Math.min(G[g], G[g + 2]) / C), xb = Math.floor(Math.max(G[g], G[g + 2]) / C);
+      var ya = Math.floor(Math.min(G[g + 1], G[g + 3]) / C), yb = Math.floor(Math.max(G[g + 1], G[g + 3]) / C);
+      for (var ix = xa; ix <= xb; ix++) for (var iy = ya; iy <= yb; iy++) {
+        var kk = key(ix, iy), l = cells.get(kk);
+        if (l) l.push(i); else cells.set(kk, [i]);
+      }
+    }
+    for (var i2 = 0; i2 < m; i2++) {
+      var h = 6 * i2, ex = G[h + 2] - G[h], ey = G[h + 3] - G[h + 1], len = Math.sqrt(ex * ex + ey * ey);
+      var mx = (G[h] + G[h + 2]) / 2, my = (G[h + 1] + G[h + 3]) / 2, rx = G[h + 4], ry = G[h + 5], best = Infinity, last = -1;
+      for (var d = 0; d <= tmax + C; d += C / 2) {
+        if (best < d - C) break;
+        var kc = key(Math.floor((mx + rx * d) / C), Math.floor((my + ry * d) / C));
+        if (kc === last) continue;
+        last = kc;
+        var L = cells.get(kc);
+        if (!L) continue;
+        for (var j = 0; j < L.length; j++) {
+          if (L[j] === i2) continue;
+          var f = 6 * L[j], sx = G[f + 2] - G[f], sy = G[f + 3] - G[f + 1];
+          var den = rx * sy - ry * sx;
+          if (Math.abs(den) < 1e-12) continue;
+          var qx = G[f] - mx, qy = G[f + 1] - my, t = (qx * sy - qy * sx) / den, u = (qx * ry - qy * rx) / den;
+          if (t > 1e-4 && u >= 0 && u <= 1 && t < best) best = t;
+        }
+      }
+      out[o + Math.min(PF_TB - 1, Math.floor(best / PF_TSTEP))] += len;
+    }
+  }
+
+  /* Bambu Lab A1, standard process profile per nozzle, values from Bambu
+     Studio's system profiles (2026-09): layer height h, line width w, wall
+     loops, top and bottom shells (the top at least topMin mm), sparse infill
+     share (the tool sets its own, and the constants below are fitted to cubic
+     infill, not the profile's grid), speeds in mm/s for outer and inner wall,
+     sparse and solid infill, and the overhang speeds by quarter of a line
+     width hanging out (0: none). */
+  var PRINT_NOZZLE = {
+    '0.4': { h: 0.2, w: 0.42, wi: 0.45, walls: 2, top: 5, topMin: 1.0, bottom: 3, infill: 0.15, outer: 200, inner: 300, sparse: 270, solid: 250, gap: 250, over: [0, 50, 30, 10, 10] },
+    '0.6': { h: 0.3, w: 0.62, wi: 0.62, walls: 2, top: 3, topMin: 0.8, bottom: 3, infill: 0.15, outer: 120, inner: 150, sparse: 100, solid: 150, gap: 50, over: [0, 50, 15, 10, 10] },
+    '0.8': { h: 0.4, w: 0.82, wi: 0.82, walls: 2, top: 3, topMin: 0.8, bottom: 3, infill: 0.15, outer: 120, inner: 150, sparse: 100, solid: 150, gap: 50, over: [0, 50, 25, 5, 10] }
+  };
+  // Generic PLA and Generic PLA Silk: most volume per second (mm³/s), density, and the shortest a layer may take before the fan slows it
+  var PRINT_FILAMENT = {
+    pla: { q: 12, rho: 1.24, layerTime: 8 },
+    silk: { q: 7.5, rho: 1.24, layerTime: 8 }
+  };
+
+  /* The line work of each layer, before any speed: length of the outer
+     wall (and how much of it hangs out by which quarter of a line), of the
+     inner walls, of solid infill, sparse infill and gap fill, and the
+     number of closed loops in the outline. Each stretch of perimeter gets
+     as many wall loops as the thickness behind it holds; what is left of a
+     narrow strip is one gap line, what the walls leave of a wide section is
+     solid infill under a top or over a bottom, sparse elsewhere, at the
+     given density (the profile's if none). Volume in mm³ uses the slicer's
+     line section, a rectangle with round ends. */
+  function printLines(F, nozzle, infill) {
+    var N = PRINT_NOZZLE[nozzle], h = N.h, w = N.w, wi = N.wi, dens = infill == null ? N.infill : infill;
+    var xs = (w - h) * h + Math.PI * h * h / 4, xsi = (wi - h) * h + Math.PI * h * h / 4;
+    var nl = Math.max(1, Math.round(F.n * F.dz / h));
+    var nt = Math.max(N.top, Math.ceil(N.topMin / h - 1e-9)), nb = N.bottom;
+    // prefix sums of the upward and downward areas, to take any window of them
+    var cu = new Float64Array(F.n + 1), cd = new Float64Array(F.n + 1);
+    for (var i = 0; i < F.n; i++) { cu[i + 1] = cu[i] + F.up[i]; cd[i + 1] = cd[i] + F.down[i]; }
+    var at = function (z) { return Math.min(F.n, Math.max(0, Math.round(z / F.dz))); };
+    var L = [], volume = 0;
+    for (var k = 0; k < nl; k++) {
+      var zm = (k + 0.5) * h, s = Math.min(F.n - 1, Math.floor(zm / F.dz));
+      var P = F.per[s], A = Math.max(0, F.area[s]);
+      if (!(A > 1e-6) || !(P > 0)) continue;
+      // walls by the thickness they stand in: as many loops as fit, a line down the middle of what is left if narrower than two lines
+      var hq = F.tb * Math.min(F.thick.length / F.tb - 1, Math.floor(s / F.loop)), H = 0;
+      for (var tb = 0; tb < F.tb; tb++) H += F.thick[hq + tb];
+      var lo = 0, li = 0, lg = 0, used = 0;
+      for (var tb2 = 0; tb2 < F.tb; tb2++) {
+        var part = H > 0 ? P * F.thick[hq + tb2] / H : (tb2 === F.tb - 1 ? P : 0);
+        if (!part) continue;
+        var th = tb2 === F.tb - 1 ? Infinity : (tb2 + 0.5) * F.tstep, nw = 0, band = 0;
+        while (nw < N.walls && th >= 1.8 * (w + nw * wi)) nw++;
+        if (nw) { lo += part; li += part * (nw - 1); band = w + (nw - 1) * wi; }
+        var left = th - 2 * band;
+        if (left < 2 * wi) {
+          // the whole strip is taken: walls and, if there is room for it, one gap line
+          if (left > 0.2 * w) lg += part / 2;
+          used += part * th / 2;
+        } else used += part * band;
+      }
+      var rest = Math.max(0, A - used), ld = 0, ls = 0;
+      if (rest < P * w) { lg += rest / wi; rest = 0; }
+      if (rest > 0) {
+        var skin = cu[at(zm + h / 2 + nt * h)] - cu[at(zm + h / 2)] + cd[at(zm - h / 2)] - cd[at(zm - h / 2 - nb * h)];
+        var solid = Math.min(rest, skin);
+        ld = solid / w; ls = (rest - solid) * dens / wi;
+      }
+      // a face leaning by t hangs h tan t of the line out over the one below
+      var over = [0, 0, 0, 0, 0], share = lo / P;
+      for (var b = 1; b < F.bins; b++) over[Math.min(4, Math.floor(h * (b + 0.5) / w))] += F.lean[s * F.bins + b] * share;
+      L.push({ lo: lo, li: li, ld: ld, ls: ls, lg: lg, over: over, loops: F.loops[s] });
+      volume += (lo + ld) * xs + (li + ls + lg) * xsi;
+    }
+    return { layers: L, count: nl, volume: volume };
+  }
+
+  /* Seconds for those lines. Every speed is capped by the filament's volume
+     per second; speeding up and slowing down at the ends and bends of the
+     lines costs v/acc per mm on top of 1/v, acc being a fitted mm²/s².
+     Overhangs slow the outer wall to the profile's speeds. Travel and
+     retraction cost a toll per layer and per loop. A layer shorter than
+     the filament's layer time is slowed to it, but not below 20 mm/s. */
+  // fitted 2026-09-27 to 306 slices in Bambu Studio 2.4 with cubic infill at 10, 15 and 25 %
+  // (notes/tools/trophy/fit2.mjs): 7.3 % standard deviation, leaving each trophy out
+  var PRINT_K = { acc: 29600, layer: 0, loop: 0.227, fixed: -38 };
+  // the 20th, 50th and 80th percentile of the slicer's time over this estimate, from the same fit
+  var PRINT_PCT = [0.93, 0.99, 1.05];
+  function printTime(lines, nozzle, filament, K) {
+    K = K || PRINT_K;
+    var N = PRINT_NOZZLE[nozzle], M = typeof filament === 'string' ? PRINT_FILAMENT[filament] : filament, h = N.h;
+    var cap = M.q / (N.w * h), capI = M.q / (N.wi * h);
+    var pace = function (v) { return 1 / v + v / K.acc; };
+    var po = pace(Math.min(N.outer, cap)), pi = pace(Math.min(N.inner, capI)), pd = pace(Math.min(N.solid, cap));
+    var ps = pace(Math.min(N.sparse, capI)), pg = pace(Math.min(N.gap, capI));
+    var total = K.fixed, parts = { wall: 0, infill: 0, travel: 0, slow: 0 };
+    for (var k = 0; k < lines.layers.length; k++) {
+      var r = lines.layers[k];
+      var tw = r.lo * po + r.li * pi, vo = Math.min(N.outer, cap);
+      for (var q = 1; q < 5; q++) if (r.over[q] && N.over[q] && N.over[q] < vo) tw += r.over[q] * (pace(N.over[q]) - po);
+      var tf = r.ld * pd + r.ls * ps + r.lg * pg, tt = K.layer + K.loop * r.loops;
+      var t = tw + tf + tt, len = r.lo + r.li + r.ld + r.ls + r.lg;
+      var slow = Math.max(0, Math.min(M.layerTime, tt + len / 20) - t);
+      parts.wall += tw; parts.infill += tf; parts.travel += tt; parts.slow += slow;
+      total += t + slow;
+    }
+    parts.total = total;
+    return parts;
+  }
+
+  /* The same piece's features scaled by s in every direction, for the
+     exponent of the time over the height. On the 0.1 mm raster a slice
+     takes the one at z / s; lengths grow with s, areas with s², the loops
+     stay. Upward and downward areas are totals per bin, so each moves to its
+     new bin whole, times s². */
+  function printScale(F, s) {
+    var n = Math.max(1, Math.round(F.n * s)), per = new Float32Array(n), area = new Float32Array(n), loops = new Float32Array(n);
+    var up = new Float32Array(n), down = new Float32Array(n), lean = new Float32Array(n * F.bins);
+    for (var k = 0; k < n; k++) {
+      var i = Math.min(F.n - 1, Math.floor((k + 0.5) / s));
+      per[k] = F.per[i] * s; area[k] = F.area[i] * s * s; loops[k] = F.loops[i];
+      for (var b = 0; b < F.bins; b++) lean[k * F.bins + b] = F.lean[i * F.bins + b] * s;
+    }
+    for (var j = 0; j < F.n; j++) {
+      var kk = Math.min(n - 1, Math.floor((j + 0.5) * s));
+      up[kk] += F.up[j] * s * s; down[kk] += F.down[j] * s * s;
+    }
+    // thickness histograms: each sample from the one at z / s, each bin to the bin of its thickness times s
+    var nq = Math.ceil(n / F.loop), thick = new Float32Array(nq * F.tb), nq0 = F.thick.length / F.tb;
+    for (var q = 0; q < nq; q++) {
+      var q0 = Math.min(nq0 - 1, Math.floor((q + 0.5) / s));
+      for (var t = 0; t < F.tb; t++) {
+        var tt = t === F.tb - 1 ? F.tb - 1 : Math.min(F.tb - 1, Math.floor((t + 0.5) * s));
+        thick[q * F.tb + tt] += F.thick[q0 * F.tb + t];
+      }
+    }
+    return { dz: F.dz, z0: F.z0 * s, n: n, bins: F.bins, per: per, area: area, up: up, down: down, lean: lean, loops: loops,
+      loop: F.loop, thick: thick, tb: F.tb, tstep: F.tstep };
+  }
+
+  /* Time and filament for the printed parts, each its own print job. */
+  function printEstimate(features, nozzle, filament, infill) {
+    var M = typeof filament === 'string' ? PRINT_FILAMENT[filament] : filament, out = { parts: [], seconds: 0, grams: 0 };
+    features.forEach(function (F) {
+      var L = printLines(F, nozzle, infill), s = printTime(L, nozzle, M).total, g = L.volume * M.rho / 1000;
+      out.parts.push({ seconds: s, grams: g });
+      out.seconds += s; out.grams += g;
+    });
+    return out;
   }
 
   /* The preview shades smoothly, with one normal per vertex. Across the
@@ -4144,6 +4409,7 @@ var TRCORE = (function () {
       delete mesh.cells; delete mesh.grid;
       st = meshStats(mesh);
     }
+    var print = (parts || [mesh]).map(printFeatures);
     var tMesh = Date.now();
     var view = mesh && !opts.noView ? { positions: mesh.positions, normals: mesh.normals, groups: [mesh.indices], sharp: mesh.sharp, faceN: mesh.faceN } : null;
     var E = plinth && plinth.engraving;
@@ -4151,6 +4417,7 @@ var TRCORE = (function () {
       mesh: mesh, parts: parts, view: view, stats: st, support: sup, notes: D.notes, params: D.P, joint: joint, pins: pins, flange: flange, glue: glue,
       engraving: E ? { capH: E.capH, groove: E.groove, depth: E.depth, lines: E.lines, condense: E.condense } : null,
       plinth: { height: zc, radius: plinth.radius },
+      print: print,
       grid: [g.nx, g.ny, g.nz], ms: { field: tField - t0, check: tCheck - tField, mesh: tMesh - tCheck }
     };
   }
@@ -4181,6 +4448,7 @@ var TRCORE = (function () {
     try {
       var r = build(job.params, job.voxel, function (p) { self.postMessage({ id: job.id, progress: p }); }, { noView: !!job.noView });
       var bufs = new Set([r.support.points.buffer]);
+      r.print.forEach(function (f) { [f.per, f.area, f.up, f.down, f.lean, f.loops, f.thick].forEach(function (a) { bufs.add(a.buffer); }); });
       [r.mesh].concat(r.parts || []).forEach(function (m) {
         if (m) [m.positions, m.normals, m.labels, m.indices, m.sharp, m.faceN].forEach(function (a) { if (a) bufs.add(a.buffer); });
       });
@@ -4199,7 +4467,8 @@ var TRCORE = (function () {
     DEFAULTS: DEFAULTS, REF_H: REF_H, merge: merge, encodeConfig: encodeConfig, decodeConfig: decodeConfig, resolve: resolve, design: design, build: build, writeSTL: writeSTL, flatView: flatView,
     layoutText: layoutText, glyph: glyph, jointSizes: jointSizes, bushingOutline: bushingOutline,
     smin: smin, dropSdf: dropSdf, dropRadiusAt: dropRadiusAt, sectionSdf: sectionSdf,
-    unionField: unionField, makeGrid: makeGrid, segDist: segDist, splatSweep: splatSweep, splatSdf: splatSdf, surfaceNets: surfaceNets, supportCheck: supportCheck, meshStats: meshStats
+    unionField: unionField, makeGrid: makeGrid, segDist: segDist, splatSweep: splatSweep, splatSdf: splatSdf, surfaceNets: surfaceNets, supportCheck: supportCheck, meshStats: meshStats, printFeatures: printFeatures,
+    PRINT_NOZZLE: PRINT_NOZZLE, PRINT_FILAMENT: PRINT_FILAMENT, printLines: printLines, printTime: printTime, printEstimate: printEstimate, printScale: printScale, PRINT_PCT: PRINT_PCT
   };
 })();
 
@@ -4430,6 +4699,29 @@ var TRCORE = (function () {
   // decimals a step size implies: 1 -> 0, 0.05 -> 2
   const decimals = (step) => { const t = String(step), i = t.indexOf('.'); return i < 0 ? 0 : t.length - i - 1; };
 
+  /* The printer for the time estimate, kept in this browser. */
+  function loadPrinter() {
+    const d = { nozzle: '0.6', filament: 'silk', q: 7.5, infill: 15 };
+    try {
+      const o = JSON.parse(localStorage.getItem('trophy-printer') || 'null');
+      if (o && TRCORE.PRINT_NOZZLE[o.nozzle] && TRCORE.PRINT_FILAMENT[o.filament] && o.q >= 3 && o.q <= 30)
+        return { nozzle: o.nozzle, filament: o.filament, q: o.q, infill: o.infill >= 10 && o.infill <= 25 ? o.infill : d.infill };
+    } catch (e) { /* unreadable: the default */ }
+    return d;
+  }
+  // 1 h 20 min, or 45 min
+  function dur(s) {
+    const m = Math.max(5, Math.round(s / 300) * 5), h = Math.floor(m / 60);
+    return h ? h + ' h' + (m % 60 ? ' ' + (m % 60) + ' min' : '') : m + ' min';
+  }
+  // the three percentiles as 35/40/45 min, or 2.3/2.5/2.7 h from an hour and a half
+  function durPct(s) {
+    const v = TRCORE.PRINT_PCT.map((f) => f * s);
+    if (v[2] < 5400) return v.map((x) => Math.max(1, Math.round(x / 60))).join('/') + ' min';
+    return v.map((x) => x < 36000 ? (x / 3600).toFixed(1) : Math.round(x / 3600)).join('/') + ' h';
+  }
+  function roundGrams(g) { return g < 100 ? Math.round(g / 5) * 5 : Math.round(g / 10) * 10; }
+
   function Slider({ label, value, shown, min, max, step, fmt, onChange }) {
     const v = shown == null ? value : shown;
     return html`<label className="tr-sl">
@@ -4535,6 +4827,14 @@ var TRCORE = (function () {
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.autoRotateSpeed = 1.2;
+        /* A drag whose pointerup never arrives (window minimised or switched
+           away mid-drag) leaves OrbitControls holding the pointer, so the
+           piece follows the bare mouse until the next click. End such a drag
+           by hand: on a mouse move with no button down, or on lost capture. */
+        const endDrag = (e) => { if (controls._isTrackingPointer(e)) controls._onPointerUp(e); };
+        const cv = renderer.domElement;
+        cv.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse' && e.buttons === 0) endDrag(e); });
+        cv.addEventListener('lostpointercapture', endDrag);
         const key = new THREE.DirectionalLight(0xfff2e0, 2.2);
         key.castShadow = true;
         key.shadow.mapSize.set(2048, 2048);
@@ -4738,6 +5038,9 @@ var TRCORE = (function () {
     const [busy, setBusy] = useState(0);
     const [exporting, setExporting] = useState(false);
     const [error, setError] = useState(null);
+    // the printer the time is estimated for; a setting of this browser, not of the design
+    const [printer, setPrinter] = useState(loadPrinter);
+    useEffect(() => { try { localStorage.setItem('trophy-printer', JSON.stringify(printer)); } catch (e) { /* private mode */ } }, [printer]);
     const [pasted, setPasted] = useState('');
     const [shareMsg, setShareMsg] = useState(START_ERR ? { bad: true, text: START_ERR } : null);
     const stageRef = useRef(null);
@@ -4756,7 +5059,7 @@ var TRCORE = (function () {
         setError(null);
         lastRes.current = d.result;
         const r = d.result;
-        setRes({ stats: r.stats, support: { volume: r.support.volume, bridged: r.support.bridged, long: r.support.long }, notes: r.notes, ms: r.ms, engraving: r.engraving, plinth: r.plinth, joint: r.joint, pins: r.pins, flange: r.flange, glue: r.glue, mode: r.params.parts });
+        setRes({ stats: r.stats, support: { volume: r.support.volume, bridged: r.support.bridged, long: r.support.long }, notes: r.notes, ms: r.ms, engraving: r.engraving, plinth: r.plinth, joint: r.joint, pins: r.pins, flange: r.flange, glue: r.glue, mode: r.params.parts, print: r.print });
         if (V.current) showResult(V.current, r, showSupRef.current);
         if (!pending.current.length) setBusy(0);
       }
@@ -4912,6 +5215,15 @@ var TRCORE = (function () {
     const pn = res && res.pins, np = pn ? pn.spots.length : 0, jt = res && res.joint;
     // the result may still be the previous mode's while the new one builds
     const fresh = res && res.mode === P.parts;
+    const est = useMemo(() => {
+      if (!res || !res.print) return null;
+      const fil = { ...TRCORE.PRINT_FILAMENT[printer.filament], q: printer.q };
+      const e = TRCORE.printEstimate(res.print, printer.nozzle, fil, printer.infill / 100);
+      // the local exponent of time over height, from the same piece 10 % larger and smaller
+      const at = (s) => TRCORE.printEstimate(res.print.map((F) => TRCORE.printScale(F, s)), printer.nozzle, fil, printer.infill / 100).seconds;
+      e.exponent = Math.log(at(1.1) / at(1 / 1.1)) / Math.log(1.21);
+      return e;
+    }, [res, printer]);
     const jointHint = !two
       ? `One STL. For two colours from one print, change filament at ${zc.toFixed(1)} mm, the top of the plinth.`
       : !fresh ? ''
@@ -4935,6 +5247,11 @@ var TRCORE = (function () {
           ${st && html`<div className="tr-stats">
             <span>Size <b>${st.size[0].toFixed(0)} × ${st.size[1].toFixed(0)} × ${st.size[2].toFixed(0)} mm</b></span>
             <span>Solid volume <b>${(st.volume / 1000).toFixed(0)} cm³</b></span>
+            ${est && html`<span>Print time P<sub>20/50/80</sub> <b>${durPct(est.seconds)}</b> <${Info} label="the print time"><p>What Bambu Studio would probably estimate for a Bambu Lab A1 with its standard profile for the ${printer.nozzle} mm nozzle (${TRCORE.PRINT_NOZZLE[printer.nozzle].h} mm layers, two walls) and ${printer.infill} % cubic infill, at ${printer.q} mm³/s.${est.parts.length > 1 ? ` Two print jobs: plinth ${dur(est.parts[0].seconds)}, sculpture ${dur(est.parts[1].seconds)}.` : ''}</p><p>The model cuts the solid into layers and adds up walls, infill and travel, each at the speed the profile allows or the filament can melt, whichever is lower; a wall too thin for two lines is one line down its middle, as the slicer draws it, and a thin layer waits for the fan. Its constants were fitted to 25 trophies sliced in Bambu Studio with three nozzles, Generic PLA and Generic PLA Silk, and cubic infill at 10, 15 and 25 %, 306 slices. P20, P50 and P80 are the percentiles of the slicer's own estimate relative to this one, with each trophy left out of the fit in turn: three times in five, Bambu Studio says something between P20 and P80.</p><p>Only a solid block would take eight times as long at twice the height. A trophy is largely walls, whose length grows with the square, and a small one waits for the fan on every layer, so twice the height costs two and a half to five times as long. Warm-up and bed levelling come on top. Other printers: an order of magnitude.</p><//></span>
+              <span>Time ∝ height<sup>${est.exponent.toFixed(1)}</sup></span>`}
+          </div>`}
+          ${st && html`<div className="tr-stats tr-stats2">
+            ${est && html`<span>Filament about <b>${roundGrams(est.grams)} g</b></span>`}
             <span>${st.triangles.toLocaleString('en')} triangles</span>
             <span>${res.ms.field + res.ms.mesh + res.ms.check} ms</span>
           </div>`}
@@ -4955,6 +5272,13 @@ var TRCORE = (function () {
               value=${P.height} min=${80} max=${300} step=${5} fmt=${(v) => v + ' mm'} onChange=${setTop('height')}/>
             <${Slider} label=${html`Overhang limit <${Info} label="the overhang limit"><p>How far a surface may lean out before your printer needs support under it. The piece is built to this angle, so it changes the shape as well: a higher limit gives flatter, wider forms, and on the transformer flatter sheds, lower radiator tips and a shallower saddle, on the flying wing a steeper pose and on the F-22 fuller wingtips. Anything that still leans past it is marked red.</p><p>45° prints on any printer, a well-cooled modern one manages 60° and more; towards 80° a surface is nearly flat, and a test print of an overhang sample first is cheap.</p><//>`}
               value=${P.overhang} min=${35} max=${80} step=${1} fmt=${(v) => v + '° from vertical'} onChange=${setTop('overhang')}/>
+            <p className="tr-sub">Nozzle and filament, for the print time</p>
+            <div className="tr-segpair"><${Seg} value=${printer.nozzle} onChange=${(v) => setPrinter((o) => ({ ...o, nozzle: v }))} options=${[['0.4', '0.4 mm'], ['0.6', '0.6 mm'], ['0.8', '0.8 mm']]}/>
+            <${Seg} value=${printer.filament} onChange=${(v) => setPrinter((o) => ({ ...o, filament: v, q: TRCORE.PRINT_FILAMENT[v].q }))} options=${[['pla', 'PLA'], ['silk', 'Silk PLA']]}/></div>
+            <${Slider} label=${html`Volumetric speed <${Info} label="the volumetric speed"><p>How many cubic millimetres of filament the hotend melts per second at most. For a trophy on a 0.6 or 0.8 mm nozzle this, not the profile's speeds, sets the pace of nearly every line, so it decides the time more than anything else.</p><p>Bambu Studio's Generic PLA profile allows 12 mm³/s, Generic PLA Silk 7.5; a tuned filament profile often manages more.</p><//>`}
+              value=${printer.q} min=${3} max=${30} step=${0.5} fmt=${(v) => v + ' mm³/s'} onChange=${(v) => setPrinter((o) => ({ ...o, q: v }))}/>
+            <${Slider} label=${html`Infill <${Info} label="the infill"><p>Density of the cubic infill inside everything thicker than a few walls. Most of a strand trophy is walls, so it matters most for the solid shapes and the plinth.</p><//>`}
+              value=${printer.infill} min=${10} max=${25} step=${1} fmt=${(v) => v + ' % cubic'} onChange=${(v) => setPrinter((o) => ({ ...o, infill: v }))}/>
           </div>
           <${Sec} k="shape" title="Shape" aside=${FAMILY_LABEL[fam] + (fam === 'torsion' ? ', ' + SECTION_LABEL[sectionOf(F)].toLowerCase() : fam === 'lattice' && F.inside === 'shells' ? ', nested' : fam === 'cup' ? ', ' + F.bowl + (F.section === 'round' ? '' : F.section === 'facet' ? ', faceted' : ', fluted') : fam === 'wing' ? (F.attitude === 'bank' ? ', banked flying wing' : F.attitude === 'climb' ? ', climbing flying wing' : F.stand === 'nose' ? ', F-22 nose down' : ', F-22') : '')} open=${openSec} onToggle=${toggleSec}>
             <select className="tr-family" aria-label="Family" value=${fam} onChange=${(e) => setTop('family')(e.target.value)}>
@@ -5062,7 +5386,7 @@ var TRCORE = (function () {
         </div></details>
         <details className="fold"><summary>Two parts</summary><div className="fold-body">
           <p>In the three two-part modes the piece is cut by the plane of the plinth top and the halves are printed apart. The sculpture stands on its flat cut face while it prints, so it needs no support there either. What differs is how the halves meet.</p>
-          <p><b>Socket.</b> The plinth grows a boss in the shape of the sculpture's foot, shrunk by a wall and the fit clearance, and the foot gets the matching socket. The boss centres the sculpture and, unless the foot is round, also decides which way it faces. Both end in a roof that rises at the overhang limit instead of a flat ceiling, which is what lets the socket print upside up. The boss aligns; it adds little strength. A printed part is weakest across its layers, and the boss, like the slim stem just above it, fails along a layer line whether the piece is printed whole or in two. Where the foot is too slender for a boss, the joint is a flat face.</p>
+          <p><b>Socket.</b> The plinth grows a boss in the shape of the sculpture's foot, shrunk by about half its width and the fit clearance, and the foot gets the matching socket. The rim left round the socket is what the sculpture stands on while it prints, so it keeps at least half the foot's area. The boss centres the sculpture and, unless the foot is round, also decides which way it faces. Both end in a roof that rises at the overhang limit instead of a flat ceiling, which is what lets the socket print upside up. The boss aligns; it adds little strength. A printed part is weakest across its layers, and the boss, like the slim stem just above it, fails along a layer line whether the piece is printed whole or in two. Where the foot is too slender for a boss, the joint is a flat face.</p>
           <p><b>Wide foot.</b> The same boss and socket, under a foot pushed outwards by a few millimetres all round, a plate that blends into the sculpture above it. A glued joint holds by its area, and the bending that tips a trophy over pulls hardest at the rim of that area, so a wider foot helps twice, and it gives a slender foot room for a boss. It does nothing for the stem above it.</p>
           <p><b>Steel pins.</b> Dowel pins are the one thing in the joint whose strength runs across the layers. Each needs a vertical hole with a wall all round, so the tool measures, slice by slice, how far up into the sculpture such a hole can go. If the best spot takes one pin deep enough, one pin it is. If the sculpture is slim everywhere, as the flame is in its ribbons, several short pins go wherever there is room, and between them they carry the bending as a pair of forces rather than each pin bending on its own. The pin sits halfway in each part, in a standard length (ISO 8734), and the hole in the sculpture ends in a pointed roof like the socket. There is no boss in this mode: the pins centre the sculpture, two or more also fix which way it faces, and a boss drilled through would only leave slivers. A single pin lets the sculpture turn, so it is set by eye while the glue is soft.</p>
           <p>Two-part epoxy is the glue for all three: it fills the clearance, so pins, boss and socket bear on each other all round, where superglue would leave a gap it cannot bridge.</p>
