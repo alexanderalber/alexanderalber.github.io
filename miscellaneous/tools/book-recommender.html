@@ -694,7 +694,32 @@
       // two steps darker, as the site's own light signals do.
       C.gold  = GREY ? 'var(--tool-emph)'    : IS_LIGHT ? '#a16207' : '#d9a441';
       C.point = GREY ? C.teal : C.gold;
+      // Top-pick map: the few largest regions get a muted tint, everything else one
+      // neutral, so the map reads as a handful of territories plus a fringe and not as
+      // a rainbow. All pre-blended toward the surface (opaque, no alpha build-up where
+      // borders are drawn twice). The grey skin's one accent is the teal, so there the
+      // slots alternate teal at falling saturation with plain grey steps: neighbours in
+      // rank order still differ, by hue or by lightness.
+      const ehex = getComputedStyle(document.documentElement).getPropertyValue('--tool-emph').trim();
+      const EMPH = /^#[0-9a-f]{6}$/i.test(ehex)
+        ? [1, 3, 5].map(i => parseInt(ehex.substr(i, 2), 16))
+        : IS_LIGHT ? [15, 23, 42] : [225, 232, 240];
+      const mix = (c, op) => `rgb(${[0, 1, 2].map(i => Math.round(MAP_BG[i] + (c[i] - MAP_BG[i]) * op)).join(',')})`;
+      const TEAL = [15, 181, 173], tealSat = s => TEAL.map(v => 123 + (v - 123) * s);
+      const hues = GREY ? [TEAL, EMPH, tealSat(0.5), EMPH, tealSat(0.25)]
+        : [TEAL, [217, 164, 65], [104, 136, 204], [196, 110, 132], [134, 172, 112]];
+      const base = GREY ? [0.3, 0.16, 0.3, 0.07, 0.24] : IS_LIGHT ? [0.15, 0.15, 0.15, 0.15, 0.15] : [0.17, 0.17, 0.17, 0.17, 0.17];
+      TP = {
+        fill: hues.map((h, i) => mix(h, base[i])),
+        hot: hues.map((h, i) => mix(h, base[i] + (GREY ? 0.1 : 0.17))),
+        swatch: hues.map((h, i) => mix(h, GREY ? Math.min(1, base[i] * 2 + 0.15) : 0.6)),
+        rest: mix(EMPH, IS_LIGHT ? 0.04 : 0.03), restHot: mix(EMPH, IS_LIGHT ? 0.13 : 0.12),
+        restSwatch: mix(EMPH, 0.15),
+        border: mix(EMPH, IS_LIGHT ? 0.35 : 0.42), edge: mix(EMPH, 0.7), emph: mix(EMPH, 1)
+      };
     }
+    let TP;
+    const TP_RES = 160;   // grid samples per axis; exact border crossings make finer grids unnecessary
     readPalette();
     function cmap(t) {   // t in [-1, 1]
       t = Math.max(-1, Math.min(1, t));
@@ -718,19 +743,27 @@
     // Statistical leverage: how far a book sits outside the taste directions your ratings
     // pinned down. High = the model extrapolates → wider uncertainty band.
     const LEV_TIP = 'How far this book sits outside the taste directions your ratings have pinned down. Higher = the model is extrapolating, so its uncertainty band is wider. It also drives which books the onboarding asks you about.';
-    // Marching squares for the top-pick map: trace the borders between adjacent
-    // grid cells won by different books as smooth vector polylines (white contours on
-    // the dark surface, no fills, no colour). `field` is a categorical fr×fr grid.
-    // For one region label we build a binary mask and emit the midpoint iso-contour,
-    // then chain the segments into loops and Chaikin-smooth them.
-    function regionContours(field, fr, label) {
-      const inside = (r, c) => (r >= 0 && r < fr && c >= 0 && c < fr && field[r * fr + c] === label) ? 1 : 0;
-      const segs = [];   // each [[x0,y0],[x1,y1]] in grid-sample coordinates (0..fr-1)
-      for (let r = 0; r < fr - 1; r++) for (let c = 0; c < fr - 1; c++) {
+    // Marching squares for the top-pick map: trace the outline of one book's region
+    // as closed vector loops (used for both its fill and its border). `field` is a
+    // categorical fr×fr grid; tH/tV hold, per grid edge, where along it the winner
+    // changes (0..1, see TopPickTab), so borders run through the actual crossings
+    // rather than the half-cell midpoints. The grid is padded by two rings that repeat
+    // the edge cells, then by emptiness, so every loop closes OUTSIDE the plotted
+    // area and the caller clips it to the triangle; a region touching the edge is
+    // then cut cleanly by the clip instead of by a rounded-off contour corner.
+    function regionContours(field, fr, label, tH, tV) {
+      const P = 2, cl = v => v < 0 ? 0 : v >= fr ? fr - 1 : v;
+      const inside = (r, c) => (r >= -P && r < fr + P && c >= -P && c < fr + P &&
+        field[cl(r) * fr + cl(c)] === label) ? 1 : 0;
+      const th = (r, c) => (c >= 0 && c < fr - 1 && r >= -P && r < fr + P) ? tH[cl(r) * fr + c] : 0.5;
+      const tv = (r, c) => (r >= 0 && r < fr - 1 && c >= -P && c < fr + P) ? tV[r * fr + cl(c)] : 0.5;
+      const segs = [];   // each [[x0,y0],[x1,y1]] in grid-sample coordinates (0..fr-1 inside)
+      for (let r = -P - 1; r < fr + P; r++) for (let c = -P - 1; c < fr + P; c++) {
         const tl = inside(r, c), tr = inside(r, c + 1), br = inside(r + 1, c + 1), bl = inside(r + 1, c);
         const sum = tl + tr + br + bl;
         if (sum === 0 || sum === 4) continue;
-        const top = [c + 0.5, r], right = [c + 1, r + 0.5], bottom = [c + 0.5, r + 1], left = [c, r + 0.5];
+        const top = [c + th(r, c), r], right = [c + 1, r + tv(r, c + 1)],
+          bottom = [c + th(r + 1, c), r + 1], left = [c, r + tv(r, c)];
         const cross = [];                         // edges whose endpoints differ carry a crossing
         if (tl !== tr) cross.push(top);
         if (tr !== br) cross.push(right);
@@ -744,7 +777,7 @@
       }
       if (!segs.length) return [];
       // Chain segments sharing an endpoint into polylines/loops.
-      const key = p => Math.round(p[0] * 2) + ',' + Math.round(p[1] * 2);
+      const key = p => p[0] + ',' + p[1];          // shared edge points are bit-identical
       const adj = new Map();                       // point key → [{pt, seg, edge}]
       segs.forEach((s, i) => {
         for (const e of [0, 1]) {
@@ -1880,8 +1913,8 @@
     // cell by the book that ranks #1 there: an approximate Voronoi/decision-region map.
     function TopPickTab({ model, comp, filtered, blend, risk, setBlend, setRisk, nerd }) {
       const [tip, setTip] = useState(null);
-      const [res, setRes] = useState(128);   // render resolution (contour smoothness)
-      const W = 760, H = 560, L = 30, R = 150, T = 24, B = 40;
+      const [legendHl, setLegendHl] = useState(null);   // book under the pointer in the list
+      const W = 760, H = 560, L = 30, R = 80, T = 24, B = 40;
       const plotW = W - L - R, plotH = H - T - B;
       const cy0 = T + plotH / 2;             // risk = 0 sits at mid-height (the fan's axis)
       const zc = 1.6449 * model.prep.meta.c90;
@@ -1894,8 +1927,8 @@
       // every column at once (upper envelope of the score lines) instead of an argmax scan
       // per cell. Keys and percentiles are precomputed into typed arrays because the sorts
       // run once per row: no sqrt or closure work inside a comparator.
-      // We then trace the borders between differing winners as vector contours (marching
-      // squares) instead of painting cells: white lines on the dark surface, no fills.
+      // We then trace each winner's region as vector loops (marching squares) instead of
+      // painting cells, and fill and outline those.
       const G = useMemo(() => {
         if (filtered.length === 0) return null;
         const books = model.prep.books, N = model.prep.n;
@@ -1915,17 +1948,41 @@
         const riskAt = (i, N2) => N2 > 1 ? 1 - 2 * i / (N2 - 1) : 0;   // row 0 (top) = +1 moonshots
         const sd = new Float64Array(N);
         for (const j of filtered) sd[j] = Math.sqrt(comp.va[j]);
-        const fr = res, field = new Int32Array(fr * fr);
-        const rp = new Float64Array(N);
+        const fr = TP_RES, field = new Int32Array(fr * fr);
+        let rp = new Float64Array(N), rpPrev = new Float64Array(N);
         const rankOrder = filtered.slice();           // both orders are reused across rows: risk
         const hullOrder = filtered.slice();           // shifts them only slightly, so re-sorting
         const row = new Int32Array(fr);               // nearly sorted data stays cheap
+        // Where exactly between two grid samples the winner changes: the zero of the
+        // score difference s_A − s_B, linearly interpolated between the two samples.
+        // Along a row that is exact (scores are linear in blend); across rows it is a
+        // good guess. Contours through these points instead of the half-cell midpoints
+        // lose the staircase the grid otherwise prints into every slanted border.
+        const tH = new Float32Array(fr * fr).fill(0.5);   // edge (r,c)–(r,c+1)
+        const tV = new Float32Array(fr * fr).fill(0.5);   // edge (r,c)–(r+1,c)
+        const sc = (j, bl, p) => mp[j] + bl * (p[j] - mp[j]);
+        const cross = (d1, d2) => {                   // ties and rank jumps can put t outside (0,1)
+          const t = d1 / (d1 - d2);
+          return t !== t ? 0.5 : Math.min(0.99, Math.max(0.01, t));
+        };
         for (let r = 0; r < fr; r++) {
           const rk = riskAt(r, fr);
           for (const j of filtered) key[j] = M.clip(comp.m[j] + rk * zc * sd[j], 1, 5);
           pct(rankOrder, rp);
           M.envelopeRow(hullOrder, mp, rp, fr, tie, row);
           field.set(row, r * fr);
+          for (let c = 0; c < fr; c++) {
+            const A = row[c], bl = c / (fr - 1);
+            if (c < fr - 1 && row[c + 1] !== A) {
+              const B = row[c + 1], b1 = (c + 1) / (fr - 1);
+              tH[r * fr + c] = cross(sc(A, bl, rp) - sc(B, bl, rp), sc(A, b1, rp) - sc(B, b1, rp));
+            }
+            if (r > 0 && field[(r - 1) * fr + c] !== A) {
+              const U = field[(r - 1) * fr + c];
+              tV[(r - 1) * fr + c] = cross(sc(U, bl, rpPrev) - sc(A, bl, rpPrev), sc(U, bl, rp) - sc(A, bl, rp));
+            }
+          }
+          const sw = rpPrev; rpPrev = rp; rp = sw;
         }
         // Winners by area, plus a label anchor per winner: the pole of
         // inaccessibility (region cell farthest from any border), the area
@@ -1966,10 +2023,9 @@
           .map(([j, a]) => ({ j, area: a, ...best.get(j),
             clear: best.get(j).score * (plotW / (fr - 1)) }))   // ≈ px to nearest border
           .sort((p, q) => q.area - p.area);
-        const contours = [];
-        for (const w of winners) for (const line of regionContours(field, fr, w.j)) contours.push(line);
-        return { field, fr, winners, contours, total: fr * fr };
-      }, [filtered, comp, res]);
+        for (const w of winners) w.loops = regionContours(field, fr, w.j, tH, tV);
+        return { field, fr, winners, total: fr * fr };
+      }, [filtered, comp]);
 
       // Triangle (fan) layout: at blend = 0 (pure match) risk has no effect, so the whole
       // left edge collapses to a single apex; the risk range fans open as blend → 1, where
@@ -2001,13 +2057,48 @@
       const onMove = e => setTip(locate(e));
       const onClick = e => { const h = locate(e); if (h) { setBlend(h.bl); setRisk(h.rk); } };
 
+      const cellAt = (bl, rk) => {
+        const c = Math.max(0, Math.min(G.fr - 1, Math.round(bl * (G.fr - 1))));
+        const r = Math.max(0, Math.min(G.fr - 1, Math.round((1 - rk) / 2 * (G.fr - 1))));
+        return G.field[r * G.fr + c];
+      };
+      // One closed path per region (outer loops and holes, even-odd), clipped to the triangle.
+      const regionD = useMemo(() => G
+        ? new Map(G.winners.map(w => [w.j, w.loops.map(l => pathD(l) + ' Z').join(' ')])) : null, [G]);
+      const NHUE = 5, NLIST = 7;
+      const rankOf = G ? new Map(G.winners.map((w, i) => [w.j, i])) : new Map();
+      const fillOf = (j, hot) => {
+        const k = rankOf.get(j);
+        return k < NHUE ? (hot ? TP.hot : TP.fill)[k] : hot ? TP.restHot : TP.rest;
+      };
+      const swatchOf = j => { const k = rankOf.get(j); return k < NHUE ? TP.swatch[k] : TP.restSwatch; };
+      const current = G ? cellAt(blend, risk) : null;
+      const hl = legendHl != null ? legendHl : tip ? tip.j : null;
+      const shareTxt = a => { const p = 100 * a / G.total; return p >= 1 ? Math.round(p) + '%' : '<1%'; };
+
       // Label a region if it is either reasonably large or has a decently clear
-      // anchor spot; a letter or two poking past a border is acceptable.
+      // anchor spot; a letter or two poking past a border is acceptable. A label that
+      // would run past the right edge (where the triangle is widest and the thin
+      // bands end) moves left, and is dropped if that takes it out of its region:
+      // the list top left names every large region anyway.
+      const trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
       const labels = G ? G.winners
         .filter(w => w.area / G.total > 0.015 && (w.clear >= 6 || w.area / G.total > 0.05))
-        .slice(0, 9) : [];
-      const trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
+        .slice(0, 9)
+        .map(w => {
+          const text = trunc(dispTitle(model.prep.books[w.j]), 22);
+          const half = text.length * 3.1 + 3, b = g2b(w.lx), rk = g2r(w.ly);
+          const x = Math.min(TX(b), TX(1) - 6 - half), y = TY(b, rk);
+          const bl = (x - L) / plotW, br = (x + half - L) / plotW;
+          const rAt = q => (cy0 - y) / Math.max(q * plotH / 2, 1e-6);
+          const ok = [bl, br, (x - half - L) / plotW].every(q => q > 0 && Math.abs(rAt(q)) <= 1 && cellAt(q, rAt(q)) === w.j);
+          return ok || x === TX(b) ? { j: w.j, text, x, y } : null;
+        })
+        .filter(Boolean) : [];
       const xticks = [0, 0.25, 0.5, 0.75, 1], yticks = [1, 0.5, 0, -0.5, -1];
+      const listed = G ? G.winners.slice(0, NLIST) : [];
+      const restN = G ? G.winners.length - listed.length : 0;
+      const restArea = G ? G.winners.slice(NLIST).reduce((s, w) => s + w.area, 0) : 0;
 
       return html`
         <div>
@@ -2023,20 +2114,27 @@
               Cold start: nothing rated yet, so the map is unpersonalized (popularity vs. population rating).
               Rate a few books on the Rate tab and it becomes yours.
             </p>`}
-          <div style=${{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', margin: '10px 0 8px' }}>
-            <span style=${{ color: C.label, fontSize: 13 }}>Resolution:</span>
-            <${Seg} options=${[{ id: '128', label: 'Coarse' }, { id: '288', label: 'Fine' }]}
-              value=${String(res)} onChange=${v => setRes(+v)} />
-          </div>
           ${!G &&
             html`<p style=${{ fontSize: 13, color: C.foot }}>No books match the current filters.</p>`}
           ${G &&
           html`<div className="rec-svgwrap">
             <svg viewBox=${`0 0 ${W} ${H}`} onMouseMove=${onMove} onMouseLeave=${() => setTip(null)} onClick=${onClick}
               style=${{ position: 'relative', cursor: 'pointer' }}>
-              <!-- Plotting triangle on the ink surface; outline in the same colour as the inner contours. -->
-              <path d=${triPath} fill="var(--tool-panel)" stroke="var(--tool-emph)" strokeWidth=${1.1} strokeOpacity=${0.82}
-                strokeLinejoin="round" />
+              <defs><clipPath id="tp-clip"><path d=${triPath} /></clipPath></defs>
+              <!-- Regions: muted fills for the largest few, one neutral for the rest; the
+                  borders are each region's own outline, pre-blended so double strokes stay flat. -->
+              <g clipPath="url(#tp-clip)" style=${{ pointerEvents: 'none' }}>
+                ${G.winners.map(w => html`
+                  <path key=${'rg' + w.j} d=${regionD.get(w.j)} fillRule="evenodd" fill=${fillOf(w.j, false)}
+                    stroke=${TP.border} strokeWidth=${0.9} strokeLinejoin="round" />
+                `)}
+                ${hl != null && regionD.has(hl) && html`
+                  <path d=${regionD.get(hl)} fillRule="evenodd" fill=${fillOf(hl, true)}
+                    stroke=${TP.emph} strokeWidth=${1.6} strokeLinejoin="round" />
+                `}
+              </g>
+              <path d=${triPath} fill="none" stroke=${TP.edge} strokeWidth=${1.1} strokeLinejoin="round"
+                style=${{ pointerEvents: 'none' }} />
               <!-- Blend (x) axis along the bottom. -->
               ${xticks.map((v, i) => html`
                 <g key=${'x' + i}>
@@ -2056,25 +2154,58 @@
                   </text>
                 </g>
               `)}
-              <text x=${TX(1) + 40} y=${TY(1, 0)} textAnchor="middle" fontSize=${11.5} fill=${C.axis}
-                transform=${`rotate(-90 ${TX(1) + 40} ${TY(1, 0)})`}>Risk (safe −1 · moonshot +1)</text>
-              <!-- Decision-region contours: white borders between differing rank-#1 winners. -->
-              ${G.contours.map((line, i) => html`
-                <path key=${'ct' + i} d=${pathD(line)} fill="none" stroke="var(--tool-emph)" strokeWidth=${1.1}
-                  opacity=${0.82} strokeLinejoin="round" strokeLinecap="round" style=${{ pointerEvents: 'none' }} />
-              `)}
-              <!-- On-map labels, anchored at each region's pole of inaccessibility;
-                  the tooltip covers the unlabelled small ones. -->
-              ${labels.map(w => html`
-                <text key=${w.j} x=${TX(g2b(w.lx))} y=${TY(g2b(w.lx), g2r(w.ly))} textAnchor="middle"
+              <text x=${TX(1) + 46} y=${TY(1, 0)} textAnchor="middle" fontSize=${11.5} fill=${C.axis}
+                transform=${`rotate(-90 ${TX(1) + 46} ${TY(1, 0)})`}>Risk (safe −1 · moonshot +1)</text>
+              <!-- On-map labels, anchored at each region's pole of inaccessibility; the halo
+                  takes the region's own fill so it reads as clearance, not as a box. -->
+              ${labels.map(l => html`
+                <text key=${'lb' + l.j} x=${l.x} y=${l.y} textAnchor="middle"
                   dominantBaseline="middle" fontSize=${11} fill=${C.text}
-                  stroke="var(--tool-panel)" strokeWidth=${2.6} style=${{ paintOrder: 'stroke', pointerEvents: 'none' }}>
-                  ${trunc(dispTitle(model.prep.books[w.j]), 22)}
+                  stroke=${fillOf(l.j, l.j === hl)} strokeWidth=${2.6} style=${{ paintOrder: 'stroke', pointerEvents: 'none' }}>
+                  ${l.text}
                 </text>
               `)}
-              <!-- Current-dial marker. -->
-              <circle cx=${TX(blend)} cy=${TY(blend, risk)} r=${6} fill="none" stroke="var(--tool-emph)" strokeWidth=${2} />
-              <circle cx=${TX(blend)} cy=${TY(blend, risk)} r=${1.6} fill="var(--tool-emph)" />
+              <!-- Current-dial marker, haloed so it holds on any fill. -->
+              <circle cx=${TX(blend)} cy=${TY(blend, risk)} r=${6} fill="none" stroke="var(--tool-panel)" strokeWidth=${4.5} />
+              <circle cx=${TX(blend)} cy=${TY(blend, risk)} r=${6} fill="none" stroke=${TP.emph} strokeWidth=${2} />
+              <circle cx=${TX(blend)} cy=${TY(blend, risk)} r=${1.6} fill=${TP.emph} />
+              <!-- The two empty corners beside the fan: top left the winners by share of
+                  the map (hover highlights, click jumps there), bottom left the book the
+                  current dials pick. Both sit fully outside the triangle at every share. -->
+              <text x=${L} y=${T - 6} fontSize=${10.5} fill=${C.axis}>Rank #1 by share of the map</text>
+              ${listed.map((w, i) => {
+                const y = T + 12 + i * 15, isCur = w.j === current, isHl = w.j === hl;
+                return html`
+                  <g key=${'lg' + w.j} style=${{ cursor: 'pointer' }}
+                    onMouseEnter=${() => setLegendHl(w.j)} onMouseLeave=${() => setLegendHl(null)}
+                    onClick=${e => { e.stopPropagation(); setBlend(g2b(w.lx)); setRisk(g2r(w.ly)); }}>
+                    <rect x=${L - 4} y=${y - 10} width=${300} height=${15} fill="transparent" />
+                    <rect x=${L} y=${y - 7} width=${10} height=${10} rx=${2} fill=${swatchOf(w.j)}
+                      stroke=${isHl ? TP.emph : 'none'} strokeWidth=${1} />
+                    <text x=${L + 16} y=${y} dominantBaseline="middle" fontSize=${11}
+                      fill=${isCur || isHl ? TP.emph : C.label} fontWeight=${isCur ? 600 : 400}>
+                      ${trunc(dispTitle(model.prep.books[w.j]), 34)}
+                    </text>
+                    <text x=${L + 292} y=${y} dominantBaseline="middle" textAnchor="end" fontSize=${10.5}
+                      fill=${isCur || isHl ? TP.emph : C.axis}>${shareTxt(w.area)}</text>
+                  </g>
+                `;
+              })}
+              ${restN > 0 && html`
+                <text x=${L + 16} y=${T + 12 + listed.length * 15} dominantBaseline="middle" fontSize=${10.5} fill=${C.axis}>
+                  ${restN} more ${restN === 1 ? 'book' : 'books'}, hover the map to find them
+                </text>
+                <text x=${L + 292} y=${T + 12 + listed.length * 15} dominantBaseline="middle" textAnchor="end"
+                  fontSize=${10.5} fill=${C.axis}>${shareTxt(restArea)}</text>
+              `}
+              <text x=${L} y=${T + plotH - 66} fontSize=${10.5} fill=${C.axis}>Your current dials pick</text>
+              <rect x=${L} y=${T + plotH - 56} width=${10} height=${10} rx=${2} fill=${swatchOf(current)} />
+              <text x=${L + 16} y=${T + plotH - 51} dominantBaseline="middle" fontSize=${12.5} fontWeight=${600} fill=${TP.emph}>
+                ${trunc(dispTitle(model.prep.books[current]), 36)}
+              </text>
+              <text x=${L + 16} y=${T + plotH - 35} dominantBaseline="middle" fontSize=${10.5} fill=${C.label}>
+                ${trunc(model.prep.books[current].a, 44)}
+              </text>
             </svg>
             ${tip && html`
               <div className="rec-tip" style=${{ left: `min(${tip.px}%, 66%)`, top: `${Math.max(tip.py - 14, 0)}%` }}>
@@ -2086,9 +2217,10 @@
             `}
           </div>`}
           <p style=${{ fontSize: 11.5, color: C.foot, marginTop: 6, maxWidth: '78ch' }}>
-            Each region is the set of dial settings for which one book wins rank #1; white contours are the
-            borders where the winner changes. Largest regions are labelled; hover any region (including small
-            ones) for its book. The white ring marks your current dials.
+            Each region is the set of dial settings for which one book wins rank #1. The five largest get a
+            muted colour, the rest share one grey; the list top left ranks the winners by how much of the map
+            they hold, and clicking an entry moves your dials into that region. Hover any region, small ones
+            included, for its book. The ring marks your current dials.
           </p>
         </div>
       `;
