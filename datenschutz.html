@@ -120,8 +120,8 @@
         deinem Gerät: Einige Bildwerkzeuge reichen eine Datei über die IndexedDB des Browsers an ein
         anderes Werkzeug weiter, wo sie beim Öffnen gleich wieder gelöscht wird. Die Seite
         „Self-Guided Walking Tour“ legt auf deinen Knopfdruck eine Offline-Kopie im Cache-Speicher des
-        Browsers ab. Der Knopf oben erfasst nur den lokalen Speicher; beides andere löschst du über
-        die Websitedaten in den Einstellungen deines Browsers.
+        Browsers ab. Der Knopf oben löscht beides mit, ebenso wie die
+        Websitedaten in den Einstellungen deines Browsers.
       </p>
 
       <h2>5. Interaktive Werkzeuge</h2>
@@ -233,8 +233,8 @@
         Two further kinds of browser storage occur only in individual tools, and also stay on your
         device: some image tools hand a file to another tool via the browser's IndexedDB, where it is
         deleted again as soon as it is opened. The Self-Guided Walking Tour stores an offline copy in
-        the browser's cache storage when you press its button. The button above covers local storage
-        only; you can delete the other two via the site data in your browser settings.
+        the browser's cache storage when you press its button. The button above deletes both as well, as
+        does clearing the site data in your browser settings.
       </p>
 
       <h2>5. Interactive tools</h2>
@@ -281,20 +281,60 @@
   </footer>
   <script>/* privacy-label-i18n */if(document.documentElement.lang==='en'){var _pl=document.querySelector('footer a[href="/datenschutz.html"]');if(_pl)_pl.textContent='Privacy';}</script>
   <script>
-  /* Loescht saemtliche lokal gespeicherten Daten dieses Origins (localStorage und
-     sessionStorage), inklusive Theme- und Sprachwahl. Die aktuell angezeigte Seite
-     behaelt ihren Zustand bis zum naechsten Laden, deshalb sagt die Rueckmeldung
-     das dazu. */
+  /* Loescht saemtliche lokal gespeicherten Daten dieses Origins: localStorage und
+     sessionStorage (inklusive Theme- und Sprachwahl), die IndexedDB-Datenbanken
+     (Dateiuebergabe zwischen Werkzeugen, assets/js/handoff.js), den Cache-Speicher
+     und den Service Worker des Walking Tour. Die aktuell angezeigte Seite behaelt
+     ihren Zustand bis zum naechsten Laden, deshalb sagt die Rueckmeldung das dazu.
+     indexedDB.databases() fehlt in aelteren Browsern; dann wird wenigstens die
+     bekannte Datenbank 'alber-handoff' geloescht. Jeder Schritt ist einzeln
+     abgefangen, damit ein fehlendes API die anderen nicht verhindert. */
+  function dseClearIdb() {
+    if (!window.indexedDB) return Promise.resolve(0);
+    /* Gezaehlt wird nur, was databases() wirklich gemeldet hat; der blinde
+       Rueckfall loescht, zaehlt aber nicht, weil er nicht weiss, ob es sie gab. */
+    var known = !!indexedDB.databases;
+    var list = known
+      ? indexedDB.databases().then(function (dbs) { return dbs.map(function (d) { return d.name; }); })
+      : Promise.resolve(['alber-handoff']);
+    return list.catch(function () { known = false; return ['alber-handoff']; }).then(function (names) {
+      names = names.filter(Boolean);
+      return Promise.all(names.map(function (name) {
+        return new Promise(function (resolve) {
+          var req = indexedDB.deleteDatabase(name);
+          req.onsuccess = req.onerror = req.onblocked = function () { resolve(); };
+        });
+      })).then(function () { return known ? names.length : 0; });
+    });
+  }
+  function dseClearCaches() {
+    if (!window.caches) return Promise.resolve(0);
+    return caches.keys().then(function (keys) {
+      return Promise.all(keys.map(function (k) { return caches.delete(k); })).then(function () { return keys.length; });
+    }).catch(function () { return 0; });
+  }
+  function dseClearWorkers() {
+    if (!navigator.serviceWorker || !navigator.serviceWorker.getRegistrations) return Promise.resolve(0);
+    return navigator.serviceWorker.getRegistrations().then(function (regs) {
+      return Promise.all(regs.map(function (r) { return r.unregister(); })).then(function () { return regs.length; });
+    }).catch(function () { return 0; });
+  }
   document.querySelectorAll('.dse-clear').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var n = 0;
       try { n = localStorage.length; localStorage.clear(); sessionStorage.clear(); } catch (e) {}
-      var out = document.getElementById(btn.dataset.out);
-      if (out) {
-        out.textContent = document.documentElement.lang === 'en'
-          ? (n + ' entries deleted. Theme and language preferences are gone too; defaults apply from the next page load.')
-          : (n + ' Einträge gelöscht. Auch Theme- und Sprachwahl sind weg; ab dem nächsten Laden gelten die Standardwerte.');
-      }
+      var en = document.documentElement.lang === 'en';
+      Promise.all([dseClearIdb().catch(function () { return 0; }), dseClearCaches(), dseClearWorkers()])
+        .then(function (r) {
+          var more = r[0] + r[1] + r[2];
+          var out = document.getElementById(btn.dataset.out);
+          if (!out) return;
+          out.textContent = en
+            ? (n + ' entries deleted' + (more ? ', plus ' + more + ' databases, offline copies or workers' : '')
+               + '. Theme and language preferences are gone too; defaults apply from the next page load.')
+            : (n + ' Einträge gelöscht' + (more ? ', dazu ' + more + ' Datenbanken, Offline-Kopien oder Worker' : '')
+               + '. Auch Theme- und Sprachwahl sind weg; ab dem nächsten Laden gelten die Standardwerte.');
+        });
     });
   });
   </script>
