@@ -954,15 +954,18 @@
       // Entlang der dominanten Achse marschieren, damit ein Schritt nie eine
       // Zelle überspringt. Die andere Achse verschiebt sich dabei um einen
       // Bruchteil einer Zelle pro Schritt.
-      let nMinor, nMajor, idx, majorSign, minorShift;
+      // Die Zelle (i quer, j längs) liegt bei j * majStride + i * minStride.
+      // Schrittweiten statt einer Indexfunktion, weil der Aufruf je Zelle im
+      // heißen Pfad lag; siehe unten beim Abtasten.
+      let nMinor, nMajor, minStride, majStride, majorSign, minorShift;
       if (Math.abs(lcol) >= Math.abs(lrow)) {
         nMinor = rows; nMajor = cols;
-        idx = function (i, j) { return i * cols + j; };
+        minStride = cols; majStride = 1;
         majorSign = lcol >= 0 ? 1 : -1;
         minorShift = lrow / Math.abs(lcol);
       } else {
         nMinor = cols; nMajor = rows;
-        idx = function (i, j) { return j * cols + i; };
+        minStride = 1; majStride = cols;
         majorSign = lrow >= 0 ? 1 : -1;
         minorShift = lcol / Math.abs(lrow);
       }
@@ -982,20 +985,35 @@
       let shade = new Float64Array(nMinor);
       let next = new Float64Array(nMinor);
 
+      /* Der Normalfall `terrain_max` wird unten ausgeschrieben statt über
+       * `resample` gerufen: zwei Funktionsaufrufe mit Stringvergleich je Zelle
+       * waren die Hälfte der Laufzeit. Ausgeschrieben ist der Sweep etwa
+       * doppelt so schnell und bitgleich. Die Untergrenze kommt dabei je
+       * Zelle aus `s`, nicht einmal vorab als Versatz `floor(-minorShift)`:
+       * auf der Diagonale ist minorShift fast, aber nicht genau 1, und dann
+       * rundet `i - minorShift` für manche i auf eine ganze Zahl, der Versatz
+       * aber nicht. Das waren bei 135 Grad 40.000 falsche Zellen.
+       */
+      const maxPath = sampling === 'terrain_max';
+      const last = nMinor - 1;
+
       for (let k = 0; k < nMajor; k++) {
         const j = majorSign > 0 ? k : nMajor - 1 - k;
+        const base = j * majStride;
         // Unbekannte Zellen gehen als "kein Hindernis" in die Rekurrenz. Für
         // das Urteil unten zählt weiter die echte Höhe, und NaN fällt dort von
         // selbst durch jeden Vergleich.
-        for (let i = 0; i < nMinor; i++) {
-          const v = heights[idx(i, j)];
+        for (let i = 0, p = base; i < nMinor; i++, p += minStride) {
+          const v = heights[p];
           cur[i] = v === v ? v : NO_OBSTACLE;
         }
 
         if (k === 0) {
           // Erster Streifen: keine Vorgeschichte, alles besonnt.
-          for (let i = 0; i < nMinor; i++) lit[idx(i, j)] = 1;
-          if (margin) for (let i = 0; i < nMinor; i++) margin[idx(i, j)] = heights[idx(i, j)] === heights[idx(i, j)] ? MARGIN_CAP : NaN;
+          for (let i = 0, p = base; i < nMinor; i++, p += minStride) {
+            lit[p] = 1;
+            if (margin) margin[p] = heights[p] === heights[p] ? MARGIN_CAP : NaN;
+          }
           shade.fill(NO_OBSTACLE);
         } else {
           for (let i = 0; i < nMinor; i++) {
@@ -1005,13 +1023,29 @@
             // Schattenhöhe. Auf letztere angewandt wandert es pro Schritt eine
             // Zelle zur Seite, fächert über hunderte Schritte auf und
             // verdreifacht den Fehler statt ihn zu senken.
-            const a = resample(prev, s, nMinor, sampling, true);
-            const b = resample(shade, s, nMinor, sampling, false);
-            next[i] = Math.max(a, b) - dropPerStep;
+            let a, b;
+            if (maxPath) {
+              // Dasselbe wie resample(prev, s, …, true) und
+              // resample(shade, s, …, false), nur ohne Aufruf.
+              const f0 = Math.floor(s), f1 = Math.ceil(s);
+              const i0 = f0 < 0 ? 0 : (f0 > last ? last : f0);
+              const i1 = f1 < 0 ? 0 : (f1 > last ? last : f1);
+              const pa = prev[i0], pb = prev[i1];
+              a = pa > pb ? pa : pb;
+              if (s <= 0) b = shade[0];
+              else if (s >= last) b = shade[last];
+              else {
+                const f = s - f0, lo = shade[f0], hi = shade[f0 + 1];
+                b = (f === 0 || lo === hi) ? lo : lo + (hi - lo) * f;
+              }
+            } else {
+              a = resample(prev, s, nMinor, sampling, true);
+              b = resample(shade, s, nMinor, sampling, false);
+            }
+            next[i] = (a > b ? a : b) - dropPerStep;
           }
           const swap = shade; shade = next; next = swap;
-          for (let i = 0; i < nMinor; i++) {
-            const p = idx(i, j);
+          for (let i = 0, p = base; i < nMinor; i++, p += minStride) {
             const d = heights[p] + eyeHeight - shade[i];
             lit[p] = d >= 0 ? 1 : 0;
             if (margin) margin[p] = capM(d);
@@ -2487,6 +2521,52 @@
      * Mittelwert aus 355 und 5 Grad wäre sonst 180, also genau die
      * Gegenrichtung, und der Schatten fiele im Bild auf die falsche Seite.
      */
+    /* Die Sonnenstände eines Jahres im Abtastraster, einmal gerechnet.
+     *
+     * Sie hängen nur an Jahr, Schrittweite und Tagesabstand, nicht am
+     * Fernhorizont und nicht an der Sichtbarkeitsschwelle: beide entscheiden
+     * erst danach, welcher Abtastwert zählt. Neu gerechnet kosteten sie bei
+     * zehn Minuten 0,77 s und bei fünf 1,5 s, und zwar bei jeder Jahreskarte,
+     * also rund ein Drittel einer groben. Aufbewahrt kostet das Einsortieren
+     * Millisekunden.
+     *
+     * Behalten werden die zwei zuletzt benutzten Raster (je bis zu 1,7 MB bei
+     * fünf Minuten); wer zwischen zwei Schrittweiten wechselt, rechnet nicht
+     * jedes Mal neu. `monthEnd[m]` ist das Ende von Monat m, damit der
+     * Fortschritt weiter monatsweise meldet.
+     */
+    const sunPathMemo = [];
+    function sunPathSamples(year, stepMin, dayStride) {
+      const key = year + '/' + stepMin + '/' + dayStride;
+      for (let i = 0; i < sunPathMemo.length; i++) {
+        if (sunPathMemo[i].key === key) {
+          const hit = sunPathMemo.splice(i, 1)[0];
+          sunPathMemo.unshift(hit);
+          return hit;
+        }
+      }
+      const az = [], el = [], monthEnd = [0];
+      let dayIndex = 0;
+      for (let m = 1; m <= 12; m++) {
+        const dm = daysInMonth(year, m);
+        for (let d = 1; d <= dm; d++) {
+          if (dayIndex++ % dayStride) continue;
+          for (let t = 0; t < 1440; t += stepMin) {
+            // In der Mitte des Intervalls abtasten, nicht an seinem Anfang:
+            // der Abtastwert vertritt das ganze Intervall.
+            const s = solarPosition(berlinMinuteToJd(year, m, d, t + stepMin / 2, 0));
+            az.push(s.az);
+            el.push(s.elev);
+          }
+        }
+        monthEnd.push(az.length);
+      }
+      const entry = { key: key, az: Float64Array.from(az), el: Float64Array.from(el), monthEnd: monthEnd };
+      sunPathMemo.unshift(entry);
+      if (sunPathMemo.length > 2) sunPathMemo.length = 2;
+      return entry;
+    }
+
     function skyPatches(year, opts) {
       opts = opts || {};
       const stepMin = opts.stepMin || 10;
@@ -2503,28 +2583,22 @@
       const bins = new Map();
       let total = 0;
       const perSample = (stepMin / 60) * dayStride;
-      let dayIndex = 0;
+      const path = sunPathSamples(year, stepMin, dayStride);
+      const az = path.az, el = path.el;
 
       for (let m = 1; m <= 12; m++) {
-        const dm = daysInMonth(year, m);
-        for (let d = 1; d <= dm; d++) {
-          if (dayIndex++ % dayStride) continue;
-          for (let t = 0; t < 1440; t += stepMin) {
-            // In der Mitte des Intervalls abtasten, nicht an seinem Anfang:
-            // der Abtastwert vertritt das ganze Intervall.
-            const s = solarPosition(berlinMinuteToJd(year, m, d, t + stepMin / 2, 0));
-            if (!sunAboveHorizonAngle(s.elev, prof ? horizonAt(prof, s.az) : 0, mode)) continue;
-            const az = mod360(s.az);
-            const key = Math.floor(az / azBin) + ',' + Math.floor(s.elev / elBin);
-            let b = bins.get(key);
-            if (!b) { b = { sa: 0, ca: 0, el: 0, h: 0 }; bins.set(key, b); }
-            const a = az * DEG;
-            b.sa += Math.sin(a) * perSample;
-            b.ca += Math.cos(a) * perSample;
-            b.el += s.elev * perSample;
-            b.h += perSample;
-            total += perSample;
-          }
+        for (let q = path.monthEnd[m - 1]; q < path.monthEnd[m]; q++) {
+          if (!sunAboveHorizonAngle(el[q], prof ? horizonAt(prof, az[q]) : 0, mode)) continue;
+          const z = mod360(az[q]);
+          const key = Math.floor(z / azBin) + ',' + Math.floor(el[q] / elBin);
+          let b = bins.get(key);
+          if (!b) { b = { sa: 0, ca: 0, el: 0, h: 0 }; bins.set(key, b); }
+          const a = z * DEG;
+          b.sa += Math.sin(a) * perSample;
+          b.ca += Math.cos(a) * perSample;
+          b.el += el[q] * perSample;
+          b.h += perSample;
+          total += perSample;
         }
         if (onProgress) onProgress(m / 12);
       }
