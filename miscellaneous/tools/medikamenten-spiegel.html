@@ -125,7 +125,13 @@
     const LN2 = Math.log(2);
 
     /* ── Pharmacokinetics ────────────────────────────────────────────────── */
-    /* One-compartment oral disposition (elimination kₑ, mono-exponential tail).
+    /* Oral disposition as a convolution of an input (absorption) function with a
+       disposition kernel. The kernel is the response to a unit bolus, written as a
+       sum of exponentials Σ A·e^(−λt). By default it is the single term {1, kₑ}:
+       one compartment, mono-exponential tail. Two cases add terms:
+       • distribution: a second, fast term (two-compartment parent, bupropion);
+       • metabolite:   the curve of a metabolite formed from the parent, which for
+                       a linear chain is again a sum of exponentials (metaboliteKernel).
        The *shape* before the tail comes from the absorption/input function, which
        is chosen per phase (`kind`); a form sums fraction-weighted phases, so
        biphasic/retard profiles are just several phases added. Input kinds:
@@ -133,16 +139,19 @@
        • zeroorder:  constant release over a duration; the flat ER plateau.
        • weibull:    release Fₐ(t)=1−e^(−(t/td)^ss); ss>1 gives an ascending,
                       sigmoidal input (e.g. Concerta OROS). No closed form with
-                      the kₑ kernel, so its single-dose response is convolved
-                      numerically once per form onto a grid and interpolated.
-       All kinds are linear, so multi-dose superposition (and steady state) still
-       hold. Two-compartment disposition and saturable (non-linear) kinetics are
-       deliberately out of scope here. unitConc returns concentration for D=1 mg,
+                      an exponential kernel, so its single-dose response is
+                      convolved numerically once per kernel term onto a grid and
+                      interpolated.
+       Every input kind meets every kernel term in closed form (or on its grid),
+       and the result is the A-weighted sum. All of it is linear, so multi-dose
+       superposition (and steady state) still hold. Saturable (non-linear)
+       kinetics stay out of scope. unitConc returns concentration for D=1 mg,
        V=1 L; callers scale by (dose/V) to get mg/L. */
     const WDT = 0.01, WMAX = 30, WN = Math.round(WMAX / WDT);   // weibull grid: 0…30 h
 
     /* Single-dose Weibull input convolved with e^(−kₑt): S(t)=∫₀ᵗ Fₐ′(τ)e^(−kₑ(t−τ))dτ.
-       Trapezoidal integration of dS/dt = Fₐ′(t) − kₑ·S on a fixed grid. */
+       Trapezoidal integration of dS/dt = Fₐ′(t) − kₑ·S on a fixed grid. Called once
+       per kernel term, with that term's λ in place of kₑ. */
     function weibullGrid(td, ss, ke) {
     const S = new Float64Array(WN + 1), e = Math.exp(-ke * WDT);
     const rate = t => t <= 0 ? 0 : (ss / td) * Math.pow(t / td, ss - 1) * Math.exp(-Math.pow(t / td, ss));
@@ -158,37 +167,86 @@
     return S[i] * (1 - f) + S[i + 1] * f;
     }
 
-    /* Precompute per-form kinetics (weibull grids built once here, not per sample). */
-    function formPK(form) {
+    /* Parent kernel of a form. Without `dist` the one-compartment term {1, kₑ}.
+       With dist = { half_life_h, frac } the two-compartment shape: a fast
+       distribution phase carrying `frac` of the initial concentration, and the
+       form's half-life as the terminal phase. V is then the central volume. */
+    function parentKernel(form, dist) {
     const ke = LN2 / form.half_life_h;
+    if (!dist) return [{ A: 1, lam: ke }];
+    return [{ A: dist.frac, lam: LN2 / dist.half_life_h }, { A: 1 - dist.frac, lam: ke }];
+    }
+
+    /* Metabolite kernel for met = { half_life_h, auc_ratio, presystemic }.
+       Two routes, both linear:
+       • systemic: formed in proportion to the parent's concentration and cleared
+         with kₘ. Each parent term A·e^(−λt) contributes
+         s·A/(kₘ−λ)·(e^(−λt) − e^(−kₘt)).
+       • presystemic: formed during absorption (first pass) and entering the blood
+         directly, i.e. the same input function convolved with q·e^(−kₘt).
+       The two scales are not taken from enzyme kinetics, which nobody publishes in
+       a usable form, but calibrated so that AUC(metabolite)/AUC(parent) equals the
+       published `auc_ratio`, of which a share `presystemic` comes from the first
+       pass. kₘ within 0.1 % of a parent λ would divide by ~0, so kₘ is nudged by
+       0.2 % there; that shifts the metabolite half-life by a few minutes. */
+    function metaboliteKernel(parent, met) {
+    let km = LN2 / met.half_life_h;
+    for (const p of parent) if (Math.abs(km - p.lam) < 1e-3 * p.lam) km *= 1.002;
+    const aucP = parent.reduce((s, p) => s + p.A / p.lam, 0);
+    const pre = met.presystemic || 0;
+    const s = met.auc_ratio * km * (1 - pre);
+    const terms = [];
+    let Akm = pre * met.auc_ratio * aucP * km;
+    for (const p of parent) {
+      const c = s * p.A / (km - p.lam);
+      terms.push({ A: c, lam: p.lam });
+      Akm -= c;
+    }
+    terms.push({ A: Akm, lam: km });
+    return terms;
+    }
+
+    /* Precompute per-form kinetics (weibull grids built once here, not per sample).
+       `kernel` defaults to one compartment with the form's half-life. */
+    function formPK(form, kernel) {
+    const ke = LN2 / form.half_life_h;
+    const terms = kernel || [{ A: 1, lam: ke }];
     const phases = form.phases.map(ph => {
       const kind = ph.kind || 'firstorder', lag = ph.lag_h || 0, frac = ph.frac;
       if (kind === 'zeroorder') return { kind, frac, lag, dur: ph.dur_h };
-      if (kind === 'weibull')   return { kind, frac, lag, grid: weibullGrid(ph.td_h, ph.ss, ke) };
+      if (kind === 'weibull')   return { kind, frac, lag, grids: terms.map(k => weibullGrid(ph.td_h, ph.ss, k.lam)) };
       return { kind: 'firstorder', frac, lag, ka: ph.ka_per_h };
     });
-    return { ke, hl: form.half_life_h, F: form.f, phases };
+    // hl drives the "older doses are negligible" cut in concAt, so it has to be the
+    // slowest term, not the form's half-life
+    const hl = kernel ? Math.max(...terms.map(k => LN2 / k.lam)) : form.half_life_h;
+    return { ke, hl, F: form.f, terms, phases };
     }
 
     /* Single-dose concentration for D=1 mg, V=1 L at elapsed time tau (h). */
     function unitConc(pk, tau) {
     if (tau < 0) return 0;
-    const ke = pk.ke;
+    const terms = pk.terms;
     let v = 0;
     for (let i = 0; i < pk.phases.length; i++) {
       const ph = pk.phases[i], t = tau - ph.lag;
       if (t < 0) continue;
-      let shape;
-      if (ph.kind === 'zeroorder') {
-        if (t <= ph.dur) shape = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * t));
-        else { const pk0 = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * ph.dur)); shape = pk0 * Math.exp(-ke * (t - ph.dur)); }
-      } else if (ph.kind === 'weibull') {
-        shape = weibullEval(ph.grid, ke, t);
-      } else {                                   // firstorder
-        const ka = ph.ka, dk = ka - ke;
-        shape = Math.abs(dk) < 1e-4 ? ke * t * Math.exp(-ke * t) : (ka / dk) * (Math.exp(-ke * t) - Math.exp(-ka * t));
+      let sum = 0;
+      for (let j = 0; j < terms.length; j++) {
+        const A = terms[j].A, ke = terms[j].lam;
+        let shape;
+        if (ph.kind === 'zeroorder') {
+          if (t <= ph.dur) shape = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * t));
+          else { const pk0 = (1 / (ke * ph.dur)) * (1 - Math.exp(-ke * ph.dur)); shape = pk0 * Math.exp(-ke * (t - ph.dur)); }
+        } else if (ph.kind === 'weibull') {
+          shape = weibullEval(ph.grids[j], ke, t);
+        } else {                                   // firstorder
+          const ka = ph.ka, dk = ka - ke;
+          shape = Math.abs(dk) < 1e-4 ? ke * t * Math.exp(-ke * t) : (ka / dk) * (Math.exp(-ke * t) - Math.exp(-ka * t));
+        }
+        sum += A * shape;
       }
-      v += ph.frac * shape;
+      v += ph.frac * sum;
     }
     return pk.F * v;
     }
@@ -259,7 +317,7 @@
         about: "Die meisten Medikamente wirken, solange ihr Blutspiegel in einem bestimmten Bereich liegt. Bei kurzer Halbwertszeit muss man über den Tag verteilt nachdosieren, um den Spiegel halbwegs konstant zu halten – oder die Einnahme so legen, dass er nachts absinkt. Wirken die Dosen länger als der Abstand zwischen ihnen, überlagern sie sich und der Spiegel schaukelt sich über mehrere Tage bis zu einem Fließgleichgewicht (Steady State) auf. Dieses Werkzeug macht genau das sichtbar: Verschiebe die Einnahmezeitpunkte, kombiniere unretardierte und retardierte Formen und beobachte, wie sich Spitzen und Täler verändern.",
         aboutHead: "Worum es geht",
         model: "Modell",
-        modelBody: "Der Blutspiegel entsteht als Faltung einer Resorptions-Rate mit einem Ein-Kompartiment-Abbau (Eliminationskonstante kₑ = ln2/t½, exponentieller Schwanz). Der Anstieg davor kommt aus der Resorptions-Funktion, die je nach Präparat unterschiedlich ist: Resorption erster Ordnung (Bateman-Kurve, unretardiert) oder eine glatte Weibull-Freisetzung für Retard- und osmotische Systeme (Concerta, Metoprolol-Succinat, Valproat-ER usw.). Die Weibull-Form (Freisetzungsanteil Fₐ(t)=1−e^(−(t/td)^ss)) startet für ss>1 mit Steigung null – dadurch bleiben die Kurven knickfrei, anders als bei einem harten Verzögerungs-Lag oder einer Rechteck-Freisetzung. Alle Ansätze sind linear, daher addieren sich mehrere Einnahmen (Superposition) und Akkumulation/Steady State entstehen von selbst. V = Verteilungsvolumen (Gewicht × Literatur-V/kg), F = Bioverfügbarkeit. Dargestellt ist die Plasmakonzentration; die tatsächliche Wirkung folgt ihr nur verzögert und nicht linear. Bewusst weggelassen: Zwei-Kompartiment-Verteilung, sättigbare (nichtlineare) Kinetik, aktive Metaboliten und interindividuelle Unterschiede.",
+        modelBody: "Der Blutspiegel entsteht als Faltung einer Resorptions-Rate mit einem Ein-Kompartiment-Abbau (Eliminationskonstante kₑ = ln2/t½, exponentieller Schwanz). Der Anstieg davor kommt aus der Resorptions-Funktion, die je nach Präparat unterschiedlich ist: Resorption erster Ordnung (Bateman-Kurve, unretardiert) oder eine glatte Weibull-Freisetzung für Retard- und osmotische Systeme (Concerta, Metoprolol-Succinat, Valproat-ER usw.). Die Weibull-Form (Freisetzungsanteil Fₐ(t)=1−e^(−(t/td)^ss)) startet für ss>1 mit Steigung null – dadurch bleiben die Kurven knickfrei, anders als bei einem harten Verzögerungs-Lag oder einer Rechteck-Freisetzung. Alle Ansätze sind linear, daher addieren sich mehrere Einnahmen (Superposition) und Akkumulation/Steady State entstehen von selbst. V = Verteilungsvolumen (Gewicht × Literatur-V/kg), F = Bioverfügbarkeit. Dargestellt ist die Plasmakonzentration; die tatsächliche Wirkung folgt ihr nur verzögert und nicht linear. Wo es die Aussage ändert, geht das Modell weiter: Bei Bupropion verteilt sich die Muttersubstanz in zwei Phasen (zweiter, schneller Exponentialterm), und der Hauptmetabolit erscheint als eigene Kurve, gebildet aus der Muttersubstanz im Blut und schon bei der ersten Leberpassage. Das bleibt linear, Superposition gilt weiter. Sonst bewusst weggelassen: Zwei-Kompartiment-Verteilung, sättigbare (nichtlineare) Kinetik, aktive Metaboliten und interindividuelle Unterschiede.",
         source: "Parameter (V/kg, Halbwertszeit, kₐ, Bioverfügbarkeit) sind vereinfachte Größenordnungen aus der Standardliteratur, keine patientenindividuellen Werte.",
         disclaimer: "Vereinfachtes Lehrmodell. Keine medizinische Beratung, keine Dosierungsempfehlung. Für Fragen zur eigenen Medikation die Ärztin, den Arzt oder die Apotheke fragen. Privates Hobbyprojekt, unkommerziell, ohne Gewähr. Keine Verbindung zu den genannten Herstellern; Markennamen dienen nur der Identifikation der jeweiligen Freisetzungsprofile.",
         loading: "Lade Wirkstoffdaten…",
@@ -293,7 +351,7 @@
         about: "Most drugs work while their blood level stays within a certain range. With a short half-life you have to re-dose across the day to keep the level roughly constant, or time the doses so it falls at night. When each dose lasts longer than the gap between doses, they overlap and the level builds up over several days to an equilibrium (steady state). This tool makes exactly that visible: drag the intake times, combine immediate- and extended-release forms, and watch how peaks and troughs change.",
         aboutHead: "What this shows",
         model: "Model",
-        modelBody: "The blood level is the convolution of an absorption rate with one-compartment elimination (elimination constant kₑ = ln2/t½, exponential tail). The rise before that comes from the absorption function, which differs by formulation: first-order absorption (the Bateman curve, immediate-release) or a smooth Weibull release for extended-release and osmotic systems (Concerta, metoprolol succinate, valproate ER, etc.). The Weibull form (released fraction Fₐ(t)=1−e^(−(t/td)^ss)) starts with zero slope for ss>1, which keeps the curves kink-free, unlike a hard delay lag or a rectangular release. All approaches are linear, so multiple intakes add up (superposition) and accumulation/steady state emerge on their own. V = volume of distribution (weight × literature V/kg), F = bioavailability. Plasma concentration is shown; the actual effect follows it only with a delay and non-linearly. Deliberately omitted: two-compartment distribution, saturable (non-linear) kinetics, active metabolites and inter-individual variation.",
+        modelBody: "The blood level is the convolution of an absorption rate with one-compartment elimination (elimination constant kₑ = ln2/t½, exponential tail). The rise before that comes from the absorption function, which differs by formulation: first-order absorption (the Bateman curve, immediate-release) or a smooth Weibull release for extended-release and osmotic systems (Concerta, metoprolol succinate, valproate ER, etc.). The Weibull form (released fraction Fₐ(t)=1−e^(−(t/td)^ss)) starts with zero slope for ss>1, which keeps the curves kink-free, unlike a hard delay lag or a rectangular release. All approaches are linear, so multiple intakes add up (superposition) and accumulation/steady state emerge on their own. V = volume of distribution (weight × literature V/kg), F = bioavailability. Plasma concentration is shown; the actual effect follows it only with a delay and non-linearly. Where it changes the conclusion, the model goes further: for bupropion the parent distributes in two phases (a second, fast exponential term), and the main metabolite gets a curve of its own, formed from the parent in the blood and already during the first pass through the liver. That stays linear, so superposition still holds. Otherwise deliberately omitted: two-compartment distribution, saturable (non-linear) kinetics, active metabolites and inter-individual variation.",
         source: "Parameters (V/kg, half-life, kₐ, bioavailability) are simplified order-of-magnitude values from standard literature, not patient-specific.",
         disclaimer: "Simplified teaching model. Not medical advice and not a dosing recommendation. For questions about your own medication ask a physician or pharmacist. Personal hobby project, non-commercial, no warranty. Not affiliated with the named manufacturers; brand names are used only to identify the respective release profiles.",
         loading: "Loading substance data…",
@@ -303,6 +361,7 @@
 
     /* ── Colours (site palette) ──────────────────────────────────────────── */
     const COL_TOTAL = '#0fb5ad';   // teal – total curve
+    const COL_MET   = 'var(--tool-sig-warn)';   // metabolite curve, dashed; distinct from teal in all three skins
     const COL_GRID  = 'var(--tool-border)';
     const COL_AXIS  = 'var(--tool-note)';
     const COL_PIN   = '#0fb5ad';
@@ -416,7 +475,7 @@
     }
 
     /* ── Concentration chart with draggable intake pins ──────────────────── */
-    function ConcChart({ intakes, pkOf, V, repeat, windowH, MF, onDragHour, t }) {
+    function ConcChart({ intakes, pkOf, pkOfMet, V, repeat, windowH, MF, onDragHour, t, names }) {
       const W = 760, H = 336, L = 52, R = 16, TP = 14, B = 70;
       const svgRef = useRef(null);
       const [drag, setDrag] = useState(null);
@@ -439,17 +498,24 @@
       const k = Math.min(2.6, Math.max(1, 1 / unitPx));
 
       const N = 480;
-      const { series, dataMax } = useMemo(() => {
-        const tot = [];
+      const { series, metSeries, dataMax } = useMemo(() => {
+        const tot = [], met = [];
         let dmax = 1e-9;
         for (let i = 0; i <= N; i++) {
           const T = windowH * i / N;
           const c = concAt(T, intakes, pkOf, V, repeat, MF);
           tot.push([T, c]);
           if (c > dmax) dmax = c;
+          if (pkOfMet) {
+            // same mg/L axis: the metabolite runs about ten times higher, and that
+            // difference in height is part of what the chart has to show
+            const cm = concAt(T, intakes, pkOfMet, V, repeat, MF);
+            met.push([T, cm]);
+            if (cm > dmax) dmax = cm;
+          }
         }
-        return { series: tot, dataMax: dmax };
-      }, [intakes, pkOf, V, repeat, windowH, MF]);
+        return { series: tot, metSeries: pkOfMet ? met : null, dataMax: dmax };
+      }, [intakes, pkOf, pkOfMet, V, repeat, windowH, MF]);
 
       const axis = niceAxis(dataMax, 4);
       const yMax = axis.max;
@@ -526,7 +592,18 @@
                 bottom-most y grid line so it reads as an axis, not as a box -->
             <line x1=${L} y1=${TP} x2=${W - R} y2=${TP} stroke=${COL_GRID} strokeWidth=${1} />
             <!-- total curve -->
+            ${metSeries && html`
+              <path d=${path(metSeries)} fill="none" stroke=${COL_MET} strokeWidth=${2.4} strokeDasharray="7 5" strokeLinejoin="round" />
+            `}
             <path d=${path(series)} fill="none" stroke=${COL_TOTAL} strokeWidth=${2.4} strokeLinejoin="round" />
+            ${metSeries && html`
+              <g style=${{ pointerEvents: 'none' }}>
+                <line x1=${L + 10} y1=${TP + 14} x2=${L + 32} y2=${TP + 14} stroke=${COL_TOTAL} strokeWidth=${2.4} />
+                <text x=${L + 38} y=${TP + 14} dominantBaseline="middle" fontSize=${11} fill=${COL_AXIS}>${names[0]}</text>
+                <line x1=${L + 10} y1=${TP + 30} x2=${L + 32} y2=${TP + 30} stroke=${COL_MET} strokeWidth=${2.4} strokeDasharray="7 5" />
+                <text x=${L + 38} y=${TP + 30} dominantBaseline="middle" fontSize=${11} fill=${COL_AXIS}>${names[1]}</text>
+              </g>
+            `}
             <!-- pin rail baseline -->
             <line x1=${L} y1=${pinY} x2=${W - R} y2=${pinY} stroke=${COL_GRID} strokeWidth=${1} />
             <!-- draggable intake pins -->
@@ -590,9 +667,20 @@
       const pkOf = useMemo(() => {
         if (!sub) return () => null;
         const m = {};
-        sub.forms.forEach(f => { m[f.id] = formPK(f); });
+        // without a distribution phase formPK's own default kernel, so every
+        // one-compartment substance runs exactly the code path it always did
+        sub.forms.forEach(f => { m[f.id] = formPK(f, sub.distribution ? parentKernel(f, sub.distribution) : undefined); });
         return fid => m[fid] || m[sub.forms[0].id];
       }, [sub]);
+      // Second curve for substances with a modelled metabolite (bupropion); null otherwise.
+      const pkOfMet = useMemo(() => {
+        if (!sub || !sub.metabolite) return null;
+        const m = {};
+        sub.forms.forEach(f => { m[f.id] = formPK(f, metaboliteKernel(parentKernel(f, sub.distribution), sub.metabolite)); });
+        return fid => m[fid] || m[sub.forms[0].id];
+      }, [sub]);
+      const metName = sub && sub.metabolite ? (lang === 'en' ? sub.metabolite.name_en : sub.metabolite.name_de) : null;
+      const subName = sub ? (lang === 'en' ? sub.name_en : sub.name_de) : '';
       const V = sub ? sub.vd_l_per_kg * weight : 1;
       // prodrugs: entered dose is the salt, the curve is the active moiety
       const MF = sub && sub.molar_factor != null ? sub.molar_factor : 1;
@@ -625,14 +713,17 @@
       const metrics = useMemo(() => {
         if (!sub || !intakes.length) return null;
         const t0 = Math.max(0, windowH - 24), t1 = windowH;
-        let mn = Infinity, mx = -Infinity, sum = 0, n = 0;
-        for (let i = 0; i <= 240; i++) {
-          const T = t0 + (t1 - t0) * i / 240;
-          const c = concAt(T, intakes, pkOf, V, repeat, MF);
-          if (c < mn) mn = c; if (c > mx) mx = c; sum += c; n++;
-        }
-        return { cmin: mn, cmax: mx, cavg: sum / n };
-      }, [sub, intakes, pkOf, V, repeat, windowH, MF]);
+        const stats = pk => {
+          let mn = Infinity, mx = -Infinity, sum = 0, n = 0;
+          for (let i = 0; i <= 240; i++) {
+            const T = t0 + (t1 - t0) * i / 240;
+            const c = concAt(T, intakes, pk, V, repeat, MF);
+            if (c < mn) mn = c; if (c > mx) mx = c; sum += c; n++;
+          }
+          return { cmin: mn, cmax: mx, cavg: sum / n };
+        };
+        return { parent: stats(pkOf), met: pkOfMet ? stats(pkOfMet) : null };
+      }, [sub, intakes, pkOf, pkOfMet, V, repeat, windowH, MF]);
 
       if (err) return html`<div className="container"><p style=${{ color: '#e05260' }}>${t.loadError}</p></div>`;
       if (!data || !sub) return html`<div className="container"><p style=${{ color: 'var(--tool-label)' }}>${t.loading}</p></div>`;
@@ -703,17 +794,23 @@
           <!-- chart -->
           <div style=${card}>
             <strong style=${{ fontSize: 15 }}>${t.chartTitle}</strong>
-            <${ConcChart} intakes=${intakes} pkOf=${pkOf} V=${V} repeat=${repeat} windowH=${windowH}
-                       MF=${MF} onDragHour=${onDragHour} t=${t} />
+            <${ConcChart} intakes=${intakes} pkOf=${pkOf} pkOfMet=${pkOfMet} V=${V} repeat=${repeat} windowH=${windowH}
+                       MF=${MF} onDragHour=${onDragHour} t=${t} names=${[subName, metName]} />
             <p style=${{ fontSize: 11, color: 'var(--tool-note)', margin: '2px 0 10px' }}>${t.chartHint}</p>
-            ${metrics && html`
-              <div style=${{ display: 'flex', gap: 22, flexWrap: 'wrap', fontSize: 13 }}>
-                <${Metric} label=${t.cmax} value=${niceConc(metrics.cmax)} unit="mg/L" />
-                <${Metric} label=${t.cmin} value=${niceConc(metrics.cmin)} unit="mg/L" />
-                <${Metric} label=${t.cavg} value=${niceConc(metrics.cavg)} unit="mg/L" />
-                <span style=${{ color: 'var(--tool-faint)', fontSize: 11, alignSelf: 'center' }}>${t.lastDay}</span>
+            ${metrics && [['parent', subName, COL_TOTAL], ['met', metName, COL_MET]].filter(r => metrics[r[0]]).map(([key, name, col]) => html`
+              <div key=${key} style=${{ display: 'flex', gap: 22, flexWrap: 'wrap', fontSize: 13, marginTop: key === 'met' ? 6 : 0 }}>
+                ${metrics.met && html`
+                  <span style=${{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 140 }}>
+                    <span style=${{ width: 14, height: 0, borderTop: '2.4px ' + (key === 'met' ? 'dashed' : 'solid') + ' ' + col, display: 'inline-block' }} />
+                    <span style=${{ color: 'var(--tool-label)' }}>${name}</span>
+                  </span>
+                `}
+                <${Metric} label=${t.cmax} value=${niceConc(metrics[key].cmax)} unit="mg/L" />
+                <${Metric} label=${t.cmin} value=${niceConc(metrics[key].cmin)} unit="mg/L" />
+                <${Metric} label=${t.cavg} value=${niceConc(metrics[key].cavg)} unit="mg/L" />
+                ${key === 'parent' && html`<span style=${{ color: 'var(--tool-faint)', fontSize: 11, alignSelf: 'center' }}>${t.lastDay}</span>`}
               </div>
-            `}
+            `)}
           </div>
 
           <!-- intakes -->
