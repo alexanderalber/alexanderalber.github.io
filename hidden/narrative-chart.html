@@ -116,7 +116,7 @@
      The e-book readers, lifted out of miscellaneous/tools/ebook-converter.html
      (its <script id="ebookcore"> block) by notes/dev/extract-reader.mjs, which
      keeps whatever the reader entry points reach and drops every writer.
-     Kept 135 declarations.
+     Kept 136 declarations.
 
      To re-sync after the converter changes: run the script again and commit
      the diff. Never patch this block in place, or the next run silently
@@ -2185,13 +2185,54 @@
 
       if (missingImages) log.warn(missingImages + ' image references could not be resolved and were dropped.');
 
-      const toc = buildMobiToc(book);
+      const own = book.sections.length > 1 ? generatedContents(bin, book.sections[0]) : null;
+      let toc;
+      if (own) {
+        // Drop the page, and send the links that pointed at it (unresolved
+        // targets fall back to the contents page) to the start of the book.
+        const gone = book.sections.shift().id;
+        const first = book.sections[0].id + '.xhtml';
+        const toGone = new RegExp('href="' + gone + '\\.xhtml[^"]*"', 'g');
+        for (const sec of book.sections) sec.html = sec.html.replace(toGone, 'href="' + first + '"');
+        toc = { entries: own, source: 'from the contents page this tool wrote' };
+      } else {
+        toc = buildMobiToc(book);
+      }
       book.toc = toc.entries;
       applyTocTitles(book);
       log.info('MOBI: ' + book.sections.length + ' sections'
         + (raw.length ? ' (split on page breaks)' : ' (no page breaks found)')
         + ', ' + book.toc.length + ' TOC entries (' + toc.source + ')');
       return book;
+    }
+
+    // The contents page writeMobi puts in front of every book. Read back as an
+    // ordinary section it would come out as a chapter, and the next MOBI written
+    // from that book would put a second one in front of it. Recognised by two
+    // things only this writer produces together: the guide's toc reference
+    // points at the very first byte of the body, and the section is nothing but
+    // an <h1> and one-link paragraphs indented in steps of 1.2em. Returns the
+    // TOC entries it holds, levels included, or null.
+    function generatedContents(bin, sec) {
+      const guide = /<reference type="toc" title="Table of Contents" filepos="(\d+)"\/>/.exec(bin);
+      const body = bin.indexOf('<body>');
+      if (!guide || body < 0 || guide.index > body || parseInt(guide[1], 10) !== body + 6) return null;
+      const html = sec.html.replace(/<a id="fp\d+"><\/a>/g, '').replace(/>\s+</g, '><').trim();
+      const P = '<p(?: style="margin-left:([0-9.]+)em")?>(?:<a href="([^"]*)">([^<]*)<\/a>|[^<]*)<\/p>';
+      const whole = new RegExp('^<div><h1>[^<]*<\/h1>(?:' + P + ')*<\/div>$');
+      if (!whole.test(html)) return null;
+      const entries = [];
+      const re = new RegExp(P, 'g');
+      let m;
+      while ((m = re.exec(html))) {
+        if (!m[2]) continue; // an entry the writer could not resolve has no link
+        entries.push({
+          title: decodeEntities(m[3]).trim(),
+          href: 'text/' + m[2],
+          level: m[1] ? Math.round(parseFloat(m[1]) / 1.2) : 0,
+        });
+      }
+      return entries;
     }
 
     // MOBI keeps its table of contents in binary index records, but it also ships
@@ -2814,6 +2855,7 @@
       findOne: findOne,
       firstHeadingNode: firstHeadingNode,
       fromBase32: fromBase32,
+      generatedContents: generatedContents,
       hasContent: hasContent,
       headingLevel: headingLevel,
       htmlToText: htmlToText,

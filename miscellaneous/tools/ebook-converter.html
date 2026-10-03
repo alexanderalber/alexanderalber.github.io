@@ -2540,13 +2540,54 @@
 
       if (missingImages) log.warn(missingImages + ' image references could not be resolved and were dropped.');
 
-      const toc = buildMobiToc(book);
+      const own = book.sections.length > 1 ? generatedContents(bin, book.sections[0]) : null;
+      let toc;
+      if (own) {
+        // Drop the page, and send the links that pointed at it (unresolved
+        // targets fall back to the contents page) to the start of the book.
+        const gone = book.sections.shift().id;
+        const first = book.sections[0].id + '.xhtml';
+        const toGone = new RegExp('href="' + gone + '\\.xhtml[^"]*"', 'g');
+        for (const sec of book.sections) sec.html = sec.html.replace(toGone, 'href="' + first + '"');
+        toc = { entries: own, source: 'from the contents page this tool wrote' };
+      } else {
+        toc = buildMobiToc(book);
+      }
       book.toc = toc.entries;
       applyTocTitles(book);
       log.info('MOBI: ' + book.sections.length + ' sections'
         + (raw.length ? ' (split on page breaks)' : ' (no page breaks found)')
         + ', ' + book.toc.length + ' TOC entries (' + toc.source + ')');
       return book;
+    }
+
+    // The contents page writeMobi puts in front of every book. Read back as an
+    // ordinary section it would come out as a chapter, and the next MOBI written
+    // from that book would put a second one in front of it. Recognised by two
+    // things only this writer produces together: the guide's toc reference
+    // points at the very first byte of the body, and the section is nothing but
+    // an <h1> and one-link paragraphs indented in steps of 1.2em. Returns the
+    // TOC entries it holds, levels included, or null.
+    function generatedContents(bin, sec) {
+      const guide = /<reference type="toc" title="Table of Contents" filepos="(\d+)"\/>/.exec(bin);
+      const body = bin.indexOf('<body>');
+      if (!guide || body < 0 || guide.index > body || parseInt(guide[1], 10) !== body + 6) return null;
+      const html = sec.html.replace(/<a id="fp\d+"><\/a>/g, '').replace(/>\s+</g, '><').trim();
+      const P = '<p(?: style="margin-left:([0-9.]+)em")?>(?:<a href="([^"]*)">([^<]*)<\/a>|[^<]*)<\/p>';
+      const whole = new RegExp('^<div><h1>[^<]*<\/h1>(?:' + P + ')*<\/div>$');
+      if (!whole.test(html)) return null;
+      const entries = [];
+      const re = new RegExp(P, 'g');
+      let m;
+      while ((m = re.exec(html))) {
+        if (!m[2]) continue; // an entry the writer could not resolve has no link
+        entries.push({
+          title: decodeEntities(m[3]).trim(),
+          href: 'text/' + m[2],
+          level: m[1] ? Math.round(parseFloat(m[1]) / 1.2) : 0,
+        });
+      }
+      return entries;
     }
 
     // MOBI keeps its table of contents in binary index records, but it also ships
@@ -3291,60 +3332,56 @@
       return { bytes: encodeUtf8(filled), imageNames: imageNames, imageIndex: imageIndex };
     }
 
-    // ══ safe record boundaries ═══════════════════════════════════════════════
-    // A MOBI text record is a fixed slice of the byte stream, and whether a
-    // reader may glue two of them back together before parsing hangs on bit 0 of
-    // the Extra Data Flags ("multibyte overlap"). With that bit set, a UTF-8
-    // sequence or a tag straddling the boundary is normal and harmless. Without
-    // it, every record has to stand on its own, and a boundary in the middle of
-    // a sequence or a tag is a real defect: the Kindle then shows replacement
-    // boxes and stops scrolling, or prints raw markup as body text.
+    // ══ text records ═════════════════════════════════════════════════════════
+    // A MOBI text record is a FIXED slice of the byte stream: every record but
+    // the last decodes to exactly record_size bytes. A Kindle relies on that.
+    // It finds a text position by dividing by record_size, not by adding up
+    // record lengths, so a record that comes up short shifts everything behind
+    // it. Measured on two omnibus files this tool wrote while it still cut
+    // records short (2026-10): the shortfalls added up to 7554 bytes in one of
+    // them, and the device dropped exactly that much off the end of the book,
+    // the whole closing scene up to "THE END". Every one of some sixty MOBI
+    // files from other writers, kindlegen and the broken ones alike, keeps the
+    // fixed size without a single exception.
     //
-    // This writer sets the flags to 0, so it must cut where nothing is split.
-    // Cuts may only move EARLIER, never later: a record longer than the declared
-    // record_size produces blank pages, overprinted text and a book that opens
-    // only after several tries.
+    // A fixed slice cuts wherever it falls, through tags and UTF-8 sequences
+    // alike. Bit 0 of the Extra Data Flags ("multibyte overlap") is what makes
+    // that legal: the reader then joins the records before parsing, so a tag
+    // across a boundary is harmless, and a character cut in half is completed
+    // by a trailing entry. That entry is the continuation bytes of the cut
+    // character (which also open the next record) followed by one byte holding
+    // their count; with nothing cut it is the count byte alone, 0. This is
+    // byte for byte what kindlegen writes.
     //
-    // Two things must not be cut through:
-    //   - a UTF-8 multibyte sequence (a continuation byte is 10xxxxxx)
-    //   - a tag, meaning any position between an unmatched '<' and its '>'
-    function safeCutPoint(bytes, from, limit) {
-      let cut = Math.min(limit, bytes.length);
-      if (cut >= bytes.length) return bytes.length;
-
-      // Back off a UTF-8 continuation byte. A sequence is at most 4 bytes, so at
-      // most 3 steps; more than that means the data is not valid UTF-8 and there
-      // is nothing sensible to preserve.
-      let guard = 0;
-      while (cut > from && (bytes[cut] & 0xC0) === 0x80 && guard < 4) { cut--; guard++; }
-
-      // Find the last '<' in [from, cut) that has no '>' after it before cut.
-      // If there is one, the cut sits inside a tag and has to move in front of it.
-      let open = -1;
-      for (let i = cut - 1; i >= from; i--) {
-        if (bytes[i] === 0x3E) break;        // '>' : the last tag closed, nothing open
-        if (bytes[i] === 0x3C) { open = i; break; } // '<'
-      }
-      if (open > from) cut = open;
-
-      // A pathological case (a "tag" longer than a whole record, or a run of
-      // continuation bytes) would push the cut back to `from` and make no
-      // progress. Then take the full slice and accept the split: an infinite
-      // loop is worse, and the caller must never emit a zero-length record.
-      if (cut <= from) return Math.min(limit, bytes.length);
-      return cut;
-    }
-
-    // Slices a byte stream into records of at most `size` bytes, cutting only at
-    // safe points. Returns the raw (uncompressed) slices.
-    function sliceTextRecords(bytes, size) {
+    // Two earlier answers are wrong and must not come back. Cutting blindly
+    // with the flags at 0 makes every record stand on its own, and a split tag
+    // or character then shows up on the device as raw markup or replacement
+    // boxes. Moving the cut earlier to dodge the split (which this tool did
+    // from 2026-08-31) keeps the records clean but short, see above. And no
+    // record may decode to MORE than record_size either: that produced blank
+    // pages, overprinted text and a book that only opened after several tries.
+    function fixedTextRecords(bytes, size) {
       const out = [];
-      let p = 0;
-      while (p < bytes.length) {
-        const end = safeCutPoint(bytes, p, p + size);
-        out.push(bytes.subarray(p, end));
-        p = end;
+      for (let p = 0; p < bytes.length; p += size) {
+        const end = Math.min(p + size, bytes.length);
+        let extra = 0;
+        if (end < bytes.length) {
+          const have = danglingUtf8(bytes.subarray(p, end));
+          if (have) {
+            const lead = bytes[end - have];
+            const need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
+            // Only real continuation bytes count; broken UTF-8 gets no overlap
+            // rather than a trailing entry that claims bytes it does not have.
+            while (extra < need - have && end + extra < bytes.length
+              && (bytes[end + extra] & 0xC0) === 0x80) extra++;
+          }
+        }
+        const rec = new Uint8Array(end - p + extra + 1);
+        rec.set(bytes.subarray(p, end + extra));
+        rec[rec.length - 1] = extra;
+        out.push(rec);
       }
+      if (!out.length) out.push(new Uint8Array([0]));
       return out;
     }
 
@@ -3355,9 +3392,7 @@
       const textBytes = markup.bytes;
 
       const RECSIZE = 4096;
-      // Extra Data Flags stay 0 below, so every record must parse on its own:
-      // cut only where neither a UTF-8 sequence nor a tag is split. Records get
-      // shorter this way, never longer than RECSIZE.
+      // Fixed records with the multibyte overlap bit, see fixedTextRecords.
       //
       // Written uncompressed, and that is a deliberate retreat. This tool has a
       // working PalmDOC compressor, and its output decompresses correctly here,
@@ -3368,9 +3403,10 @@
       // between a file that is provably fine and one that is merely provably
       // well-formed. The cost is size, roughly half again as much, which on a
       // device with gigabytes of storage buys nothing worth the risk.
-      // palmdocCompress stays, tested, for whenever the reason turns up.
-      const textRecs = sliceTextRecords(textBytes, RECSIZE);
-      if (!textRecs.length) textRecs.push(new Uint8Array(0));
+      // palmdocCompress stays, tested, for whenever the reason turns up. (A
+      // candidate since 2026-10: the compressed test files had short records
+      // too, see fixedTextRecords. Unverified, so the retreat stands.)
+      const textRecs = fixedTextRecords(textBytes, RECSIZE);
 
       const imageRecs = markup.imageNames.map(function (n) { return book.resources.get(n).bytes; });
       const firstImage = 1 + textRecs.length;
@@ -3429,7 +3465,7 @@
       dv.setUint16(M + 0xB0, 1, false);             // first content record
       dv.setUint16(M + 0xB2, lastContent, false);   // last content record
       dv.setUint32(M + 0xB4, 1, false);
-      dv.setUint32(M + 0xE0, 0, false);             // no trailing entries in the text records
+      dv.setUint32(M + 0xE0, 1, false);             // Extra Data Flags: multibyte overlap
       dv.setUint32(M + 0xE4, 0xFFFFFFFF, false);
       rec0.set(exth, 16 + MOBI_LEN);
       rec0.set(fullName, fullNameOffset);
@@ -3485,7 +3521,7 @@
     // borderline case. The broken ones came from tools that implement the MOBI
     // writer themselves instead of calling kindlegen.
 
-    const MOBI_REPAIR_CHECKS = ['boundaries', 'oversized', 'cover', 'header'];
+    const MOBI_REPAIR_CHECKS = ['boundaries', 'recsize', 'cover', 'header'];
 
     function defaultRepairOpts() {
       const o = {};
@@ -3661,33 +3697,51 @@
         }
       }
 
-      // ---- oversized records ------------------------------------------------
+      // ---- record sizes -----------------------------------------------------
       // record_size describes the UNCOMPRESSED chunk each record stands for, so
       // the raw record length is the wrong thing to measure: with the overlap
       // bit set a record legitimately carries a few trailing bytes on top, and
-      // a compressed record is normally far below the limit anyway. What breaks
-      // a reader is a chunk that decodes to more than record_size bytes.
-      if (o.oversized) {
+      // a compressed record is normally far below the limit anyway. Every
+      // record but the last has to decode to exactly record_size bytes (see
+      // fixedTextRecords). Longer shows up as blank pages and overprinted text;
+      // shorter shifts every position behind it, and the shortfall falls off
+      // the end of the book.
+      if (o.recsize) {
         const decodedSize = function (r) {
           if (h.compression === 1) return r.body.length;
           if (h.compression === 2) {
-            try { return palmdocDecompress(r.body).length; } catch (e) { return 0; }
+            try { return palmdocDecompress(r.body).length; } catch (e) { return null; }
           }
-          return 0; // HUFF/CDIC: not measurable without the tables, reported elsewhere
+          return null; // HUFF/CDIC: not measurable without the tables, reported elsewhere
         };
-        const big = recs
-          .map(function (r) { return { index: r.index, size: decodedSize(r) }; })
-          .filter(function (r) { return r.size > recordSize; });
+        const sized = recs.map(function (r, k) {
+          return { index: r.index, size: decodedSize(r), last: k === recs.length - 1 };
+        }).filter(function (r) { return r.size !== null; });
+        const big = sized.filter(function (r) { return r.size > recordSize; });
+        const short = sized.filter(function (r) { return !r.last && r.size < recordSize; });
+        const list = function (rs) {
+          return rs.slice(0, 6).map(function (r) { return r.index; }).join(', ')
+            + (rs.length > 6 ? ' and others' : '');
+        };
         if (big.length) {
-          problem('oversized', big.length + ' record' + (big.length === 1 ? ' is' : 's are')
+          problem('recsize', big.length + ' record' + (big.length === 1 ? ' is' : 's are')
             + ' larger than record_size',
             'The header declares ' + recordSize + ' bytes per record; record'
-            + (big.length === 1 ? ' ' : 's ')
-            + big.slice(0, 6).map(function (r) { return r.index; }).join(', ')
-            + (big.length > 6 ? ' and others' : '') + ' decode to more (up to '
+            + (big.length === 1 ? ' ' : 's ') + list(big) + ' decode to more (up to '
             + Math.max.apply(null, big.map(function (r) { return r.size; }))
             + ' bytes). This shows up as blank pages, overprinted text, and a book that '
             + 'only opens after several tries.',
+            !out.huff && !out.encrypted);
+        }
+        if (short.length) {
+          const lost = short.reduce(function (a, r) { return a + recordSize - r.size; }, 0);
+          problem('recsize', short.length + ' record' + (short.length === 1 ? ' is' : 's are')
+            + ' shorter than record_size',
+            'Every text record but the last has to hold exactly ' + recordSize + ' bytes, '
+            + 'because a Kindle finds a position by dividing by that number rather than by '
+            + 'adding up the records. Record' + (short.length === 1 ? ' ' : 's ') + list(short)
+            + ' fall short by ' + lost + ' bytes in total. Every position behind them is off, '
+            + 'links land early, and the last ' + lost + ' bytes of the book fall off the end.',
             !out.huff && !out.encrypted);
         }
       }
@@ -3931,40 +3985,36 @@
         }
       }
 
-      // ---- boundaries and oversized records ---------------------------------
-      const recutWanted = wanted('boundaries') || wanted('oversized');
+      // ---- boundaries and record sizes --------------------------------------
+      const recutWanted = wanted('boundaries') || wanted('recsize');
+      // The fixed records need the multibyte overlap bit, and the field for it
+      // has to exist in this header. Writing it into a shorter header would land
+      // in the EXTH block behind it.
+      const flagsField = h.hasMobi && h.headerLength >= 0xE4 && rec0.length >= M + 0xE4;
       let textRecs = null;
       if (recutWanted || markupChanged) {
         if (!textAvailable) {
           if (recutWanted) skip('Record re-cut', 'the text is not available');
+        } else if (!flagsField) {
+          skip(recutWanted ? 'Record re-cut' : 'Cover reference',
+            'the header is too short to carry the Extra Data Flags the new records need');
+          res.fixes = [];
         } else {
           const textBytes = encodeUtf8(markup);
           // The replacement records are written UNCOMPRESSED (PalmDOC
-          // compression type 1, the regular uncompressed mode). This is a
-          // deliberate decision, not an oversight: re-compressing with this
-          // tool's own PalmDOC compressor produced files that a real Paperwhite
-          // rendered wrongly, even though the output decompressed correctly here
-          // and its distances, lengths and opcodes all stayed within the range
-          // the original file used. The cause was never found. Uncompressed
-          // output ran without a single fault on the same device, and the size
-          // cost is not worth chasing an unexplained device bug.
-          const slices = sliceTextRecords(textBytes, recordSize);
-          textRecs = slices.map(function (s) { return s.slice(); });
+          // compression type 1, the regular uncompressed mode), as writeMobi
+          // does and for the same reason; see the comment there.
+          textRecs = fixedTextRecords(textBytes, recordSize);
           dv.setUint16(0, 1, false);                        // compression: none
           dv.setUint32(4, textBytes.length, false);         // uncompressed text length
           dv.setUint16(8, textRecs.length, false);
           dv.setUint16(10, recordSize, false);
-          if (h.hasMobi && rec0.length >= M + 0xE4) {
-            // No trailing bytes any more, so no overlap bit either. The records
-            // are cut so that nothing needs one.
-            dv.setUint32(M + 0xE0, 0, false);
-          }
-          if (wanted('boundaries')) {
-            res.fixes.push('Re-cut the text into ' + textRecs.length + ' records so that no '
-              + 'UTF-8 sequence and no tag is split, and wrote them uncompressed.');
-          } else if (wanted('oversized')) {
-            res.fixes.push('Re-cut the text into ' + textRecs.length + ' records of at most '
-              + recordSize + ' bytes, written uncompressed.');
+          // Exactly the multibyte overlap bit. Any other bit would promise
+          // trailing entries (TBS indexing) the new records do not carry.
+          dv.setUint32(M + 0xE0, 1, false);
+          if (wanted('recsize') || wanted('boundaries')) {
+            res.fixes.push('Re-cut the text into ' + textRecs.length + ' records of exactly '
+              + recordSize + ' bytes with the multibyte overlap bit set, written uncompressed.');
           } else {
             res.fixes.push('Rewrote the text records after the cover fix ('
               + textRecs.length + ' records, uncompressed).');
@@ -4117,8 +4167,8 @@
     // Only ONE of the four checks earns its place here, which is worth spelling
     // out because the other three look like they should. Measured on the broken
     // files: writeMobi rebuilds the whole file from the parsed book, cutting
-    // records at safe points and writing fresh header fields, so `boundaries`,
-    // `oversized` and `header` are already gone in the output whether or not a
+    // fixed records and writing fresh header fields, so `boundaries`,
+    // `recsize` and `header` are already gone in the output whether or not a
     // repair ran first. Repairing them before a conversion is work with no
     // effect on the result.
     //
@@ -4139,7 +4189,7 @@
       if (sniff(bytes, name) !== 'mobi') return out;
       let r;
       try {
-        r = repairMobi(bytes, { boundaries: false, oversized: false, cover: true, header: false });
+        r = repairMobi(bytes, { boundaries: false, recsize: false, cover: true, header: false });
       } catch (e) {
         // A file too broken to repair is still a file worth trying to read.
         return out;
@@ -7189,8 +7239,8 @@
       diagnoseMobi: diagnoseMobi, repairMobi: repairMobi,
       repairChecks: MOBI_REPAIR_CHECKS, defaultRepairOpts: defaultRepairOpts,
       repairForConversion: repairForConversion,
-      resolveExtraFlags: resolveExtraFlags, sliceTextRecords: sliceTextRecords,
-      safeCutPoint: safeCutPoint, trailingSize: trailingSize,
+      resolveExtraFlags: resolveExtraFlags, fixedTextRecords: fixedTextRecords,
+      trailingSize: trailingSize,
       danglingUtf8: danglingUtf8, danglingTag: danglingTag,
       findCoverSvgs: findCoverSvgs, mobiPlainText: mobiPlainText,
       mobiTextRecords: mobiTextRecords, extraFlagsScore: extraFlagsScore,
@@ -8288,8 +8338,8 @@
 
             <label style=${{ color: 'var(--tool-label)', fontSize: 13, marginBottom: 6, display: 'block' }}>
               Checks the record layout of this MOBI for the faults that make a Kindle show
-              replacement boxes, print raw markup as body text, or open a book only after
-              several tries. Whether a fault is a fault at all depends on one header bit:
+              replacement boxes, print raw markup as body text, drop the end of the book, or
+              open it only after several tries. Whether a fault is a fault at all depends on one header bit:
               with the multibyte overlap bit set, tags and characters may run across record
               boundaries and nothing is wrong. This file
               ${diag.info.overlap ? ' sets that bit.' : ' does not set it, so every record has to parse on its own.'}
@@ -8322,7 +8372,7 @@
             <p style=${{ fontSize: 12, color: 'var(--tool-note)', margin: '0 0 6px' }}>
               There is nothing to press. A cover pointing at a file path was already mended
               when the book was read, which is why it is fixed in every output format and
-              not just in MOBI; cut records, oversized records and wrong header fields go
+              not just in MOBI; cut records, records of the wrong size and wrong header fields go
               when the file is written, because it is rebuilt from scratch rather than
               patched. The list above describes the file as it arrived.
               ${repairStuck ? ' What is left is in a file this tool cannot write back.' : ''}
