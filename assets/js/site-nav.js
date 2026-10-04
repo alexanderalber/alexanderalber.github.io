@@ -5,6 +5,25 @@
   'use strict';
   var el = document.documentElement;
 
+  /* --seg-seam: the width a 1px border is actually painted at, in CSS pixels.
+     Browsers floor border widths to whole device pixels (at least one), while a
+     margin moves by the exact fraction. Joined .lang-seg segments overlap by one
+     border width, so at a device pixel ratio of 1.25 or 1.5 a -1px margin shifted
+     the neighbour by 1.25 or 1.5 device pixels against a 1-pixel border: the two
+     borders landed side by side, not on top of each other, and every seam came
+     out twice as thick as the outer edge. custom.css overlaps by this value
+     instead and falls back to 1px on pages without this script. Re-measured on
+     every ratio change, which is what browser zoom and moving the window to
+     another monitor both are. */
+  (function seam() {
+    var dpr = window.devicePixelRatio || 1;
+    el.style.setProperty('--seg-seam', Math.max(1, Math.floor(dpr)) / dpr + 'px');
+    if (window.matchMedia) {
+      window.matchMedia('(resolution: ' + dpr + 'dppx)')
+        .addEventListener('change', seam, { once: true });
+    }
+  })();
+
   /* Theme switcher. A click flips data-theme right away and sets .theme-morph,
      so the colours travel over half a second. Pages carrying data-theme-live
      stay put and get a `themechange` event on window (canvas/WebGL tools re-read
