@@ -301,6 +301,17 @@
       const { tool, spec } = splitRule(rule);
       if(spec === null) return out;
 
+      /* ":*" is only a wildcard at the very end. Anywhere else the colon is a
+         literal character, so "git:* push" matches no git command at all. */
+      if((tool === "Bash" || tool === "PowerShell") && /:\*/.test(spec) && !/:\*$/.test(spec)){
+        out.push({
+          level: "warn",
+          msg: "\":*\" is only a wildcard at the end of a pattern. Here the colon is taken literally "
+             + "and the rule matches nothing you meant.",
+          fix: tool + "(" + spec.replace(/:\*/g, " *") + ")",
+        });
+      }
+
       if(tool in DEAD_PATH_TOOLS){
         out.push({
           level: "warn",
@@ -363,12 +374,29 @@
       return i + 1 < order.length ? order[i + 1] : null;
     }
 
+    /* effortLevel accepts these four and nothing else. "max" exists as a
+       session level, but the settings key rejects it, and a value the schema
+       rejects makes Claude Code skip the whole file. */
+    const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"];
+
+    /* Modes that are ignored when they come from project or local settings
+       (since v2.1.257). Only user settings, managed settings or --settings
+       can start a session in them. */
+    const USER_ONLY_MODES = ["auto", "bypassPermissions"];
+
+    function modeScopeLint(mode, scope){
+      if(USER_ONLY_MODES.indexOf(mode) < 0) return null;
+      if(scope !== "project" && scope !== "local") return null;
+      return "Claude Code ignores defaultMode \"" + mode + "\" in " + scope + " settings. "
+           + "Sessions start in it only when it is set in user settings (~/.claude/settings.json).";
+    }
+
     /* ── Assemble the settings object in a stable, readable key order ── */
     function buildSettings(s){
       const out = {};
       if(s.schema) out["$schema"] = "https://json.schemastore.org/claude-code-settings.json";
       if(s.model && s.model.trim()) out.model = s.model.trim();
-      if(s.effortLevel) out.effortLevel = s.effortLevel;
+      if(EFFORT_LEVELS.indexOf(s.effortLevel) >= 0) out.effortLevel = s.effortLevel;
 
       /* An empty string is a meaningful value here: it turns the trailer off.
          So the two fields are gated by their own checkbox, not by emptiness. */
@@ -379,7 +407,14 @@
       const days = parseInt(s.cleanup, 10);
       if(!isNaN(days) && days > 0) out.cleanupPeriodDays = days;
 
-      (s.featureKeys || []).forEach(function(k){ if(s.features && s.features[k]) out[k] = true; });
+      /* A toggle switches a feature off, but the key that does it is not
+         always a disable* flag: enableArtifact and enableWorkflows take false.
+         featureValues says what to write; true when it says nothing. */
+      (s.featureKeys || []).forEach(function(k){
+        if(!(s.features && s.features[k])) return;
+        const fv = s.featureValues || {};
+        out[k] = k in fv ? fv[k] : true;
+      });
 
       const env = {};
       (s.envRows || []).forEach(function(row){ if(row.k.trim()) env[row.k.trim()] = row.v; });
@@ -406,6 +441,9 @@
       ANCHORS: ANCHORS,
       PATH_TOOLS: PATH_TOOLS,
       DEAD_PATH_TOOLS: DEAD_PATH_TOOLS,
+      EFFORT_LEVELS: EFFORT_LEVELS,
+      USER_ONLY_MODES: USER_ONLY_MODES,
+      modeScopeLint: modeScopeLint,
       splitRule: splitRule,
       anchorOf: anchorOf,
       buildSpec: buildSpec,
@@ -427,31 +465,33 @@
     const SCG = window.ScgCore;
 
     /* ── Curated palette of common permission rules ──
-       Claude Code Bash rules use prefix matching with ":*"  →  Bash(git diff:*) */
+       Bash rules match everything before the first "*" as written, so
+       Bash(git diff *) allows every git diff. The older "git diff:*" spelling
+       still works, but only at the very end of a pattern. */
     const PALETTE = [
       { label: "Read-only git", items: [
-        { rule: "Bash(git status)",  bucket: "allow" },
-        { rule: "Bash(git diff:*)",  bucket: "allow" },
-        { rule: "Bash(git log:*)",   bucket: "allow" },
-        { rule: "Bash(git show:*)",  bucket: "allow" },
-        { rule: "Bash(git branch:*)",bucket: "allow" },
+        { rule: "Bash(git status)",   bucket: "allow" },
+        { rule: "Bash(git diff *)",   bucket: "allow" },
+        { rule: "Bash(git log *)",    bucket: "allow" },
+        { rule: "Bash(git show *)",   bucket: "allow" },
+        { rule: "Bash(git branch *)", bucket: "allow" },
       ]},
       { label: "Package scripts", items: [
-        { rule: "Bash(npm run test:*)",      bucket: "allow" },
-        { rule: "Bash(npm run lint:*)",      bucket: "allow" },
-        { rule: "Bash(npm run build:*)",     bucket: "allow" },
-        { rule: "Bash(npm run typecheck:*)", bucket: "allow" },
+        { rule: "Bash(npm run test *)",      bucket: "allow" },
+        { rule: "Bash(npm run lint *)",      bucket: "allow" },
+        { rule: "Bash(npm run build *)",     bucket: "allow" },
+        { rule: "Bash(npm run typecheck *)", bucket: "allow" },
       ]},
       { label: "File editing tools", items: [
         { rule: "Edit",  bucket: "allow" },
         { rule: "Write", bucket: "allow" },
       ]},
       { label: "Read-only shell", items: [
-        { rule: "Bash(ls:*)",   bucket: "allow" },
-        { rule: "Bash(cat:*)",  bucket: "allow" },
-        { rule: "Bash(grep:*)", bucket: "allow" },
-        { rule: "Bash(rg:*)",   bucket: "allow" },
-        { rule: "Bash(find:*)", bucket: "allow" },
+        { rule: "Bash(ls *)",   bucket: "allow" },
+        { rule: "Bash(cat *)",  bucket: "allow" },
+        { rule: "Bash(grep *)", bucket: "allow" },
+        { rule: "Bash(rg *)",   bucket: "allow" },
+        { rule: "Bash(find *)", bucket: "allow" },
       ]},
       { label: "Web access", items: [
         { rule: "WebFetch",  bucket: "allow" },
@@ -461,9 +501,9 @@
         { rule: "Read(./.env)",       bucket: "deny" },
         { rule: "Read(./.env.*)",     bucket: "deny" },
         { rule: "Read(./secrets/**)", bucket: "deny" },
-        { rule: "Bash(rm -rf:*)",     bucket: "deny" },
-        { rule: "Bash(curl:*)",       bucket: "deny" },
-        { rule: "Bash(git push:*)",   bucket: "deny" },
+        { rule: "Bash(rm -rf *)",     bucket: "deny" },
+        { rule: "Bash(curl *)",       bucket: "deny" },
+        { rule: "Bash(git push *)",   bucket: "deny" },
       ]},
       /* These are the absolute forms. They hold in every project, which the
          cwd-relative guards above do not. */
@@ -478,8 +518,8 @@
     ];
 
     const MODEL_SUGGESTIONS = [
-      "default", "opus", "sonnet", "haiku",
-      "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5",
+      "default", "best", "fable", "opus", "sonnet", "haiku", "opusplan",
+      "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5",
     ];
 
     const SCOPES = {
@@ -489,11 +529,15 @@
     };
 
     /* ── Feature flags that actually remove things from the context window.
-       save = rough token estimate reclaimed; very approximate, varies by version. ── */
+       save = rough token estimate reclaimed; very approximate, varies by version.
+       value = what the key gets when the box is ticked, where that is not true:
+       enableArtifact and enableWorkflows switch off with false. They replace
+       disableArtifact (deprecated) and, for one person, disableWorkflows, which
+       is the organisation-wide switch. ── */
     const FEATURES = [
-      { key: "disableBundledSkills",     label: "Disable bundled skills",        save: 2000, hint: "Drops the built-in skills/workflows (/code-review, /verify, …) from context. Costs you those slash commands." },
-      { key: "disableWorkflows",         label: "Disable dynamic workflows",     save: 500,  hint: "Turns off dynamic workflow injection." },
-      { key: "disableArtifact",          label: "Disable Artifact publishing",   save: 700,  hint: "Removes the Artifact tool definition." },
+      { key: "disableBundledSkills",     label: "Disable bundled skills",        save: 2000, hint: "Drops the built-in skills and workflows (/code-review, /verify, …) from context and hides built-in commands such as /init from the model. Costs you those slash commands." },
+      { key: "enableWorkflows",          label: "Disable dynamic workflows",     save: 500,  value: false, hint: "Turns dynamic workflows off for you. The same switch as Dynamic workflows in /config." },
+      { key: "enableArtifact",           label: "Disable Artifact publishing",   save: 700,  value: false, hint: "Removes the Artifact tool. Needs v2.1.196 or later; older versions read disableArtifact: true instead." },
       { key: "disableClaudeAiConnectors",label: "Disable claude.ai connectors",  save: 500,  hint: "Removes claude.ai MCP connector tools (varies with how many you have connected)." },
       { key: "disableRemoteControl",     label: "Disable Remote Control",        save: 300,  hint: "Removes remote-control tooling (v2.1.128+)." },
     ];
@@ -502,7 +546,7 @@
        offer. "default" is labelled Manual in the CLI and accepts "manual". */
     const MODES = [
       { v: "",                  label: "(unset)",           hint: "" },
-      { v: "default",           label: "default (Manual)",  hint: "Prompts on first use of each tool." },
+      { v: "default",           label: "default (Manual)",  hint: "Runs only reads without asking; everything else prompts." },
       { v: "acceptEdits",       label: "acceptEdits",       hint: "Accepts file edits and common filesystem commands inside the working directories." },
       { v: "plan",              label: "plan",              hint: "Reads and explores, does not edit your source files." },
       { v: "auto",              label: "auto",              hint: "Auto-approves tool calls with background safety checks." },
@@ -510,7 +554,7 @@
       { v: "bypassPermissions", label: "bypassPermissions", hint: "Skips prompts. Only in a container or VM." },
     ];
 
-    const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+    const FEATURE_VALUES = FEATURES.reduce((m, f) => ("value" in f ? { ...m, [f.key]: f.value } : m), {});
 
     function fmtTokens(n){
       return n >= 1000 ? "~" + (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : "~" + n;
@@ -604,7 +648,7 @@
       const json = useMemo(() => JSON.stringify(SCG.buildSettings({
         schema, model, effortLevel, coAuthored, autoMemory,
         attributionOn, attributionCommit, attributionPr,
-        cleanup, features, featureKeys: FEATURES.map(f => f.key),
+        cleanup, features, featureKeys: FEATURES.map(f => f.key), featureValues: FEATURE_VALUES,
         envRows, rules, additionalDirs, defaultMode, disableAutoMode, disableBypass,
       }), null, 2), [
         schema, model, effortLevel, coAuthored, autoMemory,
@@ -682,7 +726,9 @@
                   cycles through the other two and then removes it, so any rule can be an
                   <code>allow</code>, an <code>ask</code> or a <code>deny</code>.
                   <code>deny</code> always wins over <code>allow</code>, across every settings file.
-                  Bash rules use prefix matching, e.g. <code>Bash(git diff:*)</code>.
+                  Bash rules match everything before the first <code>*</code> as written, e.g.
+                  <code>Bash(git diff *)</code>. The older <code>Bash(git diff:*)</code> works only with
+                  <code>:*</code> at the very end.
                 </p>
                 </div>
 
@@ -775,6 +821,9 @@
                 ${MODES.filter(m => m.v === defaultMode && m.hint).map(m => html`
                   <p className="scg-hint" key=${m.v} style=${{margin:"4px 0 0"}}>${m.hint}</p>
                 `)}
+                ${SCG.modeScopeLint(defaultMode, scope) && html`
+                  <div className="scg-lint" style=${{marginTop:6}}>${SCG.modeScopeLint(defaultMode, scope)}</div>
+                `}
 
                 <div className="scg-checkrow" style=${{marginTop:14, marginBottom:0}}>
                   <input id="scg-noauto" type="checkbox" className="scg-check"
@@ -802,7 +851,8 @@
                   anchor decides where the pattern starts. Only <code>Read</code> and
                   <code>Edit</code> are ever consulted for file paths; a path on
                   <code>Write</code>, <code>NotebookEdit</code>, <code>MultiEdit</code> or <code>Glob</code> is accepted and
-                  then ignored. A <code>Read</code> deny also blocks Edit and Write on the same path.
+                  then ignored. A <code>Read</code> deny also blocks Edit and Write on the same path, but not NotebookEdit;
+                  an <code>Edit</code> deny covers that.
                 </p>
                 </div>
 
@@ -920,7 +970,7 @@
                   <label htmlFor="scg-effort">Effort level</label>
                   <select className="tool-input" id="scg-effort" value=${effortLevel} onChange=${e => setEffort(e.target.value)} style=${{maxWidth:200}}>
                     <option value="">(unset)</option>
-                    ${EFFORTS.map(v => html`<option key=${v} value=${v}>${v}</option>`)}
+                    ${SCG.EFFORT_LEVELS.map(v => html`<option key=${v} value=${v}>${v}</option>`)}
                   </select>
                 </div>
 
