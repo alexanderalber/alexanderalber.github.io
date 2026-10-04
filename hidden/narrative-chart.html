@@ -3346,20 +3346,29 @@
     function properNounSpans(toks) {
       var spans = [];
       for (var i = 0; i < toks.length; i++) {
-        var hon = null, start = i;
+        var hon = null, start = i, lead = null;
         // The honorific has to be capitalised in the text. Half of these words
         // are also ordinary nouns, and "her sister Elizabeth" must not invent
         // a Sister Elizabeth who then fails to merge with Elizabeth.
         if (HONORIFIC_FORM[toks[i].lc] && /^[A-Z]/.test(toks[i].t)
             && i + 1 < toks.length && isNamey(toks[i + 1])
             && !CAP_STOPWORDS[toks[i + 1].lc]) {
-          hon = HONORIFIC_FORM[toks[i].lc];
+          // A title in the possessive is the first word of a place, not an
+          // honorific: "King's Landing" is not a King called Landing.
+          if (toks[i].poss) {
+            if (toks[i + 1].sent) continue;
+            lead = toks[i].t + "'s";
+          } else {
+            hon = HONORIFIC_FORM[toks[i].lc];
+          }
           i++;
         }
         if (!isNamey(toks[i]) || CAP_STOPWORDS[toks[i].lc]) { i = start; continue; }
-        var parts = [toks[i].t];
+        var parts = lead ? [lead, toks[i].t] : [toks[i].t];
         var end = i;
         while (end + 1 < toks.length) {
+          // A possessive closes the name: "Ned's Bran" is two people.
+          if (toks[end].poss) break;
           var nx = toks[end + 1];
           // A name part never opens a sentence. Without this, "...back to
           // Longbourn. Elizabeth said..." reads as one person called Longbourn
@@ -3388,7 +3397,12 @@
     }
 
     var FEATURES = ['speechPre', 'speechPost', 'vocative', 'honorific', 'possessive', 'pronounNear',
-      'animateVerb', 'locPrep', 'defArticle', 'ofRight', 'placeSuffix'];
+      'animateVerb', 'locPrep', 'defArticle', 'ofRight', 'placeSuffix', 'opener', 'possDet', 'plural',
+      'lowercase'];
+
+    // "Your Grace", "her Ladyship", "his Majesty": a form of address, which
+    // has every grammatical habit of a person except being one.
+    var POSS_DETS = wordSet('my your his her its our their');
 
     function emptyFeats() {
       var f = {};
@@ -3428,6 +3442,9 @@
             && (!after || after.comma)) f.vocative++;
         if (PLACE_SUFFIX_RE.test(sp.core.split(' ').pop())) f.placeSuffix++;
         if (toks[sp.to].poss) f.possessive++;
+        if (toks[sp.from].sent) f.opener++;
+        if (before && POSS_DETS[before.lc]) f.possDet++;
+        if (/[^su]s$/.test(sp.core)) f.plural++;
         // Pronoun within a short reach, but not past the next name.
         var stop = si + 1 < spans.length ? Math.min(spans[si + 1].from, sp.to + 13) : sp.to + 13;
         for (var j = sp.to + 1; j < stop && j < toks.length; j++) {
@@ -3440,37 +3457,77 @@
       return here;
     }
 
-    // Tuned on Pride and Prejudice, sanity-checked on the sample books. They
-    // are exported because the honest answer to "why 3.0" is "it separated the
-    // two clouds and nothing finer was warranted".
+    /* Fitted, not tuned: logistic regression with a light ridge (0.1) on
+     * about 540 hand-labelled candidates from ten novels, the labels in
+     * notes/tools/narrative-chart/cast-labels.json, the fit in
+     * notes/dev/narrative-cast-fit.mjs. The score is the log-odds of "this is
+     * a person", so 0 is a coin flip. Fitting on nine books and scoring the
+     * tenth lets through 17 of 202 non-persons and loses 12 of 333 persons;
+     * the hand weights before it let through 41 and lost 14 on the same
+     * labels. Refit when a feature changes; nudging one number by eye undoes
+     * the balance of the others.
+     *
+     * Two signs look surprising and are right. A vocative counts for a person
+     * only weakly, because "Hey, Jules" has the same shape. Opening a sentence
+     * counts for one, because names are subjects ("Ned said"); the words that
+     * do nothing else are caught by OPENER_ONLY below instead. */
     var WEIGHTS = {
-      speechPre: 3.0, speechPost: 3.0, honorific: 2.0, possessive: 1.5, pronounNear: 1.5,
-      vocative: 1.2, animateVerb: 1.0,
-      locPrep: -2.5, defArticle: -1.5, ofRight: -1.0, placeSuffix: -1.0,
-      countBonus: 0.3,
+      bias: -1.5,
+      speechPre: 8.3, speechPost: 5.7, possessive: 6.5, animateVerb: 5.1, pronounNear: 4.6,
+      opener: 4.8, honorific: 2.2, vocative: 1.6,
+      possDet: -6.0, defArticle: -5.3, locPrep: -4.4, ofRight: -3.5, lowercase: -3.1,
+      placeSuffix: -0.5, plural: -0.5,
     };
+
+    /* A word that opens its sentence nearly every time it is capitalised is an
+     * interjection or an adverb: Hey, Luckily, Furthermore, Excerpt. On the
+     * labelled books no person reaches 0.8, and nothing above 0.85 is a person.
+     * A threshold rather than a weight, because the relation is not linear:
+     * opening sentences often is what names do, opening them always is not. */
+    var OPENER_ONLY = 0.85;
 
     /* Rates, not totals. A protagonist mentioned 900 times and a village
      * mentioned 900 times differ in how they are used, not in how often, and
-     * only the frequency-normalised form says so. The count bonus is a small
-     * thumb on the scale for things mentioned often enough to matter. */
+     * only the frequency-normalised form says so. The fit agrees: a count
+     * term came out at practically zero and is gone. */
     function personScore(feats, count, weights) {
       var w = weights || WEIGHTS;
-      var s = 0;
+      var n = Math.max(1, count);
+      var s = w.bias || 0;
       for (var i = 0; i < FEATURES.length; i++) {
         var f = FEATURES[i];
-        s += (w[f] || 0) * ((feats[f] || 0) / Math.max(1, count));
+        s += (w[f] || 0) * ((feats[f] || 0) / n);
       }
-      return s + (w.countBonus || 0) * Math.log10(Math.max(1, count));
+      if ((feats.opener || 0) / n >= OPENER_ONLY) s -= 10;
+      return s;
+    }
+
+    /* The author's own name turns up in the front matter, the afterword and
+     * the "also by" pages, and reads exactly like a character there: Frank
+     * Herbert, Miss Austen. A candidate goes when every word of it is part of
+     * the author's name and the surname is among them, so a character who
+     * merely shares the author's first name stays. "Howey, Hugh" is the
+     * catalogue form of Hugh Howey. */
+    function isAuthorName(core, author) {
+      if (!author) return false;
+      var a = String(author);
+      var comma = a.indexOf(',');
+      var surname = comma > 0 ? a.slice(0, comma) : a;
+      surname = surname.trim().split(/\s+/).pop().toLowerCase();
+      var own = wordSet(a.toLowerCase().replace(/[^a-zÀ-ɏ' ]+/g, ' '));
+      var words = core.toLowerCase().split(/\s+/);
+      for (var i = 0; i < words.length; i++) if (!own[words[i]]) return false;
+      return words.indexOf(surname) >= 0;
     }
 
     function classifyCandidates(cands, opts) {
       var o = opts || {};
       var weights = o.weights || WEIGHTS;
-      var personAt = o.personAt == null ? 0.60 : o.personAt;
-      var unsureAt = o.unsureAt == null ? 0.20 : o.unsureAt;
+      var personAt = o.personAt == null ? 0 : o.personAt;
+      var unsureAt = o.unsureAt == null ? -1.5 : o.unsureAt;
       var out = cands.map(function (c) {
         var score = personScore(c.feats, c.count, weights);
+        if (isAuthorName(c.core, o.author)) score = Math.min(score, unsureAt - 1);
         return Object.assign({}, c, {
           score: score,
           verdict: score >= personAt ? 'person' : score >= unsureAt ? 'unsure' : 'place',
@@ -3501,6 +3558,8 @@
         var lc = lcCounts[rec.core.toLowerCase()] || 0;
         if (lc > 0 && lc >= rec.count * 0.25) return;
         if (rec.count < (o.minMentions || 3)) return;
+        // Below that line it still counts as evidence ("Hero" and "hero").
+        rec.feats.lowercase = Math.min(lc, rec.count);
         rec.scenes = 0;
         cands.push(rec);
       });
@@ -4754,7 +4813,11 @@
       }).filter(function (s) { return s.text.length > 0; });
       var scenes = splitScenes(clean, o);
       progress(0.25);
-      var got = extract(scenes, o);
+      // The author comes from the book's metadata; a Gutenberg text carries
+      // it in the licence header instead, which is stripped by now.
+      var byline = /^Author:[ \t]*(.+)$/m.exec(joined);
+      var got = extract(scenes, Object.assign({}, o,
+        { author: o.author || (byline ? byline[1].trim() : '') }));
       progress(0.9);
       var index = Object.create(null);
       for (var i = 0; i < got.candidates.length; i++) index[got.candidates[i].name] = i;
@@ -4884,6 +4947,7 @@
       countWords: countWords, isSeparator: isSeparator, chunkByWords: chunkByWords,
       splitScenes: splitScenes,
       tokenize: tokenize, properNounSpans: properNounSpans, personScore: personScore,
+      OPENER_ONLY: OPENER_ONLY, isAuthorName: isAuthorName,
       classifyCandidates: classifyCandidates, extract: extract,
       mergeAliases: mergeAliases,
       sliceScenes: sliceScenes, segmentScenes: segmentScenes, buildSlices: buildSlices,
@@ -4924,7 +4988,8 @@
       '      var sections = book.sections.map(function (s) {',
       '        return { title: s.title, text: NarrRead.htmlToText(s.html) };',
       '      });',
-      '      var res = NARR.analyze(sections, d.opts, function (f) {',
+      '      var opts = Object.assign({}, d.opts, { author: book.meta && book.meta.author });',
+      '      var res = NARR.analyze(sections, opts, function (f) {',
       '        postMessage({ type: "progress", frac: 0.35 + 0.65 * f });',
       '      });',
       '      res.meta = book.meta;',
@@ -4980,7 +5045,8 @@
         var sections = book.sections.map(function (s) {
           return { title: s.title, text: NarrRead.htmlToText(s.html) };
         });
-        var res = NARR.analyze(sections, opts, function (f) { onProgress(0.35 + 0.65 * f); });
+        var res = NARR.analyze(sections, Object.assign({}, opts, { author: book.meta && book.meta.author }),
+          function (f) { onProgress(0.35 + 0.65 * f); });
         res.meta = book.meta;
         res.sourceFormat = book.sourceFormat;
         return res;
@@ -5515,8 +5581,9 @@
 
               <p className="nc-note" style=${{ marginTop: 14, maxWidth: '74ch' }}>
                 How this is built: the book is cut into scenes, capitalised names are collected and
-                scored on how they are used (spoken to, possessive, followed by a verb of speech
-                against sitting after a preposition of place), spellings of one person are merged
+                scored on how they are used (possessive, followed by a verb of speech or action,
+                against sitting after "the", a preposition of place or "your", as in Your Grace;
+                the weights are fitted on hand-labelled novels), spellings of one person are merged
                 conservatively, and each character is then tracked as a hidden state: whether it is
                 on stage, and which company it currently keeps, both priced per switch so a line
                 stays put until the story actually moves it. The pixel positions are relaxed
