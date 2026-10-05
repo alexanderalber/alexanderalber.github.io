@@ -116,7 +116,7 @@
      The e-book readers, lifted out of miscellaneous/tools/ebook-converter.html
      (its <script id="ebookcore"> block) by notes/dev/extract-reader.mjs, which
      keeps whatever the reader entry points reach and drops every writer.
-     Kept 143 declarations.
+     Kept 146 declarations.
 
      To re-sync after the converter changes: run the script again and commit
      the diff. Never patch this block in place, or the next run silently
@@ -793,6 +793,35 @@
       });
     }
 
+    // The same for a stylesheet. Every resource, the stylesheet included, ends
+    // up flat in res/, so a url(../Fonts/x.ttf) written for the publisher's
+    // folder layout pointed at nothing afterwards: the embedded typeface rode
+    // along as dead weight and the renderer fell back. cssDir is where the
+    // stylesheet used to live, the section's folder for a head <style> block.
+    // A reference that resolves to nothing in the book stays as it was.
+    const CSS_IMPORT_RE = /(@import\s+)(?:"([^"]*)"|'([^']*)')/gi;
+
+    function rewriteCssLinks(css, cssDir, pathMap) {
+      function relink(raw) {
+        const sf = splitFrag(raw.trim());
+        const q = sf.path.indexOf('?');
+        const path = q < 0 ? sf.path : sf.path.slice(0, q);
+        if (!path || resolvePath(cssDir, path) === null) return null;
+        const target = lookupHref(pathMap, cssDir, path);
+        if (!target || target.indexOf('../res/') !== 0) return null;
+        return target.slice('../res/'.length) + sf.frag;
+      }
+      return String(css)
+        .replace(CSS_URL_RE, function (m, dq, sq, bare) {
+          const t = relink(dq !== undefined ? dq : (sq !== undefined ? sq : bare));
+          return t === null ? m : 'url("' + t + '")';
+        })
+        .replace(CSS_IMPORT_RE, function (m, at, dq, sq) {
+          const t = relink(dq !== undefined ? dq : sq);
+          return t === null ? m : at + '"' + t + '"';
+        });
+    }
+
     function bodyInner(xhtml) {
       const m = /<body([^>]*)>([\s\S]*?)<\/body\s*>/i.exec(xhtml);
       if (m) {
@@ -950,6 +979,18 @@
         if (id === coverId) book.meta.coverRes = flat;
       }
 
+      // Only now is every resource's flat name known, so the stylesheets'
+      // url() references can follow the move. Untouched bytes stay untouched.
+      for (const id of Object.keys(manifest)) {
+        const it = manifest[id];
+        if (!pathMap[it.path] || (it.mime !== 'text/css' && !/\.css$/i.test(it.path))) continue;
+        const res = book.resources.get(pathMap[it.path].slice('../res/'.length));
+        if (!res) continue;
+        const before = decodeEpubFile(res.bytes);
+        const after = rewriteCssLinks(before, dirOf(it.path), pathMap);
+        if (after !== before) res.bytes = encodeUtf8(after.replace(/^@charset\s+"[^"]*"\s*;/i, '@charset "UTF-8";'));
+      }
+
       // Section ids first, so cross-links between chapters can be resolved.
       const secIdByPath = {};
       spineIds.forEach(function (id, i) {
@@ -982,7 +1023,7 @@
         const styleRe = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
         let sm;
         while ((sm = styleRe.exec(headEnd < 0 ? doc : doc.slice(0, headEnd)))) {
-          const text = sm[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+          const text = rewriteCssLinks(sm[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim(), secDir, pathMap);
           if (!text) continue;
           let name = inlineCss.get(text);
           if (!name) {
@@ -2929,11 +2970,20 @@
       return out;
     }
 
+    // Repoint url(...) in a stylesheet at the renamed resources. Deliberately
+    // narrow: it only repairs names this merge itself changed, matching on the
+    // base name. It is not a path resolver: by the time a merge runs, the EPUB
+    // reader has already pointed every url() at its flat neighbour in res/
+    // (rewriteCssLinks), so the base name is all there is to match.
+    const CSS_URL_RE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)/g;
+
     return {
       ATTR_RE: ATTR_RE,
       BLOCK_TAGS: BLOCK_TAGS,
       CONTAINER_UNWRAP: CONTAINER_UNWRAP,
       CRC_TABLE: CRC_TABLE,
+      CSS_IMPORT_RE: CSS_IMPORT_RE,
+      CSS_URL_RE: CSS_URL_RE,
       ENDS_P: ENDS_P,
       EXTH_AUTHOR: EXTH_AUTHOR,
       EXT_BY_MIME: EXT_BY_MIME,
@@ -3053,6 +3103,7 @@
       readTxt: readTxt,
       resolveExtraFlags: resolveExtraFlags,
       resolvePath: resolvePath,
+      rewriteCssLinks: rewriteCssLinks,
       rewriteLinks: rewriteLinks,
       sanitizeName: sanitizeName,
       serializeNodes: serializeNodes,

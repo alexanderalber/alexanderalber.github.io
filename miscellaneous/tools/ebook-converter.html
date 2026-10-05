@@ -7403,6 +7403,176 @@
       return merged;
     }
 
+    // ---------- the language of a merge's sources --------------------------
+    // A merged book declares one language, so a German volume in an English
+    // series gets English hyphenation and an English voice. The model that
+    // spots this is the Language Zipper's (assets/js/ncd-core.js); the app
+    // loads it and hands in classify(text) -> ISO 639-3 code. What lives here
+    // is everything around that call, so it can be tested without the model.
+
+    const LANG_PROBE_CHARS = 400;   // ncd-core measures 99.6% from 100 characters on
+    const LANG_PROBES = 9;
+
+    // ISO 639-3 as the models name them, to the tag a book's metadata uses.
+    // A language without a two-letter code keeps its three letters, which
+    // BCP 47 allows.
+    const LANG_639_1 = {
+      eng: 'en', deu: 'de', nld: 'nl', afr: 'af', swe: 'sv', dan: 'da', nob: 'nb', isl: 'is',
+      yid: 'yi', spa: 'es', por: 'pt', fra: 'fr', ita: 'it', ron: 'ro', cat: 'ca', glg: 'gl',
+      oci: 'oc', lat: 'la', rus: 'ru', pol: 'pl', ukr: 'uk', ces: 'cs', slk: 'sk', bul: 'bg',
+      mkd: 'mk', srp: 'sr', hrv: 'hr', slv: 'sl', bel: 'be', lit: 'lt', lvs: 'lv', gle: 'ga',
+      bre: 'br', fin: 'fi', hun: 'hu', est: 'et', tur: 'tr', aze: 'az', kaz: 'kk', tat: 'tt',
+      uig: 'ug', tuk: 'tk', ara: 'ar', heb: 'he', pes: 'fa', hin: 'hi', urd: 'ur', ben: 'bn',
+      mar: 'mr', kmr: 'ku', asm: 'as', npi: 'ne', mal: 'ml', jpn: 'ja', cmn: 'zh', kor: 'ko',
+      vie: 'vi', tha: 'th', ind: 'id', zsm: 'ms', tgl: 'tl', jav: 'jv', khm: 'km', ell: 'el',
+      kat: 'ka', hye: 'hy', eus: 'eu', ava: 'av', swh: 'sw', hau: 'ha', run: 'rn', tir: 'ti',
+      epo: 'eo', ido: 'io', ina: 'ia', vol: 'vo',
+    };
+    // The reverse, for reading metadata. Macrolanguage and legacy tags land on
+    // the variety the models were trained on.
+    const LANG_FROM_TAG = { no: 'nob', nn: 'nob', iw: 'heb', in: 'ind', fa: 'pes', lv: 'lvs',
+      ms: 'zsm', ne: 'npi', sw: 'swh', zh: 'cmn', ji: 'yid' };
+    for (const c in LANG_639_1) if (!LANG_FROM_TAG[LANG_639_1[c]]) LANG_FROM_TAG[LANG_639_1[c]] = c;
+
+    function langTag(code) { return LANG_639_1[code] || code; }
+    function langOfTag(tag) {
+      const p = String(tag || '').trim().toLowerCase().split(/[-_]/)[0];
+      return LANG_FROM_TAG[p] || p;
+    }
+
+    // Evenly spaced stretches of running text. On a long book the first and
+    // last tenth are skipped: imprint, copyright page and the publisher's ads
+    // for the next volume are where a translation still carries its original
+    // language. Every stretch starts and ends at a space, so no word is cut.
+    //
+    // Positions are chosen on the markup and only the sections they land in
+    // are turned into text: flattening a whole novel cost 120 ms per book,
+    // four times the scoring itself.
+    function languageProbes(book, opts) {
+      opts = opts || {};
+      const size = opts.size || LANG_PROBE_CHARS;
+      const count = opts.count || LANG_PROBES;
+      const secs = book.sections || [];
+      const lens = secs.map(function (s) { return (s.html || '').length; });
+      const total = lens.reduce(function (a, b) { return a + b; }, 0);
+      const flat = function (s) { return htmlToText(s.html || '').replace(/\s+/g, ' ').trim(); };
+      const out = [];
+
+      // Word-aligned slice of at most `size` characters from position a.
+      function take(text, a) {
+        if (a > 0) {
+          const sp = text.indexOf(' ', a);
+          if (sp >= 0 && sp - a < 40) a = sp + 1;
+        }
+        let piece = text.slice(a, a + size);
+        const cut = piece.lastIndexOf(' ');
+        if (a + size < text.length && cut > size * 0.8) piece = piece.slice(0, cut);
+        if (piece.length >= 100) out.push(piece);
+      }
+
+      // Short book: all of it, cut into up to `count` stretches.
+      if (total < size * count * 6) {
+        const text = secs.map(flat).join(' ').trim();
+        if (text.length < 100) return out;
+        const n = Math.max(1, Math.min(count, Math.floor(text.length / size)));
+        const step = n > 1 ? (text.length - size) / (n - 1) : 0;
+        for (let i = 0; i < n; i++) take(text, Math.round(i * step));
+        return out;
+      }
+
+      const cache = new Map();
+      for (let i = 0; i < count; i++) {
+        let pos = total * (0.1 + 0.8 * (i + 0.5) / count);
+        let k = 0;
+        while (k < secs.length - 1 && pos >= lens[k]) { pos -= lens[k]; k++; }
+        if (!cache.has(k)) cache.set(k, flat(secs[k]));
+        let text = cache.get(k);
+        let a = Math.floor(text.length * (lens[k] ? pos / lens[k] : 0));
+        // A title page or a short chapter end: borrow from the sections after.
+        for (let j = k + 1; text.length - a < size && j < secs.length && j < k + 20; j++) {
+          text = text + ' ' + flat(secs[j]);
+        }
+        a = Math.max(0, Math.min(a, text.length - size));
+        take(text, a);
+      }
+      return out;
+    }
+
+    // One verdict per book: the most frequent guess over its probes. Guesses
+    // for a sibling the model is known to confuse with the winner (Danish and
+    // Norwegian, Czech and Slovak) count as agreement.
+    function bookLanguage(probes, classify, same) {
+      if (!probes.length) return null;
+      const votes = new Map();
+      for (const p of probes) {
+        const c = classify(p);
+        if (c) votes.set(c, (votes.get(c) || 0) + 1);
+      }
+      let code = '', top = 0;
+      votes.forEach(function (v, c) { if (v > top) { top = v; code = c; } });
+      if (!code) return null;
+      let agree = 0;
+      votes.forEach(function (v, c) { if (c === code || (same && same(c, code))) agree += v; });
+      return { code: code, share: agree / probes.length, probes: probes.length };
+    }
+
+    // books and names run in parallel. opts: { classify, same(a, b), name(code),
+    // language: the tag the merged book currently declares }.
+    // Returns { verdicts, groups, mixed, setLanguage, lines }: groups holds
+    // the books that could be told apart, largest group first; setLanguage is
+    // a tag when all books agree on a language the metadata does not name,
+    // '' otherwise; lines are log entries in makeLog's shape.
+    function languageReport(books, names, opts) {
+      const same = opts.same || function (a, b) { return a === b; };
+      const name = opts.name || function (c) { return c; };
+      const verdicts = books.map(function (b) {
+        return bookLanguage(languageProbes(b), opts.classify, same);
+      });
+      const groups = [];
+      const lines = [];
+      verdicts.forEach(function (v, i) {
+        if (!v) {
+          lines.push({ level: 'info', msg: 'Language of ' + names[i] + ' not checked: too little text.' });
+          return;
+        }
+        if (v.share < 0.5) {
+          lines.push({ level: 'info', msg: 'Language of ' + names[i] + ' unclear: no language in more than half of its samples.' });
+          return;
+        }
+        let g = groups.find(function (x) { return x.code === v.code || same(x.code, v.code); });
+        if (!g) { g = { code: v.code, books: [] }; groups.push(g); }
+        g.books.push(i);
+      });
+      groups.sort(function (a, b) { return b.books.length - a.books.length; });
+
+      const declared = String(opts.language || '').trim();
+      const mixed = groups.length > 1;
+      let setLanguage = '';
+      if (mixed) {
+        const parts = groups.map(function (g, gi) {
+          const who = gi === 0 && g.books.length > 2
+            ? g.books.length + ' books'
+            : g.books.map(function (i) { return names[i]; }).join(', ');
+          return name(g.code) + ': ' + who;
+        });
+        lines.push({ level: 'warn', msg: 'Mixed languages. ' + parts.join('; ') + '. The merged book declares one language ('
+          + (declared || 'none') + '), so hyphenation and read-aloud are wrong for the rest.' });
+      } else if (groups.length === 1) {
+        const g = groups[0];
+        const tag = langTag(g.code);
+        const all = g.books.length === books.length;
+        lines.push({ level: 'info', msg: (all ? 'All ' + books.length + ' books' : g.books.length + ' of ' + books.length + ' books')
+          + ' read as ' + name(g.code) + '.' });
+        const was = langOfTag(declared);
+        if (all && was !== g.code && !same(was, g.code)) {
+          setLanguage = tag;
+          lines.push({ level: 'info', msg: 'Language set to ' + tag + ', read from the text; the metadata said '
+            + (declared ? '"' + declared + '"' : 'nothing') + '.' });
+        }
+      }
+      return { verdicts: verdicts, groups: groups, mixed: mixed, setLanguage: setLanguage, lines: lines };
+    }
+
     // Read a pile of files into books, for merging. Same shape and the same
     // laziness as convertMany: bytes are fetched only when a file's turn comes.
     async function readMany(items, opts, onProgress) {
@@ -7631,6 +7801,8 @@
       buildTocFromHeadings: buildTocFromHeadings, tocFromSections: tocFromSections,
       tocRebuild: tocRebuild,
       mergeBooks: mergeBooks, mergeSeparatorId: MERGE_SEP_ID_PREFIX, seriesName: seriesName,
+      languageProbes: languageProbes, bookLanguage: bookLanguage, languageReport: languageReport,
+      langTag: langTag, langOfTag: langOfTag,
       rewriteCssUrls: rewriteCssUrls, readMany: readMany,
       drawCover: drawCover, setGeneratedCover: setGeneratedCover,
       removeGeneratedCover: removeGeneratedCover,
@@ -8883,6 +9055,69 @@
       return [dl, make, clear];
     }
 
+    // The Language Zipper's models, fetched the first time a merge needs them
+    // (about 2.5 MB) and kept for the visit. A failed load is forgotten, so
+    // the next merge tries again; until then the merge simply goes unchecked.
+    const LANG_INDEX_URL = '/assets/files/langzip/index-2026-07.json';
+    let langModels = null;
+
+    function loadLangModels() {
+      if (langModels) return langModels;
+      const core = window.NCDCore ? Promise.resolve() : new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = '/assets/js/ncd-core.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('ncd-core.js did not load'));
+        document.head.appendChild(s);
+      });
+      const get = (url, how) => fetch(url).then((r) => {
+        if (!r.ok) throw new Error(url + ': http ' + r.status);
+        return r[how]();
+      });
+      langModels = core.then(() => get(LANG_INDEX_URL, 'json')).then((ix) =>
+        get(ix.modelsUrl, 'arrayBuffer').then((buf) => {
+          const N = window.NCDCore;
+          const bin = new Uint8Array(buf);
+          const models = ix.langs.map((l, i) => ({
+            code: l.code,
+            flat: N.deserialize(bin.subarray(ix.modelOffsets[i][0], ix.modelOffsets[i][1]), ix.order),
+          }));
+          const info = {};
+          for (const l of ix.langs) info[l.code] = l;
+          const confuses = (a, b) => !!(info[a] && info[a].confusable && info[a].confusable.indexOf(b) >= 0);
+          return {
+            classify: (text) => N.scoreAll(models, text).ranked[0].code,
+            same: (a, b) => a === b || confuses(a, b) || confuses(b, a),
+            name: (c) => (info[c] ? info[c].name.en : c),
+          };
+        }));
+      langModels.catch(() => { langModels = null; });
+      return langModels;
+    }
+
+    // The Language row of a merged book's card. The log carries the details
+    // (which file, what the metadata said); this is the one-line verdict.
+    function langSummary(lc) {
+      if (lc.phase === 'running') {
+        return html`<span style=${{ color: 'var(--tool-note)' }}>checking…</span>`;
+      }
+      if (lc.phase === 'failed') {
+        return html`<span style=${{ color: 'var(--tool-note)' }}>not checked, the language models did not load</span>`;
+      }
+      const r = lc.report;
+      const books = (n) => n + ' book' + (n === 1 ? '' : 's');
+      const unknown = r.verdicts.length - r.groups.reduce((n, g) => n + g.books.length, 0);
+      const rest = unknown ? ', ' + books(unknown) + ' unclear' : '';
+      if (r.mixed) {
+        return html`<span style=${{ color: 'var(--tool-warn-text)' }}>
+          Mixed: ${r.groups.map((g) => lc.name(g.code) + ' (' + books(g.books.length) + ')').join(', ')}${rest}. Details in the log below.
+        </span>`;
+      }
+      if (!r.groups.length) return 'not determined, too little text';
+      return lc.name(r.groups[0].code) + rest
+        + (r.setLanguage ? ' (metadata corrected to ' + r.setLanguage + ')' : '');
+    }
+
     function App() {
       const [book, setBook] = useState(null);
       const [fileName, setFileName] = useState('');
@@ -8915,6 +9150,12 @@
       // Set when a book was merged rather than loaded, so the download is not
       // named after a file that does not exist.
       const [mergedFrom, setMergedFrom] = useState(0);
+      // The language check that follows a merge: null, { phase: 'running' },
+      // { phase: 'failed' } or { phase: 'done', report }. It runs after the
+      // merged book is already on screen, so the counter lets a reset or a new
+      // file discard a check that is still on its way.
+      const [langCheck, setLangCheck] = useState(null);
+      const langRun = useRef(0);
       const [bopts, setBopts] = useState({
         query: '', replacement: '', regex: false, matchCase: false, wholeWord: true, typo: '',
         // On by default: a broken cover is a defect, not a preference, and the
@@ -8947,6 +9188,7 @@
         setBook(null); setLog([]); setError(''); clearResult();
         setFileName(''); setFileSize(0); setBatch(null); setSrcBytes(null);
         setMergeMode('each'); setMergeOpts({ separators: true }); setMergedFrom(0);
+        langRun.current += 1; setLangCheck(null);
         // The tab row is only rendered once a book is loaded; whoever drops a
         // new file while on Preview must land on a tab that shows it.
         setTab('convert');
@@ -9107,6 +9349,33 @@
         clearResult();
       };
 
+      // After a merge: does every source read as the same language? The
+      // verdict goes into the log and the Language row of the book card. If
+      // the books agree on a language their metadata does not name (a German
+      // series tagged "en", or untagged and defaulted to it), the merged book
+      // takes the language of its text.
+      const checkLanguages = (books, names, declared) => {
+        const run = ++langRun.current;
+        setLangCheck({ phase: 'running' });
+        loadLangModels()
+          .then((lm) => {
+            if (langRun.current !== run) return;
+            const report = Core.languageReport(books, names, {
+              classify: lm.classify, same: lm.same, name: lm.name, language: declared,
+            });
+            setLangCheck({ phase: 'done', report: report, name: lm.name });
+            setLog((l) => l.concat(report.lines));
+            if (report.setLanguage) {
+              setBook((b) => b && Object.assign({}, b,
+                { meta: Object.assign({}, b.meta, { language: report.setLanguage }) }));
+              clearResult();
+            }
+          })
+          .catch(() => {
+            if (langRun.current === run) setLangCheck({ phase: 'failed' });
+          });
+      };
+
       // Read every file, merge, and hand the result to the single-book flow.
       // From setBook on, nothing downstream knows this book had five sources.
       const runMerge = () => {
@@ -9165,6 +9434,8 @@
             setBatch(null);
             setMergeMode('each');
             setTab('convert');
+            checkLanguages(out.books, out.results.filter((r) => r.ok).map((r) => r.name),
+              merged.meta.language);
           })
           .catch((e) => {
             setError(e && e.message ? e.message : String(e));
@@ -9420,6 +9691,7 @@
                 ${mergedFrom ? html`<${React.Fragment}>
                   <dt>Source</dt>
                   <dd>Merged from ${mergedFrom} books (${fmtSize(fileSize)})</dd>
+                  ${langCheck ? html`<dt>Language</dt><dd>${langSummary(langCheck)}</dd>` : null}
                 <//>` : html`<${React.Fragment}>
                   <dt>File</dt><dd>${fileName} (${fmtSize(fileSize)})</dd>
                   <dt>Detected</dt>
