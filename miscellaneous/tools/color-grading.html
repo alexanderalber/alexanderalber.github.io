@@ -768,11 +768,22 @@
        was white. Having both is not a duplicate, it is the difference between
        correcting the light and grading the picture.
 
-       Kelvin to chromaticity: the CIE daylight locus above 4000 K, Planck via
-       Kim et al. below it, which is the usual pairing and matches what cameras
-       label. Tint moves perpendicular to that locus, in the green-magenta
-       direction, with the same sign convention as everywhere else: positive is
-       green. */
+       Kelvin to chromaticity: the Planckian locus, via the cubic fits of Kim
+       et al. (2002), over its whole range. Not the daylight locus: tint 0 is
+       the black body, which is the convention of the DNG specification and of
+       Lightroom, and the one in which a temperature is defined at all. Real
+       daylight sits slightly on the green side of it (D65 at +9.5), see
+       daylightTint.
+
+       Temperature and tint are measured in the CIE 1960 uv plane, where
+       correlated colour temperature is defined: the temperature of a light is
+       the nearest point on the locus THERE, and its tint is the signed
+       distance from that point, Duv. Measuring in xy instead looks equivalent
+       and is not; it read this camera's balances 150 to 310 K too low. Tint is
+       Duv times 3000, the scale Lightroom uses, so a number here is a number
+       there, with the sign of this tool: positive is green. */
+    var TINT_SCALE = 3000;
+
     function kelvinToXy(k) {
       var t = Math.min(25000, Math.max(1667, k));
       var x, y;
@@ -791,32 +802,94 @@
       return [x, y];
     }
 
+    function xyToUv(x, y) {
+      var d = -2 * x + 12 * y + 3;
+      return [4 * x / d, 6 * y / d];
+    }
+
+    function uvToXy(u, v) {
+      var d = 2 * u - 8 * v + 4;
+      return [3 * u / d, 2 * v / d];
+    }
+
+    function locusUv(k) {
+      var xy = kelvinToXy(k);
+      return xyToUv(xy[0], xy[1]);
+    }
+
+    /* Unit normal to the locus in uv at k, pointing to the green side (larger
+       v). Taken from the locus itself by finite difference, which keeps it
+       right at every temperature instead of only in the middle. */
+    function locusNormal(k) {
+      var d = Math.max(1, k * 0.002);
+      var p0 = locusUv(k - d), p1 = locusUv(k + d);
+      var tu = p1[0] - p0[0], tv = p1[1] - p0[1];
+      var len = Math.hypot(tu, tv) || 1;
+      var nu = -tv / len, nv = tu / len;
+      return nv < 0 ? [-nu, -nv] : [nu, nv];
+    }
+
+    /* Chromaticity to { kelvin, tint }: nearest point on the locus in uv, by
+       scan and then refinement (the distance along the curve is not a nice
+       function of kelvin, so this is more robust than a derivative method),
+       then the signed offset along the normal. */
+    function xyToTempTint(x, y) {
+      var p = xyToUv(x, y);
+      var dist2 = function (k) {
+        var q = locusUv(k);
+        return (q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]);
+      };
+      var best = 5500, bestD = Infinity, k, d;
+      for (k = 1667; k <= 25000; k += k < 6000 ? 25 : 100) {
+        d = dist2(k);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      var step = best < 6000 ? 25 : 100;
+      for (var pass = 0; pass < 6; pass++) {
+        step /= 4;
+        for (var s = -4; s <= 4; s++) {
+          k = Math.min(25000, Math.max(1667, best + s * step));
+          d = dist2(k);
+          if (d < bestD) { bestD = d; best = k; }
+        }
+      }
+      var q = locusUv(best), n = locusNormal(best);
+      var duv = (p[0] - q[0]) * n[0] + (p[1] - q[1]) * n[1];
+      return { kelvin: best, tint: duv * TINT_SCALE };
+    }
+
+    /* Where daylight of temperature k sits on the tint axis: the CIE daylight
+       locus (CIE 15, defined from 4000 to 25000 K) measured against the black
+       body. About +8 at 4000 K and +9 to +10 from 5000 K up (D65: +9.5), so
+       a camera balance for sun
+       or open shade reads slightly green here by construction, not by error.
+       Below 4000 K there is no daylight phase to compare with, and the light
+       there is incandescent anyway, which IS a black body: null. */
+    function daylightTint(k) {
+      if (!(k >= 4000 && k <= 25000)) return null;
+      var x = k <= 7000
+        ? -4.6070e9 / (k*k*k) + 2.9678e6 / (k*k) + 0.09911e3 / k + 0.244063
+        : -2.0064e9 / (k*k*k) + 1.9018e6 / (k*k) + 0.24748e3 / k + 0.237040;
+      var y = -3 * x * x + 2.87 * x - 0.275;
+      return xyToTempTint(x, y).tint;
+    }
+
     /* The multipliers that make a light of this temperature come out neutral.
        Green is pinned to 1, the same convention estimateWhiteBalance uses, so
        the three sources of a white balance in this tool are interchangeable. */
     function whiteBalanceFromKelvin(kelvin, tint, camXyz) {
-      var xy = kelvinToXy(kelvin);
-      var x = xy[0], y = Math.max(1e-6, xy[1]);
-      /* Tint moves PERPENDICULAR to the locus, not straight up in y. The
-         difference matters: a vertical shift also changes the temperature a
-         little, so the two controls would fight each other and the readout
-         could not take a balance apart into a temperature and a tint again.
-         The normal is taken from the locus itself by finite difference, which
-         keeps it right at every temperature instead of only in the middle.
-         The scale is chosen so +/-100 spans about what a camera offers. */
+      var k = Math.min(25000, Math.max(1667, kelvin));
+      var p = locusUv(k);
+      /* Tint moves PERPENDICULAR to the locus in uv, not straight up in y. A
+         vertical shift would also change the temperature a little, so the two
+         controls would fight each other and the readout could not take a
+         balance apart into a temperature and a tint again. */
       if (tint) {
-        var d = Math.max(1, kelvin * 0.002);
-        var p0 = kelvinToXy(kelvin - d), p1 = kelvinToXy(kelvin + d);
-        var tx = p1[0] - p0[0], ty = p1[1] - p0[1];
-        var len = Math.hypot(tx, ty) || 1;
-        /* rotate the tangent by 90 degrees; the sign is fixed so positive tint
-           is green, the same direction the grading tab uses */
-        var nx = -ty / len, ny = tx / len;
-        if (ny < 0) { nx = -nx; ny = -ny; }
-        x = x + nx * tint * 0.00025;
-        y = y + ny * tint * 0.00025;
+        var n = locusNormal(k);
+        p = [p[0] + n[0] * tint / TINT_SCALE, p[1] + n[1] * tint / TINT_SCALE];
       }
-      y = Math.max(1e-6, y);
+      var xy = uvToXy(p[0], p[1]);
+      var x = xy[0], y = Math.max(1e-6, xy[1]);
       var X = x / y, Y = 1, Z = (1 - x - y) / y;
       var m = camXyz || CAM_XYZ_ILCE;
       /* camera response to that illuminant */
@@ -832,28 +905,17 @@
     }
 
     /* The inverse, for showing the temperature of a balance that came from the
-       pipette or the estimator. Solved by bisection over the locus rather than
-       in closed form: the forward direction is the one that has to be exact,
-       this only has to land on the same number the slider would show, and the
-       locus is monotone in the red-to-blue ratio so bisection is reliable.
+       camera, the pipette or the estimator.
 
-       Tint is then whatever is left over once the temperature is chosen: the
-       residual green-magenta error against the pure black-body balance. */
+       Undo the camera matrix to get back to the illuminant this balance
+       assumes, then decompose THERE. Going through channel ratios instead
+       looks simpler and is wrong: temperature and tint both move the ratios,
+       so a search on one of them absorbs part of the other and the two
+       controls drift whenever the readout writes back. In uv the split is
+       what it claims to be, the nearest point on the locus and the
+       perpendicular distance to it. */
     function kelvinFromWhiteBalance(mul, camXyz) {
-      if (!mul || !(mul[0] > 0) || !(mul[2] > 0)) return null;
-      var target = mul[0] / mul[2];
-      var lo = 1667, hi = 25000;
-      var at = function (k) {
-        var w = whiteBalanceFromKelvin(k, 0, camXyz);
-        return w ? w[0] / w[2] : null;
-      };
-      /* Undo the camera matrix to get back to the illuminant this balance
-         assumes, then decompose THERE. Going through channel ratios instead
-         looks simpler and is wrong: temperature and tint both move the ratios,
-         so a bisection on one of them absorbs part of the other and the two
-         controls drift whenever the readout writes back. On the xy plane the
-         split is what it claims to be, the nearest point on the locus and the
-         perpendicular distance to it. */
+      if (!mul || !(mul[0] > 0) || !(mul[1] > 0) || !(mul[2] > 0)) return null;
       var m = camXyz || CAM_XYZ_ILCE;
       /* cam = M * XYZ and mul = g/cam componentwise, so cam is 1/mul up to a
          scale, and XYZ follows by inverting M */
@@ -865,40 +927,10 @@
       var Z = inv[2][0]*cam[0] + inv[2][1]*cam[1] + inv[2][2]*cam[2];
       var sum = X + Y + Z;
       if (!(sum > 0)) return null;
-      var px = X / sum, py = Y / sum;
-
-      /* nearest point on the locus, by scan and then refinement; the locus is
-         a curve in the plane and the distance along it is not a nice function
-         of kelvin, so this is more robust than a derivative method */
-      var best = 5500, bestD = Infinity, k, d, q;
-      for (k = 1667; k <= 25000; k += k < 6000 ? 25 : 100) {
-        q = kelvinToXy(k);
-        d = (q[0] - px) * (q[0] - px) + (q[1] - py) * (q[1] - py);
-        if (d < bestD) { bestD = d; best = k; }
-      }
-      var step = best < 6000 ? 25 : 100;
-      for (var pass = 0; pass < 6; pass++) {
-        step /= 4;
-        for (var s = -4; s <= 4; s++) {
-          k = Math.min(25000, Math.max(1667, best + s * step));
-          q = kelvinToXy(k);
-          d = (q[0] - px) * (q[0] - px) + (q[1] - py) * (q[1] - py);
-          if (d < bestD) { bestD = d; best = k; }
-        }
-      }
-
-      /* the signed perpendicular offset, in the same units the control uses */
-      var dk = Math.max(1, best * 0.002);
-      var p0 = kelvinToXy(best - dk), p1 = kelvinToXy(best + dk);
-      var tx = p1[0] - p0[0], ty = p1[1] - p0[1];
-      var len = Math.hypot(tx, ty) || 1;
-      var nx = -ty / len, ny = tx / len;
-      if (ny < 0) { nx = -nx; ny = -ny; }
-      var onLocus = kelvinToXy(best);
-      var tint = ((px - onLocus[0]) * nx + (py - onLocus[1]) * ny) / 0.00025;
+      var r = xyToTempTint(X / sum, Y / sum);
       return {
-        kelvin: Math.round(best),
-        tint: Math.max(-100, Math.min(100, tint))
+        kelvin: Math.round(r.kelvin),
+        tint: Math.max(-100, Math.min(100, r.tint))
       };
     }
 
@@ -1120,6 +1152,7 @@
       normaliseGain: normaliseGain,
       kelvinToXy: kelvinToXy, whiteBalanceFromKelvin: whiteBalanceFromKelvin,
       kelvinFromWhiteBalance: kelvinFromWhiteBalance,
+      xyToTempTint: xyToTempTint, daylightTint: daylightTint, TINT_SCALE: TINT_SCALE,
       applyColor: applyColor, applyOrientation: applyOrientation,
       toneMap: toneMap, encodeRGBA: encodeRGBA, clipStats: clipStats,
       developARW: developARW,
@@ -3517,6 +3550,7 @@
         () => (wb ? AC.kelvinFromWhiteBalance(wb, AC.CAM_XYZ_ILCE) : null), [wb]);
       const kelvin = wbRead ? wbRead.kelvin : 5500;
       const tintVal = wbRead ? wbRead.tint : 0;
+      const fmtTint = (v) => (v > 0 ? '+' : '') + Math.round(v);
       /* One handler for both sliders: whichever one moved keeps its new value
          and the other keeps the value it is currently displaying. */
       const setKelvinTint = (which) => (v) => {
@@ -4042,7 +4076,19 @@
                   grey.</p>
                 <p>Temperature and tint are computed from the camera matrix and a black-body
                   spectrum, so 5500 K means what it means on a camera dial. Tint moves
-                  perpendicular to the daylight curve, green against magenta.</p>
+                  perpendicular to the black-body curve, green against magenta, on the same
+                  scale as Lightroom's but with the sign the other way round: plus is green.</p>
+                <p><strong>Tint 0 is the black body<//> (Planck), the light of a glowing
+                  filament. <strong>Daylight is not on it<//>: sun and sky sit slightly on the
+                  green side, at about +8 at 4000 K and +9 to +10 from 5000 K up.
+                  ${AC.daylightTint(kelvin) != null
+                    ? 'At the current ' + Math.round(kelvin) + ' K, daylight is at '
+                      + fmtTint(AC.daylightTint(kelvin)) + '.'
+                    : 'Below 4000 K there is no daylight to compare with; light that warm is a lamp, and a lamp is on the black-body curve, at 0.'}
+                  So a camera balance for an outdoor shot reading about +10 is not a green cast,
+                  it is daylight. Anything well beyond that, to either side, is the light itself
+                  (foliage, fluorescent tubes) or the camera disagreeing with this tool's color
+                  matrix.</p>
                 <p>The grading tab has its own temperature and tint. Those are a different thing on
                   purpose: they act on an already developed picture in perceptual space, which is
                   the right tool for a look. These act on the sensor data before the color matrix,
@@ -4057,7 +4103,7 @@
                 fmt=${(v) => Math.round(v) + ' K'} onChange=${setKelvinTint(null)}
                 onReset=${() => (wbShot || wbAuto) && setWb(wbShot || wbAuto)}/>
               <${Slider} label="Tint" value=${tintVal} min="-100" max="100" step="1"
-                fmt=${(v) => (v > 0 ? '+' : '') + Math.round(v)} onChange=${setKelvinTint('tint')}
+                fmt=${fmtTint} onChange=${setKelvinTint('tint')}
                 onReset=${() => (wbShot || wbAuto) && setWb(wbShot || wbAuto)}/>
               <div className="cg-wbrow" style=${{ marginTop: 10 }}>
                 <button className=${'tool-btn tool-btn-sm' + (wbPick ? ' cg-armed' : '')}
