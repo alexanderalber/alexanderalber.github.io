@@ -226,7 +226,7 @@
           <li>Hue targets, for when a correction is not enough: name the color you have and the color you want, and that part of the hue circle is rotated onto the target. The curves above reach 60 degrees, which is the right range for correcting a sky or a skin tone but cannot turn blue into red; a target can. Selection is by hue window with a soft edge and a saturation floor, so nearly grey pixels, whose hue is only rounding noise, keep out of it. Optionally the target's saturation and brightness come along too.</li>
           <li>Load a palette from the Color Extractor and pull the image toward it, softly, in one of four ways: by shifting the overall color statistics, by nudging each pixel toward its nearest palette colors, by optimal transport of the whole color distribution, or by remapping the image's own main colors onto the palette. A strength slider blends, a distance readout quantifies how far the image still is from the palette.</li>
           <li>Live RGB histogram, luma waveform and vectorscope; the vectorscope marks the palette targets as rings, so you can watch the image move onto them.</li>
-          <li>A raw intake tab that reads a Sony ARW and develops it in the browser: black and white point, the camera matrix, white balance with a pipette, exposure, and a toggle between the plain sRGB transfer function and a film curve that rolls highlights off instead of cutting them. It shows what is actually in the file, including the linearization curve and the white point read from it, and says plainly that these files carry no white balance of their own, so that setting is a decision and not a reading.</li>
+          <li>A raw intake tab that reads a Sony ARW and develops it in the browser: black and white point, the camera matrix, white balance with a pipette, exposure, and a toggle between the plain sRGB transfer function and a film curve that rolls highlights off instead of cutting them. It shows what is actually in the file, including the linearization curve and the white point read from it, and reads the camera's own white balance out of the enciphered maker note, where Sony hides it, with an estimate from the image and a pipette one click away.</li>
           <li>Export the result as PNG or JPEG at full resolution, or download the whole grade as a .cube 3D LUT for DaVinci Resolve, OBS or ffmpeg.</li>
         </ul>
       </div></div>
@@ -352,10 +352,10 @@
 
       /* Shooting data, for the metadata panel. All optional: the panel shows
          what is there and stays quiet about the rest, it never invents a value. */
-      var exif = null;
+      var exif = null, ex = null;
       var exifTag = ifd0.tags[0x8769];
       if (exifTag) {
-        var ex = readIFD(buf, tagNum(buf, exifTag, 0));
+        ex = readIFD(buf, tagNum(buf, exifTag, 0));
         if (ex) {
           var E = ex.tags;
           exif = {
@@ -370,8 +370,15 @@
         }
       }
 
+      /* The white balance the camera chose. Optional like the rest of the
+         metadata: a maker note this reader does not understand costs the
+         reading, never the file. */
+      var asShot = null;
+      try { asShot = readAsShotWhiteBalance(buf, T, ex ? ex.tags : null, model); }
+      catch (e) { asShot = null; }
+
       return {
-        make: make, model: model, orientation: orientation,
+        make: make, model: model, orientation: orientation, asShot: asShot,
         width: width, height: height, bps: bps, compression: compression,
         stripOffset: stripOffset, stripBytes: stripBytes, bytesPerRow: bytesPerRow,
         curvePoints: curvePoints, cfa: cfa, exif: exif,
@@ -393,6 +400,103 @@
         activeHeight: height,
         preview: (jpegOff && jpegLen) ? { offset: jpegOff, length: jpegLen } : null
       };
+    }
+
+    /* ---------- as-shot white balance ------------------------------------- */
+
+    /* The camera does record its white balance, just not where one would look
+       first. Newer bodies (about 2017 on) write it in plain form into the raw
+       IFD as tag 0x7313, R G G B levels. Older ones, the ILCE-5100 among them,
+       write it only into the maker note's tag 0x2010, whose bytes go through a
+       simple substitution: every byte p below 249 is stored as p^3 mod 249 (a
+       bijection, because 3 is coprime to 164 = phi(249)), and 249..255 are
+       stored unchanged. Inside the deciphered block, WB_RGBLevels are three
+       16-bit gains, R G B, at an offset that depends on the body.
+
+       Ported from LightCraft (github.com/storytold/lightcraft,
+       crates/raw/src/vendor/arw.rs, MIT OR Apache-2.0), which recovered the
+       substitution black-box on CC0 samples and took the layouts and model
+       lists from the ExifTool Sony tag documentation. Checked here against the
+       owner's ILCE-5100 frames, where it reads about 2.7 / 1 / 1.6, a daylight
+       balance, consistent across a series shot in the same light. */
+    var DECIPHER = (function () {
+      var inv = new Uint8Array(256);
+      for (var p = 0; p < 256; p++) inv[p < 249 ? p * p % 249 * p % 249 : p] = p;
+      return inv;
+    })();
+
+    /* [models, byte offset of WB_RGBLevels in the deciphered Tag2010 block] */
+    var TAG2010_WB = [
+      [['NEX-5N'], 4476],
+      [['SLT-A65', 'SLT-A77', 'NEX-7', 'NEX-VG20E'], 4480],
+      [['SLT-A37', 'SLT-A57', 'NEX-F3'], 4444],
+      [['DSC-HX10V', 'DSC-HX20V', 'DSC-HX200V', 'DSC-TX66', 'DSC-TX200V', 'DSC-TX300V',
+        'DSC-WX50', 'DSC-WX100', 'DSC-WX150'], 4568],
+      [['SLT-A58', 'SLT-A99', 'ILCE-3000', 'ILCE-3500', 'NEX-3N', 'NEX-5R', 'NEX-5T', 'NEX-6',
+        'NEX-VG30E', 'NEX-VG900', 'DSC-RX100', 'DSC-RX1', 'DSC-RX1R', 'DSC-HX300', 'DSC-HX50V',
+        'DSC-TX30', 'DSC-WX60', 'DSC-WX200', 'DSC-WX300'], 4532],
+      [['DSC-RX100M2', 'DSC-QX10', 'DSC-QX100'], 4204],
+      [['DSC-HX60V', 'DSC-HX350', 'DSC-HX400V', 'DSC-QX30', 'DSC-RX10', 'DSC-RX100M3',
+        'DSC-WX220', 'DSC-WX350', 'ILCE-7', 'ILCE-7R', 'ILCE-7S', 'ILCE-7M2', 'ILCE-5000',
+        'ILCE-5100', 'ILCE-6000', 'ILCE-QX1', 'ILCA-68', 'ILCA-77M2', 'DSC-HX80', 'DSC-HX90V',
+        'DSC-RX0', 'DSC-RX1RM2', 'DSC-RX10M2', 'DSC-RX10M3', 'DSC-RX100M4', 'DSC-RX100M5',
+        'DSC-WX500', 'ILCE-6300', 'ILCE-6500', 'ILCE-7RM2', 'ILCE-7SM2', 'ILCA-99M2'], 612],
+      [['ILCE-6100', 'ILCE-6400', 'ILCE-6600', 'ILCE-7C', 'ILCE-7M3', 'ILCE-7RM3', 'ILCE-7RM4',
+        'ILCE-9', 'ILCE-9M2', 'DSC-RX0M2', 'DSC-RX10M4', 'DSC-RX100M6', 'DSC-RX100M5A',
+        'DSC-RX100M7', 'DSC-HX99'], 594]
+    ];
+
+    /* Levels to multipliers in this tool's convention, green pinned to 1.
+       Implausible values are refused rather than passed on: they mean a layout
+       this table has wrong, and a wrong white balance presented as the
+       camera's is worse than none. */
+    function levelsToMul(r, g, b) {
+      if (!(g >= 16 && g <= 16384)) return null;
+      var mr = r / g, mb = b / g;
+      if (!(mr >= 0.2 && mr <= 8) || !(mb >= 0.2 && mb <= 8)) return null;
+      return [mr, 1, mb];
+    }
+
+    /* Sony appends a regional "V" to some names (SLT-A77V), which the
+       documented lists omit. */
+    function tag2010Offset(model) {
+      var m = (model || '').trim();
+      var bare = m.charAt(m.length - 1) === 'V' ? m.slice(0, -1) : null;
+      for (var i = 0; i < TAG2010_WB.length; i++) {
+        var list = TAG2010_WB[i][0];
+        if (list.indexOf(m) >= 0 || (bare && list.indexOf(bare) >= 0)) return TAG2010_WB[i][1];
+      }
+      return -1;
+    }
+
+    /* Deciphered WB_RGBLevels from a Tag2010 block, or null. */
+    function tag2010WhiteBalance(block, model) {
+      var off = tag2010Offset(model);
+      if (off < 0 || off + 6 > block.length) return null;
+      var b = [0, 1, 2, 3, 4, 5].map(function (k) { return DECIPHER[block[off + k]]; });
+      return levelsToMul(b[0] | b[1] << 8, b[2] | b[3] << 8, b[4] | b[5] << 8);
+    }
+
+    /* Returns { mul, source } or null. sub is the raw IFD's tags, exifTags
+       the Exif IFD's. The maker note starts either with a 12-byte "SONY DSC "
+       header or directly with its IFD; its offsets count from the start of the
+       file either way. */
+    function readAsShotWhiteBalance(buf, sub, exifTags, model) {
+      var t = sub[0x7313];
+      if (t && t.count === 4) {
+        var lv = [0, 1, 2, 3].map(function (k) { return tagNum(buf, t, k); });
+        var plain = levelsToMul(lv[0], (lv[1] + lv[2]) / 2, lv[3]);
+        if (plain) return { mul: plain, source: 'raw IFD tag 0x7313' };
+      }
+      var mn = exifTags && exifTags[0x927c];
+      if (!mn || mn.bytes < 16) return null;
+      var sony = buf.getUint32(mn.vo, false) === 0x534f4e59;           /* "SONY" */
+      var note = readIFD(buf, sony ? mn.vo + 12 : mn.vo);
+      var blk = note && note.tags[0x2010];
+      if (!blk || blk.vo + blk.bytes > buf.byteLength) return null;
+      var block = new Uint8Array(buf.buffer, buf.byteOffset + blk.vo, blk.bytes);
+      var mul = tag2010WhiteBalance(block, model);
+      return mul ? { mul: mul, source: 'maker note tag 0x2010' } : null;
     }
 
     /* ---------- linearisation curve ---------------------------------------- */
@@ -607,13 +711,12 @@
       ];
     }
 
-    /* White balance estimated from the image itself. This is a DEFAULT, not a
-       reading. These files carry no white balance of their own, because Sony's
-       encrypted SR2 block, where dcraw reads tag 0x7313, is absent from every
-       one of them: no 0x7200, no 0x7303, no 0x7313, in any IFD. The decrypter
-       was ported and checked; there is simply nothing there. That is not a
-       defect but the point of the format, so white balance is a CONTROL here
-       and this function only supplies its starting position.
+    /* White balance estimated from the image itself. This is an ALTERNATIVE to
+       the camera's own balance, not a reading. The camera's balance is not in
+       the plain tags (no 0x7303 or 0x7313 in any IFD of these files) but in the
+       enciphered maker note, see readAsShotWhiteBalance; this estimate is the
+       starting position only when that cannot be read, and otherwise a second
+       opinion one button away.
 
        Runs on camera RGB, before any correction, where an uncorrected frame is
        strongly green (the green photosites collect roughly twice what red
@@ -800,9 +903,9 @@
     }
 
     /* White balance from one spot the user clicked: whatever makes that spot
-       neutral. The pipette is the honest control for a file that carries no
-       white balance of its own, because it states an assumption ("this was
-       grey") instead of hiding one. Takes camera RGB, so it has to be read
+       neutral. The pipette states an assumption ("this was grey") instead of
+       hiding one, so it is the honest override when the camera's balance is
+       wrong. Takes camera RGB, so it has to be read
        before applyColor. */
     function whiteBalanceFromPatch(r, g, b) {
       if (!(r > 0) || !(g > 0) || !(b > 0)) return null;
@@ -1010,6 +1113,7 @@
 
     return {
       parseARW: parseARW, buildCurve: buildCurve, decodeBlock: decodeBlock,
+      tag2010WhiteBalance: tag2010WhiteBalance, DECIPHER: DECIPHER,
       decodeARW2: decodeARW2, demosaic: demosaic, previewFromRaw: previewFromRaw,
       camToSrgbMatrix: camToSrgbMatrix, estimateWhiteBalance: estimateWhiteBalance,
       whiteBalanceFromPatch: whiteBalanceFromPatch,
@@ -2945,7 +3049,8 @@
       const [tone, setTone] = useState('neutral');
       const [rawExp, setRawExp] = useState(0);
       const [wb, setWb] = useState(null);             // camera-RGB multipliers
-      const [wbAuto, setWbAuto] = useState(null);     // the estimate, for "reset to auto"
+      const [wbAuto, setWbAuto] = useState(null);     // the estimate from the image
+      const [wbShot, setWbShot] = useState(null);     // the camera's own balance, if readable
       const [wbPick, setWbPick] = useState(false);
       const [openPop, setOpenPop] = useState(null);
       const [clip, setClip] = useState(null);
@@ -3349,18 +3454,22 @@
         await yieldUI();
         /* The estimate runs on the preview, not the full frame: it is a
            starting position for a control, and a twentieth of the pixels
-           settles it to more precision than the control has anyway. */
+           settles it to more precision than the control has anyway. The
+           camera's own balance wins when the file has one: on a series shot in
+           one light it stays put from frame to frame, where the estimate
+           follows whatever happens to be bright and near grey in each. */
         const est = AC.estimateWhiteBalance(prev);
+        const shot = meta.asShot ? meta.asShot.mul : null;
         const oriented = meta.orientation >= 5;
         rawRef.current = { plane, prev, meta, step };
-        setWb(est.mul); setWbAuto(est.mul);
+        setWb(shot || est.mul); setWbAuto(est.mul); setWbShot(shot);
         setRaw({
           name: file.name || 'raw', meta, step,
           w: oriented ? prev.height : prev.width,
           h: oriented ? prev.width : prev.height,
           fw: oriented ? meta.activeHeight : meta.activeWidth,
           fh: oriented ? meta.activeWidth : meta.activeHeight,
-          wbFallback: est.fallback
+          wbFallback: !shot && est.fallback
         });
         setRawBusy(null);
         setTab('raw');
@@ -3417,10 +3526,10 @@
         if (mul) setWb(mul);
       };
 
-      /* White balance from a click: whatever makes that spot neutral. The
-         honest control for a file that carries no white balance of its own,
-         because it states an assumption ("this was grey") instead of hiding
-         one. Reads the stored camera RGB, so it has to undo the orientation
+      /* White balance from a click: whatever makes that spot neutral. It
+         states an assumption ("this was grey") instead of hiding one, which is
+         what makes it the right override when the camera guessed wrong. Reads
+         the stored camera RGB, so it has to undo the orientation
          rather than sample the canvas, which is already corrected. */
       function pickWb(e) {
         if (!wbPick || !rawRef.current || !raw) return;
@@ -3850,12 +3959,14 @@
                   decisions that a camera normally makes for you, silently. This tab makes them
                   visible: black and white point, the color matrix, the white balance, the exposure,
                   and the curve that maps the result onto a screen.</p>
-                <p>The white balance is a control here rather than a reading, and that is worth
-                  saying plainly: these files carry none. Sony normally writes it into an encrypted
-                  block, and it is absent from every frame this was built against, so the camera
-                  fixed nothing. What you get on load is an estimate from the image itself, on the
-                  assumption that the brightest near-neutral areas were meant to be neutral. The
-                  pipette is the honest alternative, since clicking a spot states an assumption
+                <p>The white balance on load is the camera's own. Sony does not write it into the
+                  usual tags but into an enciphered block of the maker note, and the tab reads it
+                  from there. That is still a decision, just one the camera made for you, and it is
+                  a control here, not a fixed fact. If the file has no balance this tab can read,
+                  the starting point is an estimate from the image itself, on the assumption that
+                  the brightest near-neutral areas were meant to be neutral; the same estimate is
+                  one button away in any case. The pipette is the third option, since clicking a
+                  spot states an assumption
                   instead of hiding one.</p>
                 <p>The curve toggle is where floating point becomes eight bits, which is the moment
                   the highlight headroom is either kept or thrown away. Neutral applies the sRGB
@@ -3921,14 +4032,14 @@
 
             <div className="ctl-sec">
               ${rawHead('wb', 'White balance', html`
-                <p>A setting here, not a reading. These files carry no white balance of their own:
-                  Sony normally writes it into an encrypted block, and it is absent from every frame
-                  this was built against, so the camera fixed nothing. That is not a defect, it is
-                  the point of the format.</p>
-                <p>What you get on load is an estimate from the image itself, on the assumption that
-                  the brightest near-neutral areas were meant to be neutral. The pipette is the
-                  honest alternative, since clicking a spot states an assumption instead of hiding
-                  one.</p>
+                <p>What you get on load is the camera's own white balance, read from an enciphered
+                  block of Sony's maker note, since the camera does not write it into the usual
+                  tags. It is a starting point like any other, not a measurement of the light.</p>
+                <p><strong>As shot<//> goes back to it. <strong>Estimate<//> takes the balance from
+                  the image instead, on the assumption that the brightest near-neutral areas were
+                  meant to be neutral; for a file whose balance cannot be read, that is what you
+                  start with. The pipette states an assumption of its own: click a spot that was
+                  grey.</p>
                 <p>Temperature and tint are computed from the camera matrix and a black-body
                   spectrum, so 5500 K means what it means on a camera dial. Tint moves
                   perpendicular to the daylight curve, green against magenta.</p>
@@ -3939,18 +4050,23 @@
               ${raw && raw.wbFallback && html`<p className="cg-note" style=${{ marginTop: 0 }}>
                 No near-neutral areas were found, so this started at the reference daylight balance.
               </p>`}
+              ${raw && !wbShot && !raw.wbFallback && html`<p className="cg-note" style=${{ marginTop: 0 }}>
+                This file's own white balance could not be read, so this started at an estimate from the image.
+              </p>`}
               <${Slider} label="Temperature" value=${kelvin} min="2000" max="12000" step="10"
                 fmt=${(v) => Math.round(v) + ' K'} onChange=${setKelvinTint(null)}
-                onReset=${() => wbAuto && setWb(wbAuto)}/>
+                onReset=${() => (wbShot || wbAuto) && setWb(wbShot || wbAuto)}/>
               <${Slider} label="Tint" value=${tintVal} min="-100" max="100" step="1"
                 fmt=${(v) => (v > 0 ? '+' : '') + Math.round(v)} onChange=${setKelvinTint('tint')}
-                onReset=${() => wbAuto && setWb(wbAuto)}/>
+                onReset=${() => (wbShot || wbAuto) && setWb(wbShot || wbAuto)}/>
               <div className="cg-wbrow" style=${{ marginTop: 10 }}>
                 <button className=${'tool-btn tool-btn-sm' + (wbPick ? ' cg-armed' : '')}
                   disabled=${!raw} onClick=${() => { setWbPick((v) => !v); }}>
                   ${ToolIcons.el('pipette')}${wbPick ? 'Click the picture' : 'Pick a neutral'}<//>
+                <button className="tool-btn tool-btn-sm" disabled=${!raw || !wbShot}
+                  onClick=${() => setWb(wbShot)}>As shot<//>
                 <button className="tool-btn tool-btn-sm" disabled=${!raw || !wbAuto}
-                  onClick=${() => setWb(wbAuto)}>Back to the estimate<//>
+                  onClick=${() => setWb(wbAuto)}>Estimate<//>
               <//>
             <//>
 
@@ -3980,6 +4096,9 @@
                 ${raw.meta.exif && raw.meta.exif.exposureBias ? html`<${React.Fragment}><dt>Compensation<//><dd>${fmtEv(raw.meta.exif.exposureBias)}<//><//>` : null}
                 <dt>Black / white<//><dd>${raw.meta.blackLevel} / ${raw.meta.whiteLevel}<//>
                 <dt>Curve<//><dd>${raw.meta.curvePoints.join(', ')}<//>
+                <dt>As shot WB<//><dd>${raw.meta.asShot
+                  ? raw.meta.asShot.mul.map((v) => v.toFixed(2)).join(' / ') + ' (R / G / B)'
+                  : 'not readable'}<//>
               </dl>
             <//>`}
           <//>
