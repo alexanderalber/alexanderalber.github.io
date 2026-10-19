@@ -2512,6 +2512,67 @@ var PCB = (function () {
     return rectPath(0, 0, +doc.board.widthMm, +doc.board.heightMm);
   }
 
+  /* A closed contour that wholly encloses the current outline, the largest if
+     there are several, or null. The app promotes it to the outline: outside the
+     outline there is no board, so such a contour cannot do anything as an
+     ordinary contour and was meant as the edge. The owner's case (2026-10-20):
+     the trace made the logo the outline, the ring drawn around it afterwards
+     stayed a contour and everything between the two vanished from the export.
+     Only the outer ring of each counts. Enclosing means every outline vertex
+     inside the candidate and no edge of the one crossing an edge of the other;
+     a contour that crosses the outline is left alone, because whether that is
+     meant to enlarge the board or is a slip of the pen is not decidable.
+     `ids` limits the candidates (the objects a command just touched), so an
+     explicit "use as outline" on an inner contour is not undone by the next
+     unrelated edit. */
+  function enclosingContourId(doc, ids, tolMm) {
+    var outline = outlineObject(doc);
+    if (!outline) return null;
+    var tol = tolMm == null ? FLAT_TOL : +tolMm;
+    var inner = flattenPath(outerSubpath(outline.path, tol), tol);
+    if (!inner.length) return null;
+    var ib = boundsOfPolys(inner);
+    var best = null, bestArea = -Infinity;
+    doc.objects.forEach(function (o) {
+      if (o === outline || o.kind !== 'contour') return;
+      if (ids && ids.indexOf(o.id) < 0) return;
+      var sub = outerSubpath(o.path, tol);
+      if (!sub.length || !subClosed(sub[0])) return;
+      var outer = flattenPath(sub, tol);
+      if (!outer.length) return;
+      var ob = boundsOfPolys(outer);
+      if (ob.minX >= ib.minX || ob.minY >= ib.minY || ob.maxX <= ib.maxX || ob.maxY <= ib.maxY) return;
+      var ring = inner[0];
+      for (var i = 0; i < ring.length; i++) {
+        if (!pointInPolys(outer, ring[i][0], ring[i][1])) return;
+      }
+      if (polysCross(outer[0], ring)) return;
+      var a = Math.abs(polysArea(outer));
+      if (a > bestArea) { bestArea = a; best = o.id; }
+    });
+    return best;
+  }
+
+  /* Whether any edge of polygon p properly crosses any edge of polygon q. */
+  function polysCross(p, q) {
+    var qb = boundsOfPolys([q]);
+    for (var i = 0, n = p.length; i < n; i++) {
+      var a = p[i], b = p[(i + 1) % n];
+      if (Math.max(a[0], b[0]) < qb.minX || Math.min(a[0], b[0]) > qb.maxX ||
+          Math.max(a[1], b[1]) < qb.minY || Math.min(a[1], b[1]) > qb.maxY) continue;
+      for (var j = 0, m = q.length; j < m; j++) {
+        var c = q[j], d = q[(j + 1) % m];
+        var d1 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        var d2 = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0]);
+        if ((d1 > 0) === (d2 > 0) || d1 === 0 || d2 === 0) continue;
+        var d3 = (d[0] - c[0]) * (a[1] - c[1]) - (d[1] - c[1]) * (a[0] - c[0]);
+        var d4 = (d[0] - c[0]) * (b[1] - c[1]) - (d[1] - c[1]) * (b[0] - c[0]);
+        if ((d3 > 0) !== (d4 > 0) && d3 !== 0 && d4 !== 0) return true;
+      }
+    }
+    return false;
+  }
+
   /* The transform that fits everything drawn into the board rectangle,
      centred, aspect preserved. The Trace tab applies it as one
      transformObjects command after a vectorization. */
@@ -9969,6 +10030,7 @@ var PCB = (function () {
     cloneDoc: cloneDoc,
     docBounds: docBounds,
     outlineObject: outlineObject,
+    enclosingContourId: enclosingContourId,
     outlinePath: outlinePath,
     outerSubpath: outerSubpath,
     fitTransform: fitTransform,
@@ -13627,6 +13689,30 @@ var PCB = (function () {
        from before the gesture, so the new one is simply not pushed. */
     const runCmds = useCallback((cmds, coalesce) => {
       const r = applySeq(cmds);
+      /* A contour drawn, moved or reshaped so that it encloses the outline
+         becomes the outline, in the same undo step. Only the contours these
+         commands touched are candidates, see enclosingContourId. */
+      const touched = [];
+      cmds.forEach((cmd) => {
+        if (cmd.type === 'addObjects') (cmd.objects || []).forEach((o) => touched.push(o.id));
+        else if (cmd.type === 'setObjectPath') {
+          if (Array.isArray(cmd.set)) cmd.set.forEach((e) => touched.push(e.id));
+          else if (cmd.id != null) touched.push(cmd.id);
+        } else if (cmd.type === 'transformObjects') (cmd.ids || []).forEach((id) => touched.push(id));
+      });
+      let promotedInv = null;
+      if (touched.length) {
+        const pid = PCB.enclosingContourId(r.doc, touched);
+        if (pid) {
+          const props = {};
+          props[pid] = { role: 'outline' };
+          const p = PCB.applyCommand(r.doc, { type: 'setObjectProps', props: props });
+          r.doc = p.doc;
+          r.invs.unshift(p.inverse);
+          promotedInv = p.inverse;
+          setMsg('The contour around the board outline is now the outline: outside it there is no board.');
+        }
+      }
       docRef.current = r.doc;
       setDoc(r.doc);
       const now = Date.now();
@@ -13634,6 +13720,12 @@ var PCB = (function () {
       const fold = coalesce && c.key === coalesce && now - c.at < 1500 && undoRef.current.length;
       if (!fold) {
         undoRef.current = undoRef.current.concat([r.invs]);
+        setUndoStack(undoRef.current);
+      } else if (promotedInv) {
+        /* The folded step restores the paths from before the gesture but knows
+           nothing of the role change, so the role's inverse joins it. */
+        const u = undoRef.current;
+        undoRef.current = u.slice(0, -1).concat([[promotedInv].concat(u[u.length - 1])]);
         setUndoStack(undoRef.current);
       }
       coalesceRef.current = { key: coalesce || null, at: now };
@@ -14093,8 +14185,23 @@ var PCB = (function () {
       } catch (e) { /* no reference is survivable */ }
     }
 
+    /* A file from before the automatic promotion can still carry a ring around
+       its outline that never became the outline. Fixed on load, without an undo
+       step: there is nothing before the load to go back to. */
+    function promoteOnLoad(d) {
+      const pid = PCB.enclosingContourId(d, null);
+      if (!pid) return { doc: d, note: '' };
+      const props = {};
+      props[pid] = { role: 'outline' };
+      return {
+        doc: PCB.applyCommand(d, { type: 'setObjectProps', props: props }).doc,
+        note: ' The contour around the old outline is now the outline.'
+      };
+    }
+
     function acceptRestore() {
-      const d = restorePrompt;
+      const pr = promoteOnLoad(restorePrompt);
+      const d = pr.doc;
       docRef.current = d;
       setDoc(d);
       setUndoStack([]);
@@ -14102,7 +14209,7 @@ var PCB = (function () {
       setSel([]);
       loadRefImage();
       setRestorePrompt(null);
-      setMsg('Last session restored.');
+      setMsg('Last session restored.' + pr.note);
     }
 
     function discardRestore() {
@@ -14290,6 +14397,11 @@ var PCB = (function () {
             }
           }
           runCmds(cmds);
+          if (!promoted) {
+            /* runCmds promotes a traced ring that encloses the old outline. */
+            const now = PCB.outlineObject(docRef.current);
+            if (now && objs.some((o) => o.id === now.id)) promoted = now.id;
+          }
           setSel([]);
           const dropped = stats.dropped
             ? ' ' + stats.dropped + ' speck' + (stats.dropped === 1 ? '' : 's') + ' below ' + minArea + ' mm2 dropped.'
@@ -15429,14 +15541,15 @@ var PCB = (function () {
         catch (e) { setErr('That file is not valid JSON.'); return; }
         const v = PCB.validateDoc(parsed);
         if (!v.ok) { setErr('Not a valid project file: ' + v.errors.slice(0, 3).join('; ')); return; }
-        docRef.current = v.doc;
-        setDoc(v.doc);
+        const pr = promoteOnLoad(v.doc);
+        docRef.current = pr.doc;
+        setDoc(pr.doc);
         setUndoStack([]);
         setRedoStack([]);
         setSel([]);
         setDraft(null);
         setErr('');
-        setMsg('Project loaded: ' + v.doc.objects.length + ' objects, ' + v.doc.seeds.length + ' seed points.');
+        setMsg('Project loaded: ' + v.doc.objects.length + ' objects, ' + v.doc.seeds.length + ' seed points.' + pr.note);
       };
       r.readAsText(file);
     }
