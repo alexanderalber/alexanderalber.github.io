@@ -3071,10 +3071,21 @@ var PCB = (function () {
       });
     });
 
+    /* The inside of the board profile, the same outer ring deriveLayers clips
+       to. findRegions needs it because "not reachable from a corner" is not the
+       same as "on the board": a contour drawn around the outline encloses a band
+       outside it that no corner reaches, and that band then showed as board in
+       the editor and vanished from the export. */
+    var inside = null;
+    if (outline) {
+      inside = new Uint8Array(w * h);
+      fillPolysPx(inside, w, h, flattenPath(outlinePath(doc, tol), tol), pxPerMm, 1);
+    }
+
     return {
       side: side, pxPerMm: pxPerMm, width: w, height: h,
       barrier: barrier, strokePlane: plane, strokes: strokes,
-      hasOutline: !!outline
+      hasOutline: !!outline, inside: inside
     };
   }
 
@@ -3085,7 +3096,9 @@ var PCB = (function () {
 
      Outside is decided at the four corners, and only if the document actually
      has an outline object: a corner that is itself a barrier pixel means the
-     outline reaches the board edge there, so there is no outside to speak of. */
+     outline reaches the board edge there, so there is no outside to speak of.
+     Regions the corners do not reach are then tested against the profile
+     itself, see raster.inside. */
   function findRegions(raster) {
     var T = traceLib();
     var w = raster.width, h = raster.height;
@@ -3111,6 +3124,20 @@ var PCB = (function () {
       for (i = 0; i < corners.length; i++) {
         L = cc.labels[corners[i][1] * w + corners[i][0]];
         if (L >= 0) outside[L] = 1;
+      }
+    }
+    /* A region enclosed by other contours can still lie outside the profile.
+       The outline is a barrier, so a region is wholly on one side of it; the
+       majority vote only absorbs the pixels along the outline itself, where the
+       barrier stroke and the fill sample the edge differently. */
+    if (raster.inside) {
+      var inCount = new Int32Array(count);
+      for (i = 0; i < w * h; i++) {
+        L = cc.labels[i];
+        if (L >= 0 && raster.inside[i]) inCount[L]++;
+      }
+      for (i = 0; i < count; i++) {
+        if (inCount[i] * 2 < cc.area[i]) outside[i] = 1;
       }
     }
     return {
