@@ -57,6 +57,24 @@
  * is a closed formula of time (fanAngle), so a run with the same clock sees
  * the same blades.
  *
+ * Options for a duct inside another building (2026-10-25, for the pyramid
+ * arcology, assets/js/pyramid.js). All default to the behaviour above, and
+ * notes/dev/shaft.test.mjs pins the default output with a hash:
+ *   - length and loft (as before), now free of the 220 m rule when fans
+ *     are given explicitly;
+ *   - bends: [{ kind: 'arc', s0, angle, R, ramp }] replaces the two
+ *     opposite bumps by ramped arcs (curvature rises linearly over ramp
+ *     metres to 1 / R, holds, falls again; angle > 0 turns right). One arc
+ *     of +pi / 2 gives the single right turn, so the mouths face two
+ *     different world axes;
+ *   - fans: [{ s, kind: 'round' | 'square' }] instead of the fixed three;
+ *   - housing: false drops the housing building. The mouths then take
+ *     their orientation from the duct ends (they always did), the collar
+ *     becomes a plate (proud, collar: its depth and its width around the
+ *     opening) for the host building's reveal, and the wall contact treats
+ *     the wall as wallT metres thick: beyond that a point is in the host
+ *     building's empty interior and gets nothing from the duct.
+ *
  * Everything hangs on globalThis.Shaft.
  */
 (function () {
@@ -146,15 +164,36 @@
     if (x >= w / 2) return w / 2;
     return 0.5 * (x + w / 2) + w / (4 * Math.PI) * Math.sin(2 * Math.PI * x / w);
   }
+  /* ramped arc: s the centre, w the total length, rp the ramp, Lp the
+     plateau, k the plateau curvature; heading integral in closed form */
+  function arcInt(b, x) {
+    const u = x + b.w / 2, rp = b.rp, Lp = b.Lp, k = b.k;
+    if (u <= 0) return 0;
+    if (u < rp) return k * u * u / (2 * rp);
+    if (u < rp + Lp) return k * (rp / 2 + u - rp);
+    if (u < b.w) { const e = u - rp - Lp; return k * (rp / 2 + Lp + e - e * e / (2 * rp)); }
+    return k * (rp + Lp);
+  }
+  function arcK(b, x) {
+    const u = x + b.w / 2;
+    if (u <= 0 || u >= b.w) return 0;
+    if (u < b.rp) return b.k * u / b.rp;
+    if (u > b.w - b.rp) return b.k * (b.w - u) / b.rp;
+    return b.k;
+  }
   function psiAt(sh, s) {
     const sc = clamp(s, 0, sh.length);
     let p = 0;
-    for (const b of sh.bends) p += b.k * bumpInt(sc - b.s, b.w);
+    for (const b of sh.bends) p += b.kind === 'arc' ? arcInt(b, sc - b.s) : b.k * bumpInt(sc - b.s, b.w);
     return p;
   }
   function curvAt(sh, s) {
     let k = 0;
-    for (const b of sh.bends) { const x = s - b.s; if (Math.abs(x) < b.w / 2) k += b.k * 0.5 * (1 + Math.cos(2 * Math.PI * x / b.w)); }
+    for (const b of sh.bends) {
+      const x = s - b.s;
+      if (b.kind === 'arc') k += arcK(b, x);
+      else if (Math.abs(x) < b.w / 2) k += b.k * 0.5 * (1 + Math.cos(2 * Math.PI * x / b.w));
+    }
     return k;
   }
 
@@ -163,7 +202,8 @@
     const C = Object.assign({}, DEF, opts);
     C.loft = (opts.loft || DEF.loft).slice();
     const L = C.length;
-    if (!(L >= C.loft[3] + 220)) throw new Error('Shaft: length must leave 220 m after the second loft');
+    if (!opts.fans && !(L >= C.loft[3] + 220)) throw new Error('Shaft: length must leave 220 m after the second loft');
+    if (!(C.loft[0] < C.loft[1] && C.loft[1] <= C.loft[2] && C.loft[2] < C.loft[3] && C.loft[3] < L)) throw new Error('Shaft: loft positions must rise and end before the exit');
     const yaw = opts.yaw || 0;
     const q = yaw / (Math.PI / 2);
     if (Math.abs(q - Math.round(q)) > 1e-6) throw new Error('Shaft: yaw must be a multiple of 90 degrees');
@@ -182,6 +222,21 @@
       bendSign: sign, bendR: bendR,
       housing: { hw: C.housingHW, top: origin[1] + C.housingUp, proud: C.proud, collar: C.collar }
     };
+    if (opts.bends) {
+      sh.bends = opts.bends.map((b) => {
+        if (b.kind !== 'arc') throw new Error('Shaft: custom bends must be arcs: { kind: "arc", s0, angle, R, ramp }');
+        const a = b.angle, R = b.R, rp = Math.min(b.ramp == null ? 40 : b.ramp, Math.abs(a) * R * 0.5);
+        const Lp = Math.abs(a) * R - rp, w = Lp + 2 * rp;
+        if (!(b.s0 >= 0 && b.s0 + w <= L)) throw new Error('Shaft: a bend must lie inside the duct');
+        return { kind: 'arc', s: b.s0 + w / 2, w: w, k: Math.sign(a) / R, rp: rp, Lp: Lp, angle: a, R: R };
+      });
+      sh.bendSign = Math.sign(sh.bends[0].k); sh.bendR = Math.min.apply(null, sh.bends.map((b) => b.R));
+    }
+    if (opts.housing === false) {
+      const wallT = C.wallT == null ? 12 : C.wallT;
+      sh.housing = { on: false, wallT: wallT, hw: RECT.a + wallT, top: origin[1] + RECT.b + wallT,
+        proud: opts.proud == null ? 2.4 : opts.proud, collar: opts.collar == null ? 16 : opts.collar };
+    }
     /* integrate the plane curve at 1 m (midpoint heading) */
     const n = Math.ceil(L), step = L / n;
     const A = new Float64Array(n + 1), B = new Float64Array(n + 1);
@@ -191,6 +246,7 @@
       B[i + 1] = B[i] + Math.sin(pm) * step;
     }
     sh.n = n; sh.step = step; sh._A = A; sh._B = B;
+    const o0 = (i) => [origin[0] + sh.dir0[0] * A[i] + sh.right0[0] * B[i], origin[2] + sh.dir0[2] * A[i] + sh.right0[2] * B[i], i * step];
     sh.minRadius = 1 / Math.max(1e-9, ...sh.bends.map((b) => Math.abs(b.k)));
 
     /* fans: two round ones in the round section, a square one 260 m before
@@ -212,7 +268,15 @@
         viaR: round ? 30 : 24
       };
     };
-    sh.fans = [fan(l1 + 230, 'round'), fan(l1 + 510, 'round'), fan(L - 260, 'square')];
+    sh.fans = opts.fans ? opts.fans.map((f) => fan(f.s, f.kind === 'square' ? 'square' : 'round'))
+      : [fan(l1 + 230, 'round'), fan(l1 + 510, 'round'), fan(L - 260, 'square')];
+    /* custom bends can turn far: toLocal then starts from the nearest of
+       these centre-line samples instead of the projection on dir0 */
+    if (opts.bends) {
+      const cs = [];
+      for (let i = 0; i <= n; i += 10) cs.push(o0(i));
+      sh._cs = cs;
+    }
     sh.layout = dressingLayout(sh);
     sh.fanFrames = sh.fans.map((f) => frameAt(sh, f.s));
     sh.T0 = frameAt(sh, 0).T; sh.T1 = frameAt(sh, L).T;
@@ -243,6 +307,10 @@
   function toLocal(sh, p) {
     const L = sh.length, o = sh.origin;
     let s = clamp((p[0] - o[0]) * sh.dir0[0] + (p[2] - o[2]) * sh.dir0[2], 0, L);
+    if (sh._cs) {
+      let bd = Infinity;
+      for (const c of sh._cs) { const dx = p[0] - c[0], dz = p[2] - c[1], d = dx * dx + dz * dz; if (d < bd) { bd = d; s = c[2]; } }
+    }
     let f;
     for (let it = 0; it < 12; it++) {
       f = frameAt(sh, s);
@@ -351,6 +419,7 @@
       if (wp[0] < b.min[0] - 2 || wp[0] > b.max[0] + 2 || wp[2] < b.min[2] - 2 || wp[2] > b.max[2] + 2 || wp[1] > H.top + 1) continue;
       const l = toLocal(sh, wp), f = l.f, s = l.s, x = l.x, y = l.y;
       if (s < -H.proud || s > L + H.proud || Math.abs(x) >= H.hw || wp[1] >= H.top || wp[1] <= 0) continue;
+      if (H.on === false && Math.abs(y) >= H.top - sh.yc) continue;
       const sc = clamp(s, 0, L), k = loftK(sh, sc);
       const F = secF(k, x, y);
       const T = f.T, N = f.N;
@@ -362,6 +431,12 @@
         const pf = s < 0 ? s + H.proud : L + H.proud - s;
         if (pf < F / gl) out.push({ n: s < 0 ? mul(T, -1) : T.slice(), r: r, pen: pf, key: 'sh', vs: null, part: 'collar' });
         else out.push({ n: toW(-g[0] / gl, -g[1] / gl), r: r, pen: F / gl, key: 'sw', vs: null, part: 'collar' });
+        continue;
+      }
+      if (F > 0 && H.on === false) {
+        /* no housing: a wall wallT thick, then the host's empty interior */
+        const g = secGrad(k, x, y), gl = Math.hypot(g[0], g[1]) || 1;
+        if (F / gl < H.wallT) out.push({ n: toW(-g[0] / gl, -g[1] / gl), r: r, pen: F / gl, key: 'sw', vs: null, part: 'wall' });
         continue;
       }
       if (F > 0) {
@@ -1465,7 +1540,8 @@ void main(){
       const sF = sEdge + sgn * H.proud;
       const inn = poly, outer = grow(poly, H.collar);
       const n = inn.length;
-      for (let i = 0; i < n; i++) {
+      const host = H.on === false;
+      for (let i = 0; i < n && !host; i++) {
         const a = inn[i], b = inn[(i + 1) % n], ao = outer[i], bo = outer[(i + 1) % n];
         /* front face of the collar */
         D.quad([a[0], a[1], sF], [b[0], b[1], sF], [bo[0], bo[1], sF], [ao[0], ao[1], sF], [0, 0, sgn], boneL(0.3));
@@ -1482,13 +1558,15 @@ void main(){
       }
       /* rims */
       const loop = (P, s, r) => { for (let i = 0; i < P.length; i++) Gl.rod([P[i][0], P[i][1], s], [P[(i + 1) % P.length][0], P[(i + 1) % P.length][1], s], r, warmC, 6); };
-      loop(grow(poly, 0.9), sF + sgn * 0.05, 0.75);
+      if (!host) loop(grow(poly, 0.9), sF + sgn * 0.05, 0.75);
       loop(grow(poly, -0.5), sEdge - sgn * 6, 0.55);
-      for (const p of grow(poly, -0.3)) Gl.rod([p[0], p[1], sF], [p[0], p[1], sEdge - sgn * 6], 0.35, warmC, 4);
+      for (const p of grow(poly, -0.3)) Gl.rod([p[0], p[1], host ? sEdge : sF], [p[0], p[1], sEdge - sgn * 6], 0.35, warmC, 4);
       /* warm landing dots on the reveal floor */
-      for (let z = 0; z <= H.proud; z += 1.5) for (const x of [-A + 8, -A / 3, A / 3, A - 8]) Gl.box(x, -Bh + 0.15, sEdge + sgn * z, 0.9, 0.2, 0.9, 0, warmC);
+      for (let z = 0; z <= H.proud && !host; z += 1.5) for (const x of [-A + 8, -A / 3, A / 3, A - 8]) Gl.box(x, -Bh + 0.15, sEdge + sgn * z, 0.9, 0.2, 0.9, 0, warmC);
       for (let z = 1.5; z <= 6; z += 1.5) for (const x of [-A + 8, -A / 3, A / 3, A - 8]) Gl.box(x, -Bh + 0.15, sEdge - sgn * z, 0.9, 0.2, 0.9, 0, warmC);
       /* lintel, sill, pilasters, floor bands and piers on the facade */
+      /* with a host building (housing: false) the facade is the host's */
+      if (host) { halos.push([toWorld(sh, sEdge + sgn * 4, 0, 0), 2 * A * 1.25, 2 * Bh * 1.25, srgbHalo([1, 0.65, 0.24], 0.09)]); return; }
       const sT = sEdge + sgn * 2.5, tone = boneL(0.55);
       D.box(0, Bh + H.collar + 6.5, sT, 2 * A + 40, 7, 5, 0, tone);
       D.box(0, -Bh - H.collar - 5, sT, 2 * A + 40, 4, 5, 0, tone);
@@ -1511,6 +1589,7 @@ void main(){
     /* ---- the housing: a long building around the duct, its outer faces
        with the city's kind of facade (uShOut: outside light, city fog) ---- */
     const Hb = new DuctBatch(sh);
+    if (H.on !== false) {
     const yB = -sh.yc, yT = H.top - sh.yc, hw = H.hw;
     const hRows = [];
     for (let s = 0; s < L; s += 10) hRows.push(s);
@@ -1536,9 +1615,11 @@ void main(){
       }
       sg.dispose();
     }
-    const houseMat = patchMat(THREE, ctx, new THREE.MeshStandardMaterial({ color: new THREE.Color().fromArray(boneL(0.42)), roughness: 0.85, metalness: 0.1, side: THREE.DoubleSide }),
+    var houseMat = patchMat(THREE, ctx, new THREE.MeshStandardMaterial({ color: new THREE.Color().fromArray(boneL(0.42)), roughness: 0.85, metalness: 0.1, side: THREE.DoubleSide }),
       { mode: 'wall', house: true, uv: true, aux: true, outside: true });
     owned.push(houseMat);
+    var houseGeo = Hb.geometry(THREE);
+    }
 
     const dressMat = patchMat(THREE, ctx, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.35, side: THREE.DoubleSide }),
       { mode: 'wall', lit: true });
@@ -1550,7 +1631,7 @@ void main(){
     add(wGeo, wallMat, 'shaft-wall');
     add(D.geometry(THREE), dressMat, 'shaft-dressing');
     add(Gl.geometry(THREE), ctx.glowMat, 'shaft-glow');
-    add(Hb.geometry(THREE), houseMat, 'shaft-housing');
+    if (H.on !== false) add(houseGeo, houseMat, 'shaft-housing');
     const halo = haloMesh(THREE, ctx, halos, 0.6);
     halo.name = 'shaft-halos';
     group.add(halo);
