@@ -62,11 +62,42 @@
       z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
       font-size: 15px; color: var(--tool-text); letter-spacing: .04em;
       text-shadow: 0 0 18px rgba(0,0,0,.95); }
-    .hk-pause { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 4;
-      pointer-events: none; text-align: center; max-width: 62ch; padding: 18px 26px; border-radius: 8px;
-      background: rgba(6, 9, 14, .72); border: 1px solid var(--tool-border); color: var(--tool-text); font-size: 13px; }
-    .hk-pause b { display: block; font-size: 22px; letter-spacing: .3em; margin-bottom: 8px; }
-    .hk-pause p { margin: 6px 0 0; color: var(--tool-note); line-height: 1.7; }
+    /* The start screen, the time trial and controls screens and the pause
+       menu: one shared .ctl-card in a left column over the city
+       (notes/tools/hikyaku/STARTSCREEN-PLAN.md). Only the surface is denser
+       than the shared card's, as the panel's is, so the text reads over the
+       neon. Entries are .tool-btn, full width, the one-line note under the
+       label. The finish card is the same card at the right edge. */
+    .hk-menu { position: absolute; left: 24px; top: 50%; transform: translateY(-50%); z-index: 4;
+      width: min(360px, calc(100vw - 48px)); max-height: calc(100% - 72px); overflow-y: auto;
+      overscroll-behavior: contain;
+      background: color-mix(in srgb, var(--tool-panel) 86%, transparent); backdrop-filter: blur(10px); }
+    .hk-menu::-webkit-scrollbar { width: 8px; }
+    .hk-menu::-webkit-scrollbar-thumb { background: var(--tool-border); border-radius: 4px; }
+    .hk-fin { position: absolute; right: 24px; top: 50%; transform: translateY(-50%); z-index: 4;
+      width: min(300px, calc(100vw - 48px));
+      background: color-mix(in srgb, var(--tool-panel) 86%, transparent); backdrop-filter: blur(10px); }
+    .hk-fin.beside { right: 366px; }
+    .hk-title { font-size: 26px; line-height: 1.15; margin: 0; color: var(--tool-emph); font-weight: 600; letter-spacing: .03em; }
+    .hk-title.sm { font-size: 19px; }
+    .hk-sub { font-size: 12.5px; color: var(--tool-note); margin: 5px 0 0; line-height: 1.45; }
+    .hk-line { font-size: 12.5px; color: var(--tool-text); margin: 0; line-height: 1.45; font-variant-numeric: tabular-nums; }
+    .hk-line + .hk-line, .hk-line + .hk-note { margin-top: 6px; }
+    .hk-menu .hk-note, .hk-fin .hk-note { font-size: 11.5px; color: var(--tool-note); }
+    .hk-menu .hk-note:first-child { margin-top: 0; }
+    .hk-entries { display: flex; flex-direction: column; gap: 7px; }
+    .hk-entry.tool-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+      width: 100%; text-align: left; padding: 0.45rem 0.85rem; }
+    .hk-entry small { font-size: 11px; color: var(--tool-note); font-weight: 400; line-height: 1.35; }
+    .hk-menu .tool-btn:focus-visible, .hk-fin .tool-btn:focus-visible {
+      outline: 2px solid var(--tool-label); outline-offset: 1px; }
+    .hk-btns { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+    .hk-btns .tool-btn { flex: 1 1 auto; }
+    .hk-btns .tool-btn-sm { flex: 0 0 auto; }
+    .ctl-sec > .hk-btns:first-child { margin-top: 0; }
+    .hk-menu .hk-seed { margin: 0 0 8px; }
+    /* the wrap of the attract camera from the finish back to the start */
+    .hk-fade { position: absolute; inset: 0; z-index: 2; pointer-events: none; background: black; opacity: 0; }
     .hk-hint { position: absolute; top: 80px; left: 50%; transform: translateX(-50%); z-index: 3;
       pointer-events: none; font-size: 12px; letter-spacing: .06em; color: var(--tool-note);
       text-shadow: 0 0 12px rgba(0,0,0,.95); }
@@ -1748,6 +1779,184 @@ var Hikyaku = (function () {
     return MUSIC_MIN + (1 - MUSIC_MIN) * clamp(v / MUSIC_V, 0, 1);
   }
 
+  /* ---- start screen and menu (notes/tools/hikyaku/STARTSCREEN-PLAN.md) ----
+     One menu state { screen, mode, run, back }, driven by menuStep from the
+     page's useReducer. screen: 'title', 'trial' (the time trial screen),
+     'controls', 'flying', 'paused', 'finished'. mode: 'free' or 'trial',
+     the mode of the flight. run counts race resets: every start, restart
+     and quit bumps it, and the page resets the ship and the race when it
+     changes. back: where 'controls' returns to ('title' or 'paused').
+
+     MODES is the registry: a later mode is one entry plus its own screen.
+     store is the mode's localStorage key, hk.<mode-short><version>; the
+     time trial keeps hk.best4. */
+  var MODES = [
+    { id: 'free', label: 'Free run', note: 'Fly the city. No clock, nothing counts.', enabled: true, timed: false, store: null },
+    { id: 'trial', label: 'Time trial', note: 'Fly the rings in order against the clock.', enabled: true, timed: true, store: 'hk.best4' },
+    { id: 'deliver', label: 'Deliveries', note: 'Coming later.', enabled: false, timed: true, store: 'hk.dlv1' }
+  ];
+
+  /* The first state. A screenshot hook (?shot=) skips the menu and flies
+     the time trial at once, except ?shot=title, which shows the menu. mode
+     is the last used mode (hk.cfg lastMode), for the focus only. */
+  function menuInit(o) {
+    o = o || {};
+    if (o.shot && o.shot !== 'title') return { screen: 'flying', mode: 'trial', run: 0, back: null };
+    return { screen: 'title', mode: o.mode === 'trial' ? 'trial' : 'free', run: 0, back: null };
+  }
+
+  function menuStep(st, a) {
+    var s = st.screen, type = a && a.type;
+    var to = function (screen, ext) {
+      var r = { screen: screen, mode: st.mode, run: st.run, back: null }, k;
+      for (k in ext || {}) r[k] = ext[k];
+      return r;
+    };
+    switch (type) {
+      case 'free': return s === 'title' ? to('flying', { mode: 'free', run: st.run + 1 }) : st;
+      case 'trial': return s === 'title' ? to('trial', { mode: 'trial' }) : st;
+      case 'controls': return s === 'title' || s === 'paused' ? to('controls', { back: s }) : st;
+      case 'start': return s === 'trial' ? to('flying', { mode: 'trial', run: st.run + 1 }) : st;
+      case 'back':
+        if (s === 'trial') return to('title');
+        if (s === 'controls') return to(st.back === 'paused' ? 'paused' : 'title');
+        return st;
+      case 'pause': return s === 'flying' ? to('paused') : st;
+      case 'resume': return s === 'paused' ? to('flying') : st;
+      /* same mode, ship back at the start, race reset (Backspace in flight
+         and "Fly again" on the finish card too) */
+      case 'restart': return s === 'paused' || s === 'flying' || s === 'finished' ? to('flying', { run: st.run + 1 }) : st;
+      case 'quit': return s === 'paused' ? to('title', { run: st.run + 1 }) : st;
+      /* the finish gate: only the time trial has a result card */
+      case 'finish': return s === 'flying' && st.mode === 'trial' ? to('finished') : st;
+      case 'newseed': return s === 'finished' ? to('trial') : st;
+      case 'menu': return s === 'finished' ? to('title', { run: st.run + 1 }) : st;
+      case 'esc':
+        if (s === 'trial' || s === 'controls') return menuStep(st, { type: 'back' });
+        if (s === 'flying') return to('paused');
+        if (s === 'paused') return to('flying');
+        if (s === 'finished') return menuStep(st, { type: 'menu' });
+        return st;
+      default: return st;
+    }
+  }
+
+  /* The title screens: the menu over the attract camera, no ship. */
+  function menuTitle(st) {
+    return st.screen === 'title' || st.screen === 'trial' || (st.screen === 'controls' && st.back !== 'paused');
+  }
+  /* Paused, the controls screen opened from the pause menu included: the
+     pause clock runs and the physics stands still. */
+  function menuPaused(st) { return st.screen === 'paused' || (st.screen === 'controls' && st.back === 'paused'); }
+  /* Whether the flight keys, the 3D mouse and the physics are live. */
+  function flightInputLive(st) { return st.screen === 'flying' || st.screen === 'finished'; }
+
+  /* Which HUD parts show. Title screens: none. Paused: the frozen clock
+     and splits, the ship and its route line. Free run: no clock, splits,
+     cue or ring count. */
+  function hudParts(st, mode) {
+    var m = mode || st.mode, timed = m !== 'free';
+    var fly = flightInputLive(st), pz = menuPaused(st);
+    return {
+      clock: timed && (fly || pz), splits: timed && (fly || pz), cue: timed && fly, rings: timed && fly,
+      hud: fly, msg: fly, hint: fly, toggle: fly, ship: fly || pz, routeLine: fly || pz
+    };
+  }
+
+  /* The input card: 'hidden' (?nohid=1), 'unsupported' (no WebHID),
+     'connected', 'error' or 'none'. */
+  function inputState(o) {
+    if (o.nohid) return 'hidden';
+    if (!o.supported) return 'unsupported';
+    if (o.name) return 'connected';
+    if (o.err) return 'error';
+    return 'none';
+  }
+
+  /* The key of a result inside a mode's store: the seed, plus ':nc' for a
+     route without the street canyon. null for an untimed or unknown mode. */
+  function bestKey(mode, seed, flags) {
+    var md = null;
+    for (var i = 0; i < MODES.length; i++) if (MODES[i].id === mode) md = MODES[i];
+    if (!md || !md.timed) return null;
+    return String(seed) + (flags && flags.canyon === false ? ':nc' : '');
+  }
+
+  /* ---- attract camera -----------------------------------------------------
+     attractPose(route, t): where the title screen's camera is t seconds
+     after the title came up. An anchor drifts along the route curve from
+     the start gate at 6 m/s; the camera sits 40 m above and 80 m behind it
+     (behind along the curve's horizontal direction over 300 m, so the yaw
+     eases instead of snapping) and looks at the anchor 300 m ahead. Over
+     the Menger block and the shaft the anchor climbs to 30 m above the
+     structure's top, with a 300 m smoothstep ramp on either side, so the
+     camera passes over them instead of through. At the finish it wraps to
+     the start; fade (0 clear, 1 black) covers the wrap, a second on each
+     side. Returns { p, at, look, fwd, s, fade, lap, period }: camera,
+     anchor (the page clamps the camera on the segment from there, like the
+     chase camera from the ship), look target, unit view direction, arc
+     length from the start gate, fade, lap count and seconds per lap. */
+  var ATTRACT = { speed: 6, up: 40, back: 80, ahead: 300, lift: 30, ramp: 300, fade: 1 };
+  var attractCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  function attractPath(route) {
+    var c = attractCache ? attractCache.get(route) : null;
+    if (c) return c;
+    var sm = route.tube.samples, n = route.n, i, s0 = null, s1 = null;
+    for (i = 0; i < sm.length; i++) {
+      if (s0 == null && sm[i].u >= 0) s0 = sm[i].s;
+      if (sm[i].u <= n - 1 + 1e-9) s1 = sm[i].s;
+    }
+    var skips = [];
+    for (var k = 0; k < route.specials.length; k++) {
+      var sp = route.specials[k];
+      if (sp.kind !== 'menger' && sp.kind !== 'shaft') continue;
+      var uA = sp.i0, uB = sp.i0 + (sp.kind === 'menger' ? 4 : sp.count - 1), a = null, b = null;
+      for (i = 0; i < sm.length; i++) {
+        if (a == null && sm[i].u >= uA - 1e-9) a = sm[i].s;
+        if (sm[i].u <= uB + 1e-9) b = sm[i].s;
+      }
+      if (a != null && b != null) skips.push({ a: a, b: b, top: sp.bounds.max[1] + ATTRACT.lift, kind: sp.kind });
+    }
+    c = { sm: sm, s0: s0, s1: s1, length: s1 - s0, skips: skips };
+    if (attractCache) attractCache.set(route, c);
+    return c;
+  }
+  function attractAnchor(P, s) {
+    var sm = P.sm, last = sm.length - 1, p;
+    if (s <= sm[0].s) p = sub(sm[0].p, mul(sm[0].d, sm[0].s - s));
+    else if (s >= sm[last].s) p = add(sm[last].p, mul(sm[last].d, s - sm[last].s));
+    else {
+      var lo = 0, hi = last;
+      while (hi - lo > 1) { var md = (lo + hi) >> 1; if (sm[md].s <= s) lo = md; else hi = md; }
+      var f = (s - sm[lo].s) / Math.max(1e-9, sm[hi].s - sm[lo].s);
+      p = add(sm[lo].p, mul(sub(sm[hi].p, sm[lo].p), f));
+    }
+    var lift = 0;
+    for (var k = 0; k < P.skips.length; k++) {
+      var sk = P.skips[k], d = s < sk.a ? sk.a - s : s > sk.b ? s - sk.b : 0;
+      if (d >= ATTRACT.ramp) continue;
+      var x = 1 - d / ATTRACT.ramp, w = x * x * (3 - 2 * x);
+      lift = Math.max(lift, w * Math.max(0, sk.top - p[1]));
+    }
+    return [p[0], p[1] + lift, p[2]];
+  }
+  function attractPose(route, t) {
+    var P = attractPath(route), A = ATTRACT;
+    var period = P.length / A.speed;
+    var tt = ((t % period) + period) % period;
+    var s = P.s0 + tt * A.speed;
+    var at = attractAnchor(P, s);
+    var a0 = attractAnchor(P, s - 150), a1 = attractAnchor(P, s + 150);
+    var h = [a1[0] - a0[0], 0, a1[2] - a0[2]], hl = len(h);
+    if (hl < 1) { var d0 = route.waypoints[0].dir; h = [d0[0], 0, d0[2]]; hl = len(h) || 1; }
+    h = mul(h, 1 / hl);
+    var p = [at[0] - h[0] * A.back, at[1] + A.up, at[2] - h[2] * A.back];
+    var look = attractAnchor(P, s + A.ahead);
+    var fade = clamp(Math.max(1 - tt / A.fade, 1 - (period - tt) / A.fade), 0, 1);
+    return { p: p, at: at, look: look, fwd: norm(sub(look, p)), s: s - P.s0, fade: fade,
+      lap: Math.floor(t / period), period: period };
+  }
+
   return {
     DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
@@ -1755,7 +1964,10 @@ var Hikyaku = (function () {
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
     formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime,
     cameraClamp: cameraClamp, vehicleBoxes: vehicleBoxes, musicIntensity: musicIntensity,
-    pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime
+    pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime,
+    MODES: MODES, menuInit: menuInit, menuStep: menuStep, menuTitle: menuTitle, menuPaused: menuPaused,
+    flightInputLive: flightInputLive, hudParts: hudParts, inputState: inputState, bestKey: bestKey,
+    ATTRACT: ATTRACT, attractPose: attractPose
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -1763,7 +1975,7 @@ if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
 
   <script id="app">
 const html = htm.bind(React.createElement);
-const { useState, useRef, useEffect, useMemo, useCallback } = React;
+const { useState, useRef, useEffect, useMemo, useCallback, useReducer } = React;
 const SD = SixDOF;
 const HF = HikyakuFlight;
 const HK = Hikyaku;
@@ -1833,7 +2045,7 @@ function hazeOf(p) {
    without storing them, ?variety=<0 to 1> the city's variety
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign', 'altstadt', 'crown'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign', 'altstadt', 'crown', 'title'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1911,6 +2123,9 @@ const DEF = {
   /* The panel: open or closed, and the open section. Stored with the rest,
      so a reload looks the way it was left. */
   panel: true, sec: '',
+  /* The mode last started from the menu (free or trial), only so the
+     title screen puts the focus on it. */
+  lastMode: 'free',
   /* Version of the stored config. Below 2, the stored gravity and assist
      are dropped once, so the new defaults (both off) reach a browser that
      stored the old ones (both on). Below 3, the city and fog values are
@@ -1922,15 +2137,16 @@ const DEF = {
      the merge. Below 6, liveliness and freightDensity are dropped once, so
      the livelier defaults (0.85, owner: the rare things were too rare)
      reach a browser that stored 0.6. signColours came later without a
-     bump: a new key, filled by the merge. */
-  cfgV: 6
+     bump: a new key, filled by the merge. Version 7 added lastMode (the
+     start screen); nothing is dropped, the merge fills it. */
+  cfgV: 7
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
    is the courier's own cyan. */
 const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
-const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'] };
+const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'], lastMode: ['free', 'trial'] };
 const STORE = 'hk.cfg';
 let SIGN_META = null;
 const SIGN_META_P = fetch('/assets/files/hikyaku-signs.json').then((r) => (r.ok ? r.json() : null))
@@ -2327,8 +2543,36 @@ function gateFrame(THREE, wp, mat, body) {
   return grp;
 }
 
+/* The controls, once: the panel's "Controls" section and the menu's
+   Controls screen both render this, so the two cannot drift apart. The 3D
+   mouse sentence follows DEF_MAP and the usual HID axis order. */
+function ControlsText() {
+  return html`<${React.Fragment}>
+    <p className="hk-note">3D mouse: Push the cap forward or back: fly forward or back. Slide it sideways: slide.
+      Pull it up or press it down: lift. Tilt it forward or back: pitch. Tilt it sideways: roll. Twist it: yaw.
+      Right button: boost. Left button: stop rotation while held.</p>
+    <p className="hk-note">Keys: <kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide,
+      <kbd>R</kbd><kbd>F</kbd> lift up and down, <kbd>Q</kbd><kbd>E</kbd> roll,
+      arrow keys pitch and yaw (up pushes the nose down), <kbd>Shift</kbd> boost.
+      <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
+      <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel, <kbd>M</kbd> music,
+      <kbd>Esc</kbd> pause and menu.</p>
+    <p className="hk-note">Mouse: left drag looks around, middle click stops rotation, wheel sets the chase distance.</p>
+    <p className="hk-note">In the menus: Arrow keys move, Enter picks, Esc goes back.</p>
+    <p className="hk-note">All settings, the panel included, are kept in this browser across reloads.</p>
+  <//>`;
+}
+
 function App() {
   const [p, setP] = useState(loadStored);
+  /* The start screen and the menus (hkcore menuInit and menuStep): one
+     screen value, a shot hook skips the menu. menuRef lets the loop and
+     the key handler read the current screen. */
+  const [menu, menuDo] = useReducer(HK.menuStep, { shot: SHOT, mode: p.lastMode }, HK.menuInit);
+  const menuRef = useRef(menu);
+  menuRef.current = menu;
+  const parts = HK.hudParts(menu);
+  const menuBoxRef = useRef(null);
   /* Panel and open section live in p, so they are stored with it. The
      screenshot hooks always hide the panel. */
   const panel = !SHOT && p.panel;
@@ -2370,7 +2614,7 @@ function App() {
      built around it. */
   const [routeCanyon, setRouteCanyon] = useState(() => p.canyon !== false);
   const route = useMemo(() => HK.makeRoute({ seed: p.seed, canyon: routeCanyon }), [p.seed, routeCanyon]);
-  const bestKey = String(p.seed) + (routeCanyon ? '' : ':nc');
+  const bestKey = HK.bestKey('trial', p.seed, { canyon: routeCanyon });
   /* Oversized structures (the Menger block, later arcologies) are bigger
      than a tile and placed on the route by makeRoute. Their reserved boxes
      (the 2 x 2 tiles around the block) go to the city, which builds
@@ -2421,15 +2665,13 @@ function App() {
      Escape pauses: no physics, so the race clock, the traffic and the fans
      stand still; the wall-clock things (weather, rain, events) run on the
      pause clock (hkcore pauseTime); the music is suspended. The scene keeps
-     rendering, and the mouse still looks around. Escape or any flight key
-     resumes. */
+     rendering, and the mouse still looks around. The menu drives it
+     (hkcore menuPaused): Escape or "Resume" resumes. */
   const pauseRef = useRef(HK.pauseClock());
-  const [paused, setPausedS] = useState(false);
   const setPaused = useCallback((on) => {
     const pc = pauseRef.current;
     if (!!on === pc.paused || SHOT) return;
     HK.pauseSet(pc, on, performance.now());
-    setPausedS(!!on);
     const S = window.Synthwave, M = musicRef.current;
     if (S && M.started && M.live) { if (on) S.pause(); else S.resume(); }
   }, []);
@@ -2600,7 +2842,9 @@ function App() {
       try { localStorage.setItem(BEST, JSON.stringify(nb)); } catch (e) { /* private mode */ }
     }
     setLastRun({ time: race.time, penalty: race.penalty, total: race.total, splits: race.splits.slice(),
-      missed: race.missed.slice(), best: isBest, seed: p.seed });
+      missed: race.missed.slice(), best: isBest, prevBest: prevBest > 0 ? prevBest : null, seed: p.seed });
+    /* the finish card (the menu ignores this outside the time trial) */
+    menuDo({ type: 'finish' });
     return isBest;
   };
 
@@ -2621,20 +2865,45 @@ function App() {
     return () => window.removeEventListener('hk-three-ready', on);
   }, [ready]);
 
-  /* ---- keyboard -------------------------------------------------------- */
+  /* ---- keyboard --------------------------------------------------------
+     Escape goes through the menu (pause, resume, back). P and M work on
+     every screen. In a menu the arrows move the focus over its buttons and
+     Enter picks (the browser clicks the focused button itself); the flight
+     keys and Space reach the ship only while it flies (hkcore
+     flightInputLive). */
   useEffect(() => {
     const down = (e) => {
-      if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
-      if (e.code === 'Escape') { setPaused(!pauseRef.current.paused); e.preventDefault(); return; }
-      if (pauseRef.current.paused && (KEYMAP[e.code] || e.code === 'Space')) setPaused(false);
+      const inField = e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName);
+      if (e.code === 'Escape') {
+        if (inField && e.target.blur) e.target.blur();
+        menuDo({ type: 'esc' }); e.preventDefault(); return;
+      }
+      if (inField) return;
+      if (e.code === 'KeyP') { setPanel((v) => !v); return; }
+      if (e.code === 'KeyM') { if (!e.repeat) musicToggle(); return; }
+      if (!HK.flightInputLive(menuRef.current)) {
+        const box = menuBoxRef.current;
+        if (!box) return;
+        const bs = Array.from(box.querySelectorAll('button:not(:disabled)'));
+        if (e.code === 'ArrowDown' || e.code === 'ArrowUp') {
+          if (bs.length) {
+            const i = bs.indexOf(document.activeElement);
+            const j = i < 0 ? 0 : (i + (e.code === 'ArrowDown' ? 1 : -1) + bs.length) % bs.length;
+            bs[j].focus();
+          }
+          e.preventDefault();
+        } else if ((e.code === 'Enter' || e.code === 'NumpadEnter') && !box.contains(document.activeElement)) {
+          const b = box.querySelector('[data-focus]') || bs[0];
+          if (b) { b.click(); e.preventDefault(); }
+        }
+        return;
+      }
       if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
       else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
       else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
       else if (e.code === 'KeyG') setP((q) => ({ ...q, gravity: !q.gravity }));
       else if (e.code === 'KeyC') setP((q) => ({ ...q, camMode: q.camMode === 'chase' ? 'cockpit' : 'chase' }));
-      else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
-      else if (e.code === 'KeyP') setPanel((v) => !v);
-      else if (e.code === 'KeyM' && !e.repeat) musicToggle();
+      else if (e.code === 'Backspace') { menuDo({ type: 'restart' }); e.preventDefault(); }
     };
     const up = (e) => { delete keysRef.current[e.code]; };
     const blur = () => { keysRef.current = {}; };
@@ -2646,7 +2915,29 @@ function App() {
       window.removeEventListener('keyup', up);
       window.removeEventListener('blur', blur);
     };
-  }, [musicToggle, setPaused]);
+  }, [musicToggle, setPanel]);
+
+  /* ---- menu side effects ------------------------------------------------
+     The pause clock follows the menu (setPaused stays the one place that
+     touches it and the music). Starting a mode stores it as lastMode. In
+     flight the focus leaves the menu buttons, so Space and the arrows
+     cannot press them; a menu screen puts the focus on its marked entry
+     (the title on the last used mode, the pause menu on Resume). */
+  useEffect(() => { setPaused(HK.menuPaused(menu)); }, [menu, setPaused]);
+  useEffect(() => {
+    if (menu.run > 0 && menu.screen === 'flying') setP((q) => (q.lastMode === menu.mode ? q : { ...q, lastMode: menu.mode }));
+  }, [menu.run]);
+  useEffect(() => {
+    if (SHOT && SHOT !== 'title') return;
+    if (HK.flightInputLive(menu)) {
+      const a = document.activeElement;
+      if (a && a !== document.body && a.blur) a.blur();
+      return;
+    }
+    const box = menuBoxRef.current;
+    const want = box && (box.querySelector('[data-focus]') || box.querySelector('button:not(:disabled)'));
+    if (want) want.focus({ preventScroll: true });
+  }, [menu.screen]);
 
   /* ---- the scene and the loop ------------------------------------------
      Built once. The route-dependent meshes are rebuilt in the effect below;
@@ -2715,7 +3006,10 @@ function App() {
       /* world events: one schedule cache per seed (an event keeps the
          origin it got when first seen), the hand-made shot event, and the
          traffic clock a shot may fix (tFix) */
-      evCache: new Map(), evShot: null, tFix: null
+      evCache: new Map(), evShot: null, tFix: null,
+      /* the attract camera: seconds since the title came up, and its
+         clamped distance (smoothed like the chase camera's) */
+      attT: 0, attD: null
     };
     /* cityR: the city renderer, owned by the city effect below. traffic:
        the traffic system of the traffic effect (hikyaku-traffic.js); the
@@ -2951,6 +3245,7 @@ function App() {
     g.reset = reset;
     reset();
     let lastReset = resetRef.current;
+    let lastRunN = menuRef.current.run;
     let lastRoute = cfgRef.current.route;
 
     const resize = () => {
@@ -3068,9 +3363,23 @@ function App() {
       last = ts;
       const dt = Math.min(0.1, dtRaw);
       if (dtRaw > 0) state.fps = state.fps ? state.fps * 0.95 + 0.05 / dtRaw : 1 / dtRaw;
-      if (resetRef.current !== lastReset || route !== lastRoute) {
+      /* the menu: a new run (start, restart, quit) resets the ship and the
+         race like Backspace did; the title screens fly the attract camera
+         and keep the physics off */
+      const mst = menuRef.current;
+      const live = HK.flightInputLive(mst);
+      const attract = HK.menuTitle(mst);
+      const newRun = mst.run !== lastRunN;
+      if (resetRef.current !== lastReset || route !== lastRoute || newRun) {
         if (route !== lastRoute) state.evCache = new Map();
-        lastReset = resetRef.current; lastRoute = route; reset();
+        lastReset = resetRef.current; lastRoute = route; lastRunN = mst.run; reset();
+        state.attD = null;
+        if (newRun && mst.screen === 'flying' && mst.mode === 'free' && !SHOT) say('Free run. Esc for the menu.', 4000, ts);
+      }
+      let att = null;
+      if (attract) {
+        state.attT = SHOT ? (Number.isFinite(URL_T) ? URL_T : 60) : state.attT + dt;
+        att = HK.attractPose(route, state.attT);
       }
 
       /* ---- input ---- */
@@ -3079,7 +3388,7 @@ function App() {
       const isPaused = pauseRef.current.paused;
       /* the pause clock in seconds: the wall clock without paused stretches */
       const wallT = HK.pauseTime(pauseRef.current, ts) / 1000;
-      if (!SHOT && !isPaused) {
+      if (!SHOT && !isPaused && live) {
         const nav = navRef.current;
         const raw = nav && nav.axes();
         if (raw) {
@@ -3111,7 +3420,7 @@ function App() {
       if (cityR && cityR.owner === city) {
         const sp = state.s;
         const hv = Math.hypot(sp.v[0], sp.v[2]);
-        const dirv = hv > 5 ? sp.v : SD.qRot(sp.q, [0, 0, -1]);
+        const dirv = att ? att.fwd : hv > 5 ? sp.v : SD.qRot(sp.q, [0, 0, -1]);
         const tb0 = performance.now();
         let ch;
         if (SHOT === 'top') {
@@ -3126,7 +3435,7 @@ function App() {
         } else {
           /* the ring shot looks at ring 3 from wherever the ship is, so it
              streams around that ring */
-          const focus = SHOT === 'ring' ? route.waypoints[Math.min(3, route.n - 1)].p : sp.p;
+          const focus = att ? att.p : SHOT === 'ring' ? route.waypoints[Math.min(3, route.n - 1)].p : sp.p;
           ch = city.sync(focus, dirv, { radius: pp.cityRadius, maxBuilds: SHOT ? Infinity : 1 });
         }
         const tb1 = performance.now();
@@ -3147,7 +3456,10 @@ function App() {
       const fc = killing ? cfg.killCraft : cr;
       const fcmd = killing ? { ...cmd, pitch: 0, yaw: 0, roll: 0 } : cmd;
       const env = { g: pp.gravity ? G : 0, rho: pp.drag ? HF.RHO : 0 };
-      state.acc = isPaused ? 0 : state.acc + dt;
+      state.acc = isPaused || !live ? 0 : state.acc + dt;
+      /* the title runs the traffic, the fans and the city life on the free
+         clock (the race is idle, hkcore trafficTime); a shot fixes it */
+      if (attract) state.simT = SHOT ? state.attT : state.simT + dt;
       let steps = 0;
       while (state.acc >= H_STEP && steps < 16) {
         const prev = state.s.p;
@@ -3191,9 +3503,12 @@ function App() {
           }
         }
         state.simT += H_STEP;
-        const r2 = HK.raceStep(state.race, prev, state.s.p, state.simT * 1000);
-        state.race = r2;
-        for (let ei = 0; ei < r2.events.length; ei++) onEvent(r2.events[ei], ts);
+        /* free run: nothing counts, the race stays idle */
+        if (mst.mode !== 'free') {
+          const r2 = HK.raceStep(state.race, prev, state.s.p, state.simT * 1000);
+          state.race = r2;
+          for (let ei = 0; ei < r2.events.length; ei++) onEvent(r2.events[ei], ts);
+        }
         state.acc -= H_STEP;
         steps++;
       }
@@ -3212,9 +3527,10 @@ function App() {
 
       /* ---- sun and shadows ---- */
       sun.castShadow = pp.shadows;
-      sun.target.position.set(s.p[0], s.p[1], s.p[2]);
+      const sunP = att ? att.at : s.p;
+      sun.target.position.set(sunP[0], sunP[1], sunP[2]);
       sun.target.updateMatrixWorld();
-      sun.position.set(s.p[0] + sunDir.x * 800, s.p[1] + sunDir.y * 800, s.p[2] + sunDir.z * 800);
+      sun.position.set(sunP[0] + sunDir.x * 800, sunP[1] + sunDir.y * 800, sunP[2] + sunDir.z * 800);
       if (pp.shadows) {
         const sc = sun.shadow.camera;
         sc.left = -220; sc.right = 220; sc.top = 220; sc.bottom = -220;
@@ -3227,7 +3543,21 @@ function App() {
       if (!L.dragging) { L.yaw *= Math.exp(-dt / 0.12); L.pitch *= Math.exp(-dt / 0.12); }
       const look = SD.qMul(SD.qFromRotVec([0, L.yaw, 0]), SD.qFromRotVec([L.pitch, 0, 0]));
       camera.up.set(0, 1, 0);
-      if (pp.camMode === 'cockpit' && !SHOT) {
+      if (att) {
+        /* the attract camera, clamped on the segment from its anchor on
+           the curve the way the chase camera is from the ship */
+        const full = SD.len(SD.sub(att.p, att.at));
+        const tCam = g.traffic ? (state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT)) : null;
+        const cc = camClampAt(cfg, att.at, att.p, full, tCam);
+        let dA = state.attD == null ? cc.d : Math.min(state.attD, full);
+        if (cc.d < dA) dA = cc.d;
+        else dA += (cc.d - dA) * (1 - Math.exp(-dt / CAM_TAU));
+        state.attD = dA;
+        const kA = full > 1e-6 ? dA / full : 1;
+        camera.position.set(att.at[0] + (att.p[0] - att.at[0]) * kA, att.at[1] + (att.p[1] - att.at[1]) * kA,
+          att.at[2] + (att.p[2] - att.at[2]) * kA);
+        camera.lookAt(att.look[0], att.look[1], att.look[2]);
+      } else if (pp.camMode === 'cockpit' && !SHOT) {
         const cq = SD.qMul(s.q, look);
         const off = SD.qRot(s.q, [0, 1.1, -2.6]);
         camera.position.set(s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]);
@@ -3251,7 +3581,8 @@ function App() {
         camera.position.set(s.p[0] + off[0] * kC, s.p[1] + off[1] * kC, s.p[2] + off[2] * kC);
         camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
       }
-      shipGrp.visible = pp.camMode !== 'cockpit' || !!SHOT;
+      shipGrp.visible = (pp.camMode !== 'cockpit' || !!SHOT) && !attract;
+      if (g.routeLine) g.routeLine.visible = !attract;
       if (SHOT === 'blockfar' && state.blockC) {
         shipGrp.visible = false;
         camera.position.set(s.p[0], s.p[1], s.p[2]);
@@ -3335,8 +3666,8 @@ function App() {
         if (pp.searchlights) kinds.push('searchlight');
         let evs = [];
         if (kinds.length && pp.liveliness > 0 && cityR) {
-          const sp0 = state.s.p, hv0 = Math.hypot(state.s.v[0], state.s.v[2]);
-          const fw = hv0 > 5 ? state.s.v : SD.qRot(state.s.q, [0, 0, -1]);
+          const sp0 = att ? att.at : state.s.p, hv0 = Math.hypot(state.s.v[0], state.s.v[2]);
+          const fw = att ? att.fwd : hv0 > 5 ? state.s.v : SD.qRot(state.s.q, [0, 0, -1]);
           const fh = Math.hypot(fw[0], fw[2]) || 1, fx = fw[0] / fh, fz = fw[2] / fh;
           let padsNow = null;
           const tubeR = route.cfg.tubeR;
@@ -3438,9 +3769,13 @@ function App() {
       set('fps', fmt(state.fps, 0));
       set('clock', HK.formatRun(HK.elapsed(race, tNow), race.penalty), race.state === 'finished' ? 'acc' : '');
       set('clockSub', race.state === 'idle' ? 'fly through the start gate'
-        : race.state === 'finished' ? 'finished, Backspace to reset'
+        : race.state === 'finished' ? 'finished, Backspace to fly again'
         : (race.next === race.n - 1 ? 'finish gate next' : 'ring ' + race.next + ' next'));
       if (H.msg) H.msg.textContent = ts < state.msgUntil ? state.msg : '';
+      if (H.fade) {
+        const fo = att ? Math.round(att.fade * 100) / 100 : 0;
+        if (H.fade.dataset.o !== String(fo)) { H.fade.style.opacity = String(fo); H.fade.dataset.o = String(fo); }
+      }
       if (H.splits && H.splits.textContent !== state.splitsText) H.splits.textContent = state.splitsText;
 
       /* ---- the cue to the next waypoint ---- */
@@ -3609,12 +3944,14 @@ function App() {
     grp.add(gateFrame(THREE, route.waypoints[route.n - 1], gf, gb));
     g.gates = { start: gs.color, finish: gf.color };
 
+    g.routeLine = null;
     if (p.routeLine) {
       const lp = [];
       for (const sm of route.tube.samples) if (sm.u >= 0 && sm.u <= route.n - 1) lp.push(sm.p[0], sm.p[1], sm.p[2]);
       const lg = new THREE.BufferGeometry();
       lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
-      grp.add(new THREE.Line(lg, g.fog.patch(new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, toneMapped: false }), { fogK: 0.6 })));
+      g.routeLine = new THREE.Line(lg, g.fog.patch(new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, toneMapped: false }), { fogK: 0.6 }));
+      grp.add(g.routeLine);
     }
     if (g.mark) g.mark();
     return undefined;
@@ -3797,59 +4134,155 @@ function App() {
   const H = hudRef.current;
   const bestHere = best[bestKey];
 
+  /* ---- start screen, menus, finish card (STARTSCREEN-PLAN.md) ---- */
+  const inState = HK.inputState({ supported: dev.supported, nohid: NOHID, name: dev.name, err: dev.err });
+  const soundLine = p.music && !(musicLive && musicAudible) && !SHOT;
+  const pick = (type) => () => menuDo({ type });
+  const urlSeedNow = Number.isFinite(URL_SEED) && URL_SEED > 0 && p.seed === URL_SEED;
+  const freshSeed = () => 1 + Math.floor(Math.random() * 99999);
+  const commitSeedText = () => { const v = parseInt(seedText, 10); if (v > 0 && v !== p.seed) setSeed(v); else setSeedText(String(p.seed)); };
+  const connectBtn = html`<div className="hk-btns">
+    <button className="tool-btn tool-btn-sm" data-music="1" onClick=${connect}>Connect 3D mouse</button>
+  </div>`;
+  const inputCard = inState === 'hidden' ? null : html`<div className="ctl-sec">
+    ${inState === 'none' ? html`<${React.Fragment}>
+      <p className="hk-line">3D mouse: not connected.</p>
+      ${connectBtn}
+      <p className="hk-note">Hikyaku is made for a 3D mouse, a 3Dconnexion SpaceMouse. Click the button and pick it in
+        the list the browser shows. Without one, the keyboard works too.</p>
+    <//>` : inState === 'connected' ? html`<p className="hk-line">${'✓ ' + dev.name + ' connected.'}</p>`
+    : inState === 'error' ? html`<${React.Fragment}>
+      <p className="hk-line">${'The 3D mouse did not connect: ' + String(dev.err).replace(/[.\s]+$/, '')
+        + '. Unplug it, plug it back in, and try again.'}</p>
+      ${connectBtn}
+    <//>` : html`<p className="hk-note">This browser cannot use a 3D mouse. That needs WebHID, which only Chromium
+      browsers have (Chrome, Edge, Opera). You can fly with the keyboard.</p>`}
+  </div>`;
+  const entry = (key, label, note, onClick, opt) => html`<button key=${key} className="tool-btn hk-entry"
+      onClick=${onClick} disabled=${!!(opt && opt.disabled)} data-focus=${opt && opt.focus ? '1' : undefined}>
+    <span>${label}</span>${note ? html`<small>${note}</small>` : null}
+  </button>`;
+  let menuCard = null;
+  if (menu.screen === 'title') {
+    menuCard = html`<${React.Fragment}>
+      <div className="ctl-sec">
+        <h1 className="hk-title">Hikyaku</h1>
+        <p className="hk-sub">A courier race through a generated city at night.</p>
+      </div>
+      ${inputCard}
+      <div className="ctl-sec"><div className="hk-entries">
+        ${HK.MODES.map((m) => entry(m.id, m.label,
+          m.note + (m.id === 'trial' && urlSeedNow ? ' Seed ' + p.seed + ' from the address.' : ''),
+          m.enabled ? pick(m.id) : null, { disabled: !m.enabled, focus: m.id === (p.lastMode || 'free') }))}
+        ${entry('settings', 'Settings', 'Flight model, camera, city, traffic, music.', () => setPanel(true))}
+        ${entry('controls', 'Controls', 'Keys and 3D mouse.', pick('controls'))}
+      </div></div>
+      ${soundLine ? html`<div className="ctl-sec"><p className="hk-note">Sound starts with your first click or key.</p></div>` : null}
+    <//>`;
+  } else if (menu.screen === 'trial') {
+    menuCard = html`<${React.Fragment}>
+      <div className="ctl-sec"><h2 className="hk-title sm">Time trial</h2></div>
+      <div className="ctl-sec">
+        <div className="hk-seed">
+          <span>Seed</span>
+          <input type="number" min="1" step="1" value=${seedText} aria-label="Seed"
+            onChange=${(e) => setSeedText(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') commitSeedText(); }}
+            onBlur=${commitSeedText} />
+          <button className="tool-btn tool-btn-sm" onClick=${() => setSeed(freshSeed())}>New seed</button>
+        </div>
+        <p className="hk-line">${bestHere > 0 ? 'Best on this seed: ' + HK.formatTime(bestHere) : 'No time on this seed yet.'}</p>
+        ${!routeCanyon ? html`<p className="hk-note">The canyon is off. Times for this seed without the canyon are kept apart.</p>` : null}
+        <p className="hk-note">The same seed gives the same city and route. Send the page address to race someone on it.</p>
+      </div>
+      <div className="ctl-sec"><div className="hk-btns">
+        <button className="tool-btn tool-btn-primary" data-focus="1"
+          onClick=${() => { commitSeedText(); menuDo({ type: 'start' }); }}>Start</button>
+        <button className="tool-btn" onClick=${pick('back')}>Back</button>
+      </div></div>
+    <//>`;
+  } else if (menu.screen === 'controls') {
+    menuCard = html`<${React.Fragment}>
+      <div className="ctl-sec"><h2 className="hk-title sm">Controls</h2></div>
+      <div className="ctl-sec"><${ControlsText} /></div>
+      <div className="ctl-sec"><div className="hk-btns">
+        <button className="tool-btn" data-focus="1" onClick=${pick('back')}>Back</button>
+      </div></div>
+    <//>`;
+  } else if (menu.screen === 'paused') {
+    menuCard = html`<${React.Fragment}>
+      <div className="ctl-sec"><h2 className="hk-title sm">Paused</h2></div>
+      ${inputCard}
+      <div className="ctl-sec"><div className="hk-entries">
+        ${entry('resume', 'Resume', null, pick('resume'), { focus: true })}
+        ${entry('restart', 'Restart', null, pick('restart'))}
+        ${entry('settings', 'Settings', null, () => setPanel(true))}
+        ${entry('controls', 'Controls', null, pick('controls'))}
+        ${entry('quit', 'Quit to menu', null, pick('quit'))}
+      </div></div>
+      <div className="ctl-sec"><p className="hk-note">Esc resumes.</p></div>
+    <//>`;
+  }
+
   return html`<${React.Fragment}>
     <div className="hk-stage" ref=${stageRef}></div>
+    <div className="hk-fade" ref=${(el) => { H.fade = el; }}></div>
     <a className="hk-back" href="/miscellaneous/#games">${'←'} Games</a>
 
-    <div className="hk-clock">
+    ${parts.clock ? html`<div className="hk-clock">
       <span ref=${(el) => { H.clock = el; }}>0:00.00</span>
       <small ref=${(el) => { H.clockSub = el; }}></small>
-    </div>
-    <div className="hk-splits" ref=${(el) => { H.splits = el; }}></div>
+    </div>` : null}
+    ${parts.splits ? html`<div className="hk-splits" ref=${(el) => { H.splits = el; }}></div>` : null}
 
-    <div className="hk-cue" ref=${(el) => { H.cue = el; }}>
+    ${parts.cue ? html`<div className="hk-cue" ref=${(el) => { H.cue = el; }}>
       <div className="hk-cue-box" ref=${(el) => { H.cueBox = el; }}></div>
       <div className="hk-cue-arrow" ref=${(el) => { H.cueArrow = el; }}><i></i></div>
       <div className="hk-cue-d" ref=${(el) => { H.cueD = el; }}></div>
-    </div>
+    </div>` : null}
 
-    <div className="hk-hud">
+    ${parts.hud ? html`<div className="hk-hud">
       <div className="hk-grid">
         ${hudRow('spd', 'AIRSPEED')}
         ${hudRow('alt', 'ALTITUDE')}
         ${hudRow('vs', 'VERTICAL')}
-        ${hudRow('ring', 'RINGS')}
+        ${parts.rings ? hudRow('ring', 'RINGS') : null}
         ${hudRow('assist', 'ASSIST')}
         ${hudRow('hits', 'CONTACTS')}
         ${hudRow('veh', 'NEAREST VEHICLE')}
         ${hudRow('evt', 'EVENT')}
         ${hudRow('fps', 'FPS')}
       </div>
-    </div>
-
-    ${p.music && !(musicLive && musicAudible) && !SHOT && !paused ? html`<div className="hk-hint">${musicLive && musicHidTried
-      ? 'click or press a key for music: the browser holds the sound until then'
-      : 'music starts with the first key, click or 3D mouse move'}</div>` : null}
-    ${paused ? html`<div className="hk-pause">
-      <b>PAUSED</b>
-      <p>Esc or any flight key resumes.</p>
-      <p><kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide, <kbd>R</kbd><kbd>F</kbd> lift,
-        <kbd>Q</kbd><kbd>E</kbd> roll, arrows pitch and yaw, <kbd>Shift</kbd> boost.
-        <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
-        <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel, <kbd>M</kbd> music, <kbd>Esc</kbd> pause.</p>
     </div>` : null}
 
-    <div className="hk-msg">
-      <span ref=${(el) => { H.msg = el; }}></span>
-      ${!SHOT && !NOHID && !dev.supported ? html`<small>This browser has no WebHID, so the 3D mouse cannot connect.
-        The keys under "Controls" work in every browser.</small>` : null}
-    </div>
+    ${parts.hint && p.music && !(musicLive && musicAudible) && !SHOT ? html`<div className="hk-hint">${musicLive && musicHidTried
+      ? 'click or press a key for music: the browser holds the sound until then'
+      : 'music starts with the first key, click or 3D mouse move'}</div>` : null}
 
-    ${!panel ? html`<button className="hk-toggle" onClick=${() => setPanel(true)}>Panel</button>` : html`
+    ${parts.msg ? html`<div className="hk-msg">
+      <span ref=${(el) => { H.msg = el; }}></span>
+    </div>` : null}
+
+    ${menuCard ? html`<div className="ctl-card hk-menu" ref=${menuBoxRef}>${menuCard}</div>` : null}
+
+    ${menu.screen === 'finished' && lastRun ? html`<div className=${'ctl-card hk-fin' + (panel ? ' beside' : '')}>
+      <div className="ctl-sec">
+        <p className="hk-title sm">${'Finish ' + HK.formatRun(lastRun.time, lastRun.penalty)}</p>
+        <p className="hk-line">${lastRun.best ? 'New best on this seed.' : 'Best on this seed: ' + HK.formatTime(lastRun.prevBest)}</p>
+      </div>
+      <div className="ctl-sec"><div className="hk-btns">
+        <button className="tool-btn tool-btn-primary" onClick=${pick('restart')}>Fly again</button>
+        <button className="tool-btn" onClick=${() => { setSeed(freshSeed()); menuDo({ type: 'newseed' }); }}>New seed</button>
+        <button className="tool-btn" onClick=${pick('menu')}>Menu</button>
+      </div></div>
+    </div>` : null}
+
+    ${!panel ? (parts.toggle ? html`<button className="hk-toggle" onClick=${() => setPanel(true)}>Panel</button>` : null) : html`
     <div className="hk-panel">
       <div className="hk-head">
         <h2>Hikyaku</h2>
-        <button className=${'lang-seg' + (paused ? ' active' : '')} onClick=${() => setPaused(!paused)}>${paused ? 'Resume' : 'Pause'}</button>
+        ${menu.screen === 'flying' || menu.screen === 'paused' ? html`<button className=${'lang-seg' + (menu.screen === 'paused' ? ' active' : '')}
+          onClick=${pick(menu.screen === 'paused' ? 'resume' : 'pause')}>${menu.screen === 'paused' ? 'Resume' : 'Pause'}</button>` : null}
         <button className="hk-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
       </div>
       <p className="hk-desc">A ring race against the clock through a procedurally generated cyberpunk city at night.
@@ -3858,7 +4291,7 @@ function App() {
       <div className="hk-chips">
         <button data-music="1" className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
           disabled=${!dev.supported || NOHID}>${dev.name || 'Connect 3D mouse'}</button>
-        <button className="lang-seg" onClick=${() => { resetRef.current++; }}>Reset</button>
+        <button className="lang-seg" onClick=${() => { if (HK.flightInputLive(menu) || menu.screen === 'paused') menuDo({ type: 'restart' }); else resetRef.current++; }}>Reset</button>
         <button className=${'lang-seg' + (p.assist ? ' active' : '')}
           onClick=${() => upd('assist')(!p.assist)}>Assist</button>
       </div>
@@ -4104,17 +4537,7 @@ function App() {
       <//>
 
       <${Section} id="keys" title="Controls" open=${sec === 'keys'} onToggle=${toggleSec}>
-        <p className="hk-note">
-          3D mouse: the cap drives all six axes. Right button: boost. Left button: stop rotation while held.
-          <br/>Keys: <kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide,
-          <kbd>R</kbd><kbd>F</kbd> lift up and down, <kbd>Q</kbd><kbd>E</kbd> roll,
-          arrow keys pitch and yaw (up pushes the nose down), <kbd>Shift</kbd> boost.
-          <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
-          <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel, <kbd>M</kbd> music,
-          <kbd>Esc</kbd> pause (Esc or any flight key resumes).
-          <br/>Mouse: left drag looks around, middle click stops rotation, wheel sets the chase distance.
-          <br/>All settings, the panel included, are kept in this browser across reloads.
-        </p>
+        <${ControlsText} />
       <//>
     </div>`}
   <//>`;
