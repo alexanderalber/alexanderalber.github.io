@@ -18,11 +18,13 @@
  *     fixed uniform). state(event, t) is the drawable state at time t, a
  *     closed formula in t: nothing is integrated.
  *   - Visual layer: create(THREE, { fog, colors }) builds fixed pools (16
- *     shot segments, 8 glows, 4 cones) and update(t, cameraPos, events)
- *     fills them. THREE is a parameter, never an import. All materials are
- *     additive ShaderMaterials that take the shared atmosphere through
- *     fog.inject (hikyaku-city.js makeFog), so they fade with distance like
- *     every other emissive thing in the scene.
+ *     shot segments, 8 glows, 4 cones, 4 bodies) and update(t, cameraPos,
+ *     events) fills them. THREE is a parameter, never an import. The light
+ *     materials are additive ShaderMaterials that take the shared
+ *     atmosphere through fog.inject (hikyaku-city.js makeFog), so they fade
+ *     with distance like every other emissive thing in the scene. The
+ *     bodies behind the searchlights (a small drone, or a lamp on a roof
+ *     pedestal) are lit meshes through fog.patch.
  *
  * Origins: the caller passes pickOrigin(kind, rng, info) and clearance(p).
  * The schedule retries a pick a few times when clearance rejects it (or when
@@ -43,7 +45,7 @@
   var SLOT = 60;                       // seconds per schedule slot
   var KINDS = ['laser', 'searchlight'];
   /* events per hour at liveliness 1 */
-  var RATES = { laser: 20, searchlight: 40 };
+  var RATES = { laser: 35, searchlight: 70 };
   /* longest possible duration per kind, so a window query can look back */
   var MAXDUR = { laser: 8, searchlight: 200 };
 
@@ -64,6 +66,8 @@
     roofEl: [-20, 50], droneEl: [-75, -15],
     azAmp: [20, 55], azPer: [40, 80], elPer: [24, 50],
     droneR: [25, 60], dronePer: [50, 90], droneUp: [120, 220],
+    roofUp: 1.2,                       // lamp centre above the roof pad, m
+    strobePer: 2.4, strobeOn: 0.09,    // the drone's white strobe, s
     minDist: 150
   };
 
@@ -286,14 +290,23 @@
     var I = smooth(0, P.fadeIn, tl) * (1 - smooth(dur - P.fadeOut, dur, tl));
     var az = P.az0 + P.azAmp * Math.sin(P.azW * tl + P.azPh);
     var el = P.el0 + P.elAmp * Math.sin(P.elW * tl + P.elPh);
-    var o = ev.origin, pos = o;
+    var o = ev.origin, pos, fwd, strobe = false;
     if (P.mount === 'drone') {
-      var a = P.dronePh + P.droneW * tl;
+      /* the craft circles; it faces along the circle (the horizontal part
+         of d pos / dt), and its strobe flashes on its own phase */
+      var a = P.dronePh + P.droneW * tl, sg = P.droneW < 0 ? -1 : 1;
       pos = [o[0] + P.droneR * Math.cos(a), o[1] + 2 * Math.sin(0.4 * a), o[2] + P.droneR * Math.sin(a)];
+      fwd = P.droneR > 0 && P.droneW !== 0 ? [-Math.sin(a) * sg, 0, Math.cos(a) * sg] : [Math.cos(az), 0, Math.sin(az)];
+      var ph = tl + P.dronePh * LIGHT.strobePer / (2 * Math.PI);
+      strobe = ph - LIGHT.strobePer * Math.floor(ph / LIGHT.strobePer) < LIGHT.strobeOn;
+    } else {
+      /* the lamp stands on a pedestal on the roof pad */
+      pos = [o[0], o[1] + LIGHT.roofUp, o[2]];
+      fwd = [Math.cos(az), 0, Math.sin(az)];
     }
     return {
       kind: 'searchlight', active: tl >= 0 && tl <= dur, intensity: I, pos: pos, dir: dirOf(az, el),
-      az: az, el: el, len: P.len, half: P.half, mount: P.mount
+      az: az, el: el, len: P.len, half: P.half, mount: P.mount, fwd: fwd, strobe: strobe
     };
   }
 
@@ -302,7 +315,7 @@
   }
 
   /* ---- visual layer ----------------------------------------------------- */
-  var POOL = { shots: 16, glows: 8, cones: 4 };
+  var POOL = { shots: 16, glows: 8, cones: 4, bodies: 4 };
   var CONE_SEG = { around: 20, along: 6 };
 
   var SHOT_VS = [
@@ -422,6 +435,55 @@
     return g;
   }
 
+  /* Merge geometries into one non-indexed position + normal geometry. */
+  function mergeGeos(THREE, geos) {
+    var parts = geos.map(function (g) { return g.index ? g.toNonIndexed() : g; }), n = 0, i;
+    for (i = 0; i < parts.length; i++) n += parts[i].getAttribute('position').count;
+    var P = new Float32Array(n * 3), N = new Float32Array(n * 3), o = 0;
+    for (i = 0; i < parts.length; i++) {
+      var p = parts[i].getAttribute('position'), q = parts[i].getAttribute('normal');
+      P.set(p.array.subarray(0, p.count * 3), o); N.set(q.array.subarray(0, p.count * 3), o);
+      o += p.count * 3;
+    }
+    for (i = 0; i < parts.length; i++) parts[i].dispose();
+    for (i = 0; i < geos.length; i++) geos[i].dispose();
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(P, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(N, 3));
+    return g;
+  }
+  /* The bodies behind the searchlights, one pool slot per cone. Frame:
+     origin at the lamp (the cone apex), y up, the craft faces -z.
+     Drone: a 7 m flat craft above the lamp, four stub ducts with dark rotor
+     discs, bone grey like the traffic drone, red nav light on the port
+     (-x) duct, green starboard, a white strobe on top. Roof: a base and a
+     pedestal down to the roof pad (LIGHT.roofUp below the lamp). The lamp
+     is a dark box whose front face (3 cm proud, so it does not fight the
+     box) is lit with the beam colour; it turns with the beam. */
+  var BODY = { span: 2.5, ductR: 1.05 };
+  function bodyGeos(THREE) {
+    var box = function (w, h, d, x, y, z) { return new THREE.BoxGeometry(w, h, d).translate(x, y, z); };
+    var S = BODY.span, hull = [], dark = [];
+    hull.push(box(2.2, 0.5, 3.4, 0, 1.1, 0), box(1.2, 0.35, 1.6, 0, 1.5, 0.2));
+    [[1, 1], [1, -1], [-1, 1], [-1, -1]].forEach(function (q) {
+      var L = Math.hypot(S, S);
+      hull.push(new THREE.BoxGeometry(0.25, 0.18, L).rotateY(Math.atan2(q[0], q[1])).translate(q[0] * S / 2, 1.0, q[1] * S / 2));
+      hull.push(new THREE.CylinderGeometry(BODY.ductR, BODY.ductR, 0.3, 14, 1, true).translate(q[0] * S, 1.15, q[1] * S));
+      dark.push(new THREE.CylinderGeometry(BODY.ductR - 0.1, BODY.ductR - 0.1, 0.04, 14).translate(q[0] * S, 1.15, q[1] * S));
+    });
+    dark.push(box(0.3, 0.9, 0.3, 0, 0.45, 0));
+    var navX = S + BODY.ductR + 0.07;
+    return {
+      craftHull: mergeGeos(THREE, hull), craftDark: mergeGeos(THREE, dark),
+      roofHull: box(1.4, 0.25, 1.4, 0, -LIGHT.roofUp + 0.1, 0),
+      roofDark: box(0.5, 0.65, 0.5, 0, -0.675, 0),
+      lampBox: box(1.0, 1.0, 1.2, 0, 0, -0.6),
+      lampFace: new THREE.PlaneGeometry(0.8, 0.8).translate(0, 0, 0.03),
+      nav: new THREE.BoxGeometry(0.25, 0.25, 0.25),
+      navPos: { port: [-navX, 1.15, -S], starboard: [navX, 1.15, -S], strobe: [0, 1.78, 0.2] }
+    };
+  }
+
   function create(THREE, opts) {
     var o = opts || {};
     var fog = o.fog || (globalThis.HikyakuCity && globalThis.HikyakuCity.makeFog(THREE));
@@ -462,10 +524,54 @@
       cm.visible = false; cm.frustumCulled = false; cm.renderOrder = 4;
       cones.push(cm); coneGroup.add(cm);
     }
-    group.add(coneGroup, shots, glows);
+    /* bodies: lit materials through fog.patch like the city's own */
+    var BG = bodyGeos(THREE);
+    var lit = function (hex, rough, metal) {
+      var m = new THREE.MeshStandardMaterial({ color: hex, roughness: rough, metalness: metal, flatShading: true });
+      return fog.patch ? fog.patch(m, { fogK: 1 }) : m;
+    };
+    var plain = function (c) {
+      var m = new THREE.MeshBasicMaterial({ color: c, toneMapped: false });
+      return fog.patch ? fog.patch(m, { fogK: 0.6 }) : m;
+    };
+    var bodyMat = { hull: lit(0x8a857c, 0.55, 0.3), dark: lit(0x26262a, 0.7, 0.3),
+      red: plain(lin(0xff2a1a, 1.8)), green: plain(lin(0x2bff6a, 1.8)), white: plain(lin(0xffffff, 2.2)) };
+    var navCol = { port: lin(0xff2a1a, 1.2), starboard: lin(0x2bff6a, 1.0), strobe: lin(0xffffff, 2.5) };
+    var bodyGroup = new THREE.Group(), bodies = [], faceMats = [];
+    bodyGroup.name = 'bodies';
+    var mesh = function (parent, geo, mat, name) { var x = new THREE.Mesh(geo, mat); x.name = name; parent.add(x); return x; };
+    for (i = 0; i < POOL.bodies; i++) {
+      var slot = new THREE.Group(); slot.name = 'body'; slot.visible = false;
+      var craft = new THREE.Group(); craft.name = 'drone';
+      mesh(craft, BG.craftHull, bodyMat.hull, 'hull'); mesh(craft, BG.craftDark, bodyMat.dark, 'rotors');
+      var navs = {};
+      for (var nk in BG.navPos) {
+        var nm = mesh(craft, BG.nav, nk === 'port' ? bodyMat.red : nk === 'starboard' ? bodyMat.green : bodyMat.white, nk);
+        nm.position.fromArray(BG.navPos[nk]); navs[nk] = nm;
+      }
+      var roof = new THREE.Group(); roof.name = 'roof';
+      mesh(roof, BG.roofHull, bodyMat.hull, 'base'); mesh(roof, BG.roofDark, bodyMat.dark, 'pedestal');
+      var lamp = new THREE.Group(); lamp.name = 'lamp';
+      var fm = plain(new THREE.Color());
+      faceMats.push(fm);
+      mesh(lamp, BG.lampBox, bodyMat.dark, 'housing'); mesh(lamp, BG.lampFace, fm, 'face');
+      slot.add(craft, roof, lamp);
+      bodies.push({ obj: slot, craft: craft, roof: roof, lamp: lamp, face: fm, navs: navs });
+      bodyGroup.add(slot);
+    }
+    var navGeo = quadInstanced(THREE, POOL.bodies * 3, { iPos: 3, iSize: 1, iCol: 3 }, -1, 1);
+    var navGlows = new THREE.Mesh(navGeo, glowMat);
+    navGlows.name = 'navGlows'; navGlows.frustumCulled = false; navGlows.renderOrder = 6;
+    bodyGroup.add(navGlows);
+    var triCount = function (g) { return (g.index ? g.index.count : g.getAttribute('position').count) / 3; };
+    var TRI = {
+      drone: triCount(BG.craftHull) + triCount(BG.craftDark) + 3 * triCount(BG.nav) + triCount(BG.lampBox) + 2,
+      roof: triCount(BG.roofHull) + triCount(BG.roofDark) + triCount(BG.lampBox) + 2
+    };
+    group.add(coneGroup, shots, glows, bodyGroup);
 
-    var stats = { events: 0, shots: 0, glows: 0, cones: 0, dropped: 0, triangles: 0 };
-    var FWD = new THREE.Vector3(0, 0, 1), tmp = new THREE.Vector3();
+    var stats = { events: 0, shots: 0, glows: 0, cones: 0, bodies: 0, navGlows: 0, dropped: 0, triangles: 0 };
+    var FWD = new THREE.Vector3(0, 0, 1), tmp = new THREE.Vector3(), wp = new THREE.Vector3();
     var cp = [0, 0, 0];
 
     function update(t, cameraPos, events) {
@@ -524,14 +630,50 @@
         U.uTan.value = Math.tan(L.half); U.uLen.value = L.len;
         U.uCol.value.copy(lightCol).multiplyScalar(C.lightGain * L.intensity);
       }
+      /* the bodies: same slots as the cones, same closed-form pose; nav
+         glows in world space, like the glow shader reads them */
+      var NP = navGeo.attributes.iPos.array, NS = navGeo.attributes.iSize.array, NC = navGeo.attributes.iCol.array;
+      var nn = 0, bodyTris = 0;
+      for (k = 0; k < POOL.bodies; k++) {
+        var bd = bodies[k];
+        if (k >= nc) { bd.obj.visible = false; continue; }
+        L = lights[k];
+        var isDrone = L.mount === 'drone';
+        bd.obj.visible = true;
+        bd.obj.position.set(L.pos[0], L.pos[1], L.pos[2]);
+        bd.craft.visible = isDrone; bd.roof.visible = !isDrone;
+        bd.craft.rotation.set(0, Math.atan2(-L.fwd[0], -L.fwd[2]), 0);
+        bd.lamp.quaternion.setFromUnitVectors(FWD, tmp.set(L.dir[0], L.dir[1], L.dir[2]));
+        bd.face.color.copy(lightCol).multiplyScalar(0.4 + 2.6 * L.intensity);
+        bd.navs.strobe.visible = !!L.strobe;
+        bd.obj.updateMatrixWorld(true);
+        bodyTris += isDrone ? TRI.drone : TRI.roof;
+        if (!isDrone) continue;
+        for (var key in bd.navs) {
+          if (key === 'strobe' && !L.strobe) continue;
+          bd.navs[key].getWorldPosition(wp);
+          var c3 = navCol[key];
+          NP[3 * nn] = wp.x; NP[3 * nn + 1] = wp.y; NP[3 * nn + 2] = wp.z;
+          NS[nn] = key === 'strobe' ? 6 : 2.2;
+          NC[3 * nn] = c3.r; NC[3 * nn + 1] = c3.g; NC[3 * nn + 2] = c3.b;
+          nn++;
+        }
+      }
+      navGeo.attributes.iPos.needsUpdate = navGeo.attributes.iSize.needsUpdate = navGeo.attributes.iCol.needsUpdate = true;
+      navGeo.instanceCount = nn;
       stats.events = list.length; stats.shots = ns; stats.glows = ng; stats.cones = nc; stats.dropped = dropped;
-      stats.triangles = 2 * ns + 2 * ng + nc * 2 * CONE_SEG.around * CONE_SEG.along;
+      stats.bodies = nc; stats.navGlows = nn;
+      stats.triangles = 2 * ns + 2 * ng + nc * 2 * CONE_SEG.around * CONE_SEG.along + bodyTris + 2 * nn;
       return stats;
     }
 
     function dispose() {
       shotGeo.dispose(); shotMat.dispose(); glowGeo.dispose(); glowMat.dispose(); coneGeo.dispose();
       for (var i = 0; i < cones.length; i++) cones[i].material.dispose();
+      navGeo.dispose();
+      for (var bk in BG) if (BG[bk] && BG[bk].isBufferGeometry) BG[bk].dispose();
+      for (var mk in bodyMat) bodyMat[mk].dispose();
+      for (i = 0; i < faceMats.length; i++) faceMats[i].dispose();
       if (group.parent) group.parent.remove(group);
     }
 
@@ -539,7 +681,7 @@
   }
 
   globalThis.HikyakuEvents = {
-    RATES: RATES, LASER: LASER, LIGHT: LIGHT, SLOT: SLOT, KINDS: KINDS, POOL: POOL, CONE_SEG: CONE_SEG,
+    RATES: RATES, LASER: LASER, LIGHT: LIGHT, SLOT: SLOT, KINDS: KINDS, POOL: POOL, CONE_SEG: CONE_SEG, BODY: BODY,
     schedule: schedule, state: state, perHour: perHour, create: create
   };
 })();

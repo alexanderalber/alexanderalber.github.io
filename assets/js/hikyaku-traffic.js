@@ -783,7 +783,7 @@
                step     [a, b] distance between candidate rows, m
                         (default [600, 900])
                keep     share of the candidate rows that carry a lane at
-                        density 1 (default 0.3)
+                        density 1 (default 0.5)
                speed    [a, b] m/s (default [15, 20])
                gap      [a, b] spacing as a multiple of the lane length
                         (default [1.6, 3])
@@ -794,8 +794,10 @@
      lane is straight and open and carries ONE freighter (spacing larger
      than the lane), which is on the lane for 1 / gap of its period and
      absent the rest: with the defaults a freighter is in the box about 45 %
-     of the time per lane, so a 4 km box at density 1 has four lanes and
-     about two freighters, usually one in sight. The random phase decides
+     of the time per lane, so a 4 km box at density 1 has six lanes (five
+     to six candidate rows per axis, half of them kept; at 0.4 the rounding
+     still gave four) and two to three freighters, usually one or two in
+     sight. The random phase decides
      when. Every lane carries lane.freight = { axis: 'x' | 'z', y, row }. */
   function rng32(seed) {
     let a = (seed | 0) ^ 0x6d2b79f5;
@@ -811,7 +813,7 @@
     const pick = (v, i) => (Array.isArray(v) ? +v[i] : +[v.x, v.y, v.z][i]);
     const lo = [pick(bounds.min, 0), 0, pick(bounds.min, 2)], hi = [pick(bounds.max, 0), 0, pick(bounds.max, 2)];
     const density = opts.density != null ? Math.max(0, +opts.density) : 1;
-    const step = opts.step || [600, 900], keep = opts.keep != null ? +opts.keep : 0.3;
+    const step = opts.step || [600, 900], keep = opts.keep != null ? +opts.keep : 0.5;
     const speed = opts.speed || [15, 20], gap = opts.gap || [1.6, 3];
     const ext = opts.ext != null ? +opts.ext : 800, fade = opts.fadeEnds != null ? +opts.fadeEnds : 400;
     const rnd = rng32(Math.imul(seed | 0, 0x2c1b3c6d) ^ 0x5eed);
@@ -1065,7 +1067,8 @@ void main(){
   a += 0.6 * exp(-r * r * uFall * 12.0);
   gl_FragColor = vec4(vCol * a, 1.0);
 }`,
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, fog: true
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, fog: true,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
     });
     const mesh = new THREE.Mesh(g, m);
     mesh.frustumCulled = false;
@@ -1161,6 +1164,9 @@ void main(){
   /* lift fans: centres (x, z), duct radius, centre height */
   const FR_FANS = [[14.5, -46], [-14.5, -46], [14.5, 46], [-14.5, 46]];
   const FR_FAN_R = 5.8, FR_FAN_Y = -8.6;
+  /* fan disc height in the duct frame (hub bottom cap at -1.0) and rim ring
+     radius (duct inner wall at FR_FAN_R - 0.8, ring tube 0.12) */
+  const FR_DISC_Y = -0.9, FR_RIM_R = FR_FAN_R - 0.8 - 0.12 - 0.05;
   /* cargo bays along the spine: container stacks (heights in 2.6 m units
      per column) or a pair of tanks; a fixed table, the paint varies */
   const FR_BAYS = [
@@ -1192,13 +1198,13 @@ void main(){
         }
         bx(g, M.accA, [0.05, 0.07, 19.0], [s * 2.33, -0.05, 0.3]);
         mk(g, revGeo(THREE, [[-9.0, 0.0], [-8.6, 0.42], [-7.6, 0.6], [7.8, 0.6], [8.8, 0.45], [9.2, 0.0]], 10), M.hull2, [s * 1.65, -2.35, 0]);
-        for (const z of [-6, -2, 2, 6]) mk(g, new THREE.CircleGeometry(0.26, 10), M.accA, [s * 1.65, -2.97, z], [Math.PI / 2, 0, 0]);
+        for (const z of [-6, -2, 2, 6]) mk(g, new THREE.CircleGeometry(0.26, 10), M.accA, [s * 1.65, -3.0, z], [Math.PI / 2, 0, 0]);
         bx(g, M.dark, [0.5, 0.6, 1.2], [s * 1.0, -2.1, -3]);
         bx(g, M.dark, [0.5, 0.6, 1.2], [s * 1.0, -2.1, 4]);
       });
       bx(g, M.dark, [3.4, 0.25, 14], [0, 2.52, 1.5]);
       bx(g, M.hull2, [2.6, 1.3, 5.0], [0, 3.3, 3.2]);
-      mirror((s) => bx(g, M.accB, [0.04, 0.9, 4.4], [s * 1.32, 3.3, 3.2]));
+      mirror((s) => bx(g, M.accB, [0.04, 0.9, 4.4], [s * 1.34, 3.3, 3.2]));
       bx(g, M.metal, [1.8, 0.6, 2.2], [0, 2.95, -4.5]);
       mirror((s) => bx(g, M.accA, [0.1, 0.15, 0.6], [s * 2.05, 2.5, -9.0]));
       bx(g, M.white, [3.0, 0.16, 0.06], [0, -0.55, -11.02]);
@@ -1207,7 +1213,7 @@ void main(){
       mirror((s) => bx(g, M.accB, [0.5, 1.6, 0.06], [s * 1.75, 0.2, 10.96]));
       mirror((s) => {
         bx(g, M.dark, [1.0, 0.7, 0.8], [s * 1.0, -1.3, 11.0]);
-        bx(g, M.accA, [0.6, 0.18, 0.04], [s * 1.0, -1.42, 11.42]);
+        bx(g, M.accA, [0.6, 0.18, 0.04], [s * 1.0, -1.42, 11.44]);
       });
       return g;
     }
@@ -1222,7 +1228,7 @@ void main(){
         bx(g, M.accA, [0.05, 0.05, 3.8], [s * 1.38, -0.62, 0.1]);
         bx(g, M.white, [0.55, 0.1, 0.05], [s * 0.6, -0.12, -2.82], [0, s * 0.25, 0]);
       });
-      bx(g, M.accB, [1.9, 0.1, 0.05], [0, 0.18, 2.82]);
+      bx(g, M.accB, [1.9, 0.1, 0.05], [0, 0.18, 2.84]);
       bx(g, M.hull2, [2.0, 0.06, 0.5], [0, 0.42, 2.55]);
       return g;
     }
@@ -1238,14 +1244,16 @@ void main(){
         arm.position.set(sx * DR / 2, 0.3, sz * DR / 2); arm.rotation.y = Math.atan2(sx, sz); g.add(arm);
         const d = new THREE.Group(); d.position.set(sx * DR, 0.35, sz * DR); g.add(d);
         mk(d, ductGeo(THREE, 0.85, 1.05, 0.38, 20), M.paint);
-        mk(d, new THREE.TorusGeometry(0.9, 0.035, 5, 24), M.accA, [0, -0.2, 0], [Math.PI / 2, 0, 0]);
+        /* rim ring just inside the duct mouth, clear of the duct's bottom
+           face and inner wall (it used to cut through both and fought) */
+        mk(d, new THREE.TorusGeometry(0.78, 0.035, 5, 24), M.accA, [0, -0.14, 0], [Math.PI / 2, 0, 0]);
         mk(d, new THREE.CylinderGeometry(0.16, 0.2, 0.3, 8), M.dark);
         const blades = new THREE.Group(); d.add(blades); rotors.push(blades);
         for (let b = 0; b < 3; b++) bx(blades, M.dark, [1.6, 0.03, 0.16], [0, 0.05, 0], [0.2, b * Math.PI / 3, 0]);
       }
       bx(g, M.paint, [2.2, 1.6, 2.8], [0, -1.9, 0]);
       bx(g, M.dark, [2.26, 0.12, 2.86], [0, -1.35, 0]);
-      mirror((s) => bx(g, M.accB, [0.04, 0.14, 2.4], [s * 1.12, -2.1, 0]));
+      mirror((s) => bx(g, M.accB, [0.04, 0.14, 2.4], [s * 1.14, -2.1, 0]));
       for (const sx of [1, -1]) for (const sz of [1, -1]) {
         const a = new THREE.Vector3(sx * 0.7, 0.1, sz * 0.7), b = new THREE.Vector3(sx * 1.0, -1.15, sz * 1.3);
         const L = a.distanceTo(b), m = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, L), M.dark);
@@ -1305,7 +1313,8 @@ void main(){
       });
       /* waterline accent, deck edge in dark, a belly band, hull seams every
          16 m and a sparse row of warm portholes: the small repeats are
-         what gives the hull its size */
+         what gives the hull its size. The portholes stand 2 cm proud of
+         the hull (at 9.97 their inner face lay in it, 5 mm off) */
       mirror((s) => {
         bx(g, M.accA, [0.12, 0.28, 136], [s * 11.04, -1.0, -1]);
         bx(g, M.dark, [0.4, 0.6, 136], [s * 8.9, 4.1, -1]);
@@ -1313,10 +1322,13 @@ void main(){
         for (let i = 0; i < 9; i++) bx(g, M.dark, [0.1, 4.4, 0.25], [s * 10.08, 1.4, -62 + i * 16], [0, 0, s * 0.38]);
         for (let i = 0; i < 40; i++) {
           if (((i * 5 + (s > 0 ? 1 : 3)) % 7) < 3) continue;
-          bx(g, M.win, [0.1, 0.6, 0.9], [s * 9.97, 1.7, -46 + i * 2.9], [0, 0, s * 0.38]);
+          bx(g, M.win, [0.1, 0.6, 0.9], [s * 10.0, 1.7, -46 + i * 2.9], [0, 0, s * 0.38]);
         }
       });
-      /* lift fans: pylon, duct, hub, slow blades, dim glow disc below */
+      /* lift fans: pylon, duct, hub, slow blades, dim glow disc below.
+         Nothing coplanar: the disc sits 10 cm above the hub's bottom cap
+         (they shared y = -1.0 and scribbled), the rim ring runs 5 cm inside
+         the inner wall instead of through the duct's bottom face. */
       const rotors = [];
       for (const f of FR_FANS) {
         const sx = Math.sign(f[0]);
@@ -1324,8 +1336,8 @@ void main(){
         const d = new THREE.Group(); d.position.set(f[0], FR_FAN_Y, f[1]); g.add(d);
         mk(d, ductGeo(THREE, FR_FAN_R - 0.8, FR_FAN_R, 2.6, 28), M.hull2);
         mk(d, new THREE.CylinderGeometry(1.2, 1.5, 2.0, 10), M.dark);
-        mk(d, new THREE.CircleGeometry(FR_FAN_R - 0.9, 24), M.fan, [0, -1.0, 0], [Math.PI / 2, 0, 0]);
-        mk(d, new THREE.TorusGeometry(FR_FAN_R - 0.6, 0.12, 5, 32), M.accA, [0, -1.25, 0], [Math.PI / 2, 0, 0]);
+        mk(d, new THREE.CircleGeometry(FR_FAN_R - 0.9, 24), M.fan, [0, FR_DISC_Y, 0], [Math.PI / 2, 0, 0]);
+        mk(d, new THREE.TorusGeometry(FR_RIM_R, 0.12, 5, 32), M.accA, [0, -1.2, 0], [Math.PI / 2, 0, 0]);
         const blades = new THREE.Group(); d.add(blades); rotors.push(blades);
         const bg = [];
         for (let b = 0; b < 4; b++) {
@@ -1514,6 +1526,8 @@ void main(){
         M.red = basic(new THREE.Color(NAV_RED).multiplyScalar(1.8));
         M.green = basic(new THREE.Color(NAV_GREEN).multiplyScalar(1.8));
         M.fan = basic(new THREE.Color(accA).multiplyScalar(0.35));
+        /* the glow discs win any remaining depth tie */
+        Object.assign(M.fan, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
         M.cargoA = std(0.62, 0.6, 0.2); M.cargoB = std(0.44, 0.6, 0.25); M.cargoC = std(0.74, 0.65, 0.15);
       }
       for (const k in M) owned.push(M[k]);
@@ -1607,7 +1621,7 @@ void main(){
       ];
       for (const f of FR_FANS) {
         P.push(part(new THREE.CylinderGeometry(FR_FAN_R, FR_FAN_R, 2.6, 8, 1, true).translate(f[0], FR_FAN_Y, f[1]), bone(0.36)));
-        P.push(part(new THREE.CylinderGeometry(FR_FAN_R - 0.8, FR_FAN_R - 0.8, 0.1, 8).translate(f[0], FR_FAN_Y - 1.0, f[1]), NA(), 0.3));
+        P.push(part(new THREE.CylinderGeometry(FR_FAN_R - 0.8, FR_FAN_R - 0.8, 0.1, 8).translate(f[0], FR_FAN_Y + FR_DISC_Y, f[1]), NA(), 0.3));
         P.push(part(box(6.5, 2.0, 3.2, Math.sign(f[0]) * 9.4, FR_FAN_Y + 2.2, f[1]), bone(0.2)));
       }
       return mergeGeos(THREE, P, ATTRS);
