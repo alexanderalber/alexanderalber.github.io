@@ -74,6 +74,9 @@
        old uniform city of setback towers); districtSize the scale of the
        district noise in metres; landmarks on or off */
     variety: 0.7, districtSize: 1200, landmarks: true,
+    /* the old town fringe (round two of CITY-VARIETY.md): low courtyard
+       blocks and houses in patches at the city's rim, see districtAt */
+    oldTown: true,
     accents: 2,           /* number of neon hues, 0 to 2 */
     roofGap: 15,          /* roof below the tube bottom, metres */
     margin: 3,            /* extra metres outside the tube radius */
@@ -173,24 +176,35 @@
      the shader's slabs, cornices and plant floors line up with geometry.
      Facade programs (V5), per box in box.prog and per vertex in aFac.w:
        0 curtain wall (core), 1 residential slab, 2 industrial,
-       3 landmark, 4 plain (roof plant, masts, signs, crowns: no windows),
-       5 landmark top tier (program 3 plus the lit crown band). */
+       3 landmark, 4 plain (roof plant, masts, signs: no windows),
+       5 landmark top tier (program 3 plus the lit crown band),
+       6 old town (program 4, punched windows), 7 crown frame (plain, a lit
+       line along its foot: the light slit of V6 and V7; for this code aFac
+       carries the box's foot instead of its top, see boxArrays). */
   var STOREY = 3.6;
-  var PROG_PLAIN = 4, PROG_LANDMARK = 3, PROG_CROWN = 5;
-  /* Districts (V2): 0 core, 1 residential slabs, 2 industrial. No low-rise
-     fringe: the owner's "almost nothing under 40 m" stands. */
-  var DIST_TONE = [0.26, 0.22, 0.17];
-  var ARCHES = ['setback', 'podium', 'twin', 'slab', 'court', 'offset', 'hall', 'silo'];
+  var PROG_PLAIN = 4, PROG_LANDMARK = 3, PROG_CROWN = 5, PROG_OLD = 6, PROG_SLIT = 7;
+  /* Districts (V2): 0 core, 1 residential slabs, 2 industrial, 3 old town.
+     The old town is the one exception to the owner's "almost nothing under
+     40 m": only at the rim of the city (districtAt), 6 to 12 storeys. */
+  var DIST_TONE = [0.26, 0.22, 0.17, 0.24];
+  var ARCHES = ['setback', 'podium', 'twin', 'slab', 'court', 'offset', 'hall', 'silo', 'house'];
   /* Archetype weights per district at full variety (blocks, not lots):
      two to three types per district, one of them dominant. */
   var ARCH_W = [
     { setback: 0.45, podium: 0.33, twin: 0.22 },
     { slab: 0.45, court: 0.3, offset: 0.25 },
-    { hall: 0.5, silo: 0.25, offset: 0.25 }
+    { hall: 0.5, silo: 0.25, offset: 0.25 },
+    { court: 0.6, house: 0.4 }
   ];
   /* lot split a block type wants: 1 whole block, 2 two long lots, 3 either,
-     0 the old rule (1, 2 or 4) */
-  var WHOLE = { setback: 0, offset: 0, slab: 2, podium: 3, twin: 1, court: 1, hall: 3, silo: 1 };
+     4 two or four small lots, 0 the old rule (1, 2 or 4) */
+  var WHOLE = { setback: 0, offset: 0, slab: 2, podium: 3, twin: 1, court: 1, hall: 3, silo: 1, house: 4 };
+  /* The old town (district 3): storeys of a block's high point and the
+     floor of the others, and where it may lie. OLD_HF: it fades in as the
+     height field falls from OLD_HF[0] to OLD_HF[1] (about 1.9 to 2.6 km
+     from the core of the page's city), OLD_SHARE of that land at full
+     variety, in patches of its own noise. */
+  var OLD_FL = [9, 12], OLD_MIN_FL = 6, OLD_HF = [0.27, 0.17], OLD_SHARE = 0.6;
   function pickArch(dist, kv, u) {
     var W = ARCH_W[dist] || ARCH_W[0], acc = 0, k;
     /* blend with the old city (setback towers only) by kv */
@@ -227,11 +241,20 @@
      scale districtSize (its own seed offsets) says core or not; at variety
      v about 0.62 v of the land leaves the core district. A third says
      residential or industrial; industrial only where the height field is
-     below 0.7, never in the tall core. variety 0: all core. */
+     below 0.7, never in the tall core. variety 0: all core. Before all
+     that, the old town (3) claims patches of the rim (OLD_HF, OLD_SHARE)
+     unless C.oldTown is false. */
   function districtAt(x, z, C) {
     var v = clamp(C.variety == null ? DEF.variety : C.variety, 0, 1);
     if (!(v > 0)) return 0;
     var S = clamp(C.districtSize || DEF.districtSize, 200, 5000), sd = (C.seed >>> 0) + 211;
+    /* the old town first: at the rim only, in patches of its own noise
+       (0.7 of the district scale), its share growing with variety up to
+       0.7 like the archetype weights */
+    if ((C.oldTown == null ? DEF.oldTown : C.oldTown)) {
+      var wo = smooth(OLD_HF[0], OLD_HF[1], heightField(x, z, C));
+      if (wo > 0 && rank3(fbm(x / (S * 0.7) + 57.1, z / (S * 0.7) - 23.3, sd + 333, 3)) < OLD_SHARE * wo * Math.min(1, v / 0.7)) return 3;
+    }
     var a = rank3(fbm(x / S, z / S, sd, 3));
     if (a < 1 - 0.62 * v) return 0;
     var b = rank3(fbm(x / S + 31.7, z / S - 12.9, sd + 96, 3));
@@ -282,6 +305,29 @@
       return { ix: ix, iz: iz, blk: blk, type: type, cell: [cx, cz], rect: [x0, z0, x1, z1] };
     }
     return null;
+  }
+
+  /* The old town block nearest to the route (for the ?shot=altstadt hook
+     and the tests): block centres lie on a 108 m grid at 54 m mod 108;
+     every tenth tube sample (40 m apart) looks at the centres within
+     reach metres. Returns { c: [x, z] block centre, p: the sample point,
+     d: horizontal distance } or null. */
+  function oldTownNear(route, C, reach) {
+    var smp = route && route.tube ? route.tube.samples : null;
+    if (!smp) return null;
+    reach = reach || 700;
+    var seen = new Map(), best = null, H = TILE / 2, n = Math.ceil(reach / H);
+    for (var i = 0; i < smp.length; i += 10) {
+      var p = smp[i].p, kx = Math.round((p[0] - H / 2) / H), kz = Math.round((p[2] - H / 2) / H);
+      for (var a = -n; a <= n; a++) for (var b = -n; b <= n; b++) {
+        var cx = (kx + a) * H + H / 2, cz = (kz + b) * H + H / 2, d = Math.hypot(cx - p[0], cz - p[2]);
+        if (d > reach || (best && d >= best.d)) continue;
+        var key = (kx + a) + ',' + (kz + b), v = seen.get(key);
+        if (v == null) { v = districtAt(cx, cz, C) === 3; seen.set(key, v); }
+        if (v) best = { c: [cx, cz], p: p.slice(), d: d };
+      }
+    }
+    return best;
   }
 
   /* City life constants (see holoPlace and beaconPlace in makeTile).
@@ -520,21 +566,137 @@
       }
       return { boxes: out, tiers: tiers, top: f * STOREY };
     }
-    /* roof clutter and maybe a mast on the top tier, as before */
-    function roof(res, cap, tone, sd, g) {
-      var top = res.tiers[res.tiers.length - 1], ty = top.y1;
-      var tw = top.x1 - top.x0, tdp = top.z1 - top.z0, cx = (top.x0 + top.x1) / 2, cz = (top.z0 + top.z1) / 2;
-      var k = R.int(1, 4);
-      for (var i = 0; i < k; i++) {
-        var bw = R.range(2, Math.max(2.5, tw * 0.4)), bd = R.range(2, Math.max(2.5, tdp * 0.4));
-        var bx = cx + R.range(-1, 1) * (tw - bw) * 0.5, bz = cz + R.range(-1, 1) * (tdp - bd) * 0.5;
-        var bh = Math.min(R.range(1.5, 5), Math.max(0.5, cap - ty));
-        res.boxes.push(mk(bx - bw / 2, ty, bz - bd / 2, bx + bw / 2, ty + bh, bz + bd / 2, tone * 0.8, sd, 'roof', g));
+    /* ---- roof programmes (V6) -------------------------------------------
+       One programme per building instead of the old 1 to 4 random boxes of
+       1.5 to 5 m on every roof; every element at least 5 m (the mast
+       aside, as before):
+         plant    one plant storey over 40 to 70 % of the roof, 6 to 10 m
+         crown    four frame walls of 12 to 24 m round an open top, a lit
+                  line along their foot (PROG_SLIT); core high points only
+         pad      the flat roof with its landing pad (res.flat, as before)
+         tanks    2 to 4 square water tanks of 6 to 8 m (residential, old town)
+         cooling  2 to 6 square cooling blocks in a row, heights stepping
+                  up or down (industrial; every hall)
+         none     a bare roof
+       plus a mast on three in four of the other high points above 150 m
+       (never on a pad, never in the old town). Each
+       element is its own box, inside the roof it stands on, under the
+       building's cap, clear of the building's other boxes and of the tube
+       (clear), or it is left out; the building stays either way. The
+       programme draws from its own stream per building (salt 400 + g), so
+       a roof never moves the rest of the tile. */
+    function roofTiers(res, arch) {
+      var out = [], t, u, i, j;
+      for (i = 0; i < res.tiers.length; i++) {
+        t = res.tiers[i];
+        var cov = false;
+        for (j = 0; j < res.tiers.length && !cov; j++) {
+          u = res.tiers[j];
+          if (j !== i && Math.abs(u.y0 - t.y1) < 1e-6 && u.x1 > t.x0 && u.x0 < t.x1 && u.z1 > t.z0 && u.z0 < t.z1) cov = true;
+        }
+        /* a hall keeps its low roof even with the taller block on it */
+        if (!cov || (arch === 'hall' && i === 0)) out.push(t);
       }
-      if (R.chance(0.5)) {
-        var mh = R.range(8, 30), mx = cx + R.range(-0.3, 0.3) * tw;
-        if (ty + mh <= cap) res.boxes.push(mk(mx - 0.18, ty, cz - 0.18, mx + 0.18, ty + mh, cz + 0.18, 0.2, sd, 'mast', g));
+      return out;
+    }
+    function roofPick(arch, plan, top, PR) {
+      var u = PR(), dist = plan.dist;
+      if (arch === 'hall') return 'cooling';
+      if (arch === 'wall') return 'plant';
+      if (dist === 0) {
+        if (plan.peak && top >= 150 && u < 0.5 * KV) return 'crown';
+        return PR() < 0.85 ? 'plant' : 'none';
       }
+      if (dist === 1) return u < 0.45 ? 'tanks' : (u < 0.9 ? 'plant' : 'none');
+      if (dist === 2) return u < 0.5 ? 'cooling' : (u < 0.85 ? 'plant' : 'none');
+      return u < 0.45 ? 'tanks' : (u < 0.75 ? 'plant' : 'none');
+    }
+    function roofProgram(res, arch, plan, cap, tone, sd, g, own) {
+      var s0 = subSeed(ix, iz, C.seed, 400 + g), PR = rng(s0);
+      /* a flat hall keeps its pad two times in five, else the cooling row */
+      var prog = res.flat && !(arch === 'hall' && PR() < 0.6) ? 'pad' : roofPick(arch, plan, res.top, PR);
+      if (prog !== 'pad') res.flat = false;
+      var out = [], capT = Math.min(cap, TOP), tiers = roofTiers(res, arch);
+      if (prog === 'pad' || prog === 'none') return { prog: prog, boxes: out };
+      /* clear of the building's own boxes (standing on one is fine), of the
+         roof's other elements by 1.5 m, and of the tube */
+      function fits(b) {
+        var k;
+        for (k = 0; k < own.length; k++) if (boxesOverlap(b, own[k], 0.8) && !(own[k].max[1] <= b.min[1] + 1e-6)) return false;
+        for (k = 0; k < out.length; k++) if (boxesOverlap(b, out[k], 1.5)) return false;
+        return clear(b);
+      }
+      function put(b) { if (fits(b)) { out.push(b); return true; } return false; }
+      var hall = arch === 'hall', crowned = false;
+      for (var ti = 0; ti < tiers.length; ti++) {
+        var t = tiers[ti], ty = t.y1, tw = t.x1 - t.x0, td = t.z1 - t.z0, room = capT - ty;
+        /* twins get the same roof on both towers; courts, silos and halls
+           one per wing */
+        var TR = rng((s0 + (arch === 'twin' ? 0 : ti * 7919)) >>> 0);
+        var kind = prog;
+        /* a hall's taller block gets plant, the hall itself the cooling row;
+           a crown only on the main roof (on both towers of twins) */
+        if ((hall || (kind === 'crown' && arch !== 'twin')) && ti > 0) kind = 'plant';
+        if (kind === 'crown') {
+          var ch = Math.min(TR.range(12, 24), room);
+          if (ch < 12 || tw < 20 || td < 20) kind = 'plant';
+          else {
+            var th = clamp(Math.min(tw, td) * 0.1, 2.5, 4), ct = tone * 0.8, y1 = ty + ch;
+            var cw = [mk(t.x0, ty, t.z0, t.x1, y1, t.z0 + th, ct, sd, 'crown', g, PROG_SLIT),
+              mk(t.x0, ty, t.z1 - th, t.x1, y1, t.z1, ct, sd, 'crown', g, PROG_SLIT),
+              mk(t.x0, ty, t.z0 + th, t.x0 + th, y1, t.z1 - th, ct, sd, 'crown', g, PROG_SLIT),
+              mk(t.x1 - th, ty, t.z0 + th, t.x1, y1, t.z1 - th, ct, sd, 'crown', g, PROG_SLIT)];
+            var okC = true;
+            for (var q = 0; q < 4 && okC; q++) okC = clear(cw[q]);
+            if (okC) { for (q = 0; q < 4; q++) out.push(cw[q]); crowned = true; }
+            else kind = 'plant';
+          }
+        }
+        if (kind === 'plant') {
+          var k = TR.range(0.4, 0.7), ph = Math.min(TR.range(6, 10), room);
+          var px = Math.min(tw - 2, tw * Math.sqrt(k) * TR.range(0.85, 1.15)), pz = Math.min(td - 2, k * tw * td / Math.max(px, 1));
+          var ux = TR(), uz = TR();
+          if (ph >= 5 && px >= 5 && pz >= 5) {
+            var x0p = t.x0 + 1 + ux * (tw - 2 - px), z0p = t.z0 + 1 + uz * (td - 2 - pz);
+            put(mk(x0p, ty, z0p, x0p + px, ty + ph, z0p + pz, tone * 0.85, sd, 'roof', g));
+          }
+        } else if (kind === 'tanks') {
+          var nt = TR.int(2, 4), ts = TR.range(6, 8), tH = Math.min(TR.range(6, 8), room), made = 0;
+          for (var tr = 0; tr < 14 && made < nt && tH >= 5 && tw >= ts + 3 && td >= ts + 3; tr++) {
+            var tx = t.x0 + 1.5 + TR() * (tw - 3 - ts), tz = t.z0 + 1.5 + TR() * (td - 3 - ts);
+            if (put(mk(tx, ty, tz, tx + ts, ty + tH, tz + ts, tone * 0.75, sd, 'roof', g))) made++;
+          }
+        } else if (kind === 'cooling') {
+          /* a row along the longer side, heights stepping up or down */
+          var alongX = tw >= td, len = alongX ? tw : td, wid = alongX ? td : tw;
+          var nc = TR.int(2, 6), cs = Math.min(TR.range(8, 13), wid - 4), gp = TR.range(2, 4);
+          while (nc > 2 && nc * cs + (nc - 1) * gp > len - 4) nc--;
+          if (nc * cs + (nc - 1) * gp > len - 4) cs = (len - 4 - (nc - 1) * gp) / nc;
+          var h0 = TR.range(6, 9), st = TR.range(1.5, 3), up = TR.chance(0.5), a0 = TR(), w0 = TR();
+          var run = nc * cs + (nc - 1) * gp;
+          var r0 = (alongX ? t.x0 : t.z0) + 2 + a0 * (len - 4 - run), c0 = (alongX ? t.z0 : t.x0) + 2 + w0 * (wid - 4 - cs);
+          for (var ci = 0; ci < nc && cs >= 5; ci++) {
+            var hc = Math.min(h0 + (up ? ci : nc - 1 - ci) * st, room);
+            if (hc < 5) continue;
+            var a1 = r0 + ci * (cs + gp);
+            put(alongX ? mk(a1, ty, c0, a1 + cs, ty + hc, c0 + cs, tone * 0.85, sd, 'roof', g)
+              : mk(c0, ty, a1, c0 + cs, ty + hc, a1 + cs, tone * 0.85, sd, 'roof', g));
+          }
+        }
+        /* a mast on a high point above 150 m three times in four (not in the
+           old town), on the main roof: in the open middle of a crown, else
+           wherever the plant leaves room; about one per 300 m of city */
+        if (ti === tiers.length - 1 && plan.dist !== 3 && plan.peak && res.top >= 150 && TR.chance(0.75)) {
+          var mh = TR.range(8, 30);
+          for (var mt = 0; mt < 6 && ty + mh <= capT; mt++) {
+            var mx = t.x0 + tw * TR.range(0.3, 0.7), mz = t.z0 + td * TR.range(0.3, 0.7);
+            if (put(mk(mx - 0.18, ty, mz - 0.18, mx + 0.18, ty + mh, mz + 0.18, 0.2, sd, 'mast', g))) break;
+          }
+        }
+      }
+      /* a crown that did not fit became plant */
+      if (prog === 'crown' && !crowned) prog = 'plant';
+      return { prog: prog, boxes: out };
     }
     /* Bridges between the two towers of one building (twins, the landmark
        pair): axis 0 means A lies at lower x than B, axis 1 at lower z.
@@ -588,9 +750,7 @@
         var f = plan.face, m = R.range(1.5, 3), fi = 1;
         var fp = [L[0] + (f[0] < 0 ? fi : m), L[1] + (f[1] < 0 ? fi : m), L[2] - (f[0] > 0 ? fi : m), L[3] - (f[1] > 0 ? fi : m)];
         var side = f[0] > 0 ? 0 : f[0] < 0 ? 1 : f[1] > 0 ? 2 : 3;
-        var res = stack(fp, 0, nFl, 'side', L, tone, sd, g, prog, R.int(2, 4), side);
-        roof(res, cap, tone, sd, g);
-        return res;
+        return stack(fp, 0, nFl, 'side', L, tone, sd, g, prog, R.int(2, 4), side);
       },
       setback: function (L, nFl, cap, tone, sd, g, prog) {
         var w = L[2] - L[0], d = L[3] - L[1], tw = w - R.range(2, 7), td = d - R.range(2, 7);
@@ -598,7 +758,6 @@
         var r = R(), style = r < 1 - 2 * KV / 3 ? 'center' : (r < 1 - KV / 3 ? 'side' : 'corner');
         var res = stack([cx - tw / 2, cz - td / 2, cx + tw / 2, cz + td / 2], 0, nFl, style, L, tone, sd, g, prog);
         res.flat = tw >= 22 && td >= 22 && R.chance(0.35);
-        if (!res.flat) roof(res, cap, tone, sd, g);
         return res;
       },
       offset: function (L, nFl, cap, tone, sd, g, prog) {
@@ -609,7 +768,6 @@
         var nt = nFl * STOREY > 70 ? R.int(3, 4) : 2;
         var res = stack([cx - bw / 2, cz - bd / 2, cx + bw / 2, cz + bd / 2], 0, nFl, 'offset', inner, tone, sd, g, prog, nt);
         res.flat = R.chance(0.3);
-        if (!res.flat) roof(res, cap, tone, sd, g);
         return res;
       },
       slab: function (L, nFl, cap, tone, sd, g, prog) {
@@ -623,7 +781,6 @@
         /* at most one step, one-sided */
         var res = stack(fp, 0, nFl, 'side', L, tone, sd, g, prog, R.chance(0.45) ? 2 : 1);
         res.flat = dep >= 20 && R.chance(0.3);
-        if (!res.flat) roof(res, cap, tone, sd, g);
         return res;
       },
       podium: function (L, nFl, cap, tone, sd, g, prog) {
@@ -638,7 +795,6 @@
         var res = stack([tx0, tz0, tx0 + tw, tz0 + td], pf, nFl - pf, R.chance(0.5) ? 'center' : 'side', P, tone, sd, g, prog);
         res.boxes.unshift(base);
         res.tiers.unshift({ x0: P[0], x1: P[2], z0: P[1], z1: P[3], y0: 0, y1: pf * STOREY });
-        roof(res, cap, tone, sd, g);
         return res;
       },
       twin: function (L, nFl, cap, tone, sd, g, prog) {
@@ -670,17 +826,7 @@
           res.tiers.push({ x0: q[0], x1: q[2], z0: q[1], z1: q[3], y0: f1 * STOREY, y1: f2 * STOREY });
           res.top = f2 * STOREY; res.flat = false;
         }
-        /* plant on the hall roof: a few blocks of 6 to 12 m, nothing under 5 m */
-        var low = res.tiers[0], nu = R.int(2, 4);
-        for (var i = 0; i < nu; i++) {
-          var uw = R.range(8, 16), ud = R.range(8, 16), uh = Math.min(R.range(6, 12), cap - low.y1);
-          if (uh < 5) break;
-          var ux = R.range(low.x0 + uw / 2 + 2, low.x1 - uw / 2 - 2), uz = R.range(low.z0 + ud / 2 + 2, low.z1 - ud / 2 - 2);
-          var ub = mk(ux - uw / 2, low.y1, uz - ud / 2, ux + uw / 2, low.y1 + uh, uz + ud / 2, tone * 0.85, sd, 'roof', g);
-          var hit = false;
-          for (var j = 1; j < res.boxes.length; j++) if (boxesOverlap(ub, res.boxes[j], 1)) hit = true;
-          if (!hit) res.boxes.push(ub);
-        }
+        /* the cooling row on the hall roof comes from the roof programme */
         return res;
       },
       silo: function (L, nFl, cap, tone, sd, g, prog) {
@@ -696,16 +842,25 @@
           res.top = Math.max(res.top, f * STOREY);
         }
         return res;
+      },
+      /* an old town house: one box on its small lot, 1 to 3 m in, now and
+         then the upper storeys stepped back on one side */
+      house: function (L, nFl, cap, tone, sd, g, prog) {
+        var m = R.range(1, 3), fp = [L[0] + m, L[1] + m, L[2] - m, L[3] - m];
+        if (fp[2] - fp[0] < 12 || fp[3] - fp[1] < 12) return null;
+        var res = stack(fp, 0, nFl, 'side', L, tone, sd, g, prog, R.chance(0.65) ? 1 : 2);
+        res.flat = false;
+        return res;
       }
     };
     /* the type a lot falls back to when the tube lowers it */
-    var SIMPLER = { setback: 'setback', offset: 'setback', slab: 'slab', podium: 'setback', twin: 'setback', hall: 'hall', silo: 'hall', court: 'court', wall: 'wall' };
+    var SIMPLER = { setback: 'setback', offset: 'setback', slab: 'slab', podium: 'setback', twin: 'setback', hall: 'hall', silo: 'hall', court: 'court', wall: 'wall', house: 'house' };
 
     /* Courtyard, U and L (V4): wings round a court of 20 to 36 m on a whole
        block, one wing maybe a fifth to two fifths taller. Each wing has its
        own cap: a wing under the tube is lowered or left out, so a U becomes
        an L rather than a cut tower. */
-    function court(L, nFl, tone, sd, g, prog) {
+    function court(L, nFl, tone, sd, g, prog, minFl, maxFl) {
       var m = R.range(2, 4), P = [L[0] + m, L[1] + m, L[2] - m, L[3] - m];
       var w = P[2] - P[0], d = P[3] - P[1], c = R.range(20, 36);
       var dx = (w - c) / 2, dz = (d - c) / 2;
@@ -729,10 +884,10 @@
           if (!keep[0]) q[1] = P[1];
           if (!keep[1]) q[3] = P[3];
         }
-        var f = i === tall ? Math.round(nFl * R.range(1.2, 1.4)) : nFl;
+        var f = Math.min(i === tall ? Math.round(nFl * R.range(1.2, 1.4)) : nFl, maxFl);
         var cap = Math.min(capFor(q[0], q[1], q[2], q[3]), TOP);
         if (f * STOREY > cap - 6) { f = fl(cap - 6); lots.lowered++; }
-        if (f < MIN_FL) continue;
+        if (f < minFl) continue;
         var bx = mk(q[0], 0, q[1], q[2], f * STOREY, q[3], tone + R.range(-0.015, 0.015), sd, 'tier', g, prog);
         if (!clear(bx)) continue;
         res.boxes.push(bx);
@@ -742,7 +897,10 @@
       return res.boxes.length ? res : null;
     }
 
-    /* Lot placement with the tube rule. plan: { arch, h, prog, tone, dist, hp }. */
+    /* Lot placement with the tube rule. plan: { arch, h, prog, tone, dist,
+       hp, peak, minFl, maxFl }: peak the block's tallest lot (hp only when
+       the block has several), minFl and maxFl the storeys the plan allows
+       (0: the city's minH and no limit; the old town is lower). */
     function placeLot(lx0, lz0, lx1, lz1, depth, block, plan) {
       lots.total++;
       if (plan.face) lots.wall++;
@@ -750,13 +908,13 @@
          is every lot of a canyon wall */
       if (!R.chance(C.density) && !(plan.hp && KV > 0) && !plan.face) { lots.empty++; return; }
       var cap = capFor(lx0, lz0, lx1, lz1);
-      var w = lx1 - lx0, d = lz1 - lz0;
-      if (cap < C.minH * 0.6 + 6 && plan.arch !== 'court') {
+      var w = lx1 - lx0, d = lz1 - lz0, minFl = plan.minFl || MIN_FL, maxFl = plan.maxFl || Infinity;
+      if (cap < (plan.minFl ? minFl * STOREY : C.minH) * 0.6 + 6 && plan.arch !== 'court') {
         if (depth === 0 && w >= 32 && d >= 32) {
           lots.cut++;
           lots.total--;
           var mx = (lx0 + lx1) / 2, mz = (lz0 + lz1) / 2, gap = 2.5;
-          var sub = { arch: 'setback', h: plan.h, prog: plan.prog, tone: plan.tone, dist: plan.dist };
+          var sub = { arch: plan.dist === 3 ? 'house' : 'setback', h: plan.h, prog: plan.prog, tone: plan.tone, dist: plan.dist, minFl: plan.minFl, maxFl: plan.maxFl };
           placeLot(lx0, lz0, mx - gap, mz - gap, 1, block, sub);
           placeLot(mx + gap, lz0, lx1, mz - gap, 1, block, sub);
           placeLot(lx0, mz + gap, mx - gap, lz1, 1, block, sub);
@@ -769,7 +927,7 @@
       var tone = plan.tone + R.range(-0.03, 0.03) * KV;
       var arch = plan.arch, L = [lx0, lz0, lx1, lz1], res = null;
       if (arch === 'court') {
-        res = court(L, Math.max(MIN_FL, fl(plan.h)), tone, sd, g, plan.prog);
+        res = court(L, Math.max(minFl, fl(plan.h)), tone, sd, g, plan.prog, minFl, maxFl);
         if (!res) { lots.dropped++; return; }
       } else {
         var h = plan.h;
@@ -786,16 +944,20 @@
       }
       lots.built++;
       if (plan.face) lots.wallBuilt++;
+      /* the roof programme (V6): each element checked on its own */
+      var rp = roofProgram(res, arch, plan, cap, tone, sd, g, res.boxes.concat(res.extra || []));
       var b = { g: g, cx: cx, cz: cz, tiers: res.tiers, top: res.top, seed: sd, tone: tone, block: block,
-        arch: arch, dist: plan.dist, prog: plan.prog, face: plan.face || null };
+        arch: arch, dist: plan.dist, prog: plan.prog, face: plan.face || null, roof: rp.prog };
       buildings.push(b);
       for (k = 0; k < res.boxes.length; k++) boxes.push(res.boxes[k]);
+      var rTop = res.top;
+      for (k = 0; k < rp.boxes.length; k++) { boxes.push(rp.boxes[k]); if (rp.boxes[k].kind !== 'mast') rTop = Math.max(rTop, rp.boxes[k].max[1]); }
       if (res.extra) for (k = 0; k < res.extra.length; k++) { bridges.push(boxes.length); boxes.push(res.extra[k]); }
       var tt = res.tiers[res.tiers.length - 1], tw2 = tt.x1 - tt.x0, td2 = tt.z1 - tt.z0;
       if (res.flat && tw2 >= 20 && td2 >= 20 && tt.y1 >= res.top - 1e-6) {
         pads.push({ p: [(tt.x0 + tt.x1) / 2, tt.y1, (tt.z0 + tt.z1) / 2], n: [0, 1, 0], w: tw2, d: td2, kind: 'roof' });
       }
-      if (res.top > 200) lights.push(whiteOf[g] = { p: [(tt.x0 + tt.x1) / 2, res.top + 2, (tt.z0 + tt.z1) / 2], size: 6, kind: 'beacon', hue: -1 });
+      if (res.top > 200) lights.push(whiteOf[g] = { p: [(tt.x0 + tt.x1) / 2, rTop + 2, (tt.z0 + tt.z1) / 2], size: 6, kind: 'beacon', hue: -1 });
     }
 
     /* The landmark of this tile's coarse cell, if its block lies here (V7).
@@ -813,11 +975,12 @@
         var res = stack(P, 0, fl(TOP - crownH), 'center', P, tone, sd, g, PROG_LANDMARK, R.int(3, 4));
         out = res.boxes; tiers = res.tiers;
         out[out.length - 1].prog = PROG_CROWN;
+        /* the frame walls carry the light slit along their foot (V6) */
         var t = tiers[tiers.length - 1], y0 = t.y1, th = 5, ct = tone * 0.8;
-        out.push(mk(t.x0, y0, t.z0, t.x1, TOP, t.z0 + th, ct, sd, 'crown', g));
-        out.push(mk(t.x0, y0, t.z1 - th, t.x1, TOP, t.z1, ct, sd, 'crown', g));
-        out.push(mk(t.x0, y0, t.z0 + th, t.x0 + th, TOP, t.z1 - th, ct, sd, 'crown', g));
-        out.push(mk(t.x1 - th, y0, t.z0 + th, t.x1, TOP, t.z1 - th, ct, sd, 'crown', g));
+        out.push(mk(t.x0, y0, t.z0, t.x1, TOP, t.z0 + th, ct, sd, 'crown', g, PROG_SLIT));
+        out.push(mk(t.x0, y0, t.z1 - th, t.x1, TOP, t.z1, ct, sd, 'crown', g, PROG_SLIT));
+        out.push(mk(t.x0, y0, t.z0 + th, t.x0 + th, TOP, t.z1 - th, ct, sd, 'crown', g, PROG_SLIT));
+        out.push(mk(t.x1 - th, y0, t.z0 + th, t.x1, TOP, t.z1 - th, ct, sd, 'crown', g, PROG_SLIT));
       } else {
         /* a pair: two equal towers to the last storey under TOP, two or
            three bridges between them */
@@ -835,7 +998,7 @@
       for (k = 0; k < out.length; k++) { boxes.push(out[k]); top = Math.max(top, out[k].max[1]); }
       for (k = 0; k < extra.length; k++) { bridges.push(boxes.length); boxes.push(extra[k]); }
       buildings.push({ g: g, cx: (B[0] + B[2]) / 2, cz: (B[1] + B[3]) / 2, tiers: tiers, top: top, seed: sd, tone: tone, block: blk,
-        arch: 'landmark', dist: -1, prog: PROG_LANDMARK });
+        arch: 'landmark', dist: -1, prog: PROG_LANDMARK, roof: LM.type === 'crown' ? 'crown' : 'pad' });
       landmark = { type: LM.type, g: g, block: blk, top: top, cell: LM.cell };
       lots.total++; lots.built++;
       lights.push(whiteOf[g] = { p: [(B[0] + B[2]) / 2, top + 3, (B[1] + B[3]) / 2], size: 9, kind: 'beacon', hue: -1 });
@@ -868,24 +1031,31 @@
           wMin = Math.ceil(wMin / STOREY - 1e-9) * STOREY > C.maxH - 6 ? Math.floor(wMin / STOREY) * STOREY : Math.ceil(wMin / STOREY - 1e-9) * STOREY;
         }
         var hBase = C.minH + (C.maxH - C.minH) * Math.pow(hf, 1.6);
+        /* the old town: its own storeys, the block's high point OLD_FL from
+           the block factor rb; a canyon wall block stays a wall */
+        var old = dist === 3 && !WB;
+        if (dist === 3 && WB) dist = 0;
+        if (old) hBase = STOREY * Math.floor(OLD_FL[0] + (OLD_FL[1] - OLD_FL[0]) * (rb - 0.9) / 0.25 + 0.5);
         /* tall districts cut their blocks finer: slender towers */
         var tallB = hf > 0.55, split, wh = WHOLE[arch];
         if (wh === 1) split = 1;
         else if (wh === 2) split = 2;
         else if (wh === 3) split = r < 0.55 ? 1 : 2;
+        else if (wh === 4) split = r < 0.4 ? 2 : 4;
         else split = r < (tallB ? 0.08 : 0.2) ? 1 : (r < (tallB ? 0.38 : 0.55) ? 2 : 4);
         var hp = R.int(0, split - 1), plans = [];
         for (var li = 0; li < split; li++) {
           var rl = R.range(0.7, 1.1), fall = R.range(0.62, 0.8), t0 = R.range(0.15, 0.34);
           var a = arch;
-          if (split === 4 && WHOLE[a]) a = dist === 0 ? 'setback' : 'offset';
+          if (split === 4 && WHOLE[a] && WHOLE[a] !== 4) a = dist === 0 ? 'setback' : 'offset';
           /* the old city: every lot its own factor; full variety: one
              factor per block and the high point rule */
-          var hh = Math.min(archHeight(a, dist, hBase * (rl + (rb - rl) * KV)), C.maxH - 6);
-          if (li !== hp) hh = Math.max(C.minH, hh * (1 + (fall - 1) * KV));
+          var hh = old ? hBase : Math.min(archHeight(a, dist, hBase * (rl + (rb - rl) * KV)), C.maxH - 6);
+          if (li !== hp) hh = Math.max(old ? OLD_MIN_FL * STOREY : C.minH, hh * (1 + (fall - 1) * KV));
           if (WB) hh = Math.min(Math.max(hh, wMin), Math.max(wMin, C.maxH - 6));
-          plans.push({ arch: a, h: hh, prog: dist, dist: dist, hp: li === hp && split > 1, tone: DIST_TONE[dist] + (t0 - DIST_TONE[dist]) * (1 - KV),
-            face: WB ? WB.face : null });
+          plans.push({ arch: a, h: hh, prog: old ? PROG_OLD : dist, dist: dist, hp: li === hp && split > 1, peak: li === hp,
+            tone: DIST_TONE[dist] + (t0 - DIST_TONE[dist]) * (1 - KV), face: WB ? WB.face : null,
+            minFl: old ? OLD_MIN_FL : 0, maxFl: old ? OLD_FL[1] : 0 });
         }
         if (split === 1) placeLot(bx0, bz0, bx1, bz1, 0, blk, plans[0]);
         else if (split === 2) {
@@ -1322,7 +1492,7 @@
       holograms: holograms, beacons: beacons,
       cables: cables, bridges: bridges, streets: streets, top: top,
       /* per building: archetype, district, facade program, block, roof */
-      buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top, wall: !!b.face }; }),
+      buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top, wall: !!b.face, roof: b.roof }; }),
       landmark: landmark
     };
   }
@@ -1781,7 +1951,14 @@
     { name: 'landmark', bay: [1.2, 1.7], mull: [0.035, 0.07], sill: [0.2, 0.32], head: [0.04, 0.08],
       div: 0.12, pPair: 0.3, pThird: 0.3, bandW: [0.04, 0.12], bandK: [0.2, 0.7],
       pierP: 0.6, plant: [10, 4], cornerP: 0.5, coreP: 0, lut: 3, grp: [[1, 3], [1, 1]],
-      lit: [[0.88, 0.98, 1.2], [1.06, 1.0, 0.9]] }
+      lit: [[0.88, 0.98, 1.2], [1.06, 1.0, 0.9]] },
+    /* old town (round two): punched windows, wide bays of 2.4 to 3.2 m
+       with broad piers and a deep parapet, 30 to 45 % glass, rare plant
+       floors, the residential light band in a warmer colour */
+    { name: 'oldtown', bay: [2.4, 3.2], mull: [0.11, 0.18], sill: [0.24, 0.34], head: [0.1, 0.16],
+      div: 0.16, pPair: 0.3, pThird: 0.25, bandW: [0.06, 0.2], bandK: [0.1, 0.8],
+      pierP: 0.3, plant: [24, 8], cornerP: 0.2, coreP: 0.15, lut: 1, grp: [[1, 3], [1, 2]],
+      lit: [[1.5, 0.9, 0.4], [1.2, 0.98, 0.68]] }
   ];
   /* glass brightness as a fraction of the wall tone (the old fixed value
      was 0.32), the two ends of the glass tint, the frame brightness */
@@ -1793,6 +1970,8 @@
      city's far brightness stays (the unlit texels carry 15 to 50 % of a
      band's mean) */
   var FAC_DIM = [0.2, 2.6];
+  /* the lit line at the foot of a crown frame (PROG_SLIT), metres */
+  var SLIT_H = 1.2;
   /* lit colours scaled to luminance 1 (Rec. 709), so a temperature never
      makes a building brighter or darker */
   function lumOne(c) { var l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; return [c[0] / l, c[1] / l, c[2] / l]; }
@@ -1918,9 +2097,12 @@
     '  vec3 n = normalize(vCgWNrm);',
     '  float wall = 1.0 - step(0.6, abs(n.y));',
     '  float code = vFac.z;',
-    '  float plain = step(3.5, code) * step(code, 4.5);',
-    '  float crown = step(4.5, code);',
-    '  int pr = int(min(code, 3.0) + 0.5);',
+    /* 4 plain, 7 crown frame (plain plus the slit), 5 landmark top tier,
+       6 old town (program 4) */
+    '  float slit = step(6.5, code);',
+    '  float plain = step(3.5, code) * step(code, 4.5) + slit;',
+    '  float crown = step(4.5, code) * step(code, 5.5);',
+    '  int pr = code > 5.5 && code < 6.5 ? 4 : int(min(code, 3.0) + 0.5);',
     '  vec4 PA = uProgA[pr], PB = uProgB[pr], PC = uProgC[pr], PD = uProgD[pr], PE = uProgE[pr], PF = uProgF[pr], PG = uProgG[pr];',
     '  float W = vFac.x, top = vFac.y, u = vFacU, y = vCgWPos.y;',
     '  float fi = abs(n.x) > 0.5 ? (n.x > 0.0 ? 0.0 : 1.0) : (n.z > 0.0 ? 2.0 : 3.0);',
@@ -2014,10 +2196,14 @@
        the sine has mean zero, so its time mean is the old steady band */
     '  float breath = 1.0 + uBreath * sin(6.2832 * (uTime / mix(5.0, 9.0, fract(hb * 3.1)) + hb));',
     '  totalEmissiveRadiance += crownB * wall * vec3(0.82, 0.9, 0.95) * uWinGain * 0.5 * breath;',
+    /* the light slit at the foot of a crown frame (V6): for code 7, top
+       holds the box's foot (boxArrays); box filtered like the bands */
+    '  float slitB = slit * cgCov(top, top + ' + SLIT_H.toFixed(2) + ', y, fy);',
+    '  totalEmissiveRadiance += slitB * wall * vec3(0.82, 0.9, 0.95) * uWinGain * 1.4 * breath;',
     '}'
   ].join('\n');
   var FACADE_DECL = 'varying vec3 vCgWNrm; flat varying float vSeed; varying float vFacU; flat varying vec3 vFac;\n' +
-    'uniform sampler2D uLUT; uniform vec3 uLutLit[4]; uniform vec3 uLutAcc[4]; uniform vec3 uLutDim[4]; uniform vec4 uProgA[4]; uniform vec4 uProgB[4]; uniform vec4 uProgC[4]; uniform vec4 uProgD[4]; uniform vec4 uProgE[4]; uniform vec4 uProgF[4]; uniform vec4 uProgG[4]; uniform vec3 uLitA[4]; uniform vec3 uLitB[4];\n' +
+    'uniform sampler2D uLUT; uniform vec3 uLutLit[NPROG]; uniform vec3 uLutAcc[NPROG]; uniform vec3 uLutDim[NPROG]; uniform vec4 uProgA[NPROG]; uniform vec4 uProgB[NPROG]; uniform vec4 uProgC[NPROG]; uniform vec4 uProgD[NPROG]; uniform vec4 uProgE[NPROG]; uniform vec4 uProgF[NPROG]; uniform vec4 uProgG[NPROG]; uniform vec3 uLitA[NPROG]; uniform vec3 uLitB[NPROG];\n'.replace(/NPROG/g, String(FACADE_PROGRAMS.length)) +
     'uniform float uStorey; uniform float uWinGain; uniform float uLutSize; uniform float uRoofDark;\n' +
     'uniform float uTime; uniform float uLife; uniform float uBreath;\n' +
     'float cgCov(float a, float b, float x, float w){ return clamp((min(b, x + 0.5 * w) - max(a, x - 0.5 * w)) / w, 0.0, 1.0); }\n';
@@ -2123,7 +2309,8 @@
      the facade attribute aFac = (u, W, top, code) of V0: u metres from the
      face's left edge (the lower x or z corner), W the face width, top the
      box's roof height, code the facade program (box.prog). Roof and floor
-     faces get u = W = 0. */
+     faces get u = W = 0. A crown frame (PROG_SLIT) carries its foot in
+     place of its top: its slit is lit from the foot up. */
   function boxArrays(list, toneOf) {
     var nf = 0, i, f, k;
     for (i = 0; i < list.length; i++) nf += list[i].min[1] > 0.05 ? 6 : 5;
@@ -2142,7 +2329,7 @@
           var c = F[k], o = (v + k) * 3, o4 = (v + k) * 4;
           fac[o4] = ta < 0 ? 0 : (c[ta] ? hi[ta] - lo[ta] : 0);
           fac[o4 + 1] = ta < 0 ? 0 : hi[ta] - lo[ta];
-          fac[o4 + 2] = hi[1]; fac[o4 + 3] = code;
+          fac[o4 + 2] = code === PROG_SLIT ? lo[1] : hi[1]; fac[o4 + 3] = code;
           pos[o] = c[0] ? hi[0] : lo[0]; pos[o + 1] = c[1] ? hi[1] : lo[1]; pos[o + 2] = c[2] ? hi[2] : lo[2];
           nrm[o] = n[0]; nrm[o + 1] = n[1]; nrm[o + 2] = n[2];
           col[o] = lr; col[o + 1] = lg; col[o + 2] = lb;
@@ -2232,9 +2419,11 @@
       uniforms: {
         uTime: timeU, uLife: lifeU, uBreath: breathU,
         uLUT: { value: lutTex }, uLutSize: { value: L.size },
-        uLutDim: { value: L.parts.map(function (q) { return new THREE.Vector3(q[0][0], q[0][1], q[0][2]); }) },
-        uLutAcc: { value: L.parts.map(function (q) { return new THREE.Vector3(q[1][0], q[1][1], q[1][2]); }) },
-        uLutLit: { value: L.parts.map(function (q) { return new THREE.Vector3(q[2][0], q[2][1], q[2][2]); }) },
+        /* the means of each program's LUT band (the old town shares the
+           residential band) */
+        uLutDim: { value: FACADE_PROGRAMS.map(function (P) { var q = L.parts[P.lut]; return new THREE.Vector3(q[0][0], q[0][1], q[0][2]); }) },
+        uLutAcc: { value: FACADE_PROGRAMS.map(function (P) { var q = L.parts[P.lut]; return new THREE.Vector3(q[1][0], q[1][1], q[1][2]); }) },
+        uLutLit: { value: FACADE_PROGRAMS.map(function (P) { var q = L.parts[P.lut]; return new THREE.Vector3(q[2][0], q[2][1], q[2][2]); }) },
         uStorey: { value: STOREY },
         uProgA: { value: progVec(function (P) { return [P.bay[0], P.bay[1], P.mull[0], P.mull[1]]; }) },
         uProgB: { value: progVec(function (P) { return [P.sill[0], P.sill[1], P.head[0], P.head[1]]; }) },
@@ -2829,7 +3018,9 @@
     TILE: TILE, PITCH: PITCH, STREET: STREET, BLOCK: BLOCK, LANE_Y: LANE_Y, LANE_CLEAR: LANE_CLEAR, DEF: DEF,
     hash: hash, hashU: hashU, rng: rng, noise2: noise2, fbm: fbm, heightField: heightField,
     STOREY: STOREY, ARCHES: ARCHES, ARCH_W: ARCH_W, LM_CELL: LM_CELL, LM_NEAR: LM_NEAR, LM_FAR: LM_FAR,
-    districtAt: districtAt, landmarkAt: landmarkAt, pickArch: pickArch, rank3: rank3,
+    districtAt: districtAt, landmarkAt: landmarkAt, pickArch: pickArch, rank3: rank3, oldTownNear: oldTownNear,
+    PROG_PLAIN: PROG_PLAIN, PROG_CROWN: PROG_CROWN, PROG_OLD: PROG_OLD, PROG_SLIT: PROG_SLIT, SLIT_H: SLIT_H,
+    OLD_FL: OLD_FL, OLD_MIN_FL: OLD_MIN_FL, OLD_HF: OLD_HF, OLD_SHARE: OLD_SHARE,
     tileKey: tileKey, tileOf: tileOf, inLaneBand: inLaneBand, boxDist: boxDist, boxesOverlap: boxesOverlap,
     makeTile: makeTile, tilesAround: tilesAround, wanted: wanted, makeCity: makeCity, findCanyon: findCanyon,
     boneRGB: boneRGB, windowLUT: windowLUT, toLin: toLin, LUT_BANDS: LUT_BANDS,

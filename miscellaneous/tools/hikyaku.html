@@ -1816,6 +1816,11 @@ function hazeOf(p) {
    city, ?shot=landmark looks at the landmark nearest to the sixth open
    ring from 600 m, ?shot=blockfar looks at the Menger block from 1050 m
    back along its approach, 300 m up, city between and behind.
+   ?shot=altstadt looks at the old town block nearest to the route
+   (HikyakuCity.oldTownNear) from the route point nearest to it, or from
+   180 m off when that point is closer, at least 80 m up. ?shot=crown
+   looks at the roof crown (not a landmark's) nearest the sixth open ring
+   from 150 m, 30 m above its top.
    ?shot=freighter looks across a freighter lane at 300 m with the traffic
    clock fixed so a freighter is in view, ?shot=laser and ?shot=searchlight
    are the city shot with one hand-made event near the camera (also
@@ -1828,7 +1833,7 @@ function hazeOf(p) {
    without storing them, ?variety=<0 to 1> the city's variety
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign', 'altstadt', 'crown'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1876,6 +1881,10 @@ const DEF = {
      facade programs from 0 (the old uniform city) to 1, the scale of the
      district noise in metres, and the landmarks. Applied on "Rebuild". */
   cityVariety: 0.7, cityDistrict: 1200, cityLandmarks: true,
+  /* The old town at the rim (round two of CITY-VARIETY.md): low courtyard
+     blocks and houses. A new key, filled by the merge, so no cfgV bump.
+     Applied on "Rebuild". */
+  cityOldTown: true,
   /* Weather: auto lets rain come and go (HikyakuCity.weatherAt), dry and
      rain pin it. particles: the drifting motes that show speed. */
   weather: 'auto', particles: true,
@@ -2384,13 +2393,13 @@ function App() {
      "Rebuild" copies them over, so dragging a slider does not throw away
      every tile on each step. */
   const cityOf = (q) => ({ density: q.cityDensity, maxH: q.cityMaxH, accents: q.cityAccents,
-    variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks,
+    variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks, oldTown: q.cityOldTown,
     liveliness: q.liveliness, holograms: q.holograms, beacons: q.beacons });
   const [cityCfg, setCityCfg] = useState(() => cityOf(loadStored()));
   const city = useMemo(() => HC.makeCity(route, {
     density: cityCfg.density, maxH: cityCfg.maxH, accents: cityCfg.accents,
     variety: Number.isFinite(URL_VARIETY) ? Math.max(0, Math.min(1, URL_VARIETY)) : cityCfg.variety,
-    districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks,
+    districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks, oldTown: cityCfg.oldTown,
     liveliness: cityCfg.liveliness, holograms: cityCfg.holograms, beacons: cityCfg.beacons,
     core: routeCore(route), reserved: specials, signs: SIGN_META
   }), [route, cityCfg, specials]);
@@ -2818,6 +2827,43 @@ function App() {
           const u = [(best.c[0] - w.p[0]) / h, (best.c[2] - w.p[2]) / h];
           const cam = [best.c[0] - u[0] * 600, 470, best.c[2] - u[1] * 600];
           const v = SD.sub(best.c, cam), l = SD.len(v);
+          state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
+        }
+      }
+      if (SHOT === 'altstadt') {
+        const A = HC.oldTownNear(cfg.route, cfg.city.cfg, 1500);
+        if (A) {
+          const c = [A.c[0], 15, A.c[1]];
+          let h = [A.p[0] - c[0], A.p[2] - c[2]], l = Math.hypot(h[0], h[1]);
+          if (l < 1) { h = [1, 0]; l = 1; }
+          const off = Math.max(l, 180);
+          const cam = [c[0] + h[0] / l * off, Math.max(80, A.p[1]), c[2] + h[1] / l * off];
+          const v = SD.sub(c, cam), lv = SD.len(v);
+          state.s = poseAt(cam, [v[0] / lv, v[1] / lv, v[2] / lv], 0);
+        }
+      }
+      if (SHOT === 'crown') {
+        const w = open[Math.min(5, open.length - 1)], t0 = HC.tileOf(w.p);
+        let cb = null;
+        for (let i = -4; i <= 4; i++) for (let k = -4; k <= 4; k++) {
+          const t = cfg.city.peek(t0[0] + i, t0[1] + k), lg = t.landmark ? t.landmark.g : -1;
+          const own = new Map();
+          for (const b of t.boxes) {
+            if (b.kind !== 'crown' || b.g === lg) continue;
+            const q = own.get(b.g) || { lo: [Infinity, Infinity, Infinity], hi: [-Infinity, -Infinity, -Infinity] };
+            for (let a = 0; a < 3; a++) { q.lo[a] = Math.min(q.lo[a], b.min[a]); q.hi[a] = Math.max(q.hi[a], b.max[a]); }
+            own.set(b.g, q);
+          }
+          for (const q of own.values()) {
+            const c = [(q.lo[0] + q.hi[0]) / 2, q.lo[1], (q.lo[2] + q.hi[2]) / 2];
+            const d = Math.hypot(c[0] - w.p[0], c[2] - w.p[2]);
+            if (!cb || d < cb.d) cb = { c, d, top: q.hi[1] };
+          }
+        }
+        if (cb) {
+          const h = Math.hypot(w.p[0] - cb.c[0], w.p[2] - cb.c[2]) || 1;
+          const cam = [cb.c[0] + (w.p[0] - cb.c[0]) / h * 150, cb.top + 30, cb.c[2] + (w.p[2] - cb.c[2]) / h * 150];
+          const tg = [cb.c[0], cb.c[1], cb.c[2]], v = SD.sub(tg, cam), l = SD.len(v);
           state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
         }
       }
@@ -4004,6 +4050,7 @@ function App() {
           <button className=${'lang-seg' + (p.freighters ? ' active' : '')} onClick=${() => upd('freighters')(!p.freighters)}>Freighters</button>
           <button className=${'lang-seg' + (p.lasers ? ' active' : '')} onClick=${() => upd('lasers')(!p.lasers)}>Lasers</button>
           <button className=${'lang-seg' + (p.searchlights ? ' active' : '')} onClick=${() => upd('searchlights')(!p.searchlights)}>Searchlights</button>
+          <button className=${'lang-seg' + (p.cityOldTown ? ' active' : '')} onClick=${() => upd('cityOldTown')(!p.cityOldTown)}>Old town</button>
           <button className=${'lang-seg' + (cityPending ? ' active' : '')} onClick=${rebuildCity}>Rebuild</button>
         </div>
         <${Slider} label="Freighter density" digits=${2} min=${0} max=${1} step=${0.05}
@@ -4020,6 +4067,9 @@ function App() {
           keeps a 60 m wide corridor under every freighter lane free from 220 m up. Where the race line crosses a
           freighter lane, the freighter leaves a gap of 3 s, like the street lanes. Lasers are rare green exchanges
           between rooftops, searchlights slow pale cones from roofs and drones.</p>
+        <p className="hk-note">"Old town" puts patches of low courtyard blocks and houses, 6 to 12 storeys with punched
+          windows and warmer light, at the rim of the city, about 2 km and more from its core. The outer part of most
+          routes crosses one. It applies on "Rebuild".</p>
       <//>
 
       <${Section} id="music" title="Music" open=${sec === 'music'} onToggle=${toggleSec}
