@@ -53,12 +53,24 @@
  *   - BufferGeometryUtils is not available to a classic script, so the
  *     merge is a small local function.
  *
+ * The heavy freighter (added 2026-10-25, owner's wish "ab und zu, deutlich
+ * ueber allen anderen Verkehrsadern, Grosstransporter"): a fourth type of
+ * 160 m, flying slowly on its own sparse lanes at FREIGHT_Y, well above the
+ * city lanes. Rarity is the design rule, so freighterLanes() lays out only
+ * a handful of long straight lanes with one freighter each and a gap of
+ * several kilometres behind it. It is an ordinary type in every respect
+ * (poses, spacing bound, contacts, gaps); only its LOD bands, its far
+ * streak and its lights (aviation red, green and white, strobes) are its
+ * own.
+ *
  * Everything hangs on globalThis.HikyakuTraffic.
  */
 (function () {
   'use strict';
 
   const CYAN = 0x22e6ff, MAGENTA = 0xff2d95;
+  /* aviation navigation lights, freighter only */
+  const NAV_RED = 0xff2414, NAV_GREEN = 0x2bff7a;
   /* Lane altitudes the city leaves free (bridges and cables only between
      them). hikyaku-city.js defines the same numbers; the two MUST match.
      Not imported on purpose, so neither module depends on the other. */
@@ -68,6 +80,24 @@
      nearFull and nearOut, the mid body fades into the streak between midFull
      and midOut, nothing is drawn beyond cull. Concept values. */
   const BANDS = { nearFull: 70, nearOut: 90, midFull: 220, midOut: 285, cull: 1500 };
+  /* Types with bands of their own. A 160 m freighter at 400 m covers as many
+     pixels as a hauler at 55 m, so it keeps the full model that far out and
+     the mid body to 1500 m; it is also seen from much further than street
+     traffic, hence the larger cull. In createTraffic's opts.bands, flat keys
+     override BANDS and reach only the types without an entry here; a
+     sub-object per type ({ freighter: { cull: 3000 } }) overrides that
+     type. So the page's { cull: 1300 } for street traffic leaves the
+     freighters alone. */
+  const TYPE_BANDS = {
+    freighter: { nearFull: 400, nearOut: 480, midFull: 1500, midOut: 1800, cull: 4000 }
+  };
+  /* Freighter altitudes, one per axis: lanes along x fly at FREIGHT_Y[0],
+     lanes along z at FREIGHT_Y[1], so two freighter lanes never cross at the
+     same height (the 40 m between them leave 10 m between the hull boxes).
+     Both are far above LANE_Y and above all ordinary towers. Landmarks above
+     260 m must stay 60 m clear of the freighter lanes; the city side has to
+     enforce that (not done yet). */
+  const FREIGHT_Y = [280, 320];
 
   /* ---- small vector helpers ------------------------------------------- */
   function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
@@ -125,14 +155,20 @@
      (lift pontoons, roof ad box and rear nozzles included for the hauler,
      the ducts for the drone). radius is the bounding sphere of the box about
      the vehicle origin; it drives the spacing bound and every cheap reject. */
-  const TYPE_NAMES = ['hauler', 'pod', 'drone'];
+  const TYPE_NAMES = ['hauler', 'pod', 'drone', 'freighter'];
+  /* The freighter box spans the lift fans with their nav lamps (20.8 m), the
+     fan bottoms (-10 m) and the strobe on the mast (+20.7 m), nose to tail
+     lamp. As
+     coarse as a building, which is what hitting it should feel like. */
   const BOX = {
     hauler: { min: [-2.4, -3.0, -11.2], max: [2.4, 4.0, 11.45] },
     pod: { min: [-1.4, -0.7, -2.95], max: [1.4, 0.95, 2.95] },
-    drone: { min: [-3.8, -2.75, -3.8], max: [3.8, 0.75, 3.8] }
+    drone: { min: [-3.8, -2.75, -3.8], max: [3.8, 0.75, 3.8] },
+    freighter: { min: [-20.8, -10, -80.6], max: [20.8, 20.7, 80.9] }
   };
-  const PAINTS = { hauler: [0.42, 0.5, 0.58], pod: [0.3, 0.45, 0.62, 0.75], drone: [0.55, 0.68] };
-  const NOMINAL_LEN = { hauler: 22, pod: 5.6, drone: 7.4 };
+  const PAINTS = { hauler: [0.42, 0.5, 0.58], pod: [0.3, 0.45, 0.62, 0.75], drone: [0.55, 0.68],
+    freighter: [0.56, 0.63, 0.7] };
+  const NOMINAL_LEN = { hauler: 22, pod: 5.6, drone: 7.4, freighter: 160 };
 
   /* Eight corners (index bits x, y, z), twelve triangles wound outward. The
      winding is fixed by checking each normal against the box centre rather
@@ -162,6 +198,7 @@
     HULLS[tn] = boxHull(BOX[tn]);
     TYPES[tn] = Object.freeze({
       len: NOMINAL_LEN[tn], boxLength: BOX[tn].max[2] - BOX[tn].min[2],
+      width: BOX[tn].max[0] - BOX[tn].min[0], height: BOX[tn].max[1] - BOX[tn].min[1],
       radius: HULLS[tn].radius, paints: Object.freeze(PAINTS[tn].slice())
     });
   }
@@ -186,7 +223,10 @@
        speed    m/s along the lane, the same for every vehicle (default 30)
        spacing  centre-to-centre distance along the lane, m (default 60),
                 raised to the no-overlap minimum if it is below it
-       types    weights { hauler, pod, drone } (default pod only)
+       types    weights { hauler, pod, drone, freighter } (default pod
+                only). A freighter lane is { freighter: 1 } alone; mixing
+                it with street types works but makes every slot as far
+                apart as two freighters
        phase    arc-length offset of slot 0 at t = t0, m (default 0)
        t0       time offset, s (default 0)
        empty    leave every n-th slot empty (k % n === 0), 0 = none. The
@@ -222,7 +262,8 @@
      lane that doubles back on itself (a hairpin whose legs run closer than
      req); laneClearance(lane) checks that numerically for a generator. */
   function typeWeights(o) {
-    const w = { hauler: 0, pod: 0, drone: 0 };
+    const w = {};
+    for (const tn of TYPE_NAMES) w[tn] = 0;
     if (o.types) {
       for (const k in o.types) {
         const tn = k === 'car' ? 'pod' : k;
@@ -238,9 +279,11 @@
     } else {
       w.pod = 1;
     }
-    const sum = w.hauler + w.pod + w.drone;
+    let sum = 0;
+    for (const tn of TYPE_NAMES) sum += w[tn];
     if (!(sum > 0)) throw new Error('makeLane: all type weights are zero');
-    return { hauler: w.hauler / sum, pod: w.pod / sum, drone: w.drone / sum };
+    for (const tn of TYPE_NAMES) w[tn] /= sum;
+    return w;
   }
 
   /* Pieces: lines { kind 0, a, d } and arcs { kind 1, c, u, w, r } with
@@ -380,8 +423,16 @@
   function slotInfo(lane, k) {
     if (lane.empty > 1 && k % lane.empty === 0) return null;
     const h = hash01(lane.seed, k * 4);
+    /* cumulative over TYPE_NAMES; the boundaries of the first three types
+       are the ones of the old three-type split, so existing lanes keep
+       their vehicles. Rounding past the sum falls to the last used type. */
     const w = lane.types;
-    const type = h < w.hauler ? 'hauler' : (h < w.hauler + w.pod ? 'pod' : 'drone');
+    let type = null, acc = 0;
+    for (const tn of TYPE_NAMES) {
+      if (!(w[tn] > 0)) continue;
+      acc += w[tn]; type = tn;
+      if (h < acc) break;
+    }
     const pl = PAINTS[type];
     return {
       type: type,
@@ -722,6 +773,81 @@
     return best;
   }
 
+  /* ---- freighter lanes --------------------------------------------------
+     freighterLanes(bounds, seed, opts) -> [lane, ...]
+       bounds  the world box the lanes have to cover: { min, max } with
+               [x, y, z] arrays or {x, y, z} vectors (a THREE.Box3 works),
+               y is ignored
+       seed    integer; the same (bounds, seed, opts) give the same lanes
+       opts    density  scales the number of lanes (default 1, 0 = none)
+               step     [a, b] distance between candidate rows, m
+                        (default [600, 900])
+               keep     share of the candidate rows that carry a lane at
+                        density 1 (default 0.3)
+               speed    [a, b] m/s (default [15, 20])
+               gap      [a, b] spacing as a multiple of the lane length
+                        (default [1.6, 3])
+               ext      how far a lane runs past the box on both ends, m
+                        (default 800, out into the fog)
+               fadeEnds dither length at the lane ends (default 400)
+     Lanes along x fly at FREIGHT_Y[0], lanes along z at FREIGHT_Y[1]. Each
+     lane is straight and open and carries ONE freighter (spacing larger
+     than the lane), which is on the lane for 1 / gap of its period and
+     absent the rest: with the defaults a freighter is in the box about 45 %
+     of the time per lane, so a 4 km box at density 1 has four lanes and
+     about two freighters, usually one in sight. The random phase decides
+     when. Every lane carries lane.freight = { axis: 'x' | 'z', y, row }. */
+  function rng32(seed) {
+    let a = (seed | 0) ^ 0x6d2b79f5;
+    return function () {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function freighterLanes(bounds, seed, opts) {
+    opts = opts || {};
+    const pick = (v, i) => (Array.isArray(v) ? +v[i] : +[v.x, v.y, v.z][i]);
+    const lo = [pick(bounds.min, 0), 0, pick(bounds.min, 2)], hi = [pick(bounds.max, 0), 0, pick(bounds.max, 2)];
+    const density = opts.density != null ? Math.max(0, +opts.density) : 1;
+    const step = opts.step || [600, 900], keep = opts.keep != null ? +opts.keep : 0.3;
+    const speed = opts.speed || [15, 20], gap = opts.gap || [1.6, 3];
+    const ext = opts.ext != null ? +opts.ext : 800, fade = opts.fadeEnds != null ? +opts.fadeEnds : 400;
+    const rnd = rng32(Math.imul(seed | 0, 0x2c1b3c6d) ^ 0x5eed);
+    const range = (r) => r[0] + (r[1] - r[0]) * rnd();
+    const out = [];
+    /* axis 0: lanes along x (rows across z), axis 1: lanes along z */
+    for (let ax = 0; ax < 2; ax++) {
+      const along = ax === 0 ? 0 : 2, across = ax === 0 ? 2 : 0, y = FREIGHT_Y[ax];
+      const rows = [];
+      for (let c = lo[across] + range(step) * 0.5; c < hi[across]; c += range(step)) rows.push(c);
+      const n = Math.min(rows.length, Math.round(rows.length * keep * density));
+      /* partial Fisher-Yates: n distinct rows */
+      for (let i = 0; i < n; i++) {
+        const j = i + Math.floor(rnd() * (rows.length - i));
+        const tmp = rows[i]; rows[i] = rows[j]; rows[j] = tmp;
+      }
+      const chosen = rows.slice(0, n).sort((a, b) => a - b);
+      for (const row of chosen) {
+        const a = [0, y, 0], b = [0, y, 0];
+        a[along] = lo[along] - ext; b[along] = hi[along] + ext;
+        a[across] = b[across] = row;
+        const L = b[along] - a[along];
+        const dir = rnd() < 0.5 ? 1 : -1;
+        const v = range(speed), sp = L * range(gap);
+        const lane = makeLane({
+          points: [a, b], dir: dir, speed: v, spacing: sp, phase: rnd() * sp,
+          types: { freighter: 1 }, seed: (Math.imul(seed | 0, 31) + out.length * 7919 + 17) | 0,
+          bob: { amp: 0.5, freq: 0.21 }, maxBank: 0, fadeEnds: fade
+        });
+        lane.freight = { axis: ax === 0 ? 'x' : 'z', y: y, row: row };
+        out.push(lane);
+      }
+    }
+    return out;
+  }
+
   /* =====================================================================
      Visual layer. Everything below takes THREE as a parameter.
      ===================================================================== */
@@ -999,6 +1125,32 @@ void main(){
     sec(1.7, 0.5, 0.45, 0.82, 0.36, 0.95, 0.3)
   ];
   const DR = 2.7;
+  /* Freighter hull: a long blunt slab, nose at -80, widest (11 m half) at
+     the waterline y -1, deck at y 4. */
+  const FR_ST = [
+    sec(-80, 2.5, -0.5, 4.0, -2.5, 3.0, -4.5),
+    sec(-77, 6.5, 2.2, 8.5, -1.8, 6.5, -6.0),
+    sec(-70, 9.0, 4.0, 11.0, -1.0, 9.0, -7.0),
+    sec(68, 9.0, 4.0, 11.0, -1.0, 9.0, -7.0),
+    sec(76, 8.0, 3.6, 10.0, -1.2, 8.0, -6.2),
+    sec(80, 6.0, 2.2, 8.0, -1.5, 6.0, -4.8)
+  ];
+  /* raised bridge, raked at the front, on the deck over the nose */
+  const FR_BRIDGE = [
+    sec(-69, 4.5, 13.0, 7.5, 9.0, 8.0, 3.8),
+    sec(-65, 6.5, 15.0, 8.0, 9.0, 8.0, 3.8),
+    sec(-50, 6.5, 15.0, 8.0, 9.0, 8.0, 3.8),
+    sec(-48, 5.5, 14.5, 7.5, 9.0, 7.8, 3.8)
+  ];
+  /* lift fans: centres (x, z), duct radius, centre height */
+  const FR_FANS = [[14.5, -46], [-14.5, -46], [14.5, 46], [-14.5, 46]];
+  const FR_FAN_R = 5.8, FR_FAN_Y = -8.6;
+  /* cargo bays along the spine: container stacks (heights in 2.6 m units
+     per column) or a pair of tanks; a fixed table, the paint varies */
+  const FR_BAYS = [
+    { z: -40, c: [2, 3, 2] }, { z: -27, c: [3, 3, 1] }, { z: -14, c: [2, 2, 3] }, { z: -1, tank: true },
+    { z: 12, tank: true }, { z: 25, c: [1, 3, 3] }, { z: 38, c: [3, 2, 2] }, { z: 51, c: [2, 3, 1] }
+  ];
 
   function makeBuilders(THREE) {
     function mk(parent, geo, mat, pos, rot) {
@@ -1088,16 +1240,115 @@ void main(){
       g.userData.rotors = rotors;
       return g;
     }
-    return { hauler: hauler, pod: pod, drone: drone };
+    /* Freighter: 160 m heavy lifter. Bone hull with a raked bridge over the
+       nose (two rows of warm windows on each side, one across the front),
+       container stacks and a tank pair along the spine, four big ducted lift
+       fans slung under the hull with a dim accent glow, one thin accent line
+       at the waterline, two aft nozzles. The running lights are separate
+       lamp meshes tagged userData.light (port, starboard, tail, strobe), at
+       the positions of the light table, so model and glow agree. */
+    function freighter(M) {
+      const g = new THREE.Group();
+      mk(g, loftGeo(THREE, FR_ST), M.paint);
+      mk(g, loftGeo(THREE, FR_BRIDGE), M.cargoA);
+      /* bridge roof and mast */
+      bx(g, M.dark, [10, 0.6, 12], [0, 15.2, -57]);
+      bx(g, M.metal, [0.7, 4.6, 0.7], [0, 17.6, -58]);
+      bx(g, M.metal, [5, 0.3, 0.3], [0, 18.6, -58]);
+      /* windows: two rows per side on the vertical bridge wall, one row
+         across the front; every fifth one dark */
+      mirror((s) => {
+        for (let row = 0; row < 2; row++) {
+          for (let i = 0; i < 12; i++) {
+            const lit = ((i * 7 + row * 3 + (s > 0 ? 2 : 0)) % 5) !== 0;
+            bx(g, lit ? M.win : M.glass, [0.12, 1.0, 0.75], [s * 8.04, 5.4 + row * 2.1, -63.5 + i * 1.15]);
+          }
+        }
+      });
+      for (let i = 0; i < 8; i++) bx(g, (i % 4) !== 1 ? M.win : M.glass, [0.85, 1.1, 0.12], [-3.5 + i, 11.0, -69.05]);
+      for (let i = 0; i < 11; i++) bx(g, (i % 3) !== 2 ? M.win : M.glass, [0.85, 0.9, 0.12], [-5.0 + i, 7.0, -69.05]);
+      /* cargo */
+      const mats = [M.paint, M.cargoA, M.cargoB, M.cargoC];
+      FR_BAYS.forEach((bay, bi) => {
+        if (bay.tank) {
+          mirror((s) => {
+            mk(g, revGeo(THREE, [[-6.0, 0], [-5.8, 2.4], [-5.0, 3.1], [5.0, 3.1], [5.8, 2.4], [6.0, 0]], 14), M.cargoC, [s * 4.2, 7.3, bay.z]);
+            bx(g, M.dark, [1.2, 2.6, 0.6], [s * 4.2, 5.2, bay.z - 4]);
+            bx(g, M.dark, [1.2, 2.6, 0.6], [s * 4.2, 5.2, bay.z + 4]);
+          });
+          bx(g, M.dark, [0.8, 0.8, 12], [0, 10.8, bay.z]);
+          return;
+        }
+        bay.c.forEach((h, ci) => {
+          for (let k = 0; k < h; k++) {
+            const m = mats[(bi * 5 + ci * 3 + k * 7) % 4];
+            bx(g, m, [5.2, 2.5, 12.0], [(ci - 1) * 5.5, 5.3 + k * 2.6, bay.z]);
+          }
+        });
+        bx(g, M.dark, [16.6, 0.2, 0.5], [0, 4.1, bay.z + 6.4]);
+      });
+      /* waterline accent, deck edge in dark, a belly band, hull seams every
+         16 m and a sparse row of warm portholes: the small repeats are
+         what gives the hull its size */
+      mirror((s) => {
+        bx(g, M.accA, [0.12, 0.28, 136], [s * 11.04, -1.0, -1]);
+        bx(g, M.dark, [0.4, 0.6, 136], [s * 8.9, 4.1, -1]);
+        bx(g, M.dark, [0.1, 0.9, 134], [s * 9.97, -4.2, -1], [0, 0, -s * 0.32]);
+        for (let i = 0; i < 9; i++) bx(g, M.dark, [0.1, 4.4, 0.25], [s * 10.08, 1.4, -62 + i * 16], [0, 0, s * 0.38]);
+        for (let i = 0; i < 40; i++) {
+          if (((i * 5 + (s > 0 ? 1 : 3)) % 7) < 3) continue;
+          bx(g, M.win, [0.1, 0.6, 0.9], [s * 9.97, 1.7, -46 + i * 2.9], [0, 0, s * 0.38]);
+        }
+      });
+      /* lift fans: pylon, duct, hub, slow blades, dim glow disc below */
+      const rotors = [];
+      for (const f of FR_FANS) {
+        const sx = Math.sign(f[0]);
+        bx(g, M.dark, [6.5, 2.0, 3.2], [sx * 9.4, FR_FAN_Y + 2.2, f[1]]);
+        const d = new THREE.Group(); d.position.set(f[0], FR_FAN_Y, f[1]); g.add(d);
+        mk(d, ductGeo(THREE, FR_FAN_R - 0.8, FR_FAN_R, 2.6, 28), M.hull2);
+        mk(d, new THREE.CylinderGeometry(1.2, 1.5, 2.0, 10), M.dark);
+        mk(d, new THREE.CircleGeometry(FR_FAN_R - 0.9, 24), M.fan, [0, -1.0, 0], [Math.PI / 2, 0, 0]);
+        mk(d, new THREE.TorusGeometry(FR_FAN_R - 0.6, 0.12, 5, 32), M.accA, [0, -1.25, 0], [Math.PI / 2, 0, 0]);
+        const blades = new THREE.Group(); d.add(blades); rotors.push(blades);
+        const bg = [];
+        for (let b = 0; b < 4; b++) {
+          bg.push(new THREE.BoxGeometry(2 * FR_FAN_R - 2.0, 0.18, 1.3).applyMatrix4(new THREE.Matrix4().makeRotationFromEuler(
+            new THREE.Euler(0.25, b * Math.PI / 4, 0))).translate(0, 0.2, 0));
+        }
+        mk(blades, mergeGeos(THREE, bg, ['position', 'normal']), M.dark);
+      }
+      /* aft nozzles */
+      mirror((s) => {
+        mk(g, revGeo(THREE, [[75.5, 2.4], [78.5, 2.6], [80.3, 2.2]], 12), M.dark, [s * 4.5, -1.5, 0]);
+        mk(g, new THREE.CircleGeometry(1.9, 12), M.fan, [s * 4.5, -1.5, 80.2]);
+      });
+      /* running lights and strobes: lamp bodies from the light table */
+      const lamps = [];
+      LIGHTS.freighter.forEach((lt, li) => {
+        if (!lt.tag) return;
+        const mat = lt.c === 'r' ? M.red : lt.c === 'g' ? M.green : M.white;
+        const m = mk(g, new THREE.BoxGeometry(0.6, 0.6, 0.6), mat, lt.p);
+        m.userData.light = lt.tag; m.userData.li = li;
+        lamps.push(m);
+      });
+      g.userData.rotors = rotors;
+      g.userData.rotorRate = 1.1;
+      g.userData.lamps = lamps;
+      return g;
+    }
+    return { hauler: hauler, pod: pod, drone: drone, freighter: freighter };
   }
   /* Merge a near model's static meshes per material: one draw call per
      material instead of one per part (HANDOFF: 2.8 to 1.1 ms). The rotor
-     blades stay separate because they turn. */
+     blades stay separate because they turn, the freighter's lamps because
+     they carry their tag and the strobes flash. */
   function compactModel(THREE, root) {
     root.updateMatrixWorld(true);
     const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
     const keep = new Set();
     for (const r of root.userData.rotors || []) r.traverse((o) => keep.add(o));
+    for (const l of root.userData.lamps || []) keep.add(l);
     const byMat = new Map(), drop = [];
     root.traverse((o) => {
       if (!o.isMesh || keep.has(o)) return;
@@ -1134,17 +1385,55 @@ void main(){
       { p: [0, 1.0, 0], k: 'omni', s: 2.4, c: 'b', g: 0.9, blink: 1.3 },
       { p: [DR, -0.2, DR], k: 'omni', s: 2.2, c: 'a', g: 0.18 }, { p: [-DR, -0.2, DR], k: 'omni', s: 2.2, c: 'a', g: 0.18 },
       { p: [DR, -0.2, -DR], k: 'omni', s: 2.2, c: 'a', g: 0.18 }, { p: [-DR, -0.2, -DR], k: 'omni', s: 2.2, c: 'a', g: 0.18 }
+    ],
+    /* Aviation convention, the one place where red and green appear: red on
+       the port (left, -x) side, green starboard, white at the tail, white
+       anticollision strobes on top and bottom. The strobes double-flash
+       (bottom 0.3 s after top) every 2.6 s, a closed formula of t; on is
+       the flash length, off the level between flashes. tag names the lamp
+       mesh of the near model. Under each lift fan a faint wide accent glow,
+       warm glows behind the front bridge windows. */
+    freighter: [
+      { p: [-20.5, FR_FAN_Y, -46], k: 'omni', s: 9, c: 'r', g: 1.0, tag: 'port' },
+      { p: [20.5, FR_FAN_Y, -46], k: 'omni', s: 9, c: 'g', g: 1.0, tag: 'starboard' },
+      { p: [0, 2.5, 80.6], k: 'tail', s: 9, c: 'w', g: 1.0, tag: 'tail' },
+      { p: [0, 20.4, -58], k: 'omni', s: 26, c: 'w', g: 1.9, blink: 2.6, on: 0.08, off: 0, tag: 'strobe' },
+      { p: [0, -7.6, 8], k: 'omni', s: 26, c: 'w', g: 1.9, blink: 2.6, on: 0.08, off: 0, shift: 2.3, tag: 'strobe' },
+      { p: [3.5, -1.0, -80.6], k: 'head', s: 5, c: 'w', g: 0.6 }, { p: [-3.5, -1.0, -80.6], k: 'head', s: 5, c: 'w', g: 0.6 },
+      { p: [-2.5, 11.0, -69.6], k: 'head', s: 5, c: 'h', g: 0.22 }, { p: [2.5, 11.0, -69.6], k: 'head', s: 5, c: 'h', g: 0.22 },
+      { p: [FR_FANS[0][0], FR_FAN_Y - 2.0, FR_FANS[0][1]], k: 'omni', s: 22, c: 'a', g: 0.07 },
+      { p: [FR_FANS[1][0], FR_FAN_Y - 2.0, FR_FANS[1][1]], k: 'omni', s: 22, c: 'a', g: 0.07 },
+      { p: [FR_FANS[2][0], FR_FAN_Y - 2.0, FR_FANS[2][1]], k: 'omni', s: 22, c: 'a', g: 0.07 },
+      { p: [FR_FANS[3][0], FR_FAN_Y - 2.0, FR_FANS[3][1]], k: 'omni', s: 22, c: 'a', g: 0.07 }
     ]
   };
+  /* strobe state, the same formula for the glow and the lamp mesh */
+  function flashOn(lt, t, ph) { return mod(t + ph + (lt.shift || 0), lt.blink) < (lt.on || 0.12); }
 
-  /* createTraffic(THREE, { lanes, debug, accents, bands, pools })
+  /* Effective bands of one type: BANDS, then for a type with its own
+     TYPE_BANDS entry that entry (flat overrides do not reach it), else the
+     flat keys of over, then over[type]. */
+  function bandsFor(tn, over) {
+    over = over || {};
+    const b = Object.assign({}, BANDS);
+    if (TYPE_BANDS[tn]) Object.assign(b, TYPE_BANDS[tn]);
+    else for (const k in BANDS) if (typeof over[k] === 'number') b[k] = over[k];
+    if (over[tn]) Object.assign(b, over[tn]);
+    return b;
+  }
+
+  /* createTraffic(THREE, { lanes, debug, accents, warm, bands, pools, fog })
        lanes    makeLane results; the visual reads poses from them, so the
                 collision layer and the picture agree by construction
        accents  [a, b] hex colours: a for strips, underglow, express streaks,
                 b for tail lights and ads (default [CYAN, MAGENTA]); one
                 entry uses that colour for both roles
-       bands    overrides of BANDS
-       pools    near models per type (default { hauler 14, pod 28, drone 16 })
+       warm     hex colour of the freighter's bridge windows (default
+                0xffa63d, the page's WARM)
+       bands    overrides of BANDS, flat for the street types, per type as
+                a sub-object (see TYPE_BANDS); stats.bands has the result
+       pools    near models per type (default { hauler 14, pod 28, drone 16,
+                freighter 3 }); a type without vehicles gets none
        debug    tint the LOD levels (near red, mid green, far blue)
      Returns { group, update(t, cameraPos), dispose(), stats, setDebug(on),
      vehicles }. group must sit in the scene untransformed: the light and
@@ -1153,10 +1442,12 @@ void main(){
   function createTraffic(THREE, opts) {
     opts = opts || {};
     const lanes = opts.lanes || [];
-    const bands = Object.assign({}, BANDS, opts.bands || {});
+    const TB = {};
+    for (const tn of TYPE_NAMES) TB[tn] = bandsFor(tn, opts.bands);
+    const warmC = opts.warm != null ? opts.warm : 0xffa63d;
     const acc = opts.accents && opts.accents.length ? opts.accents : [CYAN, MAGENTA];
     const accA = acc[0], accB = acc.length > 1 ? acc[1] : acc[0];
-    const poolSize = Object.assign({ hauler: 14, pod: 28, drone: 16 }, opts.pools || {});
+    const poolSize = Object.assign({ hauler: 14, pod: 28, drone: 16, freighter: 3 }, opts.pools || {});
     const fog = opts.fog || null;
     const stops = boneStops();
     const bone = (t) => boneColor(THREE, stops, t);
@@ -1188,7 +1479,7 @@ void main(){
     /* near pools: one material set per slot, each with its own crossfade
        range and paint; the programs are shared (same cache key) */
     const WHITE = bone(0.97);
-    function nearMats() {
+    function nearMats(tn) {
       const range = { value: new THREE.Vector2(0, 1) };
       const std = (t, rough, metal) => cgPatch(fog, patchVeh(new THREE.MeshStandardMaterial({
         color: bone(t), roughness: rough, metalness: metal, flatShading: true, side: THREE.DoubleSide }), false, range, tint.near));
@@ -1202,6 +1493,13 @@ void main(){
         accB: basic(new THREE.Color(accB).multiplyScalar(1.6)),
         white: basic(new THREE.Color(1, 1, 1).multiplyScalar(1.8))
       };
+      if (tn === 'freighter') {
+        M.win.color.set(warmC).multiplyScalar(1.25);
+        M.red = basic(new THREE.Color(NAV_RED).multiplyScalar(1.8));
+        M.green = basic(new THREE.Color(NAV_GREEN).multiplyScalar(1.8));
+        M.fan = basic(new THREE.Color(accA).multiplyScalar(0.35));
+        M.cargoA = std(0.62, 0.6, 0.2); M.cargoB = std(0.44, 0.6, 0.25); M.cargoC = std(0.74, 0.65, 0.15);
+      }
       for (const k in M) owned.push(M[k]);
       M.range = range;
       return M;
@@ -1212,7 +1510,7 @@ void main(){
       pools[tn] = [];
       const n = vehicles.some((v) => v.type === tn) ? poolSize[tn] : 0;
       for (let i = 0; i < n; i++) {
-        const M = nearMats();
+        const M = nearMats(tn);
         const obj = compactModel(THREE, builders[tn](M));
         obj.name = 'near-' + tn;
         obj.matrixAutoUpdate = false; obj.visible = false;
@@ -1274,12 +1572,37 @@ void main(){
         return mergeGeos(THREE, P, ATTRS);
       }
     };
+    /* freighter mid body: hull, bridge, one cargo slab, fan drums, and the
+       light rows (bridge windows warm, waterline and fan discs accent) as
+       emissive parts, so the rows the near model shows stay put */
+    LP.freighter = () => {
+      const W = () => new THREE.Color(warmC).multiplyScalar(0.75);
+      const P = [
+        part(loftGeo(THREE, [FR_ST[0], FR_ST[2], FR_ST[3], FR_ST[5]]), NW(), 0, 1),
+        part(loftGeo(THREE, [FR_BRIDGE[0], FR_BRIDGE[1], FR_BRIDGE[3]]), bone(0.62)),
+        part(box(16.6, 6.5, 50, 0, 7.3, -21), bone(0.44)),
+        part(box(16.6, 6.5, 37, 0, 7.3, 44.5), bone(0.36)),
+        part(box(14.8, 5.6, 25, 0, 7.3, 5.5), bone(0.3)),
+        part(box(16.2, 3.1, 12.6, 0, 6.45, -57.2), W(), 1),
+        part(box(8.0, 1.1, 0.2, 0, 11.0, -69.1), W(), 1),
+        part(box(11.0, 0.9, 0.2, 0, 7.0, -69.1), W(), 1),
+        part(box(22.2, 0.3, 136, 0, -1.0, -1), NA(), 1),
+        part(box(0.7, 4.6, 0.7, 0, 17.6, -58), bone(0.28))
+      ];
+      for (const f of FR_FANS) {
+        P.push(part(new THREE.CylinderGeometry(FR_FAN_R, FR_FAN_R, 2.6, 8, 1, true).translate(f[0], FR_FAN_Y, f[1]), bone(0.36)));
+        P.push(part(new THREE.CylinderGeometry(FR_FAN_R - 0.8, FR_FAN_R - 0.8, 0.1, 8).translate(f[0], FR_FAN_Y - 1.0, f[1]), NA(), 0.3));
+        P.push(part(box(6.5, 2.0, 3.2, Math.sign(f[0]) * 9.4, FR_FAN_Y + 2.2, f[1]), bone(0.2)));
+      }
+      return mergeGeos(THREE, P, ATTRS);
+    };
     const midMat = cgPatch(fog, patchVeh(new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.6, metalness: 0.3, flatShading: true }),
       true, null, tint.mid));
     owned.push(midMat);
     const mids = {};
     for (const tn of TYPE_NAMES) {
-      const n = Math.max(1, vehicles.filter((v) => v.type === tn).length);
+      const n = vehicles.filter((v) => v.type === tn).length;
+      if (!n) continue;
       const geo = LP[tn]();
       const aRange = new THREE.InstancedBufferAttribute(new Float32Array(n * 2), 2).setUsage(THREE.DynamicDrawUsage);
       const aPaint = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage);
@@ -1307,6 +1630,7 @@ void main(){
     /* sRGB numbers for the additive layers, which write raw output */
     const srgb = (c) => { const s = new THREE.Color(c).convertLinearToSRGB(); return [s.r, s.g, s.b]; };
     const COL = { w: srgb(WHITE), a: srgb(new THREE.Color(accA)), b: srgb(new THREE.Color(accB)),
+      r: srgb(new THREE.Color(NAV_RED)), g: srgb(new THREE.Color(NAV_GREEN)), h: srgb(new THREE.Color(warmC)),
       dbgN: srgb(new THREE.Color(1, 0.15, 0.1)), dbgM: srgb(new THREE.Color(0.15, 1, 0.25)), dbgF: srgb(new THREE.Color(0.25, 0.45, 1)) };
     const LT = {};
     for (const tn of TYPE_NAMES) LT[tn] = LIGHTS[tn].map((l) => Object.assign({ rgb: COL[l.c] }, l));
@@ -1317,7 +1641,11 @@ void main(){
     const stats = { near: 0, mid: 0, far: 0, culled: 0, fading: 0, total: vehicles.length, lights: 0, streaks: 0,
       nearPeak: {}, nearDenied: 0, deniedTotal: 0, trisNear: 0, trisMid: 0 };
     for (const tn of TYPE_NAMES) stats.nearPeak[tn] = 0;
+    stats.bands = TB;
     const nearCount = {};
+    /* per lane: the largest cull of the types it carries */
+    const laneCull = new Map();
+    for (const v of vehicles) laneCull.set(v.lane, Math.max(laneCull.get(v.lane) || 0, TB[v.type].cull));
 
     function release(v) { if (v.slot >= 0) { pools[v.type][v.slot].owner = -1; v.slot = -1; } }
     function setDebug(on) {
@@ -1338,7 +1666,7 @@ void main(){
       lastT = t;
       const st = stats;
       st.near = st.mid = st.far = st.culled = st.fading = 0; st.nearDenied = 0;
-      for (const tn of TYPE_NAMES) { mids[tn].mesh.count = 0; nearCount[tn] = 0; for (const sl of pools[tn]) sl.used = false; }
+      for (const tn of TYPE_NAMES) { if (mids[tn]) mids[tn].mesh.count = 0; nearCount[tn] = 0; for (const sl of pools[tn]) sl.used = false; }
       let gi = 0, si = 0, trisN = 0;
       const gp = glow.att.iPos.array, gs = glow.att.iSize.array, gc = glow.att.iCol.array;
       const sa = streak.att.iA.array, sb = streak.att.iB.array, sw = streak.att.iW.array, sc = streak.att.iCol.array;
@@ -1346,7 +1674,7 @@ void main(){
       for (const lane of lanes) {
         const list = byLane.get(lane);
         if (!list) continue;
-        if (boxDist(lane.lo, lane.hi, cam) > bands.cull) {
+        if (boxDist(lane.lo, lane.hi, cam) > laneCull.get(lane)) {
           for (const v of list) { release(v); v.state = 'off'; }
           st.culled += list.length;
           continue;
@@ -1365,6 +1693,7 @@ void main(){
           const P = fr.p, F = fr.f, U = fr.u, R = fr.r;
           const dx = cx - P[0], dy = cy - P[1], dz = cz - P[2];
           const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          const bands = TB[v.type];
           if (d > bands.cull) { release(v); v.state = 'off'; st.culled++; continue; }
           M4.set(R[0], U[0], -F[0], P[0], R[1], U[1], -F[1], P[1], R[2], U[2], -F[2], P[2], 0, 0, 0, 1);
           const nearF = 1 - smooth(bands.nearFull, bands.nearOut, d);
@@ -1390,7 +1719,9 @@ void main(){
             sl.obj.matrix.copy(M4); sl.obj.matrixWorldNeedsUpdate = true; sl.obj.visible = true;
             sl.M.range.value.set(0, fN * ef);
             sl.M.paint.color.copy(v.paint);
-            if (sl.obj.userData.rotors) for (const r of sl.obj.userData.rotors) r.rotation.y = t * 11 + v.bobPh;
+            const ud = sl.obj.userData;
+            if (ud.rotors) for (const r of ud.rotors) r.rotation.y = t * (ud.rotorRate || 11) + v.bobPh;
+            if (ud.lamps) for (const lm of ud.lamps) { const lt = LIGHTS[v.type][lm.userData.li]; if (lt.blink) lm.visible = flashOn(lt, t, v.bobPh); }
             nearCount[v.type]++;
             trisN += nearTris[v.type];
           }
@@ -1414,7 +1745,8 @@ void main(){
             let g = lt.g * ef;
             if (lt.k === 'head') g *= 0.15 + 0.85 * Math.pow(Math.max(0, facing), 1.5);
             else if (lt.k === 'tail') g *= 0.3 + 0.7 * Math.pow(Math.max(0, -facing), 1.5);
-            if (lt.blink) g *= mod(t + v.bobPh, lt.blink) < 0.12 ? 1 : 0.08;
+            if (lt.blink) g *= flashOn(lt, t, v.bobPh) ? 1 : (lt.off != null ? lt.off : 0.08);
+            if (g <= 0) continue;
             const col = dbg || lt.rgb;
             gp[gi * 3] = P[0] + R[0] * lx + U[0] * ly - F[0] * lz;
             gp[gi * 3 + 1] = P[1] + R[1] * lx + U[1] * ly - F[1] * lz;
@@ -1423,21 +1755,26 @@ void main(){
             gc[gi * 3] = col[0] * g; gc[gi * 3 + 1] = col[1] * g; gc[gi * 3 + 2] = col[2] * g;
             gi++;
           }
-          /* far streak: grows out of the body over the mid to far fade */
+          /* far streak: grows out of the body over the mid to far fade. The
+             freighter's streak is its own length and wide, warm white from
+             every side: a slow bright bar with the strobes on it. */
           if (farF > 0) {
-            const trail = v.len + ((lane.express ? 70 : 34) - v.len) * farF;
+            const big = v.type === 'freighter';
+            const trail = big ? v.len : v.len + ((lane.express ? 70 : 34) - v.len) * farF;
             let sN = s + v.len / 2, sT = sN - trail;
             if (lane.loop) { sN = mod(sN, lane.L); sT = mod(sT, lane.L); } else { sN = Math.min(sN, lane.L); sT = Math.max(0, sT); }
             lanePoint(lane, sN, nose); lanePoint(lane, sT, tail);
             const hc = lane.express ? COL.a : COL.w;
             const kf = Math.min(1, Math.max(0, (facing + 0.25) / 0.5));
             const k = kf * kf * (3 - 2 * kf);
-            const g = farF * ef * (debug ? 5 : 2.2);
-            const col = dbg || [hc[0] * k + COL.b[0] * (1 - k), hc[1] * k + COL.b[1] * (1 - k), hc[2] * k + COL.b[2] * (1 - k)];
+            const g = farF * ef * (debug ? 5 : big ? 1.5 : 2.2);
+            const col = dbg || (big ? [COL.w[0] * 0.6 + COL.h[0] * 0.4, COL.w[1] * 0.6 + COL.h[1] * 0.4, COL.w[2] * 0.6 + COL.h[2] * 0.4]
+              : [hc[0] * k + COL.b[0] * (1 - k), hc[1] * k + COL.b[1] * (1 - k), hc[2] * k + COL.b[2] * (1 - k)]);
             sa[si * 3] = tail.p[0]; sa[si * 3 + 1] = tail.p[1]; sa[si * 3 + 2] = tail.p[2];
             sb[si * 3] = nose.p[0]; sb[si * 3 + 1] = nose.p[1]; sb[si * 3 + 2] = nose.p[2];
             /* keep the streak at least about 1.5 px wide far out (fov 62, 900 px) */
-            sw[si * 2] = Math.max(lane.express ? 0.6 : 0.5, d * 0.0013); sw[si * 2 + 1] = 1;
+            sw[si * 2] = big ? Math.max(4, d * 0.0026) : Math.max(lane.express ? 0.6 : 0.5, d * 0.0013);
+            sw[si * 2 + 1] = big ? 0.35 : 1;
             sc[si * 3] = col[0] * g; sc[si * 3 + 1] = col[1] * g; sc[si * 3 + 2] = col[2] * g;
             si++;
           }
@@ -1449,6 +1786,7 @@ void main(){
         }
         st.nearPeak[tn] = Math.max(st.nearPeak[tn], nearCount[tn]);
         const m = mids[tn];
+        if (!m) continue;
         m.mesh.instanceMatrix.needsUpdate = true; m.aRange.needsUpdate = true; m.aPaint.needsUpdate = true;
       }
       glow.mesh.geometry.instanceCount = gi; streak.mesh.geometry.instanceCount = si;
@@ -1456,7 +1794,7 @@ void main(){
       for (const k in streak.att) streak.att[k].needsUpdate = true;
       st.lights = gi; st.streaks = si; st.trisNear = trisN;
       st.trisMid = 0;
-      for (const tn of TYPE_NAMES) st.trisMid += mids[tn].mesh.count * mids[tn].tris;
+      for (const tn of TYPE_NAMES) if (mids[tn]) st.trisMid += mids[tn].mesh.count * mids[tn].tris;
       return st;
     }
 
@@ -1471,6 +1809,8 @@ void main(){
 
   const HikyakuTraffic = {
     CYAN: CYAN, MAGENTA: MAGENTA, LANE_Y: Object.freeze(LANE_Y.slice()), BANDS: Object.freeze(Object.assign({}, BANDS)),
+    FREIGHT_Y: Object.freeze(FREIGHT_Y.slice()), TYPE_BANDS: Object.freeze(JSON.parse(JSON.stringify(TYPE_BANDS))),
+    bandsFor: bandsFor, freighterLanes: freighterLanes,
     TYPES: Object.freeze(TYPES), TYPE_NAMES: Object.freeze(TYPE_NAMES.slice()),
     makeLane: makeLane, laneLength: laneLength, countOnLane: countOnLane,
     poseAt: poseAt, velocityAt: velocityAt, nearVehicles: nearVehicles,

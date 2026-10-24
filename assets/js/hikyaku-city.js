@@ -68,8 +68,18 @@
     margin: 3,            /* extra metres outside the tube radius */
     core: null,           /* [x, z] of the tall district, or null */
     coreR: 1600,
-    reserved: null        /* [{ min, max }] world boxes kept empty */
+    reserved: null,       /* [{ min, max }] world boxes kept empty */
+    /* City life (2026-10-25): holograms between towers, aviation beacons
+       and crown breathing, windows that change over time. Rarity is the
+       rule, so every feature has a rate (true = 1, false or 0 = off,
+       up to 2), and liveliness (0 to 1) scales all of them at once. The
+       renderer takes windowLife and the crown breathing from its own
+       options (makeCityRenderer), the tile carries holograms and beacons. */
+    liveliness: 0.6, holograms: 1, beacons: 1, windowLife: 1
   };
+  function rateOf(v) { return v === true ? 1 : (v === false || v == null) ? 0 : clamp(+v || 0, 0, 2); }
+  /* the effective rate of one life feature: its own rate times liveliness */
+  function lifeRate(C, k) { return clamp(C.liveliness == null ? DEF.liveliness : C.liveliness, 0, 1) * rateOf(C[k] == null ? DEF[k] : C[k]); }
 
   function merge(def, cfg) {
     var o = {}, k;
@@ -88,6 +98,11 @@
     h = Math.imul(h ^ (h >>> 16), 0x27d4eb2f);
     return (h ^ (h >>> 15)) >>> 0;
   }
+  /* A seed for a sub-stream of tile (ix, iz). hashU alone gives tiles
+     (x, z) and (-x, -z) the same value when x and z are both odd (the two
+     products are odd, so their negations differ from them only in the
+     same way and the xor cancels); hashing ix first breaks that. */
+  function subSeed(ix, iz, seed, salt) { return hashU(hashU(ix, salt, seed, salt), iz, seed, salt + 1); }
   function hash(ix, iz, seed) { return hashU(ix, iz, seed, 0) / 4294967296; }
   function rng(seed) {
     var a = seed >>> 0;
@@ -249,6 +264,30 @@
     return null;
   }
 
+  /* City life constants (see holoPlace and beaconPlace in makeTile).
+     HOLO_P: chance per tile at life rate 1. Only about 40 % of the tiles
+     round a core have a candidate pair at all, so at liveliness 1 every
+     one of them gets its hologram: 31 to 42 of 81 tiles over three seeds,
+     one per 2 to 3 tiles; 16 to 19 at the default liveliness 0.6. HOLO_SAT: the hologram colour keeps this
+     fraction of the HSV saturation of its neon hue (see holoRGB). */
+  var HOLO_P = 1, HOLO_SAT = 0.45, HOLO_SIMILAR = 0.25, HOLO_GAP = [40, 120], HOLO_MIN_TOP = 120;
+  var BEACON_TALL = 250;
+  /* beacon and hologram light, sRGB numbers for the additive layers: the
+     aviation red and the plant amber are small point lights, the only
+     light outside the two neon hues and the bone whites */
+  var BEACON_RED = [1, 0.09, 0.05], BEACON_AMBER = [1, 0.58, 0.2], HOLO_GAIN = 0.9;
+  /* A neon hue (0xRRGGBB) desaturated to k of its HSV saturation at the
+     same value: every channel moves towards the largest by (1 - k). For
+     the two hues of the page, cyan 0x2ee8ff (S 0.820) and magenta
+     0xff3fa4 (S 0.753), k = 0.45 gives S 0.369 and 0.339, the pastels
+     0xa1f5ff and 0xffa9d6. sRGB numbers, 0 to 1. */
+  function holoRGB(hex, k) {
+    var c = [((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255];
+    var mx = Math.max(c[0], c[1], c[2]);
+    return c.map(function (v) { return mx - (mx - v) * k; });
+  }
+  function hsvSat(c) { var mx = Math.max(c[0], c[1], c[2]), mn = Math.min(c[0], c[1], c[2]); return mx > 0 ? (mx - mn) / mx : 0; }
+
   function tileKey(ix, iz) { return ix + ',' + iz; }
   function tileOf(p) { return [Math.floor(p[0] / TILE), Math.floor(p[2] / TILE)]; }
   function inLaneBand(y0, y1) {
@@ -359,7 +398,7 @@
 
     var boxes = [], buildings = [], pads = [], accents = [], lights = [], cables = [], bridges = [];
     var lots = { total: 0, built: 0, empty: 0, lowered: 0, cut: 0, dropped: 0, boxDrops: 0 };
-    var gId = 0, landmark = null;
+    var gId = 0, landmark = null, whiteOf = {};
     /* KV: how far archetype weights, tones and the high point rule have
        moved from the old uniform city towards the district tables; full at
        variety 0.7. Above 0.7 variety only widens the land outside the core
@@ -686,7 +725,7 @@
       if (res.flat && tw2 >= 20 && td2 >= 20 && tt.y1 >= res.top - 1e-6) {
         pads.push({ p: [(tt.x0 + tt.x1) / 2, tt.y1, (tt.z0 + tt.z1) / 2], n: [0, 1, 0], w: tw2, d: td2, kind: 'roof' });
       }
-      if (res.top > 200) lights.push({ p: [(tt.x0 + tt.x1) / 2, res.top + 2, (tt.z0 + tt.z1) / 2], size: 6, kind: 'beacon', hue: -1 });
+      if (res.top > 200) lights.push(whiteOf[g] = { p: [(tt.x0 + tt.x1) / 2, res.top + 2, (tt.z0 + tt.z1) / 2], size: 6, kind: 'beacon', hue: -1 });
     }
 
     /* The landmark of this tile's coarse cell, if its block lies here (V7).
@@ -729,7 +768,7 @@
         arch: 'landmark', dist: -1, prog: PROG_LANDMARK });
       landmark = { type: LM.type, g: g, block: blk, top: top, cell: LM.cell };
       lots.total++; lots.built++;
-      lights.push({ p: [(B[0] + B[2]) / 2, top + 3, (B[1] + B[3]) / 2], size: 9, kind: 'beacon', hue: -1 });
+      lights.push(whiteOf[g] = { p: [(B[0] + B[2]) / 2, top + 3, (B[1] + B[3]) / 2], size: 9, kind: 'beacon', hue: -1 });
       return true;
     }
 
@@ -934,6 +973,151 @@
       }
     }
 
+    /* ---- city life (2026-10-25) ----
+       Both features draw from their own sub-streams (salts 61 and 62), so
+       the buildings, signs and bridges of a tile are the same with them on
+       or off, and a rate change moves nothing else. */
+    var holograms = holoPlace(), beacons = beaconPlace();
+
+    /* Holograms: rarely a floating billboard between two neighbouring
+       towers of similar height (within HOLO_SIMILAR), whose facing tiers
+       stand HOLO_GAP[0] to HOLO_GAP[1] apart with free air between, in the
+       upper third of the lower tower. One per tile at most, with chance
+       HOLO_P times the life rate; no candidate, no hologram. Out of the
+       tube (every sample point Rm + 4 m from it), out of the lane bands,
+       2 m clear of every box of the tile. No collision. */
+    function holoPlace() {
+      var pH = clamp(HOLO_P * lifeRate(C, 'holograms'), 0, 1), out = [];
+      if (!nAcc || !(pH > 0)) return out;
+      var HR = rng(subSeed(ix, iz, C.seed, 61));
+      if (!(HR() < pH)) return out;
+      var tw = buildings.filter(function (b) { return b.top >= HOLO_MIN_TOP && b.arch !== 'hall' && b.arch !== 'court'; });
+      var pairs = [];
+      for (var i = 0; i < tw.length; i++) for (var j = i + 1; j < tw.length; j++) {
+        var ha = tw[i].top, hb = tw[j].top;
+        if (Math.abs(ha - hb) <= HOLO_SIMILAR * Math.max(ha, hb)) pairs.push([tw[i], tw[j]]);
+      }
+      if (!pairs.length) return out;
+      var p0 = HR.int(0, pairs.length - 1);
+      function tierY(bd, y) {
+        for (var k = bd.tiers.length - 1; k >= 0; k--) { var t = bd.tiers[k]; if (t.y0 <= y && t.y1 >= y) return t; }
+        return null;
+      }
+      function free(q, m) {
+        var k;
+        for (k = 0; k < S.length; k++) {
+          var dx = S[k][0] - q[0], dy = S[k][1] - q[1], dz = S[k][2] - q[2];
+          if (dx * dx + dy * dy + dz * dz < (Rm + 4) * (Rm + 4)) return false;
+        }
+        for (k = 0; k < RES.length; k++) if (boxDist(RES[k], q) < 4) return false;
+        for (k = 0; k < boxes.length; k++) if (boxDist(boxes[k], q) < m) return false;
+        return true;
+      }
+      for (var tr = 0; tr < Math.min(pairs.length, 12) * 3; tr++) {
+        var pr2 = pairs[(p0 + Math.floor(tr / 3)) % pairs.length], A = pr2[0], B = pr2[1];
+        var Hm = Math.min(A.top, B.top);
+        var h = HR.range(15, 30), wt = HR.range(30, 60), tilt = HR.range(3, 9) * (HR.chance(0.5) ? 1 : -1) * Math.PI / 180;
+        var yaw = HR.range(-6, 6) * Math.PI / 180, u = HR(), v = HR();
+        var ylo = Hm * 2 / 3 + h / 2 + 1, yhi = Hm - h / 2 - 4;
+        if (yhi < ylo) continue;
+        var yc = ylo + (yhi - ylo) * u;
+        var ta = tierY(A, yc), tb = tierY(B, yc);
+        if (!ta || !tb) continue;
+        var ox = Math.min(ta.x1, tb.x1) - Math.max(ta.x0, tb.x0), oz = Math.min(ta.z1, tb.z1) - Math.max(ta.z0, tb.z0);
+        var gx = Math.max(tb.x0 - ta.x1, ta.x0 - tb.x1), gz = Math.max(tb.z0 - ta.z1, ta.z0 - tb.z1);
+        var axis = -1, gap = 0, g0 = 0, o0 = 0, o1 = 0;
+        if (oz >= 12 && gx >= HOLO_GAP[0] && gx <= HOLO_GAP[1]) { axis = 0; gap = gx; g0 = Math.min(ta.x1, tb.x1); o0 = Math.max(ta.z0, tb.z0); o1 = o0 + oz; }
+        else if (ox >= 12 && gz >= HOLO_GAP[0] && gz <= HOLO_GAP[1]) { axis = 1; gap = gz; g0 = Math.min(ta.z1, tb.z1); o0 = Math.max(ta.x0, tb.x0); o1 = o0 + ox; }
+        if (axis < 0) continue;
+        var w = Math.min(wt, gap - 10);
+        if (w < 30) continue;
+        var ac = g0 + gap / 2, cc = (o0 + o1) / 2 + (v - 0.5) * 0.5 * (o1 - o0);
+        var c = axis === 0 ? [ac, yc, cc] : [cc, yc, ac];
+        /* right: along the gap, yawed; n0 the horizontal normal; up tilted
+           about right, towards n0 */
+        var right = axis === 0 ? [Math.cos(yaw), 0, Math.sin(yaw)] : [Math.sin(yaw), 0, Math.cos(yaw)];
+        var n0 = [-right[2], 0, right[0]];
+        var up = [n0[0] * Math.sin(tilt), Math.cos(tilt), n0[2] * Math.sin(tilt)];
+        var hy = h / 2 * Math.cos(tilt);
+        if (inLaneBand(yc - hy - 2, yc + hy + 2)) continue;
+        var ok = true;
+        for (var a = 0; a <= 8 && ok; a++) for (var b = 0; b <= 4 && ok; b++) {
+          var su = (a / 8 - 0.5) * w, sv = (b / 4 - 0.5) * h;
+          ok = free([c[0] + right[0] * su + up[0] * sv, c[1] + up[1] * sv, c[2] + right[2] * su + up[2] * sv], 2);
+        }
+        /* free air across the whole gap at the centre height, face to face */
+        for (a = 1; a < 12 && ok; a++) {
+          var sg = (a / 12 - 0.5) * (gap - 2);
+          ok = free(axis === 0 ? [ac + sg, yc, cc] : [cc, yc, ac + sg], 0.5);
+        }
+        if (!ok) continue;
+        out.push({ p: c, right: right, up: up, w: w, h: h, hue: nAcc === 1 ? 0 : HR.int(0, 1), sat: HOLO_SAT,
+          seed: HR(), a: A.g, b: B.g });
+        break;
+      }
+      return out;
+    }
+
+    /* Beacons: a red aviation strobe on every mast, on the landmark's top
+       (two diagonal crown corners, or each tower of a pair) and on every
+       building above BEACON_TALL that has no mast, each with its own
+       phase and a period of 1 to 2 s; one dim amber lamp on the roof plant
+       of an industrial hall (period 0: steady). A building gets its
+       beacons with the life rate as chance (all of them at liveliness 1),
+       a landmark always (there is one per 2.6 km cell at most).
+       The white roof glow of a building with a red beacon goes. */
+    function beaconPlace() {
+      var pB = clamp(lifeRate(C, 'beacons'), 0, 1), out = [];
+      if (!(pB > 0)) return out;
+      var BR = rng(subSeed(ix, iz, C.seed, 62)), kill = [];
+      for (var i = 0; i < buildings.length; i++) {
+        var bd = buildings[i], on = BR() < pB || bd.arch === 'landmark', ph = BR(), per = BR.range(1, 2), n0 = out.length;
+        if (!on) continue;
+        var own = boxes.filter(function (b) { return b.g === bd.g; });
+        var masts = own.filter(function (b) { return b.kind === 'mast'; });
+        var k;
+        function put(p, kind, period) {
+          var q = out.length - n0;
+          out.push({ p: p, kind: kind, phase: fract(ph + q * 0.381966), period: period });
+        }
+        for (k = 0; k < masts.length; k++) put([(masts[k].min[0] + masts[k].max[0]) / 2, masts[k].max[1] + 0.4, (masts[k].min[2] + masts[k].max[2]) / 2], 'mast', per);
+        if (bd.arch === 'landmark') {
+          var crowns = own.filter(function (b) { return b.kind === 'crown'; });
+          if (crowns.length) {
+            var lo = [Infinity, Infinity], hi = [-Infinity, -Infinity], top = 0;
+            for (k = 0; k < crowns.length; k++) {
+              lo[0] = Math.min(lo[0], crowns[k].min[0]); lo[1] = Math.min(lo[1], crowns[k].min[2]);
+              hi[0] = Math.max(hi[0], crowns[k].max[0]); hi[1] = Math.max(hi[1], crowns[k].max[2]); top = Math.max(top, crowns[k].max[1]);
+            }
+            put([lo[0] + 2.5, top + 0.6, lo[1] + 2.5], 'landmark', per);
+            put([hi[0] - 2.5, top + 0.6, hi[1] - 2.5], 'landmark', per);
+          } else {
+            for (k = 0; k < bd.tiers.length; k++) {
+              var t = bd.tiers[k];
+              if (t.y1 >= bd.top - 1e-6) put([(t.x0 + t.x1) / 2, t.y1 + 0.6, (t.z0 + t.z1) / 2], 'landmark', per);
+            }
+          }
+        } else if (!masts.length && bd.top > BEACON_TALL) {
+          var hb = null;
+          for (k = 0; k < own.length; k++) if (!hb || own[k].max[1] > hb.max[1]) hb = own[k];
+          put([(hb.min[0] + hb.max[0]) / 2, hb.max[1] + 0.6, (hb.min[2] + hb.max[2]) / 2], 'tower', per);
+        } else if (bd.arch === 'hall') {
+          var top0 = bd.tiers[0].y1;
+          for (k = 0; k < own.length; k++) {
+            if (own[k].kind === 'roof' && own[k].min[1] >= top0 - 1e-6) {
+              var rb2 = own[k];
+              put([rb2.max[0] - 0.5, rb2.max[1] + 0.5, rb2.max[2] - 0.5], 'plant', 0);
+              break;
+            }
+          }
+        }
+        for (k = n0; k < out.length; k++) if (!pointClear(out[k].p)) { out.splice(k, 1); k--; }
+        if (out.length > n0 && whiteOf[bd.g] && bd.top > BEACON_TALL) kill.push(whiteOf[bd.g]);
+      }
+      if (kill.length) lights = lights.filter(function (l) { return kill.indexOf(l) < 0; });
+      return out;
+    }
+
     var streets = [
       { a: [x0, 0, z0], b: [x0 + TILE, 0, z0] }, { a: [x0, 0, z0 + TILE / 2], b: [x0 + TILE, 0, z0 + TILE / 2] },
       { a: [x0, 0, z0], b: [x0, 0, z0 + TILE] }, { a: [x0 + TILE / 2, 0, z0], b: [x0 + TILE / 2, 0, z0 + TILE] }
@@ -951,6 +1135,7 @@
     return {
       key: tileKey(ix, iz), ix: ix, iz: iz, x0: x0, z0: z0, seed: C.seed,
       boxes: boxes, lots: lots, lights: lights, accents: accents, pads: pads,
+      holograms: holograms, beacons: beacons,
       cables: cables, bridges: bridges, streets: streets, top: top,
       /* per building: archetype, district, facade program, block, roof */
       buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top }; }),
@@ -1412,6 +1597,53 @@
     var pier = q.pierOn && ((cx % q.pierN) + q.pierN) % q.pierN === 0 ? 1 : 0;
     return wx * wy * (1 - plant) * (1 - pier);
   }
+  /* Window life (2026-10-25). The lit decision of a window group is its
+     LUT texel; the texel address is the group's id sid plus seed and face
+     offsets, wrapped into the program's band (FACADE_FRAG). Window life
+     adds an epoch to that address:
+
+       hl = hash(key, seed, face),  ep = floor(t * life * (0.7 + 0.6 hl) + hl)
+       sid += ep * (23, 7)
+
+     key is the whole floor (row of groups) for the office and landmark
+     programs, so a floor lights up or goes dark as one, and the single
+     group for residential and industrial, so windows toggle one by one.
+     life is liveliness * windowLife / LIFE_T epochs per second: at
+     liveliness 1 a group re-draws every LIFE_T = 240 s on average (rates
+     spread by 0.7 to 1.3 and phases by hl, so groups never switch
+     together). A re-draw changes the lit state with chance 2 q (1 - q)
+     for a lit share q: at liveliness 1 about 3 % of the windows toggle
+     per minute (office 2.9, residential 3.6, landmark 2.4, industrial
+     1.0, measured in the test), at the default 0.6 about 60 % of that.
+     life 0: ep is 0, the old pattern.
+
+     Why the far mean stays: the epoch is a time-shifted re-draw from the
+     same distribution. At any t the new address is still a uniformly
+     spread texel of the same band (the shift does not depend on the
+     texel's content, and sid is already spread over the band by the seed
+     offsets and the wrap), so the expected texel of a group is the band
+     mean M_p at every t, and the far value gain * M_p * cover_p of
+     facadeCover holds unchanged. Only which windows are lit moves, not
+     how many. One extra hash per fragment, no new attribute.
+     facadeTexel is the same address in JavaScript, for the test. */
+  var LIFE_T = 240;
+  function lifeSpeed(liveliness, windowLife) {
+    return clamp(liveliness == null ? DEF.liveliness : liveliness, 0, 1) * rateOf(windowLife == null ? DEF.windowLife : windowLife) / LIFE_T;
+  }
+  function gmod(a, n) { return a - n * Math.floor(a / n); }
+  /* LUT texel [x, y] of the window in cell (cx bays, cy storeys) on face
+     fi of a building with seed s, program p, at time t and life speed
+     life (epochs per second), LUT size 64 as the renderer builds it. */
+  function facadeTexel(p, s, fi, cx, cy, t, life) {
+    var P = FACADE_PROGRAMS[p], size = 64;
+    var sx = Math.floor(cx / P.grp[0]) + Math.floor(s * 53) + fi * 17;
+    var sy = Math.floor(cy / P.grp[1]) + Math.floor(s * 97) + fi * 5;
+    var perFl = P.lut === 0 || P.lut === 3 ? 1 : 0;
+    var hl = fract(Math.sin(sx * (1 - perFl) * 12.9898 + sy * 78.233 + s * 37.1 + fi * 3.3) * 43758.5453);
+    var ep = Math.floor(t * life * (0.7 + 0.6 * hl) + hl);
+    sx += ep * 23; sy += ep * 7;
+    return [gmod(sx, size), P.lut * 16 + gmod(sy, 16)];
+  }
   var FACADE_FRAG = [
     '{',
     '  vec3 n = normalize(vCgWNrm);',
@@ -1461,6 +1693,10 @@
     '  float crownB = crown * cgCov(top - 2.0 * uStorey, top, y, fy);',
     '  win *= (1.0 - blank) * (1.0 - corn) * (1.0 - crownB) * (1.0 - plain);',
     '  vec2 sid = floor(cid / PD.yz) + floor(vec2(vSeed * 53.0, vSeed * 97.0)) + vec2(fi * 17.0, fi * 5.0);',
+    /* window life: a time-shifted re-draw from the same band (facadeTexel) */
+    '  float perFl = 1.0 - step(0.5, PD.x) * step(PD.x, 2.5);',
+    '  float hl = fract(sin(sid.x * (1.0 - perFl) * 12.9898 + sid.y * 78.233 + vSeed * 37.1 + fi * 3.3) * 43758.5453);',
+    '  sid += floor(uTime * uLife * (0.7 + 0.6 * hl) + hl) * vec2(23.0, 7.0);',
     '  vec2 tc = vec2(mod(sid.x, uLutSize) + 0.5, PD.x * 16.0 + mod(sid.y, 16.0) + 0.5) / uLutSize;',
     '  vec3 lut = mix(texture2D(uLUT, tc).rgb * 2.0, uLutMean[pr], aa);',
     /* spandrel band at the foot of each storey, lighter than the wall: the
@@ -1483,12 +1719,16 @@
     '    totalEmissiveRadiance += (1.0 - wall) * step(0.6, n.y) * step(0.93, tile) * dot2 * texture2D(uLUT, floor(rp) / uLutSize).rgb * 3.0;',
     '  }',
     '  totalEmissiveRadiance += lut * win * wall * uWinGain;',
-    '  totalEmissiveRadiance += crownB * wall * vec3(0.82, 0.9, 0.95) * uWinGain * 0.5;',
+    /* the crown band breathes, 5 to 9 s per breath, phase per building;
+       the sine has mean zero, so its time mean is the old steady band */
+    '  float breath = 1.0 + uBreath * sin(6.2832 * (uTime / mix(5.0, 9.0, fract(hb * 3.1)) + hb));',
+    '  totalEmissiveRadiance += crownB * wall * vec3(0.82, 0.9, 0.95) * uWinGain * 0.5 * breath;',
     '}'
   ].join('\n');
   var FACADE_DECL = 'varying vec3 vCgWNrm; flat varying float vSeed; varying float vFacU; flat varying vec3 vFac;\n' +
     'uniform sampler2D uLUT; uniform vec3 uLutMean[4]; uniform vec4 uProgA[4]; uniform vec4 uProgB[4]; uniform vec4 uProgC[4]; uniform vec4 uProgD[4];\n' +
     'uniform float uStorey; uniform float uWinGain; uniform float uLutSize; uniform float uRoofDark;\n' +
+    'uniform float uTime; uniform float uLife; uniform float uBreath;\n' +
     'float cgCov(float a, float b, float x, float w){ return clamp((min(b, x + 0.5 * w) - max(a, x - 0.5 * w)) / w, 0.0, 1.0); }\n';
 
   /* The light programs (V9), one LUT band of 16 rows each: office (whole
@@ -1671,8 +1911,23 @@
     lutTex.magFilter = lutTex.minFilter = THREE.NearestFilter;
     lutTex.colorSpace = THREE.SRGBColorSpace;
     lutTex.needsUpdate = true;
+    /* City life: one clock for the facade (window life, crown breathing),
+       the beacons and the holograms, set by update (see there). */
+    var timeU = { value: 0 }, clock = 0;
+    var lifeU = { value: 0 }, breathU = { value: 0 };
+    function setLife(q) {
+      var lv = q && q.liveliness != null ? q.liveliness : (o.liveliness == null ? DEF.liveliness : o.liveliness);
+      var wl = q && q.windowLife != null ? q.windowLife : (o.windowLife == null ? DEF.windowLife : o.windowLife);
+      var bc = q && q.beacons != null ? q.beacons : (o.beacons == null ? DEF.beacons : o.beacons);
+      o = Object.assign({}, o, { liveliness: lv, windowLife: wl, beacons: bc });
+      lifeU.value = lifeSpeed(lv, wl);
+      /* crown breathing depth: 0.4 at life rate 1, 0.24 at the default */
+      breathU.value = 0.4 * clamp(clamp(lv, 0, 1) * rateOf(bc), 0, 1);
+    }
+    setLife(null);
     var facade = {
       uniforms: {
+        uTime: timeU, uLife: lifeU, uBreath: breathU,
         uLUT: { value: lutTex }, uLutSize: { value: L.size },
         uLutMean: { value: L.means.map(function (m) { return new THREE.Vector3(m[0], m[1], m[2]); }) },
         uStorey: { value: STOREY },
@@ -1745,18 +2000,36 @@
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
     });
 
-    /* additive glow billboards (faked bloom), from citygen GlowLayer */
+    /* additive glow billboards (faked bloom), from citygen GlowLayer.
+       iBlink = (mode, phase, period) for the city life beacons, a closed
+       formula of uTime: mode 0 steady (signs, haze, roof glows), 1 red
+       aviation strobe (one short pulse of about 0.2 s per period, a dim
+       0.18 between, so a beacon is a small red point that flashes), 2
+       steady small lamp (the amber roof plant). Modes 1 and 2 keep an
+       angular size of at least 0.0045 rad (about 4 px at
+       1600 px and 75 degrees) and dim by the size ratio instead, so
+       a far beacon stays a point and does not grow into a blob. */
     var glowMat = new THREE.ShaderMaterial({
-      uniforms: Object.assign({ uFogK: { value: 0.5 }, uFall: { value: 3.5 } }, fog.uniforms),
+      uniforms: Object.assign({ uFogK: { value: 0.5 }, uFall: { value: 3.5 }, uTime: timeU }, fog.uniforms),
       vertexShader: [
-        FOG_DECL, 'uniform float uFogK;',
-        'attribute vec3 iPos; attribute vec2 iSize; attribute vec3 iCol;',
+        FOG_DECL, 'uniform float uFogK; uniform float uTime;',
+        'attribute vec3 iPos; attribute vec2 iSize; attribute vec3 iCol; attribute vec3 iBlink;',
         'varying vec2 vUv; varying vec3 vCol;',
         'void main(){',
         '  vec4 mv = viewMatrix * vec4(iPos, 1.0);',
-        '  mv.xy += position.xy * iSize;',
+        '  vec2 sz = iSize; float k = 1.0;',
+        '  if (iBlink.x > 0.5) {',
+        '    float s = max(iSize.x, -mv.z * 0.0045);',
+        '    k = iSize.x / s; sz = vec2(s);',
+        '    if (iBlink.x < 1.5) {',
+        '      float ph = fract(uTime / iBlink.z + iBlink.y) * iBlink.z;',
+        '      float d = min(ph, iBlink.z - ph) / 0.1;',
+        '      k *= 0.18 + exp(-d * d);',
+        '    }',
+        '  }',
+        '  mv.xy += position.xy * sz;',
         '  vUv = uv;',
-        '  vCol = iCol * (1.0 - cgFogAmt(iPos, uFogK));',
+        '  vCol = iCol * k * (1.0 - cgFogAmt(iPos, uFogK));',
         '  gl_Position = projectionMatrix * mv;',
         '}'].join('\n'),
       fragmentShader: [
@@ -1768,6 +2041,60 @@
         '  gl_FragColor = vec4(vCol * a, 1.0);',
         '}'].join('\n'),
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, fog: false
+    });
+
+    /* holograms: one additive, translucent quad per tile hologram, all in
+       one buffer. Placeholder content until the sign atlas comes: rows of
+       bands and blocky glyph rectangles that drift sideways (each row its
+       own slow speed, alternating direction), a highlight bar sweeping
+       across every 6 to 10 s, scanlines every 0.6 m creeping upward, a
+       slow wobble and rare 1/8 s dropouts. Everything a closed formula of
+       uTime. Pastel colour (holoRGB, HOLO_SAT), additive, so it reads as
+       light in the air, not as a panel; it fades with the fog like the
+       glows, and the detail averages out with distance (no shimmer). */
+    var holoMat = new THREE.ShaderMaterial({
+      uniforms: Object.assign({ uFogK: { value: 0.55 }, uTime: timeU }, fog.uniforms),
+      vertexShader: [
+        FOG_DECL, 'uniform float uFogK;',
+        'attribute vec2 aUv; attribute vec3 aCol; attribute vec2 aSize; attribute float aSeed;',
+        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed;',
+        'void main(){',
+        '  vUv = aUv; vSize = aSize; vSeed = aSeed;',
+        '  vCol = aCol * (1.0 - cgFogAmt(position, uFogK));',
+        '  gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0);',
+        '}'].join('\n'),
+      fragmentShader: [
+        'uniform float uTime;',
+        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed;',
+        'float hh(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233)) + vSeed * 61.3) * 43758.5453); }',
+        'void main(){',
+        '  float t = uTime;',
+        '  vec2 p = vUv * vSize;',
+        '  float e = min(min(p.x, vSize.x - p.x), min(p.y, vSize.y - p.y));',
+        '  float edge = smoothstep(0.0, 2.0, e);',
+        '  float frame = exp(-pow((e - 0.7) / 0.3, 2.0));',
+        '  float rh = vSize.y / 5.0, ri = floor(p.y / rh), fy = fract(p.y / rh);',
+        '  float sp = (0.6 + 1.0 * hh(vec2(ri, 1.0))) * (mod(ri, 2.0) < 0.5 ? 1.0 : -1.0);',
+        '  float x = p.x + t * sp, cw = rh * 0.75, ci = floor(x / cw), fx = fract(x / cw);',
+        '  float band = step(hh(vec2(ri, 2.0)), 0.3);',
+        '  float g = step(0.35, hh(vec2(ci, ri))) * step(0.14, fx) * step(fx, 0.86) * step(0.2, fy) * step(fy, 0.8);',
+        '  g *= 1.0 - step(0.5, hh(vec2(ci, ri + 9.0))) * step(0.42, fx) * step(fx, 0.6) * step(0.5, fy);',
+        '  float bnd = step(0.18, fy) * step(fy, 0.82) * (0.45 + 0.15 * sin(t * 0.9 + ri * 2.1));',
+        '  float content = mix(g, bnd, band);',
+        '  float fw = max(fwidth(x / cw), fwidth(p.y / rh));',
+        '  content = mix(content, 0.3, clamp(fw * 2.0 - 0.3, 0.0, 1.0));',
+        '  float per = 6.0 + 4.0 * fract(vSeed * 7.1);',
+        '  float bx = (fract(t / per + vSeed) * 1.4 - 0.2) * vSize.x;',
+        '  float bar = exp(-pow((p.x - bx) / 3.0, 2.0));',
+        '  float sl = 0.5 + 0.5 * sin((p.y - t * 0.4) * 10.472);',
+        '  float scan = mix(0.5 + 0.5 * sl, 0.75, clamp(fwidth(p.y / 0.6) * 2.0 - 0.5, 0.0, 1.0));',
+        '  float drop = step(0.985, fract(sin(floor(t * 8.0) * 12.9898 + vSeed * 78.233) * 43758.5453));',
+        '  float flick = (0.9 + 0.1 * sin(t * 1.7 + vSeed * 40.0) * sin(t * 0.37 + vSeed * 9.0)) * (1.0 - 0.6 * drop);',
+        '  float I = ((0.07 + 0.4 * content + 0.3 * bar) * edge + 0.35 * frame) * scan * flick;',
+        '  gl_FragColor = vec4(vCol * I, 1.0);',
+        '}'].join('\n'),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
+      side: THREE.DoubleSide, fog: false
     });
 
     /* axial streaks: lamp lines along the streets, from citygen StreakLayer */
@@ -1847,7 +2174,7 @@
 
     var tiles = new Map();
     var dirty = true;
-    var layers = { signs: null, glow: null, streak: null, cables: null };
+    var layers = { signs: null, glow: null, streak: null, cables: null, holo: null };
     var tones = function (b) {
       return boneRGB(b.kind === 'mast' ? 0.2 : b.kind === 'blade' ? 0.08 : b.tone);
     };
@@ -1904,9 +2231,10 @@
       return [c[0] * gain, c[1] * gain, c[2] * gain];
     }
     function rebuildLayers() {
-      ['signs', 'glow', 'streak', 'cables'].forEach(dropLayer);
+      ['signs', 'glow', 'streak', 'cables', 'holo'].forEach(dropLayer);
       var sp = [], su = [], sc = [], ss = [], sd = [];
-      var gp = [], gs = [], gc = [];
+      var gp = [], gs = [], gc = [], gb = [];
+      var hp = [], hu = [], hc = [], hs = [], hd = [];
       var ta = [], tb = [], tw = [], tc = [];
       var cl = [];
       var lampC = hueOut(-1, 1);
@@ -1932,12 +2260,35 @@
           });
           var gcol = hueOut(a.hue, a.kind === 'blade' ? 0.2 : 0.12);
           gp.push(c[0] + n[0] * 1.5, c[1], c[2] + n[2] * 1.5);
-          gs.push(Math.max(a.w * 2.4, 8), a.h * 1.4); gc.push(gcol[0], gcol[1], gcol[2]);
+          gs.push(Math.max(a.w * 2.4, 8), a.h * 1.4); gc.push(gcol[0], gcol[1], gcol[2]); gb.push(0, 0, 1);
         }
         for (i = 0; i < t.lights.length; i++) {
           var L2 = t.lights[i];
           var lc = L2.kind === 'beacon' ? hueOut(-1, 0.8) : hueOut(L2.hue, 0.05);
-          gp.push(L2.p[0], L2.p[1], L2.p[2]); gs.push(L2.size, L2.size); gc.push(lc[0], lc[1], lc[2]);
+          gp.push(L2.p[0], L2.p[1], L2.p[2]); gs.push(L2.size, L2.size); gc.push(lc[0], lc[1], lc[2]); gb.push(0, 0, 1);
+        }
+        /* beacons: red aviation strobes, small; the amber plant lamp dim
+           and steady. Red appears nowhere else in the city. */
+        var bcs = t.beacons || [];
+        for (i = 0; i < bcs.length; i++) {
+          var B2 = bcs[i], plant = B2.kind === 'plant';
+          var bsz = plant ? 2.5 : (B2.kind === 'landmark' ? 5 : 3.5), bk = plant ? 0.3 : 1.2;
+          var bcol = plant ? BEACON_AMBER : BEACON_RED;
+          gp.push(B2.p[0], B2.p[1], B2.p[2]); gs.push(bsz, bsz); gc.push(bcol[0] * bk, bcol[1] * bk, bcol[2] * bk);
+          gb.push(plant || !(B2.period > 0) ? 2 : 1, B2.phase, B2.period > 0 ? B2.period : 1);
+        }
+        var hos = t.holograms || [];
+        for (i = 0; i < hos.length; i++) {
+          var H = hos[i], hw = H.w / 2, hh = H.h / 2, R0 = H.right, U0 = H.up, q = H.p;
+          var hx = accHex[Math.min(H.hue, accHex.length - 1)], hcol = holoRGB(hx, H.sat == null ? HOLO_SAT : H.sat);
+          var HP = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(function (k) {
+            return [q[0] + R0[0] * hw * k[0] + U0[0] * hh * k[1], q[1] + U0[1] * hh * k[1], q[2] + R0[2] * hw * k[0] + U0[2] * hh * k[1]];
+          });
+          var HUV = [[0, 0], [1, 0], [1, 1], [0, 1]];
+          [0, 1, 2, 0, 2, 3].forEach(function (k) {
+            hp.push(HP[k][0], HP[k][1], HP[k][2]); hu.push(HUV[k][0], HUV[k][1]);
+            hc.push(hcol[0] * HOLO_GAIN, hcol[1] * HOLO_GAIN, hcol[2] * HOLO_GAIN); hs.push(H.w, H.h); hd.push(H.seed);
+          });
         }
         for (i = 0; i < t.streets.length; i++) {
           var s = t.streets[i];
@@ -1977,12 +2328,27 @@
         g2.setAttribute('iPos', new THREE.InstancedBufferAttribute(new Float32Array(gp), 3));
         g2.setAttribute('iSize', new THREE.InstancedBufferAttribute(new Float32Array(gs), 2));
         g2.setAttribute('iCol', new THREE.InstancedBufferAttribute(new Float32Array(gc), 3));
+        g2.setAttribute('iBlink', new THREE.InstancedBufferAttribute(new Float32Array(gb), 3));
         g2.instanceCount = gp.length / 3;
         layers.glow = new THREE.Mesh(g2, glowMat);
         layers.glow.frustumCulled = false;
         layers.glow.renderOrder = 2;
         layers.glow.userData.kind = 'city-glow';
         group.add(layers.glow);
+      }
+      if (hp.length) {
+        var g5 = new THREE.BufferGeometry();
+        g5.setAttribute('position', new THREE.Float32BufferAttribute(hp, 3));
+        g5.setAttribute('aUv', new THREE.Float32BufferAttribute(hu, 2));
+        g5.setAttribute('aCol', new THREE.Float32BufferAttribute(hc, 3));
+        g5.setAttribute('aSize', new THREE.Float32BufferAttribute(hs, 2));
+        g5.setAttribute('aSeed', new THREE.Float32BufferAttribute(hd, 1));
+        layers.holo = new THREE.Mesh(g5, holoMat);
+        layers.holo.frustumCulled = false;
+        layers.holo.renderOrder = 3;
+        layers.holo.userData.kind = 'city-holograms';
+        layers.holo.userData.count = hp.length / 18;
+        group.add(layers.holo);
       }
       if (ta.length) {
         var g3 = new THREE.InstancedBufferGeometry();
@@ -2009,7 +2375,15 @@
       dirty = false;
     }
 
-    function update(cam) {
+    /* update(cam, dt, t): cam the camera position (THREE.Vector3), dt the
+       frame time in seconds, t the simulation time in seconds. The city
+       life (window life, crown breathing, beacons, holograms) runs on t
+       when it is a finite number, else on its own clock summed from dt,
+       so the old call update(cam, dt) keeps everything moving. */
+    function update(cam, dt, t) {
+      if (typeof t === 'number' && isFinite(t)) clock = t;
+      else if (typeof dt === 'number' && isFinite(dt)) clock += dt;
+      timeU.value = clock;
       if (dirty) rebuildLayers();
       if (cullDirty) {
         var r = loadedRect(tiles.keys());
@@ -2028,16 +2402,20 @@
     }
     function dispose() {
       tiles.forEach(function (e, k) { removeTile(k); });
-      ['signs', 'glow', 'streak', 'cables'].forEach(dropLayer);
+      ['signs', 'glow', 'streak', 'cables', 'holo'].forEach(dropLayer);
       skyG.dispose(); QUAD.dispose(); SQUAD.dispose();
-      [facadeMat, signMat, glowMat, streakMat, cableMat, skyMat].forEach(function (m) { m.dispose(); });
+      [facadeMat, signMat, glowMat, holoMat, streakMat, cableMat, skyMat].forEach(function (m) { m.dispose(); });
       lutTex.dispose();
       if (group.parent) group.parent.remove(group);
     }
     return {
       group: group, fog: fog, facadeMaterial: facadeMat, skyline: skyline, tiles: tiles,
       addTile: addTile, removeTile: removeTile, has: function (k) { return tiles.has(k); },
-      update: update, stats: stats, dispose: dispose
+      update: update, stats: stats, dispose: dispose,
+      /* setLife({ liveliness, windowLife, beacons }): the shader side of
+         the city life, live; holograms and beacons come with the tiles
+         (makeCity options). time(): the life clock in seconds. */
+      setLife: setLife, time: function () { return clock; }
     };
   }
 
@@ -2051,6 +2429,8 @@
     boneRGB: boneRGB, windowLUT: windowLUT, toLin: toLin, LUT_BANDS: LUT_BANDS,
     FACADE_PROGRAMS: FACADE_PROGRAMS, facadeCover: facadeCover, facadeNear: facadeNear,
     FOG_MED: FOG_MED, fogTau: fogTau, skylineBoxes: skylineBoxes, loadedRect: loadedRect, skylineHidden: skylineHidden, fogTauInf: fogTauInf, WEATHER: WEATHER, weatherAt: weatherAt,
+    HOLO_P: HOLO_P, HOLO_SAT: HOLO_SAT, HOLO_SIMILAR: HOLO_SIMILAR, HOLO_GAP: HOLO_GAP, HOLO_MIN_TOP: HOLO_MIN_TOP, BEACON_TALL: BEACON_TALL,
+    holoRGB: holoRGB, hsvSat: hsvSat, rateOf: rateOf, lifeRate: lifeRate, LIFE_T: LIFE_T, lifeSpeed: lifeSpeed, facadeTexel: facadeTexel,
     makeFog: makeFog, makeSky: makeSky, makeCityRenderer: makeCityRenderer
   };
   globalThis.HikyakuCity = HikyakuCity;
