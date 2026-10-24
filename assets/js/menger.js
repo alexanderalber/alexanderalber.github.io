@@ -750,11 +750,14 @@
      The renderer fills the four uniforms whenever material.fog is true. */
   const FOG_GLSL = `
 #ifdef MG_CG
-uniform float cgFogDensity;
-float mgFog(float d){ return 1.0 - exp(-cgFogDensity * d); }
+/*CG_FOG*/
+float mgFog(vec3 w, float k){ return cgFogAmt(w, k); }
+vec3 mgFogC(vec3 w){ return cgFogColor(w); }
 #elif defined(USE_FOG)
 uniform vec3 fogColor; uniform float fogNear; uniform float fogFar; uniform float fogDensity;
-float mgFog(float d){
+vec3 mgFogC(vec3 w){ return fogColor; }
+float mgFog(vec3 w, float k){
+  float d = length(w - cameraPosition) * k;
 #ifdef FOG_EXP2
   return 1.0 - exp(-fogDensity * fogDensity * d * d);
 #else
@@ -762,7 +765,8 @@ float mgFog(float d){
 #endif
 }
 #else
-float mgFog(float d){ return 0.0; }
+float mgFog(vec3 w, float k){ return 0.0; }
+vec3 mgFogC(vec3 w){ return vec3(0.0); }
 #endif
 `;
   function fogUniforms(THREE) {
@@ -772,9 +776,11 @@ float mgFog(float d){ return 0.0; }
      opts.fog. The lit materials go through fog.patch like everything else
      on the page; fog.patch sets its own program cache key, which is
      combined with the material's key here so a patched facade never shares
-     a program with a plain patched material. The custom shaders read the
-     fog uniforms directly (MG_CG). Without opts.fog the module keeps using
-     three's scene fog, as in the concept scenes. */
+     a program with a plain patched material. The custom shaders get the
+     atmosphere's declarations through fog.inject (MG_CG): its fog depends
+     on both ends of the ray, so mgFog takes the world position. Without
+     opts.fog the module keeps using three's scene fog, as in the concept
+     scenes. */
   function cgPatch(fog, mat, o) {
     if (!fog) return mat;
     const k0 = mat.customProgramCacheKey.bind(mat);
@@ -786,9 +792,7 @@ float mgFog(float d){ return 0.0; }
   function cgShader(fog, mat) {
     if (!fog || !mat || !mat.isShaderMaterial) return mat;
     mat.defines = Object.assign(mat.defines || {}, { MG_CG: '' });
-    for (const k of ['cgFogDensity', 'cgFogLow', 'cgFogHigh', 'cgFogH']) mat.uniforms[k] = fog.uniforms[k];
-    mat.needsUpdate = true;
-    return mat;
+    return fog.inject(mat);
   }
 
   /* ---- facade material ---------------------------------------------------
@@ -1096,7 +1100,7 @@ void main(){
   vec4 mv = modelViewMatrix * vec4(iPos, 1.0);
   mv.xy += position.xy * iSize;
   vUv = uv;
-  vCol = iCol * (1.0 - mgFog(length(mv.xyz) * uFogK));
+  vCol = iCol * (1.0 - mgFog((modelMatrix * vec4(iPos, 1.0)).xyz, uFogK));
   gl_Position = projectionMatrix * mv;
 }`,
       fragmentShader: `varying vec2 vUv; varying vec3 vCol;
@@ -1142,7 +1146,7 @@ void main(){
   wp += dn * (position.x - 0.5) * 2.0 * iW * 0.6;
   wp += side * position.y * iW;
   vP = position.xy;
-  vCol = iCol * (1.0 - mgFog(length(toCam) * uFogK));
+  vCol = iCol * (1.0 - mgFog(wp, uFogK));
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`,
       fragmentShader: `varying vec2 vP; varying vec3 vCol;
@@ -1184,22 +1188,18 @@ void main(){
       vertexShader: FOG_GLSL + `
 uniform float uFogK;
 attribute vec3 iCol; attribute vec3 iSeed;
-varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying float vFogY;
+varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying vec3 vFogC;
 void main(){
   vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
   vUv = uv; vCol = iCol; vSd = iSeed;
-  vFog = mgFog(length(mv.xyz) * uFogK);
-  vFogY = (modelMatrix * instanceMatrix * vec4(position, 1.0)).y;
+  vec3 wq = (modelMatrix * instanceMatrix * vec4(position, 1.0)).xyz;
+  vFog = mgFog(wq, uFogK);
+  vFogC = mgFogC(wq);
   gl_Position = projectionMatrix * mv;
 }`,
       fragmentShader: `
-#ifdef MG_CG
-uniform vec3 cgFogLow; uniform vec3 cgFogHigh; uniform vec2 cgFogH;
-#elif defined(USE_FOG)
-uniform vec3 fogColor;
-#endif
 uniform float uTime;
-varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying float vFogY;
+varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying vec3 vFogC;
 float sgH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 void main(){
   vec2 sz = vSd.yz;
@@ -1220,11 +1220,7 @@ void main(){
   if (fract(vSd.x * 13.7) > 0.12) flick = 1.0;
   vec3 c = vCol * 0.06 + vCol * frame * 1.1 + mix(vCol, vec3(1.0), 0.55) * glyph * 0.95;
   c *= flick;
-#ifdef MG_CG
-  c = mix(c, mix(cgFogLow, cgFogHigh, clamp((vFogY - cgFogH.x) / (cgFogH.y - cgFogH.x), 0.0, 1.0)), vFog);
-#elif defined(USE_FOG)
-  c = mix(c, fogColor, vFog);
-#endif
+  c = mix(c, vFogC, vFog);
   gl_FragColor = vec4(c, 1.0);
 }`,
       side: THREE.DoubleSide, toneMapped: false, fog: true

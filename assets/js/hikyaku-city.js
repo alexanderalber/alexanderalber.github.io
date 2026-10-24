@@ -54,8 +54,11 @@
 
   var DEF = {
     seed: 1,
-    density: 0.85,        /* share of lots that get a building */
-    maxH: 260, minH: 20,  /* top of anything, including masts */
+    density: 0.92,        /* share of lots that get a building */
+    /* maxH: top of the regular towers; a landmark (about 3 % of the core
+       towers) may reach maxH * landmark. Nothing, masts included, goes
+       above that. minH: the lowest ordinary building. */
+    maxH: 420, minH: 40, landmark: 1.2,
     accents: 2,           /* number of neon hues, 0 to 2 */
     roofGap: 15,          /* roof below the tube bottom, metres */
     margin: 3,            /* extra metres outside the tube radius */
@@ -111,16 +114,19 @@
 
   /* Height field: districts from a 650 m noise, a soft core around cfg.core
      (or a 2.4 km noise when there is none). 0 is the low rim, 1 the tall
-     core. */
+     core. Top-heavy since 2026-10-25 (owner: a cyberpunk city is a dense
+     core of 150 to 400 m towers, mid-rise around it, almost nothing low):
+     the district noise only modulates, it no longer zeroes whole areas,
+     and the core term carries most of the weight. */
   function heightField(x, z, C) {
     var n = fbm(x / 650, z / 650, C.seed + 11, 4);
-    var t = Math.pow(clamp((n - 0.26) / 0.4, 0, 1), 1.2);
+    var t = smooth(0.25, 0.7, n);
     var f;
     if (C.core) {
       var dx = x - C.core[0], dz = z - C.core[1];
-      f = 0.25 + 0.85 * Math.exp(-(dx * dx + dz * dz) / (C.coreR * C.coreR));
-    } else f = 0.3 + 0.7 * smooth(0.36, 0.64, fbm(x / 2400, z / 2400, C.seed + 101, 2));
-    return t * f;
+      f = Math.exp(-(dx * dx + dz * dz) / (C.coreR * C.coreR));
+    } else f = smooth(0.36, 0.64, fbm(x / 2400, z / 2400, C.seed + 101, 2));
+    return clamp((0.12 + 0.88 * f) * (0.62 + 0.38 * t), 0, 1);
   }
 
   function tileKey(ix, iz) { return ix + ',' + iz; }
@@ -186,9 +192,10 @@
       }
     }
 
+    var TOP = C.maxH * C.landmark;
     /* Highest roof a footprint may carry. -Infinity: nothing may stand. */
     function capFor(rx0, rz0, rx1, rz1) {
-      var cap = C.maxH, k;
+      var cap = TOP, k;
       rx0 -= 1.2; rz0 -= 1.2; rx1 += 1.2; rz1 += 1.2;
       for (k = 0; k < S.length; k++) {
         var p = S[k];
@@ -288,23 +295,23 @@
       var cx = (lx0 + lx1) / 2, cz = (lz0 + lz1) / 2;
       var g = gId++, sd = R();
       var tone = R.range(0.15, 0.34);
+      var hf = heightField(cx, cz, C);
       var res;
-      if (w >= 30 && d >= 30 && R.chance(0.07)) {
+      if (w >= 30 && d >= 30 && hf < 0.45 && R.chance(0.05)) {
         /* parking deck: low, wide, flat, a landing pad on top */
         var dh = Math.min(R.range(14, 26), cap);
         var dw = w - R.range(2, 5), dd = d - R.range(2, 5);
         res = { boxes: [mk(cx - dw / 2, 0, cz - dd / 2, cx + dw / 2, dh, cz + dd / 2, tone * 0.8, sd, 'deck', g)],
           tiers: [{ x0: cx - dw / 2, x1: cx + dw / 2, z0: cz - dd / 2, z1: cz + dd / 2, y0: 0, y1: dh }], top: dh, deck: true };
       } else {
-        var hf = heightField(cx, cz, C);
-        var h = C.minH + (C.maxH - C.minH) * hf * R.range(0.55, 1.12);
-        if (R.chance(0.05)) h *= 1.7;
-        h = Math.min(h, C.maxH - 6);
+        var h = C.minH + (C.maxH - C.minH) * Math.pow(hf, 1.6) * R.range(0.7, 1.1);
+        if (hf > 0.6 && R.chance(0.03)) h = C.maxH * R.range(1.06, C.landmark) - 8;
+        else h = Math.min(h, C.maxH - 6);
         if (h > cap - 6) { h = cap - 6; lots.lowered++; }
         if (h < 8) { lots.dropped++; return; }
         var tw = w - R.range(2, 7), td = d - R.range(2, 7);
         var flat = tw >= 22 && td >= 22 && R.chance(0.35);
-        res = tower(cx, cz, tw, td, h, Math.min(cap, C.maxH), tone, sd, g, flat);
+        res = tower(cx, cz, tw, td, h, Math.min(cap, TOP), tone, sd, g, flat);
         res.flat = flat;
       }
       /* the guarantee, building by building */
@@ -318,7 +325,7 @@
       var tt = res.tiers[res.tiers.length - 1], tw2 = tt.x1 - tt.x0, td2 = tt.z1 - tt.z0;
       if (res.deck) pads.push({ p: [cx, res.top, cz], n: [0, 1, 0], w: tw2, d: td2, kind: 'deck' });
       else if (res.flat && tw2 >= 20 && td2 >= 20) pads.push({ p: [cx, res.top, cz], n: [0, 1, 0], w: tw2, d: td2, kind: 'roof' });
-      if (res.top > 150) lights.push({ p: [cx, res.top + 2, cz], size: 6, kind: 'beacon', hue: -1 });
+      if (res.top > 200) lights.push({ p: [cx, res.top + 2, cz], size: 6, kind: 'beacon', hue: -1 });
     }
 
     /* 2 x 2 blocks, each 1, 2 or 4 lots. */
@@ -327,7 +334,9 @@
         var bx0 = x0 + HALF_ST + bxI * TILE / 2, bz0 = z0 + HALF_ST + bzI * TILE / 2;
         var bx1 = bx0 + BLOCK, bz1 = bz0 + BLOCK, blk = bxI + 2 * bzI;
         var r = R(), al = R.range(4, 8) / 2;
-        var split = r < 0.2 ? 1 : (r < 0.55 ? 2 : 4);
+        /* tall districts cut their blocks finer: slender towers */
+        var tallB = heightField(bx0 + BLOCK / 2, bz0 + BLOCK / 2, C) > 0.55;
+        var split = r < (tallB ? 0.08 : 0.2) ? 1 : (r < (tallB ? 0.38 : 0.55) ? 2 : 4);
         if (split === 1) placeLot(bx0, bz0, bx1, bz1, 0, blk);
         else if (split === 2) {
           var along = R.chance(0.5), m = (along ? bx0 + bx1 : bz0 + bz1) / 2 + R.range(-8, 8);
@@ -675,6 +684,28 @@
     return best;
   }
 
+  /* ---- weather ------------------------------------------------------------
+     Rain that comes and goes, as a pure function of time (seconds) and a
+     seed, so it needs no state and the tests can scan it. Time is cut into
+     cycles of WEATHER.cycle seconds; in a cycle it rains with probability
+     WEATHER.p, once, for WEATHER.min to WEATHER.max seconds including a
+     WEATHER.fade second ramp in and out (smoothstep), at an intensity of
+     0.75 to 1. The shower never touches a cycle edge, so showers never
+     merge and every cycle has a dry stretch: rain is never permanent.
+     Returns the rain level, 0 (dry) to 1. */
+  var WEATHER = { cycle: 300, p: 0.7, min: 40, max: 90, fade: 10, edge: 20 };
+  function weatherAt(t, seed) {
+    var W = WEATHER;
+    var c = Math.floor(t / W.cycle), u = t - c * W.cycle;
+    var h = rng(hashU(c, 77, seed >>> 0, 5));
+    if (h() >= W.p) return 0;
+    var dur = W.min + (W.max - W.min) * h();
+    var t0 = W.edge + (W.cycle - 2 * W.edge - dur) * h();
+    var k = 0.75 + 0.25 * h();
+    if (u <= t0 || u >= t0 + dur) return 0;
+    return k * smooth(0, W.fade, u - t0) * smooth(0, W.fade, t0 + dur - u);
+  }
+
   /* ======================================================================
      Visual layer. THREE is passed in. One merged mesh per tile; signs,
      glows, lamp streaks and cables of all loaded tiles in one buffer each,
@@ -693,33 +724,116 @@
   }
   function toLin(c) { return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
 
-  /* Height fog shared by every material of the page: exponential in
-     distance, its colour mixed between low and high by the height of the
-     fogged point. fog.patch(mat, opts) teaches a built-in material the same
-     fog (and, with opts.facade, the window shader). The uniforms hold sRGB
-     numbers, because three mixes fog after the colour-space conversion. */
+  /* ---- the atmosphere ---------------------------------------------------
+     One model for everything on the page: sky, buildings, skyline, ground,
+     rings, gates, traffic and the Menger block all fog through the same
+     functions, so nothing can stand in front of the fog it is in.
+
+     Medium. Two exponential layers in altitude y (metres, ground at 0):
+
+       k(y) = kS exp(-y / HS)  +  kH exp(-y / HH)
+
+     the ground soup (kS 0.16 per m, HS 13 m: under 50 m sight in the
+     streets, 7 per km at 40 m, nearly gone at 80 m) and the haze above the roofs (kH a few per km, HH 500 m).
+     The haze slider sets kH; the soup does not move with it, so the
+     streets stay buried at any slider position.
+
+     Optical depth along the straight segment from a to b, length d, end
+     heights ya and yb, for one layer (k, H). With y(t) = ya + (yb - ya) t / d:
+
+       tau = int_0^d k exp(-y(t) / H) dt
+           = k d (exp(-ya / H) - exp(-yb / H)) / x,   x = (yb - ya) / H
+
+     and for |x| -> 0 the limit k d exp(-ya / H) (1 - x / 2 + x^2 / 6). The
+     two layers add. For a ray that never ends (the sky), direction with
+     vertical component s > 0 from height yc:
+
+       tauInf = k H exp(-yc / H) / s,
+
+     and for s <= 0 the ray stays in the medium for ever: tauInf = infinity.
+
+     Colour. Transmittance T = exp(-tau); a surface of colour c becomes
+     c T + F(dir) (1 - T). F, the colour of fully saturated fog, depends on
+     the viewing direction only (pale and lit looking level or down, darker
+     looking up), never on the height of the fogged point. That is what
+     makes the horizon invisible: a far wall and the sky right behind it
+     share a direction, so both converge to the same F as their depth grows.
+     The sky is the same formula with the overcast deck behind an infinite
+     ray: sky = top T_inf + F (1 - T_inf). At the horizon T_inf = exp(-A / s)
+     goes to 0 smoothly (all derivatives vanish), so there is no band;
+     looking up, T_inf grows and the overcast shows through, a smooth
+     gradient from inside the soup.
+
+     Why the old fog failed (2026-10-25, owner screenshots): it took the
+     fog colour from the height of the fogged point. A tall far box was
+     fogged into the dark high colour while the sky behind it, at the same
+     elevation, was the pale low colour: dark crisp silhouettes standing
+     above the haze, worst at maximum density. The sky ramp also clamped
+     at 420 m, which drew the hard band at the top of the screen.
+
+     The uniforms hold sRGB numbers, because three mixes fog after the
+     colour-space conversion. fogTau and fogTauInf below are the same
+     formulas in JavaScript, for notes/dev/hikyaku-city.test.mjs. */
+  var FOG_MED = { soupK: 0.16, soupH: 13, hazeK: 0.0026, hazeH: 500 };
+  function fogTau1(k, H, ya, yb, d) {
+    var x = (yb - ya) / H, ea = Math.exp(-ya / H);
+    var g = Math.abs(x) < 0.01 ? ea * (1 - x / 2 + x * x / 6) : (ea - Math.exp(-yb / H)) / x;
+    return k * d * g;
+  }
+  function fogTau(a, b, med) {
+    var M = med || FOG_MED;
+    var ya = Math.max(a[1], 0), yb = Math.max(b[1], 0);
+    var d = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    return fogTau1(M.soupK, M.soupH, ya, yb, d) + fogTau1(M.hazeK, M.hazeH, ya, yb, d);
+  }
+  function fogTauInf(yc, s, med) {
+    var M = med || FOG_MED;
+    if (!(s > 0)) return Infinity;
+    yc = Math.max(yc, 0);
+    return (M.soupK * M.soupH * Math.exp(-yc / M.soupH) + M.hazeK * M.hazeH * Math.exp(-yc / M.hazeH)) / s;
+  }
   var FOG_DECL = [
-    'uniform float cgFogDensity; uniform vec3 cgFogLow; uniform vec3 cgFogHigh; uniform vec2 cgFogH;',
-    'vec3 cgFogColor(float y){ return mix(cgFogLow, cgFogHigh, clamp((y - cgFogH.x)/(cgFogH.y - cgFogH.x), 0.0, 1.0)); }',
-    'float cgFogAmt(float d, float k){ return 1.0 - exp(-cgFogDensity * d * k); }'
+    'uniform vec4 cgFogMed; uniform vec3 cgFogLow; uniform vec3 cgFogHigh; uniform vec3 cgSkyTop;',
+    'float cgTau1(float k, float H, float ya, float yb, float d){',
+    '  float x = (yb - ya) / H; float ea = exp(-ya / H);',
+    '  float g = abs(x) < 0.01 ? ea * (1.0 - 0.5 * x + x * x / 6.0) : (ea - exp(-yb / H)) / x;',
+    '  return k * d * g;',
+    '}',
+    'float cgTau(vec3 a, vec3 b){',
+    '  float ya = max(a.y, 0.0), yb = max(b.y, 0.0), d = length(b - a);',
+    '  return cgTau1(cgFogMed.x, cgFogMed.y, ya, yb, d) + cgTau1(cgFogMed.z, cgFogMed.w, ya, yb, d);',
+    '}',
+    'float cgTauInf(float yc, float s){',
+    '  yc = max(yc, 0.0);',
+    '  return (cgFogMed.x * cgFogMed.y * exp(-yc / cgFogMed.y) + cgFogMed.z * cgFogMed.w * exp(-yc / cgFogMed.w)) / max(s, 1e-4);',
+    '}',
+    'vec3 cgFogDir(vec3 dir){ return mix(cgFogLow, cgFogHigh, smoothstep(-0.15, 0.55, dir.y)); }',
+    'vec3 cgFogColor(vec3 wp){ vec3 v = wp - cameraPosition; return cgFogDir(v / max(length(v), 1e-3)); }',
+    'float cgFogAmt(vec3 wp, float k){ return 1.0 - exp(-k * cgTau(cameraPosition, wp)); }'
   ].join('\n');
 
   function makeFog(THREE) {
     var U = {
-      cgFogDensity: { value: 0.0034 },
+      cgFogMed: { value: new THREE.Vector4(FOG_MED.soupK, FOG_MED.soupH, FOG_MED.hazeK, FOG_MED.hazeH) },
       cgFogLow: { value: new THREE.Color() },
       cgFogHigh: { value: new THREE.Color() },
-      cgFogH: { value: new THREE.Vector2(0, 420) }
+      cgSkyTop: { value: new THREE.Color() }
     };
-    var lowT = 0.56, highT = 0.16;
+    /* low: saturated fog looking level, high: looking up, top: the overcast
+       deck behind the atmosphere; bone positions, with a gain each. rain
+       (0 to 1) thickens the haze and darkens the sky, for the weather. */
+    var S = { soupK: FOG_MED.soupK, soupH: FOG_MED.soupH, hazeK: FOG_MED.hazeK, hazeH: FOG_MED.hazeH,
+      low: 0.5, high: 0.28, top: 0.11, lowGain: 1, highGain: 1, topGain: 1, rain: 0 };
     function set(o) {
-      if (o.density != null) U.cgFogDensity.value = o.density;
-      if (o.low != null) lowT = o.low;
-      if (o.high != null) highT = o.high;
-      var a = boneRGB(lowT), b = boneRGB(highT);
-      U.cgFogLow.value.setRGB(a[0], a[1], a[2]);
-      U.cgFogHigh.value.setRGB(b[0], b[1], b[2]);
-      if (o.h0 != null || o.h1 != null) U.cgFogH.value.set(o.h0 == null ? U.cgFogH.value.x : o.h0, o.h1 == null ? U.cgFogH.value.y : o.h1);
+      for (var k in o) if (o[k] != null && k in S) S[k] = o[k];
+      if (o.density != null) S.hazeK = o.density;
+      var r = clamp(S.rain, 0, 1);
+      U.cgFogMed.value.set(S.soupK * (1 + 0.5 * r), S.soupH, S.hazeK * (1 + 0.7 * r), S.hazeH);
+      var a = boneRGB(S.low), b = boneRGB(S.high), c = boneRGB(S.top);
+      var ka = S.lowGain * (1 - 0.14 * r), kb = S.highGain * (1 - 0.2 * r), kc = S.topGain * (1 - 0.4 * r);
+      U.cgFogLow.value.setRGB(a[0] * ka, a[1] * ka, a[2] * ka);
+      U.cgFogHigh.value.setRGB(b[0] * kb, b[1] * kb, b[2] * kb);
+      U.cgSkyTop.value.setRGB(c[0] * kc, c[1] * kc, c[2] * kc);
     }
     set({});
     var nKey = 0;
@@ -745,11 +859,10 @@
             '}');
         sh.fragmentShader = sh.fragmentShader
           .replace('#include <common>', '#include <common>\nvarying vec3 vCgWPos;\nuniform float cgFogK; uniform float cgFogTint;\n' + FOG_DECL + '\n' +
-            (fac ? 'varying vec3 vCgWNrm; flat varying float vSeed;\nuniform sampler2D uLUT; uniform vec3 uLutMean; uniform vec2 uCell; uniform vec2 uFrame; uniform float uWinGain; uniform float uLutSize; uniform float uRoofDark;\n' : ''))
+            (fac ? 'varying vec3 vCgWNrm; flat varying float vSeed;\nuniform sampler2D uLUT; uniform vec3 uLutMean; uniform vec3 uCell; uniform vec2 uFrame; uniform float uWinGain; uniform float uLutSize; uniform float uRoofDark;\n' : ''))
           .replace('#include <fog_fragment>', '#ifdef USE_FOG\n{\n' +
-            '  float cgd = length(vCgWPos - cameraPosition);\n' +
-            '  float cgf = cgFogAmt(cgd, cgFogK);\n' +
-            '  gl_FragColor.rgb = mix(gl_FragColor.rgb, cgFogColor(vCgWPos.y) * cgFogTint, cgf);\n' +
+            '  float cgf = cgFogAmt(vCgWPos, cgFogK);\n' +
+            '  gl_FragColor.rgb = mix(gl_FragColor.rgb, cgFogColor(vCgWPos) * cgFogTint, cgf);\n' +
             '}\n#endif');
         if (fac) sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n' + FACADE_FRAG);
       };
@@ -758,41 +871,71 @@
       mat.needsUpdate = true;
       return mat;
     }
-    return { uniforms: U, set: set, patch: patch };
+    /* For a custom ShaderMaterial: the declarations go where its source
+       carries the marker comment CG_FOG, the uniforms are shared objects,
+       so set() reaches the material live. hikyaku-traffic.js and menger.js
+       use this for their additive layers and signs. */
+    function inject(mat) {
+      var mark = '/*CG_FOG*/';
+      if (mat.vertexShader.indexOf(mark) >= 0) mat.vertexShader = mat.vertexShader.replace(mark, FOG_DECL);
+      if (mat.fragmentShader.indexOf(mark) >= 0) mat.fragmentShader = mat.fragmentShader.replace(mark, FOG_DECL);
+      Object.assign(mat.uniforms, U);
+      mat.needsUpdate = true;
+      return mat;
+    }
+    return { uniforms: U, glsl: FOG_DECL, set: set, patch: patch, inject: inject, state: S };
   }
 
-  /* The window shader, from citygen. Windows are a grid in world
-     coordinates, so a 260 m tower and a 6 m roof box get the same window
-     size. Each window cell looks up a lit/dark colour in a small table,
-     offset per building. Far away, where a cell gets smaller than a pixel,
-     the pattern fades into its exact mean (coverage times the table mean),
-     the idea of the arcov3 facade: a level change alters resolution, not
-     the picture, so there is no shimmer and no popping. */
+  /* The window shader, from citygen, reworked 2026-10-25 after the owner
+     read the towers as 5 to 10 storeys. Windows are a grid in world
+     coordinates, so every tower gets the same storey height. The grid
+     itself was dense enough (2.6 m rows), but it was a dot grid of 1 m
+     slits with no horizontal structure, dim and mostly dark, which the eye
+     reads as noise; the strong horizontals were the 1 to 4 setback ledges,
+     and those got counted as floors. Now a storey is uCell.y (3.6 m, +-5 %
+     per building) split into a glass band and a lighter spandrel band, the
+     bays are uCell.x (1.1 to 2.4 m per building) with thin mullions, every
+     12th to 19th storey is a blank plant floor, and lit windows cluster
+     along storeys. A 100 m tower shows about 28 bands, a 250 m one about 70.
+     Each window cell looks up a lit/dark colour in a small table, offset
+     per building. Far away, where a cell gets smaller than a pixel, the
+     pattern fades into its exact mean (coverage times the table mean), the
+     idea of the arcov3 facade: a level change alters resolution, not the
+     picture, so there is no shimmer and no popping. */
   var FACADE_FRAG = [
     '{',
     '  vec3 n = normalize(vCgWNrm);',
     '  float wall = 1.0 - step(0.6, abs(n.y));',
     '  vec2 fu = vec2(abs(n.x) > 0.5 ? vCgWPos.z : vCgWPos.x, vCgWPos.y);',
-    '  vec2 cs = uCell * vec2(mix(0.75, 1.45, fract(vSeed * 7.13)), mix(0.9, 1.2, fract(vSeed * 3.71)));',
+    '  vec2 cs = uCell.xy * vec2(mix(0.7, 1.5, fract(vSeed * 7.13)), mix(0.95, 1.05, fract(vSeed * 3.71)));',
     '  vec2 g = fu / cs;',
     '  vec2 cid = floor(g);',
     '  vec2 f = fract(g);',
     '  vec2 fw = max(fwidth(g), vec2(1e-4));',
-    '  vec2 lo = smoothstep(uFrame - fw, uFrame + fw, f);',
-    '  vec2 hi = 1.0 - smoothstep(1.0 - uFrame - fw, 1.0 - uFrame + fw, f);',
-    '  float win = lo.x * hi.x * lo.y * hi.y;',
-    '  float cover = (1.0 - 2.0 * uFrame.x) * (1.0 - 2.0 * uFrame.y);',
+    /* glass from the sill (uFrame.y of the storey, the spandrel below it)
+       to just under the next slab; mullions uFrame.x on each side */
+    '  float sill = uFrame.y, head = uCell.z;',
+    '  float wx = smoothstep(uFrame.x - fw.x, uFrame.x + fw.x, f.x) * (1.0 - smoothstep(1.0 - uFrame.x - fw.x, 1.0 - uFrame.x + fw.x, f.x));',
+    '  float wy = smoothstep(sill - fw.y, sill + fw.y, f.y) * (1.0 - smoothstep(1.0 - head - fw.y, 1.0 - head + fw.y, f.y));',
+    '  float win = wx * wy;',
+    '  float cover = (1.0 - 2.0 * uFrame.x) * (1.0 - sill - head);',
     '  float aa = clamp(max(fw.x, fw.y) * 1.2 - 0.2, 0.0, 1.0);',
-    '  float rowH = fract(sin(dot(vec2(cid.y, floor(vSeed * 911.0)), vec2(12.9898, 78.233))) * 43758.5453);',
     '  float pierN = 3.0 + floor(fract(vSeed * 5.3) * 4.0);',
-    '  float blank = step(rowH, 0.10) + step(mod(cid.x, pierN), 0.5) * step(0.5, fract(vSeed * 2.9));',
-    '  win *= 1.0 - clamp(blank, 0.0, 1.0);',
-    '  cover *= 0.85;',
+    '  float plantN = 12.0 + floor(fract(vSeed * 8.7) * 8.0);',
+    '  float plant = step(mod(cid.y + floor(vSeed * 37.0), plantN), 0.5) * step(3.0, cid.y);',
+    '  float blank = plant + step(mod(cid.x, pierN), 0.5) * step(0.6, fract(vSeed * 2.9));',
+    '  blank = clamp(blank, 0.0, 1.0);',
+    '  win *= 1.0 - blank;',
+    '  float plantMean = 1.0 / plantN, pierMean = step(0.6, fract(vSeed * 2.9)) / pierN;',
+    '  cover *= (1.0 - plantMean) * (1.0 - pierMean);',
     '  win = mix(win, cover, aa);',
     '  vec2 sid = cid + floor(vec2(vSeed * 53.0, vSeed * 97.0));',
     '  vec3 lut = mix(texture2D(uLUT, (sid + 0.5) / uLutSize).rgb * 2.0, uLutMean, aa);',
-    '  float slab = smoothstep(0.0, fw.y * 2.0 + 0.02, f.y) * (1.0 - aa) + aa;',
-    '  diffuseColor.rgb *= mix(1.0, 0.4, win * wall) * mix(0.75, 1.0, slab);',
+    /* spandrel and slab edge a little lighter than the wall tone, glass
+       dark: the storey bands read even where no window is lit */
+    '  float band = (1.0 - smoothstep(sill * 0.15 - fw.y, sill * 0.15 + fw.y, f.y)) * (1.0 - aa) + aa * sill * 0.15;',
+    '  float bandP = mix(band, 0.0, plant * (1.0 - aa));',
+    '  diffuseColor.rgb *= mix(1.0, 0.32, win * wall) * (1.0 + 0.45 * bandP * wall);',
     '  diffuseColor.rgb *= mix(uRoofDark, 1.0, wall);',
     '  {',
     '    vec2 rp = vCgWPos.xz / 6.0;',
@@ -818,7 +961,7 @@
     var accents = o.accents || [], accentRate = o.accentRate == null ? 0.0015 : o.accentRate, warm = o.warm == null ? 0.25 : o.warm;
     var R = rng(seed), data = new Uint8Array(size * size * 4), sum = [0, 0, 0];
     for (var y = 0; y < size; y++) {
-      var rowOn = R() < rowLit, rowStart = R.int(0, size), rowLen = R.int(3, 14);
+      var rowOn = R() < rowLit, rowStart = R.int(0, size), rowLen = R.int(4, 20);
       for (var x = 0; x < size; x++) {
         var i = (y * size + x) * 4, c, r = R();
         var inRow = rowOn && ((x - rowStart + size) % size) < rowLen;
@@ -848,16 +991,20 @@
     return { data: data, size: size, mean: [sum[0] / nn, sum[1] / nn, sum[2] / nn] };
   }
 
-  /* Background sphere showing exactly the far end of the height fog. */
+  /* The sky: the atmosphere model for a ray that never ends (see makeFog),
+     the overcast deck behind it. At the horizon and below it the ray is
+     fully fogged, so the sky meets every far wall and the ground in the
+     same colour. */
   function makeSky(THREE, fog, radius) {
     var m = new THREE.ShaderMaterial({
       uniforms: fog.uniforms,
       vertexShader: 'varying vec3 vDir; void main(){ vDir = normalize(position); vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position = p.xyww; }',
-      fragmentShader: FOG_DECL + '\nvarying vec3 vDir;\nvoid main(){\n  float R = 3.0 / cgFogDensity;\n  vec3 d = normalize(vDir);\n' +
-        '  gl_FragColor = vec4(cgFogColor(cameraPosition.y + d.y * R), 1.0);\n}',
+      fragmentShader: FOG_DECL + '\nvarying vec3 vDir;\nvoid main(){\n  vec3 d = normalize(vDir);\n' +
+        '  float T = d.y > 0.0 ? exp(-cgTauInf(cameraPosition.y, d.y)) : 0.0;\n' +
+        '  gl_FragColor = vec4(mix(cgFogDir(d), cgSkyTop, T), 1.0);\n}',
       side: THREE.BackSide, depthWrite: false, fog: false
     });
-    var s = new THREE.Mesh(new THREE.SphereGeometry(radius || 9000, 32, 16), m);
+    var s = new THREE.Mesh(new THREE.SphereGeometry(radius || 9000, 48, 24), m);
     s.frustumCulled = false; s.renderOrder = -1;
     s.onBeforeRender = function (r, sc, cam) { s.position.copy(cam.position); s.updateMatrixWorld(); };
     return s;
@@ -910,7 +1057,7 @@
       var a = (i + R.range(-0.4, 0.4)) / n * Math.PI * 2;
       var rr = radius * R.range(0.92, 1.12);
       var w = R.range(40, 130), d = R.range(40, 130);
-      var h = 40 + Math.pow(R(), 1.8) * 420 * (0.5 + 0.5 * fbm(Math.cos(a) * 3, Math.sin(a) * 3, seed, 2));
+      var h = 70 + Math.pow(R(), 1.4) * 480 * (0.5 + 0.5 * fbm(Math.cos(a) * 3, Math.sin(a) * 3, seed, 2));
       var x = Math.cos(a) * rr, z = Math.sin(a) * rr;
       out.push({ min: [x - w / 2, 0, z - d / 2], max: [x + w / 2, h, z + d / 2], seed: R(), tone: 0 });
     }
@@ -931,7 +1078,7 @@
     var accSrgb = nAcc ? accHex.map(function (h) {
       return [((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255];
     }) : [];
-    var L = windowLUT(seed ^ 0x2077, { lit: 0.04, rowLit: 0.08, accents: accSrgb, accentRate: 0.0015 });
+    var L = windowLUT(seed ^ 0x2077, { lit: 0.05, rowLit: 0.12, accents: accSrgb, accentRate: 0.0015 });
     var lutTex = new THREE.DataTexture(L.data, L.size, L.size, THREE.RGBAFormat);
     lutTex.wrapS = lutTex.wrapT = THREE.RepeatWrapping;
     lutTex.magFilter = lutTex.minFilter = THREE.NearestFilter;
@@ -941,7 +1088,7 @@
       uniforms: {
         uLUT: { value: lutTex }, uLutSize: { value: L.size },
         uLutMean: { value: new THREE.Vector3(L.mean[0], L.mean[1], L.mean[2]) },
-        uCell: { value: new THREE.Vector2(1.0, 2.6) }, uFrame: { value: new THREE.Vector2(0.16, 0.25) },
+        uCell: { value: new THREE.Vector3(1.6, 3.6, 0.05) }, uFrame: { value: new THREE.Vector2(0.07, 0.34) },
         uWinGain: { value: o.winGain == null ? 1.6 : o.winGain }, uRoofDark: { value: 0.8 }
       }
     };
@@ -959,7 +1106,7 @@
         'void main(){',
         '  vUv = aUv; vCol = aCol; vSize = aSize; vSeed = aSeed;',
         '  vec4 w = modelMatrix * vec4(position, 1.0);',
-        '  vFog = cgFogAmt(length(w.xyz - cameraPosition), uFogK); vFogC = cgFogColor(w.y);',
+        '  vFog = cgFogAmt(w.xyz, uFogK); vFogC = cgFogColor(w.xyz);',
         '  gl_Position = projectionMatrix * viewMatrix * w;',
         '}'].join('\n'),
       fragmentShader: [
@@ -1015,7 +1162,7 @@
         '  vec4 mv = viewMatrix * vec4(iPos, 1.0);',
         '  mv.xy += position.xy * iSize;',
         '  vUv = uv;',
-        '  vCol = iCol * (1.0 - cgFogAmt(length(mv.xyz), uFogK));',
+        '  vCol = iCol * (1.0 - cgFogAmt(iPos, uFogK));',
         '  gl_Position = projectionMatrix * mv;',
         '}'].join('\n'),
       fragmentShader: [
@@ -1045,7 +1192,7 @@
         '  wp += dn * (position.x - 0.5) * 2.0 * wpx * 0.6;',
         '  wp += side * position.y * wpx;',
         '  vP = position.xy; vFade = iW.y;',
-        '  vCol = iCol * (1.0 - cgFogAmt(length(toCam), uFogK)) * (iW.x / wpx);',
+        '  vCol = iCol * (1.0 - cgFogAmt(wp, uFogK)) * (iW.x / wpx);',
         '  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);',
         '}'].join('\n'),
       fragmentShader: [
@@ -1062,19 +1209,14 @@
     var b0 = boneRGB(0.05);
     var cableMat = fog.patch(new THREE.LineBasicMaterial({ color: new THREE.Color().setRGB(toLin(b0[0]), toLin(b0[1]), toLin(b0[2])) }), {});
 
-    /* skyline */
+    /* skyline: dark far towers with the mean glow of their windows,
+       fogged by the same atmosphere as everything else, so at high
+       density they dissolve into the haze instead of standing above it */
     var skyMat = new THREE.ShaderMaterial({
-      uniforms: Object.assign({ uDark: { value: 0.9 } }, fog.uniforms),
+      uniforms: Object.assign({ uBase: { value: new THREE.Color(0.06, 0.065, 0.085) } }, fog.uniforms),
       vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
-      /* the sky colour in that direction (as makeSky computes it), a little
-         darker: a silhouette in the haze. Near the ground it takes the low
-         fog colour instead, so the boxes stand on the fogged ground rather
-         than float above it. */
-      fragmentShader: FOG_DECL + '\nuniform float uDark; varying vec3 vW;\nvoid main(){\n' +
-        '  vec3 d = normalize(vW - cameraPosition);\n' +
-        '  vec3 sky = cgFogColor(cameraPosition.y + d.y * 3.0 / cgFogDensity);\n' +
-        '  vec3 c = mix(cgFogColor(vW.y), sky, smoothstep(0.0, 160.0, vW.y));\n' +
-        '  gl_FragColor = vec4(c * uDark, 1.0);\n}',
+      fragmentShader: FOG_DECL + '\nuniform vec3 uBase; varying vec3 vW;\nvoid main(){\n' +
+        '  gl_FragColor = vec4(mix(uBase, cgFogColor(vW), cgFogAmt(vW, 1.0)), 1.0);\n}',
       fog: false
     });
     var skyR = o.skylineR || 1750;
@@ -1189,7 +1331,7 @@
             var A = s.a.slice(), B = s.b.slice();
             var oa = ax === 0 ? 2 : 0;
             A[oa] += side * off; B[oa] += side * off; A[1] = B[1] = 0.6;
-            ta.push(A[0], A[1], A[2]); tb.push(B[0], B[1], B[2]); tw.push(1.6, 0); tc.push(lampC[0] * 0.1, lampC[1] * 0.1, lampC[2] * 0.1);
+            ta.push(A[0], A[1], A[2]); tb.push(B[0], B[1], B[2]); tw.push(1.6, 0); tc.push(lampC[0] * 0.3, lampC[1] * 0.3, lampC[2] * 0.3);
           }
         }
         for (i = 0; i < t.cables.length; i++) {
@@ -1285,6 +1427,7 @@
     tileKey: tileKey, tileOf: tileOf, inLaneBand: inLaneBand, boxDist: boxDist, boxesOverlap: boxesOverlap,
     makeTile: makeTile, tilesAround: tilesAround, wanted: wanted, makeCity: makeCity, findCanyon: findCanyon,
     boneRGB: boneRGB, windowLUT: windowLUT,
+    FOG_MED: FOG_MED, fogTau: fogTau, fogTauInf: fogTauInf, WEATHER: WEATHER, weatherAt: weatherAt,
     makeFog: makeFog, makeSky: makeSky, makeCityRenderer: makeCityRenderer
   };
   globalThis.HikyakuCity = HikyakuCity;

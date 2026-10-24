@@ -839,11 +839,14 @@
   /* The additive layers read three's own scene fog uniforms (the renderer
      fills them because the material has fog: true) and fade the light to
      black instead of mixing in the fog colour, which is what an additive
-     light behind fog does. uFogK < 1 lets lights carry further than walls. */
+     light behind fog does. uFogK < 1 lets lights carry further than walls.
+     tfFog takes the world position of the light: with the page's
+     atmosphere (TF_CG) the fog depends on both ends of the ray, not only
+     on its length. */
   const FOG_VS = [
     'uniform float uFogK;',
     '#ifdef TF_CG',
-    'uniform float cgFogDensity;',
+    '/*CG_FOG*/',
     '#endif',
     '#ifdef USE_FOG',
     'uniform float fogNear; uniform float fogFar;',
@@ -851,11 +854,11 @@
     'uniform float fogDensity;',
     '#endif',
     '#endif',
-    'float tfFog(float d){',
-    '  d *= uFogK;',
+    'float tfFog(vec3 w){',
     '#ifdef TF_CG',
-    '  return 1.0 - exp(-cgFogDensity * d);',
+    '  return cgFogAmt(w, uFogK);',
     '#elif defined(USE_FOG)',
+    '  float d = length(w - cameraPosition) * uFogK;',
     '#ifdef FOG_EXP2',
     '  return 1.0 - exp(-fogDensity * fogDensity * d * d);',
     '#else',
@@ -866,10 +869,10 @@
     '#endif',
     '}'
   ].join('\n');
-  /* The page's own height fog (hikyaku-city.js makeFog), when createTraffic
+  /* The page's own atmosphere (hikyaku-city.js makeFog), when createTraffic
      gets opts.fog: the lit bodies go through fog.patch like every other
-     material of the page, the additive layers read its density uniform
-     (TF_CG, exponential in distance as cgFogAmt). fog.patch sets its own
+     material of the page, the additive layers get its declarations through
+     fog.inject (TF_CG, tfFog calls cgFogAmt). fog.patch sets its own
      program cache key; it is combined with the vehicle key here, otherwise
      a patched vehicle material and a patched plain material of the same
      type would share one program. */
@@ -884,8 +887,7 @@
   function cgAdditive(fog, mat) {
     if (!fog) return mat;
     mat.defines = Object.assign(mat.defines || {}, { TF_CG: '' });
-    mat.uniforms.cgFogDensity = fog.uniforms.cgFogDensity;
-    return mat;
+    return fog.inject(mat);
   }
   function fogUniforms(THREE, k) {
     return { uFogK: { value: k }, fogColor: { value: new THREE.Color() }, fogNear: { value: 1 },
@@ -911,7 +913,7 @@ void main(){
   vec4 mv = viewMatrix * vec4(iPos, 1.0);
   mv.xy += position.xy * iSize;
   vUv = uv;
-  vCol = iCol * (1.0 - tfFog(length(mv.xyz)));
+  vCol = iCol * (1.0 - tfFog(iPos));
   gl_Position = projectionMatrix * mv;
 }`,
       fragmentShader: `uniform float uFall; varying vec2 vUv; varying vec3 vCol;
@@ -956,7 +958,7 @@ void main(){
   wp += side * position.y * iW.x;
   vP = vec2(position.x, position.y);
   vFade = iW.y;
-  vCol = iCol * (1.0 - tfFog(length(toCam)));
+  vCol = iCol * (1.0 - tfFog(wp));
   gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
 }`,
       fragmentShader: `varying vec2 vP; varying vec3 vCol; varying float vFade;

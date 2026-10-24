@@ -170,6 +170,7 @@
   <script src="/assets/js/hikyaku-city.js"></script>
   <script src="/assets/js/hikyaku-traffic.js"></script>
   <script src="/assets/js/menger.js"></script>
+  <script src="/assets/js/dust.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -1124,19 +1125,29 @@ function boneColor(THREE, t, k) {
   return new THREE.Color().setRGB(c[0] * s, c[1] * s, c[2] * s, THREE.SRGBColorSpace);
 }
 
+/* The haze density in use: the URL override (per km, as on the slider) or
+   the stored setting (per metre). */
+function hazeOf(p) {
+  return Number.isFinite(URL_FOG) && URL_FOG > 0 ? URL_FOG / 1000 : p.fogDensity;
+}
+
 /* URL hooks. ?seed= makes a route shareable and best times comparable.
    ?shot=start|ring|top|city|canyon|mouth|inside places the camera
    deterministically and ignores input, for headless screenshots (mouth:
    120 m before the block's entry portal, inside: at its centre ring,
    looking at the exit); ?nohid=1 skips the 3D mouse;
    ?bench=1 measures tile builds and frame times and logs them with
-   console.error (headless Chrome prints that to stderr). Test hooks, kept
-   cheap. */
+   console.error (headless Chrome prints that to stderr). ?shot=high is the
+   owner's view of 2026-10-25: chase camera 320 m up, nose down over the
+   city. ?fog=<haze per km> and ?weather=rain|dry override the stored
+   settings without storing them. Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
+const URL_FOG = parseFloat(URLP.get('fog'));
+const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
 const DEF = {
   seed: 1,
@@ -1154,9 +1165,14 @@ const DEF = {
   camMode: 'chase',
   camF0: 0.9, camZeta: 0.7071, camRoll: 0.25, camDist: 2.4, camUp: 0.45,
   shadows: false, overlay: false, routeLine: true,
-  /* The city. Density, height and accents take effect on "Rebuild"; fog and
-     the tile window apply at once. */
-  cityDensity: 0.85, cityMaxH: 260, cityAccents: 2, fogDensity: 0.0034, cityRadius: 4,
+  /* The city. Density, height and accents take effect on "Rebuild"; haze and
+     the tile window apply at once. fogDensity is the haze above the roofs,
+     kH of the atmosphere in hikyaku-city.js makeFog, per metre at ground
+     level; the ground soup does not depend on it. */
+  cityDensity: 0.92, cityMaxH: 420, cityAccents: 2, fogDensity: 0.0026, cityRadius: 4,
+  /* Weather: auto lets rain come and go (HikyakuCity.weatherAt), dry and
+     rain pin it. particles: the drifting motes that show speed. */
+  weather: 'auto', particles: true,
   /* Traffic (step 5): on/off, the share of streets that carry lanes, and
      two debug views. */
   traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false,
@@ -1167,15 +1183,17 @@ const DEF = {
   panel: true, sec: '',
   /* Version of the stored config. Below 2, the stored gravity and assist
      are dropped once, so the new defaults (both off) reach a browser that
-     stored the old ones (both on). */
-  cfgV: 2
+     stored the old ones (both on). Below 3, the city and fog values are
+     dropped once: the fog slider means the haze of the new atmosphere and
+     the city grew taller (look round of 2026-10-25). */
+  cfgV: 3
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
    is the courier's own cyan. */
 const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
-const ENUMS = { camMode: ['chase', 'cockpit'] };
+const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'] };
 const STORE = 'hk.cfg';
 /* Best times per seed. The key changed with step 6: a seed's route now runs
    through a Menger block, so times from the old routes do not compare. */
@@ -1212,7 +1230,10 @@ function loadStored() {
     const raw = localStorage.getItem(STORE);
     if (raw) {
       const o = JSON.parse(raw);
-      if (o && typeof o === 'object' && !(o.cfgV >= DEF.cfgV)) { delete o.gravity; delete o.assist; }
+      if (o && typeof o === 'object') {
+        if (!(o.cfgV >= 2)) { delete o.gravity; delete o.assist; }
+        if (!(o.cfgV >= 3)) { delete o.cityDensity; delete o.cityMaxH; delete o.fogDensity; }
+      }
       c = { ...SD.mergeConfig(DEF, o, ENUMS), cfgV: DEF.cfgV };
     }
   } catch (e) { c = DEF; }
@@ -1272,12 +1293,16 @@ function Section({ id, title, summary, open, onToggle, children }) {
    repeat, streets 32 m wide on the tile edges and through the middle, with
    kerbs and faint lane dashes on the 54 m lane pitch. The pattern is
    symmetric, so the plane's uv orientation does not matter, only that its
-   corner sits on a tile corner. */
-function groundTexture(THREE, renderer) {
+   corner sits on a tile corner. Two canvases: the albedo, and the light of
+   the street (2026-10-25, the owner saw a black sheet): lamp strings along
+   both kerbs, shop glow along the block fronts, a few accent signs, a dim
+   glow over the blocks. Where the ground shows through the soup, it reads
+   as a lit street grid in haze. */
+function groundTextures(THREE, renderer) {
   const N = 1024, T = HC.TILE, k = N / T;
-  const c = document.createElement('canvas');
-  c.width = c.height = N;
-  const g = c.getContext('2d');
+  const mk = () => { const c = document.createElement('canvas'); c.width = c.height = N; return c; };
+  const c = mk(), e = mk();
+  const g = c.getContext('2d'), h = e.getContext('2d');
   g.fillStyle = boneCss(0.16, 0.55);
   g.fillRect(0, 0, N, N);
   const half = HC.STREET / 2 * k;
@@ -1285,19 +1310,138 @@ function groundTexture(THREE, renderer) {
   for (const m of [0, N / 2, N]) { g.fillRect(m - half, 0, 2 * half, N); g.fillRect(0, m - half, N, 2 * half); }
   g.fillStyle = boneCss(0.3, 0.45);
   for (const m of [0, N / 2, N]) for (const sgn of [-1, 1]) {
-    const e = m + sgn * half - (sgn > 0 ? 2 : 0);
-    g.fillRect(e, 0, 2, N); g.fillRect(0, e, N, 2);
+    const ed = m + sgn * half - (sgn > 0 ? 2 : 0);
+    g.fillRect(ed, 0, 2, N); g.fillRect(0, ed, N, 2);
   }
   /* lane dashes along every street, on the 54 m pitch offsets */
   g.fillStyle = boneCss(0.35, 0.35);
   for (const m of [0, N / 2, N]) for (const off of [-6, 6]) {
     for (let t = 0; t < N; t += 24) { g.fillRect(m + off * k - 1, t, 2, 12); g.fillRect(t, m + off * k - 1, 12, 2); }
   }
-  const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
-  return tex;
+  /* light: black is no light */
+  h.fillStyle = '#000';
+  h.fillRect(0, 0, N, N);
+  /* dim glow over the blocks (windows, courtyards), brighter at the fronts */
+  const rnd = Dust.rng(0x57ee7);
+  const blocks = [[half, N / 2 - half], [N / 2 + half, N - half]];
+  for (const [x0, x1] of blocks) for (const [z0, z1] of blocks) {
+    h.fillStyle = 'rgba(120,135,150,0.10)';
+    h.fillRect(x0, z0, x1 - x0, z1 - z0);
+    h.fillStyle = 'rgba(190,200,205,0.22)';
+    const fr = 2.5 * k;
+    h.fillRect(x0, z0, x1 - x0, fr); h.fillRect(x0, z1 - fr, x1 - x0, fr);
+    h.fillRect(x0, z0, fr, z1 - z0); h.fillRect(x1 - fr, z0, fr, z1 - z0);
+    /* shop fronts: short warm-white and accent bars on the block edges */
+    for (let i = 0; i < 26; i++) {
+      const side = Math.floor(rnd() * 4), len = (4 + rnd() * 12) * k, at = rnd();
+      const r = rnd();
+      h.fillStyle = r < 0.12 ? 'rgba(46,232,255,0.9)' : r < 0.22 ? 'rgba(255,63,164,0.85)' : 'rgba(235,225,205,0.7)';
+      const w = 1.2 * k;
+      if (side === 0) h.fillRect(x0 + at * (x1 - x0 - len), z0 - w, len, w);
+      else if (side === 1) h.fillRect(x0 + at * (x1 - x0 - len), z1, len, w);
+      else if (side === 2) h.fillRect(x0 - w, z0 + at * (z1 - z0 - len), w, len);
+      else h.fillRect(x1, z0 + at * (z1 - z0 - len), w, len);
+    }
+  }
+  /* lamp strings: a lamp every 9 m on both kerbs of every street, and a
+     faint pool of light on the road under each */
+  for (const m of [0, N / 2, N]) for (const sgn of [-1, 1]) {
+    const ln = m + sgn * (half - 2.2 * k);
+    for (let t = 0; t < N; t += 9 * k) {
+      const grad = (x, y) => {
+        const gr = h.createRadialGradient(x, y, 0, x, y, 4 * k);
+        gr.addColorStop(0, 'rgba(230,236,240,0.35)'); gr.addColorStop(1, 'rgba(230,236,240,0)');
+        h.fillStyle = gr; h.fillRect(x - 4 * k, y - 4 * k, 8 * k, 8 * k);
+        h.fillStyle = 'rgba(255,250,240,1)'; h.fillRect(x - 2, y - 2, 4, 4);
+      };
+      grad(ln, t + 4.5 * k); grad(t + 4.5 * k, ln);
+    }
+  }
+  const tex = (cv, srgb) => {
+    const t = new THREE.CanvasTexture(cv);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+    return t;
+  };
+  return { map: tex(c), light: tex(e) };
+}
+
+/* Rain: streaks on a lattice folded around the camera, the dust.js idea,
+   but the fold runs in the vertex shader and every drop is a quad from
+   its head back along its velocity relative to the camera, so the streaks
+   lean and stretch with the ship's speed. dust.js draws round points by
+   design (its comment explains why streaks lied there: the motes are the
+   speed cue at rest too); rain is a streak in reality, so it gets its own
+   small system here. Its random lattice comes from Dust.rng, so the field
+   is the same on every load. */
+function makeRain(THREE, n) {
+  const rnd = Dust.rng(0x7a1e);
+  const base = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) base[i] = rnd();
+  const q = new THREE.PlaneGeometry(1, 2).translate(0.5, 0, 0);
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.index = q.index; geo.setAttribute('position', q.getAttribute('position'));
+  geo.setAttribute('iBase', new THREE.InstancedBufferAttribute(base, 3));
+  geo.instanceCount = n;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uCam: { value: new THREE.Vector3() }, uShift: { value: new THREE.Vector3() }, uS: { value: 70 },
+      uRel: { value: new THREE.Vector3(0, -9, 0) }, uExp: { value: 0.035 }, uW: { value: 0.02 },
+      uAlpha: { value: 0 }, uColor: { value: new THREE.Color(0.62, 0.68, 0.72) }
+    },
+    vertexShader: `
+uniform vec3 uCam; uniform vec3 uShift; uniform float uS; uniform vec3 uRel; uniform float uExp; uniform float uW;
+attribute vec3 iBase;
+varying vec2 vP; varying float vA;
+void main(){
+  vec3 d = iBase * uS + uShift - uCam;
+  d = (fract(d / uS + 0.5) - 0.5) * uS;
+  vec3 head = uCam + d;
+  vec3 st = -uRel * uExp;
+  float L = length(st);
+  if (L > 9.0) { st *= 9.0 / L; L = 9.0; }
+  vec3 wp = head + st * position.x;
+  vec3 toCam = cameraPosition - wp;
+  float dist = length(toCam);
+  vec3 dn = st / max(L, 1e-4);
+  vec3 side = normalize(cross(dn, toCam));
+  float w = max(uW, dist * 0.0011);
+  wp += side * position.y * w;
+  vP = position.xy;
+  float r = length(d) / (0.5 * uS);
+  vA = (1.0 - smoothstep(0.55, 1.0, r)) * smoothstep(0.6, 2.5, dist) * (uW / w);
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+}`,
+    fragmentShader: `
+uniform float uAlpha; uniform vec3 uColor;
+varying vec2 vP; varying float vA;
+void main(){
+  float a = exp(-vP.y * vP.y * 4.0) * smoothstep(0.0, 0.3, vP.x) * uAlpha * vA;
+  if (a < 0.003) discard;
+  gl_FragColor = vec4(uColor, a);
+}`,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 3;
+  q.dispose();
+  return {
+    mesh,
+    /* fall: the rain's own velocity (with a little wind); vShip: the
+       camera's velocity, so the streak is the drop's motion as the eye sees it */
+    update(cam, t, level, vShip) {
+      const u = mat.uniforms, S = u.uS.value;
+      const fall = [1.2, -9.5, 0.7];
+      u.uCam.value.copy(cam);
+      u.uShift.value.set(((fall[0] * t) % S + S) % S, ((fall[1] * t) % S + S) % S, ((fall[2] * t) % S + S) % S);
+      u.uRel.value.set(fall[0] - vShip[0], fall[1] - vShip[1], fall[2] - vShip[2]);
+      u.uAlpha.value = 0.38 * level;
+      mesh.visible = level > 0.01;
+    },
+    dispose() { geo.dispose(); mat.dispose(); }
+  };
 }
 
 /* A ship pose for the screenshot hooks: back along dir from p, nose along
@@ -1511,12 +1655,14 @@ function App() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
 
-    /* One height fog for the whole page (hikyaku-city.js makeFog): dense and
-       pale low down, thinner and darker high up. Every lit material is
-       patched to use it, the sky sphere shows its far end. scene.fog is a
-       zero-density placeholder: it only switches the fog chunk on. */
+    /* One atmosphere for the whole page (hikyaku-city.js makeFog, the model
+       is written down there): a ground soup that buries the streets and a
+       haze above the roofs whose density the slider sets. Every lit
+       material is patched to use it, the sky sphere is the same model for
+       an endless ray. scene.fog is a zero-density placeholder: it only
+       switches the fog chunk on. */
     const fog = HC.makeFog(THREE);
-    fog.set({ density: cfgRef.current.p.fogDensity, low: 0.56, high: 0.16, h0: 0, h1: 420 });
+    fog.set({ density: hazeOf(cfgRef.current.p) });
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x000000, 0);
     scene.add(HC.makeSky(THREE, fog));
@@ -1553,6 +1699,7 @@ function App() {
     });
 
     const state = {
+      rain: -1, camPrev: null, camVel: [0, 0, 0],
       s: null, info: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] },
       simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: ''
     };
@@ -1561,8 +1708,15 @@ function App() {
        loop calls traffic.update(trafficTime, camera) when it is set.
        menger: the block's visual, from the block effect. hullBoxes: the
        vehicle hull debug view. */
+    /* Speed cue and weather: drifting motes (dust.js, as in the corridor)
+       and rain that comes and goes (makeRain above). */
+    const dust = Dust.makeField(THREE, { count: 2600, color: boneAt(0.62), seed: 0x6b1 });
+    scene.add(dust.obj);
+    const rain = makeRain(THREE, 14000);
+    scene.add(rain.mesh);
+
     const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null,
-      traffic: null, menger: null, hullBoxes: null };
+      traffic: null, menger: null, hullBoxes: null, groundMat: null };
     glRef.current = g;
 
     const colNext = new THREE.Color(ACCENT);
@@ -1622,6 +1776,12 @@ function App() {
       } else if ((SHOT === 'mouth' || SHOT === 'inside') && cfg.block) {
         const ws = cfg.route.waypoints, i0 = cfg.block.i0;
         state.s = SHOT === 'mouth' ? poseAt(ws[i0 + 1].p, ws[i0 + 1].dir, 120) : poseAt(ws[i0 + 2].p, ws[i0 + 2].dir, -10);
+      }
+      if (SHOT === 'high') {
+        const w = open[Math.min(5, open.length - 1)];
+        const h = Math.hypot(w.dir[0], w.dir[2]) || 1;
+        const d = [w.dir[0] / h * 0.87, -0.5, w.dir[2] / h * 0.87];
+        state.s = poseAt([w.p[0], 320, w.p[2]], d, 0);
       }
       state.info = null;
       state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
@@ -1914,11 +2074,45 @@ function App() {
         camera.position.set(cx, hgt, cz);
         camera.up.set(0, 0, -1);
         camera.lookAt(cx, 0, cz);
-        fog.uniforms.cgFogDensity.value = 0.25 / hgt;
+        /* the map view: a thin uniform haze scaled to the height, unless
+           the URL asks for a given fog */
+        if (!Number.isFinite(URL_FOG)) fog.set({ soupK: 0.004, hazeK: 0.25 / hgt, hazeH: 1e6 });
         if (cityR) cityR.skyline.visible = false;
       }
       camera.updateMatrixWorld();
       if (cityR) cityR.update(camera.position, dt);
+
+      /* ---- weather and particles ----
+         The rain level follows HikyakuCity.weatherAt (auto) or the panel,
+         at most a tenth per second, so a switch fades instead of popping.
+         It thickens the haze, darkens the sky, wets the ground (lower
+         roughness, brighter lamp pools) and shows the streaks. The camera
+         velocity skews the streaks and moves the motes past the eye. */
+      {
+        const mode = URL_WEATHER || pp.weather;
+        const wallT = ts / 1000;
+        const target = mode === 'rain' ? 1 : mode === 'dry' ? 0 : HC.weatherAt(wallT, (pp.seed * 7919) >>> 0);
+        if (state.rain < 0 || SHOT) state.rain = target;
+        else state.rain += Math.max(-dt / 10, Math.min(dt / 10, target - state.rain));
+        const lvl = state.rain;
+        if (Math.abs(fog.state.rain - lvl) > 1e-3) fog.set({ rain: lvl });
+        if (g.groundMat) {
+          g.groundMat.roughness = 0.9 - 0.55 * lvl;
+          g.groundMat.emissiveIntensity = 1 + 0.5 * lvl;
+        }
+        const cp = camera.position;
+        if (state.camPrev && dt > 0) {
+          const k = Math.min(1, dt * 8);
+          for (let i = 0; i < 3; i++) state.camVel[i] += k * ((cp.getComponent(i) - state.camPrev[i]) / dt - state.camVel[i]);
+        }
+        state.camPrev = [cp.x, cp.y, cp.z];
+        rain.update(cp, wallT, lvl, SHOT ? s.v : state.camVel);
+        dust.obj.visible = pp.particles;
+        if (pp.particles) {
+          Dust.update(dust, [cp.x, cp.y, cp.z], { far: 90, sizeNear: 3.2, sizeFar: 1.4, opNear: 0.55, opFar: 0.1,
+            edge: 0.3, pix: renderer.getPixelRatio() });
+        }
+      }
       /* The traffic layer: every pose a closed formula of the traffic time
          (race time once the start gate is crossed, hkcore trafficTime). */
       const tTraffic = HK.trafficTime(state.race, state.simT);
@@ -2055,6 +2249,7 @@ function App() {
       window.removeEventListener('mousemove', onMove);
       host.removeEventListener('wheel', onWheel);
       ship.dispose();
+      dust.geo.dispose(); dust.obj.material.dispose(); rain.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
       glRef.current = null;
@@ -2076,6 +2271,7 @@ function App() {
         if (c.geometry) c.geometry.dispose();
         if (c.material) {
           if (c.material.map) c.material.map.dispose();
+          if (c.material.emissiveMap) c.material.emissiveMap.dispose();
           c.material.dispose();
         }
       });
@@ -2089,10 +2285,15 @@ function App() {
     const b = route.bounds;
     const cx = (b.min[0] + b.max[0]) / 2, cz = (b.min[2] + b.max[2]) / 2;
     const size = Math.ceil((Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) + 12000) / (2 * T)) * 2 * T;
-    const tex = groundTexture(THREE, g.renderer);
-    tex.repeat.set(size / T, size / T);
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size).rotateX(-Math.PI / 2),
-      g.fog.patch(new THREE.MeshLambertMaterial({ map: tex })));
+    const tx = groundTextures(THREE, g.renderer);
+    tx.map.repeat.set(size / T, size / T);
+    tx.light.repeat.set(size / T, size / T);
+    /* Standard, not Lambert, so rain can make it glossy (the loop lowers
+       the roughness with the rain level) */
+    const gMat = g.fog.patch(new THREE.MeshStandardMaterial({ map: tx.map, emissiveMap: tx.light,
+      emissive: new THREE.Color(1, 1, 1), emissiveIntensity: 1, roughness: 0.9, metalness: 0 }));
+    g.groundMat = gMat;
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size).rotateX(-Math.PI / 2), gMat);
     ground.position.set(Math.round(cx / T) * T, 0, Math.round(cz / T) * T);
     ground.receiveShadow = true;
     grp.add(ground);
@@ -2163,7 +2364,7 @@ function App() {
 
   useEffect(() => {
     const g = glRef.current;
-    if (g && SHOT !== 'top') g.fog.set({ density: p.fogDensity });
+    if (g && (SHOT !== 'top' || Number.isFinite(URL_FOG))) g.fog.set({ density: hazeOf(p) });
   }, [ready, p.fogDensity]);
 
   /* ---- the Menger block ----------------------------------------------
@@ -2429,21 +2630,23 @@ function App() {
         summary=${(cityPending ? 'rebuild to apply, ' : '') + 'up to ' + fmt(cityCfg.maxH, 0) + ' m, ' + cityCfg.accents + ' accent' + (cityCfg.accents === 1 ? '' : 's')}>
         <${Slider} label="Density" digits=${2} min=${0.3} max=${1} step=${0.05}
           value=${p.cityDensity} onChange=${upd('cityDensity')} />
-        <${Slider} label="Max height" unit="m" digits=${0} min=${80} max=${400} step=${10}
+        <${Slider} label="Max height" unit="m" digits=${0} min=${120} max=${500} step=${10}
           value=${p.cityMaxH} onChange=${upd('cityMaxH')} />
         <${Seg} label="Neon accent colours" value=${p.cityAccents} onChange=${upd('cityAccents')}
           options=${[{ value: 0, label: 'None' }, { value: 1, label: 'One' }, { value: 2, label: 'Two' }]} />
         <div className="hk-chips">
           <button className=${'lang-seg' + (cityPending ? ' active' : '')} onClick=${rebuildCity}>Rebuild</button>
         </div>
-        <${Slider} label="Fog density" unit="per km" digits=${1} scale=${1000} min=${0.001} max=${0.008} step=${0.0002}
+        <${Slider} label="Haze" unit="per km" digits=${1} scale=${1000} min=${0.001} max=${0.008} step=${0.0001}
           value=${p.fogDensity} onChange=${upd('fogDensity')} />
         <${Slider} label="Tile window" unit="tiles each way" digits=${0} min=${2} max=${5} step=${1}
           value=${p.cityRadius} onChange=${upd('cityRadius')} />
         <p className="hk-note">Density, height and accents apply on "Rebuild". The city never builds inside the
           45 m tube around the route: buildings there are lowered, split into a canyon or left out, so every ring
           stays reachable. Bridges and cables keep clear of the three future traffic altitudes
-          (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.</p>
+          (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.
+          "Haze" sets the fog above the roofs. The fog in the streets stays dense at any setting, and it thins out
+          above about 60 m. "Max height" is the top of the regular towers; a few landmarks reach a fifth higher.</p>
       <//>
 
       <${Section} id="traffic" title="Traffic" open=${sec === 'traffic'} onToggle=${toggleSec}
@@ -2476,9 +2679,13 @@ function App() {
           <button className=${'lang-seg' + (p.routeLine ? ' active' : '')} onClick=${() => upd('routeLine')(!p.routeLine)}>Route line</button>
           <button className=${'lang-seg' + (p.overlay ? ' active' : '')} onClick=${() => upd('overlay')(!p.overlay)}>Collision hull</button>
           <button className=${'lang-seg' + (p.shadows ? ' active' : '')} onClick=${() => upd('shadows')(!p.shadows)}>Shadows</button>
+          <button className=${'lang-seg' + (p.particles ? ' active' : '')} onClick=${() => upd('particles')(!p.particles)}>Particles</button>
         </div>
+        <${Seg} label="Weather" value=${p.weather} onChange=${upd('weather')}
+          options=${[{ value: 'auto', label: 'Auto' }, { value: 'dry', label: 'Dry' }, { value: 'rain', label: 'Rain' }]} />
         <p className="hk-note">"Collision hull" shows the 18 points and the hull the physics uses. Shadows are off by default
-          because they cost frame time.</p>
+          because they cost frame time. "Particles" are the drifting motes that show your speed. On "Auto", rain comes
+          and goes: a shower of 40 to 90 s in most five-minute stretches, fading in and out over 10 s.</p>
       <//>
 
       <${Section} id="keys" title="Controls" open=${sec === 'keys'} onToggle=${toggleSec}>
