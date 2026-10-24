@@ -62,6 +62,14 @@
       z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
       font-size: 15px; color: var(--tool-text); letter-spacing: .04em;
       text-shadow: 0 0 18px rgba(0,0,0,.95); }
+    .hk-pause { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 4;
+      pointer-events: none; text-align: center; max-width: 62ch; padding: 18px 26px; border-radius: 8px;
+      background: rgba(6, 9, 14, .72); border: 1px solid var(--tool-border); color: var(--tool-text); font-size: 13px; }
+    .hk-pause b { display: block; font-size: 22px; letter-spacing: .3em; margin-bottom: 8px; }
+    .hk-pause p { margin: 6px 0 0; color: var(--tool-note); line-height: 1.7; }
+    .hk-hint { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 3;
+      pointer-events: none; font-size: 12px; letter-spacing: .06em; color: var(--tool-note);
+      text-shadow: 0 0 12px rgba(0,0,0,.95); }
     .hk-msg small { display: block; margin-top: 8px; font-size: 11.5px; color: var(--tool-note); letter-spacing: 0; }
 
     /* The cue to the next waypoint: a diamond on the target while it is on
@@ -172,6 +180,8 @@
   <script src="/assets/js/colorramps.js"></script>
   <script src="/assets/js/courier.js"></script>
   <script src="/assets/js/hikyaku-city.js"></script>
+  <script src="/assets/js/hikyaku-events.js"></script>
+  <script src="/assets/js/synthwave.js"></script>
   <script src="/assets/js/hikyaku-traffic.js"></script>
   <script src="/assets/js/menger.js"></script>
   <script src="/assets/js/shaft.js"></script>
@@ -300,7 +310,16 @@ var Hikyaku = (function () {
        shaftAltMax through a housing building of its own, the mouths in the
        end facades, with approach and leave legs of shaftLead metres
        outside the mouths. */
-    shaft: true, shaftAt: 0.8, shaftAltMin: 70, shaftAltMax: 110, shaftLead: 80
+    shaft: true, shaftAt: 0.8, shaftAltMin: 70, shaftAltMax: 110, shaftLead: 80,
+    /* Freighter lanes (HikyakuTraffic.freighterLanes) over the route's box
+       plus freightMargin, the full set at density 1 (the panel's density
+       picks a subset in makeLanes). A lane whose hull sweep comes within
+       freightClear of the block or the shaft housing is left out. Every
+       remaining lane reserves a corridor in the city: freightHalf metres to
+       each side of its line, from freightFloor up, so no tower or landmark
+       reaches a freighter (the city caps buildings 10 m under the corridor
+       floor and keeps landmarks 30 m beside it). */
+    freight: true, freightMargin: 900, freightHalf: 30, freightFloor: 220, freightClear: 30
   };
   /* Box indices of the block, clear of every city box: the city numbers its
      boxes tile * 4096 + i, below 2^45. contactsBoxes keys on idx. */
@@ -680,6 +699,48 @@ var Hikyaku = (function () {
         hi[j] = Math.max(hi[j], samples[i].p[j] + R.tubeR);
       }
     }
+    /* Freighter lanes and their corridors (see DEF_ROUTE). Without
+       HikyakuTraffic loaded the route simply has none. */
+    var freight = { lanes: [], corridors: [], skipped: 0 };
+    var HTf = globalThis.HikyakuTraffic;
+    if (R.freight && HTf && HTf.freighterLanes) {
+      var fm = R.freightMargin;
+      var fBox = { min: [lo[0] - fm, 0, lo[2] - fm], max: [hi[0] + fm, 0, hi[2] + fm] };
+      var fls = HTf.freighterLanes(fBox, (R.seed ^ 0x46524748) >>> 0, { density: 1 });
+      var FB = { box: HTf.vehicleHull('freighter') };
+      for (i = 0; i < fls.length; i++) {
+        var fl = fls[i], fa = fl.freight.axis === 'x' ? 0 : 2, fc = fa === 0 ? 2 : 0, fy = fl.freight.y;
+        var a0 = Math.min(fl.points[0][fa], fl.points[1][fa]), a1 = Math.max(fl.points[0][fa], fl.points[1][fa]);
+        /* the hull sweep: half width and height of the freighter's box */
+        var sw = { min: [0, fy + FB.box.min[1], 0], max: [0, fy + FB.box.max[1], 0] };
+        var hw2 = Math.max(-FB.box.min[0], FB.box.max[0]);
+        sw.min[fa] = a0; sw.max[fa] = a1; sw.min[fc] = fl.freight.row - hw2; sw.max[fc] = fl.freight.row + hw2;
+        var bad = false;
+        for (j = 0; j < specials.length && !bad; j++) {
+          var sb = specials[j].bounds, mC = R.freightClear;
+          if (sw.min[0] < sb.max[0] + mC && sw.max[0] > sb.min[0] - mC && sw.min[2] < sb.max[2] + mC && sw.max[2] > sb.min[2] - mC
+            && sw.min[1] < sb.max[1] + mC) bad = true;
+        }
+        if (bad) { freight.skipped++; continue; }
+        var cb = { min: [0, R.freightFloor, 0], max: [0, fy + 80, 0], freight: freight.lanes.length };
+        cb.min[fa] = a0; cb.max[fa] = a1; cb.min[fc] = fl.freight.row - R.freightHalf; cb.max[fc] = fl.freight.row + R.freightHalf;
+        freight.corridors.push(cb);
+        freight.lanes.push({
+          kind: 'freight', axis: fl.freight.axis, y: fy, row: fl.freight.row, index: i,
+          points: fl.points.map(function (q) { return q.slice(); }), speed: fl.speed, spacing: fl.spacing, phase: fl.phase,
+          types: { freighter: 1 }, seed: fl.seed, bob: { amp: fl.bobAmp, freq: fl.bobFreq }, maxBank: 0,
+          fadeEnds: fl.fadeEnds, freight: { axis: fl.freight.axis, y: fy, row: fl.freight.row }
+        });
+      }
+    }
+    /* Every box the city keeps free: the specials' (per 100 m of the shaft)
+       and the freighter corridors. */
+    var reserved = [];
+    for (i = 0; i < specials.length; i++) {
+      if (specials[i].reservedList) reserved = reserved.concat(specials[i].reservedList);
+      else reserved.push(specials[i].reserved);
+    }
+    reserved = reserved.concat(freight.corridors);
     var tube = {
       r: R.tubeR, samples: samples,
       /* Distance from p to the nearest sample. Brute force, for tests and
@@ -696,6 +757,7 @@ var Hikyaku = (function () {
     };
     return {
       seed: R.seed, cfg: R, n: n, waypoints: waypoints, segments: segments, specials: specials,
+      freight: freight, reserved: reserved,
       spline: spline, tube: tube, length: sAcc, minRadius: minR,
       bounds: { min: lo, max: hi }
     };
@@ -983,12 +1045,25 @@ var Hikyaku = (function () {
      flies next to the vehicles, not through them, and no gap can help.
      Such a stretch is stored as 'parallel' and left alone if it keeps
      `parallelMin` (12 m) of the line; closer than that the lane is
-     dropped. */
+     dropped.
+
+     Freighter lanes (route.freight, laid out by makeRoute at density 1):
+     `freight` switches them on, `freightDensity` keeps each with that
+     probability (a hash of the seed and the lane's index, so a lower
+     density keeps a subset of a higher one, and the corridors makeRoute
+     reserved cover every density). They go through the same crossing rule,
+     with `freightNear` (45 m: the hull's half width and height, the ship's
+     radius and a margin) in place of `near` and as the parallel limit:
+     a freighter lane running alongside the race line within 45 m is
+     dropped. They come back in out.freight, not in out.lanes, and their
+     crossings carry kind 'freight' and an index into out.freight. `on`
+     switches the city and block lanes alone. */
   var DEF_LANES = {
     on: true, density: 0.5, margin: 900, offset: 5,
     spacing: 55, spacingMax: 120, speed: 24, speedMax: 40,
     vNom: 45, window: 3, clear: 8, near: 25, cut: 25, minLen: 160, parallelMin: 12,
-    fade: 60, blockFade: 45, axisFlip: -1
+    fade: 60, blockFade: 45, axisFlip: -1,
+    freight: true, freightDensity: 0.6, freightNear: 45
   };
   /* Haulers get rarer the lower the lane. */
   var LANE_TYPES = [
@@ -1028,9 +1103,9 @@ var Hikyaku = (function () {
     var HT = globalThis.HikyakuTraffic, HCt = globalThis.HikyakuCity, MG = globalThis.Menger;
     if (!HT || !HCt) throw new Error('makeLanes needs HikyakuTraffic and HikyakuCity loaded first');
     var C = merge(DEF_LANES, cfg);
-    var out = { lanes: [], specs: [], crossings: [], parallels: [], cfg: C,
-      stats: { lanes: 0, city: 0, block: 0, vehicles: 0, crossings: 0, parallels: 0, phased: 0, emptied: 0, spaced: 0, dropped: 0 } };
-    if (!C.on) return out;
+    var out = { lanes: [], freight: [], specs: [], crossings: [], parallels: [], cfg: C,
+      stats: { lanes: 0, city: 0, block: 0, freight: 0, freighters: 0, vehicles: 0, crossings: 0, parallels: 0, phased: 0, emptied: 0, spaced: 0, dropped: 0 } };
+    if (!C.on && !C.freight) return out;
     var seed = route.seed >>> 0;
     var LY = HCt.LANE_Y, ST = HCt.TILE / 2;
     var smp = route.tube.samples, specs = [], i, k;
@@ -1042,7 +1117,7 @@ var Hikyaku = (function () {
     (route.specials || []).forEach(function (sp) { if (sp.kind === 'shaft') cuts = cuts.concat(sp.reservedList); });
 
     /* ---- city lanes ---- */
-    for (var li = 0; li < LY.length; li++) {
+    for (var li = 0; li < LY.length && C.on; li++) {
       var ax = (li + flip) % 2;          /* 0: along x, 1: along z */
       var aa = ax === 0 ? 0 : 2, pa = ax === 0 ? 2 : 0;
       var y = LY[li];
@@ -1095,7 +1170,7 @@ var Hikyaku = (function () {
     out.stats.city = specs.length;
 
     /* ---- the blocks' own lanes ---- */
-    for (var bJ = 0; bJ < blocks.length; bJ++) {
+    for (var bJ = 0; bJ < blocks.length && C.on; bJ++) {
       var ls = MG.laneSet(blocks[bJ].block);
       for (i = 0; i < ls.length; i++) {
         var l = ls[i];
@@ -1108,6 +1183,18 @@ var Hikyaku = (function () {
       }
     }
     out.stats.block = specs.length - out.stats.city;
+
+    /* ---- freighter lanes, a density subset of the route's ---- */
+    var fAll = C.freight && route.freight ? route.freight.lanes : [];
+    var fDen = clamp(+C.freightDensity || 0, 0, 1);
+    for (i = 0; i < fAll.length; i++) {
+      if (!(hash3(seed ^ 0x46524748, 7, fAll[i].index) < fDen)) continue;
+      var fq = Object.assign({}, fAll[i]);
+      fq.points = fq.points.map(function (pp) { return pp.slice(); });
+      fq.id = specs.length; fq.alt = -1; fq.empty = 0;
+      specs.push(fq);
+    }
+    out.stats.freight = specs.length - out.stats.city - out.stats.block;
 
     /* ---- the crossing rule ---- */
     var s0 = null;
@@ -1123,6 +1210,7 @@ var Hikyaku = (function () {
       var lane = HT.makeLane(sp);
       /* runs of race samples within `near` of the lane */
       var checks = [], paras = [], run = null;
+      var nearC = sp.kind === 'freight' ? C.freightNear : C.near, parMin = sp.kind === 'freight' ? C.freightNear : C.parallelMin;
       var flush = function () {
         if (!run) return;
         var best = run[0];
@@ -1140,16 +1228,16 @@ var Hikyaku = (function () {
         var dx = Math.max(lane.lo[0] - pr[0], 0, pr[0] - lane.hi[0]);
         var dy = Math.max(lane.lo[1] - pr[1], 0, pr[1] - lane.hi[1]);
         var dz = Math.max(lane.lo[2] - pr[2], 0, pr[2] - lane.hi[2]);
-        if (dx * dx + dy * dy + dz * dz <= C.near * C.near) {
+        if (dx * dx + dy * dy + dz * dz <= nearC * nearC) {
           var ns = HT.nearestS(lane, pr);
-          if (ns.dist <= C.near) hit = { sm: race[i], ns: ns, d: ns.dist };
+          if (ns.dist <= nearC) hit = { sm: race[i], ns: ns, d: ns.dist };
         }
         if (hit) { if (!run) run = []; run.push(hit); } else flush();
       }
       flush();
       sp.crossings = checks.length;
       var fix = 'none';
-      var tooClose = paras.some(function (pr0) { return pr0.dist < C.parallelMin; });
+      var tooClose = paras.some(function (pr0) { return pr0.dist < parMin; });
       if (tooClose) fix = 'dropped';
       else if (checks.length) {
         var base = sp.phase, sp0 = sp.spacing, done = false;
@@ -1192,9 +1280,16 @@ var Hikyaku = (function () {
     var laneOf = {};
     for (si = 0; si < specs.length; si++) {
       if (specs[si].fix === 'dropped') continue;
-      laneOf[specs[si].id] = out.lanes.length;
       var ln = HT.makeLane(specs[si]);
       ln.spec = specs[si];
+      if (specs[si].kind === 'freight') {
+        ln.freight = specs[si].freight;
+        laneOf[specs[si].id] = out.freight.length;
+        out.freight.push(ln);
+        out.stats.freighters += laneVehicles(ln);
+        continue;
+      }
+      laneOf[specs[si].id] = out.lanes.length;
       out.lanes.push(ln);
       out.stats.vehicles += laneVehicles(ln);
     }
@@ -1316,13 +1411,43 @@ var Hikyaku = (function () {
     return { p: at(best), d: best, t: best / L, hit: hit };
   }
 
+  /* ---- pause ----------------------------------------------------------
+     The race clock is the simulation time, which simply stands still while
+     the game is paused (the page skips the physics), so the race, the
+     traffic and the fans need no correction. What runs on the wall clock
+     (weather, rain streaks, the world events) uses pauseTime instead: the
+     wall clock minus every paused stretch, the current one included. ts in
+     any unit, the same for every call. */
+  function pauseClock() { return { paused: false, since: 0, total: 0 }; }
+  function pauseSet(pc, on, ts) {
+    if (!!on === pc.paused) return pc;
+    if (on) { pc.paused = true; pc.since = ts; }
+    else { pc.total += Math.max(0, ts - pc.since); pc.paused = false; }
+    return pc;
+  }
+  function pauseTime(pc, ts) {
+    return ts - pc.total - (pc.paused ? Math.max(0, ts - pc.since) : 0);
+  }
+
+  /* ---- music ----------------------------------------------------------
+     The intensity the soundtrack (assets/js/synthwave.js) gets from the
+     airspeed: 0.35 at rest, rising linearly to 1 at 80 m/s and staying
+     there. The page smooths it over a few seconds. */
+  var MUSIC_V = 80, MUSIC_MIN = 0.35;
+  function musicIntensity(airspeed) {
+    var v = +airspeed;
+    if (!(v > 0)) return MUSIC_MIN;
+    return MUSIC_MIN + (1 - MUSIC_MIN) * clamp(v / MUSIC_V, 0, 1);
+  }
+
   return {
     DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
     boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
     formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime,
-    cameraClamp: cameraClamp
+    cameraClamp: cameraClamp, musicIntensity: musicIntensity,
+    pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -1339,6 +1464,7 @@ const HT = HikyakuTraffic;
 const MG = Menger;
 const SHF = Shaft;
 const CR = ColorRamps;
+const HE = HikyakuEvents;
 const G = HF.G0;
 
 /* Colours are literals: the page has no theme switcher and only exists dark.
@@ -1382,11 +1508,18 @@ function hazeOf(p) {
    city, ?shot=landmark looks at the landmark nearest to the sixth open
    ring from 600 m, ?shot=blockfar looks at the Menger block from 1050 m
    back along its approach, 300 m up, city between and behind.
+   ?shot=freighter looks across a freighter lane at 300 m with the traffic
+   clock fixed so a freighter is in view, ?shot=laser and ?shot=searchlight
+   are the city shot with one hand-made event near the camera (also
+   &event=laser|searchlight on any shot); the event clock is ?t= (default
+   0) on every shot. ?music=1 starts the soundtrack from a dispatched click
+   and logs Synthwave.playing() (a headless check that start throws
+   nothing).
    ?fog=<haze per km> and ?weather=rain|dry override the stored settings
    without storing them, ?variety=<0 to 1> the city's variety
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1398,6 +1531,9 @@ const URL_VARIETY = parseFloat(URLP.get('variety'));
 /* ?t=<seconds> fixes the city life clock (holograms, beacons, windows) for
    a shot; ?shot=hologram looks at the hologram nearest the sixth open ring */
 const URL_T = parseFloat(URLP.get('t'));
+const URL_EVENT = ['laser', 'searchlight'].indexOf(URLP.get('event')) >= 0 ? URLP.get('event')
+  : (SHOT === 'laser' || SHOT === 'searchlight' ? SHOT : null);
+const URL_MUSIC = URLP.get('music') === '1';
 const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
 const DEF = {
@@ -1431,6 +1567,17 @@ const DEF = {
   /* Traffic (step 5): on/off, the share of streets that carry lanes, and
      two debug views. */
   traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false,
+  /* The world's life (2026-10-25): one liveliness scales every rare thing.
+     Holograms and beacons are placed with the city tiles, so they and the
+     liveliness of their placement apply on "Rebuild"; window life, the
+     beacon blink and the events follow at once. Freighters fly their own
+     lanes at 280 and 320 m; freightDensity keeps a share of them. */
+  liveliness: 0.6, holograms: true, beacons: true, windowLife: true,
+  freighters: true, freightDensity: 0.6, lasers: true, searchlights: true,
+  /* The soundtrack (synthwave.js). On by default (owner, 2026-10-25), but
+     the browser allows sound only after a gesture, so "on" means: start
+     with the first key or click of the visit. */
+  music: true, musicVolume: 0.6, musicSeed: 2, musicBpm: 118,
   /* The race: seconds added per missed ring or portal (hkcore raceStep). */
   missPenalty: 5,
   /* The panel: open or closed, and the open section. Stored with the rest,
@@ -1442,8 +1589,10 @@ const DEF = {
      dropped once: the fog slider means the haze of the new atmosphere and
      the city grew taller (look round of 2026-10-25). Version 4 added
      cityVariety, cityDistrict and cityLandmarks; nothing is dropped, the
-     merge fills the three missing keys with their defaults. */
-  cfgV: 4
+     merge fills the three missing keys with their defaults. Version 5
+     added the world life, freighter, event and music keys, also filled by
+     the merge. */
+  cfgV: 5
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
@@ -1452,6 +1601,43 @@ const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
 const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'] };
 const STORE = 'hk.cfg';
+/* Event lookups: a hand-made event for the screenshot hooks, at a roof
+   pad in front of the camera (the city must have streamed in). */
+function shotEvent(kind, t, pos, fwd, pads) {
+  const hf = Math.hypot(fwd[0], fwd[2]) || 1, f = [fwd[0] / hf, fwd[2] / hf];
+  const near = kind === 'laser' ? [450, 900] : [350, 700];
+  let best = null;
+  for (const pd of pads) {
+    if (pd.kind !== 'roof' || pd.p[1] < 25) continue;
+    const dx = pd.p[0] - pos[0], dz = pd.p[2] - pos[2], d = Math.hypot(dx, dz);
+    if (d < near[0] || d > near[1]) continue;
+    const a = Math.atan2(f[0] * dz - f[1] * dx, f[0] * dx + f[1] * dz);
+    const score = Math.abs(Math.abs(a) - 0.2);
+    if (Math.abs(a) < 0.5 && (!best || score < best.score)) best = { p: pd.p.slice(), score };
+  }
+  const o = best ? best.p : [pos[0] + f[0] * 600, 60, pos[2] + f[1] * 600];
+  /* across the view: the heading turned by 70 degrees toward the middle */
+  const side = best && Math.atan2(f[0] * (o[2] - pos[2]) - f[1] * (o[0] - pos[0]), f[0] * (o[0] - pos[0]) + f[1] * (o[2] - pos[2])) > 0 ? -1 : 1;
+  const az = Math.atan2(f[1], f[0]) + side * 70 * Math.PI / 180;
+  if (kind === 'laser') {
+    const el = 16 * Math.PI / 180, shots = [];
+    const dirOf = (a, e) => [Math.cos(e) * Math.cos(a), Math.sin(e), Math.cos(e) * Math.sin(a)];
+    for (let k = 0; k < 7; k++) {
+      shots.push({ k, t: 0.13 * k, from: [o[0], o[1] + 1.5, o[2]], dir: dirOf(az + (k % 3 - 1) * 0.03, el + (k % 2) * 0.02),
+        len: 30, range: 1300, reply: false });
+    }
+    const air = [o[0] + 450 * Math.cos(az), o[1] + 130, o[2] + 450 * Math.sin(az)];
+    for (let j = 0; j < 2; j++) {
+      const v = SD.sub([o[0], o[1], o[2]], air), l = SD.len(v);
+      shots.push({ k: 7 + j, t: 0.35 + 0.3 * j, from: air.slice(), dir: [v[0] / l, v[1] / l, v[2] / l], len: 30, range: l, reply: true });
+    }
+    return { kind: 'laser', id: 'shot:laser', tStart: t - 0.75, tEnd: t + 4, origin: o, params: { speed: 600, shots, air }, info: {} };
+  }
+  return { kind: 'searchlight', id: 'shot:searchlight', tStart: t - 30, tEnd: t + 100, origin: o,
+    params: { mount: 'roof', len: 380, half: 5 * Math.PI / 180, elMin: -0.35, elMax: 0.87,
+      az0: az, azAmp: 0, azW: 0, azPh: 0, el0: 48 * Math.PI / 180, elAmp: 0, elW: 0, elPh: 0,
+      droneR: 0, droneW: 0, dronePh: 0, fadeIn: 5, fadeOut: 8 }, info: {} };
+}
 /* Best times per seed. The key changed with step 6 (a seed's route runs
    through a Menger block) and again with the shaft (and through a
    ventilation shaft): times from the old routes do not compare. */
@@ -1844,25 +2030,32 @@ function App() {
      than a tile and placed on the route by makeRoute. Their reserved boxes
      (the 2 x 2 tiles around the block) go to the city, which builds
      nothing inside them. */
-  const specials = useMemo(() => route.specials.flatMap((sp) => sp.reservedList || [sp.reserved]), [route]);
+  const specials = route.reserved;
   const block = route.specials.find((sp) => sp.kind === 'menger') || null;
   /* The ventilation shaft (shaft.js): its housing's envelope is in
-     `specials` too, per 100 m of axis. */
+     `specials` too, per 100 m of axis, and so are the freighter corridors
+     (hkcore makeRoute). */
   const shaftSp = route.specials.find((sp) => sp.kind === 'shaft') || null;
   /* The traffic lanes, a pure function of the route and the density, with
      the gaps at the race line already cut (hkcore makeLanes). */
-  const lanes = useMemo(() => (p.traffic ? HK.makeLanes(route, { density: p.trafficDensity }) : null),
-    [route, p.traffic, p.trafficDensity]);
+  const lanes = useMemo(() => (p.traffic || p.freighters ? HK.makeLanes(route, {
+    on: p.traffic, density: p.trafficDensity, freight: p.freighters, freightDensity: p.freightDensity }) : null),
+    [route, p.traffic, p.trafficDensity, p.freighters, p.freightDensity]);
+  /* the city and block lanes plus the freighter lanes, for the traffic
+     system and the contacts */
+  const allLanes = useMemo(() => (lanes ? lanes.lanes.concat(lanes.freight) : null), [lanes]);
   /* The generator settings the city was built with. The panel edits p and
      "Rebuild" copies them over, so dragging a slider does not throw away
      every tile on each step. */
   const cityOf = (q) => ({ density: q.cityDensity, maxH: q.cityMaxH, accents: q.cityAccents,
-    variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks });
+    variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks,
+    liveliness: q.liveliness, holograms: q.holograms, beacons: q.beacons });
   const [cityCfg, setCityCfg] = useState(() => cityOf(loadStored()));
   const city = useMemo(() => HC.makeCity(route, {
     density: cityCfg.density, maxH: cityCfg.maxH, accents: cityCfg.accents,
     variety: Number.isFinite(URL_VARIETY) ? Math.max(0, Math.min(1, URL_VARIETY)) : cityCfg.variety,
     districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks,
+    liveliness: cityCfg.liveliness, holograms: cityCfg.holograms, beacons: cityCfg.beacons,
     core: routeCore(route), reserved: specials
   }), [route, cityCfg, specials]);
   const cityNow = cityOf(p);
@@ -1870,7 +2063,119 @@ function App() {
   const rebuildCity = () => setCityCfg(cityNow);
 
   const cfgRef = useRef(null);
-  cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, lanes, geo };
+  cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, lanes, allLanes, geo };
+
+  /* ---- music -----------------------------------------------------------
+     synthwave.js needs a user gesture for its AudioContext, so every start
+     comes from a key or a click handler: M, the panel button, or the first
+     gesture of the visit when the stored setting is on (the HUD shows
+     "press M for music" until then). Off pauses the context, so on again
+     carries on where it was; a new music seed starts afresh. The loop
+     feeds intensity, biome and rain. */
+  /* ---- pause ----
+     Escape pauses: no physics, so the race clock, the traffic and the fans
+     stand still; the wall-clock things (weather, rain, events) run on the
+     pause clock (hkcore pauseTime); the music is suspended. The scene keeps
+     rendering, and the mouse still looks around. Escape or any flight key
+     resumes. */
+  const pauseRef = useRef(HK.pauseClock());
+  const [paused, setPausedS] = useState(false);
+  const setPaused = useCallback((on) => {
+    const pc = pauseRef.current;
+    if (!!on === pc.paused || SHOT) return;
+    HK.pauseSet(pc, on, performance.now());
+    setPausedS(!!on);
+    const S = window.Synthwave, M = musicRef.current;
+    if (S && M.started && M.live) { if (on) S.pause(); else S.resume(); }
+  }, []);
+  const musicRef = useRef({ started: false, live: false, int: HK.musicIntensity(0), biome: 'open', rain: false, acc: 0 });
+  const [musicLive, setMusicLive] = useState(false);
+  const musicPlay = useCallback(() => {
+    const S = window.Synthwave, M = musicRef.current;
+    if (!S) return false;
+    const q = cfgRef.current.p;
+    try {
+      if (M.started) S.resume();
+      else {
+        S.start({ seed: q.musicSeed, intensity: M.int, biome: M.biome, rain: M.rain, volume: q.musicVolume, bpm: q.musicBpm });
+        M.started = true;
+      }
+    } catch (e) { console.error('Synthwave.start failed: ' + (e && e.message)); return false; }
+    M.live = true;
+    setMusicLive(true);
+    return true;
+  }, []);
+  const musicHalt = useCallback(() => {
+    const S = window.Synthwave, M = musicRef.current;
+    if (S && M.started) S.pause();
+    M.live = false;
+    setMusicLive(false);
+  }, []);
+  /* from a gesture: on plays (and stores on), off pauses */
+  const musicToggle = useCallback(() => {
+    const M = musicRef.current;
+    if (M.live) { musicHalt(); setP((q) => ({ ...q, music: false })); }
+    else if (musicPlay()) {
+      setP((q) => ({ ...q, music: true }));
+      /* paused: the context is unlocked now, but stays quiet until resume */
+      if (pauseRef.current.paused && window.Synthwave) window.Synthwave.pause();
+    }
+  }, [musicPlay, musicHalt]);
+  useEffect(() => {
+    /* the first gesture starts a stored "on"; M and the panel button handle
+       themselves */
+    const first = (e) => {
+      if (e.code === 'KeyM' || (e.target && e.target.closest && e.target.closest('[data-music]'))) return;
+      if (cfgRef.current.p.music && !musicRef.current.live && !SHOT) {
+        musicPlay();
+        if (pauseRef.current.paused && window.Synthwave) window.Synthwave.pause();
+      }
+    };
+    window.addEventListener('keydown', first, true);
+    window.addEventListener('pointerdown', first, true);
+    return () => {
+      window.removeEventListener('keydown', first, true);
+      window.removeEventListener('pointerdown', first, true);
+      if (musicRef.current.started && window.Synthwave) window.Synthwave.stop();
+      musicRef.current.started = false; musicRef.current.live = false;
+    };
+  }, [musicPlay]);
+  useEffect(() => {
+    const S = window.Synthwave;
+    if (S && musicRef.current.started) S.setVolume(p.musicVolume);
+  }, [p.musicVolume]);
+  useEffect(() => {
+    const S = window.Synthwave;
+    if (S && musicRef.current.started) S.setBpm(p.musicBpm);
+  }, [p.musicBpm]);
+  const musicSeedRef = useRef(p.musicSeed);
+  useEffect(() => {
+    if (musicSeedRef.current === p.musicSeed) return;
+    musicSeedRef.current = p.musicSeed;
+    const S = window.Synthwave, M = musicRef.current;
+    if (!S || !M.started) return;
+    /* a new composition: stop the old one; if it was playing, the context
+       is already unlocked, so the new one starts at once */
+    S.stop(); M.started = false;
+    if (M.live) musicPlay();
+  }, [p.musicSeed, musicPlay]);
+  /* ?music=1: the headless check. A dispatched click is no user
+     activation, so the context may stay suspended; what matters is that
+     start throws nothing. */
+  useEffect(() => {
+    if (!URL_MUSIC) return undefined;
+    const onClick = () => {
+      const ok = musicPlay();
+      console.error('HKMUSIC start ' + (ok ? 'ok' : 'failed'));
+      setTimeout(() => {
+        const S = window.Synthwave;
+        console.error('HKMUSIC playing=' + (S ? S.playing() : 'no Synthwave') + ' ctx=' + (S && S._ctx ? S._ctx.state : '-'));
+      }, 1500);
+    };
+    window.addEventListener('click', onClick, { once: true });
+    const id = setTimeout(() => document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })), 400);
+    return () => { clearTimeout(id); window.removeEventListener('click', onClick); };
+  }, [musicPlay]);
 
   const der = useMemo(() => HF.speeds(craft, p.gravity ? G : 0), [craft, p.gravity]);
 
@@ -1936,6 +2241,8 @@ function App() {
   useEffect(() => {
     const down = (e) => {
       if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+      if (e.code === 'Escape') { setPaused(!pauseRef.current.paused); e.preventDefault(); return; }
+      if (pauseRef.current.paused && (KEYMAP[e.code] || e.code === 'Space')) setPaused(false);
       if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
       else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
       else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
@@ -1943,6 +2250,7 @@ function App() {
       else if (e.code === 'KeyC') setP((q) => ({ ...q, camMode: q.camMode === 'chase' ? 'cockpit' : 'chase' }));
       else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
       else if (e.code === 'KeyP') setPanel((v) => !v);
+      else if (e.code === 'KeyM' && !e.repeat) musicToggle();
     };
     const up = (e) => { delete keysRef.current[e.code]; };
     const blur = () => { keysRef.current = {}; };
@@ -1954,7 +2262,7 @@ function App() {
       window.removeEventListener('keyup', up);
       window.removeEventListener('blur', blur);
     };
-  }, []);
+  }, [musicToggle, setPaused]);
 
   /* ---- the scene and the loop ------------------------------------------
      Built once. The route-dependent meshes are rebuilt in the effect below;
@@ -2019,7 +2327,11 @@ function App() {
     const state = {
       rain: -1, camPrev: null, camVel: [0, 0, 0],
       s: null, info: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] },
-      simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: ''
+      simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: '',
+      /* world events: one schedule cache per seed (an event keeps the
+         origin it got when first seen), the hand-made shot event, and the
+         traffic clock a shot may fix (tFix) */
+      evCache: new Map(), evShot: null, tFix: null
     };
     /* cityR: the city renderer, owned by the city effect below. traffic:
        the traffic system of the traffic effect (hikyaku-traffic.js); the
@@ -2074,7 +2386,7 @@ function App() {
       state.s = HK.startState(cfg.route, 60);
       /* the city shots stay on the open part of the route */
       const open = cfg.route.waypoints.filter((w) => w.biome === 'open');
-      if (SHOT === 'city') {
+      if (SHOT === 'city' || SHOT === 'laser') {
         const w = open[Math.min(5, open.length - 1)];
         state.s = poseAt(w.p, w.dir, 70);
       } else if (SHOT === 'canyon') {
@@ -2151,7 +2463,35 @@ function App() {
           state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
         }
       }
-      if (SHOT === 'high') {
+      state.tFix = null;
+      if (SHOT === 'freighter' && cfg.lanes && cfg.lanes.freight.length) {
+        /* the freighter lane nearest the sixth open ring: the point of its
+           line closest to the ring, the traffic clock fixed at the moment
+           its freighter passes 60 m beyond that point */
+        const w = open[Math.min(5, open.length - 1)];
+        let fb = null;
+        for (const ln of cfg.lanes.freight) {
+          const ax = ln.freight.axis === 'x' ? 0 : 2, ac = 2 - ax;
+          const d = Math.abs(w.p[ac] - ln.freight.row);
+          if (!fb || d < fb.d) fb = { ln, d, ax, ac };
+        }
+        const ln = fb.ln, ax = fb.ax, ac = fb.ac;
+        const q = ln.points[0].slice(); q[ax] = w.p[ax];
+        const ns = HT.nearestS(ln, q);
+        const sc = Math.min(ln.L - 300, Math.max(300, ns.s + 60));
+        let tF = (sc - ln.phase) / ln.speed + ln.t0;
+        const per = ln.spacing / ln.speed;
+        tF -= Math.floor(tF / per) * per;
+        state.tFix = tF;
+        const P = HT.poseAt(ln, 0, tF);
+        const c = P ? P.p : q;
+        /* over its corridor (free from 220 m up),
+           260 m ahead and 100 m above its lane, looking back at it */
+        const cam = c.slice(); cam[1] = ln.freight.y + 100; cam[ac] = ln.freight.row + 20; cam[ax] += 260 * Math.sign(ln.points[1][ax] - ln.points[0][ax]);
+        const v = SD.sub(c, cam), l = SD.len(v);
+        state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
+      }
+      if (SHOT === 'high' || SHOT === 'searchlight') {
         const w = open[Math.min(5, open.length - 1)];
         const h = Math.hypot(w.dir[0], w.dir[2]) || 1;
         const d = [w.dir[0] / h * 0.87, -0.5, w.dir[2] / h * 0.87];
@@ -2287,13 +2627,17 @@ function App() {
       const dt = Math.min(0.1, dtRaw);
       if (dtRaw > 0) state.fps = state.fps ? state.fps * 0.95 + 0.05 / dtRaw : 1 / dtRaw;
       if (resetRef.current !== lastReset || route !== lastRoute) {
+        if (route !== lastRoute) state.evCache = new Map();
         lastReset = resetRef.current; lastRoute = route; reset();
       }
 
       /* ---- input ---- */
       const cmd = { fwd: 0, right: 0, up: 0, pitch: 0, yaw: 0, roll: 0, main: 0 };
       let holdKill = false;
-      if (!SHOT) {
+      const isPaused = pauseRef.current.paused;
+      /* the pause clock in seconds: the wall clock without paused stretches */
+      const wallT = HK.pauseTime(pauseRef.current, ts) / 1000;
+      if (!SHOT && !isPaused) {
         const nav = navRef.current;
         const raw = nav && nav.axes();
         if (raw) {
@@ -2355,7 +2699,7 @@ function App() {
       const fc = killing ? cfg.killCraft : cr;
       const fcmd = killing ? { ...cmd, pitch: 0, yaw: 0, roll: 0 } : cmd;
       const env = { g: pp.gravity ? G : 0, rho: pp.drag ? HF.RHO : 0 };
-      state.acc += dt;
+      state.acc = isPaused ? 0 : state.acc + dt;
       let steps = 0;
       while (state.acc >= H_STEP && steps < 16) {
         const prev = state.s.p;
@@ -2378,9 +2722,9 @@ function App() {
         /* Vehicles: the ones whose bounding sphere reaches the ship's, at
            the traffic time of the new state. vs in each contact is the
            vehicle's surface velocity, so a hauler hits like a moving wall. */
-        if (g.traffic && cfg.lanes) {
-          const tT = HK.trafficTime(state.race, state.simT + H_STEP);
-          const nv = HT.nearVehicles(cfg.lanes.lanes, state.s.p, SHIP_R + 1, tT);
+        if (g.traffic && cfg.allLanes) {
+          const tT = state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT + H_STEP);
+          const nv = HT.nearVehicles(cfg.allLanes, state.s.p, SHIP_R + 1, tT);
           if (nv.length) {
             const cv = HT.contactsVehicles(state.s, cr.hull.verts, nv, { hull: cfg.geo.collisionHull });
             if (cv.length) cs = cs.concat(cv);
@@ -2482,7 +2826,7 @@ function App() {
       }
       if (URL_CAMDX) camera.translateX(URL_CAMDX);
       camera.updateMatrixWorld();
-      if (cityR) cityR.update(camera.position, dt, URL_T);
+      if (cityR) cityR.update(camera.position, isPaused ? 0 : dt, Number.isFinite(URL_T) ? URL_T : state.simT);
 
       /* ---- weather and particles ----
          The rain level follows HikyakuCity.weatherAt (auto) or the panel,
@@ -2492,10 +2836,10 @@ function App() {
          velocity skews the streaks and moves the motes past the eye. */
       {
         const mode = URL_WEATHER || pp.weather;
-        const wallT = ts / 1000;
         const target = mode === 'rain' ? 1 : mode === 'dry' ? 0 : HC.weatherAt(wallT, (pp.seed * 7919) >>> 0);
+        const dtW = isPaused ? 0 : dt;
         if (state.rain < 0 || SHOT) state.rain = target;
-        else state.rain += Math.max(-dt / 10, Math.min(dt / 10, target - state.rain));
+        else state.rain += Math.max(-dtW / 10, Math.min(dtW / 10, target - state.rain));
         const lvl = state.rain;
         if (Math.abs(fog.state.rain - lvl) > 1e-3) fog.set({ rain: lvl });
         if (g.groundMat) {
@@ -2517,7 +2861,7 @@ function App() {
       }
       /* The traffic layer: every pose a closed formula of the traffic time
          (race time once the start gate is crossed, hkcore trafficTime). */
-      const tTraffic = HK.trafficTime(state.race, state.simT);
+      const tTraffic = state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT);
       let trMs = 0;
       if (g.traffic) {
         const t0 = performance.now();
@@ -2525,6 +2869,74 @@ function App() {
         trMs = performance.now() - t0;
       }
       if (g.menger) g.menger.update(state.simT, camera.position);
+
+      /* ---- world events (hikyaku-events.js) ----
+         Laser exchanges and searchlights on their own clock (the page's
+         wall clock; ?t= or 0 on shots), drawn from a schedule that is the
+         same for a seed at any time it is asked. Origins: roof pads of the
+         loaded city 400 to 1500 m from the ship, to the sides of the
+         flight direction for lasers (a ground origin would drown in the
+         street fog), a little ahead for searchlights, never in the route
+         tube. */
+      let evActive = null;
+      if (g.events) {
+        const evT = SHOT ? (Number.isFinite(URL_T) ? URL_T : 0) : wallT;
+        const kinds = [];
+        if (pp.lasers) kinds.push('laser');
+        if (pp.searchlights) kinds.push('searchlight');
+        let evs = [];
+        if (kinds.length && pp.liveliness > 0 && cityR) {
+          const sp0 = state.s.p, hv0 = Math.hypot(state.s.v[0], state.s.v[2]);
+          const fw = hv0 > 5 ? state.s.v : SD.qRot(state.s.q, [0, 0, -1]);
+          const fh = Math.hypot(fw[0], fw[2]) || 1, fx = fw[0] / fh, fz = fw[2] / fh;
+          let padsNow = null;
+          const tubeR = route.cfg.tubeR;
+          evs = HE.schedule(route.seed, evT - 1, evT + 1, {
+            liveliness: pp.liveliness, kinds, cache: state.evCache, around: sp0, forward: [fx, 0, fz],
+            clearance: (q) => route.tube.dist(q) > tubeR + 20,
+            pickOrigin: (kind, rng) => {
+              if (!padsNow) padsNow = city.pads().filter((pd) => pd.kind === 'roof' && pd.p[1] > 25);
+              const ok = [];
+              for (const pd of padsNow) {
+                const dx = pd.p[0] - sp0[0], dz = pd.p[2] - sp0[2], d = Math.hypot(dx, dz);
+                if (d < 400 || d > 1500) continue;
+                const c = (dx * fx + dz * fz) / d;
+                if (kind === 'laser' ? Math.abs(c) < 0.6 : c > 0.25) ok.push(pd);
+              }
+              return ok.length ? ok[Math.floor(rng() * ok.length)].p.slice() : null;
+            }
+          });
+        }
+        if (URL_EVENT) {
+          if (!state.evShot && cityR && !state.pending) {
+            const cp0 = camera.position, fd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            state.evShot = shotEvent(URL_EVENT, evT, [cp0.x, cp0.y, cp0.z], [fd.x, fd.y, fd.z], city.pads());
+          }
+          if (state.evShot) evs = evs.concat([state.evShot]);
+        }
+        g.events.update(evT, camera.position, evs);
+        for (const ev of evs) {
+          if (ev.kind !== 'laser' || evT < ev.tStart || evT > ev.tEnd) continue;
+          const d = Math.hypot(ev.origin[0] - s.p[0], ev.origin[1] - s.p[1], ev.origin[2] - s.p[2]);
+          if (d < 1500 && (evActive == null || d < evActive)) evActive = d;
+        }
+      }
+
+      /* ---- music: intensity from the airspeed, smoothed over 3 s; biome
+         from where the ship is; rain from the weather level ---- */
+      {
+        const M = musicRef.current, SW = window.Synthwave;
+        if (!isPaused) M.int += (HK.musicIntensity(info ? info.airspeed : 0) - M.int) * (1 - Math.exp(-dt / 3));
+        const shf = cfg.shaft, blk = cfg.block;
+        M.biome = shf && SHF.near(shf.shaft, s.p, 5) && SHF.inside(shf.shaft, s.p) ? 'shaft'
+          : blk && MG.inside(blk.block, s.p, 0) ? 'menger' : 'open';
+        if (state.rain > 0.6) M.rain = true; else if (state.rain < 0.4) M.rain = false;
+        M.acc += dt;
+        if (M.started && SW && M.acc > 0.25) {
+          M.acc = 0;
+          SW.setIntensity(M.int); SW.setBiome(M.biome); SW.setRain(M.rain);
+        }
+      }
       /* The shaft's fans on the traffic clock, as in the contacts. Inside
          the duct the sun and the sky light fade (to a fifth, over the first
          40 m behind a mouth): the duct is lit by its own lamps, and the
@@ -2563,8 +2975,9 @@ function App() {
         set('assist', fmt(load * 100, 0) + ' % load');
       }
       set('hits', String(state.hits), state.hits ? 'hot' : '');
-      if (g.traffic && cfg.lanes) {
-        const nv = HT.nearVehicles(cfg.lanes.lanes, s.p, 150, tTraffic);
+      set('evt', evActive != null ? 'LASER ' + fmt(evActive, 0) + ' m' : '-', evActive != null ? 'acc' : '');
+      if (g.traffic && cfg.allLanes) {
+        const nv = HT.nearVehicles(cfg.allLanes, s.p, 150, tTraffic);
         let dmin = Infinity;
         for (const v of nv) dmin = Math.min(dmin, SD.len(SD.sub(v.pose.p, s.p)) - HT.TYPES[v.type].radius);
         set('veh', Number.isFinite(dmin) ? fmt(Math.max(0, dmin), 0) + ' m' : '-', dmin < 15 ? 'hot' : '');
@@ -2767,7 +3180,9 @@ function App() {
     const g = glRef.current;
     if (!g) return undefined;
     city.clear();
-    const cr = HC.makeCityRenderer(g.THREE, { fog: g.fog, seed: city.seed, accents: city.cfg.accents, accentColors: CITY_HUES });
+    const q0 = cfgRef.current.p;
+    const cr = HC.makeCityRenderer(g.THREE, { fog: g.fog, seed: city.seed, accents: city.cfg.accents, accentColors: CITY_HUES,
+      liveliness: q0.liveliness, windowLife: q0.windowLife, beacons: q0.beacons });
     cr.owner = city;
     g.scene.add(cr.group);
     g.cityR = cr;
@@ -2777,10 +3192,32 @@ function App() {
     };
   }, [ready, city]);
 
+  /* the shader side of the city life follows the panel at once */
+  useEffect(() => {
+    const g = glRef.current;
+    if (g && g.cityR) g.cityR.setLife({ liveliness: p.liveliness, windowLife: p.windowLife, beacons: p.beacons });
+  }, [ready, city, p.liveliness, p.windowLife, p.beacons]);
+
   useEffect(() => {
     const g = glRef.current;
     if (g && (SHOT !== 'top' || Number.isFinite(URL_FOG))) g.fog.set({ density: hazeOf(p) });
   }, [ready, p.fogDensity]);
+
+  /* ---- world events ----
+     One fixed pool of laser segments, glows and searchlight cones
+     (hikyaku-events.js), fogged by the page's atmosphere; the loop fills
+     it from the schedule. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g) return undefined;
+    const fx = HE.create(g.THREE, { fog: g.fog, colors: { laserGain: 4 } });
+    g.scene.add(fx.group);
+    g.events = fx;
+    return () => {
+      fx.dispose();
+      if (g.events === fx) g.events = null;
+    };
+  }, [ready]);
 
   /* ---- the Menger block ----------------------------------------------
      Built once per route (about 50 ms, off the hot path). Its details keep
@@ -2819,12 +3256,14 @@ function App() {
   }, [ready, route, shaftSp]);
 
   /* ---- traffic ---------------------------------------------------------
-     One traffic system for the city lanes and the block's lanes. The page
-     owns the clock (hkcore trafficTime); the loop passes it in. */
+     One traffic system for the city lanes, the block's lanes and the
+     freighter lanes. The page owns the clock (hkcore trafficTime); the
+     loop passes it in. The flat cull band is for the street types only:
+     the freighter keeps its own bands (hikyaku-traffic.js TYPE_BANDS). */
   useEffect(() => {
     const g = glRef.current;
-    if (!g || !lanes) return undefined;
-    const tr = HT.createTraffic(g.THREE, { lanes: lanes.lanes, accents: CITY_HUES, fog: g.fog, bands: { cull: 1300 } });
+    if (!g || !allLanes || !allLanes.length) return undefined;
+    const tr = HT.createTraffic(g.THREE, { lanes: allLanes, accents: CITY_HUES, warm: WARM, fog: g.fog, bands: { cull: 1300 } });
     g.scene.add(tr.group);
     g.traffic = { tr, update: (t, camera) => tr.update(t, camera.position) };
     return () => {
@@ -2832,7 +3271,7 @@ function App() {
       tr.dispose();
       g.traffic = null;
     };
-  }, [ready, lanes]);
+  }, [ready, allLanes]);
   useEffect(() => {
     const g = glRef.current;
     if (g && g.traffic) g.traffic.tr.setDebug(p.trafficTint);
@@ -2925,9 +3364,20 @@ function App() {
         ${hudRow('assist', 'ASSIST')}
         ${hudRow('hits', 'CONTACTS')}
         ${hudRow('veh', 'NEAREST VEHICLE')}
+        ${hudRow('evt', 'EVENT')}
         ${hudRow('fps', 'FPS')}
       </div>
     </div>
+
+    ${p.music && !musicLive && !SHOT && !paused ? html`<div className="hk-hint">music starts with the first key</div>` : null}
+    ${paused ? html`<div className="hk-pause">
+      <b>PAUSED</b>
+      <p>Esc or any flight key resumes.</p>
+      <p><kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide, <kbd>R</kbd><kbd>F</kbd> lift,
+        <kbd>Q</kbd><kbd>E</kbd> roll, arrows pitch and yaw, <kbd>Shift</kbd> boost.
+        <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
+        <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel, <kbd>M</kbd> music, <kbd>Esc</kbd> pause.</p>
+    </div>` : null}
 
     <div className="hk-msg">
       <span ref=${(el) => { H.msg = el; }}></span>
@@ -2939,6 +3389,7 @@ function App() {
     <div className="hk-panel">
       <div className="hk-head">
         <h2>Hikyaku</h2>
+        <button className=${'lang-seg' + (paused ? ' active' : '')} onClick=${() => setPaused(!paused)}>${paused ? 'Resume' : 'Pause'}</button>
         <button className="hk-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
       </div>
       <p className="hk-desc">A 6DOF courier flight for a 3D mouse. Fly the rings in order against the clock,
@@ -3117,6 +3568,54 @@ function App() {
           "Hull boxes" shows the collision boxes of nearby vehicles.</p>
       <//>
 
+      <${Section} id="world" title="World" open=${sec === 'world'} onToggle=${toggleSec}
+        summary=${'liveliness ' + fmt(p.liveliness, 2) + (p.freighters ? ', freighters' : '') + (cityPending ? ', rebuild to apply' : '')}>
+        <${Slider} label="Liveliness" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.liveliness} onChange=${upd('liveliness')} />
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (p.holograms ? ' active' : '')} onClick=${() => upd('holograms')(!p.holograms)}>Holograms</button>
+          <button className=${'lang-seg' + (p.beacons ? ' active' : '')} onClick=${() => upd('beacons')(!p.beacons)}>Beacons</button>
+          <button className=${'lang-seg' + (p.windowLife ? ' active' : '')} onClick=${() => upd('windowLife')(!p.windowLife)}>Window life</button>
+        </div>
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (p.freighters ? ' active' : '')} onClick=${() => upd('freighters')(!p.freighters)}>Freighters</button>
+          <button className=${'lang-seg' + (p.lasers ? ' active' : '')} onClick=${() => upd('lasers')(!p.lasers)}>Lasers</button>
+          <button className=${'lang-seg' + (p.searchlights ? ' active' : '')} onClick=${() => upd('searchlights')(!p.searchlights)}>Searchlights</button>
+          <button className=${'lang-seg' + (cityPending ? ' active' : '')} onClick=${rebuildCity}>Rebuild</button>
+        </div>
+        <${Slider} label="Freighter density" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.freightDensity} onChange=${upd('freightDensity')} />
+        ${lanes && p.freighters ? html`<div className="hk-derived">
+          <span>Freighter lanes on this route</span><b>${lanes.freight.length} of ${route.freight.lanes.length}</b>
+        </div>` : null}
+        <p className="hk-note">"Liveliness" scales every rare thing in the world at once, 0 switches all of it off.
+          Holograms hang between neighbouring towers of similar height, beacons blink red on masts and tall towers.
+          Both are placed with the city, so they, and the liveliness they were placed with, apply on "Rebuild".
+          "Window life" lets lit windows change over time; it and the blinking follow the slider at once.</p>
+        <p className="hk-note">Freighters are 160 m long and fly slowly on lanes of their own, along x at 280 m and along z
+          at 320 m, far above the street traffic. Each lane carries one, and it is there less than half the time. The city
+          keeps a 60 m wide corridor under every freighter lane free from 220 m up. Where the race line crosses a
+          freighter lane, the freighter leaves a gap of 3 s, like the street lanes. Lasers are rare green exchanges
+          between rooftops, searchlights slow pale cones from roofs and drones.</p>
+      <//>
+
+      <${Section} id="music" title="Music" open=${sec === 'music'} onToggle=${toggleSec}
+        summary=${(musicLive ? 'playing' : p.music ? 'on, starts with the first key' : 'off') + ', ' + p.musicBpm + ' bpm'}>
+        <div className="hk-chips">
+          <button data-music="1" className=${'lang-seg' + (musicLive ? ' active' : '')} onClick=${musicToggle}>${musicLive ? 'Music on' : 'Music off'}</button>
+        </div>
+        <${Slider} label="Volume" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.musicVolume} onChange=${upd('musicVolume')} />
+        <${Slider} label="Tempo" unit="bpm" digits=${0} min=${90} max=${140} step=${1}
+          value=${p.musicBpm} onChange=${upd('musicBpm')} />
+        <div className="hk-nums">
+          <${Num} label="Music seed" unit="" value=${p.musicSeed} step=${1} min=${1} onChange=${(v) => upd('musicSeed')(Math.max(1, Math.round(v)))} />
+        </div>
+        <p className="hk-note">Endless generated synthwave, made in the browser. It gets more intense with your airspeed,
+          changes its colour inside the block and the shaft, and hears the rain. <kbd>M</kbd> switches it on and off.
+          The browser only allows sound after a key or a click, so a stored "on" waits for the first one.</p>
+      <//>
+
       <${Section} id="debug" title="Display and debug" open=${sec === 'debug'} onToggle=${toggleSec}>
         <div className="hk-chips">
           <button className=${'lang-seg' + (p.routeLine ? ' active' : '')} onClick=${() => upd('routeLine')(!p.routeLine)}>Route line</button>
@@ -3138,7 +3637,8 @@ function App() {
           <kbd>R</kbd><kbd>F</kbd> lift up and down, <kbd>Q</kbd><kbd>E</kbd> roll,
           arrow keys pitch and yaw (up pushes the nose down), <kbd>Shift</kbd> boost.
           <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
-          <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel.
+          <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel, <kbd>M</kbd> music,
+          <kbd>Esc</kbd> pause (Esc or any flight key resumes).
           <br/>Mouse: left drag looks around, middle click stops rotation, wheel sets the chase distance.
           <br/>All settings, the panel included, are kept in this browser across reloads.
         </p>
