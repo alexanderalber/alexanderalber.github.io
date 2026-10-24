@@ -1497,6 +1497,113 @@
     };
   }
 
+  /* ---- ground layer mockup (notes/tools/hikyaku/GROUND-CONCEPT.md) ------
+     Option 1, the layered street, behind ?ground=layered and off by
+     default: viaducts and an elevated railway in the band the soup leaves
+     visible (20 to 45 m), over the buried street. A street line (every
+     108 m) is a deck line, a rail line or nothing, from a hash of its
+     index alone, so a viaduct runs on across tiles. Decks along x sit at
+     GROUND.deckY[0], along z at deckY[1], rails at railY[0|1], so no two
+     crossing structures meet. A line is cut into chunks (GROUND.chunk);
+     a chunk stays only if it, with the air its lights need, keeps clear of
+     every box of the tile (bridges, balconies, signs), of every reserved
+     box and of the route tube (own radius plus margin, as clear() in
+     makeTile). Pylons stand off the crossings. Tiles with old-town
+     buildings get nothing, the fringe stays as it is. Nothing reaches
+     GROUND.top (45 m, the bottom of the lowest lane band).
+
+     groundPlace(tile, route, cfg) -> { boxes, runs } or null for no or an
+     unknown cfg.ground. boxes are collision boxes (kind deck | pylon |
+     rail, ground: true); runs { kind, axis (0: along x, 2: along z), line,
+     a, b (along-axis extent), y (deck top or rail top), hue } feed the
+     light layer. Pure in (tile, route, cfg). */
+  var GROUND = {
+    layered: { deckP: 0.36, railP: 0.18, deckY: [21, 29], deckT: 2, deckW: 14, deckAir: 3,
+      railY: [35, 40.8], railT: 1.6, railW: 3, railAir: 4, pylon: 2.4, rpylon: 1.6,
+      chunk: 27, top: 45, accentP: 0.25 }
+  };
+  function groundPlace(tile, route, cfg) {
+    var G = cfg && GROUND[cfg.ground];
+    if (!G) return null;
+    var out = { boxes: [], runs: [] };
+    for (var bi = 0; bi < tile.buildings.length; bi++) if (tile.buildings[bi].prog === PROG_OLD) return out;
+    var seed = (cfg.seed >>> 0), margin = cfg.margin == null ? DEF.margin : cfg.margin;
+    var x0 = tile.x0, z0 = tile.z0, S = [], SR = [], RES = [], NB = [];
+    /* the edge streets x0 and z0 are shared with the tiles at ix - 1 and
+       iz - 1, whose balconies, signs and bridges reach into them: cfg.near
+       holds those tiles' boxes */
+    if (cfg.near) for (var ni = 0; ni < cfg.near.length; ni++) {
+      var nb = cfg.near[ni];
+      if (nb.max[0] > x0 - 10 && nb.min[0] < x0 + TILE + 10 && nb.max[2] > z0 - 10 && nb.min[2] < z0 + TILE + 10 && nb.min[1] < G.top) NB.push(nb);
+    }
+    if (route && route.tube) {
+      var smp = route.tube.samples, reach = route.tube.r + margin + 12;
+      for (var si = 0; si < smp.length; si++) {
+        var q = smp[si].p;
+        if (q[0] > x0 - reach && q[0] < x0 + TILE + reach && q[2] > z0 - reach && q[2] < z0 + TILE + reach && q[1] - reach < G.top) {
+          S.push(q); SR.push((smp[si].r == null ? route.tube.r : smp[si].r) + margin);
+        }
+      }
+    }
+    if (cfg.reserved) for (var ri = 0; ri < cfg.reserved.length; ri++) {
+      var rb = cfg.reserved[ri];
+      if (rb.kind !== 'wall' && rb.max[0] > x0 - 20 && rb.min[0] < x0 + TILE + 20 && rb.max[2] > z0 - 20 && rb.min[2] < z0 + TILE + 20) RES.push(rb);
+    }
+    function free(b) {
+      var k;
+      if (b.max[1] > G.top) return false;
+      for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < SR[k]) return false;
+      for (k = 0; k < RES.length; k++) if (boxesOverlap(b, RES[k], 2)) return false;
+      for (k = 0; k < tile.boxes.length; k++) if (boxesOverlap(b, tile.boxes[k], 1)) return false;
+      for (k = 0; k < NB.length; k++) if (boxesOverlap(b, NB[k], 1)) return false;
+      return true;
+    }
+    function box(ax, line, a, b, hw, y0, y1) {
+      return ax === 0 ? { min: [a, y0, line - hw], max: [b, y1, line + hw] } : { min: [line - hw, y0, a], max: [line + hw, y1, b] };
+    }
+    var H = TILE / 2;
+    for (var ax = 0; ax <= 2; ax += 2) {
+      for (var j = 0; j < 2; j++) {
+        /* along x: z = z0 + 108 j, line index 2 iz + j; along z likewise */
+        var line = (ax === 0 ? z0 : x0) + H * j, idx = Math.round(line / H), a0 = ax === 0 ? x0 : z0;
+        var R = rng(hashU(idx, ax, seed, 71)), u = R();
+        var kind = u < G.deckP ? 'deck' : u < G.deckP + G.railP ? 'rail' : null;
+        if (!kind) continue;
+        var hue = R() < G.accentP ? (R() < 0.5 ? 0 : 1) : -1;
+        var deck = kind === 'deck', yt = deck ? G.deckY[ax ? 1 : 0] : G.railY[ax ? 1 : 0];
+        var th = deck ? G.deckT : G.railT, hw = (deck ? G.deckW : G.railW) / 2, air = deck ? G.deckAir : G.railAir;
+        var n = Math.round(TILE / G.chunk), keep = [];
+        for (var c = 0; c < n; c++) {
+          var ca = a0 + c * G.chunk, cb = ca + G.chunk;
+          keep.push(free(box(ax, line, ca, cb, hw, yt - th, yt + air)));
+        }
+        /* runs of kept chunks, one box each */
+        for (c = 0; c < n; c++) {
+          if (!keep[c]) continue;
+          var e = c;
+          while (e + 1 < n && keep[e + 1]) e++;
+          var ra = a0 + c * G.chunk, rbx = a0 + (e + 1) * G.chunk;
+          var B = box(ax, line, ra, rbx, hw, yt - th, yt);
+          B.kind = deck ? 'deck' : 'rail'; B.ground = true; B.tone = deck ? 0.13 : 0.18; B.seed = R();
+          out.boxes.push(B);
+          out.runs.push({ kind: B.kind, axis: ax, line: line, a: ra, b: rbx, y: yt, hue: hue, w: hw * 2 });
+          c = e;
+        }
+        /* pylons on chunk joints off the crossings, under a kept chunk */
+        for (c = 1; c < n; c++) {
+          var s = a0 + c * G.chunk;
+          if (Math.abs(s - a0 - H) < 1 || !(keep[c - 1] || keep[c])) continue;
+          var pw = (deck ? G.pylon : G.rpylon) / 2;
+          var P = box(ax, line, s - pw, s + pw, pw, 0, yt - th);
+          if (!free(P)) continue;
+          P.kind = 'pylon'; P.ground = true; P.tone = 0.1; P.seed = R();
+          out.boxes.push(P);
+        }
+      }
+    }
+    return out;
+  }
+
   /* ---- streaming -------------------------------------------------------- */
 
   /* Tiles whose square comes within radius of p, horizontally. */
@@ -1542,6 +1649,40 @@
     if (!cfg || cfg.seed == null) C.seed = route ? ((route.seed * 2654435761 + 977) >>> 0) : 1;
     var tiles = new Map();
     var GC = 27, GN = TILE / GC;
+    /* the ground layer mockup (groundPlace), only with cfg.ground set: its
+       boxes join the tile's boxes for the collision, tile.ground keeps the
+       placement for the renderer, which leaves them out of the facade mesh */
+    var GID = cfg && GROUND[cfg.ground] ? cfg.ground : null;
+    var spare = new Map();
+    function neighbour(ix, iz) {
+      var key = tileKey(ix, iz), e = tiles.get(key);
+      if (e) return e.tile;
+      var t = spare.get(key);
+      if (!t) {
+        t = makeTile(ix, iz, C.seed, route, C);
+        spare.set(key, t);
+        if (spare.size > 24) spare.delete(spare.keys().next().value);
+      }
+      return t;
+    }
+    function addGround(t) {
+      var near = [], nk = [[t.ix - 1, t.iz], [t.ix, t.iz - 1], [t.ix - 1, t.iz - 1]];
+      for (var m = 0; m < nk.length; m++) {
+        var nt = neighbour(nk[m][0], nk[m][1]);
+        for (var q = 0; q < nt.boxes.length; q++) if (!nt.boxes[q].ground) near.push(nt.boxes[q]);
+      }
+      var gp = groundPlace(t, route, { ground: GID, seed: C.seed, margin: C.margin, reserved: C.reserved, near: near });
+      var tid = ((t.ix + 32768) & 0xffff) * 65536 + ((t.iz + 32768) & 0xffff);
+      for (var i = 0; i < gp.boxes.length; i++) {
+        var b = gp.boxes[i];
+        b.c = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+        b.half = [(b.max[0] - b.min[0]) / 2, (b.max[1] - b.min[1]) / 2, (b.max[2] - b.min[2]) / 2];
+        b.idx = tid * 4096 + 3000 + i;
+        t.boxes.push(b);
+        if (b.max[1] > t.top) t.top = b.max[1];
+      }
+      t.ground = gp;
+    }
     function attach(t) {
       var grid = new Array(GN * GN);
       for (var i = 0; i < t.boxes.length; i++) {
@@ -1559,7 +1700,8 @@
       var key = tileKey(ix, iz);
       var e = tiles.get(key);
       if (e) return e.tile;
-      var t = makeTile(ix, iz, C.seed, route, C);
+      var t = GID && spare.get(key) || makeTile(ix, iz, C.seed, route, C);
+      if (GID) { spare.delete(key); addGround(t); }
       tiles.set(key, attach(t));
       return t;
     }
@@ -2684,6 +2826,64 @@
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide, fog: false
     });
 
+    /* ground layer mockup (groundPlace): the structure in one merged mesh
+       of all loaded tiles, a plain fogged lit material; the lights along it
+       as camera-facing ribbons like the streaks, animated on the city
+       clock. iW: width (m), speed (m/s, sign is direction), spacing (m),
+       mode (0 steady strip, 1 vehicles, 2 train); iPh: phase (m). The
+       pattern runs on the world coordinate along the run, so it continues
+       across runs and tiles. Far away a dash pattern becomes its mean (the
+       facade's fwidth rule), so it does not shimmer. */
+    /* sRGB numbers, like hueOut: head and tail lights (warm white and
+       amber, no red: red is the beacons'), the train's windows, the lamp
+       pools under the decks */
+    var HEAD = [0.95, 0.9, 0.78], TAIL = [0.85, 0.5, 0.18], TRAIN = [0.8, 0.88, 0.9], POOL = [0.09, 0.075, 0.055];
+    var groundMat = fog.patch(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 }), {});
+    var gStreamMat = new THREE.ShaderMaterial({
+      uniforms: Object.assign({ uFogK: { value: 0.8 }, uTime: timeU }, fog.uniforms),
+      vertexShader: [
+        FOG_DECL, 'uniform float uFogK;',
+        'attribute vec3 iA; attribute vec3 iB; attribute vec4 iW; attribute vec3 iCol; attribute float iPh;',
+        'varying float vX; varying float vLoc; varying float vL; varying float vY; varying vec3 vCol; varying vec4 vW;',
+        'void main(){',
+        '  vec3 dir = iB - iA; float L = length(dir); vec3 dn = dir / max(L, 1e-4);',
+        '  vec3 wp = iA + dir * position.x;',
+        '  vec3 toCam = cameraPosition - wp;',
+        '  vec3 side = normalize(cross(dn, toCam));',
+        '  float w = max(iW.x, length(toCam) * 0.0012);',
+        '  wp += side * position.y * w * 0.5;',
+        '  vLoc = position.x * L; vL = L; vX = dot(iA, dn) + vLoc + iPh; vY = position.y; vW = iW;',
+        '  vCol = iCol * (1.0 - cgFogAmt(wp, uFogK)) * (iW.x / w);',
+        '  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);',
+        '}'].join('\n'),
+      fragmentShader: [
+        'uniform float uTime;',
+        'varying float vX; varying float vLoc; varying float vL; varying float vY; varying vec3 vCol; varying vec4 vW;',
+        'float gh(float n){ return fract(sin(n * 12.9898 + 4.1) * 43758.5453); }',
+        'void main(){',
+        '  float across = exp(-vY * vY * 3.0);',
+        '  float I = 1.0;',
+        '  if (vW.w > 0.5 && vW.w < 1.5) {',
+        '    float ph = (vX - uTime * vW.y) / vW.z;',
+        '    float c = floor(ph), f = fract(ph) * vW.z;',
+        '    float occ = step(gh(c + sign(vW.y) * 0.37), 0.6);',
+        '    float car = smoothstep(0.0, 0.5, f) * (1.0 - smoothstep(3.6, 4.2, f));',
+        '    float aa = clamp(fwidth(ph) * 2.0 - 0.3, 0.0, 1.0);',
+        '    I = mix(occ * car, 0.6 * 4.0 / vW.z, aa) * 1.8;',
+        '  } else if (vW.w > 1.5) {',
+        '    float f = mod(vX - uTime * vW.y, vW.z);',
+        '    float on = step(f, 64.0);',
+        '    float g = fract(f / 3.2);',
+        '    float aa = clamp(fwidth(f / 3.2) * 2.0 - 0.3, 0.0, 1.0);',
+        '    float win = mix(step(0.3, g) * (1.0 - step(0.9, g)), 0.6, aa);',
+        '    I = on * (0.25 + 1.4 * win);',
+        '  }',
+        '  float ends = smoothstep(0.0, 1.0, vLoc) * (1.0 - smoothstep(vL - 1.0, vL, vLoc));',
+        '  gl_FragColor = vec4(vCol * across * I * ends, 1.0);',
+        '}'].join('\n'),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide, fog: false
+    });
+
     var b0 = boneRGB(0.05);
     var cableMat = fog.patch(new THREE.LineBasicMaterial({ color: new THREE.Color().setRGB(toLin(b0[0]), toLin(b0[1]), toLin(b0[2])) }), {});
 
@@ -2731,14 +2931,14 @@
 
     var tiles = new Map();
     var dirty = true;
-    var layers = { signs: null, glow: null, streak: null, cables: null, holo: null };
+    var layers = { signs: null, glow: null, streak: null, cables: null, holo: null, ground: null, gstream: null };
     var tones = function (b) {
       return boneRGB(b.kind === 'mast' ? 0.2 : b.kind === 'blade' ? 0.08 : b.tone);
     };
 
     function addTile(tile) {
       if (tiles.has(tile.key)) removeTile(tile.key);
-      var A = boxArrays(tile.boxes, tones);
+      var A = boxArrays(tile.ground ? tile.boxes.filter(function (b) { return !b.ground; }) : tile.boxes, tones);
       var g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(A.pos, 3));
       g.setAttribute('normal', new THREE.BufferAttribute(A.nrm, 3));
@@ -2788,13 +2988,14 @@
       return [c[0] * gain, c[1] * gain, c[2] * gain];
     }
     function rebuildLayers() {
-      ['signs', 'glow', 'streak', 'cables', 'holo'].forEach(dropLayer);
+      ['signs', 'glow', 'streak', 'cables', 'holo', 'ground', 'gstream'].forEach(dropLayer);
       var sp = [], su = [], sc = [], ss = [], sd = [];
       var gp = [], gs = [], gc = [], gb = [];
       var hp = [], hu = [], hc = [], hs = [], hd = [], hk = [];
       var ta = [], tb = [], tw = [], tc = [];
       var cl = [];
       var lampC = hueOut(-1, 1);
+      var gList = [], qa = [], qb = [], qw = [], qc = [], qp = [];
       var sl = [], meta = signLayer ? signAtlas.meta : null, effN = sigEffN();
       tiles.forEach(function (e) {
         var t = e.tile, i;
@@ -2883,6 +3084,34 @@
             ta.push(A[0], A[1], A[2]); tb.push(B[0], B[1], B[2]); tw.push(1.6, 0); tc.push(lampC[0] * 0.3, lampC[1] * 0.3, lampC[2] * 0.3);
           }
         }
+        /* the ground layer mockup: structure boxes, the light ribbons on
+           each run and a warm lamp pool under the deck every chunk */
+        if (t.ground) {
+          for (i = 0; i < t.ground.boxes.length; i++) gList.push(t.ground.boxes[i]);
+          for (i = 0; i < t.ground.runs.length; i++) {
+            var gr = t.ground.runs[i], gax = gr.axis, oax = gax === 0 ? 2 : 0;
+            var lane = function (off, y, w, spd, spc, mode, col, ph) {
+              var A3 = [0, y, 0], B3 = [0, y, 0];
+              A3[gax] = gr.a; B3[gax] = gr.b; A3[oax] = B3[oax] = gr.line + off;
+              qa.push(A3[0], A3[1], A3[2]); qb.push(B3[0], B3[1], B3[2]);
+              qw.push(w, spd, spc, mode); qc.push(col[0], col[1], col[2]); qp.push(ph);
+            };
+            var ph0 = (Math.round(gr.line) * 7.31) % 500;
+            if (gr.kind === 'deck') {
+              var edge = gr.hue < 0 ? hueOut(-1, 0.22) : hueOut(gr.hue, 0.5), hw2 = gr.w / 2 - 0.4;
+              lane(-hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0); lane(hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0);
+              lane(-4.6, gr.y + 0.8, 1.1, 21, 13, 1, HEAD, ph0); lane(-1.9, gr.y + 0.8, 1.1, 26, 17, 1, HEAD, ph0 + 5);
+              lane(1.9, gr.y + 0.8, 1.1, -24, 15, 1, TAIL, ph0 + 3); lane(4.6, gr.y + 0.8, 1.1, -19, 12, 1, TAIL, ph0 + 9);
+              for (var ga = gr.a + 13.5; ga < gr.b; ga += 27) {
+                var gq = [0, gr.y - 3, 0]; gq[gax] = ga; gq[oax] = gr.line;
+                gp.push(gq[0], gq[1], gq[2]); gs.push(16, 16); gc.push(POOL[0], POOL[1], POOL[2]); gb.push(0, 0, 1);
+              }
+            } else {
+              lane(0, gr.y + 2.1, 2.6, 28, 480, 2, TRAIN, ph0 * 1.7);
+              lane(0, gr.y + 0.2, 0.25, 0, 1, 0, hueOut(-1, 0.3), 0);
+            }
+          }
+        }
         for (i = 0; i < t.cables.length; i++) {
           var cb = t.cables[i], prev = null;
           for (var k = 0; k <= 10; k++) {
@@ -2950,6 +3179,34 @@
         layers.streak.userData.kind = 'city-streaks';
         group.add(layers.streak);
       }
+      if (gList.length) {
+        var GA = boxArrays(gList, function (b) { return boneRGB(b.tone); });
+        var g6 = new THREE.BufferGeometry();
+        g6.setAttribute('position', new THREE.BufferAttribute(GA.pos, 3));
+        g6.setAttribute('normal', new THREE.BufferAttribute(GA.nrm, 3));
+        g6.setAttribute('color', new THREE.BufferAttribute(GA.col, 3));
+        g6.setIndex(new THREE.BufferAttribute(GA.idx, 1));
+        layers.ground = new THREE.Mesh(g6, groundMat);
+        layers.ground.frustumCulled = false;
+        layers.ground.userData.kind = 'city-ground';
+        layers.ground.userData.boxes = gList.length;
+        group.add(layers.ground);
+      }
+      if (qa.length) {
+        var g7 = new THREE.InstancedBufferGeometry();
+        g7.index = SQUAD.index; g7.setAttribute('position', SQUAD.getAttribute('position'));
+        g7.setAttribute('iA', new THREE.InstancedBufferAttribute(new Float32Array(qa), 3));
+        g7.setAttribute('iB', new THREE.InstancedBufferAttribute(new Float32Array(qb), 3));
+        g7.setAttribute('iW', new THREE.InstancedBufferAttribute(new Float32Array(qw), 4));
+        g7.setAttribute('iCol', new THREE.InstancedBufferAttribute(new Float32Array(qc), 3));
+        g7.setAttribute('iPh', new THREE.InstancedBufferAttribute(new Float32Array(qp), 1));
+        g7.instanceCount = qa.length / 3;
+        layers.gstream = new THREE.Mesh(g7, gStreamMat);
+        layers.gstream.frustumCulled = false;
+        layers.gstream.renderOrder = 1;
+        layers.gstream.userData.kind = 'city-ground-lights';
+        group.add(layers.gstream);
+      }
       if (cl.length) {
         var g4 = new THREE.BufferGeometry();
         g4.setAttribute('position', new THREE.Float32BufferAttribute(cl, 3));
@@ -2989,9 +3246,9 @@
     }
     function dispose() {
       tiles.forEach(function (e, k) { removeTile(k); });
-      ['signs', 'glow', 'streak', 'cables', 'holo'].forEach(dropLayer);
+      ['signs', 'glow', 'streak', 'cables', 'holo', 'ground', 'gstream'].forEach(dropLayer);
       skyG.dispose(); QUAD.dispose(); SQUAD.dispose();
-      [facadeMat, signMat, glowMat, holoMat, streakMat, cableMat, skyMat].forEach(function (m) { m.dispose(); });
+      [facadeMat, signMat, glowMat, holoMat, streakMat, cableMat, skyMat, groundMat, gStreamMat].forEach(function (m) { m.dispose(); });
       lutTex.dispose();
       /* the atlas layer and its texture are this renderer's own; a load
          still in flight sees disposed and throws its texture away */
@@ -3016,6 +3273,7 @@
 
   var HikyakuCity = {
     TILE: TILE, PITCH: PITCH, STREET: STREET, BLOCK: BLOCK, LANE_Y: LANE_Y, LANE_CLEAR: LANE_CLEAR, DEF: DEF,
+    GROUND: GROUND, groundPlace: groundPlace,
     hash: hash, hashU: hashU, rng: rng, noise2: noise2, fbm: fbm, heightField: heightField,
     STOREY: STOREY, ARCHES: ARCHES, ARCH_W: ARCH_W, LM_CELL: LM_CELL, LM_NEAR: LM_NEAR, LM_FAR: LM_FAR,
     districtAt: districtAt, landmarkAt: landmarkAt, pickArch: pickArch, rank3: rank3, oldTownNear: oldTownNear,
