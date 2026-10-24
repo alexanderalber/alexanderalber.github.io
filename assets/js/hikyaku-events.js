@@ -340,7 +340,7 @@
     'uniform vec3 uCol; varying vec2 vP; varying float vI;',
     'void main(){',
     '  float y = vP.y;',
-    '  float core = exp(-y * y * 40.0), halo = 0.5 * exp(-y * y * 6.0);',
+    '  float core = exp(-y * y * 80.0), halo = 0.5 * exp(-y * y * 6.0);',
     '  float along = mix(0.25, 1.0, clamp(vP.x, 0.0, 1.0));',
     '  vec3 c = uCol * (core + halo) + vec3(0.9) * core * 0.55;',
     '  gl_FragColor = vec4(c * along * vI, 1.0);',
@@ -488,7 +488,7 @@
     var o = opts || {};
     var fog = o.fog || (globalThis.HikyakuCity && globalThis.HikyakuCity.makeFog(THREE));
     if (!fog) throw new Error('HikyakuEvents.create needs opts.fog (HikyakuCity.makeFog)');
-    var C = Object.assign({ laser: 0x3dff6e, laserGain: 6, glowGain: 3, light: 0xdde6ea, lightGain: 0.8 }, o.colors || {});
+    var C = Object.assign({ laser: 0x3dff6e, laserGain: 2.5, glowGain: 3, light: 0xdde6ea, lightGain: 0.8 }, o.colors || {});
     var lin = function (hex, gain) { return new THREE.Color(hex).multiplyScalar(gain); };
     var laserCol = lin(C.laser, C.laserGain);
     var lightCol = lin(C.light, 1);

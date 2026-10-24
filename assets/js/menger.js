@@ -808,7 +808,7 @@ vec3 mgFogC(vec3 w){ return vec3(0.0); }
   const MB_DECL = `
 varying vec3 vMbN; varying float vKind; varying float vSeed; varying vec3 vMbL;
 uniform vec3 uMbLo; uniform vec3 uMbHi; uniform vec3 uMbWarm; uniform vec3 uMbCyan; uniform float uMbGain;
-uniform vec3 uMbCam; uniform vec4 uMbPort[5]; uniform float uMbSpill; uniform float uMbSmall; uniform float uMbSelf;
+uniform vec3 uMbCam; uniform vec4 uMbPort[5]; uniform float uMbSpill; uniform float uMbSmall; uniform float uMbSelf; uniform float uMbSelfNear;
 float mbH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 float mbN(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(mbH(i), mbH(i + vec2(1.0, 0.0)), f.x), mix(mbH(i + vec2(0.0, 1.0)), mbH(i + vec2(1.0, 1.0)), f.x), f.y); }
@@ -910,7 +910,10 @@ float mbSpill(vec3 p){
     float fres = pow(1.0 - abs(dot(V, n)), 3.0);
     emi += (room * 0.7 + vec3(0.05, 0.065, 0.08) * (0.4 + fres)) * win;
     dif *= mix(1.0, 0.1, win);
-    emi += dif * vec3(0.1, 0.105, 0.11) * uMbSelf * (1.0 - win);
+    /* self-light: selfNear up close, self from 450 m on, so the far look
+       the haze works on stays what the depth fix of 2026-10-25 set */
+    float selfK = mix(uMbSelfNear, uMbSelf, smoothstep(150.0, 450.0, length(wp - uMbCam)));
+    emi += dif * vec3(0.1, 0.105, 0.11) * selfK * (1.0 - win);
     ao = 1.0;
   } else if (kind < 1.5) {
     /* ROOF and terraces: panel seams, a few service lights */
@@ -1006,7 +1009,8 @@ float mbSpill(vec3 p){
       uMbLo: { value: new THREE.Vector3(X0, 0, Z0) }, uMbHi: { value: new THREE.Vector3(-X0, H, -Z0) },
       uMbWarm: { value: new THREE.Color(o.warm) }, uMbCyan: { value: new THREE.Color(o.accent) },
       uMbGain: { value: o.gain }, uMbCam: { value: new THREE.Vector3(0, 0, 1000) },
-      uMbPort: { value: ports }, uMbSpill: { value: o.spill }, uMbSmall: { value: o.small }, uMbSelf: { value: o.self }
+      uMbPort: { value: ports }, uMbSpill: { value: o.spill }, uMbSmall: { value: o.small }, uMbSelf: { value: o.self },
+      uMbSelfNear: { value: o.selfNear == null ? o.self : o.selfNear }
     };
     mat.onBeforeCompile = (sh) => {
       Object.assign(sh.uniforms, u);
@@ -1293,7 +1297,11 @@ void main(){
                 facade glowed at about the saturated fog colour by itself,
                 so the haze could not lighten it with distance: from 1 km
                 the block read as farther than the towers it hides
-                (2026-10-25, the owner's depth screenshot)
+                (2026-10-25, the owner's depth screenshot). This is the
+                value from 450 m on
+       selfNear self-light of the outer panels within 150 m (0.45), blended
+                to self in between: up close 0.3 left the panels almost
+                black, while the far look keeps the 0.3 the depth fix needs
        paths    polylines (world points) the details keep clear of, default
                 the default flythrough; pass the route's own path here
        pathClear clearance of the details from those paths (14 m)
@@ -1391,7 +1399,8 @@ void main(){
       tone: opts.tone == null ? 0.46 : opts.tone, gain: opts.gain == null ? 1.6 : opts.gain,
       warm: warm, accent: accent, mouths: mouths,
       spill: opts.spill == null ? 0.22 : opts.spill, small: opts.small == null ? 1 : opts.small,
-      self: opts.self == null ? 0.3 : opts.self
+      self: opts.self == null ? 0.3 : opts.self,
+      selfNear: opts.selfNear == null ? 0.45 : opts.selfNear
     });
     owned.push(mat);
     const group = new THREE.Group();

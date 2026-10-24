@@ -102,17 +102,23 @@
   function smooth(a, b, x) { var t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
 
   /* ---- hashing and noise ------------------------------------------------ */
+  /* ix goes through one mixing round of its own before iz joins. With both
+     plain products xor-ed (the version before 2026-10-25) tiles (x, z) and
+     (-x, -z) got the same value whenever x and z were both odd: for odd a,
+     -a is a ^ 0xfffffffe, so the two negations cancel in the xor and the
+     mirrored tile shared its content. The extra round makes the ix term
+     nonlinear, so no sign pattern cancels. */
   function hashU(ix, iz, seed, salt) {
-    var h = Math.imul(ix | 0, 374761393) ^ Math.imul(iz | 0, 668265263) ^
+    var h = Math.imul(ix | 0, 374761393);
+    h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d) ^ Math.imul(iz | 0, 668265263) ^
       Math.imul(((seed | 0) + Math.imul(salt | 0, 0x9e3779b9)) | 0, 0x85ebca6b);
     h = Math.imul(h ^ (h >>> 13), 1274126177);
     h = Math.imul(h ^ (h >>> 16), 0x27d4eb2f);
     return (h ^ (h >>> 15)) >>> 0;
   }
-  /* A seed for a sub-stream of tile (ix, iz). hashU alone gives tiles
-     (x, z) and (-x, -z) the same value when x and z are both odd (the two
-     products are odd, so their negations differ from them only in the
-     same way and the xor cancels); hashing ix first breaks that. */
+  /* A seed for a sub-stream of tile (ix, iz): ix hashed first, then iz,
+     with the salt in both rounds. Written while hashU still had the mirror
+     symmetry above and left as it is. */
   function subSeed(ix, iz, seed, salt) { return hashU(hashU(ix, salt, seed, salt), iz, seed, salt + 1); }
   function hash(ix, iz, seed) { return hashU(ix, iz, seed, 0) / 4294967296; }
   function rng(seed) {

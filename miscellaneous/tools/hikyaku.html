@@ -1620,7 +1620,9 @@ var Hikyaku = (function () {
      given radius touches something. probes is a list; each entry is either
        an array of boxes { min, max } (the city's and the block's), tested
        as the segment against the box grown by the radius (slab method,
-       first entry), or
+       first entry); a box may carry o (origin) and ax (three unit axes),
+       then min and max are in that frame: an oriented box, the shape
+       vehicleBoxes builds for the traffic hulls, or
        a distance function p -> metres of free space around p (positive in
        the open, a lower bound of the true distance is fine), sampled along
        the segment every opts.step metres (default the radius); the first
@@ -1674,14 +1676,19 @@ var Hikyaku = (function () {
         continue;
       }
       for (i = 0; i < pr.length; i++) {
-        var b = pr[i], t0 = 0, t1 = best, ok = true;
-        var bd = boxDist(b, from);
+        var b = pr[i], t0 = 0, t1 = best, ok = true, fo = from, ul = u;
+        if (b.ax) {
+          var rel = [from[0] - b.o[0], from[1] - b.o[1], from[2] - b.o[2]], X = b.ax;
+          fo = [0, 1, 2].map(function (j) { return rel[0] * X[j][0] + rel[1] * X[j][1] + rel[2] * X[j][2]; });
+          ul = [0, 1, 2].map(function (j) { return u[0] * X[j][0] + u[1] * X[j][1] + u[2] * X[j][2]; });
+        }
+        var bd = boxDist(b, fo);
         if (!(bd > 0)) continue;
         var rb = Math.min(radius, bd * 0.9);
         for (var a = 0; a < 3 && ok; a++) {
-          var lo2 = b.min[a] - rb, hi2 = b.max[a] + rb, o = from[a];
-          if (Math.abs(u[a]) < 1e-12) { if (o < lo2 || o > hi2) ok = false; continue; }
-          var ta = (lo2 - o) / u[a], tb = (hi2 - o) / u[a];
+          var lo2 = b.min[a] - rb, hi2 = b.max[a] + rb, o = fo[a];
+          if (Math.abs(ul[a]) < 1e-12) { if (o < lo2 || o > hi2) ok = false; continue; }
+          var ta = (lo2 - o) / ul[a], tb = (hi2 - o) / ul[a];
           if (ta > tb) { var sw = ta; ta = tb; tb = sw; }
           if (ta > t0) t0 = ta;
           if (tb < t1) t1 = tb;
@@ -1695,6 +1702,20 @@ var Hikyaku = (function () {
     var mn = opts.min || 0;
     if (best < mn) best = Math.min(mn, L);
     return { p: at(best), d: best, t: best / L, hit: hit };
+  }
+
+  /* The traffic hulls as oriented boxes for cameraClamp, from the list
+     HikyakuTraffic.nearVehicles returns: the vehicle's own collision box
+     (vehicleHull, the one the contacts use) in its body frame, axes right,
+     up and back (body +z is the tail). */
+  function vehicleBoxes(vehicles) {
+    var HTv = globalThis.HikyakuTraffic, out = [], i;
+    for (i = 0; i < vehicles.length; i++) {
+      var ps = vehicles[i].pose, h = HTv.vehicleHull(vehicles[i].type);
+      out.push({ min: h.min, max: h.max, o: ps.p,
+        ax: [ps.right, ps.up, [-ps.heading[0], -ps.heading[1], -ps.heading[2]]] });
+    }
+    return out;
   }
 
   /* ---- pause ----------------------------------------------------------
@@ -1732,7 +1753,7 @@ var Hikyaku = (function () {
     boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
     formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime,
-    cameraClamp: cameraClamp, musicIntensity: musicIntensity,
+    cameraClamp: cameraClamp, vehicleBoxes: vehicleBoxes, musicIntensity: musicIntensity,
     pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime
   };
 })();
@@ -2209,7 +2230,9 @@ function poseAt(p, dir, back) {
    The chase camera sits on the segment from the ship to where camStep and
    the panel want it, as far out as a 2.5 m sphere gets (hkcore
    cameraClamp): city and block boxes near the segment, the ground, and in
-   and around the shaft its free space and its fans. Never closer than 8 m,
+   and around the shaft its free space and its fans, and the traffic hulls
+   whose bounding sphere reaches the sphere around the segment (hkcore
+   vehicleBoxes; with traffic off there are none). Never closer than 8 m,
    which keeps the whole hull in front of the near plane; the distance drops
    at once when something comes between and grows back with a time
    constant of 0.35 s, so the view does not pump. */
@@ -2243,10 +2266,14 @@ function fanSlab(sh, fi) {
     }
   };
 }
-function camClampAt(cfg, from, want, full) {
+function camClampAt(cfg, from, want, full, tVeh) {
   const mid = [(from[0] + want[0]) / 2, (from[1] + want[1]) / 2, (from[2] + want[2]) / 2];
   const r = full / 2 + CAM_R + 1;
   const probes = [cfg.city.boxesNear(mid, r)];
+  if (tVeh != null && cfg.allLanes) {
+    const nv = HT.nearVehicles(cfg.allLanes, mid, r, tVeh);
+    if (nv.length) probes.push(HK.vehicleBoxes(nv));
+  }
   if (cfg.block) probes.push(MG.boxesNear(cfg.block.block, mid, r));
   const shf = cfg.shaft;
   if (shf && SHF.near(shf.shaft, from, full + 10)) {
@@ -3156,7 +3183,8 @@ function App() {
            place on screen and the view direction stays the chase one */
         const full = SD.len(off);
         const want = [s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]];
-        const cc = camClampAt(cfg, s.p, want, full);
+        const tCam = g.traffic ? (state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT)) : null;
+        const cc = camClampAt(cfg, s.p, want, full, tCam);
         let dC = state.camD == null ? cc.d : Math.min(state.camD, full);
         if (cc.d < dC) dC = cc.d;
         else dC += (cc.d - dC) * (1 - Math.exp(-dt / CAM_TAU));
@@ -3576,7 +3604,7 @@ function App() {
   useEffect(() => {
     const g = glRef.current;
     if (!g) return undefined;
-    const fx = HE.create(g.THREE, { fog: g.fog, colors: { laserGain: 4 } });
+    const fx = HE.create(g.THREE, { fog: g.fog, colors: { laserGain: 2.5 } });
     g.scene.add(fx.group);
     g.events = fx;
     return () => {
