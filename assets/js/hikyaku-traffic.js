@@ -881,13 +881,29 @@
         idx.push(a, c, d, a, d, b);
       }
     }
-    for (const end of [[0, false], [rings.length - 1, true]]) {
-      const ri = end[0], flip = end[1], r = rings[ri], cen = [0, 0, 0];
-      for (const p of r) { cen[0] += p[0] / n; cen[1] += p[1] / n; cen[2] += p[2] / n; }
+    /* End caps, a fan from the ring centroid. The winding is chosen per cap
+       from the geometry: the cap normal must point away from the neighbour
+       ring. Until 2026-10-25 both caps were wound inward, which the near
+       models hid (DoubleSide) and the FrontSide mid bodies did not: seen
+       from behind, a hauler had no back. */
+    const centroid = (r) => {
+      const c = [0, 0, 0];
+      for (const p of r) { c[0] += p[0] / n; c[1] += p[1] / n; c[2] += p[2] / n; }
+      return c;
+    };
+    for (const end of [[0, 1], [rings.length - 1, rings.length - 2]]) {
+      const ri = end[0], r = rings[ri], cen = centroid(r), nb = centroid(rings[end[1]]);
       const ci = pos.length / 3; pos.push(cen[0], cen[1], cen[2]);
+      /* ring orientation: Newell normal of the ring in index order */
+      const nr = [0, 0, 0];
+      for (let k = 0; k < n; k++) {
+        const p = r[k], q = r[(k + 1) % n];
+        nr[0] += (p[1] - q[1]) * (p[2] + q[2]); nr[1] += (p[2] - q[2]) * (p[0] + q[0]); nr[2] += (p[0] - q[0]) * (p[1] + q[1]);
+      }
+      const out = nr[0] * (cen[0] - nb[0]) + nr[1] * (cen[1] - nb[1]) + nr[2] * (cen[2] - nb[2]);
       for (let k = 0; k < n; k++) {
         const a = ri * n + k, b = ri * n + (k + 1) % n;
-        if (flip) idx.push(ci, a, b); else idx.push(ci, b, a);
+        if (out > 0) idx.push(ci, a, b); else idx.push(ci, b, a);
       }
     }
     const g = new THREE.BufferGeometry();

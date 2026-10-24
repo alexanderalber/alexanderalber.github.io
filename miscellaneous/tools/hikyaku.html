@@ -67,7 +67,7 @@
       background: rgba(6, 9, 14, .72); border: 1px solid var(--tool-border); color: var(--tool-text); font-size: 13px; }
     .hk-pause b { display: block; font-size: 22px; letter-spacing: .3em; margin-bottom: 8px; }
     .hk-pause p { margin: 6px 0 0; color: var(--tool-note); line-height: 1.7; }
-    .hk-hint { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 3;
+    .hk-hint { position: absolute; top: 80px; left: 50%; transform: translateX(-50%); z-index: 3;
       pointer-events: none; font-size: 12px; letter-spacing: .06em; color: var(--tool-note);
       text-shadow: 0 0 12px rgba(0,0,0,.95); }
     .hk-msg small { display: block; margin-top: 8px; font-size: 11.5px; color: var(--tool-note); letter-spacing: 0; }
@@ -1873,11 +1873,13 @@ void main(){
   q.dispose();
   return {
     mesh,
-    /* fall: the rain's own velocity (with a little wind); vShip: the
-       camera's velocity, so the streak is the drop's motion as the eye sees it */
+    /* fall: the rain's own velocity (a little wind); vShip: the camera's
+       velocity, so the streak is the drop's motion as the eye sees it.
+       15 m/s is about a heavy drop's terminal speed; at 9.5 m/s the streaks
+       leaned almost flat at flight speed (owner, 2026-10-25). */
     update(cam, t, level, vShip) {
       const u = mat.uniforms, S = u.uS.value;
-      const fall = [1.2, -9.5, 0.7];
+      const fall = [0.6, -15, 0.35];
       u.uCam.value.copy(cam);
       u.uShift.value.set(((fall[0] * t) % S + S) % S, ((fall[1] * t) % S + S) % S, ((fall[2] * t) % S + S) % S);
       u.uRel.value.set(fall[0] - vShip[0], fall[1] - vShip[1], fall[2] - vShip[2]);
@@ -2088,8 +2090,13 @@ function App() {
     const S = window.Synthwave, M = musicRef.current;
     if (S && M.started && M.live) { if (on) S.pause(); else S.resume(); }
   }, []);
-  const musicRef = useRef({ started: false, live: false, int: HK.musicIntensity(0), biome: 'open', rain: false, acc: 0 });
+  const musicRef = useRef({ started: false, live: false, audible: false, hidTried: false, int: HK.musicIntensity(0), biome: 'open', rain: false, acc: 0 });
   const [musicLive, setMusicLive] = useState(false);
+  /* audible: the context really runs (Synthwave.playing(), polled by the
+     loop). live only says a start was asked for; from the 3D mouse the
+     browser may keep the context suspended, and the hint has to stay. */
+  const [musicAudible, setMusicAudible] = useState(false);
+  const [musicHidTried, setMusicHidTried] = useState(false);
   const musicPlay = useCallback(() => {
     const S = window.Synthwave, M = musicRef.current;
     if (!S) return false;
@@ -2126,7 +2133,10 @@ function App() {
        themselves */
     const first = (e) => {
       if (e.code === 'KeyM' || (e.target && e.target.closest && e.target.closest('[data-music]'))) return;
-      if (cfgRef.current.p.music && !musicRef.current.live && !SHOT) {
+      const M = musicRef.current;
+      /* not live, or live but held suspended (a start from the 3D mouse
+         without any gesture before it): this gesture unlocks it */
+      if (cfgRef.current.p.music && !(M.live && M.audible) && !SHOT) {
         musicPlay();
         if (pauseRef.current.paused && window.Synthwave) window.Synthwave.pause();
       }
@@ -2190,7 +2200,37 @@ function App() {
     navRef.current = ctl;
     return () => { ctl.destroy(); navRef.current = null; };
   }, []);
-  const connect = useCallback(() => { if (navRef.current) navRef.current.connect(); }, []);
+  /* The connect click is a user gesture, the 3D mouse's input reports are
+     not. So the click only unlocks audio: it creates and resumes the
+     AudioContext that Synthwave.start later reuses (synthwave.js keeps it
+     in _ctx and takes an existing one), and the music itself starts with
+     the first clear input of the device (musicFromHid). The button carries
+     data-music, so the first-gesture handler leaves it alone. */
+  const connect = useCallback(() => {
+    const S = window.Synthwave;
+    if (S && cfgRef.current.p.music && !SHOT) {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!S._ctx && Ctx) S._ctx = new Ctx({ latencyHint: 'playback' });
+        if (S._ctx && S._ctx.state === 'suspended') S._ctx.resume();
+      } catch (e) { /* no Web Audio: the music just stays off */ }
+    }
+    if (navRef.current) navRef.current.connect();
+  }, []);
+  /* Called from the loop on the first clear 3D mouse input (an axis above
+     0.3 after norm6, or a button). Without the connect click or any other
+     gesture earlier in this document Chromium keeps the context suspended;
+     the hint then asks for a click or a key, and that gesture resumes it. */
+  const musicFromHidRef = useRef(null);
+  musicFromHidRef.current = () => {
+    const M = musicRef.current;
+    if (M.hidTried || SHOT) return;
+    M.hidTried = true;
+    setMusicHidTried(true);
+    if (!cfgRef.current.p.music) return;
+    if (!M.live) musicPlay();
+    else if (window.Synthwave) window.Synthwave.resume();
+  };
 
   useEffect(() => {
     try { localStorage.setItem(STORE, JSON.stringify(p)); } catch (e) { /* private mode */ }
@@ -2342,7 +2382,7 @@ function App() {
        and rain that comes and goes (makeRain above). */
     const dust = Dust.makeField(THREE, { count: 2600, color: boneAt(0.62), seed: 0x6b1 });
     scene.add(dust.obj);
-    const rain = makeRain(THREE, 14000);
+    const rain = makeRain(THREE, 32000);   /* 2 triangles a drop; 14000 until 2026-10-25 */
     scene.add(rain.mesh);
 
     const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null,
@@ -2645,6 +2685,12 @@ function App() {
           for (const a of AXES) cmd[a] = n6[DEF_MAP[a]] * DEF_INV[a] * pp.gain;
         }
         const btn = nav ? nav.buttons() : 0;
+        if (raw && pp.music && !musicRef.current.hidTried) {
+          const n6 = SpaceNav.norm6(raw, { deadzone: pp.deadzone, curve: pp.curve });
+          let mx = 0;
+          for (const k in n6) mx = Math.max(mx, Math.abs(n6[k]));
+          if (mx > 0.3 || btn) musicFromHidRef.current();
+        } else if (!raw && btn && pp.music && !musicRef.current.hidTried) musicFromHidRef.current();
         if (btn & 2) cmd.main = 1;
         holdKill = !!(btn & 1);
         for (const code in keysRef.current) {
@@ -2935,7 +2981,9 @@ function App() {
         if (M.started && SW && M.acc > 0.25) {
           M.acc = 0;
           SW.setIntensity(M.int); SW.setBiome(M.biome); SW.setRain(M.rain);
-        }
+          const aud = !!(M.live && SW.playing());
+          if (aud !== M.audible) { M.audible = aud; setMusicAudible(aud); }
+        } else if (!M.started && M.audible) { M.audible = false; setMusicAudible(false); }
       }
       /* The shaft's fans on the traffic clock, as in the contacts. Inside
          the duct the sun and the sky light fade (to a fifth, over the first
@@ -3369,7 +3417,9 @@ function App() {
       </div>
     </div>
 
-    ${p.music && !musicLive && !SHOT && !paused ? html`<div className="hk-hint">music starts with the first key</div>` : null}
+    ${p.music && !(musicLive && musicAudible) && !SHOT && !paused ? html`<div className="hk-hint">${musicLive && musicHidTried
+      ? 'click or press a key for music: the browser holds the sound until then'
+      : 'music starts with the first key, click or 3D mouse move'}</div>` : null}
     ${paused ? html`<div className="hk-pause">
       <b>PAUSED</b>
       <p>Esc or any flight key resumes.</p>
@@ -3396,7 +3446,7 @@ function App() {
         through a city that is built around the route.</p>
 
       <div className="hk-chips">
-        <button className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
+        <button data-music="1" className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
           disabled=${!dev.supported || NOHID}>${dev.name || 'Connect 3D mouse'}</button>
         <button className="lang-seg" onClick=${() => { resetRef.current++; }}>Reset</button>
         <button className=${'lang-seg' + (p.assist ? ' active' : '')}
@@ -3600,7 +3650,7 @@ function App() {
       <//>
 
       <${Section} id="music" title="Music" open=${sec === 'music'} onToggle=${toggleSec}
-        summary=${(musicLive ? 'playing' : p.music ? 'on, starts with the first key' : 'off') + ', ' + p.musicBpm + ' bpm'}>
+        summary=${(musicLive && musicAudible ? 'playing' : p.music ? 'on, starts with the first input' : 'off') + ', ' + p.musicBpm + ' bpm'}>
         <div className="hk-chips">
           <button data-music="1" className=${'lang-seg' + (musicLive ? ' active' : '')} onClick=${musicToggle}>${musicLive ? 'Music on' : 'Music off'}</button>
         </div>
