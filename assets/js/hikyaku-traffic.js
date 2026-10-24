@@ -391,6 +391,7 @@
     const req = 2 * Rmax + 2 * lane.bobAmp + lane.margin;
     const g = buildPieces(lane, req / 2);
     lane.pieces = g.pieces; lane.L = g.L; lane.rMin = g.rMin;
+    headingHints(lane);
     lane.reqDist = req;
     lane.minSpacing = isFinite(g.rMin) ? 2 * g.rMin * Math.asin(Math.min(1, req / (2 * g.rMin))) : req;
     let sp = o.spacing != null ? +o.spacing : (o.gap ? lenMax + (o.gap[0] + o.gap[1]) / 2 : 60);
@@ -474,45 +475,158 @@
     out.pc = pc; out.sig = sig;
     return out;
   }
-  /* Full frame of a vehicle at arc length s and time t: position with bob,
-     forward f, up u, starboard r. Banks into corners like an aircraft, the
-     lift vector tilted toward the centre by atan(v^2 / (r g)), capped at
-     maxBank and ramped in and out inside the arc. */
-  function laneFrame(lane, s, t, bobPh, out) {
+  /* ---- attitude per vehicle type ---------------------------------------
+     A quadcopter cannot fly on its side, and a lift-fan craft only a
+     little. So the body attitude is built against world up, not against
+     the lane: yaw from the horizontal part of the travel direction, then a
+     pitch about the horizontal starboard axis, then the bank about the
+     nose. Per type:
+       drone      pitch only from speed: nose down by DRONE_TILT tanh(v_h /
+                  DRONE_TILT_V), v_h the horizontal speed, so vertical
+                  travel gives no tilt; bank capped at DRONE_BANK
+       pod,hauler pitch toward the travel elevation, soft-capped at 25 deg
+       freighter  the same, soft-capped at 10 deg
+     The soft cap is the identity below half the limit and runs into the
+     limit with tanh above it, so a lane that bends from horizontal into
+     vertical gives a smooth pitch. On a horizontal lane every non-drone
+     type has exactly the old frame. Travel direction (fwd) and body nose
+     (heading) differ wherever the cap bites. */
+  const DEG = Math.PI / 180;
+  const PITCH_MAX = { pod: 25 * DEG, hauler: 25 * DEG, freighter: 10 * DEG };
+  const DRONE_TILT = 12 * DEG, DRONE_TILT_V = 35, DRONE_BANK = 20 * DEG;
+  /* below this horizontal share of the tangent (cos of the elevation) the
+     heading blends from the tangent into the piece's heading hint; below
+     VERT_C a piece end counts as vertical */
+  const HEAD_BLEND = 0.3, VERT_C = 0.05;
+  const WUP = [0, 1, 0];
+  function smooth01(x) { return x >= 1 ? 1 : x <= 0 ? 0 : x * x * (3 - 2 * x); }
+  function softCap(x, m) {
+    const a = Math.abs(x), k = 0.5 * m;
+    if (a <= k) return x;
+    return Math.sign(x) * (k + (m - k) * Math.tanh((a - k) / (m - k)));
+  }
+  function horiz(v) { return [v[0], 0, v[2]]; }
+  /* v rotated about world up by angle a */
+  function yawRot(v, a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c];
+  }
+  function yawLerp(a, b, x) {
+    if (x <= 0) return a.slice();
+    if (x >= 1) return b.slice();
+    return yawRot(a, Math.atan2(a[2] * b[0] - a[0] * b[2], dot(a, b)) * x);
+  }
+  function pieceTangent(pc, sig) {
+    if (pc.kind === 0) return pc.d;
+    const ph = sig / pc.r, cs = Math.cos(ph), sn = Math.sin(ph);
+    return [-pc.u[0] * sn + pc.w[0] * cs, -pc.u[1] * sn + pc.w[1] * cs, -pc.u[2] * sn + pc.w[2] * cs];
+  }
+  /* Heading hints at both ends of every piece (hS, hE, horizontal unit
+     vectors), so the heading stays defined and continuous where the lane
+     runs vertical. An end with a horizontal tangent share takes its
+     direction; the vertical end of an arc takes the limit direction from
+     just inside the arc; a vertical straight takes the hints of its
+     neighbours (the last horizontal heading before it, the next one after
+     it) and turns from one to the other along its length. A lane without
+     any horizontal heading takes the up hint (or up2) projected to the
+     horizontal plane. */
+  function headingHints(lane) {
+    const P = lane.pieces, n = P.length;
+    let fb = horiz(lane.up);
+    if (len(fb) < 0.2) fb = horiz(lane.up2);
+    fb = len(fb) > 1e-6 ? norm(fb) : [0, 0, -1];
+    const endH = (pc, atEnd) => {
+      let h = horiz(pieceTangent(pc, atEnd ? pc.len : 0));
+      if (len(h) >= VERT_C) return norm(h);
+      if (pc.kind === 0) return null;
+      const d = Math.min(pc.len * 0.5, 1e-3 * pc.r);
+      h = horiz(pieceTangent(pc, atEnd ? pc.len - d : d));
+      return len(h) > 1e-9 ? norm(h) : null;
+    };
+    const raw = P.map((pc) => [endH(pc, false), endH(pc, true)]);
+    for (let i = 0; i < n; i++) {
+      let hS = raw[i][0], hE = raw[i][1];
+      if (!hS || !hE) {
+        let prev = null, next = null;
+        for (let j = 1; j < n && !prev; j++) {
+          if (i - j < 0 && !lane.loop) break;
+          const q = raw[mod(i - j, n)];
+          prev = q[1] || q[0];
+        }
+        for (let j = 1; j < n && !next; j++) {
+          if (i + j >= n && !lane.loop) break;
+          const q = raw[mod(i + j, n)];
+          next = q[0] || q[1];
+        }
+        hS = hS || prev || next || hE || fb;
+        hE = hE || next || prev || hS;
+      }
+      P[i].hS = hS; P[i].hE = hE;
+    }
+  }
+
+  /* Full frame of a vehicle of the given type at arc length s and time t:
+     position with bob, travel direction f, body nose h, body up u,
+     starboard r. Banks into corners like an aircraft, the lift vector
+     tilted toward the centre by atan(v^2 / (r g)), capped at maxBank (and
+     DRONE_BANK for drones) and ramped in and out inside the arc. The bob
+     runs along the old lane-perpendicular up, so positions do not depend
+     on the type and the spacing bound stays as it was. */
+  function laneFrame(lane, s, t, bobPh, out, type) {
     lanePoint(lane, s, out);
     const f = out.f, pc = out.pc;
-    let h = lane.up, hf = dot(h, f);
-    if (Math.abs(hf) > 0.98) { h = lane.up2; hf = dot(h, f); }
-    let u0 = [h[0] - f[0] * hf, h[1] - f[1] * hf, h[2] - f[2] * hf];
-    u0 = norm(u0);
-    const r0 = cross(f, u0);
-    let phi = 0;
+    let inward = null, ramp = 0, bankMag = 0;
     if (pc.kind === 1 && lane.maxBank > 0) {
       const ph = out.sig / pc.r, cs = Math.cos(ph), sn = Math.sin(ph);
-      const inward = [-(pc.u[0] * cs + pc.w[0] * sn), -(pc.u[1] * cs + pc.w[1] * sn), -(pc.u[2] * cs + pc.w[2] * sn)];
-      const side = dot(inward, r0);
-      const mag = Math.min(lane.maxBank, Math.atan(lane.speed * lane.speed / (pc.r * GRAV)));
-      const sm = (x) => (x >= 1 ? 1 : x <= 0 ? 0 : x * x * (3 - 2 * x));
-      phi = side * mag * sm(out.sig / pc.ramp) * sm((pc.len - out.sig) / pc.ramp);
+      inward = [-(pc.u[0] * cs + pc.w[0] * sn), -(pc.u[1] * cs + pc.w[1] * sn), -(pc.u[2] * cs + pc.w[2] * sn)];
+      ramp = smooth01(out.sig / pc.ramp) * smooth01((pc.len - out.sig) / pc.ramp);
+      bankMag = Math.min(lane.maxBank, Math.atan(lane.speed * lane.speed / (pc.r * GRAV)));
     }
-    const cp = Math.cos(phi), sp = Math.sin(phi);
-    const u = out.u, r = out.r;
-    for (let k = 0; k < 3; k++) u[k] = u0[k] * cp + r0[k] * sp;
-    const rr = cross(f, u);
-    r[0] = rr[0]; r[1] = rr[1]; r[2] = rr[2];
     if (lane.bobAmp > 0) {
+      let hh = lane.up, hf = dot(hh, f);
+      if (Math.abs(hf) > 0.98) { hh = lane.up2; hf = dot(hh, f); }
+      const u0 = norm([hh[0] - f[0] * hf, hh[1] - f[1] * hf, hh[2] - f[2] * hf]);
+      const r0 = cross(f, u0);
+      const phi0 = inward ? dot(inward, r0) * bankMag * ramp : 0;
+      const c0 = Math.cos(phi0), s0 = Math.sin(phi0);
       const b = lane.bobAmp * Math.sin(lane.bobFreq * t + bobPh);
-      out.p[0] += u[0] * b; out.p[1] += u[1] * b; out.p[2] += u[2] * b;
+      for (let k = 0; k < 3; k++) out.p[k] += (u0[k] * c0 + r0[k] * s0) * b;
     }
+    /* heading: the horizontal tangent, blended into the piece's hint near vertical */
+    const fh = horiz(f), c = len(fh);
+    let hd;
+    if (c >= HEAD_BLEND) hd = [fh[0] / c, 0, fh[2] / c];
+    else {
+      const hint = yawLerp(pc.hS, pc.hE, smooth01(out.sig / pc.len));
+      const w = smooth01(c / HEAD_BLEND), m = c > 1e-12 ? w / c : 0;
+      hd = [fh[0] * m + hint[0] * (1 - w), 0, fh[2] * m + hint[2] * (1 - w)];
+      hd = len(hd) > 1e-6 ? norm(hd) : hint;
+    }
+    const rh = cross(hd, WUP);
+    let pitch;
+    if (type === 'drone') pitch = -DRONE_TILT * Math.tanh(lane.speed * c / DRONE_TILT_V);
+    else pitch = softCap(Math.asin(Math.max(-1, Math.min(1, f[1]))), PITCH_MAX[type] || PITCH_MAX.pod);
+    let phi = 0;
+    if (inward) phi = dot(inward, rh) * (type === 'drone' ? Math.min(bankMag, DRONE_BANK) : bankMag) * ramp;
+    const cp = Math.cos(pitch), sp = Math.sin(pitch), cr = Math.cos(phi), sr = Math.sin(phi);
+    const N = out.h, u = out.u, r = out.r;
+    for (let k = 0; k < 3; k++) {
+      N[k] = hd[k] * cp + WUP[k] * sp;
+      u[k] = (-hd[k] * sp + WUP[k] * cp) * cr + rh[k] * sr;
+    }
+    const rr = cross(N, u);
+    r[0] = rr[0]; r[1] = rr[1]; r[2] = rr[2];
     return out;
   }
-  function scratch() { return { p: [0, 0, 0], f: [0, 0, 0], u: [0, 0, 0], r: [0, 0, 0], pc: null, sig: 0 }; }
+  function scratch() { return { p: [0, 0, 0], f: [0, 0, 0], h: [0, 0, 0], u: [0, 0, 0], r: [0, 0, 0], pc: null, sig: 0 }; }
 
   /* The pose of slot k at time t, a pure function of (lane, k, t):
-       { p, q, fwd, up, right, type, paint, s, k, speed }
+       { p, q, fwd, heading, up, right, type, paint, s, k, speed }
+     fwd is the travel direction (the lane tangent), heading the body nose.
      q is [w, x, y, z] body to world, the body frame nose -z, so
-     qRot(q, [0, 0, -1]) = fwd. null for an empty slot or, on an open lane,
-     a slot that is past the end. */
+     qRot(q, [0, 0, -1]) = heading and qRot(q, [0, 1, 0]) = up. Models and
+     hull boxes go by q (or heading, up, right), never by fwd. null for an
+     empty slot or, on an open lane, a slot that is past the end. */
   function poseAt(lane, k, t) {
     const N = lane.count;
     if (!N) return null;
@@ -521,13 +635,14 @@
     if (!info) return null;
     const s = slotS(lane, k, t);
     if (!lane.loop && s >= lane.L) return null;
-    const fr = laneFrame(lane, s, t, info.bobPh, scratch());
-    const B = [-fr.f[0], -fr.f[1], -fr.f[2]];
+    const fr = laneFrame(lane, s, t, info.bobPh, scratch(), info.type);
+    const B = [-fr.h[0], -fr.h[1], -fr.h[2]];
     return {
-      p: fr.p, q: qFromBasis(fr.r, fr.u, B), fwd: fr.f, up: fr.u, right: fr.r,
+      p: fr.p, q: qFromBasis(fr.r, fr.u, B), fwd: fr.f, heading: fr.h, up: fr.u, right: fr.r,
       type: info.type, paint: info.paint, s: s, k: k, speed: lane.speed
     };
   }
+
   /* World velocity of a point fixed in the vehicle frame (default the
      centre), by central difference of the pose formula. Falls back to
      speed * fwd where the slot enters or leaves an open lane. */
@@ -630,7 +745,7 @@
     const rs = pts.map((pt) => qRot(s.q, pt));
     for (let vi = 0; vi < vehicles.length; vi++) {
       const veh = vehicles[vi], pose = veh.pose, H = HULLS[veh.type];
-      const R = pose.right, U = pose.up, B = [-pose.fwd[0], -pose.fwd[1], -pose.fwd[2]];
+      const R = pose.right, U = pose.up, B = [-pose.heading[0], -pose.heading[1], -pose.heading[2]];
       const cols = [R, U, B];
       const key = 'v' + vi;
       for (let i = 0; i < pts.length; i++) {
@@ -1719,8 +1834,10 @@ void main(){
             if (ef <= 1e-3) { release(v); v.state = 'off'; st.culled++; continue; }
             ef = ef * ef * (3 - 2 * ef);
           }
-          laneFrame(lane, s, t, v.bobPh, fr);
-          const P = fr.p, F = fr.f, U = fr.u, R = fr.r;
+          laneFrame(lane, s, t, v.bobPh, fr, v.type);
+          /* models, mid bodies and lights follow the body frame (nose F = fr.h);
+             the far streak follows the lane */
+          const P = fr.p, F = fr.h, U = fr.u, R = fr.r;
           const dx = cx - P[0], dy = cy - P[1], dz = cz - P[2];
           const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
           const bands = TB[v.type];
