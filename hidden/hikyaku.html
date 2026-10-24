@@ -167,6 +167,7 @@
   <script src="/assets/js/hikyaku-flight.js"></script>
   <script src="/assets/js/colorramps.js"></script>
   <script src="/assets/js/courier.js"></script>
+  <script src="/assets/js/hikyaku-city.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -437,109 +438,16 @@ var Hikyaku = (function () {
   }
 
   /* ---- obstacles ----------------------------------------------------------
-     A stand-in for the city: axis-aligned boxes on the ground near the
-     route, never inside the clearance tube. The city step replaces the
-     placement and keeps the output shape:
-       { boxes: [{ min, max, c, half, idx }], boxesNear(p, r), pads }
-     boxesNear is a uniform grid in x and z, because the contact code must
-     only see the handful of boxes within reach of the hull.
-     pads are flat roof tops large enough to land on, marked now for the
-     delivery waypoints of v2. */
-  var DEF_OBST = {
-    seed: 0, count: 40, near: 150,
-    hMin: 20, hMax: 120,
-    wMin: 8, wMax: 26,      /* half extents in x and z */
-    gap: 8,                 /* daylight between two boxes */
-    margin: 2,              /* extra metres outside the tube */
-    under: 0.35,            /* share of tries placed straight under the route */
-    cell: 64, padMin: 10
-  };
-
+     The city (assets/js/hikyaku-city.js) builds the boxes around the route
+     and answers boxesNear(p, r) with the shape contactsBoxes takes:
+       { min, max, c, half, idx }
+     The step-2 stand-in makeObstacles is gone. boxDist stays: tests and the
+     contact code use it. */
   function boxDist(b, p) {
     var dx = Math.max(b.min[0] - p[0], 0, p[0] - b.max[0]);
     var dy = Math.max(b.min[1] - p[1], 0, p[1] - b.max[1]);
     var dz = Math.max(b.min[2] - p[2], 0, p[2] - b.max[2]);
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
-  }
-
-  function makeObstacles(route, cfg) {
-    var O = merge(DEF_OBST, cfg);
-    if (!cfg || cfg.seed == null) O.seed = (route.seed * 7919 + 17) >>> 0;
-    var rand = SD.rng(O.seed >>> 0);
-    var S = route.tube.samples, Rt = route.tube.r;
-    var boxes = [], tries = 0, maxTries = O.count * 80, i, k;
-    while (boxes.length < O.count && tries++ < maxTries) {
-      var sp = S[Math.floor(rand() * S.length)];
-      var hn = norm([-sp.d[2], 0, sp.d[0]]);
-      if (len(hn) < 0.5) continue;
-      var side = rand() < 0.5 ? -1 : 1;
-      var hx = O.wMin + rand() * (O.wMax - O.wMin), hz = O.wMin + rand() * (O.wMax - O.wMin);
-      var off = rand() < O.under ? rand() * O.near
-        : Rt + O.margin + Math.max(hx, hz) + rand() * Math.max(0, O.near - Rt - O.margin);
-      var c = [sp.p[0] + hn[0] * side * off, 0, sp.p[2] + hn[2] * side * off];
-      var h = O.hMin + Math.pow(rand(), 1.4) * (O.hMax - O.hMin);
-      var b = { min: [c[0] - hx, 0, c[2] - hz], max: [c[0] + hx, h, c[2] + hz] };
-      var dmin = Infinity;
-      for (k = 0; k < S.length; k++) {
-        var d = boxDist(b, S[k].p);
-        if (d < dmin) { dmin = d; if (dmin < Rt + O.margin) break; }
-      }
-      if (dmin < Rt + O.margin || dmin > O.near) continue;
-      var clash = false;
-      for (k = 0; k < boxes.length; k++) {
-        var o = boxes[k];
-        if (b.min[0] < o.max[0] + O.gap && b.max[0] > o.min[0] - O.gap &&
-            b.min[2] < o.max[2] + O.gap && b.max[2] > o.min[2] - O.gap) { clash = true; break; }
-      }
-      if (clash) continue;
-      b.c = [c[0], h / 2, c[2]];
-      b.half = [hx, h / 2, hz];
-      b.idx = boxes.length;
-      b.clear = dmin;
-      boxes.push(b);
-    }
-
-    var cell = O.cell, grid = new Map();
-    function key(ix, iz) { return ix + ',' + iz; }
-    for (i = 0; i < boxes.length; i++) {
-      var bx = boxes[i];
-      for (var ix = Math.floor(bx.min[0] / cell); ix <= Math.floor(bx.max[0] / cell); ix++) {
-        for (var iz = Math.floor(bx.min[2] / cell); iz <= Math.floor(bx.max[2] / cell); iz++) {
-          var kk = key(ix, iz), lst = grid.get(kk);
-          if (!lst) { lst = []; grid.set(kk, lst); }
-          lst.push(i);
-        }
-      }
-    }
-    var stamp = new Int32Array(boxes.length), tick = 0;
-    /* Boxes whose bounds come within r of p. */
-    function boxesNear(p, r) {
-      var out = [];
-      tick++;
-      var x0 = Math.floor((p[0] - r) / cell), x1 = Math.floor((p[0] + r) / cell);
-      var z0 = Math.floor((p[2] - r) / cell), z1 = Math.floor((p[2] + r) / cell);
-      for (var gx = x0; gx <= x1; gx++) {
-        for (var gz = z0; gz <= z1; gz++) {
-          var l = grid.get(key(gx, gz));
-          if (!l) continue;
-          for (var m = 0; m < l.length; m++) {
-            var bi = l[m];
-            if (stamp[bi] === tick) continue;
-            stamp[bi] = tick;
-            if (boxDist(boxes[bi], p) <= r) out.push(boxes[bi]);
-          }
-        }
-      }
-      return out;
-    }
-    var pads = [];
-    for (i = 0; i < boxes.length; i++) {
-      var bb = boxes[i];
-      if (bb.half[0] >= O.padMin && bb.half[2] >= O.padMin) {
-        pads.push({ p: [bb.c[0], bb.max[1], bb.c[2]], half: [bb.half[0], bb.half[2]], box: i });
-      }
-    }
-    return { seed: O.seed, cfg: O, boxes: boxes, cell: cell, boxesNear: boxesNear, pads: pads };
   }
 
   /* ---- contacts -----------------------------------------------------------
@@ -673,9 +581,9 @@ var Hikyaku = (function () {
   }
 
   return {
-    DEF_ROUTE: DEF_ROUTE, DEF_OBST: DEF_OBST,
+    DEF_ROUTE: DEF_ROUTE,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
-    makeObstacles: makeObstacles, boxDist: boxDist, contactsBoxes: contactsBoxes,
+    boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, elapsed: elapsed,
     formatTime: formatTime
   };
@@ -689,6 +597,7 @@ const { useState, useRef, useEffect, useMemo, useCallback } = React;
 const SD = SixDOF;
 const HF = HikyakuFlight;
 const HK = Hikyaku;
+const HC = HikyakuCity;
 const CR = ColorRamps;
 const G = HF.G0;
 
@@ -713,16 +622,16 @@ function boneColor(THREE, t, k) {
   const c = boneAt(t), s = k == null ? 1 : k;
   return new THREE.Color().setRGB(c[0] * s, c[1] * s, c[2] * s, THREE.SRGBColorSpace);
 }
-/* Fog, ground and boxes take the upper half of bone, darkened: the lower
-   half of the ramp is blue and reads lavender as a sky. */
-const FOG = [0.62, 0.5];
 
 /* URL hooks. ?seed= makes a route shareable and best times comparable.
-   ?shot=start|ring|top places the camera deterministically and ignores input,
-   for headless screenshots; ?nohid=1 skips the 3D mouse. Test hooks, kept
+   ?shot=start|ring|top|city|canyon places the camera deterministically and
+   ignores input, for headless screenshots; ?nohid=1 skips the 3D mouse;
+   ?bench=1 measures tile builds and frame times and logs them with
+   console.error (headless Chrome prints that to stderr). Test hooks, kept
    cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
 
@@ -739,8 +648,14 @@ const DEF = {
   deadzone: 0, curve: 1, gain: 1,
   camMode: 'chase',
   camF0: 0.9, camZeta: 0.7071, camRoll: 0.25, camDist: 2.4, camUp: 0.45,
-  shadows: false, overlay: false, routeLine: true
+  shadows: false, overlay: false, routeLine: true,
+  /* The city. Density, height and accents take effect on "Rebuild"; fog and
+     the tile window apply at once. */
+  cityDensity: 0.85, cityMaxH: 260, cityAccents: 2, fogDensity: 0.0034, cityRadius: 4
 };
+/* The two neon hues of the city (handoff: one or two per scene). The first
+   is the courier's own cyan. */
+const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
 const ENUMS = { camMode: ['chase', 'cockpit'] };
 const STORE = 'hk.cfg';
@@ -825,23 +740,49 @@ function Section({ id, title, summary, open, onToggle, children }) {
   </div>`;
 }
 
-/* The ground texture: one 100 m tile with a strong edge and 25 m minor
-   lines, so both speed and height read off it. */
+/* The street level: one city tile (HikyakuCity.TILE, 216 m) per texture
+   repeat, streets 32 m wide on the tile edges and through the middle, with
+   kerbs and faint lane dashes on the 54 m lane pitch. The pattern is
+   symmetric, so the plane's uv orientation does not matter, only that its
+   corner sits on a tile corner. */
 function groundTexture(THREE, renderer) {
+  const N = 1024, T = HC.TILE, k = N / T;
   const c = document.createElement('canvas');
-  c.width = c.height = 512;
+  c.width = c.height = N;
   const g = c.getContext('2d');
-  g.fillStyle = boneCss(0.6, 0.2);
-  g.fillRect(0, 0, 512, 512);
-  g.fillStyle = boneCss(0.6, 0.27);
-  for (let i = 1; i < 4; i++) { g.fillRect(i * 128 - 1, 0, 2, 512); g.fillRect(0, i * 128 - 1, 512, 2); }
-  g.fillStyle = boneCss(0.62, 0.38);
-  g.fillRect(0, 0, 512, 4); g.fillRect(0, 0, 4, 512);
+  g.fillStyle = boneCss(0.16, 0.55);
+  g.fillRect(0, 0, N, N);
+  const half = HC.STREET / 2 * k;
+  g.fillStyle = boneCss(0.1, 0.5);
+  for (const m of [0, N / 2, N]) { g.fillRect(m - half, 0, 2 * half, N); g.fillRect(0, m - half, N, 2 * half); }
+  g.fillStyle = boneCss(0.3, 0.45);
+  for (const m of [0, N / 2, N]) for (const sgn of [-1, 1]) {
+    const e = m + sgn * half - (sgn > 0 ? 2 : 0);
+    g.fillRect(e, 0, 2, N); g.fillRect(0, e, N, 2);
+  }
+  /* lane dashes along every street, on the 54 m pitch offsets */
+  g.fillStyle = boneCss(0.35, 0.35);
+  for (const m of [0, N / 2, N]) for (const off of [-6, 6]) {
+    for (let t = 0; t < N; t += 24) { g.fillRect(m + off * k - 1, t, 2, 12); g.fillRect(t, m + off * k - 1, 12, 2); }
+  }
   const tex = new THREE.CanvasTexture(c);
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
   return tex;
+}
+
+/* A ship pose for the screenshot hooks: back along dir from p, nose along
+   dir, wings level. */
+function poseAt(p, dir, back) {
+  const f = HK.frameOf(dir);
+  return { p: SD.sub(p, SD.mul(dir, back)), v: [0, 0, 0], q: HK.quatFromAxes(f.right, f.up, SD.mul(dir, -1)), w: [0, 0, 0] };
+}
+
+/* The tall core of the city sits on the middle of the route. */
+function routeCore(route) {
+  const w = route.waypoints;
+  return [w.reduce((a, q) => a + q.p[0], 0) / w.length, w.reduce((a, q) => a + q.p[2], 0) / w.length];
 }
 
 /* A gate frame after the portal rule: a dark rectangular body with real depth,
@@ -909,12 +850,28 @@ function App() {
   const killCraft = useMemo(() => ({ ...craft, rateDamp: 8 }), [craft]);
 
   /* The route is geometry: rebuilt only on a new seed, and the world is
-     built around it. makeObstacles is the slot the city generator takes. */
+     built around it. */
   const route = useMemo(() => HK.makeRoute({ seed: p.seed }), [p.seed]);
-  const obst = useMemo(() => HK.makeObstacles(route), [route]);
+  /* Oversized structures (arcologies, Menger blocks, step 6) are bigger
+     than a tile and placed on the route separately. Their world boxes go
+     here; the city builds nothing inside them. Empty for now. */
+  const specials = useMemo(() => [], [route]);
+  /* The generator settings the city was built with. The panel edits p and
+     "Rebuild" copies them over, so dragging a slider does not throw away
+     every tile on each step. */
+  const [cityCfg, setCityCfg] = useState(() => {
+    const q = loadStored();
+    return { density: q.cityDensity, maxH: q.cityMaxH, accents: q.cityAccents };
+  });
+  const city = useMemo(() => HC.makeCity(route, {
+    density: cityCfg.density, maxH: cityCfg.maxH, accents: cityCfg.accents,
+    core: routeCore(route), reserved: specials
+  }), [route, cityCfg, specials]);
+  const cityPending = cityCfg.density !== p.cityDensity || cityCfg.maxH !== p.cityMaxH || cityCfg.accents !== p.cityAccents;
+  const rebuildCity = () => setCityCfg({ density: p.cityDensity, maxH: p.cityMaxH, accents: p.cityAccents });
 
   const cfgRef = useRef(null);
-  cfgRef.current = { p, craft, killCraft, route, obst };
+  cfgRef.current = { p, craft, killCraft, route, city };
 
   const der = useMemo(() => HF.speeds(craft, p.gravity ? G : 0), [craft, p.gravity]);
 
@@ -1005,17 +962,24 @@ function App() {
     const THREE = window.THREE;
     const host = stageRef.current;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-    const fogCol = boneColor(THREE, FOG[0], FOG[1]);
-    renderer.setClearColor(fogCol, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.2;
+    renderer.setClearColor(boneColor(THREE, 0.5), 1);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
 
+    /* One height fog for the whole page (hikyaku-city.js makeFog): dense and
+       pale low down, thinner and darker high up. Every lit material is
+       patched to use it, the sky sphere shows its far end. scene.fog is a
+       zero-density placeholder: it only switches the fog chunk on. */
+    const fog = HC.makeFog(THREE);
+    fog.set({ density: cfgRef.current.p.fogDensity, low: 0.56, high: 0.16, h0: 0, h1: 420 });
     const scene = new THREE.Scene();
-    scene.background = fogCol;
-    scene.fog = new THREE.Fog(fogCol, 260, 2600);
+    scene.fog = new THREE.FogExp2(0x000000, 0);
+    scene.add(HC.makeSky(THREE, fog));
     const camera = new THREE.PerspectiveCamera(62, 1, 0.5, 30000);
 
     const worldGrp = new THREE.Group();
@@ -1023,13 +987,14 @@ function App() {
     const shipGrp = new THREE.Group();
     scene.add(shipGrp);
 
-    const sunDir = new THREE.Vector3(0.45, 0.8, 0.35).normalize();
-    const sun = new THREE.DirectionalLight(0xfff1e0, 2.4);
+    /* Dusk light as in the concepts: a pale moon and a bone sky light. */
+    const sunDir = new THREE.Vector3(-0.4, 1, 0.3).normalize();
+    const sun = new THREE.DirectionalLight(boneColor(THREE, 0.85), 0.9);
     sun.shadow.mapSize.set(2048, 2048);
     sun.shadow.normalBias = 0.4;
     scene.add(sun);
     scene.add(sun.target);
-    const hemi = new THREE.HemisphereLight(boneColor(THREE, 0.8), boneColor(THREE, 0.55, 0.2), 1.1);
+    const hemi = new THREE.HemisphereLight(boneColor(THREE, 0.75), boneColor(THREE, 0.12), 1.1);
     scene.add(hemi);
 
     /* The courier. Plumes are scaled from the loop: the four fan plumes with
@@ -1040,14 +1005,21 @@ function App() {
     ship.visual.traverse((o) => {
       if (o.userData.thruster === 'fan') fans.push(o);
       else if (o.userData.thruster === 'main') mains.push(o);
-      else if (o.isMesh && !o.userData.fx) { o.castShadow = true; o.receiveShadow = true; }
+      else if (o.isMesh && !o.userData.fx) {
+        o.castShadow = true; o.receiveShadow = true;
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        for (const m of mats) if (m && !m.transparent && !m.userData.hkFog) { fog.patch(m); m.userData.hkFog = true; }
+      }
     });
 
     const state = {
       s: null, info: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] },
       simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: ''
     };
-    const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, rings: null, gates: null };
+    /* cityR: the city renderer, owned by the city effect below. traffic:
+       the slot for step 5 (hikyaku-traffic.js); the loop calls
+       traffic.update(simT, camera) when it is set. */
+    const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null, traffic: null };
     glRef.current = g;
 
     const colNext = new THREE.Color(ACCENT);
@@ -1081,6 +1053,14 @@ function App() {
     const reset = () => {
       const cfg = cfgRef.current;
       state.s = HK.startState(cfg.route, 60);
+      if (SHOT === 'city') {
+        const w = cfg.route.waypoints[Math.min(5, cfg.route.n - 1)];
+        state.s = poseAt(w.p, w.dir, 70);
+      } else if (SHOT === 'canyon') {
+        const w = cfg.route.waypoints[Math.min(5, cfg.route.n - 1)];
+        const spot = HC.findCanyon(cfg.city, w.p, 900);
+        if (spot) state.s = poseAt(spot.p, spot.dir, 0);
+      }
       state.info = null;
       state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
       state.simT = 0; state.acc = 0; state.hits = 0;
@@ -1128,6 +1108,47 @@ function App() {
     const tmpV = new THREE.Vector3();
     let last = 0, raf = 0;
 
+    /* ?bench=1: tile build times (pure generator and mesh separately), then,
+       once streaming has settled, 120 frames with the city and 120 without,
+       timed on the CPU and, where the browser has the timer query, on the
+       GPU. The city's GPU cost is the difference. Reported once through
+       console.error. */
+    const gl = renderer.getContext();
+    const tq = BENCH ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+    const bench = { builds: [], pendQ: [], phase: 'settle', settle: 0, A: { dt: [], cpu: [], gpu: [] }, B: { dt: [], cpu: [], gpu: [] }, done: false, info: null };
+    const benchPoll = (sink) => {
+      while (bench.pendQ.length) {
+        const q = bench.pendQ[0];
+        if (!gl.getQueryParameter(q.q, gl.QUERY_RESULT_AVAILABLE)) break;
+        const ns = gl.getQueryParameter(q.q, gl.QUERY_RESULT);
+        const dis = gl.getParameter(tq.GPU_DISJOINT_EXT);
+        gl.deleteQuery(q.q); bench.pendQ.shift();
+        if (!dis && q.sink) q.sink.gpu.push(ns / 1e6);
+      }
+    };
+    const benchReport = () => {
+      const avg = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+      const pct = (a, f) => { if (!a.length) return null; const b = a.slice().sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(f * b.length))]; };
+      const r2 = (x) => x == null ? null : Math.round(x * 1000) / 1000;
+      const pure = bench.builds.map((b) => b.pure), mesh = bench.builds.map((b) => b.mesh);
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      const out = {
+        gpu: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+        shot: SHOT, w: renderer.domElement.width, h: renderer.domElement.height,
+        builds: bench.builds.length, buildPureAvg: r2(avg(pure)), buildPureMax: r2(Math.max(0, ...pure)),
+        buildMeshAvg: r2(avg(mesh)), buildMeshMax: r2(Math.max(0, ...mesh)),
+        frameAvg: r2(avg(bench.A.dt)), frameP95: r2(pct(bench.A.dt, 0.95)),
+        cpuAvg: r2(avg(bench.A.cpu)), cpuNoCity: r2(avg(bench.B.cpu)),
+        gpuAvg: r2(avg(bench.A.gpu)), gpuNoCity: r2(avg(bench.B.gpu)),
+        gpuCity: avg(bench.A.gpu) != null && avg(bench.B.gpu) != null ? r2(avg(bench.A.gpu) - avg(bench.B.gpu)) : null,
+        gpuSamples: [bench.A.gpu.length, bench.B.gpu.length],
+        ...bench.info
+      };
+      console.error('HKBENCH ' + JSON.stringify(out));
+      document.title = 'HKBENCH ' + JSON.stringify(out);
+    };
+    let topKeys = null;
+
     const say = (txt, ms, ts) => { state.msg = txt; state.msgUntil = ts + ms; };
 
     const onEvent = (ev, ts) => {
@@ -1147,7 +1168,8 @@ function App() {
     const frame = (ts) => {
       raf = requestAnimationFrame(frame);
       const cfg = cfgRef.current;
-      const pp = cfg.p, cr = cfg.craft, route = cfg.route, obst = cfg.obst;
+      const pp = cfg.p, cr = cfg.craft, route = cfg.route, city = cfg.city;
+      const c0 = performance.now();
       const dtRaw = last ? (ts - last) / 1000 : 0;
       last = ts;
       const dt = Math.min(0.1, dtRaw);
@@ -1176,6 +1198,43 @@ function App() {
         for (const k in cmd) cmd[k] = Math.max(k === 'main' ? 0 : -1, Math.min(1, cmd[k]));
       }
 
+      /* ---- city streaming ----
+         Diff the wanted tile window against the loaded tiles. The 3 x 3
+         around the ship is built at once (collision needs it), anything else
+         one tile per frame, nearest first. Screenshots build everything at
+         once. The top view loads every tile under the route. */
+      const cityR = g.cityR;
+      if (cityR && cityR.owner === city) {
+        const sp = state.s;
+        const hv = Math.hypot(sp.v[0], sp.v[2]);
+        const dirv = hv > 5 ? sp.v : SD.qRot(sp.q, [0, 0, -1]);
+        const tb0 = performance.now();
+        let ch;
+        if (SHOT === 'top') {
+          if (!topKeys) {
+            topKeys = new Set();
+            const b = route.bounds;
+            for (let i = Math.floor(b.min[0] / HC.TILE) - 1; i <= Math.floor(b.max[0] / HC.TILE) + 1; i++) {
+              for (let k = Math.floor(b.min[2] / HC.TILE) - 1; k <= Math.floor(b.max[2] / HC.TILE) + 1; k++) topKeys.add(HC.tileKey(i, k));
+            }
+          }
+          ch = city.syncKeys(topKeys, topKeys, sp.p, { maxBuilds: Infinity });
+        } else {
+          /* the ring shot looks at ring 3 from wherever the ship is, so it
+             streams around that ring */
+          const focus = SHOT === 'ring' ? route.waypoints[Math.min(3, route.n - 1)].p : sp.p;
+          ch = city.sync(focus, dirv, { radius: pp.cityRadius, maxBuilds: SHOT ? Infinity : 1 });
+        }
+        const tb1 = performance.now();
+        for (const key of ch.removed) cityR.removeTile(key);
+        for (const t of ch.added) {
+          const m0 = performance.now();
+          cityR.addTile(t);
+          if (BENCH) bench.builds.push({ pure: (tb1 - tb0) / ch.added.length, mesh: performance.now() - m0 });
+        }
+        state.pending = ch.pending;
+      }
+
       /* ---- physics, fixed 1/120 s steps ----
          Flight, then contacts against the boxes within reach and the ground,
          then the race. The race sees each substep, so the crossing time is
@@ -1190,7 +1249,7 @@ function App() {
         const prev = state.s.p;
         const o = HF.step(fc, state.s, fcmd, env, H_STEP, 1);
         state.s = o.state; state.info = o.info;
-        const near = obst.boxesNear(state.s.p, 12);
+        const near = city.boxesNear(state.s.p, 12);
         const cs = HK.contactsBoxes(state.s, cr.hull.verts, near);
         if (cs.length) {
           const hit = SD.resolve(state.s, cs, cr.I, pp.restitution);
@@ -1264,9 +1323,13 @@ function App() {
         camera.position.set(cx, hgt, cz);
         camera.up.set(0, 0, -1);
         camera.lookAt(cx, 0, cz);
-        scene.fog.near = hgt; scene.fog.far = hgt * 4;
+        fog.uniforms.cgFogDensity.value = 0.25 / hgt;
+        if (cityR) cityR.skyline.visible = false;
       }
       camera.updateMatrixWorld();
+      if (cityR) cityR.update(camera.position, dt);
+      /* step 5: the traffic layer, every pose a closed formula of time */
+      if (g.traffic) g.traffic.update(state.simT, camera);
 
       /* ---- HUD ---- */
       const H = hudRef.current;
@@ -1341,7 +1404,35 @@ function App() {
         }
       }
 
+      if (!BENCH || bench.done || !cityR) { renderer.render(scene, camera); return; }
+
+      /* ---- bench ---- */
+      let sink = null;
+      if (bench.phase === 'settle') {
+        if (!state.pending) bench.settle++;
+        if (bench.settle > 60) {
+          bench.phase = 'A';
+          const st = cityR.stats();
+          bench.info = { tiles: st.tiles, cityTris: st.tris, cityBoxes: st.boxes };
+        }
+      } else sink = bench[bench.phase];
+      if (sink) cityR.group.visible = bench.phase === 'A';
+      let q = null;
+      if (tq && bench.pendQ.length < 8) { q = gl.createQuery(); gl.beginQuery(tq.TIME_ELAPSED_EXT, q); }
       renderer.render(scene, camera);
+      if (q) { gl.endQuery(tq.TIME_ELAPSED_EXT); bench.pendQ.push({ q, sink }); }
+      if (tq) benchPoll();
+      if (sink) {
+        sink.dt.push(dtRaw * 1000);
+        sink.cpu.push(performance.now() - c0);
+        if (bench.phase === 'A' && !bench.info.calls) { bench.info.calls = renderer.info.render.calls; bench.info.tris = renderer.info.render.triangles; }
+        if (sink.dt.length >= 120) {
+          if (bench.phase === 'A') bench.phase = 'B';
+          else if (!bench.pendQ.length || sink.dt.length > 200) {
+            bench.done = true; cityR.group.visible = true; benchReport();
+          }
+        }
+      }
     };
     raf = requestAnimationFrame(frame);
 
@@ -1360,10 +1451,9 @@ function App() {
   }, [ready]);
 
   /* ---- the world around the route --------------------------------------
-     Rebuilt when the route changes. Ground, boxes as one instanced mesh with
-     their edges as one line set, rings as one instanced torus mesh, the two
-     gates, and a faint line along the route. The city step replaces the
-     boxes; the rest stays. */
+     Rebuilt when the route changes: the street-level ground, rings as one
+     instanced torus mesh, the two gates, and a faint line along the route.
+     The city itself is streamed (effect below and the loop). */
   useEffect(() => {
     const g = glRef.current;
     if (!g) return undefined;
@@ -1382,55 +1472,26 @@ function App() {
     };
     wipe();
 
+    /* Ground: snapped so a texture repeat sits exactly on a city tile, and
+       large enough to reach past the fog in every direction. */
+    const T = HC.TILE;
     const b = route.bounds;
     const cx = (b.min[0] + b.max[0]) / 2, cz = (b.min[2] + b.max[2]) / 2;
-    const size = Math.ceil((Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) + 8000) / 100) * 100;
+    const size = Math.ceil((Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) + 12000) / (2 * T)) * 2 * T;
     const tex = groundTexture(THREE, g.renderer);
-    tex.repeat.set(size / 100, size / 100);
+    tex.repeat.set(size / T, size / T);
     const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size).rotateX(-Math.PI / 2),
-      new THREE.MeshLambertMaterial({ map: tex }));
-    /* Snap the plane to whole tiles so the grid lines sit on round metres. */
-    ground.position.set(Math.round(cx / 100) * 100, 0, Math.round(cz / 100) * 100);
+      g.fog.patch(new THREE.MeshLambertMaterial({ map: tex })));
+    ground.position.set(Math.round(cx / T) * T, 0, Math.round(cz / T) * T);
     ground.receiveShadow = true;
     grp.add(ground);
-
-    const boxes = obst.boxes;
-    if (boxes.length) {
-      const bg = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
-      const bm = new THREE.MeshLambertMaterial({ color: 0xffffff });
-      const inst = new THREE.InstancedMesh(bg, bm, boxes.length);
-      const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3();
-      const rnd = SD.rng((obst.seed ^ 0x9e3779b9) >>> 0);
-      const ep = [];
-      boxes.forEach((bx, i) => {
-        P.set(bx.c[0], 0, bx.c[2]);
-        S.set(bx.half[0] * 2, bx.max[1], bx.half[2] * 2);
-        M.compose(P, Q, S);
-        inst.setMatrixAt(i, M);
-        const tt = rnd();
-        inst.setColorAt(i, boneColor(THREE, 0.55 + tt * 0.25, 0.55 + tt * 0.3));
-        const x0 = bx.min[0], x1 = bx.max[0], y0 = 0, y1 = bx.max[1], z0 = bx.min[2], z1 = bx.max[2];
-        const e = (a, c) => { ep.push(a[0], a[1], a[2], c[0], c[1], c[2]); };
-        e([x0, y1, z0], [x1, y1, z0]); e([x1, y1, z0], [x1, y1, z1]);
-        e([x1, y1, z1], [x0, y1, z1]); e([x0, y1, z1], [x0, y1, z0]);
-        e([x0, y0, z0], [x0, y1, z0]); e([x1, y0, z0], [x1, y1, z0]);
-        e([x1, y0, z1], [x1, y1, z1]); e([x0, y0, z1], [x0, y1, z1]);
-      });
-      inst.instanceMatrix.needsUpdate = true;
-      inst.instanceColor.needsUpdate = true;
-      inst.castShadow = true; inst.receiveShadow = true;
-      grp.add(inst);
-      const eg = new THREE.BufferGeometry();
-      eg.setAttribute('position', new THREE.Float32BufferAttribute(ep, 3));
-      grp.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: boneColor(THREE, 0.6, 0.16) })));
-    }
 
     /* Rings: one instanced torus, coloured per instance by the race. */
     const ringWps = route.waypoints.filter((w) => w.kind === 'ring');
     if (ringWps.length) {
       const R0 = route.cfg.ringR;
       const tg = new THREE.TorusGeometry(R0, 0.55, 10, 64);
-      const tm = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
+      const tm = g.fog.patch(new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }), { fogK: 0.45 });
       const rm = new THREE.InstancedMesh(tg, tm, ringWps.length);
       const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
       const Z = new THREE.Vector3(0, 0, 1), D = new THREE.Vector3();
@@ -1447,9 +1508,9 @@ function App() {
       g.rings = { mesh: rm, wpIdx: ringWps.map((w) => w.idx) };
     } else g.rings = null;
 
-    const gs = new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false });
-    const gf = new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false });
-    const gb = new THREE.MeshLambertMaterial({ color: boneColor(THREE, 0.62, 0.6) });
+    const gs = g.fog.patch(new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false }), { fogK: 0.45 });
+    const gf = g.fog.patch(new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false }), { fogK: 0.45 });
+    const gb = g.fog.patch(new THREE.MeshLambertMaterial({ color: boneColor(THREE, 0.3, 0.6) }));
     grp.add(gateFrame(THREE, route.waypoints[0], gs, gb));
     grp.add(gateFrame(THREE, route.waypoints[route.n - 1], gf, gb));
     g.gates = { start: gs.color, finish: gf.color };
@@ -1459,11 +1520,38 @@ function App() {
       for (const sm of route.tube.samples) if (sm.u >= 0 && sm.u <= route.n - 1) lp.push(sm.p[0], sm.p[1], sm.p[2]);
       const lg = new THREE.BufferGeometry();
       lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
-      grp.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, toneMapped: false })));
+      grp.add(new THREE.Line(lg, g.fog.patch(new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, toneMapped: false }), { fogK: 0.6 })));
     }
     if (g.mark) g.mark();
     return undefined;
-  }, [ready, route, obst, p.routeLine]);
+  }, [ready, route, p.routeLine]);
+
+  /* ---- the city renderer -------------------------------------------------
+     One per city object: a new route or a rebuild empties both the pure
+     container and the renderer, and the loop streams the tiles back in.
+     owner ties the two together, so the loop never feeds one city's tiles
+     into another city's renderer. Slots for later steps: the traffic layer
+     goes into g.traffic (see the main effect), oversized structures into
+     `specials` above, whose boxes the city keeps free; their meshes would
+     hang on the scene next to cityR.group. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g) return undefined;
+    city.clear();
+    const cr = HC.makeCityRenderer(g.THREE, { fog: g.fog, seed: city.seed, accents: city.cfg.accents, accentColors: CITY_HUES });
+    cr.owner = city;
+    g.scene.add(cr.group);
+    g.cityR = cr;
+    return () => {
+      cr.dispose();
+      if (g.cityR === cr) g.cityR = null;
+    };
+  }, [ready, city]);
+
+  useEffect(() => {
+    const g = glRef.current;
+    if (g && SHOT !== 'top') g.fog.set({ density: p.fogDensity });
+  }, [ready, p.fogDensity]);
 
   /* ---- collision overlay (debug) ---- */
   useEffect(() => {
@@ -1527,7 +1615,7 @@ function App() {
         <button className="hk-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
       </div>
       <p className="hk-desc">A 6DOF courier flight for a 3D mouse. Prototype: fly the rings in order against the clock,
-        over flat ground with a few boxes. The city comes later.</p>
+        through a city that is built around the route.</p>
 
       <div className="hk-chips">
         <button className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
@@ -1549,7 +1637,7 @@ function App() {
         <span>Rings, then the finish gate</span><b>${route.n - 2} + 1</b>
         <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
         <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
-        <span>Boxes</span><b>${obst.boxes.length}</b>
+        <span>City tile</span><b>${HC.TILE} m, window ${2 * p.cityRadius + 1} x ${2 * p.cityRadius + 1}</b>
         <span>Best for this seed</span><b>${bestHere > 0 ? HK.formatTime(bestHere) : '-'}</b>
       </div>
       <p className="hk-note">The seed is in the address bar. Share the address to fly the same route and compare times.</p>
@@ -1636,6 +1724,27 @@ function App() {
           value=${p.camRoll} onChange=${upd('camRoll')} />
         <p className="hk-note">The chase camera follows the ship's attitude with a lag. "Roll follow" sets how much of a
           roll it copies. The mouse wheel also changes the distance.</p>
+      <//>
+
+      <${Section} id="city" title="City" open=${sec === 'city'} onToggle=${toggleSec}
+        summary=${(cityPending ? 'rebuild to apply, ' : '') + 'up to ' + fmt(cityCfg.maxH, 0) + ' m, ' + cityCfg.accents + ' accent' + (cityCfg.accents === 1 ? '' : 's')}>
+        <${Slider} label="Density" digits=${2} min=${0.3} max=${1} step=${0.05}
+          value=${p.cityDensity} onChange=${upd('cityDensity')} />
+        <${Slider} label="Max height" unit="m" digits=${0} min=${80} max=${400} step=${10}
+          value=${p.cityMaxH} onChange=${upd('cityMaxH')} />
+        <${Seg} label="Neon accent colours" value=${p.cityAccents} onChange=${upd('cityAccents')}
+          options=${[{ value: 0, label: 'None' }, { value: 1, label: 'One' }, { value: 2, label: 'Two' }]} />
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (cityPending ? ' active' : '')} onClick=${rebuildCity}>Rebuild</button>
+        </div>
+        <${Slider} label="Fog density" unit="per km" digits=${1} scale=${1000} min=${0.001} max=${0.008} step=${0.0002}
+          value=${p.fogDensity} onChange=${upd('fogDensity')} />
+        <${Slider} label="Tile window" unit="tiles each way" digits=${0} min=${2} max=${5} step=${1}
+          value=${p.cityRadius} onChange=${upd('cityRadius')} />
+        <p className="hk-note">Density, height and accents apply on "Rebuild". The city never builds inside the
+          45 m tube around the route: buildings there are lowered, split into a canyon or left out, so every ring
+          stays reachable. Bridges and cables keep clear of the three future traffic altitudes
+          (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.</p>
       <//>
 
       <${Section} id="debug" title="Display and debug" open=${sec === 'debug'} onToggle=${toggleSec}>
