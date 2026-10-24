@@ -808,7 +808,7 @@ vec3 mgFogC(vec3 w){ return vec3(0.0); }
   const MB_DECL = `
 varying vec3 vMbN; varying float vKind; varying float vSeed; varying vec3 vMbL;
 uniform vec3 uMbLo; uniform vec3 uMbHi; uniform vec3 uMbWarm; uniform vec3 uMbCyan; uniform float uMbGain;
-uniform vec3 uMbCam; uniform vec4 uMbPort[5]; uniform float uMbSpill; uniform float uMbSmall;
+uniform vec3 uMbCam; uniform vec4 uMbPort[5]; uniform float uMbSpill; uniform float uMbSmall; uniform float uMbSelf;
 float mbH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 float mbN(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(mbH(i), mbH(i + vec2(1.0, 0.0)), f.x), mix(mbH(i + vec2(0.0, 1.0)), mbH(i + vec2(1.0, 1.0)), f.x), f.y); }
@@ -910,7 +910,7 @@ float mbSpill(vec3 p){
     float fres = pow(1.0 - abs(dot(V, n)), 3.0);
     emi += (room * 0.7 + vec3(0.05, 0.065, 0.08) * (0.4 + fres)) * win;
     dif *= mix(1.0, 0.1, win);
-    emi += dif * vec3(0.1, 0.105, 0.11) * (1.0 - win);
+    emi += dif * vec3(0.1, 0.105, 0.11) * uMbSelf * (1.0 - win);
     ao = 1.0;
   } else if (kind < 1.5) {
     /* ROOF and terraces: panel seams, a few service lights */
@@ -1006,7 +1006,7 @@ float mbSpill(vec3 p){
       uMbLo: { value: new THREE.Vector3(X0, 0, Z0) }, uMbHi: { value: new THREE.Vector3(-X0, H, -Z0) },
       uMbWarm: { value: new THREE.Color(o.warm) }, uMbCyan: { value: new THREE.Color(o.accent) },
       uMbGain: { value: o.gain }, uMbCam: { value: new THREE.Vector3(0, 0, 1000) },
-      uMbPort: { value: ports }, uMbSpill: { value: o.spill }, uMbSmall: { value: o.small }
+      uMbPort: { value: ports }, uMbSpill: { value: o.spill }, uMbSmall: { value: o.small }, uMbSelf: { value: o.self }
     };
     mat.onBeforeCompile = (sh) => {
       Object.assign(sh.uniforms, u);
@@ -1289,6 +1289,11 @@ void main(){
        tone     bone value of the concrete (0.46)
        spill    warm spill of the rims into the tunnels (0.22)
        small    self-light of the small holes (1)
+       self     self-light of the outer panels (0.3). At 1 (the concept) the
+                facade glowed at about the saturated fog colour by itself,
+                so the haze could not lighten it with distance: from 1 km
+                the block read as farther than the towers it hides
+                (2026-10-25, the owner's depth screenshot)
        paths    polylines (world points) the details keep clear of, default
                 the default flythrough; pass the route's own path here
        pathClear clearance of the details from those paths (14 m)
@@ -1385,7 +1390,8 @@ void main(){
     const mat = makeBlockMaterial(THREE, ctx, {
       tone: opts.tone == null ? 0.46 : opts.tone, gain: opts.gain == null ? 1.6 : opts.gain,
       warm: warm, accent: accent, mouths: mouths,
-      spill: opts.spill == null ? 0.22 : opts.spill, small: opts.small == null ? 1 : opts.small
+      spill: opts.spill == null ? 0.22 : opts.spill, small: opts.small == null ? 1 : opts.small,
+      self: opts.self == null ? 0.3 : opts.self
     });
     owned.push(mat);
     const group = new THREE.Group();

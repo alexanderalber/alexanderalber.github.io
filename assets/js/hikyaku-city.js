@@ -1629,6 +1629,25 @@
     return out;
   }
 
+  /* The rectangle (world x0, z0, x1, z1) covered by a set of tile keys,
+     empty (x0 > x1) for none; and whether a skyline box, offset by the ring
+     centre off = [x, z], meets it. The skyline vertex shader runs the same
+     test, so no skyline box ever stands inside the loaded city. */
+  function loadedRect(keys) {
+    var r = [Infinity, Infinity, -Infinity, -Infinity];
+    for (var key of keys) {
+      var c = key.split(','), i = parseInt(c[0], 10), k = parseInt(c[1], 10);
+      if (i * TILE < r[0]) r[0] = i * TILE;
+      if (k * TILE < r[1]) r[1] = k * TILE;
+      if ((i + 1) * TILE > r[2]) r[2] = (i + 1) * TILE;
+      if ((k + 1) * TILE > r[3]) r[3] = (k + 1) * TILE;
+    }
+    return r[0] > r[2] ? [1, 1, -1, -1] : r;
+  }
+  function skylineHidden(b, off, r) {
+    return b.min[0] + off[0] < r[2] && b.max[0] + off[0] > r[0] && b.min[2] + off[1] < r[3] && b.max[2] + off[1] > r[1];
+  }
+
   function makeCityRenderer(THREE, opts) {
     var o = opts || {};
     var fog = o.fog || makeFog(THREE);
@@ -1784,27 +1803,47 @@
     var b0 = boneRGB(0.05);
     var cableMat = fog.patch(new THREE.LineBasicMaterial({ color: new THREE.Color().setRGB(toLin(b0[0]), toLin(b0[1]), toLin(b0[2])) }), {});
 
-    /* skyline: dark far towers with the mean glow of their windows,
-       fogged by the same atmosphere as everything else, so at high
-       density they dissolve into the haze instead of standing above it */
+    /* skyline: dark far towers for the world edge, fogged by exactly the
+       same atmosphere as a real box (cgFogAmt with k = 1 and the shared
+       uniforms), so at high density they dissolve into the haze instead of
+       standing above it. The ring is centred on the camera, but the tile
+       window is not (pushed 1.5 tiles ahead, kept one tile larger), so
+       real tiles reach 1.8 to 2.1 km on the diagonals, into the ring at
+       1.6 to 2 km. A skyline box whose footprint meets the rectangle of
+       the loaded tiles (uCull, world x0 z0 x1 z1, kept by update) collapses
+       in the vertex shader: the skyline only fills in where the city has
+       stopped (skylineHidden is the same test in JavaScript). */
     var skyMat = new THREE.ShaderMaterial({
-      uniforms: Object.assign({ uBase: { value: new THREE.Color(0.06, 0.065, 0.085) } }, fog.uniforms),
-      vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+      uniforms: Object.assign({ uBase: { value: new THREE.Color(0.06, 0.065, 0.085) },
+        uCull: { value: new THREE.Vector4(1, 1, -1, -1) } }, fog.uniforms),
+      vertexShader: 'attribute vec4 aBox; uniform vec4 uCull; varying vec3 vW;\nvoid main(){\n' +
+        '  vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;\n' +
+        '  vec4 b = aBox + modelMatrix[3].xzxz;\n' +
+        '  bool hid = b.x < uCull.z && b.z > uCull.x && b.y < uCull.w && b.w > uCull.y;\n' +
+        '  gl_Position = hid ? vec4(0.0, 0.0, 2.0, 1.0) : projectionMatrix * viewMatrix * w;\n}',
       fragmentShader: FOG_DECL + '\nuniform vec3 uBase; varying vec3 vW;\nvoid main(){\n' +
         '  gl_FragColor = vec4(mix(uBase, cgFogColor(vW), cgFogAmt(vW, 1.0)), 1.0);\n}',
       fog: false
     });
     var skyR = o.skylineR || 1750;
-    var skyA = boxArrays(skylineBoxes(seed, skyR), function () { return [0, 0, 0]; });
+    var skyList = skylineBoxes(seed, skyR);
+    var skyA = boxArrays(skyList, function () { return [0, 0, 0]; });
+    var skyBox = new Float32Array(skyA.pos.length / 3 * 4), nvb = skyA.pos.length / 3 / skyList.length;
+    skyList.forEach(function (b, i) {
+      for (var j = 0; j < nvb; j++) skyBox.set([b.min[0], b.min[2], b.max[0], b.max[2]], (i * nvb + j) * 4);
+    });
     var skyG = new THREE.BufferGeometry();
     skyG.setAttribute('position', new THREE.BufferAttribute(skyA.pos, 3));
+    skyG.setAttribute('aBox', new THREE.BufferAttribute(skyBox, 4));
     skyG.setIndex(new THREE.BufferAttribute(skyA.idx, 1));
     var skyline = new THREE.Mesh(skyG, skyMat);
     skyline.frustumCulled = false;
     skyline.renderOrder = -0.5;
     skyline.userData.kind = 'city-skyline';
+    skyline.userData.boxes = skyList;
     skyline.visible = o.skyline !== false;
     group.add(skyline);
+    var cullDirty = true;
 
     var tiles = new Map();
     var dirty = true;
@@ -1832,7 +1871,7 @@
       mesh.name = 'tile ' + tile.key;
       group.add(mesh);
       tiles.set(tile.key, { tile: tile, mesh: mesh, tris: A.idx.length / 3 });
-      dirty = true;
+      dirty = true; cullDirty = true;
     }
     function removeTile(key) {
       var e = tiles.get(key);
@@ -1840,7 +1879,7 @@
       group.remove(e.mesh);
       e.mesh.geometry.dispose();
       tiles.delete(key);
-      dirty = true;
+      dirty = true; cullDirty = true;
     }
 
     var QUAD = new THREE.PlaneGeometry(1, 1);
@@ -1972,6 +2011,11 @@
 
     function update(cam) {
       if (dirty) rebuildLayers();
+      if (cullDirty) {
+        var r = loadedRect(tiles.keys());
+        skyMat.uniforms.uCull.value.set(r[0], r[1], r[2], r[3]);
+        cullDirty = false;
+      }
       if (cam) {
         skyline.position.set(cam.x, 0, cam.z);
         skyline.updateMatrixWorld();
@@ -2006,7 +2050,7 @@
     makeTile: makeTile, tilesAround: tilesAround, wanted: wanted, makeCity: makeCity, findCanyon: findCanyon,
     boneRGB: boneRGB, windowLUT: windowLUT, toLin: toLin, LUT_BANDS: LUT_BANDS,
     FACADE_PROGRAMS: FACADE_PROGRAMS, facadeCover: facadeCover, facadeNear: facadeNear,
-    FOG_MED: FOG_MED, fogTau: fogTau, fogTauInf: fogTauInf, WEATHER: WEATHER, weatherAt: weatherAt,
+    FOG_MED: FOG_MED, fogTau: fogTau, skylineBoxes: skylineBoxes, loadedRect: loadedRect, skylineHidden: skylineHidden, fogTauInf: fogTauInf, WEATHER: WEATHER, weatherAt: weatherAt,
     makeFog: makeFog, makeSky: makeSky, makeCityRenderer: makeCityRenderer
   };
   globalThis.HikyakuCity = HikyakuCity;
