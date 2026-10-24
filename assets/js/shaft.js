@@ -1242,7 +1242,15 @@ void main(){
     };
     const owned = [];
     const ctx = { U: U, fog: opts.fog || null, bone: (t) => boneL(t), cyanLin: (g) => hexLin(accent, g) };
-    ctx.glowMat = patchMat(THREE, ctx, new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: THREE.DoubleSide }), { mode: 'wall', fogK: 0.7 });
+    /* The glow geometry always sits on or just in front of something lit
+       (a lamp housing, a rib face, the wall). Besides the few centimetres
+       of real offset below, the polygon offset pulls it forward in depth by
+       a slope-scaled amount, so it wins against its backing at any distance
+       instead of z-fighting with it once the 24-bit depth steps grow
+       coarser than the gap (about 3 cm at 500 m with the near plane at
+       0.5 m). */
+    ctx.glowMat = patchMat(THREE, ctx, new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), { mode: 'wall', fogK: 0.7 });
     owned.push(ctx.glowMat);
 
     /* section angles: uniform, plus the chamfer corners so the rectangle
@@ -1334,7 +1342,7 @@ void main(){
         D.quad([a.o[0], a.o[1], S1], [b.o[0], b.o[1], S1], [b.i[0], b.i[1], S1], [a.i[0], a.i[1], S1], [0, 0, 1], tone);
         if (rb.band) {
           /* a cyan band on the face the pilot sees, a third of the way in */
-          const f1 = rb.depth * 0.3, f2 = f1 + 0.6, sB = S0 - 0.06;
+          const f1 = rb.depth * 0.3, f2 = f1 + 0.6, sB = S0 - 0.1;
           const p = (q, d) => [q.o[0] + q.n[0] * (out + d), q.o[1] + q.n[1] * (out + d), sB];
           Gl.quad(p(a, f1), p(b, f1), p(b, f2), p(a, f2), [0, 0, -1], cyan);
         }
@@ -1403,7 +1411,8 @@ void main(){
       for (const x of [-wk.hw, wk.hw]) {
         D.box(x, wk.y + wk.rail, sm, 0.35, 0.35, 19.6, 0, boneL(0.2));
         D.box(x, wk.y + wk.rail / 2, sg[0] + 1, 0.35, wk.rail, 0.35, 0, boneL(0.2));
-        Gl.box(x * 0.92, wk.y + 0.42, sm, 0.5, 0.15, 1.2, 0, dotC);
+        /* on the deck, its underside 2.5 cm clear of the deck's top (0.35) */
+        Gl.box(x * 0.92, wk.y + 0.45, sm, 0.5, 0.15, 1.2, 0, dotC);
       }
       D.box(0, wk.y - 4.5, sm, 2.2, 9, 2.2, 0, boneL(0.2));
     }
@@ -1417,8 +1426,12 @@ void main(){
       } else {
         for (const sg of [1, -1]) {
           const a = Math.PI / 2 - sg * LA;
+          /* The housing reaches in to RR - 3.35. The lit panel used to sit at
+             RR - 3.2 with 0.3 of thickness, so its face lay exactly in the
+             housing's face and the two z-fought (the flicker on the round
+             section's lamps). Now it stands 5 cm proud of the housing. */
           D.box(Math.cos(a) * (RR - 1.6), Math.sin(a) * (RR - 1.6), s, 3.5, 3.0, 6, a, boneL(0.2));
-          Gl.box(Math.cos(a) * (RR - 3.2), Math.sin(a) * (RR - 3.2), s, 0.3, 2.2, 4.6, a, white);
+          Gl.box(Math.cos(a) * (RR - 3.25), Math.sin(a) * (RR - 3.25), s, 0.3, 2.2, 4.6, a, white);
           halos.push([toWorld(sh, s, Math.cos(a) * (RR - 5), Math.sin(a) * (RR - 5)), 26, 26, srgbHalo(boneRGB(stops, 0.95), 0.5)]);
         }
       }
@@ -1430,7 +1443,9 @@ void main(){
         const e = Math.min(L - 4, s + 12);
         for (let a = s; a < e - 1e-6; a += 3) {
           const b = Math.min(e, a + 3);
-          Gl.rod(wallPt(a, th, 0.35), wallPt(b, th, 0.35), 0.4, cyan, 4);
+          /* the square rod's corners reach 0.4 from its axis: at 0.45 from
+             the wall it no longer cuts into the loft */
+          Gl.rod(wallPt(a, th, 0.45), wallPt(b, th, 0.45), 0.4, cyan, 4);
         }
         strips++;
       }

@@ -1211,12 +1211,96 @@ var Hikyaku = (function () {
     return simT - TRAFFIC_LEAD;
   }
 
+  /* ---- chase camera collision ---------------------------------------------
+     How far the camera can sit from the ship along the segment from -> to
+     (ship centre to the desired camera position) before a sphere of the
+     given radius touches something. probes is a list; each entry is either
+       an array of boxes { min, max } (the city's and the block's), tested
+       as the segment against the box grown by the radius (slab method,
+       first entry), or
+       a distance function p -> metres of free space around p (positive in
+       the open, a lower bound of the true distance is fine), sampled along
+       the segment every opts.step metres (default the radius); the first
+       sample below the radius is refined by bisection to where the distance
+       equals the radius.
+     The ground plane y = opts.ground (default 0, null for none) is always a
+     probe. A probe closer to the ship than the radius is tested with a
+     smaller radius (nine tenths of the ship's own clearance), and one the
+     ship is inside (inside a box, or a distance function at or below zero at
+     from) is skipped, because no camera position along the segment could get
+     out of it, and stopping at the ship would throw the view away. The
+     minimum distance (opts.min, 0 by
+     default) wins over every probe: the page keeps the ship in front of the
+     near plane that way. Returns { p, d, t, hit }: the camera point, its
+     distance from from, the fraction of the full segment and whether
+     anything clamped it. */
+  function cameraClamp(from, to, radius, probes, opts) {
+    opts = opts || {};
+    var dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2];
+    var L = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!(L > 1e-9)) return { p: to.slice(), d: 0, t: 1, hit: false };
+    var u = [dx / L, dy / L, dz / L];
+    var best = L, i, k;
+    var at = function (d) { return [from[0] + u[0] * d, from[1] + u[1] * d, from[2] + u[2] * d]; };
+    var gy = opts.ground === undefined ? 0 : opts.ground;
+    if (gy != null && from[1] > gy + radius && u[1] < 0) {
+      var dg = (gy + radius - from[1]) / u[1];
+      if (dg < best) best = dg;
+    }
+    var list = probes || [];
+    for (k = 0; k < list.length; k++) {
+      var pr = list[k];
+      if (typeof pr === 'function') {
+        var f0 = pr(from);
+        if (!(f0 > 0)) continue;
+        var rr = Math.min(radius, f0 * 0.9);
+        var step = opts.step || radius, n = Math.ceil(best / step), prev = 0;
+        for (i = 1; i <= n; i++) {
+          var di = Math.min(best, i * step);
+          if (pr(at(di)) < rr) {
+            var lo = prev, hi = di;
+            for (var it = 0; it < 8; it++) {
+              var mid = (lo + hi) / 2;
+              if (pr(at(mid)) < rr) hi = mid; else lo = mid;
+            }
+            best = lo;
+            break;
+          }
+          prev = di;
+        }
+        continue;
+      }
+      for (i = 0; i < pr.length; i++) {
+        var b = pr[i], t0 = 0, t1 = best, ok = true;
+        var bd = boxDist(b, from);
+        if (!(bd > 0)) continue;
+        var rb = Math.min(radius, bd * 0.9);
+        for (var a = 0; a < 3 && ok; a++) {
+          var lo2 = b.min[a] - rb, hi2 = b.max[a] + rb, o = from[a];
+          if (Math.abs(u[a]) < 1e-12) { if (o < lo2 || o > hi2) ok = false; continue; }
+          var ta = (lo2 - o) / u[a], tb = (hi2 - o) / u[a];
+          if (ta > tb) { var sw = ta; ta = tb; tb = sw; }
+          if (ta > t0) t0 = ta;
+          if (tb < t1) t1 = tb;
+          if (t0 > t1) ok = false;
+        }
+        if (!ok) continue;
+        if (t0 < best) best = t0;
+      }
+    }
+    var hit = best < L - 1e-9;
+    var mn = opts.min || 0;
+    if (best < mn) best = Math.min(mn, L);
+    return { p: at(best), d: best, t: best / L, hit: hit };
+  }
+
   return {
     DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
     boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
-    formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime
+    formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime,
+    cameraClamp: cameraClamp
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -1276,10 +1360,13 @@ function hazeOf(p) {
    city. ?fog=<haze per km> and ?weather=rain|dry override the stored
    settings without storing them. Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
+/* camdx: shift the rendered camera sideways by that many metres (a pair of
+   shots a metre apart shows z-fighting, which one frame cannot) */
+const URL_CAMDX = parseFloat(URLP.get('camdx')) || 0;
 const URL_FOG = parseFloat(URLP.get('fog'));
 const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
@@ -1584,6 +1671,61 @@ void main(){
 function poseAt(p, dir, back) {
   const f = HK.frameOf(dir);
   return { p: SD.sub(p, SD.mul(dir, back)), v: [0, 0, 0], q: HK.quatFromAxes(f.right, f.up, SD.mul(dir, -1)), w: [0, 0, 0] };
+}
+
+/* ---- chase camera collision ----
+   The chase camera sits on the segment from the ship to where camStep and
+   the panel want it, as far out as a 2.5 m sphere gets (hkcore
+   cameraClamp): city and block boxes near the segment, the ground, and in
+   and around the shaft its free space and its fans. Never closer than 8 m,
+   which keeps the whole hull in front of the near plane; the distance drops
+   at once when something comes between and grows back with a time
+   constant of 0.35 s, so the view does not pump. */
+const CAM_R = 2.5, CAM_MIN = 8, CAM_TAU = 0.35;
+/* Free space around p for the shaft: inside the duct the distance to its
+   wall (the section continued straight out of the mouths, so the opening
+   stays free), outside the distance to the housing block (|x| < hw, ground
+   to roof, mouth to mouth in duct coordinates). The ribs, pipes and the
+   catwalk are left out: they reach at most 4.5 m into the duct. */
+function shaftFree(sh, p) {
+  const l = SHF.toLocal(sh, p), H = sh.housing, L = sh.length;
+  const dIn = -SHF.secF(SHF.loftK(sh, Math.max(0, Math.min(L, l.s))), l.x, l.y);
+  const qs = Math.max(-l.s, l.s - L), qx = Math.abs(l.x) - H.hw, qy = Math.max(-p[1], p[1] - H.top);
+  const dOut = Math.hypot(Math.max(qs, 0), Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qs, qx, qy), 0);
+  return Math.max(dIn, dOut);
+}
+/* A fan as a slab across the duct, as thick as its pitched blades (or the
+   square fan's plate) reach along the axis. The gaps between the blades are
+   not free for the camera: it passes the fan plane only once the ship has. */
+function fanSlab(sh, fi) {
+  const fan = sh.fans[fi], F = sh.fanFrames[fi];
+  const chord = fan.radius * fan.cover * Math.PI / fan.blades / Math.cos(fan.pitch);
+  const zh = Math.max(fan.plateHZ || 0, chord * Math.sin(fan.pitch) + fan.thick / 2 * Math.cos(fan.pitch) + 0.4) + 0.3;
+  const along = (p) => (p[0] - F.p[0]) * F.T[0] + (p[2] - F.p[2]) * F.T[2];
+  return {
+    along: along,
+    f: (p) => {
+      const x = (p[0] - F.p[0]) * F.N[0] + (p[2] - F.p[2]) * F.N[2], y = p[1] - F.p[1];
+      if (x * x + y * y > (SHF.ROUND_R + 8) * (SHF.ROUND_R + 8)) return 1e9;
+      return Math.abs(along(p)) - zh;
+    }
+  };
+}
+function camClampAt(cfg, from, want, full) {
+  const mid = [(from[0] + want[0]) / 2, (from[1] + want[1]) / 2, (from[2] + want[2]) / 2];
+  const r = full / 2 + CAM_R + 1;
+  const probes = [cfg.city.boxesNear(mid, r)];
+  if (cfg.block) probes.push(MG.boxesNear(cfg.block.block, mid, r));
+  const shf = cfg.shaft;
+  if (shf && SHF.near(shf.shaft, from, full + 10)) {
+    const sh = shf.shaft;
+    probes.push((p) => shaftFree(sh, p));
+    for (let fi = 0; fi < sh.fans.length; fi++) {
+      const sl = fanSlab(sh, fi);
+      if (Math.abs(sl.along(from)) < full + 20) probes.push(sl.f);
+    }
+  }
+  return HK.cameraClamp(from, want, CAM_R, probes, { min: CAM_MIN });
 }
 
 /* The tall core of the city sits on the middle of the route. */
@@ -1918,6 +2060,14 @@ function App() {
         const ws = cfg.route.waypoints.slice(cfg.shaft.i0, cfg.shaft.i0 + cfg.shaft.count);
         const entry = ws.find((w) => w.kind === 'portal'), ring = ws.find((w) => w.kind === 'ring');
         state.s = SHOT === 'shaftmouth' ? poseAt(entry.p, entry.dir, 120) : poseAt(ring.p, ring.dir, 0);
+      } else if (SHOT === 'shaftwall' && cfg.shaft) {
+        /* the camera clamp at work: the ship 6 m from the right wall of the
+           round section, between the two round fans, yawed 15 degrees
+           toward the axis, so the chase camera wants to sit in the wall */
+        const sh = cfg.shaft.shaft, sW = (sh.fans[0].s + sh.fans[1].s) / 2, f = SHF.frameAt(sh, sW);
+        const off = SHF.ROUND_R - 6, a = 15 * Math.PI / 180;
+        const dir = [f.T[0] * Math.cos(a) - f.N[0] * Math.sin(a), 0, f.T[2] * Math.cos(a) - f.N[2] * Math.sin(a)];
+        state.s = poseAt([f.p[0] + f.N[0] * off, f.p[1], f.p[2] + f.N[2] * off], dir, 0);
       }
       if (SHOT === 'high') {
         const w = open[Math.min(5, open.length - 1)];
@@ -1927,6 +2077,7 @@ function App() {
       }
       state.info = null;
       state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
+      state.camD = null;
       state.simT = 0; state.acc = 0; state.hits = 0;
       state.race = HK.makeRace(cfg.route, { missPenalty: cfg.p.missPenalty });
       state.msg = ''; state.msgUntil = 0; state.splitsText = '';
@@ -2211,7 +2362,18 @@ function App() {
         state.cam = SD.camStep(state.cam, s.q, dt, pp.camF0, pp.camZeta, pp.camRoll);
         const cq = SD.qMul(state.cam.q, look);
         const off = SD.qRot(cq, [0, pp.camUp * SHIP_L, pp.camDist * SHIP_L]);
-        camera.position.set(s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]);
+        /* collision: the camera moves in along off, so the ship keeps its
+           place on screen and the view direction stays the chase one */
+        const full = SD.len(off);
+        const want = [s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]];
+        const cc = camClampAt(cfg, s.p, want, full);
+        let dC = state.camD == null ? cc.d : Math.min(state.camD, full);
+        if (cc.d < dC) dC = cc.d;
+        else dC += (cc.d - dC) * (1 - Math.exp(-dt / CAM_TAU));
+        state.camD = dC;
+        state.camHit = cc.hit;
+        const kC = full > 1e-6 ? dC / full : 1;
+        camera.position.set(s.p[0] + off[0] * kC, s.p[1] + off[1] * kC, s.p[2] + off[2] * kC);
         camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
       }
       shipGrp.visible = pp.camMode !== 'cockpit' || !!SHOT;
@@ -2232,6 +2394,7 @@ function App() {
         if (!Number.isFinite(URL_FOG)) fog.set({ soupK: 0.004, hazeK: 0.25 / hgt, hazeH: 1e6 });
         if (cityR) cityR.skyline.visible = false;
       }
+      if (URL_CAMDX) camera.translateX(URL_CAMDX);
       camera.updateMatrixWorld();
       if (cityR) cityR.update(camera.position, dt);
 

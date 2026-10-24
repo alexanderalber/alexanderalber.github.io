@@ -1148,7 +1148,10 @@
         '  vec3 c = vCol * (0.07 + 1.3 * frame + 1.2 * g) + vec3(1.0) * (0.55 * g + 0.25 * frame);',
         '  gl_FragColor = vec4(mix(c, vFogC, vFog), 1.0);',
         '}'].join('\n'),
-      side: THREE.DoubleSide, toneMapped: false, fog: false
+      /* flat signs hang 0.3 m off the facade: the polygon offset keeps
+         them in front of it at any distance (no z-fighting) */
+      side: THREE.DoubleSide, toneMapped: false, fog: false,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
     });
 
     /* additive glow billboards (faked bloom), from citygen GlowLayer */

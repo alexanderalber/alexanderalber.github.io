@@ -1223,7 +1223,10 @@ void main(){
   c = mix(c, vFogC, vFog);
   gl_FragColor = vec4(c, 1.0);
 }`,
-      side: THREE.DoubleSide, toneMapped: false, fog: true
+      /* a sign hangs a few centimetres in front of its plate or wall: the
+         polygon offset keeps it in front at any distance (no z-fighting) */
+      side: THREE.DoubleSide, toneMapped: false, fog: true,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
     });
     mesh.count = n;
     mesh.frustumCulled = false;
@@ -1500,8 +1503,8 @@ void main(){
           if (ok([cc, sa(cc, UP, sh / 2), sa(cc, UP, -sh / 2), sa(cc, n, sw / 2)], 1)) {
             const hex = rng.chance(0.7) ? hues[0] : hues[1];
             boxAt(sa(cc, UP, sh / 2 + 0.2), n, a, sw + 0.3, sh + 0.4, 0.5, 0.08);
-            signAdd(sa(cc, a, 0.27), sw, sh, a, hex);
-            signAdd(sa(cc, a, -0.27), sw, sh, mul(a, -1), hex);
+            signAdd(sa(cc, a, 0.3), sw, sh, a, hex);
+            signAdd(sa(cc, a, -0.3), sw, sh, mul(a, -1), hex);
             glowAdd(sa(cc, n, 0.3), sw * 3, sh * 1.4, srgb(hex, 0.16));
             st.signs++;
           }
