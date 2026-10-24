@@ -273,7 +273,9 @@ var Hikyaku = (function () {
      dir    the facing direction, which is the curve tangent there. A ring
             counts only when crossed along dir.
      biome  'open', 'menger' on the five block points, 'shaft' on the
-            shaft's points.
+            shaft's points, 'canyon' on the five points of the street
+            canyon (entry and exit are via points, the three rings
+            between them count).
 
      The curve is a cubic Hermite spline per leg. The tangent at a waypoint
      is the bisector of the two legs meeting there, scaled by the chord of
@@ -297,6 +299,26 @@ var Hikyaku = (function () {
     forgive: 1.5,       /* metres of grace on the ring and gate edge */
     leadIn: 160, leadOut: 120,
     step: 4,            /* tube sample spacing, metres */
+    /* One street canyon (the handoff's biome "Street Canyon: schnelle
+       Gerade, Rhythmuswechsel"), before the block, after canyonAt regular
+       legs (2 puts its middle at 15 to 25 % of the race length): a
+       straight leg of canyonMin to canyonMax metres down the centre line
+       of a city street, between walls of towers canyonHMin to canyonHMax
+       high. Inside it the tube radius drops to canyonR (see placeCanyon
+       for why 8 m) and grows back by a metre per metre of arc outside it.
+       canyonWeave: the rings' offset left and right of the centre line,
+       canyonUp: the third ring's lift. canyonEntry and canyonExit: open
+       street after the entry and before the exit before the walls start
+       (the exit one keeps the next leg's full tube off the walls).
+       canyonAir: the height above the leg kept free of bridges, cables,
+       signs and holograms. 40 m puts its top at 116 m, just over the
+       105 m lane band (95 to 115), so the bridges and cables across the
+       canyon hang in the 116 to 145 m window under the 155 m band, 40 to
+       70 m over the pilot, where the chase view still sees them ahead
+       (at the 60 m first asked for, that window shrank to 136 to 145 m
+       and nearly all of them went above 165 m, out of the picture). */
+    canyon: true, canyonAt: 2, canyonMin: 450, canyonMax: 700, canyonR: 8, canyonWeave: 3, canyonUp: 8,
+    canyonEntry: 30, canyonExit: 60, canyonAir: 40, canyonHMin: 180, canyonHMax: 260,
     /* One Menger block on the route (step 6): after mengerAt of the regular
        legs (the 1.6 km of shaft after it put the block at 31 to 46 % of
        the length), lead metres of straight approach and leave outside its
@@ -364,7 +386,9 @@ var Hikyaku = (function () {
        collinear by design and the block box stands in for them. */
     var h = rand() * Math.PI * 2;
     var pts = [[0, R.altMin + 50 + rand() * 70, 0]];
-    var G = { h: h, sign: rand() < 0.5 ? -1 : 1, left: 2 + Math.floor(rand() * 3), legPrev: null };
+    /* yLo, yHi: altitude bounds for the next leg only (the canyon's
+       descent start and its climb out), kept inside the slope limit */
+    var G = { h: h, sign: rand() < 0.5 ? -1 : 1, left: 2 + Math.floor(rand() * 3), legPrev: null, yLo: null, yHi: null };
     var noSep = {}, avoid = [];
     function legClear(p, leg, iNew) {
       var jj, s;
@@ -387,7 +411,10 @@ var Hikyaku = (function () {
           if (tr >= 50) turn *= 0.3;
           turn = clamp(turn, -R.maxTurn, R.maxTurn);
           var L = R.spMin + rand() * (R.spMax - R.spMin);
-          var y = clamp(p[1] + (rand() * 2 - 1) * L * R.slope, R.altMin, R.altMax);
+          var yl = R.altMin, yh = R.altMax;
+          if (G.yLo != null) yl = Math.max(yl, Math.min(G.yLo, p[1] + L * R.slope));
+          if (G.yHi != null) yh = Math.min(yh, Math.max(G.yHi, p[1] - L * R.slope));
+          var y = clamp(p[1] + (rand() * 2 - 1) * L * R.slope, yl, yh);
           var hh = G.h + turn * DEG;
           var q = [p[0] + Math.sin(hh) * L, y, p[2] - Math.cos(hh) * L];
           var leg = sub(q, p);
@@ -398,9 +425,143 @@ var Hikyaku = (function () {
           var q2 = [p[0] + Math.sin(G.h) * R.spMin, p[1], p[2] - Math.cos(G.h) * R.spMin];
           got = { q: q2, h: G.h, leg: sub(q2, p) };
         }
-        pts.push(got.q); G.h = got.h; G.legPrev = got.leg;
+        pts.push(got.q); G.h = got.h; G.legPrev = got.leg; G.yLo = G.yHi = null;
         if (--G.left <= 0) { G.sign = -G.sign; G.left = 2 + Math.floor(rand() * 3); }
       }
+    }
+
+    /* The street canyon. The leg runs down the centre line of a tile's
+       inner street: the city has streets every 108 m (TILE / 2), and the
+       inner one of a tile, an odd multiple of 108 m, has both of its sides
+       in that tile, so the tile's own bridges and cables span it. The
+       street lies along the axis of the 55 m lanes (makeLanes gives each
+       lane altitude one axis, by the parity of the seed with its default
+       axisFlip), so the lowest traffic flows under the pilot, and on a
+       line whose 55 m lane exists from a lane density of 0.35 up, where
+       one lies within eight tiles to either side.
+       Nothing is placed yet when this runs, so the route so far is turned
+       about its start until its heading is 10 to 25 degrees (seeded side)
+       off the street axis, and shifted sideways until its last point P
+       lies on the street line. From P the leg runs straight down the
+       street to the entry E, long enough for the descent at the slope
+       limit; then three rings and the exit X, all facing along the
+       street, so the spline between them has no sideways or vertical
+       tangent and neither bulges nor overshoots.
+       Altitude: halfway between the 55 m and the 105 m band, less half
+       the up ring's lift: 76 m. The tube there (radius canyonR) then
+       keeps the 10 m lane clearance from both bands, under the up ring
+       too (68 >= 65 and 92 <= 95).
+       Tube radius: the street is 32 m wide and the walls stand at its
+       edges. A lot keeps margin (3 m) plus its own radius from every tube
+       sample, measured from the lot grown by 1.2 m, so with the rings 3 m
+       off the centre line the radius can be at most 16 - 1.2 - 3 - 3 =
+       8.8 m. 8 m it is; the ring itself is 10 m, the open street 32.
+       The walls: every block on either side of the street that lies
+       wholly between canyonEntry metres after E and canyonExit metres
+       before X, one wall box per side { kind: 'wall', minH, face } (face
+       the horizontal normal towards the street). The city builds those
+       blocks densely with towers of at least minH. An air box over the
+       street, 3 m inside its edges, from 15 m under the leg to canyonAir
+       metres above it and 40 m beyond both ends, keeps bridges, cables,
+       signs and holograms out of the flight space; the bridges and cables
+       across the canyon start above it. Returns null when the turn into
+       the street is too sharp. */
+    var canyon = null;
+    function canyonAlt() {
+      var HCt = globalThis.HikyakuCity;
+      if (!HCt) throw new Error('makeRoute: cfg.canyon needs HikyakuCity (assets/js/hikyaku-city.js) loaded first');
+      return (HCt.LANE_Y[0] + HCt.LANE_Y[1] - R.canyonUp) / 2;
+    }
+    function placeCanyon() {
+      var HCt = globalThis.HikyakuCity;
+      var ST = HCt.TILE / 2, HS = HCt.STREET / 2, BK = HCt.BLOCK, alt = canyonAlt();
+      var aa = (R.seed & 1) ? 2 : 0, la = 2 - aa, s, jj;
+      var hA = aa === 0 ? (Math.sin(G.h) >= 0 ? Math.PI / 2 : -Math.PI / 2) : (Math.cos(G.h) >= 0 ? 0 : Math.PI);
+      var del = (rand() < 0.5 ? -1 : 1) * (10 + rand() * 15) * DEG;
+      var dl = hA + del - G.h, cd = Math.cos(dl), sdl = Math.sin(dl), o = pts[0];
+      for (j = 0; j < pts.length; j++) {
+        var x = pts[j][0] - o[0], z = pts[j][2] - o[2];
+        pts[j] = [o[0] + x * cd - z * sdl, pts[j][1], o[2] + x * sdl + z * cd];
+      }
+      G.h = hA + del;
+      var ax = [Math.round(Math.sin(hA)), 0, Math.round(-Math.cos(hA))];
+      var P = pts[pts.length - 1];
+      var kc = 2 * Math.round((P[la] / ST - 1) / 2) + 1, k = kc;
+      for (var dk = 0; dk <= 16; dk += 2) {
+        if (hash3(R.seed, 0, kc + dk) < 0.35) { k = kc + dk; break; }
+        if (dk && hash3(R.seed, 0, kc - dk) < 0.35) { k = kc - dk; break; }
+      }
+      var line = k * ST, shL = line - P[la];
+      for (j = 0; j < pts.length; j++) pts[j][la] += shL;
+      G.legPrev = sub(P, pts[pts.length - 2]);
+      var L = R.canyonMin + rand() * (R.canyonMax - R.canyonMin);
+      var D = Math.max(R.spMin, Math.abs(P[1] - alt) / (R.slope * 0.95));
+      var E = [P[0] + ax[0] * D, alt, P[2] + ax[2] * D], X = add(E, mul(ax, L));
+      if (angle(G.legPrev, sub(E, P)) > R.maxLeg * DEG) return null;
+      /* the rings: left, right and up in a seeded order, at a quarter,
+         half and three quarters of the leg */
+      var right = frameOf(ax).right;
+      var offs = [[-R.canyonWeave, 0], [R.canyonWeave, 0], [0, R.canyonUp]];
+      for (j = 2; j > 0; j--) { var q = Math.floor(rand() * (j + 1)), tq = offs[j]; offs[j] = offs[q]; offs[q] = tq; }
+      var cp = [E];
+      for (j = 0; j < 3; j++) {
+        var c = add(E, mul(ax, L * (j + 1) / 4));
+        cp.push([c[0] + right[0] * offs[j][0], alt + offs[j][1], c[2] + right[2] * offs[j][0]]);
+      }
+      cp.push(X);
+      /* the walls: whole blocks, along-street extent [108 j + 16, 108 j + 92] */
+      var s0 = Math.min(E[aa] + ax[aa] * R.canyonEntry, X[aa] - ax[aa] * R.canyonExit);
+      var s1 = Math.max(E[aa] + ax[aa] * R.canyonEntry, X[aa] - ax[aa] * R.canyonExit);
+      var j0 = Math.ceil((s0 - HS) / ST - 1e-9), j1 = Math.floor((s1 - HS - BK) / ST + 1e-9);
+      if (j1 < j0 + 1) return null;
+      var walls = [];
+      for (var sd = -1; sd <= 1; sd += 2) {
+        var wh = R.canyonHMin + rand() * (R.canyonHMax - R.canyonHMin);
+        var wb = { min: [0, 0, 0], max: [0, wh, 0], kind: 'wall', minH: wh, face: la === 0 ? [-sd, 0] : [0, -sd] };
+        wb.min[aa] = j0 * ST + HS; wb.max[aa] = j1 * ST + HS + BK;
+        wb.min[la] = sd < 0 ? line - HS - BK : line + HS; wb.max[la] = sd < 0 ? line - HS : line + HS + BK;
+        walls.push(wb);
+      }
+      var air = { min: [0, alt - 15, 0], max: [0, alt + R.canyonAir, 0], kind: 'air', axis: aa, line: line };
+      air.min[aa] = Math.min(E[aa], X[aa]) - 40; air.max[aa] = Math.max(E[aa], X[aa]) + 40;
+      air.min[la] = line - HS + 3; air.max[la] = line + HS - 3;
+      /* the older legs keep the full tube plus 10 m from the walls */
+      for (jj = 0; jj + 1 < pts.length; jj++) {
+        for (s = 0; s <= 8; s++) {
+          var qq = add(pts[jj], mul(sub(pts[jj + 1], pts[jj]), s / 8));
+          for (var wi = 0; wi < 2; wi++) if (boxDist(walls[wi], qq) < R.tubeR + 10) return null;
+        }
+      }
+      var i0 = pts.length;
+      for (j = 0; j < 5; j++) pts.push(cp[j]);
+      for (j = i0; j < i0 + 4; j++) noSep[j] = true;
+      avoid.push(walls[0], walls[1]);
+      G.h = hA; G.legPrev = sub(X, cp[3]);
+      return {
+        kind: 'canyon', axis: ax, along: aa, lateral: la, line: line, street: k, alt: alt, i0: i0, count: 5,
+        length: L, approach: D, entry: E.slice(), exit: X.slice(), offsets: offs, turn: del / DEG,
+        walls: walls, air: air, wallRange: [j0 * ST + HS, j1 * ST + HS + BK],
+        /* what the city gets: the two wall boxes and the air box */
+        reservedList: [walls[0], walls[1], air]
+      };
+    }
+    /* Grows count regular legs; with the canyon on, it comes after
+       canyonAt of them, stands in for two of them, and the leg after it
+       climbs out by 25 m at least. The legs before it end at least 25 m
+       above the canyon (turned towards the street axis, they run nearly
+       parallel to the 55 m lanes, and a parallel run closer than 12 m
+       would cost a whole lane), the last one at most 60 m above it, so
+       the descent stays under the 155 m lanes too. */
+    function growWithCanyon(count) {
+      var ca = R.canyon ? canyonAlt() : 0;
+      /* no canyon where the altitude limits leave no room for it */
+      if (!R.canyon || canyon || count < 1 || ca < R.altMin || ca + 60 > R.altMax) { grow(count); return; }
+      var kk = Math.max(1, Math.min(count, Math.round(R.canyonAt)));
+      for (var g1 = 0; g1 + 1 < kk; g1++) { G.yLo = ca + 25; grow(1); }
+      G.yLo = ca + 25; G.yHi = ca + 60; grow(1);
+      canyon = placeCanyon();
+      if (canyon) G.yLo = ca + 25;
+      grow(Math.max(canyon ? 1 : 0, count - kk - (canyon ? 2 : 0)));
     }
 
     /* The Menger block (handoff, section 8, step 6), about halfway. The
@@ -413,7 +574,14 @@ var Hikyaku = (function () {
        points (approach, entry mouth, centre, exit mouth, leave) follow, all
        on one line; and the rest of the route grows on from the leave point
        with the same heading. Up to four yaws are tried; if none fits, the
-       route has no block. */
+       route has no block.
+       With a canyon on the route, the route is already on the street grid
+       and may not turn or move. Then the block takes the world axis
+       nearest to the heading (a turn of 45 degrees at most) and lands on
+       the tile corner whose row is nearest to the approach line, at least
+       the descent length ahead; the leg to the approach point bends onto
+       the axis sideways by at most half a tile (23 degrees over 250 m),
+       and the five points from the approach on are straight as before. */
     var block = null;
     function placeMenger() {
       var MG = globalThis.Menger, HCt = globalThis.HikyakuCity;
@@ -422,15 +590,75 @@ var Hikyaku = (function () {
       var bSeed = 1 + ((Math.imul(R.seed, 2654435761) >>> 0) % 99991);
       var k0 = Math.floor(rand() * 4);
       var hs = Math.round(G.h / (Math.PI / 2)) * (Math.PI / 2), dl = hs - G.h;
+      var take = function (blk, ft, yaw, ax, org) {
+        var i0 = pts.length;
+        for (j = 0; j < 5; j++) pts.push(ft.waypoints[j].p.slice());
+        for (j = i0; j < i0 + 4; j++) noSep[j] = true;
+        avoid.push(blk.bounds);
+        G.h = hs; G.legPrev = sub(pts[i0 + 4], pts[i0 + 3]);
+        var ports = MG.portals(blk), byId = {};
+        for (j = 0; j < ports.length; j++) byId[ports[j].id] = ports[j];
+        return {
+          kind: 'menger', seed: bSeed, yaw: yaw, origin: org, block: blk, ft: ft,
+          axis: ax, i0: i0, entry: byId[ft.entry], exit: byId[ft.exit],
+          bounds: blk.bounds,
+          /* the 2 x 2 tiles around the tile corner: the city builds nothing here */
+          reserved: { min: [org[0] - T, 0, org[2] - T], max: [org[0] + T, 4000, org[2] + T] }
+        };
+      };
+      if (canyon) {
+        var axS = [Math.round(Math.sin(hs)), 0, Math.round(-Math.cos(hs))];
+        var aS = axS[0] ? 0 : 2, lS = 2 - aS, sgS = axS[aS], lastS = pts[pts.length - 1];
+        for (var tyS = 0; tyS < 4; tyS++) {
+          var yawS = ((k0 + tyS) % 4) * Math.PI / 2;
+          var f0 = MG.flythrough(MG.makeBlock(bSeed, bopt([0, 0, 0], yawS)), { dir: axS, lead: R.mengerLead });
+          if (!f0 || f0.waypoints.length !== 5 || f0.waypoints[2].kind !== 'centre') continue;
+          var A0s = f0.waypoints[0].p;
+          var Dm = Math.max(R.spMin, Math.abs(lastS[1] - A0s[1]) / (R.slope * 0.95));
+          var Sl0 = Math.round((lastS[lS] - A0s[lS]) / T) * T;
+          var lats = [Sl0, Sl0 + T, Sl0 - T].sort(function (a, b) {
+            return Math.abs(a + A0s[lS] - lastS[lS]) - Math.abs(b + A0s[lS] - lastS[lS]);
+          });
+          for (var ex = 0; ex < 3; ex++) {
+            var tgt = lastS[aS] + sgS * (Dm + ex * T) - A0s[aS];
+            var Sa = sgS > 0 ? Math.ceil(tgt / T) * T : Math.floor(tgt / T) * T;
+            for (var li2 = 0; li2 < 3; li2++) {
+              var org = [0, 0, 0]; org[aS] = Sa; org[lS] = lats[li2];
+              var blkS = MG.makeBlock(bSeed, bopt(org, yawS));
+              var ftS = MG.flythrough(blkS, { dir: axS, lead: R.mengerLead });
+              if (!ftS || ftS.waypoints.length !== 5) continue;
+              var legS = sub(ftS.waypoints[0].p, lastS), okS = true, sS, jS;
+              if (G.legPrev && angle(G.legPrev, legS) > R.maxLeg * DEG) continue;
+              if (angle([legS[0], 0, legS[2]], axS) > R.maxTurn * DEG) continue;
+              for (jS = 0; jS + 1 < pts.length && okS; jS++) {
+                for (sS = 0; sS <= 8; sS++) {
+                  if (boxDist(blkS.bounds, add(pts[jS], mul(sub(pts[jS + 1], pts[jS]), sS / 8))) < R.tubeR + 10) { okS = false; break; }
+                }
+              }
+              for (jS = 0; jS + 2 < pts.length && okS; jS++) {
+                if (noSep[jS]) continue;
+                for (sS = 0; sS <= 8; sS++) if (pointSegDist(add(lastS, mul(legS, sS / 8)), pts[jS], pts[jS + 1]) < R.minSep) { okS = false; break; }
+              }
+              for (jS = 0; jS < avoid.length && okS; jS++) {
+                for (sS = 0; sS <= 8; sS++) if (boxDist(avoid[jS], add(lastS, mul(legS, sS / 8))) < R.tubeR + 10) { okS = false; break; }
+              }
+              var resS = { min: [org[0] - T, 0, org[2] - T], max: [org[0] + T, 4000, org[2] + T] };
+              for (jS = 0; jS < canyon.walls.length && okS; jS++) if (boxesNearXZ(canyon.walls[jS], resS, 30)) okS = false;
+              if (okS) return take(blkS, ftS, yawS, axS, org);
+            }
+          }
+        }
+        return null;
+      }
       var cd = Math.cos(dl), sdl = Math.sin(dl), o = pts[0];
       var rot = pts.map(function (q) {
         var x = q[0] - o[0], z = q[2] - o[2];
         return [o[0] + x * cd - z * sdl, q[1], o[2] + x * sdl + z * cd];
       });
       var ax = [Math.round(Math.sin(hs)), 0, Math.round(-Math.cos(hs))];
-      var bopt = function (origin, yaw) {
+      function bopt(origin, yaw) {
         return { origin: origin, yaw: yaw, idxBase: MENGER_IDX, lanes: { reach: R.mengerReach } };
-      };
+      }
       for (var ty = 0; ty < 4; ty++) {
         var yaw = ((k0 + ty) % 4) * Math.PI / 2;
         var ft0 = MG.flythrough(MG.makeBlock(bSeed, bopt([0, 0, 0], yaw)), { dir: ax, lead: R.mengerLead });
@@ -461,20 +689,7 @@ var Hikyaku = (function () {
         if (!ok) continue;
         pts.length = 0;
         for (j = 0; j < part.length; j++) pts.push(part[j]);
-        var i0 = pts.length;
-        for (j = 0; j < 5; j++) pts.push(ft.waypoints[j].p.slice());
-        for (j = i0; j < i0 + 4; j++) noSep[j] = true;
-        avoid.push(blk.bounds);
-        G.h = hs; G.legPrev = sub(pts[i0 + 4], pts[i0 + 3]);
-        var ports = MG.portals(blk), byId = {};
-        for (j = 0; j < ports.length; j++) byId[ports[j].id] = ports[j];
-        return {
-          kind: 'menger', seed: bSeed, yaw: yaw, origin: [Sx, 0, Sz], block: blk, ft: ft,
-          axis: ax, i0: i0, entry: byId[ft.entry], exit: byId[ft.exit],
-          bounds: blk.bounds,
-          /* the 2 x 2 tiles around the tile corner: the city builds nothing here */
-          reserved: { min: [Sx - T, 0, Sz - T], max: [Sx + T, 4000, Sz + T] }
-        };
+        return take(blk, ft, yaw, ax, [Sx, 0, Sz]);
       }
       return null;
     }
@@ -529,6 +744,7 @@ var Hikyaku = (function () {
             for (s = 0; s <= 8; s++) if (boxDist(avoid[jj], add(last, mul(legA, s / 8))) < R.tubeR + 10) { ok = false; break; }
           }
           if (ok && block) for (kk = 0; kk < boxes.length; kk++) if (boxesNearXZ(boxes[kk], block.reserved, 30)) { ok = false; break; }
+          if (ok && canyon) for (kk = 0; kk < boxes.length && ok; kk++) for (jj = 0; jj < 2; jj++) if (boxesNearXZ(boxes[kk], canyon.walls[jj], 30)) { ok = false; break; }
           if (!ok) continue;
           var ft = SH.flythrough(sh, { lead: lead, ringR: R.ringR });
           var i0 = pts.length;
@@ -572,7 +788,7 @@ var Hikyaku = (function () {
     var nBefore = Math.max(2, Math.min(R.n - 2, Math.round((R.n - 2) * R.mengerAt)));
     var mAfter = Math.max(1, Math.round((R.n - 2) * (1 - R.shaftAt)) - 1);
     if (R.menger) {
-      grow(nBefore - 1);
+      growWithCanyon(nBefore - 1);
       block = placeMenger();
       if (R.shaft) {
         grow(Math.max(1, R.n - 4 - nBefore - mAfter) + (block ? 0 : 2));
@@ -580,22 +796,28 @@ var Hikyaku = (function () {
         grow(mAfter + (shaft ? 0 : 2));
       } else grow(block ? R.n - 2 - nBefore : R.n - nBefore);
     } else if (R.shaft) {
-      grow(Math.max(2, R.n - 3 - mAfter));
+      growWithCanyon(Math.max(2, R.n - 3 - mAfter));
       shaft = placeShaft();
       grow(mAfter + (shaft ? 0 : 2));
-    } else grow(R.n - 1);
+    } else growWithCanyon(R.n - 1);
     var n = pts.length;
+    /* in placement order of the generator, the canyon last although it
+       comes first on the route (code that wants route order sorts by i0) */
     var specials = [];
     if (block) specials.push(block);
     if (shaft) specials.push(shaft);
+    if (canyon) specials.push(canyon);
     var bi0 = block ? block.i0 : -1;
     var inBlockWp = function (k) { return bi0 >= 0 && k >= bi0 && k < bi0 + 5; };
     var si0 = shaft ? shaft.i0 : -1;
     var inShaftWp = function (k) { return si0 >= 0 && k >= si0 && k < si0 + shaft.count; };
+    var ci0 = canyon ? canyon.i0 : -1;
+    var inCanyonWp = function (k) { return ci0 >= 0 && k >= ci0 && k < ci0 + 5; };
 
     var dirs = pts.map(function (pt, k) {
       if (inBlockWp(k)) return block.axis.slice();
       if (inShaftWp(k)) return shaft.ft.waypoints[k - si0].dir.slice();
+      if (inCanyonWp(k)) return canyon.axis.slice();
       if (k === 0) return norm(sub(pts[1], pts[0]));
       if (k === n - 1) return norm(sub(pts[n - 1], pts[n - 2]));
       return norm(add(norm(sub(pt, pts[k - 1])), norm(sub(pts[k + 1], pt))));
@@ -620,6 +842,10 @@ var Hikyaku = (function () {
         biome = 'shaft';
         if (kind === 'portal') portal = sw.portal === 'entry' ? shaft.entry : shaft.exit;
       }
+      if (inCanyonWp(k)) {
+        kind = k === ci0 || k === ci0 + 4 ? 'via' : 'ring';
+        biome = 'canyon';
+      }
       var f = frameOf(dirs[k]);
       var w = {
         idx: k, ri: kind === 'via' ? null : ri++, kind: kind, p: pt, dir: dirs[k], right: f.right, up: f.up,
@@ -643,7 +869,8 @@ var Hikyaku = (function () {
     for (i = 0; i + 1 < n; i++) {
       var c = len(sub(pts[i + 1], pts[i]));
       segments.push({ i: i, p0: pts[i], p1: pts[i + 1], m0: mul(dirs[i], c), m1: mul(dirs[i + 1], c), chord: c,
-        biome: inBlockWp(i) && inBlockWp(i + 1) ? 'menger' : inShaftWp(i) && inShaftWp(i + 1) ? 'shaft' : 'open' });
+        biome: inBlockWp(i) && inBlockWp(i + 1) ? 'menger' : inShaftWp(i) && inShaftWp(i + 1) ? 'shaft'
+          : inCanyonWp(i) && inCanyonWp(i + 1) ? 'canyon' : 'open' });
     }
 
     /* u runs from 0 at the start gate to n - 1 at the finish. */
@@ -692,6 +919,26 @@ var Hikyaku = (function () {
     if (shaft) {
       for (i = 0; i < samples.length; i++) samples[i].inShaft = globalThis.Shaft.inside(shaft.shaft, samples[i].p);
     }
+    /* Every sample carries its own clearance radius r: tubeR, except in
+       the canyon (canyonR from the entry to the exit, inCanyon set) and on
+       a cone around it, one metre more per metre of arc outside, so the
+       tube narrows over 37 m and the city around the descent and the
+       climb is not cut off at a step. */
+    if (canyon) {
+      for (i = 0; i < samples.length; i++) {
+        if (canyon.s0 == null && samples[i].u >= ci0 - 1e-9) canyon.s0 = samples[i].s;
+        if (canyon.s1 == null && samples[i].u >= ci0 + 4 - 1e-9) canyon.s1 = samples[i].s;
+      }
+    }
+    for (i = 0; i < samples.length; i++) {
+      var smI = samples[i], rI = R.tubeR;
+      if (canyon) {
+        var outC = Math.max(0, canyon.s0 - smI.s, smI.s - canyon.s1);
+        rI = Math.min(R.tubeR, R.canyonR + outC);
+        smI.inCanyon = outC === 0;
+      }
+      smI.r = rI;
+    }
     var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (i = 0; i < samples.length; i++) {
       for (j = 0; j < 3; j++) {
@@ -717,6 +964,8 @@ var Hikyaku = (function () {
         sw.min[fa] = a0; sw.max[fa] = a1; sw.min[fc] = fl.freight.row - hw2; sw.max[fc] = fl.freight.row + hw2;
         var bad = false;
         for (j = 0; j < specials.length && !bad; j++) {
+          /* the canyon walls go under the corridors instead (below) */
+          if (specials[j].kind === 'canyon') continue;
           var sb = specials[j].bounds, mC = R.freightClear;
           if (sw.min[0] < sb.max[0] + mC && sw.max[0] > sb.min[0] - mC && sw.min[2] < sb.max[2] + mC && sw.max[2] > sb.min[2] - mC
             && sw.min[1] < sb.max[1] + mC) bad = true;
@@ -733,8 +982,26 @@ var Hikyaku = (function () {
         });
       }
     }
+    /* A wall stays 20 m under every freighter corridor over it: the city
+       caps a lot 10 m under the corridor floor, a tower stops another 6 m
+       under its cap, on the storey grid. */
+    if (canyon) {
+      for (i = 0; i < canyon.walls.length; i++) {
+        var wq = canyon.walls[i];
+        for (j = 0; j < freight.corridors.length; j++) {
+          var cq = freight.corridors[j];
+          if (wq.max[0] > cq.min[0] - 4 && wq.min[0] < cq.max[0] + 4 && wq.max[2] > cq.min[2] - 4 && wq.min[2] < cq.max[2] + 4) {
+            wq.minH = Math.min(wq.minH, cq.min[1] - 20);
+          }
+        }
+        wq.max[1] = wq.minH;
+      }
+    }
     /* Every box the city keeps free: the specials' (per 100 m of the shaft)
-       and the freighter corridors. */
+       and the freighter corridors. The canyon adds its two wall boxes
+       (kind 'wall': build towers of at least minH there) and its air box
+       (kind 'air': no bridge, cable, sign or hologram), which the city
+       reads by kind. */
     var reserved = [];
     for (i = 0; i < specials.length; i++) {
       if (specials[i].reservedList) reserved = reserved.concat(specials[i].reservedList);
@@ -742,17 +1009,31 @@ var Hikyaku = (function () {
     }
     reserved = reserved.concat(freight.corridors);
     var tube = {
+      /* r: the default radius, the largest; every sample has its own r */
       r: R.tubeR, samples: samples,
-      /* Distance from p to the nearest sample. Brute force, for tests and
-         generators; the loop never calls it. */
+      /* Distance from p to the tube's axis, on the scale where the surface
+         is at r everywhere: the distance to each sample minus the excess
+         of r over that sample's own radius, the smallest of them. Where
+         the radius is the default this is the plain distance to the
+         nearest sample; dist(p) > r means outside the tube. Brute force,
+         for tests and generators; the loop never calls it. */
       dist: function (pt) {
         var best = Infinity;
         for (var k = 0; k < samples.length; k++) {
           var q = samples[k].p, dx = q[0] - pt[0], dy = q[1] - pt[1], dz = q[2] - pt[2];
-          var dd = dx * dx + dy * dy + dz * dz;
+          var dd = Math.sqrt(dx * dx + dy * dy + dz * dz) + R.tubeR - samples[k].r;
           if (dd < best) best = dd;
         }
-        return Math.sqrt(best);
+        return best;
+      },
+      /* The radius at curve parameter u: the smaller of the two samples
+         around it (the samples are ordered by u). */
+      radiusAt: function (u) {
+        var lo = 0, hi = samples.length - 1;
+        if (u <= samples[0].u) return samples[0].r;
+        if (u >= samples[hi].u) return samples[hi].r;
+        while (hi - lo > 1) { var md = (lo + hi) >> 1; if (samples[md].u <= u) lo = md; else hi = md; }
+        return Math.min(samples[lo].r, samples[hi].r);
       }
     };
     return {
@@ -1062,7 +1343,7 @@ var Hikyaku = (function () {
     on: true, density: 0.5, margin: 900, offset: 5,
     spacing: 55, spacingMax: 120, speed: 24, speedMax: 40,
     vNom: 45, window: 3, clear: 8, near: 25, cut: 25, minLen: 160, parallelMin: 12,
-    fade: 60, blockFade: 45, axisFlip: -1,
+    fade: 60, blockFade: 45, axisFlip: -1, canyonSpacing: 0.7,
     freight: true, freightDensity: 0.6, freightNear: 45
   };
   /* Haulers get rarer the lower the lane. */
@@ -1114,6 +1395,8 @@ var Hikyaku = (function () {
     /* Lanes are cut before every block and before the shaft's housing (its
        reserved boxes, one per 100 m of axis). */
     var cuts = blocks.map(function (sp) { return sp.bounds; });
+    var cyL = null;
+    (route.specials || []).forEach(function (sp) { if (sp.kind === 'canyon') cyL = sp; });
     (route.specials || []).forEach(function (sp) { if (sp.kind === 'shaft') cuts = cuts.concat(sp.reservedList); });
 
     /* ---- city lanes ---- */
@@ -1156,6 +1439,9 @@ var Hikyaku = (function () {
             var hs = hash3(seed ^ 0x51ed27, li * 4096 + k, dsg * 7 + q2);
             var hs2 = hash3(seed ^ 0x2545f4, li * 4096 + k, dsg * 7 + q2);
             var spc = C.spacing + (C.spacingMax - C.spacing) * hs;
+            /* the 55 m lanes under the canyon run denser: the traffic under
+               the pilot is the look of the biome (concept traffic-canyon) */
+            if (cyL && li === 0 && aa === cyL.along && Math.abs(c - cyL.line) < 1) spc = C.spacing * C.canyonSpacing;
             specs.push({
               id: specs.length, kind: 'city', alt: li, axis: ax === 0 ? 'x' : 'z',
               points: [pA, pB], speed: C.speed + (C.speedMax - C.speed) * hs2,
@@ -1520,7 +1806,7 @@ function hazeOf(p) {
    without storing them, ?variety=<0 to 1> the city's variety
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1582,6 +1868,10 @@ const DEF = {
   music: true, musicVolume: 0.6, musicSeed: 2, musicBpm: 118,
   /* The race: seconds added per missed ring or portal (hkcore raceStep). */
   missPenalty: 5,
+  /* The street canyon on the route (hkcore makeRoute, cfg.canyon). The
+     panel switch takes effect with the next route (New route or a seed),
+     so a run in progress keeps its route. */
+  canyon: true,
   /* The panel: open or closed, and the open section. Stored with the rest,
      so a reload looks the way it was left. */
   panel: true, sec: '',
@@ -1649,9 +1939,11 @@ function shotEvent(kind, t, pos, fwd, pads) {
       droneR: 0, droneW: 0, dronePh: 0, fadeIn: 5, fadeOut: 8 }, info: {} };
 }
 /* Best times per seed. The key changed with step 6 (a seed's route runs
-   through a Menger block) and again with the shaft (and through a
-   ventilation shaft): times from the old routes do not compare. */
-const BEST = 'hk.best3';
+   through a Menger block), again with the shaft (and through a
+   ventilation shaft) and with the street canyon (and down a street):
+   times from the old routes do not compare. A route without the canyon
+   (panel, Canyon off) keeps its times under the seed plus ':nc'. */
+const BEST = 'hk.best4';
 const SHIP_L = 15;
 /* Bounding radius of the courier's collision hull about its centre of mass,
    for the vehicle query (hikyaku-traffic.js nearVehicles takes the radius
@@ -2038,7 +2330,9 @@ function App() {
 
   /* The route is geometry: rebuilt only on a new seed, and the world is
      built around it. */
-  const route = useMemo(() => HK.makeRoute({ seed: p.seed }), [p.seed]);
+  const [routeCanyon, setRouteCanyon] = useState(() => p.canyon !== false);
+  const route = useMemo(() => HK.makeRoute({ seed: p.seed, canyon: routeCanyon }), [p.seed, routeCanyon]);
+  const bestKey = String(p.seed) + (routeCanyon ? '' : ':nc');
   /* Oversized structures (the Menger block, later arcologies) are bigger
      than a tile and placed on the route by makeRoute. Their reserved boxes
      (the 2 x 2 tiles around the block) go to the city, which builds
@@ -2258,7 +2552,7 @@ function App() {
 
   /* Called from the loop when the finish gate is crossed. */
   onFinishRef.current = (race) => {
-    const key = String(p.seed);
+    const key = bestKey;
     const prevBest = best[key];
     /* the best time is the total, missed rings included */
     const isBest = !(prevBest > 0) || race.total < prevBest;
@@ -2277,6 +2571,7 @@ function App() {
   const setSeed = (v) => {
     const n = Math.max(1, Math.min(999999, Math.round(v)));
     setP((q) => ({ ...q, seed: n }));
+    setRouteCanyon(p.canyon !== false);
     resetRef.current++;
   };
 
@@ -2453,6 +2748,13 @@ function App() {
           const sp2 = spot.p.slice();
           if (ln) sp2[1] = ln.points[0][1] + 9;
           state.s = poseAt(sp2, spot.dir, 0);
+        }
+      } else if (SHOT === 'canyonrun') {
+        /* chase view in the street canyon, 50 m before its second ring */
+        const cy = cfg.route.specials.find((sp) => sp.kind === 'canyon');
+        if (cy) {
+          const w = cfg.route.waypoints[cy.i0 + 2];
+          state.s = poseAt(w.p, w.dir, 50);
         }
       } else if ((SHOT === 'mouth' || SHOT === 'inside') && cfg.block) {
         const ws = cfg.route.waypoints, i0 = cfg.block.i0;
@@ -3396,7 +3698,7 @@ function App() {
     <b ref=${(el) => { hudRef.current[k] = el; }}>-</b>
   <//>`;
   const H = hudRef.current;
-  const bestHere = best[String(p.seed)];
+  const bestHere = best[bestKey];
 
   return html`<${React.Fragment}>
     <div className="hk-stage" ref=${stageRef}></div>
@@ -3474,13 +3776,18 @@ function App() {
       </div>
       <div className="hk-derived">
         <span>Rings and portals, then the finish</span><b>${route.waypoints.filter((w) => w.kind === 'ring').length} + ${route.waypoints.filter((w) => w.kind === 'portal').length} + 1</b>
-        <span>On the route</span><b>${route.specials.map((sp) => (sp.kind === 'menger' ? 'block' : sp.kind)).join(', ') || 'open city only'}</b>
+        <span>On the route</span><b>${route.specials.slice().sort((a, b) => a.i0 - b.i0)
+          .map((sp) => (sp.kind === 'menger' ? 'block' : sp.kind)).join(', ') || 'open city only'}</b>
         <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
         <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
         <span>City tile</span><b>${HC.TILE} m, window ${2 * p.cityRadius + 1} x ${2 * p.cityRadius + 1}</b>
         <span>Best for this seed</span><b>${bestHere > 0 ? HK.formatTime(bestHere) : '-'}</b>
       </div>
       <p className="hk-note">The seed is in the address bar. Share the address to fly the same route and compare times.</p>
+      <div className="seg-row">
+        <button className=${'lang-seg' + (p.canyon ? ' active' : '')} onClick=${() => upd('canyon')(!p.canyon)}>Street canyon</button>
+      </div>
+      ${p.canyon !== routeCanyon ? html`<p className="hk-note">The canyon switch applies to the next route (New route or another seed).</p>` : null}
 
       <${Seg} label="View" value=${p.camMode} onChange=${upd('camMode')}
         options=${[{ value: 'chase', label: 'Chase' }, { value: 'cockpit', label: 'Cockpit' }]} />

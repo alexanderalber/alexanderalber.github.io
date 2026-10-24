@@ -40,6 +40,17 @@
  * and placed separately; makeTile takes a reserved list of world boxes and
  * builds nothing inside them.
  *
+ * The street canyon of the route (hkcore placeCanyon) reaches the city as
+ * two more kinds of reserved box. kind 'wall' { minH, face }: every block
+ * wholly inside it is a canyon wall, built densely (every lot) with towers
+ * of at least minH whose face towards the street (face, the horizontal
+ * normal) stays flush; more signs on that face, more bridges and cables
+ * across the street, holograms across it too. kind 'air' { axis, line }:
+ * the flight space over the street, where no bridge, cable, sign, balcony
+ * or hologram goes (buildings ignore it: it lies inside the street). The
+ * tube's samples carry their own radius r (8 m in the canyon, 45 m
+ * elsewhere), and every clearance here uses the sample's own.
+ *
  * Everything hangs on globalThis.HikyakuCity.
  */
 (function () {
@@ -68,7 +79,7 @@
     margin: 3,            /* extra metres outside the tube radius */
     core: null,           /* [x, z] of the tall district, or null */
     coreR: 1600,
-    reserved: null,       /* [{ min, max }] world boxes kept empty */
+    reserved: null,       /* [{ min, max, kind? }] world boxes kept empty; kind 'wall' and 'air' see the header */
     /* City life (2026-10-25): holograms between towers, aviation beacons
        and crown breathing, windows that change over time. Rarity is the
        rule, so every feature has a rate (true = 1, false or 0 = off,
@@ -342,22 +353,49 @@
     var tube = route && route.tube ? route.tube : null;
     var Rm = tube ? tube.r + C.margin : 0;
 
-    /* The tube samples that can matter for this tile, once. */
-    var S = [];
+    /* The tube samples that can matter for this tile, once, with their
+       clearance (own radius plus margin) in SR. */
+    var S = [], SR = [];
     if (tube) {
       var reach = Rm + 12;
       var smp = tube.samples;
       for (var si = 0; si < smp.length; si++) {
         var q = smp[si].p;
-        if (q[0] > x0 - reach && q[0] < x0 + TILE + reach && q[2] > z0 - reach && q[2] < z0 + TILE + reach) S.push(q);
+        if (q[0] > x0 - reach && q[0] < x0 + TILE + reach && q[2] > z0 - reach && q[2] < z0 + TILE + reach) {
+          S.push(q); SR.push((smp[si].r == null ? tube.r : smp[si].r) + C.margin);
+        }
       }
     }
-    var RES = [];
+    /* RES: boxes nothing may enter (the air boxes included), RESCAP: the
+       ones that cap a lot (not the air: it lies inside a street), WALLS:
+       the canyon walls, AIR: the air boxes */
+    var RES = [], RESCAP = [], WALLS = [], AIR = [];
     if (C.reserved) {
       for (var ri = 0; ri < C.reserved.length; ri++) {
         var rb = C.reserved[ri];
-        if (rb.max[0] > x0 - 8 && rb.min[0] < x0 + TILE + 8 && rb.max[2] > z0 - 8 && rb.min[2] < z0 + TILE + 8) RES.push(rb);
+        if (!(rb.max[0] > x0 - 8 && rb.min[0] < x0 + TILE + 8 && rb.max[2] > z0 - 8 && rb.min[2] < z0 + TILE + 8)) continue;
+        if (rb.kind === 'wall') { WALLS.push(rb); continue; }
+        RES.push(rb);
+        if (rb.kind === 'air') AIR.push(rb); else RESCAP.push(rb);
       }
+    }
+    /* the wall a block lies in, or null */
+    function wallOf(b0, c0, b1, c1) {
+      for (var k = 0; k < WALLS.length; k++) {
+        var w = WALLS[k];
+        if (b0 >= w.min[0] - 0.5 && b1 <= w.max[0] + 0.5 && c0 >= w.min[2] - 0.5 && c1 <= w.max[2] + 0.5) return w;
+      }
+      return null;
+    }
+    /* The air box over the tile's inner street on axis 0 (the street
+       along z at x0 + 108) or 1 (along x at z0 + 108), or null: the
+       canyon runs through this tile there. */
+    function canyonAir(axis) {
+      for (var k = 0; k < AIR.length; k++) {
+        var a = AIR[k];
+        if (axis === 0 ? a.axis === 2 && Math.abs(a.line - (x0 + TILE / 2)) < 1 : a.axis === 0 && Math.abs(a.line - (z0 + TILE / 2)) < 1) return a;
+      }
+      return null;
     }
 
     var TOP = C.maxH * C.landmark;
@@ -366,27 +404,28 @@
       var cap = TOP, k;
       rx0 -= 1.2; rz0 -= 1.2; rx1 += 1.2; rz1 += 1.2;
       for (k = 0; k < S.length; k++) {
-        var p = S[k];
+        var p = S[k], rk = SR[k];
         var dx = Math.max(rx0 - p[0], 0, p[0] - rx1), dz = Math.max(rz0 - p[2], 0, p[2] - rz1);
         var d2 = dx * dx + dz * dz;
-        if (d2 >= Rm * Rm) continue;
-        var lim = p[1] - Math.sqrt(Rm * Rm - d2) - C.roofGap;
+        if (d2 >= rk * rk) continue;
+        var lim = p[1] - Math.sqrt(rk * rk - d2) - C.roofGap;
         if (lim < cap) cap = lim;
       }
-      for (k = 0; k < RES.length; k++) {
-        var b = RES[k];
+      for (k = 0; k < RESCAP.length; k++) {
+        var b = RESCAP[k];
         if (rx1 > b.min[0] - 4 && rx0 < b.max[0] + 4 && rz1 > b.min[2] - 4 && rz0 < b.max[2] + 4) {
           cap = b.min[1] > 0 ? Math.min(cap, b.min[1] - 10) : -Infinity;
         }
       }
       return cap;
     }
-    /* The guarantee: a box keeps Rm from every tube sample (the samples are
-       4 m apart, so the curve between two of them is at most 2 m closer,
-       inside the 3 m margin) and stays out of every reserved box. */
+    /* The guarantee: a box keeps its own radius plus the margin from every
+       tube sample (the samples are 4 m apart, so the curve between two of
+       them is at most 2 m closer, inside the 3 m margin) and stays out of
+       every reserved box. */
     function clear(b) {
       var k;
-      for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < Rm) return false;
+      for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < SR[k]) return false;
       for (k = 0; k < RES.length; k++) if (boxesOverlap(b, RES[k], 2)) return false;
       return true;
     }
@@ -394,14 +433,14 @@
       var k;
       for (k = 0; k < S.length; k++) {
         var dx = S[k][0] - p[0], dy = S[k][1] - p[1], dz = S[k][2] - p[2];
-        if (dx * dx + dy * dy + dz * dz < Rm * Rm) return false;
+        if (dx * dx + dy * dy + dz * dz < SR[k] * SR[k]) return false;
       }
       for (k = 0; k < RES.length; k++) if (boxDist(RES[k], p) < 2) return false;
       return true;
     }
 
     var boxes = [], buildings = [], pads = [], accents = [], lights = [], cables = [], bridges = [];
-    var lots = { total: 0, built: 0, empty: 0, lowered: 0, cut: 0, dropped: 0, boxDrops: 0 };
+    var lots = { total: 0, built: 0, empty: 0, lowered: 0, cut: 0, dropped: 0, boxDrops: 0, wall: 0, wallBuilt: 0 };
     var gId = 0, landmark = null, whiteOf = {};
     /* KV: how far archetype weights, tones and the high point rule have
        moved from the old uniform city towards the district tables; full at
@@ -423,12 +462,14 @@
        'side' (one face stays flush, the others step back), 'corner' (two
        faces flush), 'offset' (each tier shifted sideways, up to 8 m beyond
        the one below, kept inside lot = [x0, z0, x1, z1]), 'single'. nt
-       forces the number of tiers. */
-    function stack(fp, f0, nFl, style, lot, tone, sd, g, prog, nt) {
+       forces the number of tiers, fside the face 'side' keeps flush (0 +x,
+       1 -x, 2 +z, 3 -z). */
+    function stack(fp, f0, nFl, style, lot, tone, sd, g, prog, nt, fside) {
       var out = [], tiers = [];
       var h = nFl * STOREY;
       if (nt == null) nt = style === 'single' ? 1 : (h > 90 ? R.int(2, 4) : (h > 45 ? R.int(1, 2) : 1));
       var side = R.int(0, 3), cur = fp.slice(), f = f0, rem = nFl;
+      if (fside != null) side = fside;
       function next(c) {
         var w = c[2] - c[0], d = c[3] - c[1], n;
         if (style === 'side') {
@@ -529,6 +570,17 @@
        lot does not suit it. Axis aligned boxes, footprints inside the lot,
        nothing under 5 m except the old roof clutter and masts. */
     var ARCH = {
+      /* a canyon wall tower: the face towards the street (plan.face) 1 m
+         behind the lot edge and flush up every tier, the other faces 1.5
+         to 3 m in, two to four tiers stepping back from the street */
+      wall: function (L, nFl, cap, tone, sd, g, prog, plan) {
+        var f = plan.face, m = R.range(1.5, 3), fi = 1;
+        var fp = [L[0] + (f[0] < 0 ? fi : m), L[1] + (f[1] < 0 ? fi : m), L[2] - (f[0] > 0 ? fi : m), L[3] - (f[1] > 0 ? fi : m)];
+        var side = f[0] > 0 ? 0 : f[0] < 0 ? 1 : f[1] > 0 ? 2 : 3;
+        var res = stack(fp, 0, nFl, 'side', L, tone, sd, g, prog, R.int(2, 4), side);
+        roof(res, cap, tone, sd, g);
+        return res;
+      },
       setback: function (L, nFl, cap, tone, sd, g, prog) {
         var w = L[2] - L[0], d = L[3] - L[1], tw = w - R.range(2, 7), td = d - R.range(2, 7);
         var cx = (L[0] + L[2]) / 2, cz = (L[1] + L[3]) / 2;
@@ -636,7 +688,7 @@
       }
     };
     /* the type a lot falls back to when the tube lowers it */
-    var SIMPLER = { setback: 'setback', offset: 'setback', slab: 'slab', podium: 'setback', twin: 'setback', hall: 'hall', silo: 'hall', court: 'court' };
+    var SIMPLER = { setback: 'setback', offset: 'setback', slab: 'slab', podium: 'setback', twin: 'setback', hall: 'hall', silo: 'hall', court: 'court', wall: 'wall' };
 
     /* Courtyard, U and L (V4): wings round a court of 20 to 36 m on a whole
        block, one wing maybe a fifth to two fifths taller. Each wing has its
@@ -682,8 +734,10 @@
     /* Lot placement with the tube rule. plan: { arch, h, prog, tone, dist, hp }. */
     function placeLot(lx0, lz0, lx1, lz1, depth, block, plan) {
       lots.total++;
-      /* the block's high point is always built (with full variety) */
-      if (!R.chance(C.density) && !(plan.hp && KV > 0)) { lots.empty++; return; }
+      if (plan.face) lots.wall++;
+      /* the block's high point is always built (with full variety), and so
+         is every lot of a canyon wall */
+      if (!R.chance(C.density) && !(plan.hp && KV > 0) && !plan.face) { lots.empty++; return; }
       var cap = capFor(lx0, lz0, lx1, lz1);
       var w = lx1 - lx0, d = lz1 - lz0;
       if (cap < C.minH * 0.6 + 6 && plan.arch !== 'court') {
@@ -712,7 +766,7 @@
         var nFl = fl(h);
         if (nFl * STOREY < 8) { lots.dropped++; return; }
         var capR = Math.min(cap, TOP);
-        res = ARCH[arch](L, nFl, capR, tone, sd, g, plan.prog);
+        res = ARCH[arch](L, nFl, capR, tone, sd, g, plan.prog, plan);
         if (!res) { arch = 'setback'; res = ARCH.setback(L, nFl, capR, tone, sd, g, plan.prog); }
       }
       /* the guarantee, building by building */
@@ -720,8 +774,9 @@
         if (!clear(res.boxes[k])) { lots.dropped++; return; }
       }
       lots.built++;
+      if (plan.face) lots.wallBuilt++;
       var b = { g: g, cx: cx, cz: cz, tiers: res.tiers, top: res.top, seed: sd, tone: tone, block: block,
-        arch: arch, dist: plan.dist, prog: plan.prog };
+        arch: arch, dist: plan.dist, prog: plan.prog, face: plan.face || null };
       buildings.push(b);
       for (k = 0; k < res.boxes.length; k++) boxes.push(res.boxes[k]);
       if (res.extra) for (k = 0; k < res.extra.length; k++) { bridges.push(boxes.length); boxes.push(res.extra[k]); }
@@ -793,6 +848,14 @@
         /* courts are broad and low: not in the deep core, where the
            residential district builds slabs instead */
         if (arch === 'court' && hf > 0.8) arch = 'slab';
+        /* a canyon wall: wall towers on every lot, at least minH (on the
+           storey grid, under maxH), the district keeps its facade program */
+        var WB = wallOf(bx0, bz0, bx1, bz1), wMin = 0;
+        if (WB) {
+          arch = 'wall';
+          wMin = Math.min(WB.minH, C.maxH - 6);
+          wMin = Math.ceil(wMin / STOREY - 1e-9) * STOREY > C.maxH - 6 ? Math.floor(wMin / STOREY) * STOREY : Math.ceil(wMin / STOREY - 1e-9) * STOREY;
+        }
         var hBase = C.minH + (C.maxH - C.minH) * Math.pow(hf, 1.6);
         /* tall districts cut their blocks finer: slender towers */
         var tallB = hf > 0.55, split, wh = WHOLE[arch];
@@ -809,7 +872,9 @@
              factor per block and the high point rule */
           var hh = Math.min(archHeight(a, dist, hBase * (rl + (rb - rl) * KV)), C.maxH - 6);
           if (li !== hp) hh = Math.max(C.minH, hh * (1 + (fall - 1) * KV));
-          plans.push({ arch: a, h: hh, prog: dist, dist: dist, hp: li === hp && split > 1, tone: DIST_TONE[dist] + (t0 - DIST_TONE[dist]) * (1 - KV) });
+          if (WB) hh = Math.min(Math.max(hh, wMin), Math.max(wMin, C.maxH - 6));
+          plans.push({ arch: a, h: hh, prog: dist, dist: dist, hp: li === hp && split > 1, tone: DIST_TONE[dist] + (t0 - DIST_TONE[dist]) * (1 - KV),
+            face: WB ? WB.face : null });
         }
         if (split === 1) placeLot(bx0, bz0, bx1, bz1, 0, blk, plans[0]);
         else if (split === 2) {
@@ -856,9 +921,11 @@
             w: b.max[0] - b.min[0], d: b.max[2] - b.min[2], kind: 'balcony' });
         }
       }
-      if (!nAcc || fh < 45 || !R.chance(0.3)) return;
+      /* a canyon wall tower has a sign more often, on its street face */
+      if (!nAcc || fh < 45 || !R.chance(bd.face ? 0.85 : 0.3)) return;
       var hue = nAcc === 1 ? 0 : (R.chance(0.6) ? 0 : 1);
       var fc = FACES[R.int(0, 3)];
+      if (bd.face) fc = bd.face;
       var faceW = fc[0] ? t0.z1 - t0.z0 : t0.x1 - t0.x0;
       var fpx = fc[0] > 0 ? t0.x1 : fc[0] < 0 ? t0.x0 : (t0.x0 + t0.x1) / 2;
       var fpz = fc[1] > 0 ? t0.z1 : fc[1] < 0 ? t0.z0 : (t0.z0 + t0.z1) / 2;
@@ -888,8 +955,56 @@
       }
     });
 
+    /* More signs on the canyon walls: two to four flat ones per tower on
+       its street face, at any height (flat signs are quads on the face,
+       not boxes, so the air box does not keep them out), none overlapping
+       another sign of that face. Their own sub-stream (salt 63), so the
+       rest of the tile does not move. */
+    if (nAcc && WALLS.length) {
+      var CR = rng(subSeed(ix, iz, C.seed, 63));
+      buildings.forEach(function (bd) {
+        if (!bd.face || bd.top < 40) return;
+        var f = bd.face, tang = f[0] ? [0, 0, 1] : [1, 0, 0], ns = CR.int(2, 4);
+        for (var i = 0; i < ns; i++) {
+          var vert = CR.chance(0.65);
+          var w = vert ? CR.range(3.5, 7) : CR.range(9, 18), h = vert ? w * CR.range(1.8, 3.2) : CR.range(2, 3.6);
+          var y = CR.range(10 + h / 2, Math.max(11 + h / 2, bd.top - 10 - h / 2));
+          var hue2 = nAcc === 1 ? 0 : (CR.chance(0.6) ? 0 : 1), sdS = CR(), ou = CR.range(-0.5, 0.5);
+          /* the tier over the sign's height reaching furthest to the street */
+          var t = null, tv = -Infinity;
+          for (var k = 0; k < bd.tiers.length; k++) {
+            var q = bd.tiers[k];
+            if (!(q.y0 <= y - h / 2 - 0.5 && q.y1 >= y + h / 2 + 0.5)) continue;
+            var v = f[0] > 0 ? q.x1 : f[0] < 0 ? -q.x0 : f[1] > 0 ? q.z1 : -q.z0;
+            if (v > tv) { tv = v; t = q; }
+          }
+          if (!t) continue;
+          var fw = f[0] ? t.z1 - t.z0 : t.x1 - t.x0;
+          if (fw < w + 2) continue;
+          var fx = f[0] > 0 ? t.x1 : f[0] < 0 ? t.x0 : (t.x0 + t.x1) / 2;
+          var fz = f[1] > 0 ? t.z1 : f[1] < 0 ? t.z0 : (t.z0 + t.z1) / 2;
+          var o = ou * (fw - w - 2);
+          var p = [fx + tang[0] * o + f[0] * 0.3, y, fz + tang[2] * o + f[1] * 0.3];
+          var along = tang[0] ? p[0] : p[2], hit = false;
+          for (k = 0; k < accents.length && !hit; k++) {
+            var a = accents[k];
+            if (a.kind !== 'flat' || a.n[0] !== f[0] || a.n[2] !== f[1]) continue;
+            if (Math.abs((f[0] ? a.p[0] - p[0] : a.p[2] - p[2])) > 0.5) continue;
+            var aa = tang[0] ? a.p[0] : a.p[2];
+            hit = Math.abs(aa - along) < (a.w + w) / 2 + 1 && Math.abs(a.p[1] - y) < (a.h + h) / 2 + 1;
+          }
+          if (hit) continue;
+          accents.push({ p: p, n: [f[0], 0, f[1]], w: w, h: h, hue: hue2, seed: sdS, kind: 'flat' });
+        }
+      });
+    }
+
     /* Bridges and cables across the two inner streets of the tile, so they
-       stay inside it. Never in a lane band, never in the tube. */
+       stay inside it. Never in a lane band, never in the tube. Across the
+       canyon (its air box over this street, both towers walls) they come
+       more often, from the air box's top to the lower roof, three in four
+       of them in the 28 m over the air box (under the 155 m band): the
+       rhythm overhead, low enough for the chase view to see it. */
     /* The tier of bd spanning y0..y1 that faces the other building: on
        axis 0 the one reaching furthest to +x (dir 1) or -x (dir -1), on
        axis 1 the same in z. A court's inner wing never gets a bridge
@@ -915,14 +1030,17 @@
             : (a.block === 0 && b.block === 2) || (a.block === 1 && b.block === 3)) pairs.push([a, b]);
         });
       });
+      var cAir = canyonAir(axis);
       for (var pi = 0; pi < pairs.length; pi++) {
         var A = pairs[pi][0], B = pairs[pi][1];
-        var hMin = Math.min(A.tiers[0].y1, B.tiers[0].y1);
+        var cy = !!(cAir && A.face && B.face);
+        var hMin = cy ? Math.min(A.top, B.top) : Math.min(A.tiers[0].y1, B.tiers[0].y1);
         if (hMin < 40) continue;
+        var by0 = cy ? cAir.max[1] + 3 : 15, byTop = cy ? hMin - 8 : Math.min(hMin, 240) - 8;
         /* skybridge */
-        if (nBridge < 3 && R.chance(0.22 * C.density)) {
+        if (nBridge < (cy ? 6 : 3) && R.chance((cy ? 0.7 : 0.22) * C.density)) {
           for (var tr = 0; tr < 12; tr++) {
-            var bh2 = R.range(3.5, 7), by = R.range(15, Math.min(hMin, 240) - bh2 - 8), bw2 = R.range(4, 9);
+            var bh2 = R.range(3.5, 7), by = R.range(by0, (cy && R.chance(0.75) ? Math.min(byTop, by0 + 28) : byTop) - bh2), bw2 = R.range(4, 9);
             if (by < 12 || inLaneBand(by - 1, by + bh2 + 1)) continue;
             var ta = tierAt(A, by, by + bh2, axis, 1), tb = tierAt(B, by, by + bh2, axis, -1);
             if (!ta || !tb) continue;
@@ -941,9 +1059,10 @@
           }
         }
         /* a few cables */
-        var nc = R.chance(0.5 * C.density) ? R.int(1, 3) : 0;
+        var nc = cy ? (R.chance(0.9 * C.density) ? R.int(2, 4) : 0) : (R.chance(0.5 * C.density) ? R.int(1, 3) : 0);
         for (var ci = 0; ci < nc; ci++) {
-          var ya = R.range(10, Math.min(hMin, 220) - 4), yb = ya + R.range(-6, 6), sag = R.range(0.8, 5);
+          var ya = cy ? R.range(by0 + 9, Math.max(by0 + 10, R.chance(0.75) ? Math.min(hMin - 6, by0 + 28) : hMin - 6)) : R.range(10, Math.min(hMin, 220) - 4);
+          var yb = ya + R.range(-6, 6), sag = R.range(0.8, 5);
           if (yb < 6) continue;
           if (inLaneBand(Math.min(ya, yb) - sag - 0.5, Math.max(ya, yb) + 0.5)) continue;
           var t1 = tierAt(A, Math.max(ya, yb), Math.max(ya, yb), axis, 1), t2 = tierAt(B, Math.max(ya, yb), Math.max(ya, yb), axis, -1);
@@ -992,21 +1111,32 @@
        running along one tier face of each tower over its full height, with
        no yaw; it tilts only about its long axis. One per tile at most, with chance
        HOLO_P times the life rate; no candidate, no hologram. Out of the
-       tube (every sample point Rm + 4 m from it), out of the lane bands,
-       2 m clear of every box of the tile. No collision. */
+       tube (every sample point its own radius plus margin plus 4 m from
+       it), out of the lane bands, 2 m clear of every box of the tile. No
+       collision. In a canyon tile the wall towers facing each other
+       across the canyon street come first: their gap may be the street
+       (28 m and up), and their hologram hangs low, between the top of
+       the air box and the 155 m band, among the bridges. */
     function holoPlace() {
       var pH = clamp(HOLO_P * lifeRate(C, 'holograms'), 0, 1), out = [];
       if (!nAcc || !(pH > 0)) return out;
       var HR = rng(subSeed(ix, iz, C.seed, 61));
       if (!(HR() < pH)) return out;
       var tw = buildings.filter(function (b) { return b.top >= HOLO_MIN_TOP && b.arch !== 'hall' && b.arch !== 'court'; });
-      var pairs = [];
+      /* pairs of canyon wall towers facing each other across the street
+         first: there the gap may be the street, 28 m and up */
+      var pairs = [], cyPairs = [];
       for (var i = 0; i < tw.length; i++) for (var j = i + 1; j < tw.length; j++) {
         var ha = tw[i].top, hb = tw[j].top;
-        if (Math.abs(ha - hb) <= HOLO_SIMILAR * Math.max(ha, hb)) pairs.push([tw[i], tw[j]]);
+        if (!(Math.abs(ha - hb) <= HOLO_SIMILAR * Math.max(ha, hb))) continue;
+        var fa = tw[i].face, fb = tw[j].face;
+        if (fa && fb && fa[0] + fb[0] === 0 && fa[1] + fb[1] === 0) cyPairs.push([tw[i], tw[j], true]);
+        else pairs.push([tw[i], tw[j]]);
       }
+      var nCy = cyPairs.length;
+      pairs = cyPairs.concat(pairs);
       if (!pairs.length) return out;
-      var p0 = HR.int(0, pairs.length - 1);
+      var p0 = HR.int(0, (nCy || pairs.length) - 1);
       function tierY(bd, y) {
         for (var k = bd.tiers.length - 1; k >= 0; k--) { var t = bd.tiers[k]; if (t.y0 <= y && t.y1 >= y) return t; }
         return null;
@@ -1015,7 +1145,7 @@
         var k;
         for (k = 0; k < S.length; k++) {
           var dx = S[k][0] - q[0], dy = S[k][1] - q[1], dz = S[k][2] - q[2];
-          if (dx * dx + dy * dy + dz * dz < (Rm + 4) * (Rm + 4)) return false;
+          if (dx * dx + dy * dy + dz * dz < (SR[k] + 4) * (SR[k] + 4)) return false;
         }
         for (k = 0; k < RES.length; k++) if (boxDist(RES[k], q) < 4) return false;
         for (k = 0; k < boxes.length; k++) if (boxDist(boxes[k], q) < m) return false;
@@ -1032,6 +1162,10 @@
         var h = HR.range(15, 30), tilt = HR.range(3, 9) * (HR.chance(0.5) ? 1 : -1) * Math.PI / 180;
         var u = HR(), v = HR();
         var ylo = Hm * 2 / 3 + h / 2 + 1, yhi = Hm - h / 2 - 4;
+        /* across the canyon: low, in the window over its air box and under
+           the 155 m band, where the bridges hang and the chase view sees it */
+        var cA = pr2[2] ? canyonAir(A.face[0] ? 0 : 1) : null;
+        if (cA) { ylo = cA.max[1] + 5 + h / 2; yhi = Math.min(yhi, LANE_Y[2] - LANE_CLEAR - 2 - h / 2); }
         if (yhi < ylo) continue;
         var yc = ylo + (yhi - ylo) * u, hy = h / 2 * Math.cos(tilt), hz = h / 2 * Math.abs(Math.sin(tilt));
         /* the same tier of each tower over the whole height of the quad, so
@@ -1041,9 +1175,9 @@
           tierY(B, yc - hy - 1) !== tb || tierY(B, yc + hy + 1) !== tb) continue;
         var ox = Math.min(ta.x1, tb.x1) - Math.max(ta.x0, tb.x0), oz = Math.min(ta.z1, tb.z1) - Math.max(ta.z0, tb.z0);
         var gx = Math.max(tb.x0 - ta.x1, ta.x0 - tb.x1), gz = Math.max(tb.z0 - ta.z1, ta.z0 - tb.z1);
-        var axis = -1, gap = 0, g0 = 0, o0 = 0, o1 = 0;
-        if (oz >= 12 && gx >= HOLO_GAP[0] && gx <= HOLO_GAP[1]) { axis = 0; gap = gx; g0 = Math.min(ta.x1, tb.x1); o0 = Math.max(ta.z0, tb.z0); o1 = o0 + oz; }
-        else if (ox >= 12 && gz >= HOLO_GAP[0] && gz <= HOLO_GAP[1]) { axis = 1; gap = gz; g0 = Math.min(ta.z1, tb.z1); o0 = Math.max(ta.x0, tb.x0); o1 = o0 + ox; }
+        var axis = -1, gap = 0, g0 = 0, o0 = 0, o1 = 0, gLo = pr2[2] ? 28 : HOLO_GAP[0];
+        if (oz >= 12 && gx >= gLo && gx <= HOLO_GAP[1]) { axis = 0; gap = gx; g0 = Math.min(ta.x1, tb.x1); o0 = Math.max(ta.z0, tb.z0); o1 = o0 + oz; }
+        else if (ox >= 12 && gz >= gLo && gz <= HOLO_GAP[1]) { axis = 1; gap = gz; g0 = Math.min(ta.z1, tb.z1); o0 = Math.max(ta.x0, tb.x0); o1 = o0 + ox; }
         if (axis < 0) continue;
         /* full width: face to face, minus the inset on each side */
         var w = gap - 2 * HOLO_INSET;
@@ -1069,7 +1203,7 @@
         }
         if (!ok) continue;
         out.push({ p: c, right: right, up: up, w: w, h: h, hue: nAcc === 1 ? 0 : HR.int(0, 1), sat: HOLO_SAT,
-          seed: HR(), a: A.g, b: B.g,
+          seed: HR(), a: A.g, b: B.g, canyon: !!pr2[2],
           /* ticker: scroll speed in m/s and direction along right (+1 or -1) */
           speed: HR.range(HOLO_SPEED[0], HOLO_SPEED[1]), dir: HR.chance(0.5) ? 1 : -1 });
         break;
@@ -1157,7 +1291,7 @@
       holograms: holograms, beacons: beacons,
       cables: cables, bridges: bridges, streets: streets, top: top,
       /* per building: archetype, district, facade program, block, roof */
-      buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top }; }),
+      buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top, wall: !!b.face }; }),
       landmark: landmark
     };
   }
