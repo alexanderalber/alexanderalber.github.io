@@ -86,7 +86,10 @@
        up to 2), and liveliness (0 to 1) scales all of them at once. The
        renderer takes windowLife and the crown breathing from its own
        options (makeCityRenderer), the tile carries holograms and beacons. */
-    liveliness: 0.6, holograms: 1, beacons: 1, windowLife: 1
+    liveliness: 0.6, holograms: 1, beacons: 1, windowLife: 1,
+    /* the sign atlas metadata (assets/files/hikyaku-signs.json) or null:
+       with it the blade signs carry their word and shrink to it (makeTile) */
+    signs: null
   };
   function rateOf(v) { return v === true ? 1 : (v === false || v == null) ? 0 : clamp(+v || 0, 0, 2); }
   /* the effective rate of one life feature: its own rate times liveliness */
@@ -339,7 +342,9 @@
                      and the rare parking deck went with the old lot rule.
        lots:    { total, built, empty, lowered, cut, dropped, boxDrops }
        lights:  [{ p, size, kind: 'beacon' | 'haze', hue }]
-       accents: [{ p, n, w, h, hue, seed, kind: 'flat' | 'blade' }]
+       accents: [{ p, n, w, h, hue, seed, kind: 'flat' | 'blade', sign? }]
+                (sign: the atlas entry id of a blade when opts.signs was
+                given, its w and h then the word's fitted body)
        pads:    [{ p, n, w, d, kind: 'roof' | 'balcony' | 'deck' }]  (no deck since V3)
        cables:  [{ a, b, sag }]
        bridges: [box index]
@@ -899,6 +904,7 @@
 
     /* Balconies and signs need a facade: the base tier of a building. */
     var FACES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    var SG = C.signs && C.signs.entries && globalThis.HikyakuSigns ? globalThis.HikyakuSigns : null, nBlade = 0;
     function addExtra(b) {
       if (clear(b)) { boxes.push(b); return true; }
       lots.boxDrops++;
@@ -943,13 +949,32 @@
         var off = R.range(-0.35, 0.35) * faceW;
         var ax = fpx + tang[0] * off, az = fpz + tang[2] * off;
         var nx = fc[0], nz = fc[1];
-        var ex = ax + nx * (sw + 1.2), ez = az + nz * (sw + 1.2);
-        var bb = mk(Math.min(ax, ex) - (fc[0] ? 0 : 0.3), sy - sh / 2 - 0.2, Math.min(az, ez) - (fc[1] ? 0 : 0.3),
-          Math.max(ax, ex) + (fc[0] ? 0 : 0.3), sy + sh / 2 + 0.2, Math.max(az, ez) + (fc[1] ? 0 : 0.3), 0.08, bd.seed, 'blade', bd.g);
-        if (addExtra(bb)) {
-          accents.push({ p: [ax + nx * (sw / 2 + 0.6), sy, az + nz * (sw / 2 + 0.6)], n: tang.slice(), w: sw, h: sh,
-            hue: hue, seed: R(), kind: 'blade' });
+        var bladeBox = function (w, h) {
+          var ex = ax + nx * (w + 1.2), ez = az + nz * (w + 1.2);
+          return mk(Math.min(ax, ex) - (fc[0] ? 0 : 0.3), sy - h / 2 - 0.2, Math.min(az, ez) - (fc[1] ? 0 : 0.3),
+            Math.max(ax, ex) + (fc[0] ? 0 : 0.3), sy + h / 2 + 0.2, Math.max(az, ez) + (fc[1] ? 0 : 0.3), 0.08, bd.seed, 'blade', bd.g);
+        };
+        var bb = bladeBox(sw, sh), keep = bb, ent = null;
+        /* With the sign atlas (C.signs, hikyaku-signs.js) the word is
+           picked here, before the box is kept, and the blade shrinks to
+           the word's fitted body (same centre height, same facade anchor,
+           less reach and less height, never more), so a short word leaves
+           no invisible slab. The pick seed is a hash, not R, and the
+           clearance test runs on the full box: the tile's random stream
+           and everything else in it stay the same with or without the
+           atlas. */
+        if (SG) {
+          ent = SG.pick(C.signs, sw, sh, hashU(ix, iz, C.seed, 700 + nBlade));
+          var ft = SG.fit(ent, sw, sh);
+          sw = Math.min(sw, ft.bw); sh = Math.min(sh, ft.bh);
+          keep = bladeBox(sw, sh);
         }
+        nBlade++;
+        if (clear(bb)) {
+          boxes.push(keep);
+          accents.push({ p: [ax + nx * (sw / 2 + 0.6), sy, az + nz * (sw / 2 + 0.6)], n: tang.slice(), w: sw, h: sh,
+            hue: hue, seed: R(), kind: 'blade', sign: ent ? ent.id : null });
+        } else lots.boxDrops++;
       } else {
         var vert = R.chance(0.6);
         var w2 = Math.min(R.range(6, 14), faceW - 2), h2 = vert ? w2 * R.range(1.6, 2.6) : w2 * R.range(0.3, 0.45);
@@ -2225,9 +2250,10 @@
     };
     var facadeMat = fog.patch(new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.85, metalness: 0.15 }), { facade: facade });
 
-    /* signs: procedural neon panels, no texture, no text yet (the sign
-       atlas comes with the easter egg). A frame tube and a column of
-       glyph-like strokes, white core, hue halo. */
+    /* signs, fallback: procedural neon panels, no texture, no text. A
+       frame tube and a column of glyph-like strokes, white core, hue halo.
+       Only drawn until the sign atlas has loaded (see signLayer below), or
+       when it cannot load. */
     var signMat = new THREE.ShaderMaterial({
       uniforms: Object.assign({ uFogK: { value: 0.55 } }, fog.uniforms),
       vertexShader: [
@@ -2284,6 +2310,44 @@
       side: THREE.DoubleSide, toneMapped: false, fog: false,
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1
     });
+
+    /* signs: real Japanese words from the prerendered atlas
+       (hikyaku-signs.js, assets/files/hikyaku-signs.*), all signs as ONE
+       instanced mesh. The atlas carries no hue; it comes from sigPal, the
+       city's two accents first, then the module's louder extras. With up
+       to two sign colours a sign keeps its tile hue (a.hue), above that
+       the colour follows the sign's seed; either way its glow billboard
+       takes the same palette entry. opts.signColours (1 to 8, default 2)
+       and setSignColours(n) set the count; one accent colour (nAcc 1)
+       keeps a single hue unless more than two are asked for. Loaded
+       asynchronously: the fallback panels above stand in until then. */
+    var HS = globalThis.HikyakuSigns || null;
+    var sigPal = (o.accentColors || [0x2ee8ff, 0xff3fa4]).slice(0, 2);
+    if (HS) sigPal = sigPal.concat(HS.PALETTE.slice(sigPal.length));
+    var signN = 2, signLayer = null, signAtlas = null, disposed = false;
+    function sigEffN() { return Math.min(sigPal.length, nAcc === 1 && signN <= 2 ? 1 : signN); }
+    function setSignColours(n) {
+      signN = clamp(Math.round(n == null ? 2 : +n || 2), 1, 8);
+      if (signLayer) { signLayer.setPalette(sigPal, sigEffN()); dirty = true; }
+    }
+    setSignColours(o.signColours);
+    if (HS && nAcc && o.signAtlas !== false) {
+      HS.loadAtlas(THREE, o.signBase ? { base: o.signBase } : undefined).then(function (at) {
+        if (disposed) { at.texture.dispose(); return; }
+        signAtlas = at;
+        signLayer = HS.create(THREE, at, { fog: fog, palette: sigPal, paletteN: sigEffN() });
+        signLayer.mesh.userData.kind = 'city-signs';
+        group.add(signLayer.mesh);
+        dirty = true;
+      }).catch(function (e) {
+        if (typeof console !== 'undefined') console.warn('hikyaku: sign atlas not loaded, procedural signs stay', e);
+      });
+    }
+    /* sRGB numbers of sign palette entry for colour value u, times gain */
+    function sigOut(u, gain) {
+      var x = sigPal[HS.colourIndex(u, sigEffN())[0]];
+      return [((x >> 16) & 255) / 255 * gain, ((x >> 8) & 255) / 255 * gain, (x & 255) / 255 * gain];
+    }
 
     /* additive glow billboards (faked bloom), from citygen GlowLayer.
        iBlink = (mode, phase, period) for the city life beacons, a closed
@@ -2542,11 +2606,37 @@
       var ta = [], tb = [], tw = [], tc = [];
       var cl = [];
       var lampC = hueOut(-1, 1);
+      var sl = [], meta = signLayer ? signAtlas.meta : null, effN = sigEffN();
       tiles.forEach(function (e) {
         var t = e.tile, i;
         for (i = 0; i < t.accents.length; i++) {
           var a = t.accents[i];
           var n = a.n, up = [0, 1, 0];
+          if (meta) {
+            /* atlas sign: a blade carries its word from the tile (picked
+               there so its box fits it); a flat one picks here. A blade's
+               box is 0.6 m thick around a.p, so the word goes on both of
+               its faces, each instance facing outward. */
+            var ent = a.sign != null && meta.entries[a.sign] ? meta.entries[a.sign] : undefined;
+            var su0 = effN <= 2 ? HS.colourU(Math.min(Math.max(a.hue, 0), effN - 1), effN) : undefined;
+            var spec = { p: a.p, n: a.n, w: a.w, h: a.h, seed: a.seed, u: su0, entry: ent }, q0;
+            if (a.kind === 'blade') {
+              for (var sd2 = -1; sd2 <= 1; sd2 += 2) {
+                spec.p = [a.p[0] + n[0] * 0.35 * sd2, a.p[1], a.p[2] + n[2] * 0.35 * sd2];
+                spec.n = [n[0] * sd2, 0, n[2] * sd2];
+                q0 = HS.instance(meta, spec, { paletteN: effN });
+                spec.entry = q0.entry;
+                sl.push(q0);
+              }
+            } else {
+              q0 = HS.instance(meta, spec, { paletteN: effN });
+              sl.push(q0);
+            }
+            var gq = sigOut(q0.sign[0], a.kind === 'blade' ? 0.2 : 0.12), fq = q0.fit;
+            gp.push(a.p[0] + n[0] * 1.5, a.p[1], a.p[2] + n[2] * 1.5);
+            gs.push(Math.max(fq.bw * 2.4, 8), fq.bh * 1.4); gc.push(gq[0], gq[1], gq[2]); gb.push(0, 0, 1);
+            continue;
+          }
           /* right = up x n, so the quad faces along n */
           var r = [n[2], 0, -n[0]];
           var hw = a.w / 2, hh = a.h / 2, c = a.p;
@@ -2614,6 +2704,8 @@
           }
         }
       });
+      /* the atlas layer stays in the group and is only refilled */
+      if (signLayer) signLayer.set(sl);
       if (sp.length) {
         var g1 = new THREE.BufferGeometry();
         g1.setAttribute('position', new THREE.Float32BufferAttribute(sp, 3));
@@ -2689,6 +2781,7 @@
       if (typeof t === 'number' && isFinite(t)) clock = t;
       else if (typeof dt === 'number' && isFinite(dt)) clock += dt;
       timeU.value = clock;
+      if (signLayer) signLayer.uniforms.uTime.value = clock;
       if (dirty) rebuildLayers();
       if (cullDirty) {
         var r = loadedRect(tiles.keys());
@@ -2711,6 +2804,11 @@
       skyG.dispose(); QUAD.dispose(); SQUAD.dispose();
       [facadeMat, signMat, glowMat, holoMat, streakMat, cableMat, skyMat].forEach(function (m) { m.dispose(); });
       lutTex.dispose();
+      /* the atlas layer and its texture are this renderer's own; a load
+         still in flight sees disposed and throws its texture away */
+      disposed = true;
+      if (signLayer) { signLayer.dispose(); signLayer = null; }
+      if (signAtlas) { signAtlas.texture.dispose(); signAtlas = null; }
       if (group.parent) group.parent.remove(group);
     }
     return {
@@ -2720,7 +2818,10 @@
       /* setLife({ liveliness, windowLife, beacons }): the shader side of
          the city life, live; holograms and beacons come with the tiles
          (makeCity options). time(): the life clock in seconds. */
-      setLife: setLife, time: function () { return clock; }
+      setLife: setLife, time: function () { return clock; },
+      /* setSignColours(n): 1 to 8 sign hues, live (atlas signs only);
+         signs(): the atlas layer once loaded, else null */
+      setSignColours: setSignColours, signs: function () { return signLayer; }
     };
   }
 

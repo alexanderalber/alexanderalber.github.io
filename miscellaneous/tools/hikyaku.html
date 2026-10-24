@@ -180,6 +180,7 @@
   <script src="/assets/js/colorramps.js"></script>
   <script src="/assets/js/courier.js"></script>
   <script src="/assets/js/hikyaku-city.js"></script>
+  <script src="/assets/js/hikyaku-signs.js"></script>
   <script src="/assets/js/hikyaku-events.js"></script>
   <script src="/assets/js/synthwave.js"></script>
   <script src="/assets/js/hikyaku-traffic.js"></script>
@@ -1827,7 +1828,7 @@ function hazeOf(p) {
    without storing them, ?variety=<0 to 1> the city's variety
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1837,7 +1838,9 @@ const URL_CAMDX = parseFloat(URLP.get('camdx')) || 0;
 const URL_FOG = parseFloat(URLP.get('fog'));
 const URL_VARIETY = parseFloat(URLP.get('variety'));
 /* ?t=<seconds> fixes the city life clock (holograms, beacons, windows) for
-   a shot; ?shot=hologram looks at the hologram nearest the sixth open ring */
+   a shot; ?shot=hologram looks at the hologram nearest the sixth open ring,
+   ?shot=sign at the blade sign nearest to it, from 40 m down the street
+   and 9 m below it */
 const URL_T = parseFloat(URLP.get('t'));
 const URL_EVENT = ['laser', 'searchlight'].indexOf(URLP.get('event')) >= 0 ? URLP.get('event')
   : (SHOT === 'laser' || SHOT === 'searchlight' ? SHOT : null);
@@ -1866,6 +1869,9 @@ const DEF = {
      kH of the atmosphere in hikyaku-city.js makeFog, per metre at ground
      level; the ground soup does not depend on it. */
   cityDensity: 0.92, cityMaxH: 420, cityAccents: 2, fogDensity: 0.0026, cityRadius: 4,
+  /* Hues of the neon signs (hikyaku-signs.js palette): 2 are the city's
+     two accents, 4 and 8 add amber, green, violet and more. Live. */
+  signColours: 2,
   /* City variety (CITY-VARIETY.md, first round): districts, archetypes and
      facade programs from 0 (the old uniform city) to 1, the scale of the
      district noise in metres, and the landmarks. Applied on "Rebuild". */
@@ -1906,7 +1912,8 @@ const DEF = {
      added the world life, freighter, event and music keys, also filled by
      the merge. Below 6, liveliness and freightDensity are dropped once, so
      the livelier defaults (0.85, owner: the rare things were too rare)
-     reach a browser that stored 0.6. */
+     reach a browser that stored 0.6. signColours came later without a
+     bump: a new key, filled by the merge. */
   cfgV: 6
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
@@ -1916,9 +1923,13 @@ const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
 const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'] };
 const STORE = 'hk.cfg';
+let SIGN_META = null;
+const SIGN_META_P = fetch('/assets/files/hikyaku-signs.json').then((r) => (r.ok ? r.json() : null))
+  .then((m) => { SIGN_META = m && Array.isArray(m.entries) ? m : null; }).catch(() => {});
 /* Event lookups: a hand-made event for the screenshot hooks, at a roof
    pad in front of the camera (the city must have streamed in). */
-function shotEvent(kind, t, pos, fwd, pads) {
+function shotEvent(kind, t, pos, fwd, pads, boxesNear) {
+  if (kind === 'laser') return HE.shotLaser(t, pos, fwd, pads, boxesNear);
   const hf = Math.hypot(fwd[0], fwd[2]) || 1, f = [fwd[0] / hf, fwd[2] / hf];
   const near = kind === 'laser' ? [450, 900] : [350, 700];
   let best = null;
@@ -1934,20 +1945,6 @@ function shotEvent(kind, t, pos, fwd, pads) {
   /* across the view: the heading turned by 70 degrees toward the middle */
   const side = best && Math.atan2(f[0] * (o[2] - pos[2]) - f[1] * (o[0] - pos[0]), f[0] * (o[0] - pos[0]) + f[1] * (o[2] - pos[2])) > 0 ? -1 : 1;
   const az = Math.atan2(f[1], f[0]) + side * 70 * Math.PI / 180;
-  if (kind === 'laser') {
-    const el = 16 * Math.PI / 180, shots = [];
-    const dirOf = (a, e) => [Math.cos(e) * Math.cos(a), Math.sin(e), Math.cos(e) * Math.sin(a)];
-    for (let k = 0; k < 7; k++) {
-      shots.push({ k, t: 0.13 * k, from: [o[0], o[1] + 1.5, o[2]], dir: dirOf(az + (k % 3 - 1) * 0.03, el + (k % 2) * 0.02),
-        len: 30, range: 1300, reply: false });
-    }
-    const air = [o[0] + 450 * Math.cos(az), o[1] + 130, o[2] + 450 * Math.sin(az)];
-    for (let j = 0; j < 2; j++) {
-      const v = SD.sub([o[0], o[1], o[2]], air), l = SD.len(v);
-      shots.push({ k: 7 + j, t: 0.35 + 0.3 * j, from: air.slice(), dir: [v[0] / l, v[1] / l, v[2] / l], len: 30, range: l, reply: true });
-    }
-    return { kind: 'laser', id: 'shot:laser', tStart: t - 0.75, tEnd: t + 4, origin: o, params: { speed: 600, shots, air }, info: {} };
-  }
   if (URL_DRONE) {
     return { kind: 'searchlight', id: 'shot:searchlight', tStart: t - 30, tEnd: t + 100, origin: [o[0], o[1] + 120, o[2]],
       params: { mount: 'drone', len: 380, half: 5 * Math.PI / 180, elMin: -1.31, elMax: -0.26,
@@ -2395,7 +2392,7 @@ function App() {
     variety: Number.isFinite(URL_VARIETY) ? Math.max(0, Math.min(1, URL_VARIETY)) : cityCfg.variety,
     districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks,
     liveliness: cityCfg.liveliness, holograms: cityCfg.holograms, beacons: cityCfg.beacons,
-    core: routeCore(route), reserved: specials
+    core: routeCore(route), reserved: specials, signs: SIGN_META
   }), [route, cityCfg, specials]);
   const cityNow = cityOf(p);
   const cityPending = Object.keys(cityNow).some((k) => cityNow[k] !== cityCfg[k]);
@@ -2848,6 +2845,20 @@ function App() {
           state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
         }
       }
+      if (SHOT === 'sign') {
+        const w = open[Math.min(5, open.length - 1)], t0 = HC.tileOf(w.p);
+        let sb = null;
+        for (let i = -3; i <= 3; i++) for (let k = -3; k <= 3; k++) for (const A of cfg.city.peek(t0[0] + i, t0[1] + k).accents) {
+          if (A.kind !== 'blade' || A.p[1] < 25) continue;
+          const d = Math.hypot(A.p[0] - w.p[0], A.p[2] - w.p[2]);
+          if (!sb || d < sb.d) sb = { A, d };
+        }
+        if (sb) {
+          /* level, so the sign stands above the ship rather than behind it */
+          const A = sb.A, cam = [A.p[0] + A.n[0] * 40, A.p[1] - 9, A.p[2] + A.n[2] * 40];
+          state.s = poseAt(cam, [-A.n[0], 0, -A.n[2]], 0);
+        }
+      }
       state.tFix = null;
       if (SHOT === 'freighter' && cfg.lanes && cfg.lanes.freight.length) {
         /* the freighter lane nearest the sixth open ring: the point of its
@@ -3286,6 +3297,7 @@ function App() {
           evs = HE.schedule(route.seed, evT - 1, evT + 1, {
             liveliness: pp.liveliness, kinds, cache: state.evCache, around: sp0, forward: [fx, 0, fz],
             clearance: (q) => route.tube.dist(q) > tubeR + 20,
+            roofs: () => city.pads(), boxesNear: city.boxesNear,
             pickOrigin: (kind, rng) => {
               if (!padsNow) padsNow = city.pads().filter((pd) => pd.kind === 'roof' && pd.p[1] > 25);
               const ok = [];
@@ -3293,7 +3305,7 @@ function App() {
                 const dx = pd.p[0] - sp0[0], dz = pd.p[2] - sp0[2], d = Math.hypot(dx, dz);
                 if (d < 400 || d > 1500) continue;
                 const c = (dx * fx + dz * fz) / d;
-                if (kind === 'laser' ? Math.abs(c) < 0.6 : c > 0.25) ok.push(pd);
+                if (c > 0.25) ok.push(pd);
               }
               return ok.length ? ok[Math.floor(rng() * ok.length)].p.slice() : null;
             }
@@ -3302,11 +3314,11 @@ function App() {
         if (URL_EVENT) {
           if (!state.evShot && cityR && !state.pending) {
             const cp0 = camera.position, fd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-            state.evShot = shotEvent(URL_EVENT, evT, [cp0.x, cp0.y, cp0.z], [fd.x, fd.y, fd.z], city.pads());
+            state.evShot = shotEvent(URL_EVENT, evT, [cp0.x, cp0.y, cp0.z], [fd.x, fd.y, fd.z], city.pads(), city.boxesNear);
           }
           if (state.evShot) evs = evs.concat([state.evShot]);
         }
-        g.events.update(evT, camera.position, evs);
+        g.events.update(evT, camera.position, evs, renderer.domElement.height);
         for (const ev of evs) {
           if (ev.kind !== 'laser' || evT < ev.tStart || evT > ev.tEnd) continue;
           const d = Math.hypot(ev.origin[0] - s.p[0], ev.origin[1] - s.p[1], ev.origin[2] - s.p[2]);
@@ -3576,7 +3588,7 @@ function App() {
     city.clear();
     const q0 = cfgRef.current.p;
     const cr = HC.makeCityRenderer(g.THREE, { fog: g.fog, seed: city.seed, accents: city.cfg.accents, accentColors: CITY_HUES,
-      liveliness: q0.liveliness, windowLife: q0.windowLife, beacons: q0.beacons });
+      liveliness: q0.liveliness, windowLife: q0.windowLife, beacons: q0.beacons, signColours: q0.signColours });
     cr.owner = city;
     g.scene.add(cr.group);
     g.cityR = cr;
@@ -3585,6 +3597,12 @@ function App() {
       if (g.cityR === cr) g.cityR = null;
     };
   }, [ready, city]);
+
+  /* the sign hues follow the panel at once */
+  useEffect(() => {
+    const g = glRef.current;
+    if (g && g.cityR) g.cityR.setSignColours(p.signColours);
+  }, [ready, city, p.signColours]);
 
   /* the shader side of the city life follows the panel at once */
   useEffect(() => {
@@ -3921,6 +3939,8 @@ function App() {
           value=${p.cityMaxH} onChange=${upd('cityMaxH')} />
         <${Seg} label="Neon accent colours" value=${p.cityAccents} onChange=${upd('cityAccents')}
           options=${[{ value: 0, label: 'None' }, { value: 1, label: 'One' }, { value: 2, label: 'Two' }]} />
+        <${Seg} label="Sign colours" value=${p.signColours} onChange=${upd('signColours')}
+          options=${[1, 2, 4, 8].map((v) => ({ value: v, label: String(v) }))} />
         <${Slider} label="Variety" digits=${2} min=${0} max=${1} step=${0.05}
           value=${p.cityVariety} onChange=${upd('cityVariety')} />
         <${Slider} label="District size" unit="m" digits=${0} min=${600} max=${2000} step=${50}
@@ -3940,6 +3960,8 @@ function App() {
           45 m tube around the route: buildings there are lowered, split into a canyon or left out, so every ring
           stays reachable. Bridges and cables keep clear of the three future traffic altitudes
           (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.
+          "Sign colours" sets how many hues the neon signs use and applies at once. Two are the accent
+          colours; four and eight add more.
           "Haze" sets the fog above the roofs. The fog in the streets stays dense at any setting, and it thins out
           above about 60 m. "Max height" is the top of the regular towers; a few landmarks reach a fifth higher.</p>
       <//>
@@ -4048,7 +4070,13 @@ function App() {
   <//>`;
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+/* The sign atlas metadata goes into the city generator (blade signs carry
+   their word and shrink to it), so the page waits for the 14 kB JSON
+   before the first render; then the collision boxes are the same from the
+   first tile on. Without it the blades keep their full boxes (the
+   renderer still loads the atlas on its own, or falls back to the
+   procedural panels). */
+SIGN_META_P.then(() => ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`));
   </script>
 </body>
 </html>

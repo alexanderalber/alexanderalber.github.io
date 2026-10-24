@@ -1,5 +1,5 @@
-/* hikyaku-events.js -- rare world events for Hikyaku: laser exchanges and
- * searchlights.
+/* hikyaku-events.js -- rare world events for Hikyaku: rooftop firefights
+ * with laser handguns, and searchlights.
  *
  * The owner's rule for all of this: these things are good exactly when they
  * are rare. So every event kind has a rate per hour, and one global
@@ -18,15 +18,23 @@
  *     fixed uniform). state(event, t) is the drawable state at time t, a
  *     closed formula in t: nothing is integrated.
  *   - Visual layer: create(THREE, { fog, colors }) builds fixed pools (16
- *     shot segments, 8 glows, 4 cones, 4 bodies) and update(t, cameraPos,
- *     events) fills them. THREE is a parameter, never an import. The light
+ *     bolts, 12 glows, 4 cones, 4 bodies) and update(t, cameraPos,
+ *     events, viewH?) fills them (viewH: canvas height in pixels, for the
+ *     bolts' pixel floor). THREE is a parameter, never an import. The light
  *     materials are additive ShaderMaterials that take the shared
  *     atmosphere through fog.inject (hikyaku-city.js makeFog), so they fade
  *     with distance like every other emissive thing in the scene. The
  *     bodies behind the searchlights (a small drone, or a lamp on a roof
  *     pedestal) are lit meshes through fog.patch.
  *
- * Origins: the caller passes pickOrigin(kind, rng, info) and clearance(p).
+ * Lasers: a firefight between two shooters on nearby roofs, short bursts
+ * of travelling bolts both ways (see LASER). The caller passes the roofs
+ * (the city pads) and, optionally, boxesNear for a clear line of fire;
+ * findPairs keeps the pairs 20 to 80 m apart, 60 m up or more, 150 to
+ * 600 m from the ship, out of the route tube.
+ *
+ * Searchlight origins: the caller passes pickOrigin(kind, rng, info) and
+ * clearance(p).
  * The schedule retries a pick a few times when clearance rejects it (or when
  * it lies closer than minDist to opts.around) and drops the event if no pick
  * passes. Because the page's picker depends on where the ship is right now,
@@ -47,17 +55,34 @@
   /* events per hour at liveliness 1 */
   var RATES = { laser: 35, searchlight: 70 };
   /* longest possible duration per kind, so a window query can look back */
-  var MAXDUR = { laser: 8, searchlight: 200 };
+  var MAXDUR = { laser: 10, searchlight: 200 };
 
+  /* A laser event is a firefight between two roofs: two shooters on the
+     facing edges of two nearby roofs (or two far corners of one big roof)
+     trade short bursts of travelling bolts. Bolts, not instant lines: a
+     line across 50 m reads as one beam weapon, a 3 to 6 m bolt moving at
+     handgun-ish speed reads as small arms, and at 60 fps it advances about
+     its own length per frame, so it is seen as a dash, not as a dot. */
   var LASER = {
-    speed: 600,                        // m/s
-    shots: [3, 8], window: [1, 2],     // shots per exchange, seconds
-    len: [20, 40],                     // segment length, m
-    elev: [10, 30],                    // degrees above horizontal
-    range: [900, 1600],                // m a shot flies before it is gone
-    replyChance: 0.55, replies: [1, 2],
-    replyDist: [300, 600],             // airborne point, m from the origin
-    minDist: 300                       // m from the ship, at least
+    speed: 240,                        // m/s, bolt speed
+    len: [3.5, 6],                     // bolt length, m
+    dur: [3, 7],                       // s of shooting per event
+    burst: [2, 5],                     // shots per burst
+    gap: [0.1, 0.24],                  // s between shots inside a burst
+    pause: [0.35, 1.5],                // s between bursts, irregular
+    alt: 0.8,                          // chance the next burst is the other side
+    maxShots: 40,
+    pair: [20, 80],                    // m between the shooters, horizontal
+    maxDy: 40,                         // m height difference, at most
+    maxSlope: 1.2,                     // dy / horizontal, at most
+    minY: 60,                          // m roof height, at least
+    near: [150, 600],                  // m from the ship to the pair's middle
+    sameRoof: 60,                      // m: one roof this long holds a pair across it
+    inset: 1,                          // m from the roof edge to the shooter
+    up: 1.3,                           // m muzzle above the roof
+    spread: 1.8,                       // m of miss around the target, horizontal
+    muzzle: { size: 0.6, rise: 0.004, decay: 0.05 },
+    impact: { size: 1.1, rise: 0.004, decay: 0.11 }
   };
   var LIGHT = {
     dur: [60, 180], fadeIn: 5, fadeOut: 8,
@@ -115,7 +140,7 @@
         var faz = Math.atan2(f[2], f[0]);
         var side = r() < 0.5 ? -1 : 1;
         var az = faz + side * Math.PI / 2 + (r() + r() - 1) * 50 * DEG;
-        var rr = kind === 'laser' ? uni(r, [400, 1200]) : uni(r, [250, 1400]);
+        var rr = kind === 'laser' ? uni(r, [200, 580]) : uni(r, [250, 1400]);
         p = [c[0] + rr * Math.cos(az), 0, c[2] + rr * Math.sin(az)];
       } else {
         var e = opts.extent || 2000;
@@ -138,46 +163,189 @@
     return true;
   }
 
-  /* ---- event construction --------------------------------------------- */
-  function makeLaser(ev, r, pick, opts) {
-    var P = LASER, minD = opts.minDist != null ? opts.minDist : P.minDist;
-    var o = null, pr = rngFrom(hash(ev.h, 77));
-    for (var k = 0; k < 8 && !o; k++) {
-      var c = asPoint(pick('laser', pr, ev.info));
-      if (okPoint(c, opts, minD)) o = c;
+  /* ---- roof pairs --------------------------------------------------------
+     A roof is { p: [x, y, z] the centre of its top face, w (along x), d
+     (along z), kind?, bid? }, exactly the city's pads (HikyakuCity
+     makeCity().pads(), kind 'roof'). Entries with another kind are
+     skipped. A pair is two shooter spots, each on the edge of its roof that
+     faces the other, LASER.inset in from the edge. */
+  function roofList(src, around, P) {
+    var list = typeof src === 'function' ? src(around, P.near[0], P.near[1]) : src;
+    var out = [];
+    if (!list) return out;
+    var reach = P.near[1] + P.pair[1] + 80;
+    for (var i = 0; i < list.length; i++) {
+      var q = list[i];
+      if (!q || !q.p || (q.kind && q.kind !== 'roof')) continue;
+      if (!(q.p[1] >= P.minY) || !(q.w > 2 * P.inset) || !(q.d > 2 * P.inset)) continue;
+      if (around && Math.hypot(q.p[0] - around[0], q.p[2] - around[2]) > reach) continue;
+      out.push(q);
     }
-    if (!o) return null;
-    var n = intIn(r, P.shots), W = uni(r, P.window);
-    var az0 = r() * 2 * Math.PI, el0 = uni(r, [P.elev[0] + 4, P.elev[1] - 4]) * DEG;
-    var shots = [], ts = [0];
-    for (var i = 1; i < n; i++) ts.push(r() * W);
-    ts.sort(function (a, b) { return a - b; });
-    var end = 0;
-    for (i = 0; i < n; i++) {
-      var az = az0 + (r() + r() - 1) * 5 * DEG;
-      var el = clamp(el0 + (r() * 2 - 1) * 4 * DEG, P.elev[0] * DEG, P.elev[1] * DEG);
-      var from = [o[0] + (r() * 2 - 1) * 1.5, o[1] + 1 + r(), o[2] + (r() * 2 - 1) * 1.5];
-      var s = { k: i, t: ts[i], from: from, dir: dirOf(az, el), len: uni(r, P.len), range: uni(r, P.range), reply: false };
-      shots.push(s); end = Math.max(end, s.t + s.range / P.speed);
+    /* sorted, so the pick does not depend on the order the city loaded
+       its tiles in */
+    out.sort(function (a, b) { return a.p[0] - b.p[0] || a.p[2] - b.p[2] || a.p[1] - b.p[1]; });
+    return out;
+  }
+  /* the point of roof q nearest to (x, z), inset from the edge */
+  function edgeSpot(q, x, z, inset) {
+    var hw = q.w / 2 - inset, hd = q.d / 2 - inset;
+    return [clamp(x, q.p[0] - hw, q.p[0] + hw), q.p[1], clamp(z, q.p[2] - hd, q.p[2] + hd)];
+  }
+  /* segment a-b against box {min, max}, slab test, true when they meet */
+  function segBox(a, b, bx) {
+    var t0 = 0, t1 = 1;
+    for (var k = 0; k < 3; k++) {
+      var d = b[k] - a[k];
+      if (Math.abs(d) < 1e-9) { if (a[k] < bx.min[k] || a[k] > bx.max[k]) return false; continue; }
+      var u = (bx.min[k] - a[k]) / d, v = (bx.max[k] - a[k]) / d;
+      if (u > v) { var w = u; u = v; v = w; }
+      if (u > t0) t0 = u;
+      if (v < t1) t1 = v;
+      if (t0 > t1) return false;
     }
-    var air = null;
-    if (r() < P.replyChance) {
-      var D = uni(r, P.replyDist);
-      var a = [o[0] + D * Math.cos(az0), o[1] + Math.max(60, D * Math.tan(el0) * uni(r, [0.6, 1.0])), o[2] + D * Math.sin(az0)];
-      if (!opts.clearance || opts.clearance(a)) {
-        air = a;
-        var m = intIn(r, P.replies);
-        for (var j = 0; j < m; j++) {
-          var tgt = [o[0] + (r() * 2 - 1) * 12, o[1], o[2] + (r() * 2 - 1) * 12];
-          var dx = tgt[0] - a[0], dy = tgt[1] - a[1], dz = tgt[2] - a[2], L = Math.hypot(dx, dy, dz);
-          var rs = { k: n + j, t: uni(r, [0.4, W + 0.6]), from: a.slice(), dir: [dx / L, dy / L, dz / L], len: uni(r, P.len), range: L, reply: true };
-          shots.push(rs); end = Math.max(end, rs.t + rs.range / P.speed);
-        }
+    return true;
+  }
+  /* the box a roof is the top face of: we stand on it, it does not block */
+  function isRoofBox(bx, q) {
+    return Math.abs(bx.max[1] - q.p[1]) < 0.05 && q.p[0] >= bx.min[0] - 0.01 && q.p[0] <= bx.max[0] + 0.01 &&
+      q.p[2] >= bx.min[2] - 0.01 && q.p[2] <= bx.max[2] + 0.01;
+  }
+  function lineClear(a, b, qa, qb, opts) {
+    var k;
+    if (opts.clearance) {
+      for (k = 0; k <= 4; k++) {
+        var u = k / 4;
+        if (!opts.clearance([a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u])) return false;
       }
     }
-    ev.origin = o;
-    ev.tEnd = ev.tStart + end + 0.5;
-    ev.params = { speed: P.speed, shots: shots, air: air };
+    if (opts.boxesNear) {
+      var m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+      var bs = opts.boxesNear(m, dist3(a, b) / 2 + 1) || [];
+      for (k = 0; k < bs.length; k++) {
+        var bx = bs[k];
+        if (isRoofBox(bx, qa) || isRoofBox(bx, qb)) continue;
+        if (segBox(a, b, bx)) return false;
+      }
+    }
+    return true;
+  }
+  /* A candidate pair of shooter spots (or null): the horizontal distance,
+     height difference, slope, the ship's distance and, when the caller
+     gives them, the route tube and the city boxes decide. */
+  function pairOf(qa, qb, opts, P) {
+    var a, b, same = qa === qb;
+    if (same) {
+      /* across one big roof (a courtyard, a wide deck): the two ends of its
+         long axis */
+      var alongX = qa.w >= qa.d, half = (alongX ? qa.w : qa.d) / 2 - P.inset;
+      a = alongX ? [qa.p[0] - half, qa.p[1], qa.p[2]] : [qa.p[0], qa.p[1], qa.p[2] - half];
+      b = alongX ? [qa.p[0] + half, qa.p[1], qa.p[2]] : [qa.p[0], qa.p[1], qa.p[2] + half];
+    } else {
+      a = edgeSpot(qa, qb.p[0], qb.p[2], P.inset);
+      b = edgeSpot(qb, a[0], a[2], P.inset);
+      a = edgeSpot(qa, b[0], b[2], P.inset);
+    }
+    var h = Math.hypot(b[0] - a[0], b[2] - a[2]), dy = Math.abs(b[1] - a[1]);
+    if (h < P.pair[0] || h > P.pair[1] || dy > P.maxDy || dy > P.maxSlope * h) return null;
+    var mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+    var dm = opts.around ? Math.hypot(mid[0] - opts.around[0], mid[2] - opts.around[2]) : 0;
+    if (opts.around && (dm < P.near[0] || dm > P.near[1])) return null;
+    var ma = [a[0], a[1] + P.up, a[2]], mb = [b[0], b[1] + P.up, b[2]];
+    if (!lineClear(ma, mb, qa, qb, opts)) return null;
+    return { a: ma, b: mb, ra: qa, rb: qb, h: h, dy: dy, mid: mid, dist: dm };
+  }
+  /* all valid pairs among the roofs, in a fixed order */
+  function findPairs(roofs, opts) {
+    var o = opts || {}, P = LASER;
+    var list = roofList(roofs, o.around, P), out = [], maxW = 0, i, j;
+    for (i = 0; i < list.length; i++) maxW = Math.max(maxW, list[i].w);
+    for (i = 0; i < list.length; i++) {
+      var qa = list[i];
+      if (Math.max(qa.w, qa.d) >= P.sameRoof + 2 * P.inset) { var s = pairOf(qa, qa, o, P); if (s) out.push(s); }
+      for (j = i + 1; j < list.length; j++) {
+        var qb = list[j];
+        if (qb.p[0] - qa.p[0] > P.pair[1] + maxW) break;
+        if (qa.bid != null && qa.bid === qb.bid) continue;
+        if (Math.abs(qb.p[2] - qa.p[2]) > P.pair[1] + (qa.d + qb.d) / 2) continue;
+        var pr = pairOf(qa, qb, o, P);
+        if (pr) out.push(pr);
+      }
+    }
+    return out;
+  }
+  /* a pair drawn by weight: ahead of the ship counts more than behind,
+     where nobody looks */
+  function choosePair(pairs, r, opts) {
+    if (!pairs.length) return null;
+    var f = opts.forward, c = opts.around, ws = [], W = 0;
+    for (var i = 0; i < pairs.length; i++) {
+      var w = 1;
+      if (f && c) {
+        var dx = pairs[i].mid[0] - c[0], dz = pairs[i].mid[2] - c[2], L = Math.hypot(dx, dz) || 1;
+        var cs = (dx * f[0] + dz * f[2]) / (L * (Math.hypot(f[0], f[2]) || 1));
+        w = cs > 0.3 ? 3 : cs > -0.3 ? 1 : 0.15;
+      }
+      ws.push(w); W += w;
+    }
+    var u = r() * W;
+    for (i = 0; i < pairs.length; i++) { u -= ws[i]; if (u <= 0) return pairs[i]; }
+    return pairs[pairs.length - 1];
+  }
+  /* without any roof provider (pure use, tests): two made-up roofs near a
+     point from the default picker */
+  function syntheticPair(r, pick, ev) {
+    var c = asPoint(pick('laser', r, ev.info));
+    if (!c) return null;
+    var P = LASER, az = r() * 2 * Math.PI, h = uni(r, [30, 70]), ya = uni(r, [70, 150]);
+    var yb = clamp(ya + (r() * 2 - 1) * 25, P.minY, 200);
+    var qa = { p: [c[0], ya, c[2]], w: 30, d: 30 };
+    var qb = { p: [c[0] + (h + 30) * Math.cos(az), yb, c[2] + (h + 30) * Math.sin(az)], w: 30, d: 30 };
+    return pairOf(qa, qb, {}, P);
+  }
+
+  /* ---- event construction --------------------------------------------- */
+  /* The firefight itself from a pair and the event's own random stream:
+     bursts that alternate sides (the first reply is certain, later ones
+     come with LASER.alt), each shot from the shooter's muzzle to a point
+     near the other shooter, never below the target roof. */
+  function firefight(pair, r) {
+    var P = LASER, sp = [pair.a, pair.b], roofY = [pair.rb.p[1], pair.ra.p[1]];
+    var dur = uni(r, P.dur), t = 0, side = r() < 0.5 ? 0 : 1, shots = [], end = 0, burst = 0;
+    while (t <= dur && shots.length < P.maxShots) {
+      var n = intIn(r, P.burst);
+      for (var i = 0; i < n && shots.length < P.maxShots; i++) {
+        var f0 = sp[side], g0 = sp[1 - side];
+        var from = [f0[0] + (r() * 2 - 1) * 0.4, f0[1] + (r() * 2 - 1) * 0.25, f0[2] + (r() * 2 - 1) * 0.4];
+        var to = [g0[0] + (r() * 2 - 1) * P.spread, Math.max(roofY[side] + 0.15, g0[1] + uni(r, [-1.4, 0.7])), g0[2] + (r() * 2 - 1) * P.spread];
+        var dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2], L = Math.hypot(dx, dy, dz);
+        var s = { k: shots.length, t: t, from: from, dir: [dx / L, dy / L, dz / L], len: uni(r, P.len), range: L, reply: side === 1, burst: burst };
+        shots.push(s);
+        end = Math.max(end, s.t + (s.range + s.len) / P.speed);
+        if (i < n - 1) t += uni(r, P.gap);
+      }
+      t += uni(r, P.pause);
+      if (burst === 0 || r() < P.alt) side = 1 - side;
+      burst++;
+    }
+    return { shots: shots, end: end };
+  }
+
+  function makeLaser(ev, r, pick, opts) {
+    var pr = rngFrom(hash(ev.h, 77)), pair;
+    if (opts.roofs) pair = choosePair(findPairs(opts.roofs, opts), pr, opts);
+    else if (!opts.pickOrigin) {
+      for (var k = 0; k < 8 && !pair; k++) {
+        pair = syntheticPair(pr, pick, ev);
+        if (pair && !(okPoint(pair.a, opts, LASER.near[0]) && okPoint(pair.b, opts, LASER.near[0]))) pair = null;
+      }
+    }
+    /* a page that gives pickOrigin but no roofs gets no lasers: a single
+       point cannot say where the other side stands */
+    if (!pair) return null;
+    var ff = firefight(pair, r);
+    ev.origin = pair.a.slice();
+    ev.tEnd = ev.tStart + ff.end + 0.4;
+    ev.params = { speed: LASER.speed, shots: ff.shots, a: pair.a, b: pair.b, roofs: [pair.ra.p.slice(), pair.rb.p.slice()] };
     return ev;
   }
 
@@ -213,10 +381,15 @@
 
   /* ---- schedule ---------------------------------------------------------
      opts: liveliness (default 1), rates ({laser, searchlight} per hour),
-     pickOrigin(kind, rng, info), clearance(p) -> bool, around ([x,y,z],
-     the ship; enforces minDist), forward (default picker bias), minDist
-     (lasers, default 300), lightMinDist (default 150), extent (default
-     picker without around), cache (Map id -> event), kinds (subset). */
+     pickOrigin(kind, rng, info) (searchlights), clearance(p) -> bool,
+     around ([x,y,z], the ship), forward (pick bias), lightMinDist (default
+     150), extent (default picker without around), cache (Map id -> event),
+     kinds (subset).
+     Lasers: roofs (array of roofs, or a function (around, rMin, rMax) ->
+     array; the city's pads() as is) and boxesNear(p, r) -> [{min, max}]
+     (optional, rejects a line of fire through a third box). Without roofs
+     and without pickOrigin the lasers run between two made-up roofs (pure
+     use); with pickOrigin but no roofs there are no lasers. */
   function schedule(seed, t0, t1, opts) {
     var o = opts || {};
     var live = o.liveliness == null ? 1 : Math.max(0, o.liveliness);
@@ -253,6 +426,36 @@
     return out;
   }
 
+  /* A hand-made firefight for screenshot hooks: the valid pair best in view
+     (ahead of pos along fwd, near 300 m), its event shifted so that at t
+     the most bolts of the whole event are in the air at once. Returns null
+     when no pair is valid. o: seed, clearance, near. */
+  function shotLaser(t, pos, fwd, roofs, boxesNear, o) {
+    o = o || {};
+    var opts = { around: pos, forward: fwd, boxesNear: boxesNear, clearance: o.clearance };
+    var pairs = findPairs(roofs, opts), best = null, fh = Math.hypot(fwd[0], fwd[2]) || 1;
+    for (var i = 0; i < pairs.length; i++) {
+      var q = pairs[i], dx = q.mid[0] - pos[0], dz = q.mid[2] - pos[2], L = Math.hypot(dx, dz) || 1;
+      var cs = (dx * fwd[0] + dz * fwd[2]) / (L * fh);
+      if (cs < 0.9) continue;
+      /* near the target distance, and across the view rather than along it */
+      var ax = Math.abs(((q.b[0] - q.a[0]) * dx + (q.b[2] - q.a[2]) * dz) / (q.h * L));
+      var score = Math.abs(L - (o.near || 300)) / 100 + ax + (1 - cs) * 10;
+      if (!best || score < best.score) best = { q: q, score: score };
+    }
+    if (!best) return null;
+    var ff = firefight(best.q, rngFrom(hash(o.seed || 1, 99)));
+    var ev = { kind: 'laser', id: 'shot:laser', tStart: 0, tEnd: ff.end + 0.4, origin: best.q.a.slice(),
+      params: { speed: LASER.speed, shots: ff.shots, a: best.q.a, b: best.q.b, roofs: [best.q.ra.p.slice(), best.q.rb.p.slice()] }, info: {} };
+    var bestT = 0, bestN = -1;
+    for (var tt = 0; tt < ff.end; tt += 0.01) {
+      var st = laserState(ev, tt), n = st.shots.length + 0.5 * st.glows.length;
+      if (n > bestN) { bestN = n; bestT = tt; }
+    }
+    ev.tStart = t - bestT; ev.tEnd += ev.tStart;
+    return ev;
+  }
+
   /* expected events per hour for a kind */
   function perHour(kind, liveliness, rates) {
     var r = Object.assign({}, RATES, rates || {});
@@ -260,28 +463,33 @@
   }
 
   /* ---- state ------------------------------------------------------------ */
-  function flash(x) { return x < 0 ? 0 : (1 - Math.exp(-x / 0.015)) * Math.exp(-x / 0.15); }
+  function flash(x, rise, decay) { return x < 0 ? 0 : (1 - Math.exp(-x / rise)) * Math.exp(-x / decay); }
 
+  /* A bolt leaves the muzzle at zero length, grows to its length, flies
+     at the event's speed, stops at its impact point and shrinks into it,
+     so both ends are continuous in t and never leave the segment from
+     s.from to the impact. Glows: a muzzle flash at s.from when it fires,
+     a whiter spark at the impact when its head arrives. */
   function laserState(ev, t) {
-    var P = ev.params, v = P.speed, tl = t - ev.tStart;
-    var shots = [], gO = 0, gA = 0;
+    var P = ev.params, v = P.speed, tl = t - ev.tStart, M = LASER.muzzle, X = LASER.impact;
+    var shots = [], glows = [];
     for (var i = 0; i < P.shots.length; i++) {
       var s = P.shots[i], dt = tl - s.t;
-      if (s.reply) gA += flash(dt); else gO += flash(dt);
       if (dt < 0) continue;
-      var head = v * dt;
-      if (head > s.range) continue;
-      var tail = Math.max(0, head - s.len);
-      var I = 1 - smooth(0.7 * s.range, s.range, head);
+      var tHit = s.range / v;
+      var gm = flash(dt, M.rise, M.decay), gi = flash(dt - tHit, X.rise, X.decay);
+      var end = [s.from[0] + s.dir[0] * s.range, s.from[1] + s.dir[1] * s.range, s.from[2] + s.dir[2] * s.range];
+      if (gm > 1e-3) glows.push({ p: s.from, i: gm, kind: 'muzzle', k: s.k });
+      if (gi > 1e-3) glows.push({ p: end, i: gi, kind: 'impact', k: s.k });
+      var head = Math.min(v * dt, s.range), tail = v * dt - s.len;
+      if (tail >= s.range) continue;
+      tail = Math.max(0, tail);
       shots.push({
-        k: s.k, reply: s.reply, i: I,
+        k: s.k, reply: s.reply, i: 1,
         a: [s.from[0] + s.dir[0] * tail, s.from[1] + s.dir[1] * tail, s.from[2] + s.dir[2] * tail],
         b: [s.from[0] + s.dir[0] * head, s.from[1] + s.dir[1] * head, s.from[2] + s.dir[2] * head]
       });
     }
-    var glows = [];
-    if (gO > 1e-3) glows.push({ p: ev.origin, i: Math.min(gO, 1.6) });
-    if (P.air && gA > 1e-3) glows.push({ p: P.air, i: Math.min(gA, 1.6) });
     return { kind: 'laser', active: t >= ev.tStart && t <= ev.tEnd, shots: shots, glows: glows };
   }
 
@@ -315,35 +523,52 @@
   }
 
   /* ---- visual layer ----------------------------------------------------- */
-  var POOL = { shots: 16, glows: 8, cones: 4, bodies: 4 };
+  var POOL = { shots: 16, glows: 12, cones: 4, bodies: 4 };
   var CONE_SEG = { around: 20, along: 6 };
 
+  /* Bolt shader. The quad spans the halo; its half-width is the physical
+     halo radius or LASER_VIS.haloPx pixels, whichever is wider, and the
+     core inside it the physical core radius or corePx pixels. So a bolt is
+     never thinner than about two pixels of core in four to six of halo
+     (far streaks do not vanish into dots, handoff section 7), and never
+     thicker than a few centimetres of core up close. When the pixel floor
+     widens a line, its brightness drops with the square root of the
+     widening (core: power 0.35): a far bolt stays visible without
+     turning into a bar. The
+     ends are round (the quad runs one half-width past each end), the head
+     brighter than the tail, and a bolt of zero length draws nothing. */
+  var LASER_VIS = { core: 0.05, halo: 0.3, corePx: 0.9, haloPx: 3.2, haloGain: 0.3, white: 0.6, viewH: 900 };
   var SHOT_VS = [
     '/*CG_FOG*/',
-    'uniform float uFogK; uniform float uW;',
+    'uniform float uFogK; uniform float uViewH; uniform vec4 uW;',
     'attribute vec3 iA; attribute vec3 iB; attribute float iI;',
-    'varying vec2 vP; varying float vI;',
+    'varying float vY; varying float vS; varying float vL; varying float vHw; varying float vC; varying float vIc; varying float vIh;',
     'void main(){',
     '  vec3 d = iB - iA; float L = length(d); vec3 dn = L > 1e-4 ? d / L : vec3(0.0, 1.0, 0.0);',
     '  vec3 wp = mix(iA, iB, position.x);',
     '  vec3 toCam = cameraPosition - wp; float dc = length(toCam);',
+    '  float px = dc * 2.0 / (projectionMatrix[1][1] * uViewH);',
+    '  float hw = max(uW.y, uW.w * px), cw = max(uW.x, uW.z * px);',
     '  vec3 sd = cross(dn, toCam); float sl = length(sd);',
     '  sd = sl > 1e-5 ? sd / sl : vec3(1.0, 0.0, 0.0);',
-    '  float w = max(uW, dc * 0.0024);',
-    '  wp += dn * (position.x - 0.5) * 2.0 * w * 2.0;',
-    '  wp += sd * position.y * w * 4.0;',
-    '  vP = position.xy;',
-    '  vI = iI * (1.0 - cgFogAmt(wp, uFogK)) * pow(uW / w, 0.3);',
+    '  float ex = position.x * 2.0 - 1.0;',
+    '  wp += dn * ex * hw + sd * position.y * hw;',
+    '  vY = position.y; vS = position.x * L + ex * hw; vL = L; vHw = hw; vC = cw / hw;',
+    '  float vis = (1.0 - cgFogAmt(wp, uFogK)) * iI * smoothstep(0.0, 0.8, L);',
+    '  vIc = vis * pow(uW.x / cw, 0.35); vIh = vis * sqrt(uW.y / hw);',
     '  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);',
     '}'].join('\n');
   var SHOT_FS = [
-    'uniform vec3 uCol; varying vec2 vP; varying float vI;',
+    'uniform vec3 uCol; uniform float uHalo; uniform float uWhite;',
+    'varying float vY; varying float vS; varying float vL; varying float vHw; varying float vC; varying float vIc; varying float vIh;',
     'void main(){',
-    '  float y = vP.y;',
-    '  float core = exp(-y * y * 80.0), halo = 0.5 * exp(-y * y * 6.0);',
-    '  float along = mix(0.25, 1.0, clamp(vP.x, 0.0, 1.0));',
-    '  vec3 c = uCol * (core + halo) + vec3(0.9) * core * 0.55;',
-    '  gl_FragColor = vec4(c * along * vI, 1.0);',
+    '  float e = max(max(-vS, vS - vL), 0.0) / vHw;',
+    '  float r2 = vY * vY + e * e;',
+    '  float core = exp(-r2 / (vC * vC) * 2.0) * vIc;',
+    '  float halo = exp(-r2 * 4.0) * (1.0 - smoothstep(0.7, 1.0, sqrt(r2))) * vIh * uHalo;',
+    '  float along = mix(0.45, 1.0, clamp(vS / max(vL, 1e-3), 0.0, 1.0));',
+    '  vec3 c = uCol * (core + halo) + vec3(uWhite) * core;',
+    '  gl_FragColor = vec4(c * along, 1.0);',
     '}'].join('\n');
 
   var GLOW_VS = [
@@ -499,7 +724,9 @@
 
     var shotGeo = quadInstanced(THREE, POOL.shots, { iA: 3, iB: 3, iI: 1 }, 0, 1);
     var shotMat = fog.inject(new THREE.ShaderMaterial(Object.assign({
-      uniforms: { uCol: { value: laserCol }, uFogK: { value: o.laserFogK == null ? 0.4 : o.laserFogK }, uW: { value: 0.22 } },
+      uniforms: { uCol: { value: laserCol }, uFogK: { value: o.laserFogK == null ? 0.4 : o.laserFogK },
+        uViewH: { value: o.viewH || LASER_VIS.viewH }, uHalo: { value: LASER_VIS.haloGain }, uWhite: { value: LASER_VIS.white },
+        uW: { value: new THREE.Vector4(LASER_VIS.core, LASER_VIS.halo, LASER_VIS.corePx, LASER_VIS.haloPx) } },
       vertexShader: SHOT_VS, fragmentShader: SHOT_FS, side: THREE.DoubleSide
     }, additive)));
     var shots = new THREE.Mesh(shotGeo, shotMat);
@@ -574,7 +801,8 @@
     var FWD = new THREE.Vector3(0, 0, 1), tmp = new THREE.Vector3(), wp = new THREE.Vector3();
     var cp = [0, 0, 0];
 
-    function update(t, cameraPos, events) {
+    function update(t, cameraPos, events, viewH) {
+      if (viewH > 0) shotMat.uniforms.uViewH.value = viewH;
       if (cameraPos) { cp[0] = cameraPos.x != null ? cameraPos.x : cameraPos[0]; cp[1] = cameraPos.y != null ? cameraPos.y : cameraPos[1]; cp[2] = cameraPos.z != null ? cameraPos.z : cameraPos[2]; }
       var segs = [], gl = [], lights = [], list = events || [];
       for (var e = 0; e < list.length; e++) {
@@ -585,7 +813,10 @@
           for (var k = 0; k < st.shots.length; k++) { var s = st.shots[k]; s.d = dist3(s.b, cp); segs.push(s); }
           for (k = 0; k < st.glows.length; k++) {
             var g = st.glows[k];
-            gl.push({ p: g.p, d: dist3(g.p, cp), size: 9, r: laserCol.r * C.glowGain / C.laserGain * g.i, g: laserCol.g * C.glowGain / C.laserGain * g.i, b: laserCol.b * C.glowGain / C.laserGain * g.i });
+            /* muzzle: the laser green; impact: a spark, half way to white */
+            var gk = C.glowGain / C.laserGain * g.i, imp = g.kind === 'impact', wk = imp ? 0.5 * C.glowGain * g.i : 0;
+            gl.push({ p: g.p, d: dist3(g.p, cp), size: imp ? LASER.impact.size : LASER.muzzle.size,
+              r: laserCol.r * gk + wk, g: laserCol.g * gk + wk, b: laserCol.b * gk + wk });
           }
         } else if (st.intensity > 1e-3) {
           st.d = dist3(st.pos, cp); lights.push(st);
@@ -682,6 +913,8 @@
 
   globalThis.HikyakuEvents = {
     RATES: RATES, LASER: LASER, LIGHT: LIGHT, SLOT: SLOT, KINDS: KINDS, POOL: POOL, CONE_SEG: CONE_SEG, BODY: BODY,
-    schedule: schedule, state: state, perHour: perHour, create: create
+    LASER_VIS: LASER_VIS,
+    schedule: schedule, state: state, perHour: perHour, create: create,
+    findPairs: findPairs, segBox: segBox, shotLaser: shotLaser
   };
 })();
