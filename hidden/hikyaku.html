@@ -660,30 +660,68 @@ var Hikyaku = (function () {
                a ring taken out of order simply does not count. `next`
                counts in race order (the waypoints without the via points,
                race.wps), which is each waypoint's ri.
-     finished  the finish gate was crossed; time is the total and splits[k]
-               the clock when waypoint k + 1 was taken (n - 1 of them, the
-               last one equal to time). Nothing changes until a reset.
+     finished  the finish gate was crossed; time is the clock at the finish
+               and splits[k] the clock when waypoint k + 1 was taken or
+               missed (n - 1 of them, the last one equal to time). total is
+               time plus the miss penalties. Nothing changes until a reset.
+
+     Missed rings (owner, after the first flights: turning round for a ring
+     you overshot takes ages). A ring or portal that is the target counts as
+     missed, the target moves on and the race goes on, when
+       (a) a step crosses its plane along dir outside the hole, or
+       (b) a step takes the ship from less than missDepth (60 m) to
+           missDepth or more behind its plane, or
+       (c) it becomes the target while the ship already is missDepth or
+           more behind its plane (it was passed before it was live).
+     All three are crossings, so the rule needs no memory, and a ship that
+     appears far beyond a ring without flying there (a test, a reset) does
+     not miss it. In continuous flight a ship can only get behind a plane by
+     (a) or (b), and (c) covers a target that was already behind. The start
+     and the finish gate are never missed: the clock starts at one and stops
+     at the other. Each miss adds missPenalty seconds (5 s, 0 allowed) to the
+     total; the split list keeps the time of the miss, and missed holds the
+     race indices of the missed waypoints.
+
      t is the simulation time at cur, in milliseconds. raceStep is pure: it
-     returns a new race with event set to what happened on this step. */
-  function makeRace(route) {
+     returns a new race with event set to the last thing that happened on
+     this step and events to all of them (a pass can be followed by a miss
+     of type (c) on the same step). */
+  var DEF_RACE = { missPenalty: 5, missDepth: 60 };
+
+  function makeRace(route, cfg) {
+    var C = merge(DEF_RACE, cfg);
     var wps = route.waypoints.filter(function (w) { return w.kind !== 'via'; });
     return {
       state: 'idle', next: 0, n: wps.length, wps: wps,
       forgive: route.cfg ? route.cfg.forgive : DEF_ROUTE.forgive,
-      t0: null, lastT: null, splits: [], time: null, dwell: 0, event: null
+      missPenalty: Math.max(0, C.missPenalty), missDepth: C.missDepth,
+      t0: null, lastT: null, splits: [], missed: [], penalty: 0, time: null, total: null,
+      dwell: 0, event: null, events: []
     };
+  }
+
+  function missable(wp) { return wp && (wp.kind === 'ring' || wp.kind === 'portal'); }
+
+  /* The fraction along prev -> cur at which wp counts as missed by rules
+     (a) or (b), or null. Call only when ringPass found no pass. */
+  function missAt(prev, cur, wp, depth) {
+    if (!missable(wp)) return null;
+    var d0 = dot(sub(prev, wp.p), wp.dir), d1 = dot(sub(cur, wp.p), wp.dir);
+    if (d0 < 0 && d1 >= 0) return d0 / (d0 - d1);
+    if (d0 < depth && d1 >= depth) return (depth - d0) / (d1 - d0);
+    return null;
   }
 
   function raceStep(race, prev, cur, t) {
     var r = {}, k;
     for (k in race) r[k] = race[k];
-    r.event = null;
+    r.event = null; r.events = [];
     var tPrev = race.lastT == null ? t : race.lastT;
     r.lastT = t;
     if (r.state === 'finished') return r;
     var wp = r.wps[r.next];
     if (!wp) return r;
-    var tc;
+    var tc, miss = false;
     if (wp.kind === 'delivery') {
       /* v2: hover inside the zone, slower than maxSpeed, for hold.ms. */
       var hd = wp.hold || { ms: 1500, maxSpeed: 2 };
@@ -695,24 +733,51 @@ var Hikyaku = (function () {
       tc = t;
     } else {
       var f = ringPass(prev, cur, wp, r.forgive);
+      if (f == null && r.state === 'running') {
+        f = missAt(prev, cur, wp, r.missDepth);
+        miss = f != null;
+      }
       if (f == null) return r;
       tc = tPrev + f * (t - tPrev);
     }
     if (r.state === 'idle') {
       r.state = 'running'; r.t0 = tc; r.next = 1;
       r.event = { type: 'start', idx: wp.idx, time: 0 };
+      r.events = [r.event];
       return r;
     }
-    var split = tc - r.t0;
-    r.splits = race.splits.concat([split]);
-    r.next = race.next + 1;
-    if (wp.kind === 'finish' || r.next >= r.n) {
-      r.state = 'finished'; r.time = split;
-      r.event = { type: 'finish', idx: wp.idx, time: split };
-    } else {
-      r.event = { type: wp.kind === 'delivery' || wp.kind === 'portal' ? wp.kind : 'ring', idx: wp.idx, time: split };
+    r.splits = race.splits.slice();
+    r.missed = race.missed.slice();
+    var advance = function (w, isMiss, time) {
+      r.splits.push(time);
+      r.next++;
+      if (isMiss) {
+        r.missed.push(w.ri);
+        r.penalty = r.missed.length * r.missPenalty * 1000;
+        r.event = { type: 'miss', kind: w.kind, idx: w.idx, ri: w.ri, time: time };
+      } else if (w.kind === 'finish' || r.next >= r.n) {
+        r.state = 'finished'; r.time = time; r.total = time + r.penalty;
+        r.event = { type: 'finish', idx: w.idx, ri: w.ri, time: time, penalty: r.penalty, total: r.total };
+      } else {
+        r.event = { type: w.kind === 'delivery' || w.kind === 'portal' ? w.kind : 'ring', idx: w.idx, ri: w.ri, time: time };
+      }
+      r.events.push(r.event);
+    };
+    advance(wp, miss, tc - r.t0);
+    /* rule (c): targets the ship is already far behind */
+    while (r.state === 'running' && missable(r.wps[r.next]) &&
+           dot(sub(cur, r.wps[r.next].p), r.wps[r.next].dir) >= r.missDepth) {
+      advance(r.wps[r.next], true, tc - r.t0);
     }
     return r;
+  }
+
+  /* The total as shown at the finish: the clock, and the penalty apart,
+     "1:23.45 + 10 s". */
+  function formatRun(time, penalty) {
+    var s = formatTime(time);
+    if (penalty > 0) s += ' + ' + (Math.round(penalty / 100) / 10) + ' s';
+    return s;
   }
 
   /* The clock as shown: 0 before the start, running time, then the total. */
@@ -1015,11 +1080,11 @@ var Hikyaku = (function () {
   }
 
   return {
-    DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
+    DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
     boxDist: boxDist, contactsBoxes: contactsBoxes,
-    ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, elapsed: elapsed,
-    formatTime: formatTime, makeLanes: makeLanes, trafficTime: trafficTime
+    ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
+    formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -1075,7 +1140,9 @@ const URL_SEED = parseInt(URLP.get('seed'), 10);
 
 const DEF = {
   seed: 1,
-  assist: true, gravity: true, drag: true,
+  /* Gravity and assist start off: the owner learned to fly best with both
+     off (2026-10-25). G and X toggle them in flight. */
+  assist: false, gravity: false, drag: true,
   /* The courier's flat-plate drag torque pitches the nose away from the wind
      at angle of attack; a weak torque plus rate damping keeps it flyable. */
   dragTorque: 0.3, rateDamp: 2,
@@ -1092,7 +1159,16 @@ const DEF = {
   cityDensity: 0.85, cityMaxH: 260, cityAccents: 2, fogDensity: 0.0034, cityRadius: 4,
   /* Traffic (step 5): on/off, the share of streets that carry lanes, and
      two debug views. */
-  traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false
+  traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false,
+  /* The race: seconds added per missed ring or portal (hkcore raceStep). */
+  missPenalty: 5,
+  /* The panel: open or closed, and the open section. Stored with the rest,
+     so a reload looks the way it was left. */
+  panel: true, sec: '',
+  /* Version of the stored config. Below 2, the stored gravity and assist
+     are dropped once, so the new defaults (both off) reach a browser that
+     stored the old ones (both on). */
+  cfgV: 2
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
@@ -1134,7 +1210,11 @@ function loadStored() {
   let c = DEF;
   try {
     const raw = localStorage.getItem(STORE);
-    if (raw) c = SD.mergeConfig(DEF, JSON.parse(raw), ENUMS);
+    if (raw) {
+      const o = JSON.parse(raw);
+      if (o && typeof o === 'object' && !(o.cfgV >= DEF.cfgV)) { delete o.gravity; delete o.assist; }
+      c = { ...SD.mergeConfig(DEF, o, ENUMS), cfgV: DEF.cfgV };
+    }
   } catch (e) { c = DEF; }
   if (Number.isFinite(URL_SEED) && URL_SEED > 0) c = { ...c, seed: URL_SEED };
   return c;
@@ -1263,8 +1343,11 @@ function gateFrame(THREE, wp, mat, body) {
 
 function App() {
   const [p, setP] = useState(loadStored);
-  const [panel, setPanel] = useState(!SHOT);
-  const [sec, setSec] = useState('');
+  /* Panel and open section live in p, so they are stored with it. The
+     screenshot hooks always hide the panel. */
+  const panel = !SHOT && p.panel;
+  const setPanel = useCallback((v) => setP((q) => ({ ...q, panel: typeof v === 'function' ? v(q.panel) : v })), []);
+  const sec = p.sec;
   const [dev, setDev] = useState({ name: null, err: null, supported: !!(window.SpaceNav && SpaceNav.supported()) });
   const [ready, setReady] = useState(!!window.__hkThreeReady);
   const [best, setBest] = useState(loadBest);
@@ -1276,7 +1359,7 @@ function App() {
   const navRef = useRef(null);
   const glRef = useRef(null);
   const keysRef = useRef({});
-  const lookRef = useRef({ yaw: 0, pitch: 0, dragging: false, chase: null });
+  const lookRef = useRef({ yaw: 0, pitch: 0, dragging: false });
   const killRef = useRef(false);
   const resetRef = useRef(0);
   const onFinishRef = useRef(null);
@@ -1359,17 +1442,19 @@ function App() {
   onFinishRef.current = (race) => {
     const key = String(p.seed);
     const prevBest = best[key];
-    const isBest = !(prevBest > 0) || race.time < prevBest;
+    /* the best time is the total, missed rings included */
+    const isBest = !(prevBest > 0) || race.total < prevBest;
     if (isBest) {
-      const nb = { ...best, [key]: race.time };
+      const nb = { ...best, [key]: race.total };
       setBest(nb);
       try { localStorage.setItem(BEST, JSON.stringify(nb)); } catch (e) { /* private mode */ }
     }
-    setLastRun({ time: race.time, splits: race.splits.slice(), best: isBest, seed: p.seed });
+    setLastRun({ time: race.time, penalty: race.penalty, total: race.total, splits: race.splits.slice(),
+      missed: race.missed.slice(), best: isBest, seed: p.seed });
     return isBest;
   };
 
-  const toggleSec = useCallback((id) => setSec((s) => (s === id ? '' : id)), []);
+  const toggleSec = useCallback((id) => setP((q) => ({ ...q, sec: q.sec === id ? '' : id })), []);
   const upd = (k) => (v) => setP((q) => ({ ...q, [k]: v }));
   const setSeed = (v) => {
     const n = Math.max(1, Math.min(999999, Math.round(v)));
@@ -1392,6 +1477,7 @@ function App() {
       if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
       else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
       else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
+      else if (e.code === 'KeyG') setP((q) => ({ ...q, gravity: !q.gravity }));
       else if (e.code === 'KeyC') setP((q) => ({ ...q, camMode: q.camMode === 'chase' ? 'cockpit' : 'chase' }));
       else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
       else if (e.code === 'KeyP') setPanel((v) => !v);
@@ -1540,7 +1626,7 @@ function App() {
       state.info = null;
       state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
       state.simT = 0; state.acc = 0; state.hits = 0;
-      state.race = HK.makeRace(cfg.route);
+      state.race = HK.makeRace(cfg.route, { missPenalty: cfg.p.missPenalty });
       state.msg = ''; state.msgUntil = 0; state.splitsText = '';
       killRef.current = false;
       mark();
@@ -1571,9 +1657,11 @@ function App() {
       L.yaw -= (e.movementX || 0) * 0.004;
       L.pitch = Math.max(-1.4, Math.min(1.4, L.pitch - (e.movementY || 0) * 0.004));
     };
+    /* The wheel sets the stored chase distance, the same value as the
+       Camera slider, so it survives a reload. */
     const onWheel = (e) => {
-      const L = lookRef.current;
-      L.chase = Math.max(0.8, Math.min(12, (L.chase || cfgRef.current.p.camDist) * Math.exp(e.deltaY * 0.0012)));
+      const k = Math.exp(e.deltaY * 0.0012);
+      setP((q) => ({ ...q, camDist: Math.round(Math.max(0.8, Math.min(12, q.camDist * k)) * 100) / 100 }));
       e.preventDefault();
     };
     host.addEventListener('mousedown', onDown);
@@ -1637,12 +1725,19 @@ function App() {
       const race = state.race;
       if (ev.type === 'start') say('GO', 1200, ts);
       else if (ev.type === 'ring' || ev.type === 'delivery' || ev.type === 'portal') {
-        say((ev.type === 'portal' ? 'PORTAL ' : 'RING ') + race.splits.length + ' of ' + (race.n - 2) + '   ' + HK.formatTime(ev.time), 1400, ts);
+        say((ev.type === 'portal' ? 'PORTAL ' : 'RING ') + ev.ri + ' of ' + (race.n - 2) + '   ' + HK.formatTime(ev.time), 1400, ts);
+      } else if (ev.type === 'miss') {
+        say('MISSED ' + (ev.kind === 'portal' ? 'PORTAL ' : 'RING ') + ev.ri
+          + (race.missPenalty > 0 ? '   + ' + race.missPenalty + ' s' : ''), 1600, ts);
       } else if (ev.type === 'finish') {
         const isBest = onFinishRef.current ? onFinishRef.current(race) : false;
-        say('FINISH ' + HK.formatTime(ev.time) + (isBest ? '   best for this seed' : ''), 6000, ts);
-        state.splitsText = race.splits.map((t, i) =>
-          (i === race.splits.length - 1 ? 'finish ' : (race.wps[i + 1].kind === 'portal' ? 'gate ' : 'ring ') + String(i + 1).padStart(2, ' ') + ' ') + HK.formatTime(t)).join('\n');
+        say('FINISH ' + HK.formatRun(ev.time, ev.penalty) + (isBest ? '   best for this seed' : ''), 6000, ts);
+        state.splitsText = race.splits.map((t, i) => {
+          if (i === race.splits.length - 1) return 'finish ' + HK.formatRun(t, race.penalty);
+          const w = race.wps[i + 1];
+          return (w.kind === 'portal' ? 'gate ' : 'ring ') + String(i + 1).padStart(2, ' ') + ' ' + HK.formatTime(t)
+            + (race.missed.indexOf(w.ri) >= 0 ? '  missed' : '');
+        }).join('\n');
       }
       mark();
     };
@@ -1760,7 +1855,7 @@ function App() {
         state.simT += H_STEP;
         const r2 = HK.raceStep(state.race, prev, state.s.p, state.simT * 1000);
         state.race = r2;
-        if (r2.event) onEvent(r2.event, ts);
+        for (let ei = 0; ei < r2.events.length; ei++) onEvent(r2.events[ei], ts);
         state.acc -= H_STEP;
         steps++;
       }
@@ -1802,7 +1897,7 @@ function App() {
       } else {
         state.cam = SD.camStep(state.cam, s.q, dt, pp.camF0, pp.camZeta, pp.camRoll);
         const cq = SD.qMul(state.cam.q, look);
-        const off = SD.qRot(cq, [0, pp.camUp * SHIP_L, (L.chase || pp.camDist) * SHIP_L]);
+        const off = SD.qRot(cq, [0, pp.camUp * SHIP_L, pp.camDist * SHIP_L]);
         camera.position.set(s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]);
         camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
       }
@@ -1849,10 +1944,9 @@ function App() {
       set('spd', fmt(info ? info.airspeed : 0, 1) + ' m/s');
       set('alt', fmt(s.p[1], 0) + ' m', s.p[1] < 15 ? 'hot' : '');
       set('vs', (s.v[1] >= 0 ? '+' : '') + fmt(s.v[1], 1) + ' m/s');
-      const nRings = race.n - 1;
-      set('ring', race.state === 'idle' ? '0 of ' + nRings
-        : race.state === 'finished' ? nRings + ' of ' + nRings
-        : (race.next - 1) + ' of ' + nRings);
+      const nRings = race.n - 1, nMiss = race.missed.length;
+      const taken = race.state === 'idle' ? 0 : (race.state === 'finished' ? nRings : race.next - 1) - nMiss;
+      set('ring', taken + ' of ' + nRings + (nMiss ? '   MISSED ' + nMiss : ''), nMiss ? 'hot' : '');
       if (!pp.assist) set('assist', 'off');
       else if (info && info.saturated) set('assist', 'short ' + fmt(info.missing / G, 2) + ' g', 'hot');
       else if (info) {
@@ -1869,7 +1963,7 @@ function App() {
         if (g.hullBoxes) g.hullBoxes.update(nv);
       } else set('veh', 'off');
       set('fps', fmt(state.fps, 0));
-      set('clock', HK.formatTime(HK.elapsed(race, tNow)), race.state === 'finished' ? 'acc' : '');
+      set('clock', HK.formatRun(HK.elapsed(race, tNow), race.penalty), race.state === 'finished' ? 'acc' : '');
       set('clockSub', race.state === 'idle' ? 'fly through the start gate'
         : race.state === 'finished' ? 'finished, Backspace to reset'
         : (race.next === race.n - 1 ? 'finish gate next' : 'ring ' + race.next + ' next'));
@@ -2243,14 +2337,21 @@ function App() {
       <${Seg} label="View" value=${p.camMode} onChange=${upd('camMode')}
         options=${[{ value: 'chase', label: 'Chase' }, { value: 'cockpit', label: 'Cockpit' }]} />
 
-      <${Section} id="run" title="Last run" open=${sec === 'run'} onToggle=${toggleSec}
-        summary=${lastRun ? HK.formatTime(lastRun.time) + (lastRun.best ? ', best' : '') : 'none yet'}>
+      <${Section} id="run" title="Race and last run" open=${sec === 'run'} onToggle=${toggleSec}
+        summary=${(lastRun ? HK.formatRun(lastRun.time, lastRun.penalty) + (lastRun.best ? ', best' : '') : 'no run yet')
+          + ', miss + ' + p.missPenalty + ' s'}>
+        <${Slider} label="Penalty per missed ring" unit="s" digits=${0} min=${0} max=${30} step=${1}
+          value=${p.missPenalty} onChange=${upd('missPenalty')} />
         ${lastRun ? html`<div className="hk-derived">
           ${lastRun.splits.map((t, i) => html`<${React.Fragment} key=${i}>
-            <span>${i === lastRun.splits.length - 1 ? 'Finish' : 'Ring ' + (i + 1)}</span><b>${HK.formatTime(t)}</b>
+            <span>${i === lastRun.splits.length - 1 ? 'Finish' : 'Ring ' + (i + 1) + (lastRun.missed.indexOf(i + 1) >= 0 ? ', missed' : '')}</span>
+            <b>${i === lastRun.splits.length - 1 ? HK.formatRun(t, lastRun.penalty) : HK.formatTime(t)}</b>
           <//>`)}
-        </div>` : html`<p className="hk-note">No finished run on this seed yet. The clock starts at the start gate
-          and stops at the finish gate. A ring only counts when it is the next one, flown in its direction.</p>`}
+        </div>` : html`<p className="hk-note">No finished run on this seed yet.</p>`}
+        <p className="hk-note">The clock starts at the start gate and stops at the finish gate. A ring only counts when it
+          is the next one, flown in its direction. Fly past it, outside the ring or more than ${HK.DEF_RACE.missDepth} m
+          beyond it, and it counts as missed: the cue moves on and the penalty is added to the time. The best time
+          includes the penalties. A new penalty applies from the next reset.</p>
       <//>
 
       <${Section} id="flight" title="Flight model" open=${sec === 'flight'} onToggle=${toggleSec}
@@ -2310,8 +2411,8 @@ function App() {
 
       <${Section} id="cam" title="Camera" open=${sec === 'cam'} onToggle=${toggleSec}
         summary=${fmt(p.camDist * SHIP_L, 0) + ' m behind, ' + fmt(p.camUp * SHIP_L, 0) + ' m up'}>
-        <${Slider} label="Distance" unit="ship lengths" digits=${1} min=${0.8} max=${8} step=${0.1}
-          value=${p.camDist} onChange=${(v) => { lookRef.current.chase = null; upd('camDist')(v); }} />
+        <${Slider} label="Distance" unit="ship lengths" digits=${1} min=${0.8} max=${12} step=${0.1}
+          value=${p.camDist} onChange=${upd('camDist')} />
         <${Slider} label="Height" unit="ship lengths" digits=${2} min=${0} max=${2} step=${0.05}
           value=${p.camUp} onChange=${upd('camUp')} />
         <${Slider} label="Follow frequency" unit="Hz" digits=${2} min=${0.1} max=${3} step=${0.05}
@@ -2386,9 +2487,10 @@ function App() {
           <br/>Keys: <kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide,
           <kbd>R</kbd><kbd>F</kbd> lift up and down, <kbd>Q</kbd><kbd>E</kbd> roll,
           arrow keys pitch and yaw (up pushes the nose down), <kbd>Shift</kbd> boost.
-          <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>C</kbd> view,
+          <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>G</kbd> gravity, <kbd>C</kbd> view,
           <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel.
           <br/>Mouse: left drag looks around, middle click stops rotation, wheel sets the chase distance.
+          <br/>All settings, the panel included, are kept in this browser across reloads.
         </p>
       <//>
     </div>`}
