@@ -1,0 +1,1669 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-section="miscellaneous">
+<head>
+  <meta charset="utf-8">
+  <!-- No theme one-liner and no switcher: the game fills the screen and only
+       exists dark, like asteroid-corridor.html and asteroid-lab.html, so a
+       stored light preference must not reach this page. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Hikyaku - 6DOF Courier Flight Prototype</title>
+  <meta name="description" content="Prototype of a 6DOF courier flight game for a 3D mouse. Fly a small glider with gravity, drag and a flight assist through a timed route of rings over flat ground.">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <style>
+    /* Full-screen canvas, so the Pico container, the site header and the site
+       footer are deliberately absent, as in asteroid-corridor. Everything
+       that would live in them goes into the floating panel. */
+    html, body { height: 100%; }
+    body { margin: 0; overflow: hidden; background: #05070b; }
+    #root { position: fixed; inset: 0; }
+
+    .hk-stage { position: absolute; inset: 0; touch-action: none; cursor: crosshair; }
+    .hk-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+    .hk-back { position: absolute; top: 12px; left: 12px; z-index: 3;
+      font-size: 12.5px; color: var(--tool-label); text-decoration: none;
+      padding: 5px 11px; border-radius: 999px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .hk-back:hover { color: var(--tool-text); border-color: var(--tool-faint); }
+
+    /* The readouts are written straight into these nodes from the animation
+       loop. Routing them through React state would re-render the panel sixty
+       times a second for nothing. */
+    .hk-hud { position: absolute; bottom: 12px; left: 12px; z-index: 3;
+      pointer-events: none;
+      padding: 9px 14px; border-radius: 10px; border: 1px solid rgba(51,65,85,.8);
+      background: color-mix(in srgb, var(--tool-panel) 60%, transparent); backdrop-filter: blur(6px); }
+    .hk-grid { display: grid; grid-template-columns: auto auto; gap: 3px 14px;
+      font-size: 11.5px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      letter-spacing: .02em; }
+    .hk-grid b { color: var(--tool-text); font-weight: 600; text-align: right; }
+    .hk-grid b.hot { color: #fbbf24; }
+    .hk-grid b.acc { color: #2ee8ff; }
+
+    .hk-clock { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 3;
+      pointer-events: none; text-align: center;
+      font-size: 22px; font-weight: 600; color: var(--tool-text); font-variant-numeric: tabular-nums;
+      letter-spacing: .04em; text-shadow: 0 0 14px rgba(0,0,0,.9); }
+    .hk-clock small { display: block; font-size: 11.5px; font-weight: 400; color: var(--tool-note);
+      letter-spacing: .06em; margin-top: 2px; }
+
+    .hk-splits { position: absolute; top: 74px; left: 50%; transform: translateX(-50%); z-index: 3;
+      pointer-events: none; white-space: pre; font-size: 11.5px; line-height: 1.5;
+      color: var(--tool-text); font-variant-numeric: tabular-nums; text-shadow: 0 0 10px rgba(0,0,0,.95); }
+
+    .hk-msg { position: absolute; top: 38%; left: 50%; transform: translate(-50%, -50%);
+      z-index: 3; pointer-events: none; text-align: center; max-width: 60ch;
+      font-size: 15px; color: var(--tool-text); letter-spacing: .04em;
+      text-shadow: 0 0 18px rgba(0,0,0,.95); }
+    .hk-msg small { display: block; margin-top: 8px; font-size: 11.5px; color: var(--tool-note); letter-spacing: 0; }
+
+    /* The cue to the next waypoint: a diamond on the target while it is on
+       screen, an arrow at the screen edge while it is not. Positioned from
+       the loop through style.transform, so it never touches layout. */
+    .hk-cue { position: absolute; left: 0; top: 0; z-index: 2; pointer-events: none; display: none; }
+    .hk-cue-box { width: 22px; height: 22px; margin: -11px 0 0 -11px; border: 2px solid #2ee8ff;
+      transform: rotate(45deg); box-shadow: 0 0 10px rgba(46,232,255,.55); }
+    .hk-cue-arrow { position: absolute; left: -12px; top: -12px; width: 24px; height: 24px; }
+    .hk-cue-arrow i { position: absolute; left: 1px; top: 0; width: 0; height: 0;
+      border-left: 11px solid transparent; border-right: 11px solid transparent;
+      border-bottom: 20px solid #2ee8ff; filter: drop-shadow(0 0 5px rgba(46,232,255,.7)); }
+    .hk-cue-d { position: absolute; left: 0; top: 16px; transform: translateX(-50%);
+      font-size: 11.5px; color: #2ee8ff; white-space: nowrap; font-variant-numeric: tabular-nums;
+      text-shadow: 0 0 6px #000, 0 0 2px #000; }
+
+    .hk-panel { position: absolute; top: 12px; right: 12px; z-index: 4;
+      width: min(330px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+      overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid var(--tool-border); border-radius: 10px; padding: 12px 14px 14px;
+      background: color-mix(in srgb, var(--tool-panel) 88%, transparent); backdrop-filter: blur(10px);
+      box-shadow: var(--tool-panel-shadow); }
+    .hk-panel::-webkit-scrollbar { width: 8px; }
+    .hk-panel::-webkit-scrollbar-thumb { background: var(--tool-border); border-radius: 4px; }
+    .hk-toggle { position: absolute; top: 12px; right: 12px; z-index: 4;
+      font-size: 12.5px; color: var(--tool-text); cursor: pointer; width: auto; margin: 0;
+      padding: 6px 13px; border-radius: 999px; border: 1px solid var(--tool-border);
+      background: color-mix(in srgb, var(--tool-panel) 75%, transparent); backdrop-filter: blur(8px); }
+    .hk-toggle:hover { border-color: var(--tool-faint); }
+
+    .hk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+    .hk-head h2 { font-size: 14px; color: var(--tool-text); margin: 0; font-weight: 600; flex: 1; }
+    .hk-x { background: none; border: none; color: var(--tool-note); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 4px; margin: 0; width: auto; }
+    .hk-x:hover { color: var(--tool-text); }
+    .hk-desc { font-size: 11.5px; color: var(--tool-note); margin: 0 0 6px; line-height: 1.45; }
+
+    /* Accordion, the shape asteroid-corridor uses. A collapsed header keeps
+       showing its current value. */
+    .hk-acc { border-top: 1px solid var(--tool-hairline); }
+    .hk-acc-h { display: flex; align-items: baseline; gap: 8px; width: 100%;
+      margin: 0; padding: 9px 2px; background: none; border: none; cursor: pointer;
+      font-size: 11px; color: var(--tool-note); letter-spacing: .06em; text-transform: uppercase;
+      text-align: left; }
+    .hk-acc-h:hover { color: var(--tool-text); }
+    .hk-acc-h.open { color: var(--tool-label); }
+    .hk-acc-s { margin-left: auto; font-size: 11px; color: var(--tool-faint);
+      text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 58%; }
+    .hk-acc-c { margin-left: auto; font-size: 13px; line-height: 1; color: var(--tool-faint); flex: none; }
+    .hk-acc-s + .hk-acc-c { margin-left: 6px; }
+    .hk-acc-b { padding: 0 2px 12px; }
+
+    .hk-row { display: grid; grid-template-columns: 1fr auto; align-items: baseline;
+      gap: 2px 8px; margin: 6px 0; }
+    .hk-row label { font-size: 11.5px; color: var(--tool-label); margin: 0; }
+    .hk-row output { font-size: 11.5px; color: var(--tool-text); text-align: right;
+      font-variant-numeric: tabular-nums; }
+    .hk-row input[type=range] { grid-column: 1 / -1; margin: 2px 0 0; }
+
+    /* Number fields. Pico's input rule is input:not(...), which beats a plain
+       class; the attribute selector here outranks it for height and padding. */
+    .hk-nums { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 6px 0; }
+    .hk-num { display: grid; grid-template-columns: 1fr 58px 3.2ch; align-items: center; gap: 4px;
+      font-size: 11px; color: var(--tool-label); margin: 0; }
+    .hk-num input[type=number] { height: 24px; padding: 1px 5px;
+      font-size: 11.5px; margin: 0; font-variant-numeric: tabular-nums; }
+    .hk-num i { font-style: normal; font-size: 10.5px; color: var(--tool-faint); }
+    .hk-seed { display: flex; gap: 6px; align-items: center; margin: 6px 0 4px; }
+    .hk-seed input[type=number] { height: 28px; padding: 2px 8px;
+      width: 96px; margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .hk-seed span { font-size: 11.5px; color: var(--tool-label); }
+    .hk-seed button { margin: 0; width: auto; }
+
+    /* Deliberate chip rows of separate actions, so they opt out of the shared
+       adjacency rounding the way .rd-row and .qr-chips do. */
+    .hk-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 6px; }
+    .hk-chips button { width: auto; margin: 0; border-radius: 4px; margin-left: 0; }
+    .hk-seg { margin: 4px 0 4px; }
+    .hk-seg button { width: auto; margin: 0; }
+    .hk-seg-l { font-size: 11.5px; color: var(--tool-label); display: block; margin: 9px 0 2px; }
+
+    .hk-derived { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+      font-size: 11px; color: var(--tool-note); font-variant-numeric: tabular-nums;
+      margin: 9px 0 0; padding-top: 8px; border-top: 1px solid var(--tool-hairline); }
+    .hk-derived b { color: var(--tool-text); font-weight: 600; text-align: right; }
+
+    .hk-note { font-size: 10.5px; color: var(--tool-faint); margin: 8px 0 0; line-height: 1.5; }
+    .hk-note kbd { font-size: 10px; }
+  </style>
+
+  <script type="importmap">
+  { "imports": { "three": "/assets/js/three.module.min.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE = THREE;
+    window.__hkThreeReady = true;
+    window.dispatchEvent(new Event('hk-three-ready'));
+  </script>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/spacenav.js"></script>
+  <script src="/assets/js/sixdof.js"></script>
+  <script src="/assets/js/hikyaku-flight.js"></script>
+  <script src="/assets/js/colorramps.js"></script>
+  <script src="/assets/js/courier.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- The pure half: the route, the boxes around it, the ring test, the race
+       clock and the box contacts. No DOM, no three.js, no React, so
+       notes/dev/hikyaku.test.mjs pulls this block out by id and evaluates it
+       on top of assets/js/sixdof.js. Moving any of it into the app block
+       breaks that seam. -->
+  <script id="hkcore">
+var Hikyaku = (function () {
+  'use strict';
+
+  var SD = globalThis.SixDOF;
+  if (!SD) throw new Error('hkcore needs SixDOF (assets/js/sixdof.js) loaded first');
+  var add = SD.add, sub = SD.sub, mul = SD.mul, dot = SD.dot, cross = SD.cross, len = SD.len;
+  var DEG = Math.PI / 180;
+
+  function norm(v) { var l = len(v); return l > 1e-12 ? mul(v, 1 / l) : [0, 0, 0]; }
+  function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
+  function angle(a, b) {
+    var c = dot(a, b) / Math.max(1e-12, len(a) * len(b));
+    return Math.acos(clamp(c, -1, 1));
+  }
+  /* Only keys the defaults know, numbers only if finite. */
+  function merge(def, cfg) {
+    var o = {}, k;
+    for (k in def) o[k] = def[k];
+    if (cfg) for (k in def) {
+      var v = cfg[k];
+      if (v == null) continue;
+      if (typeof def[k] === 'number' && !(typeof v === 'number' && isFinite(v))) continue;
+      o[k] = v;
+    }
+    return o;
+  }
+  function pointSegDist(p, a, b) {
+    var ab = sub(b, a), t = dot(sub(p, a), ab) / Math.max(1e-12, dot(ab, ab));
+    t = clamp(t, 0, 1);
+    return len(sub(p, add(a, mul(ab, t))));
+  }
+
+  /* ---- the route ----------------------------------------------------------
+     World: flat ground at y = 0, sky up +y. The route is a list of waypoints
+     and a smooth curve through them. The route comes first and the world is
+     built around it (handoff, section 2), so everything the later city
+     generator needs is in here: the waypoints, the curve, and a clearance
+     tube along the curve that no building may enter.
+
+     Waypoint shape, shared by every kind:
+       { idx, kind, p, dir, right, up, shape, r, hw, hh, hold, biome }
+     kind   'start' | 'ring' | 'finish'. v2 adds 'delivery': a waypoint where
+            the pilot must hover or land. It reuses p and r (the radius of the
+            hover zone) and fills hold = { ms, maxSpeed }; raceStep already
+            handles it, nothing else has to change.
+     shape  'circle' (rings, radius r) or 'rect' (gates, half sizes hw x hh,
+            the portal rule of the handoff: rectangular, warm edge).
+     dir    the facing direction, which is the curve tangent there. A ring
+            counts only when crossed along dir.
+     biome  'open' everywhere for now. The biome step marks legs here.
+
+     The curve is a cubic Hermite spline per leg. The tangent at a waypoint
+     is the bisector of the two legs meeting there, scaled by the chord of
+     the leg. That keeps the curve tangent-continuous through every ring, and
+     with the turn per leg bounded it bounds the curvature: the tightest
+     possible leg (250 m chord, an S-bend at the full turn limit) comes out
+     near 80 m radius, eight ring radii. The handoff warns that a curve
+     tighter than the tube folds the tube; the tube here is 45 m, and the
+     tests sample the radius on many seeds. */
+  var DEF_ROUTE = {
+    seed: 1, n: 12,
+    ringR: 10,          /* handoff: ship 15 m, ring radius 10 m */
+    gateW: 30, gateH: 18,
+    tubeR: 45,          /* clearance radius, about 3 ship lengths */
+    altMin: 30, altMax: 300,
+    spMin: 250, spMax: 500,   /* horizontal distance between waypoints */
+    maxTurn: 45,        /* degrees of heading change per waypoint */
+    maxLeg: 58,         /* degrees between two consecutive legs in 3D */
+    slope: 0.22,        /* climb per horizontal metre, at most */
+    minSep: 120,        /* metres between a new leg and every older one */
+    forgive: 1.5,       /* metres of grace on the ring and gate edge */
+    leadIn: 160, leadOut: 120,
+    step: 4             /* tube sample spacing, metres */
+  };
+
+  /* Right and up of a facing direction, with world up as the reference. */
+  function frameOf(d) {
+    var r = cross(d, [0, 1, 0]);
+    if (len(r) < 1e-6) r = [1, 0, 0];
+    r = norm(r);
+    return { right: r, up: norm(cross(r, d)) };
+  }
+
+  function hermite(sg, t) {
+    var t2 = t * t, t3 = t2 * t;
+    var h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+    var g00 = 6 * t2 - 6 * t, g10 = 3 * t2 - 4 * t + 1, g01 = -6 * t2 + 6 * t, g11 = 3 * t2 - 2 * t;
+    var k00 = 12 * t - 6, k10 = 6 * t - 4, k01 = -12 * t + 6, k11 = 6 * t - 2;
+    var p = [], d1 = [], d2 = [];
+    for (var a = 0; a < 3; a++) {
+      p.push(h00 * sg.p0[a] + h10 * sg.m0[a] + h01 * sg.p1[a] + h11 * sg.m1[a]);
+      d1.push(g00 * sg.p0[a] + g10 * sg.m0[a] + g01 * sg.p1[a] + g11 * sg.m1[a]);
+      d2.push(k00 * sg.p0[a] + k10 * sg.m0[a] + k01 * sg.p1[a] + k11 * sg.m1[a]);
+    }
+    return { p: p, d1: d1, d2: d2 };
+  }
+
+  function makeRoute(cfg) {
+    var R = merge(DEF_ROUTE, cfg);
+    R.n = Math.max(3, Math.round(R.n));
+    R.seed = R.seed >>> 0;
+    var rand = SD.rng(R.seed ^ 0x5bd1e995);
+    var n = R.n, i, j;
+
+    /* Waypoints. The heading drifts: a slow turn in one direction for two to
+       four legs, then the other way, plus jitter. That gives a route that
+       wanders without coming back on itself. A candidate leg is drawn again
+       when it turns too hard in 3D or comes too close to an older leg. */
+    var h = rand() * Math.PI * 2;
+    var pts = [[0, R.altMin + 50 + rand() * 70, 0]];
+    var sign = rand() < 0.5 ? -1 : 1, left = 2 + Math.floor(rand() * 3);
+    var legPrev = null;
+    for (i = 1; i < n; i++) {
+      var p = pts[i - 1], got = null;
+      for (var tr = 0; tr < 80 && !got; tr++) {
+        var turn = sign * (8 + rand() * 22) + (rand() * 2 - 1) * 14;
+        if (tr >= 50) turn *= 0.3;
+        turn = clamp(turn, -R.maxTurn, R.maxTurn);
+        var L = R.spMin + rand() * (R.spMax - R.spMin);
+        var y = clamp(p[1] + (rand() * 2 - 1) * L * R.slope, R.altMin, R.altMax);
+        var hh = h + turn * DEG;
+        var q = [p[0] + Math.sin(hh) * L, y, p[2] - Math.cos(hh) * L];
+        var leg = sub(q, p);
+        if (legPrev && angle(legPrev, leg) > R.maxLeg * DEG) continue;
+        var ok = true;
+        for (j = 0; j + 2 < i && ok; j++) {
+          for (var s = 0; s <= 8; s++) {
+            if (pointSegDist(add(p, mul(leg, s / 8)), pts[j], pts[j + 1]) < R.minSep) { ok = false; break; }
+          }
+        }
+        if (ok) got = { q: q, h: hh, leg: leg };
+      }
+      if (!got) {
+        var q2 = [p[0] + Math.sin(h) * R.spMin, p[1], p[2] - Math.cos(h) * R.spMin];
+        got = { q: q2, h: h, leg: sub(q2, p) };
+      }
+      pts.push(got.q); h = got.h; legPrev = got.leg;
+      if (--left <= 0) { sign = -sign; left = 2 + Math.floor(rand() * 3); }
+    }
+
+    var dirs = pts.map(function (pt, k) {
+      if (k === 0) return norm(sub(pts[1], pts[0]));
+      if (k === n - 1) return norm(sub(pts[n - 1], pts[n - 2]));
+      return norm(add(norm(sub(pt, pts[k - 1])), norm(sub(pts[k + 1], pt))));
+    });
+
+    var waypoints = pts.map(function (pt, k) {
+      var kind = k === 0 ? 'start' : (k === n - 1 ? 'finish' : 'ring');
+      var gate = kind !== 'ring', f = frameOf(dirs[k]);
+      return {
+        idx: k, kind: kind, p: pt, dir: dirs[k], right: f.right, up: f.up,
+        shape: gate ? 'rect' : 'circle',
+        r: gate ? 0 : R.ringR,
+        hw: gate ? R.gateW / 2 : R.ringR, hh: gate ? R.gateH / 2 : R.ringR,
+        hold: null, biome: 'open'
+      };
+    });
+
+    var segments = [];
+    for (i = 0; i + 1 < n; i++) {
+      var c = len(sub(pts[i + 1], pts[i]));
+      segments.push({ i: i, p0: pts[i], p1: pts[i + 1], m0: mul(dirs[i], c), m1: mul(dirs[i + 1], c), chord: c, biome: 'open' });
+    }
+
+    /* u runs from 0 at the start gate to n - 1 at the finish. */
+    function spline(u) {
+      var uu = clamp(u, 0, n - 1);
+      var k = Math.min(n - 2, Math.floor(uu));
+      var e = hermite(segments[k], uu - k);
+      var sp = len(e.d1);
+      var kap = sp > 1e-9 ? len(cross(e.d1, e.d2)) / (sp * sp * sp) : 0;
+      return { p: e.p, d: mul(e.d1, 1 / Math.max(1e-9, sp)), curvature: kap };
+    }
+
+    /* The tube: dense samples along the curve, plus a straight lead-in before
+       the start gate (the reset position sits on it) and a lead-out after the
+       finish. A sample is { p, d, u, s }, s the arc length from the lead-in
+       end. */
+    var samples = [], sAcc = 0, minR = Infinity, last = null;
+    function push(pt, d, u) {
+      if (last) sAcc += len(sub(pt, last));
+      samples.push({ p: pt, d: d, u: u, s: sAcc });
+      last = pt;
+    }
+    var d0 = dirs[0], nIn = Math.ceil(R.leadIn / R.step);
+    for (i = 0; i < nIn; i++) {
+      var f0 = 1 - i / nIn;
+      push(sub(pts[0], mul(d0, R.leadIn * f0)), d0, -f0);
+    }
+    for (i = 0; i + 1 < n; i++) {
+      var nSt = Math.max(4, Math.ceil(segments[i].chord / R.step));
+      for (j = 0; j < nSt; j++) {
+        var sp2 = spline(i + j / nSt);
+        if (sp2.curvature > 1e-12) minR = Math.min(minR, 1 / sp2.curvature);
+        push(sp2.p, sp2.d, i + j / nSt);
+      }
+    }
+    var dn = dirs[n - 1], nOut = Math.ceil(R.leadOut / R.step);
+    for (i = 0; i <= nOut; i++) push(add(pts[n - 1], mul(dn, R.leadOut * i / nOut)), dn, n - 1 + i / nOut);
+
+    var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (i = 0; i < samples.length; i++) {
+      for (j = 0; j < 3; j++) {
+        lo[j] = Math.min(lo[j], samples[i].p[j] - R.tubeR);
+        hi[j] = Math.max(hi[j], samples[i].p[j] + R.tubeR);
+      }
+    }
+    var tube = {
+      r: R.tubeR, samples: samples,
+      /* Distance from p to the nearest sample. Brute force, for tests and
+         generators; the loop never calls it. */
+      dist: function (pt) {
+        var best = Infinity;
+        for (var k = 0; k < samples.length; k++) {
+          var q = samples[k].p, dx = q[0] - pt[0], dy = q[1] - pt[1], dz = q[2] - pt[2];
+          var dd = dx * dx + dy * dy + dz * dz;
+          if (dd < best) best = dd;
+        }
+        return Math.sqrt(best);
+      }
+    };
+    return {
+      seed: R.seed, cfg: R, n: n, waypoints: waypoints, segments: segments,
+      spline: spline, tube: tube, length: sAcc, minRadius: minR,
+      bounds: { min: lo, max: hi }
+    };
+  }
+
+  /* Where the ship is put on reset: back along the start gate's facing
+     direction, at rest, nose along the direction, wings level. */
+  function startState(route, back) {
+    var w = route.waypoints[0], b = back == null ? 60 : back;
+    var p = sub(w.p, mul(w.dir, b));
+    return { p: p, v: [0, 0, 0], q: quatFromAxes(w.right, w.up, mul(w.dir, -1)), w: [0, 0, 0] };
+  }
+
+  /* Quaternion [w, x, y, z] of the rotation that takes the body axes onto
+     the given world vectors (X right, Y up, Z aft). */
+  function quatFromAxes(X, Y, Z) {
+    var m00 = X[0], m01 = Y[0], m02 = Z[0];
+    var m10 = X[1], m11 = Y[1], m12 = Z[1];
+    var m20 = X[2], m21 = Y[2], m22 = Z[2];
+    var tr = m00 + m11 + m22, q, S;
+    if (tr > 0) {
+      S = Math.sqrt(tr + 1) * 2;
+      q = [0.25 * S, (m21 - m12) / S, (m02 - m20) / S, (m10 - m01) / S];
+    } else if (m00 > m11 && m00 > m22) {
+      S = Math.sqrt(1 + m00 - m11 - m22) * 2;
+      q = [(m21 - m12) / S, 0.25 * S, (m01 + m10) / S, (m02 + m20) / S];
+    } else if (m11 > m22) {
+      S = Math.sqrt(1 + m11 - m00 - m22) * 2;
+      q = [(m02 - m20) / S, (m01 + m10) / S, 0.25 * S, (m12 + m21) / S];
+    } else {
+      S = Math.sqrt(1 + m22 - m00 - m11) * 2;
+      q = [(m10 - m01) / S, (m02 + m20) / S, (m12 + m21) / S, 0.25 * S];
+    }
+    return SD.qNorm(q);
+  }
+
+  /* ---- obstacles ----------------------------------------------------------
+     A stand-in for the city: axis-aligned boxes on the ground near the
+     route, never inside the clearance tube. The city step replaces the
+     placement and keeps the output shape:
+       { boxes: [{ min, max, c, half, idx }], boxesNear(p, r), pads }
+     boxesNear is a uniform grid in x and z, because the contact code must
+     only see the handful of boxes within reach of the hull.
+     pads are flat roof tops large enough to land on, marked now for the
+     delivery waypoints of v2. */
+  var DEF_OBST = {
+    seed: 0, count: 40, near: 150,
+    hMin: 20, hMax: 120,
+    wMin: 8, wMax: 26,      /* half extents in x and z */
+    gap: 8,                 /* daylight between two boxes */
+    margin: 2,              /* extra metres outside the tube */
+    under: 0.35,            /* share of tries placed straight under the route */
+    cell: 64, padMin: 10
+  };
+
+  function boxDist(b, p) {
+    var dx = Math.max(b.min[0] - p[0], 0, p[0] - b.max[0]);
+    var dy = Math.max(b.min[1] - p[1], 0, p[1] - b.max[1]);
+    var dz = Math.max(b.min[2] - p[2], 0, p[2] - b.max[2]);
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  function makeObstacles(route, cfg) {
+    var O = merge(DEF_OBST, cfg);
+    if (!cfg || cfg.seed == null) O.seed = (route.seed * 7919 + 17) >>> 0;
+    var rand = SD.rng(O.seed >>> 0);
+    var S = route.tube.samples, Rt = route.tube.r;
+    var boxes = [], tries = 0, maxTries = O.count * 80, i, k;
+    while (boxes.length < O.count && tries++ < maxTries) {
+      var sp = S[Math.floor(rand() * S.length)];
+      var hn = norm([-sp.d[2], 0, sp.d[0]]);
+      if (len(hn) < 0.5) continue;
+      var side = rand() < 0.5 ? -1 : 1;
+      var hx = O.wMin + rand() * (O.wMax - O.wMin), hz = O.wMin + rand() * (O.wMax - O.wMin);
+      var off = rand() < O.under ? rand() * O.near
+        : Rt + O.margin + Math.max(hx, hz) + rand() * Math.max(0, O.near - Rt - O.margin);
+      var c = [sp.p[0] + hn[0] * side * off, 0, sp.p[2] + hn[2] * side * off];
+      var h = O.hMin + Math.pow(rand(), 1.4) * (O.hMax - O.hMin);
+      var b = { min: [c[0] - hx, 0, c[2] - hz], max: [c[0] + hx, h, c[2] + hz] };
+      var dmin = Infinity;
+      for (k = 0; k < S.length; k++) {
+        var d = boxDist(b, S[k].p);
+        if (d < dmin) { dmin = d; if (dmin < Rt + O.margin) break; }
+      }
+      if (dmin < Rt + O.margin || dmin > O.near) continue;
+      var clash = false;
+      for (k = 0; k < boxes.length; k++) {
+        var o = boxes[k];
+        if (b.min[0] < o.max[0] + O.gap && b.max[0] > o.min[0] - O.gap &&
+            b.min[2] < o.max[2] + O.gap && b.max[2] > o.min[2] - O.gap) { clash = true; break; }
+      }
+      if (clash) continue;
+      b.c = [c[0], h / 2, c[2]];
+      b.half = [hx, h / 2, hz];
+      b.idx = boxes.length;
+      b.clear = dmin;
+      boxes.push(b);
+    }
+
+    var cell = O.cell, grid = new Map();
+    function key(ix, iz) { return ix + ',' + iz; }
+    for (i = 0; i < boxes.length; i++) {
+      var bx = boxes[i];
+      for (var ix = Math.floor(bx.min[0] / cell); ix <= Math.floor(bx.max[0] / cell); ix++) {
+        for (var iz = Math.floor(bx.min[2] / cell); iz <= Math.floor(bx.max[2] / cell); iz++) {
+          var kk = key(ix, iz), lst = grid.get(kk);
+          if (!lst) { lst = []; grid.set(kk, lst); }
+          lst.push(i);
+        }
+      }
+    }
+    var stamp = new Int32Array(boxes.length), tick = 0;
+    /* Boxes whose bounds come within r of p. */
+    function boxesNear(p, r) {
+      var out = [];
+      tick++;
+      var x0 = Math.floor((p[0] - r) / cell), x1 = Math.floor((p[0] + r) / cell);
+      var z0 = Math.floor((p[2] - r) / cell), z1 = Math.floor((p[2] + r) / cell);
+      for (var gx = x0; gx <= x1; gx++) {
+        for (var gz = z0; gz <= z1; gz++) {
+          var l = grid.get(key(gx, gz));
+          if (!l) continue;
+          for (var m = 0; m < l.length; m++) {
+            var bi = l[m];
+            if (stamp[bi] === tick) continue;
+            stamp[bi] = tick;
+            if (boxDist(boxes[bi], p) <= r) out.push(boxes[bi]);
+          }
+        }
+      }
+      return out;
+    }
+    var pads = [];
+    for (i = 0; i < boxes.length; i++) {
+      var bb = boxes[i];
+      if (bb.half[0] >= O.padMin && bb.half[2] >= O.padMin) {
+        pads.push({ p: [bb.c[0], bb.max[1], bb.c[2]], half: [bb.half[0], bb.half[2]], box: i });
+      }
+    }
+    return { seed: O.seed, cfg: O, boxes: boxes, cell: cell, boxesNear: boxesNear, pads: pads };
+  }
+
+  /* ---- contacts -----------------------------------------------------------
+     Hull points against the OUTSIDE of axis-aligned boxes and against the
+     ground plane y = 0, in the record SixDOF.resolve takes:
+       { n, r, pen, key }
+     n the world normal the hull has to move along, r the lever arm from the
+     centre of mass, pen the depth, key the group for the positional
+     correction (one per box, 'g' for the ground).
+     A point inside a box leaves through the face it is least deep behind.
+     The bottom face is skipped for boxes standing on the ground, because
+     pushing the ship down into the ground is never the way out. At a few
+     metres per substep against boxes 16 m wide and more, the least deep face
+     is the face the point came through. */
+  function contactsBoxes(s, pts, boxes) {
+    var out = [], i, k;
+    for (i = 0; i < pts.length; i++) {
+      var r = SD.qRot(s.q, pts[i]);
+      var wp = [s.p[0] + r[0], s.p[1] + r[1], s.p[2] + r[2]];
+      if (wp[1] < 0) out.push({ n: [0, 1, 0], r: r, pen: -wp[1], key: 'g' });
+      for (k = 0; k < boxes.length; k++) {
+        var b = boxes[k], mn = b.min, mx = b.max;
+        if (!(wp[0] > mn[0] && wp[0] < mx[0] && wp[1] > mn[1] && wp[1] < mx[1] &&
+              wp[2] > mn[2] && wp[2] < mx[2])) continue;
+        var best = mx[1] - wp[1], n = [0, 1, 0], c;
+        if ((c = wp[0] - mn[0]) < best) { best = c; n = [-1, 0, 0]; }
+        if ((c = mx[0] - wp[0]) < best) { best = c; n = [1, 0, 0]; }
+        if ((c = wp[2] - mn[2]) < best) { best = c; n = [0, 0, -1]; }
+        if ((c = mx[2] - wp[2]) < best) { best = c; n = [0, 0, 1]; }
+        if (mn[1] > 0 && (c = wp[1] - mn[1]) < best) { best = c; n = [0, -1, 0]; }
+        out.push({ n: n, r: r, pen: best, key: 'b' + (b.idx != null ? b.idx : k), box: b.idx != null ? b.idx : k });
+      }
+    }
+    return out;
+  }
+
+  /* ---- rings and gates ----------------------------------------------------
+     Did the segment prev -> cur pass through the waypoint? Only along its
+     facing direction: a ring flown backwards does not count, which keeps the
+     route a route and stops a pilot from taking ring 4 on the way back from
+     ring 5. The edge has a small grace (route cfg.forgive, 1.5 m), because
+     the test uses the centre of a 15 m ship and a graze that visibly went
+     through should count. Returns the fraction along the segment at which
+     the plane was crossed, or null. */
+  function ringPass(prev, cur, wp, forgive) {
+    var d0 = dot(sub(prev, wp.p), wp.dir), d1 = dot(sub(cur, wp.p), wp.dir);
+    if (!(d0 < 0 && d1 >= 0)) return null;
+    var f = d0 / (d0 - d1);
+    var x = add(prev, mul(sub(cur, prev), f)), o = sub(x, wp.p);
+    var tol = forgive == null ? DEF_ROUTE.forgive : forgive;
+    var a = dot(o, wp.right), b = dot(o, wp.up);
+    if (wp.shape === 'rect') {
+      if (Math.abs(a) > wp.hw + tol || Math.abs(b) > wp.hh + tol) return null;
+    } else if (a * a + b * b > (wp.r + tol) * (wp.r + tol)) return null;
+    return f;
+  }
+
+  /* ---- the race -----------------------------------------------------------
+     idle      only the start gate is live. Crossing it starts the clock
+               (handoff: the clock starts at the start gate), at the
+               interpolated crossing time, not at the frame.
+     running   only waypoint `next` is live. Every other ring is scenery, so
+               a ring taken out of order simply does not count.
+     finished  the finish gate was crossed; time is the total and splits[k]
+               the clock when waypoint k + 1 was taken (n - 1 of them, the
+               last one equal to time). Nothing changes until a reset.
+     t is the simulation time at cur, in milliseconds. raceStep is pure: it
+     returns a new race with event set to what happened on this step. */
+  function makeRace(route) {
+    return {
+      state: 'idle', next: 0, n: route.waypoints.length, wps: route.waypoints,
+      forgive: route.cfg ? route.cfg.forgive : DEF_ROUTE.forgive,
+      t0: null, lastT: null, splits: [], time: null, dwell: 0, event: null
+    };
+  }
+
+  function raceStep(race, prev, cur, t) {
+    var r = {}, k;
+    for (k in race) r[k] = race[k];
+    r.event = null;
+    var tPrev = race.lastT == null ? t : race.lastT;
+    r.lastT = t;
+    if (r.state === 'finished') return r;
+    var wp = r.wps[r.next];
+    if (!wp) return r;
+    var tc;
+    if (wp.kind === 'delivery') {
+      /* v2: hover inside the zone, slower than maxSpeed, for hold.ms. */
+      var hd = wp.hold || { ms: 1500, maxSpeed: 2 };
+      var dtm = t - tPrev, v = dtm > 0 ? len(sub(cur, prev)) / (dtm / 1000) : 0;
+      if (len(sub(cur, wp.p)) <= (wp.r || 10) && v <= hd.maxSpeed) r.dwell = race.dwell + dtm;
+      else r.dwell = 0;
+      if (r.dwell < hd.ms) return r;
+      r.dwell = 0;
+      tc = t;
+    } else {
+      var f = ringPass(prev, cur, wp, r.forgive);
+      if (f == null) return r;
+      tc = tPrev + f * (t - tPrev);
+    }
+    if (r.state === 'idle') {
+      r.state = 'running'; r.t0 = tc; r.next = 1;
+      r.event = { type: 'start', idx: wp.idx, time: 0 };
+      return r;
+    }
+    var split = tc - r.t0;
+    r.splits = race.splits.concat([split]);
+    r.next = race.next + 1;
+    if (wp.kind === 'finish' || r.next >= r.n) {
+      r.state = 'finished'; r.time = split;
+      r.event = { type: 'finish', idx: wp.idx, time: split };
+    } else {
+      r.event = { type: wp.kind === 'delivery' ? 'delivery' : 'ring', idx: wp.idx, time: split };
+    }
+    return r;
+  }
+
+  /* The clock as shown: 0 before the start, running time, then the total. */
+  function elapsed(race, t) {
+    if (race.state === 'running') return t - race.t0;
+    if (race.state === 'finished') return race.time;
+    return 0;
+  }
+
+  /* m:ss.cc, truncated to the hundredth, as a race clock does. */
+  function formatTime(ms) {
+    if (ms == null || !isFinite(ms)) return '-:--.--';
+    var neg = ms < 0, cs = Math.floor(Math.abs(ms) / 10);
+    var m = Math.floor(cs / 6000), s = Math.floor(cs / 100) % 60, c = cs % 100;
+    return (neg ? '-' : '') + m + ':' + (s < 10 ? '0' : '') + s + '.' + (c < 10 ? '0' : '') + c;
+  }
+
+  return {
+    DEF_ROUTE: DEF_ROUTE, DEF_OBST: DEF_OBST,
+    makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
+    makeObstacles: makeObstacles, boxDist: boxDist, contactsBoxes: contactsBoxes,
+    ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, elapsed: elapsed,
+    formatTime: formatTime
+  };
+})();
+if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
+  </script>
+
+  <script id="app">
+const html = htm.bind(React.createElement);
+const { useState, useRef, useEffect, useMemo, useCallback } = React;
+const SD = SixDOF;
+const HF = HikyakuFlight;
+const HK = Hikyaku;
+const CR = ColorRamps;
+const G = HF.G0;
+
+/* Colours are literals: the page has no theme switcher and only exists dark.
+   The world is bone grey (handoff, Look), with two neon accents at most: the
+   courier's cyan for the next ring and the cue, and a warm amber for the
+   rectangular gates (the portal rule). */
+const ACCENT = 0x2ee8ff;
+const WARM = 0xffa63d;
+const BONE = CR.rampById('bone').stops;
+function boneAt(t) {
+  const x = Math.max(0, Math.min(1, t)) * (BONE.length - 1);
+  const i = Math.min(BONE.length - 2, Math.floor(x)), f = x - i;
+  const a = BONE[i], b = BONE[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+function boneCss(t, k) {
+  const c = boneAt(t).map((v) => Math.round(Math.min(1, v * (k == null ? 1 : k)) * 255));
+  return 'rgb(' + c.join(',') + ')';
+}
+function boneColor(THREE, t, k) {
+  const c = boneAt(t), s = k == null ? 1 : k;
+  return new THREE.Color().setRGB(c[0] * s, c[1] * s, c[2] * s, THREE.SRGBColorSpace);
+}
+/* Fog, ground and boxes take the upper half of bone, darkened: the lower
+   half of the ramp is blue and reads lavender as a sky. */
+const FOG = [0.62, 0.5];
+
+/* URL hooks. ?seed= makes a route shareable and best times comparable.
+   ?shot=start|ring|top places the camera deterministically and ignores input,
+   for headless screenshots; ?nohid=1 skips the 3D mouse. Test hooks, kept
+   cheap. */
+const URLP = new URLSearchParams(location.search);
+const SHOT = ['start', 'ring', 'top'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const NOHID = URLP.get('nohid') === '1';
+const URL_SEED = parseInt(URLP.get('seed'), 10);
+
+const DEF = {
+  seed: 1,
+  assist: true, gravity: true, drag: true,
+  /* The courier's flat-plate drag torque pitches the nose away from the wind
+     at angle of attack; a weak torque plus rate damping keeps it flyable. */
+  dragTorque: 0.3, rateDamp: 2,
+  /* Budget in g per body axis and sign, as in hikyaku-flight.js. */
+  bXp: 1, bXn: 1, bYp: 3, bYn: 1.5, bZn: 1, bZp: 1, bBoost: 2,
+  aPitch: 1.5, aYaw: 1.0, aRoll: 3.0, mass: 3000, cd: 0.9,
+  restitution: 0.3,
+  deadzone: 0, curve: 1, gain: 1,
+  camMode: 'chase',
+  camF0: 0.9, camZeta: 0.7071, camRoll: 0.25, camDist: 2.4, camUp: 0.45,
+  shadows: false, overlay: false, routeLine: true
+};
+const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
+const ENUMS = { camMode: ['chase', 'cockpit'] };
+const STORE = 'hk.cfg';
+const BEST = 'hk.best';
+const SHIP_L = 15;
+const H_STEP = 1 / 120;
+
+/* The 3D mouse mapping of asteroid-corridor, unchanged. */
+const DEF_INV = { fwd: -1, right: 1, up: -1, pitch: 1, yaw: -1, roll: 1 };
+const DEF_MAP = { fwd: 'ty', right: 'tx', up: 'tz', pitch: 'rx', yaw: 'rz', roll: 'ry' };
+const AXES = ['fwd', 'right', 'up', 'pitch', 'yaw', 'roll'];
+
+/* Keyboard. Signs follow the body frame: pitch + is nose up, yaw + is nose
+   left, roll + is left wing down. The arrows pitch like a stick: up pushes
+   the nose down. */
+const KEYMAP = {
+  KeyW: ['fwd', 1], KeyS: ['fwd', -1], KeyD: ['right', 1], KeyA: ['right', -1],
+  KeyR: ['up', 1], KeyF: ['up', -1],
+  ArrowUp: ['pitch', -1], ArrowDown: ['pitch', 1],
+  ArrowLeft: ['yaw', 1], ArrowRight: ['yaw', -1],
+  KeyQ: ['roll', 1], KeyE: ['roll', -1],
+  ShiftLeft: ['main', 1], ShiftRight: ['main', 1]
+};
+
+function fmt(x, d) { return Number.isFinite(x) ? x.toFixed(d == null ? 1 : d) : '-'; }
+
+function loadStored() {
+  let c = DEF;
+  try {
+    const raw = localStorage.getItem(STORE);
+    if (raw) c = SD.mergeConfig(DEF, JSON.parse(raw), ENUMS);
+  } catch (e) { c = DEF; }
+  if (Number.isFinite(URL_SEED) && URL_SEED > 0) c = { ...c, seed: URL_SEED };
+  return c;
+}
+function loadBest() {
+  try { const b = JSON.parse(localStorage.getItem(BEST) || '{}'); return b && typeof b === 'object' ? b : {}; }
+  catch (e) { return {}; }
+}
+
+function Slider(props) {
+  return html`<div className="hk-row">
+    <label>${props.label}</label>
+    <output>${fmt(props.value * (props.scale || 1), props.digits)}${props.unit ? ' ' + props.unit : ''}</output>
+    <input type="range" min=${props.min} max=${props.max} step=${props.step} value=${props.value}
+      onInput=${(e) => props.onChange(parseFloat(e.target.value))} />
+  </div>`;
+}
+
+function Num({ label, unit, value, step, min, onChange }) {
+  return html`<label className="hk-num">
+    <span>${label}</span>
+    <input type="number" value=${value} step=${step} min=${min}
+      onChange=${(e) => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v) && v >= (min == null ? -Infinity : min)) onChange(v);
+      }} />
+    <i>${unit || ''}</i>
+  </label>`;
+}
+
+function Seg({ label, value, options, onChange }) {
+  return html`<${React.Fragment}>
+    ${label ? html`<span className="hk-seg-l">${label}</span>` : null}
+    <div className="hk-seg seg-row">
+      ${options.map((o) => html`<button key=${o.value}
+        className=${'lang-seg' + (value === o.value ? ' active' : '')}
+        onClick=${() => onChange(o.value)}>${o.label}</button>`)}
+    </div>
+  <//>`;
+}
+
+function Section({ id, title, summary, open, onToggle, children }) {
+  return html`<div className="hk-acc">
+    <button type="button" className=${'hk-acc-h' + (open ? ' open' : '')}
+      aria-expanded=${open} onClick=${() => onToggle(id)}>
+      <span>${title}</span>
+      ${!open && summary ? html`<span className="hk-acc-s">${summary}</span>` : null}
+      <span className="hk-acc-c">${open ? '−' : '+'}</span>
+    </button>
+    ${open ? html`<div className="hk-acc-b">${children}</div>` : null}
+  </div>`;
+}
+
+/* The ground texture: one 100 m tile with a strong edge and 25 m minor
+   lines, so both speed and height read off it. */
+function groundTexture(THREE, renderer) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = boneCss(0.6, 0.2);
+  g.fillRect(0, 0, 512, 512);
+  g.fillStyle = boneCss(0.6, 0.27);
+  for (let i = 1; i < 4; i++) { g.fillRect(i * 128 - 1, 0, 2, 512); g.fillRect(0, i * 128 - 1, 512, 2); }
+  g.fillStyle = boneCss(0.62, 0.38);
+  g.fillRect(0, 0, 512, 4); g.fillRect(0, 0, 4, 512);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
+  return tex;
+}
+
+/* A gate frame after the portal rule: a dark rectangular body with real depth,
+   and its reveal (the inner faces) glowing in the warm accent. The glow material
+   is passed in, so its colour can follow the race state. */
+function gateFrame(THREE, wp, mat, body) {
+  const grp = new THREE.Group();
+  const t = 2.2, dep = 5, hw = wp.hw, hh = wp.hh, lip = 0.35;
+  const box = (w, h, d, x, y, z, m) => {
+    const ms = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    ms.position.set(x, y, z);
+    grp.add(ms);
+  };
+  /* dark lit body */
+  box(2 * hw + 2 * t, t, dep, 0, hh + t / 2, 0, body);
+  box(2 * hw + 2 * t, t, dep, 0, -hh - t / 2, 0, body);
+  box(t, 2 * hh, dep, -hw - t / 2, 0, 0, body);
+  box(t, 2 * hh, dep, hw + t / 2, 0, 0, body);
+  /* the glowing reveal: thin warm plates on the four inner faces */
+  box(2 * hw, lip, dep + 0.1, 0, hh - lip / 2, 0, mat);
+  box(2 * hw, lip, dep + 0.1, 0, -hh + lip / 2, 0, mat);
+  box(lip, 2 * hh, dep + 0.1, -hw + lip / 2, 0, 0, mat);
+  box(lip, 2 * hh, dep + 0.1, hw - lip / 2, 0, 0, mat);
+  grp.position.set(wp.p[0], wp.p[1], wp.p[2]);
+  /* Local x right, y up, z against the facing direction. */
+  const q = HK.quatFromAxes(wp.right, wp.up, SD.mul(wp.dir, -1));
+  grp.quaternion.set(q[1], q[2], q[3], q[0]);
+  return grp;
+}
+
+function App() {
+  const [p, setP] = useState(loadStored);
+  const [panel, setPanel] = useState(!SHOT);
+  const [sec, setSec] = useState('');
+  const [dev, setDev] = useState({ name: null, err: null, supported: !!(window.SpaceNav && SpaceNav.supported()) });
+  const [ready, setReady] = useState(!!window.__hkThreeReady);
+  const [best, setBest] = useState(loadBest);
+  const [lastRun, setLastRun] = useState(null);
+  const [seedText, setSeedText] = useState(String(loadStored().seed));
+
+  const stageRef = useRef(null);
+  const hudRef = useRef({});
+  const navRef = useRef(null);
+  const glRef = useRef(null);
+  const keysRef = useRef({});
+  const lookRef = useRef({ yaw: 0, pitch: 0, dragging: false, chase: null });
+  const killRef = useRef(false);
+  const resetRef = useRef(0);
+  const onFinishRef = useRef(null);
+
+  /* The courier's own frame is kept for collision and drawing, and the
+     principal moments are passed in as I. Letting makeCraft principalize the
+     hull would tilt its points by a few tenths of a metre against the drawn
+     ship, for products of inertia that are negligible on this hull. */
+  const geo = useMemo(() => Courier.geometry(), []);
+  const I0 = useMemo(() => SD.principalize(geo.collisionHull.verts, geo.collisionHull.faces).I, [geo]);
+  const craft = useMemo(() => HF.makeCraft({
+    hull: geo.collisionHull, I: I0, mass: p.mass, cd: p.cd,
+    budget: { xp: p.bXp * G, xn: p.bXn * G, yp: p.bYp * G, yn: p.bYn * G, zp: p.bZp * G, zn: p.bZn * G },
+    aBoost: p.bBoost * G, aPitch: p.aPitch, aYaw: p.aYaw, aRoll: p.aRoll,
+    assist: p.assist, dragTorque: p.dragTorque, rateDamp: p.rateDamp
+  }), [geo, I0, p.mass, p.cd, p.bXp, p.bXn, p.bYp, p.bYn, p.bZp, p.bZn, p.bBoost,
+    p.aPitch, p.aYaw, p.aRoll, p.assist, p.dragTorque, p.rateDamp]);
+  /* Space kills rotation with a strong damper and no pilot torque. */
+  const killCraft = useMemo(() => ({ ...craft, rateDamp: 8 }), [craft]);
+
+  /* The route is geometry: rebuilt only on a new seed, and the world is
+     built around it. makeObstacles is the slot the city generator takes. */
+  const route = useMemo(() => HK.makeRoute({ seed: p.seed }), [p.seed]);
+  const obst = useMemo(() => HK.makeObstacles(route), [route]);
+
+  const cfgRef = useRef(null);
+  cfgRef.current = { p, craft, killCraft, route, obst };
+
+  const der = useMemo(() => HF.speeds(craft, p.gravity ? G : 0), [craft, p.gravity]);
+
+  /* ---- 3D mouse -------------------------------------------------------- */
+  useEffect(() => {
+    if (NOHID || !window.SpaceNav || !SpaceNav.supported()) return undefined;
+    const ctl = SpaceNav.create({
+      opts: { deadzone: 0, curve: 1 },
+      onStatus: (s) => setDev((d) => ({ ...d, name: s.connected, err: s.error }))
+    });
+    ctl.init();
+    navRef.current = ctl;
+    return () => { ctl.destroy(); navRef.current = null; };
+  }, []);
+  const connect = useCallback(() => { if (navRef.current) navRef.current.connect(); }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORE, JSON.stringify(p)); } catch (e) { /* private mode */ }
+  }, [p]);
+  useEffect(() => {
+    setSeedText(String(p.seed));
+    setLastRun(null);
+    try {
+      const u = new URL(location.href);
+      u.searchParams.set('seed', String(p.seed));
+      history.replaceState(null, '', u.toString());
+    } catch (e) { /* file:// or sandbox */ }
+  }, [p.seed]);
+
+  /* Called from the loop when the finish gate is crossed. */
+  onFinishRef.current = (race) => {
+    const key = String(p.seed);
+    const prevBest = best[key];
+    const isBest = !(prevBest > 0) || race.time < prevBest;
+    if (isBest) {
+      const nb = { ...best, [key]: race.time };
+      setBest(nb);
+      try { localStorage.setItem(BEST, JSON.stringify(nb)); } catch (e) { /* private mode */ }
+    }
+    setLastRun({ time: race.time, splits: race.splits.slice(), best: isBest, seed: p.seed });
+    return isBest;
+  };
+
+  const toggleSec = useCallback((id) => setSec((s) => (s === id ? '' : id)), []);
+  const upd = (k) => (v) => setP((q) => ({ ...q, [k]: v }));
+  const setSeed = (v) => {
+    const n = Math.max(1, Math.min(999999, Math.round(v)));
+    setP((q) => ({ ...q, seed: n }));
+    resetRef.current++;
+  };
+
+  useEffect(() => {
+    if (ready) return undefined;
+    const on = () => setReady(true);
+    window.addEventListener('hk-three-ready', on, { once: true });
+    if (window.__hkThreeReady) setReady(true);
+    return () => window.removeEventListener('hk-three-ready', on);
+  }, [ready]);
+
+  /* ---- keyboard -------------------------------------------------------- */
+  useEffect(() => {
+    const down = (e) => {
+      if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+      if (KEYMAP[e.code]) { keysRef.current[e.code] = 1; e.preventDefault(); }
+      else if (e.code === 'Space') { killRef.current = true; e.preventDefault(); }
+      else if (e.code === 'KeyX') setP((q) => ({ ...q, assist: !q.assist }));
+      else if (e.code === 'KeyC') setP((q) => ({ ...q, camMode: q.camMode === 'chase' ? 'cockpit' : 'chase' }));
+      else if (e.code === 'Backspace') { resetRef.current++; e.preventDefault(); }
+      else if (e.code === 'KeyP') setPanel((v) => !v);
+    };
+    const up = (e) => { delete keysRef.current[e.code]; };
+    const blur = () => { keysRef.current = {}; };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, []);
+
+  /* ---- the scene and the loop ------------------------------------------
+     Built once. The route-dependent meshes are rebuilt in the effect below;
+     everything else is read out of cfgRef each frame. */
+  useEffect(() => {
+    if (!ready || !stageRef.current) return undefined;
+    const THREE = window.THREE;
+    const host = stageRef.current;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    const fogCol = boneColor(THREE, FOG[0], FOG[1]);
+    renderer.setClearColor(fogCol, 1);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    host.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = fogCol;
+    scene.fog = new THREE.Fog(fogCol, 260, 2600);
+    const camera = new THREE.PerspectiveCamera(62, 1, 0.5, 30000);
+
+    const worldGrp = new THREE.Group();
+    scene.add(worldGrp);
+    const shipGrp = new THREE.Group();
+    scene.add(shipGrp);
+
+    const sunDir = new THREE.Vector3(0.45, 0.8, 0.35).normalize();
+    const sun = new THREE.DirectionalLight(0xfff1e0, 2.4);
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.normalBias = 0.4;
+    scene.add(sun);
+    scene.add(sun.target);
+    const hemi = new THREE.HemisphereLight(boneColor(THREE, 0.8), boneColor(THREE, 0.55, 0.2), 1.1);
+    scene.add(hemi);
+
+    /* The courier. Plumes are scaled from the loop: the four fan plumes with
+       the lift the fans deliver, the two main plumes with the boost. */
+    const ship = Courier.build(THREE);
+    shipGrp.add(ship.visual);
+    const fans = [], mains = [];
+    ship.visual.traverse((o) => {
+      if (o.userData.thruster === 'fan') fans.push(o);
+      else if (o.userData.thruster === 'main') mains.push(o);
+      else if (o.isMesh && !o.userData.fx) { o.castShadow = true; o.receiveShadow = true; }
+    });
+
+    const state = {
+      s: null, info: null, cam: { q: [1, 0, 0, 0], w: [0, 0, 0] },
+      simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: ''
+    };
+    const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, rings: null, gates: null };
+    glRef.current = g;
+
+    const colNext = new THREE.Color(ACCENT);
+    const colAhead = boneColor(THREE, 0.8, 0.95);
+    const colDone = boneColor(THREE, 0.4, 0.8);
+    const warmOn = new THREE.Color(WARM);
+    const warmOff = new THREE.Color(WARM).multiplyScalar(0.35);
+
+    /* Ring and gate colours follow the race: the next waypoint in the
+       accent, the ones ahead pale, the ones taken dim. */
+    const mark = () => {
+      const race = state.race;
+      if (!race) return;
+      if (g.rings) {
+        const R = g.rings;
+        for (let k = 0; k < R.wpIdx.length; k++) {
+          const wi = R.wpIdx[k];
+          const col = race.state !== 'idle' && wi === race.next ? colNext
+            : (race.state !== 'idle' && wi < race.next) || race.state === 'finished' ? colDone : colAhead;
+          R.mesh.setColorAt(k, col);
+        }
+        R.mesh.instanceColor.needsUpdate = true;
+      }
+      if (g.gates) {
+        g.gates.start.copy(race.state === 'idle' ? warmOn : warmOff);
+        g.gates.finish.copy(race.state === 'running' && race.next === race.n - 1 ? warmOn : warmOff);
+      }
+    };
+    g.mark = mark;
+
+    const reset = () => {
+      const cfg = cfgRef.current;
+      state.s = HK.startState(cfg.route, 60);
+      state.info = null;
+      state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
+      state.simT = 0; state.acc = 0; state.hits = 0;
+      state.race = HK.makeRace(cfg.route);
+      state.msg = ''; state.msgUntil = 0; state.splitsText = '';
+      killRef.current = false;
+      mark();
+    };
+    g.reset = reset;
+    reset();
+    let lastReset = resetRef.current;
+    let lastRoute = cfgRef.current.route;
+
+    const resize = () => {
+      const w = host.clientWidth || window.innerWidth;
+      const h = host.clientHeight || window.innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    const onDown = (e) => {
+      if (e.button === 0) { lookRef.current.dragging = true; e.preventDefault(); }
+      if (e.button === 1) { killRef.current = true; e.preventDefault(); }
+    };
+    const onUp = (e) => { if (e.button === 0) lookRef.current.dragging = false; };
+    const onMove = (e) => {
+      const L = lookRef.current;
+      if (!L.dragging) return;
+      L.yaw -= (e.movementX || 0) * 0.004;
+      L.pitch = Math.max(-1.4, Math.min(1.4, L.pitch - (e.movementY || 0) * 0.004));
+    };
+    const onWheel = (e) => {
+      const L = lookRef.current;
+      L.chase = Math.max(0.8, Math.min(12, (L.chase || cfgRef.current.p.camDist) * Math.exp(e.deltaY * 0.0012)));
+      e.preventDefault();
+    };
+    host.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('mousemove', onMove);
+    host.addEventListener('wheel', onWheel, { passive: false });
+
+    const tmpV = new THREE.Vector3();
+    let last = 0, raf = 0;
+
+    const say = (txt, ms, ts) => { state.msg = txt; state.msgUntil = ts + ms; };
+
+    const onEvent = (ev, ts) => {
+      const race = state.race;
+      if (ev.type === 'start') say('GO', 1200, ts);
+      else if (ev.type === 'ring' || ev.type === 'delivery') {
+        say('RING ' + race.splits.length + ' of ' + (race.n - 2) + '   ' + HK.formatTime(ev.time), 1400, ts);
+      } else if (ev.type === 'finish') {
+        const isBest = onFinishRef.current ? onFinishRef.current(race) : false;
+        say('FINISH ' + HK.formatTime(ev.time) + (isBest ? '   best for this seed' : ''), 6000, ts);
+        state.splitsText = race.splits.map((t, i) =>
+          (i === race.splits.length - 1 ? 'finish ' : 'ring ' + String(i + 1).padStart(2, ' ') + ' ') + HK.formatTime(t)).join('\n');
+      }
+      mark();
+    };
+
+    const frame = (ts) => {
+      raf = requestAnimationFrame(frame);
+      const cfg = cfgRef.current;
+      const pp = cfg.p, cr = cfg.craft, route = cfg.route, obst = cfg.obst;
+      const dtRaw = last ? (ts - last) / 1000 : 0;
+      last = ts;
+      const dt = Math.min(0.1, dtRaw);
+      if (dtRaw > 0) state.fps = state.fps ? state.fps * 0.95 + 0.05 / dtRaw : 1 / dtRaw;
+      if (resetRef.current !== lastReset || route !== lastRoute) {
+        lastReset = resetRef.current; lastRoute = route; reset();
+      }
+
+      /* ---- input ---- */
+      const cmd = { fwd: 0, right: 0, up: 0, pitch: 0, yaw: 0, roll: 0, main: 0 };
+      let holdKill = false;
+      if (!SHOT) {
+        const nav = navRef.current;
+        const raw = nav && nav.axes();
+        if (raw) {
+          const n6 = SpaceNav.norm6(raw, { deadzone: pp.deadzone, curve: pp.curve });
+          for (const a of AXES) cmd[a] = n6[DEF_MAP[a]] * DEF_INV[a] * pp.gain;
+        }
+        const btn = nav ? nav.buttons() : 0;
+        if (btn & 2) cmd.main = 1;
+        holdKill = !!(btn & 1);
+        for (const code in keysRef.current) {
+          const m = KEYMAP[code];
+          if (m) cmd[m[0]] = cmd[m[0]] + m[1];
+        }
+        for (const k in cmd) cmd[k] = Math.max(k === 'main' ? 0 : -1, Math.min(1, cmd[k]));
+      }
+
+      /* ---- physics, fixed 1/120 s steps ----
+         Flight, then contacts against the boxes within reach and the ground,
+         then the race. The race sees each substep, so the crossing time is
+         interpolated inside a step of 8 ms. */
+      const killing = killRef.current || holdKill;
+      const fc = killing ? cfg.killCraft : cr;
+      const fcmd = killing ? { ...cmd, pitch: 0, yaw: 0, roll: 0 } : cmd;
+      const env = { g: pp.gravity ? G : 0, rho: pp.drag ? HF.RHO : 0 };
+      state.acc += dt;
+      let steps = 0;
+      while (state.acc >= H_STEP && steps < 16) {
+        const prev = state.s.p;
+        const o = HF.step(fc, state.s, fcmd, env, H_STEP, 1);
+        state.s = o.state; state.info = o.info;
+        const near = obst.boxesNear(state.s.p, 12);
+        const cs = HK.contactsBoxes(state.s, cr.hull.verts, near);
+        if (cs.length) {
+          const hit = SD.resolve(state.s, cs, cr.I, pp.restitution);
+          if (hit) {
+            state.s = hit.state;
+            if (hit.impact > 1.5) {
+              state.hits++;
+              say((hit.contact.key === 'g' ? 'GROUND ' : 'HIT ') + fmt(hit.impact, 1) + ' m/s', 1000, ts);
+            }
+          }
+        }
+        state.simT += H_STEP;
+        const r2 = HK.raceStep(state.race, prev, state.s.p, state.simT * 1000);
+        state.race = r2;
+        if (r2.event) onEvent(r2.event, ts);
+        state.acc -= H_STEP;
+        steps++;
+      }
+      if (steps >= 16) state.acc = 0;
+      if (killRef.current && SD.len(state.s.w) < 2e-3) killRef.current = false;
+
+      /* ---- ship and plumes ---- */
+      const s = state.s, info = state.info;
+      shipGrp.position.set(s.p[0], s.p[1], s.p[2]);
+      shipGrp.quaternion.set(s.q[1], s.q[2], s.q[3], s.q[0]);
+      const use = info ? info.assistUse : null;
+      const fanAmt = Math.min(1, (use ? Math.max(use.yp, use.yn) : 0) + Math.abs(cmd.up) * 0.8);
+      const mainAmt = Math.max(cmd.main, use ? use.boost : 0);
+      for (const f of fans) f.scale.set(1, 0.25 + 1.75 * fanAmt, 1);
+      for (const m of mains) { m.visible = mainAmt > 0.02; m.scale.set(1, 0.1 + 1.6 * mainAmt, 1); }
+
+      /* ---- sun and shadows ---- */
+      sun.castShadow = pp.shadows;
+      sun.target.position.set(s.p[0], s.p[1], s.p[2]);
+      sun.target.updateMatrixWorld();
+      sun.position.set(s.p[0] + sunDir.x * 800, s.p[1] + sunDir.y * 800, s.p[2] + sunDir.z * 800);
+      if (pp.shadows) {
+        const sc = sun.shadow.camera;
+        sc.left = -220; sc.right = 220; sc.top = 220; sc.bottom = -220;
+        sc.near = 10; sc.far = 2000;
+        sc.updateProjectionMatrix();
+      }
+
+      /* ---- camera ---- */
+      const L = lookRef.current;
+      if (!L.dragging) { L.yaw *= Math.exp(-dt / 0.12); L.pitch *= Math.exp(-dt / 0.12); }
+      const look = SD.qMul(SD.qFromRotVec([0, L.yaw, 0]), SD.qFromRotVec([L.pitch, 0, 0]));
+      camera.up.set(0, 1, 0);
+      if (pp.camMode === 'cockpit' && !SHOT) {
+        const cq = SD.qMul(s.q, look);
+        const off = SD.qRot(s.q, [0, 1.1, -2.6]);
+        camera.position.set(s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]);
+        camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
+      } else {
+        state.cam = SD.camStep(state.cam, s.q, dt, pp.camF0, pp.camZeta, pp.camRoll);
+        const cq = SD.qMul(state.cam.q, look);
+        const off = SD.qRot(cq, [0, pp.camUp * SHIP_L, (L.chase || pp.camDist) * SHIP_L]);
+        camera.position.set(s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]);
+        camera.quaternion.set(cq[1], cq[2], cq[3], cq[0]);
+      }
+      shipGrp.visible = pp.camMode !== 'cockpit' || !!SHOT;
+      if (SHOT === 'ring') {
+        const w = route.waypoints[Math.min(3, route.n - 1)];
+        camera.position.set(w.p[0] - w.dir[0] * 80, w.p[1] - w.dir[1] * 80 + 6, w.p[2] - w.dir[2] * 80);
+        camera.lookAt(w.p[0], w.p[1], w.p[2]);
+      } else if (SHOT === 'top') {
+        const b = route.bounds;
+        const cx = (b.min[0] + b.max[0]) / 2, cz = (b.min[2] + b.max[2]) / 2;
+        const span = Math.max(b.max[0] - b.min[0], (b.max[2] - b.min[2]) * camera.aspect) / camera.aspect;
+        const hgt = span / (2 * Math.tan(camera.fov * Math.PI / 360)) * 1.08 + 200;
+        camera.position.set(cx, hgt, cz);
+        camera.up.set(0, 0, -1);
+        camera.lookAt(cx, 0, cz);
+        scene.fog.near = hgt; scene.fog.far = hgt * 4;
+      }
+      camera.updateMatrixWorld();
+
+      /* ---- HUD ---- */
+      const H = hudRef.current;
+      const set = (k, v, cls) => {
+        const el = H[k];
+        if (!el) return;
+        if (el.textContent !== v) el.textContent = v;
+        const cn = cls || '';
+        if (el.className !== cn) el.className = cn;
+      };
+      const race = state.race;
+      const tNow = state.simT * 1000;
+      set('spd', fmt(info ? info.airspeed : 0, 1) + ' m/s');
+      set('alt', fmt(s.p[1], 0) + ' m', s.p[1] < 15 ? 'hot' : '');
+      set('vs', (s.v[1] >= 0 ? '+' : '') + fmt(s.v[1], 1) + ' m/s');
+      const nRings = race.n - 1;
+      set('ring', race.state === 'idle' ? '0 of ' + nRings
+        : race.state === 'finished' ? nRings + ' of ' + nRings
+        : (race.next - 1) + ' of ' + nRings);
+      if (!pp.assist) set('assist', 'off');
+      else if (info && info.saturated) set('assist', 'short ' + fmt(info.missing / G, 2) + ' g', 'hot');
+      else if (info) {
+        const u = info.assistUse;
+        const load = Math.max(u.xp, u.xn, u.yp, u.yn, u.zp, u.zn, u.boost);
+        set('assist', fmt(load * 100, 0) + ' % load');
+      }
+      set('hits', String(state.hits), state.hits ? 'hot' : '');
+      set('fps', fmt(state.fps, 0));
+      set('clock', HK.formatTime(HK.elapsed(race, tNow)), race.state === 'finished' ? 'acc' : '');
+      set('clockSub', race.state === 'idle' ? 'fly through the start gate'
+        : race.state === 'finished' ? 'finished, Backspace to reset'
+        : (race.next === race.n - 1 ? 'finish gate next' : 'ring ' + race.next + ' next'));
+      if (H.msg) H.msg.textContent = ts < state.msgUntil ? state.msg : '';
+      if (H.splits && H.splits.textContent !== state.splitsText) H.splits.textContent = state.splitsText;
+
+      /* ---- the cue to the next waypoint ---- */
+      const cue = H.cue;
+      if (cue) {
+        const wp = race.state === 'finished' ? null : route.waypoints[race.next];
+        if (!wp || SHOT === 'top') cue.style.display = 'none';
+        else {
+          const W = host.clientWidth || window.innerWidth, Hh = host.clientHeight || window.innerHeight;
+          tmpV.set(wp.p[0], wp.p[1], wp.p[2]).applyMatrix4(camera.matrixWorldInverse);
+          const front = tmpV.z < 0;
+          const dist = Math.hypot(wp.p[0] - s.p[0], wp.p[1] - s.p[1], wp.p[2] - s.p[2]);
+          let x, y, onScreen = false, ang = 0;
+          if (front) {
+            tmpV.applyMatrix4(camera.projectionMatrix);
+            if (Math.abs(tmpV.x) < 0.94 && Math.abs(tmpV.y) < 0.9) {
+              onScreen = true;
+              x = (tmpV.x + 1) / 2 * W; y = (1 - tmpV.y) / 2 * Hh;
+            } else { ang = Math.atan2(tmpV.y, tmpV.x); }
+          } else {
+            /* Behind the camera: point the shortest way round. Straight
+               behind has no preferred side, so it points down. */
+            ang = (Math.abs(tmpV.x) + Math.abs(tmpV.y) < 1e-6) ? -Math.PI / 2 : Math.atan2(tmpV.y, tmpV.x);
+          }
+          if (!onScreen) {
+            const cx = W / 2, cy = Hh / 2, mx = cx - 46, my = cy - 46;
+            const dx = Math.cos(ang), dy = -Math.sin(ang);
+            const k = Math.min(mx / Math.max(1e-6, Math.abs(dx)), my / Math.max(1e-6, Math.abs(dy)));
+            x = cx + dx * k; y = cy + dy * k;
+          }
+          cue.style.display = 'block';
+          cue.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px)';
+          if (H.cueBox) H.cueBox.style.display = onScreen ? 'block' : 'none';
+          if (H.cueArrow) {
+            H.cueArrow.style.display = onScreen ? 'none' : 'block';
+            H.cueArrow.style.transform = 'rotate(' + (90 - ang * 180 / Math.PI).toFixed(1) + 'deg)';
+          }
+          if (H.cueD) H.cueD.textContent = fmt(dist, 0) + ' m' + (wp.kind === 'finish' ? ' finish' : wp.kind === 'start' ? ' start' : '');
+        }
+      }
+
+      renderer.render(scene, camera);
+    };
+    raf = requestAnimationFrame(frame);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+      host.removeEventListener('mousedown', onDown);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('mousemove', onMove);
+      host.removeEventListener('wheel', onWheel);
+      ship.dispose();
+      renderer.dispose();
+      if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
+      glRef.current = null;
+    };
+  }, [ready]);
+
+  /* ---- the world around the route --------------------------------------
+     Rebuilt when the route changes. Ground, boxes as one instanced mesh with
+     their edges as one line set, rings as one instanced torus mesh, the two
+     gates, and a faint line along the route. The city step replaces the
+     boxes; the rest stays. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g) return undefined;
+    const THREE = g.THREE;
+    const grp = g.worldGrp;
+    const wipe = () => {
+      grp.traverse((c) => {
+        if (c === grp) return;
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) {
+          if (c.material.map) c.material.map.dispose();
+          c.material.dispose();
+        }
+      });
+      while (grp.children.length) grp.remove(grp.children[grp.children.length - 1]);
+    };
+    wipe();
+
+    const b = route.bounds;
+    const cx = (b.min[0] + b.max[0]) / 2, cz = (b.min[2] + b.max[2]) / 2;
+    const size = Math.ceil((Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) + 8000) / 100) * 100;
+    const tex = groundTexture(THREE, g.renderer);
+    tex.repeat.set(size / 100, size / 100);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size).rotateX(-Math.PI / 2),
+      new THREE.MeshLambertMaterial({ map: tex }));
+    /* Snap the plane to whole tiles so the grid lines sit on round metres. */
+    ground.position.set(Math.round(cx / 100) * 100, 0, Math.round(cz / 100) * 100);
+    ground.receiveShadow = true;
+    grp.add(ground);
+
+    const boxes = obst.boxes;
+    if (boxes.length) {
+      const bg = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+      const bm = new THREE.MeshLambertMaterial({ color: 0xffffff });
+      const inst = new THREE.InstancedMesh(bg, bm, boxes.length);
+      const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3();
+      const rnd = SD.rng((obst.seed ^ 0x9e3779b9) >>> 0);
+      const ep = [];
+      boxes.forEach((bx, i) => {
+        P.set(bx.c[0], 0, bx.c[2]);
+        S.set(bx.half[0] * 2, bx.max[1], bx.half[2] * 2);
+        M.compose(P, Q, S);
+        inst.setMatrixAt(i, M);
+        const tt = rnd();
+        inst.setColorAt(i, boneColor(THREE, 0.55 + tt * 0.25, 0.55 + tt * 0.3));
+        const x0 = bx.min[0], x1 = bx.max[0], y0 = 0, y1 = bx.max[1], z0 = bx.min[2], z1 = bx.max[2];
+        const e = (a, c) => { ep.push(a[0], a[1], a[2], c[0], c[1], c[2]); };
+        e([x0, y1, z0], [x1, y1, z0]); e([x1, y1, z0], [x1, y1, z1]);
+        e([x1, y1, z1], [x0, y1, z1]); e([x0, y1, z1], [x0, y1, z0]);
+        e([x0, y0, z0], [x0, y1, z0]); e([x1, y0, z0], [x1, y1, z0]);
+        e([x1, y0, z1], [x1, y1, z1]); e([x0, y0, z1], [x0, y1, z1]);
+      });
+      inst.instanceMatrix.needsUpdate = true;
+      inst.instanceColor.needsUpdate = true;
+      inst.castShadow = true; inst.receiveShadow = true;
+      grp.add(inst);
+      const eg = new THREE.BufferGeometry();
+      eg.setAttribute('position', new THREE.Float32BufferAttribute(ep, 3));
+      grp.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: boneColor(THREE, 0.6, 0.16) })));
+    }
+
+    /* Rings: one instanced torus, coloured per instance by the race. */
+    const ringWps = route.waypoints.filter((w) => w.kind === 'ring');
+    if (ringWps.length) {
+      const R0 = route.cfg.ringR;
+      const tg = new THREE.TorusGeometry(R0, 0.55, 10, 64);
+      const tm = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
+      const rm = new THREE.InstancedMesh(tg, tm, ringWps.length);
+      const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
+      const Z = new THREE.Vector3(0, 0, 1), D = new THREE.Vector3();
+      ringWps.forEach((w, i) => {
+        P.set(w.p[0], w.p[1], w.p[2]);
+        Q.setFromUnitVectors(Z, D.set(w.dir[0], w.dir[1], w.dir[2]));
+        M.compose(P, Q, S);
+        rm.setMatrixAt(i, M);
+        rm.setColorAt(i, new THREE.Color(0xffffff));
+      });
+      rm.instanceMatrix.needsUpdate = true;
+      rm.frustumCulled = false;
+      grp.add(rm);
+      g.rings = { mesh: rm, wpIdx: ringWps.map((w) => w.idx) };
+    } else g.rings = null;
+
+    const gs = new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false });
+    const gf = new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false });
+    const gb = new THREE.MeshLambertMaterial({ color: boneColor(THREE, 0.62, 0.6) });
+    grp.add(gateFrame(THREE, route.waypoints[0], gs, gb));
+    grp.add(gateFrame(THREE, route.waypoints[route.n - 1], gf, gb));
+    g.gates = { start: gs.color, finish: gf.color };
+
+    if (p.routeLine) {
+      const lp = [];
+      for (const sm of route.tube.samples) if (sm.u >= 0 && sm.u <= route.n - 1) lp.push(sm.p[0], sm.p[1], sm.p[2]);
+      const lg = new THREE.BufferGeometry();
+      lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
+      grp.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, toneMapped: false })));
+    }
+    if (g.mark) g.mark();
+    return undefined;
+  }, [ready, route, obst, p.routeLine]);
+
+  /* ---- collision overlay (debug) ---- */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !p.overlay) return undefined;
+    const ov = Courier.collisionOverlay(g.ship, g.THREE);
+    g.ship.visual.add(ov.dots);
+    g.ship.visual.add(ov.lines);
+    return () => {
+      g.ship.visual.remove(ov.dots);
+      g.ship.visual.remove(ov.lines);
+      ov.dispose();
+    };
+  }, [ready, p.overlay]);
+
+  const hudRow = (k, label) => html`<${React.Fragment} key=${k}>
+    <span>${label}</span>
+    <b ref=${(el) => { hudRef.current[k] = el; }}>-</b>
+  <//>`;
+  const H = hudRef.current;
+  const bestHere = best[String(p.seed)];
+
+  return html`<${React.Fragment}>
+    <div className="hk-stage" ref=${stageRef}></div>
+    <a className="hk-back" href="/miscellaneous/">${'←'} Tools</a>
+
+    <div className="hk-clock">
+      <span ref=${(el) => { H.clock = el; }}>0:00.00</span>
+      <small ref=${(el) => { H.clockSub = el; }}></small>
+    </div>
+    <div className="hk-splits" ref=${(el) => { H.splits = el; }}></div>
+
+    <div className="hk-cue" ref=${(el) => { H.cue = el; }}>
+      <div className="hk-cue-box" ref=${(el) => { H.cueBox = el; }}></div>
+      <div className="hk-cue-arrow" ref=${(el) => { H.cueArrow = el; }}><i></i></div>
+      <div className="hk-cue-d" ref=${(el) => { H.cueD = el; }}></div>
+    </div>
+
+    <div className="hk-hud">
+      <div className="hk-grid">
+        ${hudRow('spd', 'AIRSPEED')}
+        ${hudRow('alt', 'ALTITUDE')}
+        ${hudRow('vs', 'VERTICAL')}
+        ${hudRow('ring', 'RINGS')}
+        ${hudRow('assist', 'ASSIST')}
+        ${hudRow('hits', 'CONTACTS')}
+        ${hudRow('fps', 'FPS')}
+      </div>
+    </div>
+
+    <div className="hk-msg">
+      <span ref=${(el) => { H.msg = el; }}></span>
+      ${!SHOT && !NOHID && !dev.supported ? html`<small>This browser has no WebHID, so the 3D mouse cannot connect.
+        The keys under "Controls" work in every browser.</small>` : null}
+    </div>
+
+    ${!panel ? html`<button className="hk-toggle" onClick=${() => setPanel(true)}>Panel</button>` : html`
+    <div className="hk-panel">
+      <div className="hk-head">
+        <h2>Hikyaku</h2>
+        <button className="hk-x" onClick=${() => setPanel(false)} aria-label="Close">${'×'}</button>
+      </div>
+      <p className="hk-desc">A 6DOF courier flight for a 3D mouse. Prototype: fly the rings in order against the clock,
+        over flat ground with a few boxes. The city comes later.</p>
+
+      <div className="hk-chips">
+        <button className=${'lang-seg' + (dev.name ? ' active' : '')} onClick=${connect}
+          disabled=${!dev.supported || NOHID}>${dev.name || 'Connect 3D mouse'}</button>
+        <button className="lang-seg" onClick=${() => { resetRef.current++; }}>Reset</button>
+        <button className=${'lang-seg' + (p.assist ? ' active' : '')}
+          onClick=${() => upd('assist')(!p.assist)}>Assist</button>
+      </div>
+
+      <div className="hk-seed">
+        <span>Seed</span>
+        <input type="number" min="1" step="1" value=${seedText}
+          onChange=${(e) => setSeedText(e.target.value)}
+          onKeyDown=${(e) => { if (e.key === 'Enter') { const v = parseInt(seedText, 10); if (v > 0) setSeed(v); } }}
+          onBlur=${() => { const v = parseInt(seedText, 10); if (v > 0 && v !== p.seed) setSeed(v); else setSeedText(String(p.seed)); }} />
+        <button className="lang-seg" onClick=${() => setSeed(1 + Math.floor(Math.random() * 99999))}>New route</button>
+      </div>
+      <div className="hk-derived">
+        <span>Rings, then the finish gate</span><b>${route.n - 2} + 1</b>
+        <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
+        <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
+        <span>Boxes</span><b>${obst.boxes.length}</b>
+        <span>Best for this seed</span><b>${bestHere > 0 ? HK.formatTime(bestHere) : '-'}</b>
+      </div>
+      <p className="hk-note">The seed is in the address bar. Share the address to fly the same route and compare times.</p>
+
+      <${Seg} label="View" value=${p.camMode} onChange=${upd('camMode')}
+        options=${[{ value: 'chase', label: 'Chase' }, { value: 'cockpit', label: 'Cockpit' }]} />
+
+      <${Section} id="run" title="Last run" open=${sec === 'run'} onToggle=${toggleSec}
+        summary=${lastRun ? HK.formatTime(lastRun.time) + (lastRun.best ? ', best' : '') : 'none yet'}>
+        ${lastRun ? html`<div className="hk-derived">
+          ${lastRun.splits.map((t, i) => html`<${React.Fragment} key=${i}>
+            <span>${i === lastRun.splits.length - 1 ? 'Finish' : 'Ring ' + (i + 1)}</span><b>${HK.formatTime(t)}</b>
+          <//>`)}
+        </div>` : html`<p className="hk-note">No finished run on this seed yet. The clock starts at the start gate
+          and stops at the finish gate. A ring only counts when it is the next one, flown in its direction.</p>`}
+      <//>
+
+      <${Section} id="flight" title="Flight model" open=${sec === 'flight'} onToggle=${toggleSec}
+        summary=${(p.gravity ? 'gravity' : 'no gravity') + ', ' + (p.drag ? 'drag' : 'no drag') + ', assist ' + (p.assist ? 'on' : 'off')}>
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (p.gravity ? ' active' : '')} onClick=${() => upd('gravity')(!p.gravity)}>Gravity</button>
+          <button className=${'lang-seg' + (p.drag ? ' active' : '')} onClick=${() => upd('drag')(!p.drag)}>Drag</button>
+          <button className=${'lang-seg' + (p.assist ? ' active' : '')} onClick=${() => upd('assist')(!p.assist)}>Assist</button>
+        </div>
+        <${Slider} label="Drag torque" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.dragTorque} onChange=${upd('dragTorque')} />
+        <${Slider} label="Rate damping" digits=${1} min=${0} max=${6} step=${0.1}
+          value=${p.rateDamp} onChange=${upd('rateDamp')} />
+        <${Slider} label="Restitution" digits=${2} min=${0} max=${0.9} step=${0.05}
+          value=${p.restitution} onChange=${upd('restitution')} />
+        <${Slider} label="3D mouse gain" digits=${2} min=${0.2} max=${1.5} step=${0.05}
+          value=${p.gain} onChange=${upd('gain')} />
+        <div className="hk-derived">
+          <span>Top speed, nose first</span><b>${fmt(der.noseFirst, 0)} m/s</b>
+          <span>Top speed with boost</span><b>${fmt(der.boost, 0)} m/s</b>
+          <span>Flat fall, no thrust</span><b>${fmt(der.flatFall, 0)} m/s</b>
+        </div>
+        <p className="hk-note">The assist spends part of the thrust on holding the ship against gravity, in any attitude.
+          Upside down, the weaker reversed fans do that work, so less is left for you. "Assist" in the HUD
+          shows how much of the busiest channel the hold uses, and turns amber when it cannot hold.</p>
+        <p className="hk-note">Drag acts on the area the hull shows to the wind. Nose first is fast, flat is an air brake.
+          "Drag torque" turns the hull in the airflow. At angle of attack it lifts the nose further, so
+          some "Rate damping" keeps the ship calm. Rate damping stops a rotation once you let go of that axis.</p>
+      <//>
+
+      <${Section} id="budget" title="Thrust budget" open=${sec === 'budget'} onToggle=${toggleSec}
+        summary=${'lift ' + fmt(p.bYp, 1) + ' g, boost ' + fmt(p.bBoost, 1) + ' g, ' + fmt(p.mass / 1000, 1) + ' t'}>
+        <div className="hk-nums">
+          <${Num} label="Lift up" unit="g" value=${p.bYp} step=${0.1} min=${0} onChange=${upd('bYp')} />
+          <${Num} label="Lift down" unit="g" value=${p.bYn} step=${0.1} min=${0} onChange=${upd('bYn')} />
+          <${Num} label="Forward" unit="g" value=${p.bZn} step=${0.1} min=${0} onChange=${upd('bZn')} />
+          <${Num} label="Back" unit="g" value=${p.bZp} step=${0.1} min=${0} onChange=${upd('bZp')} />
+          <${Num} label="Right" unit="g" value=${p.bXp} step=${0.1} min=${0} onChange=${upd('bXp')} />
+          <${Num} label="Left" unit="g" value=${p.bXn} step=${0.1} min=${0} onChange=${upd('bXn')} />
+          <${Num} label="Boost" unit="g" value=${p.bBoost} step=${0.1} min=${0} onChange=${upd('bBoost')} />
+          <${Num} label="Mass" unit="kg" value=${p.mass} step=${100} min=${100} onChange=${upd('mass')} />
+          <${Num} label="Pitch" unit="r/s2" value=${p.aPitch} step=${0.1} min=${0} onChange=${upd('aPitch')} />
+          <${Num} label="Yaw" unit="r/s2" value=${p.aYaw} step=${0.1} min=${0} onChange=${upd('aYaw')} />
+          <${Num} label="Roll" unit="r/s2" value=${p.aRoll} step=${0.1} min=${0} onChange=${upd('aRoll')} />
+          <${Num} label="Drag coeff." unit="" value=${p.cd} step=${0.05} min=${0} onChange=${upd('cd')} />
+        </div>
+        <div className="hk-chips">
+          <button className="lang-seg" onClick=${() => setP((q) => {
+            const o = { ...q };
+            for (const k of BUDGET_KEYS) o[k] = DEF[k];
+            return o;
+          })}>Reset to defaults</button>
+        </div>
+        <p className="hk-note">Thrust per body axis and direction, in g. The rotation rates are angular accelerations in
+          rad/s2. Mass only matters for drag: a heavier ship keeps its speed longer.</p>
+      <//>
+
+      <${Section} id="cam" title="Camera" open=${sec === 'cam'} onToggle=${toggleSec}
+        summary=${fmt(p.camDist * SHIP_L, 0) + ' m behind, ' + fmt(p.camUp * SHIP_L, 0) + ' m up'}>
+        <${Slider} label="Distance" unit="ship lengths" digits=${1} min=${0.8} max=${8} step=${0.1}
+          value=${p.camDist} onChange=${(v) => { lookRef.current.chase = null; upd('camDist')(v); }} />
+        <${Slider} label="Height" unit="ship lengths" digits=${2} min=${0} max=${2} step=${0.05}
+          value=${p.camUp} onChange=${upd('camUp')} />
+        <${Slider} label="Follow frequency" unit="Hz" digits=${2} min=${0.1} max=${3} step=${0.05}
+          value=${p.camF0} onChange=${upd('camF0')} />
+        <${Slider} label="Damping" digits=${2} min=${0.3} max=${1.5} step=${0.01}
+          value=${p.camZeta} onChange=${upd('camZeta')} />
+        <${Slider} label="Roll follow" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.camRoll} onChange=${upd('camRoll')} />
+        <p className="hk-note">The chase camera follows the ship's attitude with a lag. "Roll follow" sets how much of a
+          roll it copies. The mouse wheel also changes the distance.</p>
+      <//>
+
+      <${Section} id="debug" title="Display and debug" open=${sec === 'debug'} onToggle=${toggleSec}>
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (p.routeLine ? ' active' : '')} onClick=${() => upd('routeLine')(!p.routeLine)}>Route line</button>
+          <button className=${'lang-seg' + (p.overlay ? ' active' : '')} onClick=${() => upd('overlay')(!p.overlay)}>Collision hull</button>
+          <button className=${'lang-seg' + (p.shadows ? ' active' : '')} onClick=${() => upd('shadows')(!p.shadows)}>Shadows</button>
+        </div>
+        <p className="hk-note">"Collision hull" shows the 18 points and the hull the physics uses. Shadows are off by default
+          because they cost frame time.</p>
+      <//>
+
+      <${Section} id="keys" title="Controls" open=${sec === 'keys'} onToggle=${toggleSec}>
+        <p className="hk-note">
+          3D mouse: the cap drives all six axes. Right button: boost. Left button: stop rotation while held.
+          <br/>Keys: <kbd>W</kbd><kbd>S</kbd> forward and back, <kbd>A</kbd><kbd>D</kbd> slide,
+          <kbd>R</kbd><kbd>F</kbd> lift up and down, <kbd>Q</kbd><kbd>E</kbd> roll,
+          arrow keys pitch and yaw (up pushes the nose down), <kbd>Shift</kbd> boost.
+          <br/><kbd>Space</kbd> stop rotation, <kbd>X</kbd> flight assist, <kbd>C</kbd> view,
+          <kbd>Backspace</kbd> back to the start, <kbd>P</kbd> panel.
+          <br/>Mouse: left drag looks around, middle click stops rotation, wheel sets the chase distance.
+        </p>
+      <//>
+    </div>`}
+  <//>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>
