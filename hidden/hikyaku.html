@@ -8,7 +8,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="robots" content="noindex, nofollow">
   <title>Hikyaku - 6DOF Courier Flight Prototype</title>
-  <meta name="description" content="Prototype of a 6DOF courier flight game for a 3D mouse. Fly a small glider with gravity, drag and a flight assist through a timed route of rings over flat ground.">
+  <meta name="description" content="Prototype of a 6DOF courier flight game for a 3D mouse. Fly a small glider with gravity, drag and a flight assist through a timed route of rings, through a city with traffic and a hollow Menger block.">
   <link rel="stylesheet" href="/assets/css/pico.min.css">
   <link rel="stylesheet" href="/assets/css/custom.css">
   <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
@@ -168,14 +168,18 @@
   <script src="/assets/js/colorramps.js"></script>
   <script src="/assets/js/courier.js"></script>
   <script src="/assets/js/hikyaku-city.js"></script>
+  <script src="/assets/js/hikyaku-traffic.js"></script>
+  <script src="/assets/js/menger.js"></script>
 </head>
 <body>
   <div id="root"></div>
 
-  <!-- The pure half: the route, the boxes around it, the ring test, the race
-       clock and the box contacts. No DOM, no three.js, no React, so
+  <!-- The pure half: the route with its Menger block, the boxes around it,
+       the ring test, the race clock, the box contacts, the traffic lanes and
+       the traffic clock. No DOM, no three.js, no React, so
        notes/dev/hikyaku.test.mjs pulls this block out by id and evaluates it
-       on top of assets/js/sixdof.js. Moving any of it into the app block
+       on top of assets/js/sixdof.js, hikyaku-city.js, hikyaku-traffic.js and
+       menger.js (their pure layers). Moving any of it into the app block
        breaks that seam. -->
   <script id="hkcore">
 var Hikyaku = (function () {
@@ -218,16 +222,21 @@ var Hikyaku = (function () {
      tube along the curve that no building may enter.
 
      Waypoint shape, shared by every kind:
-       { idx, kind, p, dir, right, up, shape, r, hw, hh, hold, biome }
-     kind   'start' | 'ring' | 'finish'. v2 adds 'delivery': a waypoint where
+       { idx, ri, kind, p, dir, right, up, shape, r, hw, hh, hold, biome }
+     kind   'start' | 'ring' | 'portal' | 'via' | 'finish'. A portal is the
+            mouth of a Menger block, a rectangular gate centred on c (the
+            opening) that the race counts like a ring. A via point only
+            shapes the curve (approach and leave of the block); the race
+            skips it and ri, the race index, is null. v2 adds 'delivery': a waypoint where
             the pilot must hover or land. It reuses p and r (the radius of the
             hover zone) and fills hold = { ms, maxSpeed }; raceStep already
             handles it, nothing else has to change.
-     shape  'circle' (rings, radius r) or 'rect' (gates, half sizes hw x hh,
-            the portal rule of the handoff: rectangular, warm edge).
+     shape  'circle' (rings, radius r), 'rect' (gates and portals, half
+            sizes hw x hh, the portal rule of the handoff: rectangular, warm
+            edge) or 'none' (via).
      dir    the facing direction, which is the curve tangent there. A ring
             counts only when crossed along dir.
-     biome  'open' everywhere for now. The biome step marks legs here.
+     biome  'open', or 'menger' on the five block points.
 
      The curve is a cubic Hermite spline per leg. The tangent at a waypoint
      is the bisector of the two legs meeting there, scaled by the chord of
@@ -250,8 +259,17 @@ var Hikyaku = (function () {
     minSep: 120,        /* metres between a new leg and every older one */
     forgive: 1.5,       /* metres of grace on the ring and gate edge */
     leadIn: 160, leadOut: 120,
-    step: 4             /* tube sample spacing, metres */
+    step: 4,            /* tube sample spacing, metres */
+    /* One Menger block on the route (step 6): about mengerAt of the way
+       along, lead metres of straight approach and leave outside its
+       mouths (more than the tube radius plus 10 m, so the next leg clears
+       the block), its own lanes reaching mengerReach from its centre
+       (inside the 2 x 2 tiles it reserves). */
+    menger: true, mengerAt: 0.5, mengerLead: 60, mengerReach: 190
   };
+  /* Box indices of the block, clear of every city box: the city numbers its
+     boxes tile * 4096 + i, below 2^45. contactsBoxes keys on idx. */
+  var MENGER_IDX = 1e15;
 
   /* Right and up of a facing direction, with world up as the reference. */
   function frameOf(d) {
@@ -280,66 +298,188 @@ var Hikyaku = (function () {
     R.n = Math.max(3, Math.round(R.n));
     R.seed = R.seed >>> 0;
     var rand = SD.rng(R.seed ^ 0x5bd1e995);
-    var n = R.n, i, j;
+    var i, j;
 
     /* Waypoints. The heading drifts: a slow turn in one direction for two to
        four legs, then the other way, plus jitter. That gives a route that
        wanders without coming back on itself. A candidate leg is drawn again
-       when it turns too hard in 3D or comes too close to an older leg. */
+       when it turns too hard in 3D, comes too close to an older leg, or
+       comes within the tube radius (plus 10 m) of a box in `avoid` (the
+       Menger block, once it is placed). Legs in `noSep` (the straight legs
+       inside the block) are left out of the separation test: they are
+       collinear by design and the block box stands in for them. */
     var h = rand() * Math.PI * 2;
     var pts = [[0, R.altMin + 50 + rand() * 70, 0]];
-    var sign = rand() < 0.5 ? -1 : 1, left = 2 + Math.floor(rand() * 3);
-    var legPrev = null;
-    for (i = 1; i < n; i++) {
-      var p = pts[i - 1], got = null;
-      for (var tr = 0; tr < 80 && !got; tr++) {
-        var turn = sign * (8 + rand() * 22) + (rand() * 2 - 1) * 14;
-        if (tr >= 50) turn *= 0.3;
-        turn = clamp(turn, -R.maxTurn, R.maxTurn);
-        var L = R.spMin + rand() * (R.spMax - R.spMin);
-        var y = clamp(p[1] + (rand() * 2 - 1) * L * R.slope, R.altMin, R.altMax);
-        var hh = h + turn * DEG;
-        var q = [p[0] + Math.sin(hh) * L, y, p[2] - Math.cos(hh) * L];
-        var leg = sub(q, p);
-        if (legPrev && angle(legPrev, leg) > R.maxLeg * DEG) continue;
-        var ok = true;
-        for (j = 0; j + 2 < i && ok; j++) {
-          for (var s = 0; s <= 8; s++) {
-            if (pointSegDist(add(p, mul(leg, s / 8)), pts[j], pts[j + 1]) < R.minSep) { ok = false; break; }
-          }
+    var G = { h: h, sign: rand() < 0.5 ? -1 : 1, left: 2 + Math.floor(rand() * 3), legPrev: null };
+    var noSep = {}, avoid = [];
+    function legClear(p, leg, iNew) {
+      var jj, s;
+      for (jj = 0; jj + 2 < iNew; jj++) {
+        if (noSep[jj]) continue;
+        for (s = 0; s <= 8; s++) {
+          if (pointSegDist(add(p, mul(leg, s / 8)), pts[jj], pts[jj + 1]) < R.minSep) return false;
         }
-        if (ok) got = { q: q, h: hh, leg: leg };
       }
-      if (!got) {
-        var q2 = [p[0] + Math.sin(h) * R.spMin, p[1], p[2] - Math.cos(h) * R.spMin];
-        got = { q: q2, h: h, leg: sub(q2, p) };
+      for (jj = 0; jj < avoid.length; jj++) {
+        for (s = 0; s <= 8; s++) if (boxDist(avoid[jj], add(p, mul(leg, s / 8))) < R.tubeR + 10) return false;
       }
-      pts.push(got.q); h = got.h; legPrev = got.leg;
-      if (--left <= 0) { sign = -sign; left = 2 + Math.floor(rand() * 3); }
+      return true;
+    }
+    function grow(count) {
+      for (var c = 0; c < count; c++) {
+        var iNew = pts.length, p = pts[iNew - 1], got = null;
+        for (var tr = 0; tr < 80 && !got; tr++) {
+          var turn = G.sign * (8 + rand() * 22) + (rand() * 2 - 1) * 14;
+          if (tr >= 50) turn *= 0.3;
+          turn = clamp(turn, -R.maxTurn, R.maxTurn);
+          var L = R.spMin + rand() * (R.spMax - R.spMin);
+          var y = clamp(p[1] + (rand() * 2 - 1) * L * R.slope, R.altMin, R.altMax);
+          var hh = G.h + turn * DEG;
+          var q = [p[0] + Math.sin(hh) * L, y, p[2] - Math.cos(hh) * L];
+          var leg = sub(q, p);
+          if (G.legPrev && angle(G.legPrev, leg) > R.maxLeg * DEG) continue;
+          if (legClear(p, leg, iNew)) got = { q: q, h: hh, leg: leg };
+        }
+        if (!got) {
+          var q2 = [p[0] + Math.sin(G.h) * R.spMin, p[1], p[2] - Math.cos(G.h) * R.spMin];
+          got = { q: q2, h: G.h, leg: sub(q2, p) };
+        }
+        pts.push(got.q); G.h = got.h; G.legPrev = got.leg;
+        if (--G.left <= 0) { G.sign = -G.sign; G.left = 2 + Math.floor(rand() * 3); }
+      }
     }
 
+    /* The Menger block (handoff, section 8, step 6), about halfway. The
+       route so far is turned about its start until its last heading is a
+       world axis, and shifted until the block, straight ahead on that axis,
+       stands on a tile corner (2 x 2 tiles of the city around it). Neither
+       changes a turn, a slope or a distance. Then the leg to the block runs
+       straight along the axis, long enough for the climb or the descent to
+       the tunnel height at the route's slope limit; the five flythrough
+       points (approach, entry mouth, centre, exit mouth, leave) follow, all
+       on one line; and the rest of the route grows on from the leave point
+       with the same heading. Up to four yaws are tried; if none fits, the
+       route has no block. */
+    var block = null;
+    function placeMenger() {
+      var MG = globalThis.Menger, HCt = globalThis.HikyakuCity;
+      if (!MG || !HCt) throw new Error('makeRoute: cfg.menger needs Menger (assets/js/menger.js) and HikyakuCity loaded first');
+      var T = HCt.TILE;
+      var bSeed = 1 + ((Math.imul(R.seed, 2654435761) >>> 0) % 99991);
+      var k0 = Math.floor(rand() * 4);
+      var hs = Math.round(G.h / (Math.PI / 2)) * (Math.PI / 2), dl = hs - G.h;
+      var cd = Math.cos(dl), sdl = Math.sin(dl), o = pts[0];
+      var rot = pts.map(function (q) {
+        var x = q[0] - o[0], z = q[2] - o[2];
+        return [o[0] + x * cd - z * sdl, q[1], o[2] + x * sdl + z * cd];
+      });
+      var ax = [Math.round(Math.sin(hs)), 0, Math.round(-Math.cos(hs))];
+      var bopt = function (origin, yaw) {
+        return { origin: origin, yaw: yaw, idxBase: MENGER_IDX, lanes: { reach: R.mengerReach } };
+      };
+      for (var ty = 0; ty < 4; ty++) {
+        var yaw = ((k0 + ty) % 4) * Math.PI / 2;
+        var ft0 = MG.flythrough(MG.makeBlock(bSeed, bopt([0, 0, 0], yaw)), { dir: ax, lead: R.mengerLead });
+        if (!ft0 || ft0.waypoints.length !== 5 || ft0.waypoints[2].kind !== 'centre') continue;
+        var A0 = ft0.waypoints[0].p, last = rot[rot.length - 1];
+        var D = Math.max(R.spMin, Math.abs(last[1] - A0[1]) / (R.slope * 0.95));
+        var Cx = last[0] + ax[0] * D - A0[0], Cz = last[2] + ax[2] * D - A0[2];
+        var Sx = Math.round(Cx / T) * T, Sz = Math.round(Cz / T) * T;
+        var part = rot.map(function (q) { return [q[0] + Sx - Cx, q[1], q[2] + Sz - Cz]; });
+        var blk = MG.makeBlock(bSeed, bopt([Sx, 0, Sz], yaw));
+        var ft = MG.flythrough(blk, { dir: ax, lead: R.mengerLead });
+        if (!ft || ft.waypoints.length !== 5) continue;
+        /* older legs keep the tube radius plus 10 m from the block; the leg
+           to the block keeps minSep from the older legs */
+        var ok = true, s;
+        for (j = 0; j + 1 < part.length && ok; j++) {
+          for (s = 0; s <= 8; s++) {
+            var qq = add(part[j], mul(sub(part[j + 1], part[j]), s / 8));
+            if (boxDist(blk.bounds, qq) < R.tubeR + 10) { ok = false; break; }
+          }
+        }
+        var A = ft.waypoints[0].p, legA = sub(A, part[part.length - 1]);
+        for (j = 0; j + 2 < part.length && ok; j++) {
+          for (s = 0; s <= 8; s++) {
+            if (pointSegDist(add(part[part.length - 1], mul(legA, s / 8)), part[j], part[j + 1]) < R.minSep) { ok = false; break; }
+          }
+        }
+        if (!ok) continue;
+        pts.length = 0;
+        for (j = 0; j < part.length; j++) pts.push(part[j]);
+        var i0 = pts.length;
+        for (j = 0; j < 5; j++) pts.push(ft.waypoints[j].p.slice());
+        for (j = i0; j < i0 + 4; j++) noSep[j] = true;
+        avoid.push(blk.bounds);
+        G.h = hs; G.legPrev = sub(pts[i0 + 4], pts[i0 + 3]);
+        var ports = MG.portals(blk), byId = {};
+        for (j = 0; j < ports.length; j++) byId[ports[j].id] = ports[j];
+        return {
+          kind: 'menger', seed: bSeed, yaw: yaw, origin: [Sx, 0, Sz], block: blk, ft: ft,
+          axis: ax, i0: i0, entry: byId[ft.entry], exit: byId[ft.exit],
+          bounds: blk.bounds,
+          /* the 2 x 2 tiles around the tile corner: the city builds nothing here */
+          reserved: { min: [Sx - T, 0, Sz - T], max: [Sx + T, 4000, Sz + T] }
+        };
+      }
+      return null;
+    }
+
+    var nBefore = Math.max(2, Math.min(R.n - 2, Math.round((R.n - 2) * R.mengerAt)));
+    if (R.menger) {
+      grow(nBefore - 1);
+      block = placeMenger();
+      grow(block ? R.n - 2 - nBefore : R.n - nBefore);
+    } else grow(R.n - 1);
+    var n = pts.length;
+    var specials = block ? [block] : [];
+    var bi0 = block ? block.i0 : -1;
+    var inBlockWp = function (k) { return bi0 >= 0 && k >= bi0 && k < bi0 + 5; };
+
     var dirs = pts.map(function (pt, k) {
+      if (inBlockWp(k)) return block.axis.slice();
       if (k === 0) return norm(sub(pts[1], pts[0]));
       if (k === n - 1) return norm(sub(pts[n - 1], pts[n - 2]));
       return norm(add(norm(sub(pt, pts[k - 1])), norm(sub(pts[k + 1], pt))));
     });
 
+    /* Race index ri: the position in the race order, null for a via point
+       (approach and leave of the block: they shape the curve, the race does
+       not see them). */
+    var ri = 0;
     var waypoints = pts.map(function (pt, k) {
       var kind = k === 0 ? 'start' : (k === n - 1 ? 'finish' : 'ring');
-      var gate = kind !== 'ring', f = frameOf(dirs[k]);
-      return {
-        idx: k, kind: kind, p: pt, dir: dirs[k], right: f.right, up: f.up,
-        shape: gate ? 'rect' : 'circle',
-        r: gate ? 0 : R.ringR,
-        hw: gate ? R.gateW / 2 : R.ringR, hh: gate ? R.gateH / 2 : R.ringR,
-        hold: null, biome: 'open'
+      var biome = 'open', portal = null;
+      if (inBlockWp(k)) {
+        var e = k - bi0;
+        kind = e === 0 || e === 4 ? 'via' : e === 1 || e === 3 ? 'portal' : 'ring';
+        biome = 'menger';
+        if (kind === 'portal') portal = e === 1 ? block.entry : block.exit;
+      }
+      var f = frameOf(dirs[k]);
+      var w = {
+        idx: k, ri: kind === 'via' ? null : ri++, kind: kind, p: pt, dir: dirs[k], right: f.right, up: f.up,
+        shape: 'circle', r: R.ringR, hw: R.ringR, hh: R.ringR, hold: null, biome: biome
       };
+      if (kind === 'start' || kind === 'finish') {
+        w.shape = 'rect'; w.r = 0; w.hw = R.gateW / 2; w.hh = R.gateH / 2;
+      } else if (kind === 'via') {
+        w.shape = 'none'; w.r = 0; w.hw = 0; w.hh = 0;
+      } else if (kind === 'portal') {
+        /* The gate is the mouth itself, centred on the opening (c), with
+           a metre of margin inside the rim; p, the point the curve passes
+           and the cue points at, is the flythrough's. */
+        w.shape = 'rect'; w.r = 0; w.c = portal.p.slice();
+        w.hw = portal.w / 2 - 1; w.hh = portal.h / 2 - 1; w.portal = portal.id;
+      }
+      return w;
     });
 
     var segments = [];
     for (i = 0; i + 1 < n; i++) {
       var c = len(sub(pts[i + 1], pts[i]));
-      segments.push({ i: i, p0: pts[i], p1: pts[i + 1], m0: mul(dirs[i], c), m1: mul(dirs[i + 1], c), chord: c, biome: 'open' });
+      segments.push({ i: i, p0: pts[i], p1: pts[i + 1], m0: mul(dirs[i], c), m1: mul(dirs[i + 1], c), chord: c,
+        biome: inBlockWp(i) && inBlockWp(i + 1) ? 'menger' : 'open' });
     }
 
     /* u runs from 0 at the start gate to n - 1 at the finish. */
@@ -378,6 +518,11 @@ var Hikyaku = (function () {
     var dn = dirs[n - 1], nOut = Math.ceil(R.leadOut / R.step);
     for (i = 0; i <= nOut; i++) push(add(pts[n - 1], mul(dn, R.leadOut * i / nOut)), dn, n - 1 + i / nOut);
 
+    /* Samples inside the block: there the flythrough's own wall clearance
+       holds (13.5 m in an 81 m tunnel), not the 45 m tube. */
+    if (block) {
+      for (i = 0; i < samples.length; i++) samples[i].inBlock = globalThis.Menger.inside(block.block, samples[i].p, 0);
+    }
     var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (i = 0; i < samples.length; i++) {
       for (j = 0; j < 3; j++) {
@@ -400,7 +545,7 @@ var Hikyaku = (function () {
       }
     };
     return {
-      seed: R.seed, cfg: R, n: n, waypoints: waypoints, segments: segments,
+      seed: R.seed, cfg: R, n: n, waypoints: waypoints, segments: segments, specials: specials,
       spline: spline, tube: tube, length: sAcc, minRadius: minR,
       bounds: { min: lo, max: hi }
     };
@@ -490,13 +635,15 @@ var Hikyaku = (function () {
      route a route and stops a pilot from taking ring 4 on the way back from
      ring 5. The edge has a small grace (route cfg.forgive, 1.5 m), because
      the test uses the centre of a 15 m ship and a graze that visibly went
-     through should count. Returns the fraction along the segment at which
-     the plane was crossed, or null. */
+     through should count. A portal's rectangle is centred on wp.c, the
+     opening, rather than on p. Returns the fraction along the segment at
+     which the plane was crossed, or null. */
   function ringPass(prev, cur, wp, forgive) {
+    if (wp.shape === 'none') return null;
     var d0 = dot(sub(prev, wp.p), wp.dir), d1 = dot(sub(cur, wp.p), wp.dir);
     if (!(d0 < 0 && d1 >= 0)) return null;
     var f = d0 / (d0 - d1);
-    var x = add(prev, mul(sub(cur, prev), f)), o = sub(x, wp.p);
+    var x = add(prev, mul(sub(cur, prev), f)), o = sub(x, wp.c || wp.p);
     var tol = forgive == null ? DEF_ROUTE.forgive : forgive;
     var a = dot(o, wp.right), b = dot(o, wp.up);
     if (wp.shape === 'rect') {
@@ -510,15 +657,18 @@ var Hikyaku = (function () {
                (handoff: the clock starts at the start gate), at the
                interpolated crossing time, not at the frame.
      running   only waypoint `next` is live. Every other ring is scenery, so
-               a ring taken out of order simply does not count.
+               a ring taken out of order simply does not count. `next`
+               counts in race order (the waypoints without the via points,
+               race.wps), which is each waypoint's ri.
      finished  the finish gate was crossed; time is the total and splits[k]
                the clock when waypoint k + 1 was taken (n - 1 of them, the
                last one equal to time). Nothing changes until a reset.
      t is the simulation time at cur, in milliseconds. raceStep is pure: it
      returns a new race with event set to what happened on this step. */
   function makeRace(route) {
+    var wps = route.waypoints.filter(function (w) { return w.kind !== 'via'; });
     return {
-      state: 'idle', next: 0, n: route.waypoints.length, wps: route.waypoints,
+      state: 'idle', next: 0, n: wps.length, wps: wps,
       forgive: route.cfg ? route.cfg.forgive : DEF_ROUTE.forgive,
       t0: null, lastT: null, splits: [], time: null, dwell: 0, event: null
     };
@@ -560,7 +710,7 @@ var Hikyaku = (function () {
       r.state = 'finished'; r.time = split;
       r.event = { type: 'finish', idx: wp.idx, time: split };
     } else {
-      r.event = { type: wp.kind === 'delivery' ? 'delivery' : 'ring', idx: wp.idx, time: split };
+      r.event = { type: wp.kind === 'delivery' || wp.kind === 'portal' ? wp.kind : 'ring', idx: wp.idx, time: split };
     }
     return r;
   }
@@ -580,12 +730,296 @@ var Hikyaku = (function () {
     return (neg ? '-' : '') + m + ':' + (s < 10 ? '0' : '') + s + '.' + (c < 10 ? '0' : '') + c;
   }
 
+
+  /* ---- traffic lanes ------------------------------------------------------
+     makeLanes(route, cfg) -> { lanes, specs, crossings, stats, cfg }
+     A deterministic set of lanes for HikyakuTraffic (assets/js/
+     hikyaku-traffic.js), built from the route alone, so a seed always gets
+     the same traffic.
+
+     City lanes run along street centre lines (every TILE / 2 = 108 m, the
+     city's street plan) at the three LANE_Y altitudes of the city, one
+     lane per travel direction, each offset `offset` metres to its right
+     of the centre line (5 m: the widest vehicle, a 7.6 m drone, keeps clear
+     of the blade signs and balconies, which come to 9.4 m of a centre
+     line). All lanes of one altitude run along the same world axis, x on
+     the first and third altitude and z on the second (or the other way
+     round, from the seed): so no two city lanes ever cross, the way the
+     Menger block's lattice keeps its lanes apart. A street carries lanes
+     with probability `density`; a lane reaches as far as the street stays
+     within `margin` of the route (all of it is beyond the fog from the
+     route) and is cut 25 m before a Menger block's bounds, where it
+     dithers out (fadeEnds). Haulers get rarer the lower the lane.
+
+     The block's own lanes (Menger.laneSet) join the list as they are.
+
+     The crossing rule (handoff: dense lanes across the race line need
+     deliberate gaps). Wherever a lane comes within `near` (25 m) of the
+     race line between the start and the finish gate, the ship is expected
+     there at t = arc length from the start gate / vNom (45 m/s), in race
+     time, which is the traffic time (see trafficTime). The lane must leave
+     a free window of `window` (3 s) centred on t at that point
+     (HikyakuTraffic.gapsAcross). Shifting the phase in 48 steps of a
+     spacing comes first, then leaving every 2nd, 3rd or 4th slot empty,
+     then 1.5 and 2 times the spacing; a lane that still blocks is dropped.
+     Every crossing is stored with its fix, so a test can check it.
+     A lane that runs alongside the race line instead (less than 30 degrees
+     between the two at the closest point) does not cross it: the ship
+     flies next to the vehicles, not through them, and no gap can help.
+     Such a stretch is stored as 'parallel' and left alone if it keeps
+     `parallelMin` (12 m) of the line; closer than that the lane is
+     dropped. */
+  var DEF_LANES = {
+    on: true, density: 0.5, margin: 900, offset: 5,
+    spacing: 55, spacingMax: 120, speed: 24, speedMax: 40,
+    vNom: 45, window: 3, clear: 8, near: 25, cut: 25, minLen: 160, parallelMin: 12,
+    fade: 60, blockFade: 45, axisFlip: -1
+  };
+  /* Haulers get rarer the lower the lane. */
+  var LANE_TYPES = [
+    { hauler: 0.04, pod: 0.66, drone: 0.30 },
+    { hauler: 0.18, pod: 0.62, drone: 0.20 },
+    { hauler: 0.32, pod: 0.50, drone: 0.18 }
+  ];
+  function hash3(a, b, c) {
+    var hh = Math.imul(a | 0, 0x9e3779b1) ^ Math.imul((b | 0) + 0x632be5ab, 0x85ebca77) ^ Math.imul((c | 0) + 0x5bd1e995, 0xc2b2ae3d);
+    hh ^= hh >>> 15; hh = Math.imul(hh, 0x2c1b3c6d);
+    hh ^= hh >>> 12; hh = Math.imul(hh, 0x297a2d39);
+    hh ^= hh >>> 15;
+    return (hh >>> 0) / 4294967296;
+  }
+  /* Unit tangent of a lane at arc length s, by central difference of the
+     slot formula (slot 0 placed at s; the lane is a polyline with rounded
+     corners, so this is exact up to the step). */
+  function laneTangent(lane, s) {
+    var a = lanePt(lane, Math.max(0, s - 0.5)), b = lanePt(lane, Math.min(lane.L, s + 0.5));
+    return norm(sub(b, a));
+  }
+  function lanePt(lane, s) {
+    var pcs = lane.pieces, pc = pcs[0];
+    for (var k = 0; k < pcs.length; k++) if (pcs[k].s0 <= s) pc = pcs[k];
+    var sg = clamp(s - pc.s0, 0, pc.len);
+    if (pc.kind === 0) return add(pc.a, mul(pc.d, sg));
+    var ph = sg / pc.r;
+    return add(pc.c, add(mul(pc.u, pc.r * Math.cos(ph)), mul(pc.w, pc.r * Math.sin(ph))));
+  }
+  function laneVehicles(lane) {
+    var c = 0;
+    for (var k = 0; k < lane.count; k++) if (!(lane.empty > 1 && k % lane.empty === 0)) c++;
+    return c;
+  }
+
+  function makeLanes(route, cfg) {
+    var HT = globalThis.HikyakuTraffic, HCt = globalThis.HikyakuCity, MG = globalThis.Menger;
+    if (!HT || !HCt) throw new Error('makeLanes needs HikyakuTraffic and HikyakuCity loaded first');
+    var C = merge(DEF_LANES, cfg);
+    var out = { lanes: [], specs: [], crossings: [], parallels: [], cfg: C,
+      stats: { lanes: 0, city: 0, block: 0, vehicles: 0, crossings: 0, parallels: 0, phased: 0, emptied: 0, spaced: 0, dropped: 0 } };
+    if (!C.on) return out;
+    var seed = route.seed >>> 0;
+    var LY = HCt.LANE_Y, ST = HCt.TILE / 2;
+    var smp = route.tube.samples, specs = [], i, k;
+    var flip = C.axisFlip >= 0 ? C.axisFlip & 1 : seed & 1;
+    var blocks = (route.specials || []).filter(function (sp) { return sp.kind === 'menger'; });
+
+    /* ---- city lanes ---- */
+    for (var li = 0; li < LY.length; li++) {
+      var ax = (li + flip) % 2;          /* 0: along x, 1: along z */
+      var aa = ax === 0 ? 0 : 2, pa = ax === 0 ? 2 : 0;
+      var y = LY[li];
+      var k0 = Math.ceil((route.bounds.min[pa] - C.margin) / ST), k1 = Math.floor((route.bounds.max[pa] + C.margin) / ST);
+      for (k = k0; k <= k1; k++) {
+        if (hash3(seed, li, k) >= C.density) continue;
+        var c = k * ST, e0 = Infinity, e1 = -Infinity;
+        for (i = 0; i < smp.length; i++) {
+          var dpa = Math.abs(smp[i].p[pa] - c);
+          if (dpa >= C.margin) continue;
+          var hw = Math.sqrt(C.margin * C.margin - dpa * dpa);
+          if (smp[i].p[aa] - hw < e0) e0 = smp[i].p[aa] - hw;
+          if (smp[i].p[aa] + hw > e1) e1 = smp[i].p[aa] + hw;
+        }
+        if (!(e1 > e0)) continue;
+        for (var dsg = 1; dsg >= -1; dsg -= 2) {
+          /* keep right: +x travels at z = c + offset, +z at x = c - offset */
+          var line = c + (ax === 0 ? dsg : -dsg) * C.offset;
+          var iv = [[e0, e1]];
+          for (var bI = 0; bI < blocks.length; bI++) {
+            var bb = blocks[bI].bounds;
+            if (line < bb.min[pa] - C.cut || line > bb.max[pa] + C.cut || y < bb.min[1] - C.cut || y > bb.max[1] + C.cut) continue;
+            var c0 = bb.min[aa] - C.cut, c1 = bb.max[aa] + C.cut, nv = [];
+            for (var q = 0; q < iv.length; q++) {
+              if (iv[q][0] < c0) nv.push([iv[q][0], Math.min(iv[q][1], c0)]);
+              if (iv[q][1] > c1) nv.push([Math.max(iv[q][0], c1), iv[q][1]]);
+            }
+            iv = nv;
+          }
+          for (var q2 = 0; q2 < iv.length; q2++) {
+            var a0 = iv[q2][0], a1 = iv[q2][1];
+            if (a1 - a0 < C.minLen) continue;
+            var pA = [0, y, 0], pB = [0, y, 0];
+            pA[pa] = pB[pa] = line;
+            pA[aa] = dsg > 0 ? a0 : a1; pB[aa] = dsg > 0 ? a1 : a0;
+            var hs = hash3(seed ^ 0x51ed27, li * 4096 + k, dsg * 7 + q2);
+            var hs2 = hash3(seed ^ 0x2545f4, li * 4096 + k, dsg * 7 + q2);
+            var spc = C.spacing + (C.spacingMax - C.spacing) * hs;
+            specs.push({
+              id: specs.length, kind: 'city', alt: li, axis: ax === 0 ? 'x' : 'z',
+              points: [pA, pB], speed: C.speed + (C.speedMax - C.speed) * hs2,
+              spacing: spc, phase: hash3(seed, li * 4096 + k, 99 + dsg * 7 + q2) * spc,
+              types: LANE_TYPES[Math.min(li, LANE_TYPES.length - 1)], fadeEnds: C.fade,
+              seed: (hash3(seed, k, li * 17 + dsg + q2 * 5) * 2147483647) | 0, empty: 0
+            });
+          }
+        }
+      }
+    }
+    out.stats.city = specs.length;
+
+    /* ---- the blocks' own lanes ---- */
+    for (var bJ = 0; bJ < blocks.length; bJ++) {
+      var ls = MG.laneSet(blocks[bJ].block);
+      for (i = 0; i < ls.length; i++) {
+        var l = ls[i];
+        specs.push({
+          id: specs.length, kind: 'menger', alt: -1, axis: l.axis,
+          points: l.points.map(function (pp) { return pp.slice(); }), speed: l.speed, spacing: l.spacing,
+          phase: l.phase, types: l.types, up: l.up.slice(), express: !!l.express, fadeEnds: C.blockFade,
+          seed: (hash3(seed, bJ, 1000 + i) * 2147483647) | 0, empty: 0
+        });
+      }
+    }
+    out.stats.block = specs.length - out.stats.city;
+
+    /* ---- the crossing rule ---- */
+    var s0 = null;
+    for (i = 0; i < smp.length; i++) if (smp[i].u >= 0) { s0 = smp[i].s; break; }
+    var race = smp.filter(function (sm) { return sm.u >= 0 && sm.u <= route.n - 1; });
+    var half = C.window / 2;
+    function free(lane, ck) {
+      var f = HT.gapsAcross(lane, ck.s, ck.t - half, ck.t + half, { clear: C.clear });
+      return f.length === 1 && f[0][0] <= ck.t - half + 1e-6 && f[0][1] >= ck.t + half - 1e-6;
+    }
+    for (var si = 0; si < specs.length; si++) {
+      var sp = specs[si];
+      var lane = HT.makeLane(sp);
+      /* runs of race samples within `near` of the lane */
+      var checks = [], paras = [], run = null;
+      var flush = function () {
+        if (!run) return;
+        var best = run[0];
+        for (var r = 1; r < run.length; r++) if (run[r].d < best.d) best = run[r];
+        var tg = laneTangent(lane, best.ns.s);
+        var cosA = Math.abs(dot(tg, best.sm.d));
+        var rec = { s: best.ns.s, t: (best.sm.s - s0) / C.vNom, p: best.sm.p.slice(), u: best.sm.u, dist: best.d,
+          arc: best.sm.s - s0, angle: Math.acos(clamp(cosA, 0, 1)) / DEG };
+        if (cosA > Math.cos(30 * DEG)) { rec.len = run[run.length - 1].sm.s - run[0].sm.s; paras.push(rec); run = null; return; }
+        checks.push(rec);
+        run = null;
+      };
+      for (i = 0; i < race.length; i++) {
+        var pr = race[i].p, hit = null;
+        var dx = Math.max(lane.lo[0] - pr[0], 0, pr[0] - lane.hi[0]);
+        var dy = Math.max(lane.lo[1] - pr[1], 0, pr[1] - lane.hi[1]);
+        var dz = Math.max(lane.lo[2] - pr[2], 0, pr[2] - lane.hi[2]);
+        if (dx * dx + dy * dy + dz * dz <= C.near * C.near) {
+          var ns = HT.nearestS(lane, pr);
+          if (ns.dist <= C.near) hit = { sm: race[i], ns: ns, d: ns.dist };
+        }
+        if (hit) { if (!run) run = []; run.push(hit); } else flush();
+      }
+      flush();
+      sp.crossings = checks.length;
+      var fix = 'none';
+      var tooClose = paras.some(function (pr0) { return pr0.dist < C.parallelMin; });
+      if (tooClose) fix = 'dropped';
+      else if (checks.length) {
+        var base = sp.phase, sp0 = sp.spacing, done = false;
+        var EMPTY = [0, 2, 3, 4], SPM = [1, 1.5, 2];
+        for (var mi = 0; mi < SPM.length && !done; mi++) {
+          var wl = mi === 0 ? lane : HT.makeLane(Object.assign({}, sp, { spacing: sp0 * SPM[mi], empty: 0 }));
+          for (var ei = 0; ei < EMPTY.length && !done; ei++) {
+            for (var jj = 0; jj < 48 && !done; jj++) {
+              wl.phase = base + wl.spacing * jj / 48;
+              wl.empty = EMPTY[ei];
+              var okAll = true;
+              for (var ci = 0; ci < checks.length && okAll; ci++) okAll = free(wl, checks[ci]);
+              if (okAll) {
+                done = true;
+                sp.phase = wl.phase; sp.empty = wl.empty; sp.spacing = sp0 * SPM[mi];
+                fix = mi > 0 ? 'spacing' : ei > 0 ? 'empty' : (jj > 0 ? 'phase' : 'none');
+              }
+            }
+          }
+        }
+        if (!done) fix = 'dropped';
+      }
+      sp.fix = fix;
+      for (var pj = 0; pj < paras.length; pj++) {
+        var pq = paras[pj];
+        out.parallels.push({ spec: sp.id, lane: -1, dist: pq.dist, len: pq.len, angle: pq.angle, u: pq.u, p: pq.p, kind: sp.kind, fix: fix });
+      }
+      for (var cj = 0; cj < checks.length; cj++) {
+        var ck = checks[cj];
+        out.crossings.push({ spec: sp.id, lane: -1, s: ck.s, t: ck.t, p: ck.p, u: ck.u, dist: ck.dist, arc: ck.arc,
+          window: [ck.t - half, ck.t + half], fix: fix, kind: sp.kind });
+      }
+      if (fix === 'phase') out.stats.phased++;
+      else if (fix === 'empty') out.stats.emptied++;
+      else if (fix === 'spacing') out.stats.spaced++;
+      else if (fix === 'dropped') out.stats.dropped++;
+    }
+
+    /* ---- the final lanes, from the fixed specs ---- */
+    var laneOf = {};
+    for (si = 0; si < specs.length; si++) {
+      if (specs[si].fix === 'dropped') continue;
+      laneOf[specs[si].id] = out.lanes.length;
+      var ln = HT.makeLane(specs[si]);
+      ln.spec = specs[si];
+      out.lanes.push(ln);
+      out.stats.vehicles += laneVehicles(ln);
+    }
+    for (i = 0; i < out.crossings.length; i++) {
+      var cr = out.crossings[i];
+      if (laneOf[cr.spec] != null) cr.lane = laneOf[cr.spec];
+    }
+    for (i = 0; i < out.parallels.length; i++) {
+      if (laneOf[out.parallels[i].spec] != null) out.parallels[i].lane = laneOf[out.parallels[i].spec];
+    }
+    out.stats.parallels = out.parallels.length;
+    out.specs = specs;
+    out.stats.lanes = out.lanes.length;
+    out.stats.crossings = out.crossings.length;
+    return out;
+  }
+
+  /* ---- the traffic clock --------------------------------------------------
+     Every vehicle pose is a closed formula of the traffic time (handoff:
+     "the clock starts at the start gate"). Decision: traffic time IS race
+     time once the start gate is crossed, so a seed's traffic is the same in
+     every run, the gaps makeLanes cut at the expected arrival times are
+     where they were designed, and best times stay comparable. Before the
+     start the same formula runs on the free clock, shifted by TRAFFIC_LEAD
+     (3.5 s, about the time from the reset point 60 m before the gate to the
+     gate at 1 g from rest), so it reaches 0 about when the pilot reaches
+     the gate. A common period of all lanes would not help: the crossing
+     time is the pilot's, so some jump at the gate is unavoidable. It is a
+     reset to the designed configuration, as small as the pilot's delay
+     against 3.5 s, and visible only for vehicles on screen at that moment.
+     After the finish the race clock just keeps running, so there is no
+     second jump. simT in seconds, race the hkcore race (t0 in ms). */
+  var TRAFFIC_LEAD = 3.5;
+  function trafficTime(race, simT) {
+    if (race && race.t0 != null) return simT - race.t0 / 1000;
+    return simT - TRAFFIC_LEAD;
+  }
+
   return {
-    DEF_ROUTE: DEF_ROUTE,
+    DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
     boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, elapsed: elapsed,
-    formatTime: formatTime
+    formatTime: formatTime, makeLanes: makeLanes, trafficTime: trafficTime
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -598,6 +1032,8 @@ const SD = SixDOF;
 const HF = HikyakuFlight;
 const HK = Hikyaku;
 const HC = HikyakuCity;
+const HT = HikyakuTraffic;
+const MG = Menger;
 const CR = ColorRamps;
 const G = HF.G0;
 
@@ -624,13 +1060,15 @@ function boneColor(THREE, t, k) {
 }
 
 /* URL hooks. ?seed= makes a route shareable and best times comparable.
-   ?shot=start|ring|top|city|canyon places the camera deterministically and
-   ignores input, for headless screenshots; ?nohid=1 skips the 3D mouse;
+   ?shot=start|ring|top|city|canyon|mouth|inside places the camera
+   deterministically and ignores input, for headless screenshots (mouth:
+   120 m before the block's entry portal, inside: at its centre ring,
+   looking at the exit); ?nohid=1 skips the 3D mouse;
    ?bench=1 measures tile builds and frame times and logs them with
    console.error (headless Chrome prints that to stderr). Test hooks, kept
    cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -651,16 +1089,26 @@ const DEF = {
   shadows: false, overlay: false, routeLine: true,
   /* The city. Density, height and accents take effect on "Rebuild"; fog and
      the tile window apply at once. */
-  cityDensity: 0.85, cityMaxH: 260, cityAccents: 2, fogDensity: 0.0034, cityRadius: 4
+  cityDensity: 0.85, cityMaxH: 260, cityAccents: 2, fogDensity: 0.0034, cityRadius: 4,
+  /* Traffic (step 5): on/off, the share of streets that carry lanes, and
+     two debug views. */
+  traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false
 };
+const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
    is the courier's own cyan. */
 const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
 const ENUMS = { camMode: ['chase', 'cockpit'] };
 const STORE = 'hk.cfg';
-const BEST = 'hk.best';
+/* Best times per seed. The key changed with step 6: a seed's route now runs
+   through a Menger block, so times from the old routes do not compare. */
+const BEST = 'hk.best2';
 const SHIP_L = 15;
+/* Bounding radius of the courier's collision hull about its centre of mass,
+   for the vehicle query (hikyaku-traffic.js nearVehicles takes the radius
+   of what is tested). */
+const SHIP_R = 8.5;
 const H_STEP = 1 / 120;
 
 /* The 3D mouse mapping of asteroid-corridor, unchanged. */
@@ -852,10 +1300,16 @@ function App() {
   /* The route is geometry: rebuilt only on a new seed, and the world is
      built around it. */
   const route = useMemo(() => HK.makeRoute({ seed: p.seed }), [p.seed]);
-  /* Oversized structures (arcologies, Menger blocks, step 6) are bigger
-     than a tile and placed on the route separately. Their world boxes go
-     here; the city builds nothing inside them. Empty for now. */
-  const specials = useMemo(() => [], [route]);
+  /* Oversized structures (the Menger block, later arcologies) are bigger
+     than a tile and placed on the route by makeRoute. Their reserved boxes
+     (the 2 x 2 tiles around the block) go to the city, which builds
+     nothing inside them. */
+  const specials = useMemo(() => route.specials.map((sp) => sp.reserved), [route]);
+  const block = route.specials.length ? route.specials[0] : null;
+  /* The traffic lanes, a pure function of the route and the density, with
+     the gaps at the race line already cut (hkcore makeLanes). */
+  const lanes = useMemo(() => (p.traffic ? HK.makeLanes(route, { density: p.trafficDensity }) : null),
+    [route, p.traffic, p.trafficDensity]);
   /* The generator settings the city was built with. The panel edits p and
      "Rebuild" copies them over, so dragging a slider does not throw away
      every tile on each step. */
@@ -871,7 +1325,7 @@ function App() {
   const rebuildCity = () => setCityCfg({ density: p.cityDensity, maxH: p.cityMaxH, accents: p.cityAccents });
 
   const cfgRef = useRef(null);
-  cfgRef.current = { p, craft, killCraft, route, city };
+  cfgRef.current = { p, craft, killCraft, route, city, block, lanes, geo };
 
   const der = useMemo(() => HF.speeds(craft, p.gravity ? G : 0), [craft, p.gravity]);
 
@@ -1017,16 +1471,23 @@ function App() {
       simT: 0, acc: 0, race: null, hits: 0, msg: '', msgUntil: 0, fps: 0, splitsText: ''
     };
     /* cityR: the city renderer, owned by the city effect below. traffic:
-       the slot for step 5 (hikyaku-traffic.js); the loop calls
-       traffic.update(simT, camera) when it is set. */
-    const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null, traffic: null };
+       the traffic system of the traffic effect (hikyaku-traffic.js); the
+       loop calls traffic.update(trafficTime, camera) when it is set.
+       menger: the block's visual, from the block effect. hullBoxes: the
+       vehicle hull debug view. */
+    const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null,
+      traffic: null, menger: null, hullBoxes: null };
     glRef.current = g;
 
     const colNext = new THREE.Color(ACCENT);
     const colAhead = boneColor(THREE, 0.8, 0.95);
     const colDone = boneColor(THREE, 0.4, 0.8);
-    const warmOn = new THREE.Color(WARM);
-    const warmOff = new THREE.Color(WARM).multiplyScalar(0.35);
+    /* Lit gates glow like the Menger block's portal rims, which Menger.build
+       draws as neon that is not tone mapped, at a gain over 1: the warm
+       clips toward gold. The rims run at 2.6 but are thin and sit in an
+       orange halo; a gate's flat reveal reads the same at 1.6. */
+    const warmOn = new THREE.Color(WARM).multiplyScalar(1.6);
+    const warmOff = new THREE.Color(WARM).multiplyScalar(0.45);
 
     /* Ring and gate colours follow the race: the next waypoint in the
        accent, the ones ahead pale, the ones taken dim. */
@@ -1035,8 +1496,8 @@ function App() {
       if (!race) return;
       if (g.rings) {
         const R = g.rings;
-        for (let k = 0; k < R.wpIdx.length; k++) {
-          const wi = R.wpIdx[k];
+        for (let k = 0; k < R.ri.length; k++) {
+          const wi = R.ri[k];
           const col = race.state !== 'idle' && wi === race.next ? colNext
             : (race.state !== 'idle' && wi < race.next) || race.state === 'finished' ? colDone : colAhead;
           R.mesh.setColorAt(k, col);
@@ -1053,13 +1514,28 @@ function App() {
     const reset = () => {
       const cfg = cfgRef.current;
       state.s = HK.startState(cfg.route, 60);
+      /* the city shots stay on the open part of the route */
+      const open = cfg.route.waypoints.filter((w) => w.biome === 'open');
       if (SHOT === 'city') {
-        const w = cfg.route.waypoints[Math.min(5, cfg.route.n - 1)];
+        const w = open[Math.min(5, open.length - 1)];
         state.s = poseAt(w.p, w.dir, 70);
       } else if (SHOT === 'canyon') {
-        const w = cfg.route.waypoints[Math.min(5, cfg.route.n - 1)];
+        const w = open[Math.min(5, open.length - 1)];
         const spot = HC.findCanyon(cfg.city, w.p, 900);
-        if (spot) state.s = poseAt(spot.p, spot.dir, 0);
+        if (spot) {
+          /* Lift the view to a traffic lane in that street, if it has one,
+             so the shot shows vehicles in the canyon. */
+          const ax = Math.abs(spot.dir[0]) > 0.5 ? 0 : 2, pa = 2 - ax;
+          const ln = cfg.lanes ? cfg.lanes.lanes.find((l) => l.spec.kind === 'city' && l.spec.axis === (ax === 0 ? 'x' : 'z')
+            && Math.abs(l.points[0][pa] - spot.p[pa]) < 8
+            && Math.min(l.points[0][ax], l.points[1][ax]) < spot.p[ax] - 200 && Math.max(l.points[0][ax], l.points[1][ax]) > spot.p[ax] + 200) : null;
+          const sp2 = spot.p.slice();
+          if (ln) sp2[1] = ln.points[0][1] + 9;
+          state.s = poseAt(sp2, spot.dir, 0);
+        }
+      } else if ((SHOT === 'mouth' || SHOT === 'inside') && cfg.block) {
+        const ws = cfg.route.waypoints, i0 = cfg.block.i0;
+        state.s = SHOT === 'mouth' ? poseAt(ws[i0 + 1].p, ws[i0 + 1].dir, 120) : poseAt(ws[i0 + 2].p, ws[i0 + 2].dir, -10);
       }
       state.info = null;
       state.cam = { q: state.s.q.slice(), w: [0, 0, 0] };
@@ -1131,6 +1607,12 @@ function App() {
       const pct = (a, f) => { if (!a.length) return null; const b = a.slice().sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(f * b.length))]; };
       const r2 = (x) => x == null ? null : Math.round(x * 1000) / 1000;
       const pure = bench.builds.map((b) => b.pure), mesh = bench.builds.map((b) => b.mesh);
+      const trA = bench.info && bench.info.trafficMs ? bench.info.trafficMs : [];
+      if (bench.info) bench.info.trafficMs = r2(avg(trA));
+      if (bench.info && g.traffic) {
+        const ts3 = g.traffic.tr.stats;
+        Object.assign(bench.info, { near: ts3.near, mid: ts3.mid, far: ts3.far, culled: ts3.culled, nearDenied: ts3.deniedTotal });
+      }
       const dbg = gl.getExtension('WEBGL_debug_renderer_info');
       const out = {
         gpu: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
@@ -1154,13 +1636,13 @@ function App() {
     const onEvent = (ev, ts) => {
       const race = state.race;
       if (ev.type === 'start') say('GO', 1200, ts);
-      else if (ev.type === 'ring' || ev.type === 'delivery') {
-        say('RING ' + race.splits.length + ' of ' + (race.n - 2) + '   ' + HK.formatTime(ev.time), 1400, ts);
+      else if (ev.type === 'ring' || ev.type === 'delivery' || ev.type === 'portal') {
+        say((ev.type === 'portal' ? 'PORTAL ' : 'RING ') + race.splits.length + ' of ' + (race.n - 2) + '   ' + HK.formatTime(ev.time), 1400, ts);
       } else if (ev.type === 'finish') {
         const isBest = onFinishRef.current ? onFinishRef.current(race) : false;
         say('FINISH ' + HK.formatTime(ev.time) + (isBest ? '   best for this seed' : ''), 6000, ts);
         state.splitsText = race.splits.map((t, i) =>
-          (i === race.splits.length - 1 ? 'finish ' : 'ring ' + String(i + 1).padStart(2, ' ') + ' ') + HK.formatTime(t)).join('\n');
+          (i === race.splits.length - 1 ? 'finish ' : (race.wps[i + 1].kind === 'portal' ? 'gate ' : 'ring ') + String(i + 1).padStart(2, ' ') + ' ') + HK.formatTime(t)).join('\n');
       }
       mark();
     };
@@ -1250,14 +1732,28 @@ function App() {
         const o = HF.step(fc, state.s, fcmd, env, H_STEP, 1);
         state.s = o.state; state.info = o.info;
         const near = city.boxesNear(state.s.p, 12);
-        const cs = HK.contactsBoxes(state.s, cr.hull.verts, near);
+        const blk = cfg.block;
+        if (blk) { const mb = MG.boxesNear(blk.block, state.s.p, 12); for (let i = 0; i < mb.length; i++) near.push(mb[i]); }
+        let cs = HK.contactsBoxes(state.s, cr.hull.verts, near);
+        /* Vehicles: the ones whose bounding sphere reaches the ship's, at
+           the traffic time of the new state. vs in each contact is the
+           vehicle's surface velocity, so a hauler hits like a moving wall. */
+        if (g.traffic && cfg.lanes) {
+          const tT = HK.trafficTime(state.race, state.simT + H_STEP);
+          const nv = HT.nearVehicles(cfg.lanes.lanes, state.s.p, SHIP_R + 1, tT);
+          if (nv.length) {
+            const cv = HT.contactsVehicles(state.s, cr.hull.verts, nv, { hull: cfg.geo.collisionHull });
+            if (cv.length) cs = cs.concat(cv);
+          }
+        }
         if (cs.length) {
           const hit = SD.resolve(state.s, cs, cr.I, pp.restitution);
           if (hit) {
             state.s = hit.state;
             if (hit.impact > 1.5) {
               state.hits++;
-              say((hit.contact.key === 'g' ? 'GROUND ' : 'HIT ') + fmt(hit.impact, 1) + ' m/s', 1000, ts);
+              const ky = hit.contact.key;
+              say((ky === 'g' ? 'GROUND ' : ky[0] === 'v' ? 'TRAFFIC ' : 'HIT ') + fmt(hit.impact, 1) + ' m/s', 1000, ts);
             }
           }
         }
@@ -1328,8 +1824,16 @@ function App() {
       }
       camera.updateMatrixWorld();
       if (cityR) cityR.update(camera.position, dt);
-      /* step 5: the traffic layer, every pose a closed formula of time */
-      if (g.traffic) g.traffic.update(state.simT, camera);
+      /* The traffic layer: every pose a closed formula of the traffic time
+         (race time once the start gate is crossed, hkcore trafficTime). */
+      const tTraffic = HK.trafficTime(state.race, state.simT);
+      let trMs = 0;
+      if (g.traffic) {
+        const t0 = performance.now();
+        g.traffic.update(tTraffic, camera);
+        trMs = performance.now() - t0;
+      }
+      if (g.menger) g.menger.update(state.simT, camera.position);
 
       /* ---- HUD ---- */
       const H = hudRef.current;
@@ -1357,6 +1861,13 @@ function App() {
         set('assist', fmt(load * 100, 0) + ' % load');
       }
       set('hits', String(state.hits), state.hits ? 'hot' : '');
+      if (g.traffic && cfg.lanes) {
+        const nv = HT.nearVehicles(cfg.lanes.lanes, s.p, 150, tTraffic);
+        let dmin = Infinity;
+        for (const v of nv) dmin = Math.min(dmin, SD.len(SD.sub(v.pose.p, s.p)) - HT.TYPES[v.type].radius);
+        set('veh', Number.isFinite(dmin) ? fmt(Math.max(0, dmin), 0) + ' m' : '-', dmin < 15 ? 'hot' : '');
+        if (g.hullBoxes) g.hullBoxes.update(nv);
+      } else set('veh', 'off');
       set('fps', fmt(state.fps, 0));
       set('clock', HK.formatTime(HK.elapsed(race, tNow)), race.state === 'finished' ? 'acc' : '');
       set('clockSub', race.state === 'idle' ? 'fly through the start gate'
@@ -1368,7 +1879,7 @@ function App() {
       /* ---- the cue to the next waypoint ---- */
       const cue = H.cue;
       if (cue) {
-        const wp = race.state === 'finished' ? null : route.waypoints[race.next];
+        const wp = race.state === 'finished' ? null : race.wps[race.next];
         if (!wp || SHOT === 'top') cue.style.display = 'none';
         else {
           const W = host.clientWidth || window.innerWidth, Hh = host.clientHeight || window.innerHeight;
@@ -1400,7 +1911,7 @@ function App() {
             H.cueArrow.style.display = onScreen ? 'none' : 'block';
             H.cueArrow.style.transform = 'rotate(' + (90 - ang * 180 / Math.PI).toFixed(1) + 'deg)';
           }
-          if (H.cueD) H.cueD.textContent = fmt(dist, 0) + ' m' + (wp.kind === 'finish' ? ' finish' : wp.kind === 'start' ? ' start' : '');
+          if (H.cueD) H.cueD.textContent = fmt(dist, 0) + ' m' + (wp.kind === 'finish' ? ' finish' : wp.kind === 'start' ? ' start' : wp.kind === 'portal' ? ' portal' : '');
         }
       }
 
@@ -1413,7 +1924,12 @@ function App() {
         if (bench.settle > 60) {
           bench.phase = 'A';
           const st = cityR.stats();
-          bench.info = { tiles: st.tiles, cityTris: st.tris, cityBoxes: st.boxes };
+          bench.info = { tiles: st.tiles, cityTris: st.tris, cityBoxes: st.boxes, trafficMs: [] };
+          if (g.traffic) {
+            const ts2 = g.traffic.tr.stats;
+            bench.info.vehicles = ts2.total; bench.info.lanes = cfg.lanes ? cfg.lanes.lanes.length : 0;
+          }
+          if (g.menger) bench.info.mengerBuildMs = Math.round(g.menger.stats.buildMs);
         }
       } else sink = bench[bench.phase];
       if (sink) cityR.group.visible = bench.phase === 'A';
@@ -1425,6 +1941,7 @@ function App() {
       if (sink) {
         sink.dt.push(dtRaw * 1000);
         sink.cpu.push(performance.now() - c0);
+        if (bench.phase === 'A') bench.info.trafficMs.push(trMs);
         if (bench.phase === 'A' && !bench.info.calls) { bench.info.calls = renderer.info.render.calls; bench.info.tris = renderer.info.render.triangles; }
         if (sink.dt.length >= 120) {
           if (bench.phase === 'A') bench.phase = 'B';
@@ -1505,11 +2022,13 @@ function App() {
       rm.instanceMatrix.needsUpdate = true;
       rm.frustumCulled = false;
       grp.add(rm);
-      g.rings = { mesh: rm, wpIdx: ringWps.map((w) => w.idx) };
+      g.rings = { mesh: rm, ri: ringWps.map((w) => w.ri) };
     } else g.rings = null;
 
     const gs = g.fog.patch(new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false }), { fogK: 0.45 });
     const gf = g.fog.patch(new THREE.MeshBasicMaterial({ color: WARM, toneMapped: false }), { fogK: 0.45 });
+    /* The block's portals are their own gates: Menger.build draws the warm
+       rim on the mouths, the route adds only the cue. */
     const gb = g.fog.patch(new THREE.MeshLambertMaterial({ color: boneColor(THREE, 0.3, 0.6) }));
     grp.add(gateFrame(THREE, route.waypoints[0], gs, gb));
     grp.add(gateFrame(THREE, route.waypoints[route.n - 1], gf, gb));
@@ -1552,6 +2071,84 @@ function App() {
     const g = glRef.current;
     if (g && SHOT !== 'top') g.fog.set({ density: p.fogDensity });
   }, [ready, p.fogDensity]);
+
+  /* ---- the Menger block ----------------------------------------------
+     Built once per route (about 50 ms, off the hot path). Its details keep
+     clear of the route's own curve through it, passed as paths. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !block) return undefined;
+    const path = [];
+    for (const sm of route.tube.samples) if (MG.inside(block.block, sm.p, 80)) path.push(sm.p);
+    const vis = MG.build(g.THREE, block.block, { paths: [path], fog: g.fog, accent: ACCENT, warm: WARM });
+    g.scene.add(vis.group);
+    g.menger = vis;
+    return () => {
+      vis.dispose();
+      if (g.menger === vis) g.menger = null;
+    };
+  }, [ready, route, block]);
+
+  /* ---- traffic ---------------------------------------------------------
+     One traffic system for the city lanes and the block's lanes. The page
+     owns the clock (hkcore trafficTime); the loop passes it in. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !lanes) return undefined;
+    const tr = HT.createTraffic(g.THREE, { lanes: lanes.lanes, accents: CITY_HUES, fog: g.fog, bands: { cull: 1300 } });
+    g.scene.add(tr.group);
+    g.traffic = { tr, update: (t, camera) => tr.update(t, camera.position) };
+    return () => {
+      g.scene.remove(tr.group);
+      tr.dispose();
+      g.traffic = null;
+    };
+  }, [ready, lanes]);
+  useEffect(() => {
+    const g = glRef.current;
+    if (g && g.traffic) g.traffic.tr.setDebug(p.trafficTint);
+  }, [ready, lanes, p.trafficTint]);
+
+  /* ---- vehicle hull boxes (debug) ----
+     The collision boxes of the vehicles within 150 m, as wire boxes, drawn
+     from the same poses the contacts use. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !p.trafficHulls || !lanes) return undefined;
+    const THREE = g.THREE, MAX = 48;
+    const pos = new Float32Array(MAX * 24 * 3);
+    const geoL = new THREE.BufferGeometry();
+    geoL.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+    geoL.setDrawRange(0, 0);
+    const line = new THREE.LineSegments(geoL, new THREE.LineBasicMaterial({ color: 0xff5a4a, toneMapped: false }));
+    line.frustumCulled = false;
+    g.scene.add(line);
+    const E = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+    const hulls = {};
+    for (const tn of HT.TYPE_NAMES) hulls[tn] = HT.vehicleHull(tn);
+    g.hullBoxes = {
+      update(nv) {
+        let n = 0;
+        for (const v of nv) {
+          if (n >= MAX) break;
+          const P = v.pose, hv = hulls[v.type].verts;
+          const w = hv.map((c) => [
+            P.p[0] + P.right[0] * c[0] + P.up[0] * c[1] - P.fwd[0] * c[2],
+            P.p[1] + P.right[1] * c[0] + P.up[1] * c[1] - P.fwd[1] * c[2],
+            P.p[2] + P.right[2] * c[0] + P.up[2] * c[1] - P.fwd[2] * c[2]]);
+          for (const e of E) for (const vi of e) { pos.set(w[vi], n * 72 + (E.indexOf(e) * 2 + e.indexOf(vi)) * 3); }
+          n++;
+        }
+        geoL.setDrawRange(0, n * 24);
+        geoL.attributes.position.needsUpdate = true;
+      }
+    };
+    return () => {
+      g.scene.remove(line);
+      geoL.dispose(); line.material.dispose();
+      g.hullBoxes = null;
+    };
+  }, [ready, lanes, p.trafficHulls]);
 
   /* ---- collision overlay (debug) ---- */
   useEffect(() => {
@@ -1598,6 +2195,7 @@ function App() {
         ${hudRow('ring', 'RINGS')}
         ${hudRow('assist', 'ASSIST')}
         ${hudRow('hits', 'CONTACTS')}
+        ${hudRow('veh', 'NEAREST VEHICLE')}
         ${hudRow('fps', 'FPS')}
       </div>
     </div>
@@ -1634,7 +2232,7 @@ function App() {
         <button className="lang-seg" onClick=${() => setSeed(1 + Math.floor(Math.random() * 99999))}>New route</button>
       </div>
       <div className="hk-derived">
-        <span>Rings, then the finish gate</span><b>${route.n - 2} + 1</b>
+        <span>Rings and portals, then the finish</span><b>${route.waypoints.filter((w) => w.kind === 'ring').length} + ${route.waypoints.filter((w) => w.kind === 'portal').length} + 1</b>
         <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
         <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
         <span>City tile</span><b>${HC.TILE} m, window ${2 * p.cityRadius + 1} x ${2 * p.cityRadius + 1}</b>
@@ -1745,6 +2343,31 @@ function App() {
           45 m tube around the route: buildings there are lowered, split into a canyon or left out, so every ring
           stays reachable. Bridges and cables keep clear of the three future traffic altitudes
           (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.</p>
+      <//>
+
+      <${Section} id="traffic" title="Traffic" open=${sec === 'traffic'} onToggle=${toggleSec}
+        summary=${!p.traffic ? 'off' : (TRAFFIC_DENSITIES.find((d) => d.value === p.trafficDensity) || { label: fmt(p.trafficDensity, 2) }).label.toLowerCase()
+          + (lanes ? ', ' + lanes.stats.vehicles + ' vehicles' : '')}>
+        <div className="hk-chips">
+          <button className=${'lang-seg' + (p.traffic ? ' active' : '')} onClick=${() => upd('traffic')(!p.traffic)}>Traffic</button>
+          <button className=${'lang-seg' + (p.trafficTint ? ' active' : '')} onClick=${() => upd('trafficTint')(!p.trafficTint)}
+            disabled=${!p.traffic}>LOD tint</button>
+          <button className=${'lang-seg' + (p.trafficHulls ? ' active' : '')} onClick=${() => upd('trafficHulls')(!p.trafficHulls)}
+            disabled=${!p.traffic}>Hull boxes</button>
+        </div>
+        <${Seg} label="Density" value=${p.trafficDensity} onChange=${upd('trafficDensity')} options=${TRAFFIC_DENSITIES} />
+        ${lanes ? html`<div className="hk-derived">
+          <span>Lanes, city and block</span><b>${lanes.stats.city - (lanes.specs.filter((q) => q.kind === 'city' && q.fix === 'dropped').length)} + ${lanes.stats.block - (lanes.specs.filter((q) => q.kind === 'menger' && q.fix === 'dropped').length)}</b>
+          <span>Vehicles</span><b>${lanes.stats.vehicles}</b>
+          <span>Crossings of the race line</span><b>${lanes.stats.crossings}</b>
+          <span>Gaps cut: phase, empty slots, spacing</span><b>${lanes.stats.phased} / ${lanes.stats.emptied} / ${lanes.stats.spaced}</b>
+          <span>Lanes dropped</span><b>${lanes.stats.dropped}</b>
+        </div>` : null}
+        <p className="hk-note">Vehicles fly fixed lanes along the streets, x and z on different altitudes, so lanes never cross
+          each other. Traffic never dodges, and its clock is the race clock: the same seed always meets the same traffic.
+          Where a lane crosses the race line, the generator cut a gap of at least 3 s around the time a ship at 45 m/s
+          gets there. Fly faster or slower and the gap moves away from you. "LOD tint" colours the three detail levels,
+          "Hull boxes" shows the collision boxes of nearby vehicles.</p>
       <//>
 
       <${Section} id="debug" title="Display and debug" open=${sec === 'debug'} onToggle=${toggleSec}>

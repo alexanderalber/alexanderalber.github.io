@@ -749,7 +749,10 @@
      chunks so the module does not depend on a renderer to resolve includes.
      The renderer fills the four uniforms whenever material.fog is true. */
   const FOG_GLSL = `
-#ifdef USE_FOG
+#ifdef MG_CG
+uniform float cgFogDensity;
+float mgFog(float d){ return 1.0 - exp(-cgFogDensity * d); }
+#elif defined(USE_FOG)
 uniform vec3 fogColor; uniform float fogNear; uniform float fogFar; uniform float fogDensity;
 float mgFog(float d){
 #ifdef FOG_EXP2
@@ -764,6 +767,28 @@ float mgFog(float d){ return 0.0; }
 `;
   function fogUniforms(THREE) {
     return { fogColor: { value: new THREE.Color() }, fogNear: { value: 1 }, fogFar: { value: 2000 }, fogDensity: { value: 0.00025 } };
+  }
+  /* The page's own height fog (hikyaku-city.js makeFog), when build() gets
+     opts.fog. The lit materials go through fog.patch like everything else
+     on the page; fog.patch sets its own program cache key, which is
+     combined with the material's key here so a patched facade never shares
+     a program with a plain patched material. The custom shaders read the
+     fog uniforms directly (MG_CG). Without opts.fog the module keeps using
+     three's scene fog, as in the concept scenes. */
+  function cgPatch(fog, mat, o) {
+    if (!fog) return mat;
+    const k0 = mat.customProgramCacheKey.bind(mat);
+    fog.patch(mat, o);
+    const k1 = mat.customProgramCacheKey.bind(mat);
+    mat.customProgramCacheKey = function () { return k0() + '|' + k1(); };
+    return mat;
+  }
+  function cgShader(fog, mat) {
+    if (!fog || !mat || !mat.isShaderMaterial) return mat;
+    mat.defines = Object.assign(mat.defines || {}, { MG_CG: '' });
+    for (const k of ['cgFogDensity', 'cgFogLow', 'cgFogHigh', 'cgFogH']) mat.uniforms[k] = fog.uniforms[k];
+    mat.needsUpdate = true;
+    return mat;
   }
 
   /* ---- facade material ---------------------------------------------------
@@ -1159,19 +1184,22 @@ void main(){
       vertexShader: FOG_GLSL + `
 uniform float uFogK;
 attribute vec3 iCol; attribute vec3 iSeed;
-varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog;
+varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying float vFogY;
 void main(){
   vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
   vUv = uv; vCol = iCol; vSd = iSeed;
   vFog = mgFog(length(mv.xyz) * uFogK);
+  vFogY = (modelMatrix * instanceMatrix * vec4(position, 1.0)).y;
   gl_Position = projectionMatrix * mv;
 }`,
       fragmentShader: `
-#ifdef USE_FOG
+#ifdef MG_CG
+uniform vec3 cgFogLow; uniform vec3 cgFogHigh; uniform vec2 cgFogH;
+#elif defined(USE_FOG)
 uniform vec3 fogColor;
 #endif
 uniform float uTime;
-varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog;
+varying vec2 vUv; varying vec3 vCol; varying vec3 vSd; varying float vFog; varying float vFogY;
 float sgH(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 void main(){
   vec2 sz = vSd.yz;
@@ -1192,7 +1220,9 @@ void main(){
   if (fract(vSd.x * 13.7) > 0.12) flick = 1.0;
   vec3 c = vCol * 0.06 + vCol * frame * 1.1 + mix(vCol, vec3(1.0), 0.55) * glyph * 0.95;
   c *= flick;
-#ifdef USE_FOG
+#ifdef MG_CG
+  c = mix(c, mix(cgFogLow, cgFogHigh, clamp((vFogY - cgFogH.x) / (cgFogH.y - cgFogH.x), 0.0, 1.0)), vFog);
+#elif defined(USE_FOG)
   c = mix(c, fogColor, vFog);
 #endif
   gl_FragColor = vec4(c, 1.0);
@@ -1268,6 +1298,8 @@ void main(){
        lights   number of real point lights at the mouths (0; the rim spill
                 in the shader does their job without taxing every material
                 in the scene)
+       fog      the page's height fog (hikyaku-city.js makeFog); without it
+                the materials use three's scene fog
        seed     detail seed (block seed + 1) */
   function build(THREE, block, opts) {
     opts = opts || {};
@@ -1591,6 +1623,11 @@ void main(){
     if (signM) parts.push(signM);
     if (streaks.length) parts.push(streakMesh(THREE, streaks, 0.6));
     if (glow.length) parts.push(glowMesh(THREE, glow, 0.6));
+    if (opts.fog) {
+      cgPatch(opts.fog, mat); cgPatch(opts.fog, plainMat); cgPatch(opts.fog, darkMat);
+      cgPatch(opts.fog, neonMat, { fogK: 0.6 });
+      for (const p of parts) cgShader(opts.fog, p.material);
+    }
     for (const p of parts) { if (p.material && owned.indexOf(p.material) < 0) owned.push(p.material); group.add(p); }
     for (const L of lights) {
       const pl = new THREE.PointLight(L.color, L.power, L.dist, 2);

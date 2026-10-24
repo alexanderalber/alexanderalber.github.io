@@ -199,6 +199,11 @@
                 runs along up (default [0, 0, 1]), for vertical lanes
        maxBank  bank limit in corners, rad (default 0.6)
        express  wider, cyan far streaks (concept flag)
+       fadeEnds open lanes only: vehicles dither in over the first fadeEnds
+                metres and out over the last ones, so a lane may end in
+                plain sight (in front of a Menger block, say) without a
+                pop. Default 0, no fade. Rendering only: poses, contacts and
+                gaps are unchanged
      The concept form is still accepted: { x0, y0, zA, zB, dir, v, mix,
      gap } becomes a straight open lane along z (dir > 0 runs from zB to zA),
      mix ['hauler', 'car', ...] becomes weights, gap [a, b] a spacing of the
@@ -334,7 +339,8 @@
       bobAmp: Math.abs(+bob.amp || 0), bobFreq: +bob.freq || 0,
       up: norm(o.up || [0, 1, 0]), up2: norm(o.up2 || [0, 0, 1]),
       maxBank: o.maxBank != null ? +o.maxBank : 0.6, express: !!o.express,
-      margin: o.margin != null ? +o.margin : 1
+      margin: o.margin != null ? +o.margin : 1,
+      fadeEnds: o.fadeEnds != null ? Math.max(0, +o.fadeEnds) : 0
     };
     if (lane.empty === 1) throw new Error('makeLane: empty = 1 would leave every slot empty');
     let Rmax = 0, lenMax = 0;
@@ -836,6 +842,9 @@
      light behind fog does. uFogK < 1 lets lights carry further than walls. */
   const FOG_VS = [
     'uniform float uFogK;',
+    '#ifdef TF_CG',
+    'uniform float cgFogDensity;',
+    '#endif',
     '#ifdef USE_FOG',
     'uniform float fogNear; uniform float fogFar;',
     '#ifdef FOG_EXP2',
@@ -844,7 +853,9 @@
     '#endif',
     'float tfFog(float d){',
     '  d *= uFogK;',
-    '#ifdef USE_FOG',
+    '#ifdef TF_CG',
+    '  return 1.0 - exp(-cgFogDensity * d);',
+    '#elif defined(USE_FOG)',
     '#ifdef FOG_EXP2',
     '  return 1.0 - exp(-fogDensity * fogDensity * d * d);',
     '#else',
@@ -855,6 +866,27 @@
     '#endif',
     '}'
   ].join('\n');
+  /* The page's own height fog (hikyaku-city.js makeFog), when createTraffic
+     gets opts.fog: the lit bodies go through fog.patch like every other
+     material of the page, the additive layers read its density uniform
+     (TF_CG, exponential in distance as cgFogAmt). fog.patch sets its own
+     program cache key; it is combined with the vehicle key here, otherwise
+     a patched vehicle material and a patched plain material of the same
+     type would share one program. */
+  function cgPatch(fog, mat, opts) {
+    if (!fog) return mat;
+    const k0 = mat.customProgramCacheKey.bind(mat);
+    fog.patch(mat, opts);
+    const k1 = mat.customProgramCacheKey.bind(mat);
+    mat.customProgramCacheKey = function () { return k0() + '|' + k1(); };
+    return mat;
+  }
+  function cgAdditive(fog, mat) {
+    if (!fog) return mat;
+    mat.defines = Object.assign(mat.defines || {}, { TF_CG: '' });
+    mat.uniforms.cgFogDensity = fog.uniforms.cgFogDensity;
+    return mat;
+  }
   function fogUniforms(THREE, k) {
     return { uFogK: { value: k }, fogColor: { value: new THREE.Color() }, fogNear: { value: 1 },
       fogFar: { value: 2000 }, fogDensity: { value: 0.00025 } };
@@ -1123,6 +1155,7 @@ void main(){
     const acc = opts.accents && opts.accents.length ? opts.accents : [CYAN, MAGENTA];
     const accA = acc[0], accB = acc.length > 1 ? acc[1] : acc[0];
     const poolSize = Object.assign({ hauler: 14, pod: 28, drone: 16 }, opts.pools || {});
+    const fog = opts.fog || null;
     const stops = boneStops();
     const bone = (t) => boneColor(THREE, stops, t);
     const owned = [];
@@ -1155,13 +1188,13 @@ void main(){
     const WHITE = bone(0.97);
     function nearMats() {
       const range = { value: new THREE.Vector2(0, 1) };
-      const std = (t, rough, metal) => patchVeh(new THREE.MeshStandardMaterial({
-        color: bone(t), roughness: rough, metalness: metal, flatShading: true, side: THREE.DoubleSide }), false, range, tint.near);
-      const basic = (c) => patchVeh(new THREE.MeshBasicMaterial({ color: c, toneMapped: false, side: THREE.DoubleSide }), false, range, tint.near);
+      const std = (t, rough, metal) => cgPatch(fog, patchVeh(new THREE.MeshStandardMaterial({
+        color: bone(t), roughness: rough, metalness: metal, flatShading: true, side: THREE.DoubleSide }), false, range, tint.near));
+      const basic = (c) => cgPatch(fog, patchVeh(new THREE.MeshBasicMaterial({ color: c, toneMapped: false, side: THREE.DoubleSide }), false, range, tint.near), { fogK: 0.6 });
       const M = {
         paint: std(0.5, 0.55, 0.3), hull2: std(0.36, 0.55, 0.3), dark: std(0.14, 0.7, 0.3), metal: std(0.28, 0.35, 0.7),
-        glass: patchVeh(new THREE.MeshStandardMaterial({ color: bone(0.22), roughness: 0.15, metalness: 0.7, flatShading: true,
-          side: THREE.DoubleSide, emissive: new THREE.Color(accA).multiplyScalar(0.03) }), false, range, tint.near),
+        glass: cgPatch(fog, patchVeh(new THREE.MeshStandardMaterial({ color: bone(0.22), roughness: 0.15, metalness: 0.7, flatShading: true,
+          side: THREE.DoubleSide, emissive: new THREE.Color(accA).multiplyScalar(0.03) }), false, range, tint.near)),
         win: basic(bone(0.78).multiplyScalar(1.15)),
         accA: basic(new THREE.Color(accA).multiplyScalar(1.6)),
         accB: basic(new THREE.Color(accB).multiplyScalar(1.6)),
@@ -1239,8 +1272,8 @@ void main(){
         return mergeGeos(THREE, P, ATTRS);
       }
     };
-    const midMat = patchVeh(new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.6, metalness: 0.3, flatShading: true }),
-      true, null, tint.mid);
+    const midMat = cgPatch(fog, patchVeh(new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.6, metalness: 0.3, flatShading: true }),
+      true, null, tint.mid));
     owned.push(midMat);
     const mids = {};
     for (const tn of TYPE_NAMES) {
@@ -1265,6 +1298,7 @@ void main(){
     streak.mesh.name = 'far';
     const glow = glowMesh(THREE, Math.max(1, nLights));
     glow.mesh.name = 'lights';
+    cgAdditive(fog, streak.mesh.material); cgAdditive(fog, glow.mesh.material);
     group.add(streak.mesh, glow.mesh);
     owned.push(streak.mesh.material, glow.mesh.material);
 
@@ -1318,6 +1352,13 @@ void main(){
         for (const v of list) {
           const s = slotS(lane, v.k, t);
           if (!lane.loop && s >= lane.L) { release(v); v.state = 'off'; st.culled++; continue; }
+          /* ef: the dithered fade at the ends of an open lane (fadeEnds) */
+          let ef = 1;
+          if (!lane.loop && lane.fadeEnds > 0) {
+            ef = Math.min(1, s / lane.fadeEnds, (lane.L - s) / lane.fadeEnds);
+            if (ef <= 1e-3) { release(v); v.state = 'off'; st.culled++; continue; }
+            ef = ef * ef * (3 - 2 * ef);
+          }
           laneFrame(lane, s, t, v.bobPh, fr);
           const P = fr.p, F = fr.f, U = fr.u, R = fr.r;
           const dx = cx - P[0], dy = cy - P[1], dz = cz - P[2];
@@ -1345,14 +1386,14 @@ void main(){
             const sl = pools[v.type][v.slot];
             sl.used = true;
             sl.obj.matrix.copy(M4); sl.obj.matrixWorldNeedsUpdate = true; sl.obj.visible = true;
-            sl.M.range.value.set(0, fN);
+            sl.M.range.value.set(0, fN * ef);
             sl.M.paint.color.copy(v.paint);
             if (sl.obj.userData.rotors) for (const r of sl.obj.userData.rotors) r.rotation.y = t * 11 + v.bobPh;
             nearCount[v.type]++;
             trisN += nearTris[v.type];
           }
           /* mid body: everything the near model and the streak do not cover */
-          const lo = fN, hi = 1 - farF;
+          const lo = fN * ef, hi = (1 - farF) * ef;
           if (hi > lo + 1e-3) {
             const m = mids[v.type], i = m.mesh.count++;
             m.mesh.setMatrixAt(i, M4);
@@ -1368,7 +1409,7 @@ void main(){
           /* lights, at every distance */
           for (const lt of LT[v.type]) {
             const lx = lt.p[0], ly = lt.p[1], lz = lt.p[2];
-            let g = lt.g;
+            let g = lt.g * ef;
             if (lt.k === 'head') g *= 0.15 + 0.85 * Math.pow(Math.max(0, facing), 1.5);
             else if (lt.k === 'tail') g *= 0.3 + 0.7 * Math.pow(Math.max(0, -facing), 1.5);
             if (lt.blink) g *= mod(t + v.bobPh, lt.blink) < 0.12 ? 1 : 0.08;
@@ -1389,7 +1430,7 @@ void main(){
             const hc = lane.express ? COL.a : COL.w;
             const kf = Math.min(1, Math.max(0, (facing + 0.25) / 0.5));
             const k = kf * kf * (3 - 2 * kf);
-            const g = farF * (debug ? 5 : 2.2);
+            const g = farF * ef * (debug ? 5 : 2.2);
             const col = dbg || [hc[0] * k + COL.b[0] * (1 - k), hc[1] * k + COL.b[1] * (1 - k), hc[2] * k + COL.b[2] * (1 - k)];
             sa[si * 3] = tail.p[0]; sa[si * 3 + 1] = tail.p[1]; sa[si * 3 + 2] = tail.p[2];
             sb[si * 3] = nose.p[0]; sb[si * 3 + 1] = nose.p[1]; sb[si * 3 + 2] = nose.p[2];
