@@ -170,17 +170,19 @@
   <script src="/assets/js/hikyaku-city.js"></script>
   <script src="/assets/js/hikyaku-traffic.js"></script>
   <script src="/assets/js/menger.js"></script>
+  <script src="/assets/js/shaft.js"></script>
   <script src="/assets/js/dust.js"></script>
 </head>
 <body>
   <div id="root"></div>
 
-  <!-- The pure half: the route with its Menger block, the boxes around it,
+  <!-- The pure half: the route with its Menger block and its ventilation
+       shaft, the boxes around it,
        the ring test, the race clock, the box contacts, the traffic lanes and
        the traffic clock. No DOM, no three.js, no React, so
        notes/dev/hikyaku.test.mjs pulls this block out by id and evaluates it
-       on top of assets/js/sixdof.js, hikyaku-city.js, hikyaku-traffic.js and
-       menger.js (their pure layers). Moving any of it into the app block
+       on top of assets/js/sixdof.js, hikyaku-city.js, hikyaku-traffic.js,
+       menger.js and shaft.js (their pure layers). Moving any of it into the app block
        breaks that seam. -->
   <script id="hkcore">
 var Hikyaku = (function () {
@@ -225,9 +227,10 @@ var Hikyaku = (function () {
      Waypoint shape, shared by every kind:
        { idx, ri, kind, p, dir, right, up, shape, r, hw, hh, hold, biome }
      kind   'start' | 'ring' | 'portal' | 'via' | 'finish'. A portal is the
-            mouth of a Menger block, a rectangular gate centred on c (the
-            opening) that the race counts like a ring. A via point only
-            shapes the curve (approach and leave of the block); the race
+            mouth of a Menger block or of the shaft, a rectangular gate
+            centred on c (the opening) that the race counts like a ring. A
+            via point only shapes the curve (approach and leave of the block
+            and the shaft, the pass points at the shaft's fans); the race
             skips it and ri, the race index, is null. v2 adds 'delivery': a waypoint where
             the pilot must hover or land. It reuses p and r (the radius of the
             hover zone) and fills hold = { ms, maxSpeed }; raceStep already
@@ -237,7 +240,8 @@ var Hikyaku = (function () {
             edge) or 'none' (via).
      dir    the facing direction, which is the curve tangent there. A ring
             counts only when crossed along dir.
-     biome  'open', or 'menger' on the five block points.
+     biome  'open', 'menger' on the five block points, 'shaft' on the
+            shaft's points.
 
      The curve is a cubic Hermite spline per leg. The tangent at a waypoint
      is the bisector of the two legs meeting there, scaled by the chord of
@@ -261,12 +265,20 @@ var Hikyaku = (function () {
     forgive: 1.5,       /* metres of grace on the ring and gate edge */
     leadIn: 160, leadOut: 120,
     step: 4,            /* tube sample spacing, metres */
-    /* One Menger block on the route (step 6): about mengerAt of the way
-       along, lead metres of straight approach and leave outside its
+    /* One Menger block on the route (step 6): after mengerAt of the regular
+       legs (the 1.6 km of shaft after it put the block at 31 to 46 % of
+       the length), lead metres of straight approach and leave outside its
        mouths (more than the tube radius plus 10 m, so the next leg clears
        the block), its own lanes reaching mengerReach from its centre
        (inside the 2 x 2 tiles it reserves). */
-    menger: true, mengerAt: 0.5, mengerLead: 60, mengerReach: 190
+    menger: true, mengerAt: 0.5, mengerLead: 60, mengerReach: 190,
+    /* One ventilation shaft (assets/js/shaft.js) after the block, its middle
+       at about shaftAt of the way along (0.8 puts one leg and the finish
+       after it). It lies level at an altitude between shaftAltMin and
+       shaftAltMax through a housing building of its own, the mouths in the
+       end facades, with approach and leave legs of shaftLead metres
+       outside the mouths. */
+    shaft: true, shaftAt: 0.8, shaftAltMin: 70, shaftAltMax: 110, shaftLead: 80
   };
   /* Box indices of the block, clear of every city box: the city numbers its
      boxes tile * 4096 + i, below 2^45. contactsBoxes keys on idx. */
@@ -426,19 +438,123 @@ var Hikyaku = (function () {
       return null;
     }
 
+    /* The ventilation shaft (shaft.js), after the block. Same idea as the
+       block, but the route is not turned (the block, already placed, would
+       turn with it): the leg to the shaft takes the world axis nearest to
+       the current heading, a turn of 45 degrees at most, which the
+       generator allows anyway. The shaft lies level at a seeded altitude,
+       its entry mouth lead metres beyond the approach point, and the leg
+       there is long enough for the climb at the slope limit. Its two bends
+       cancel, so it leaves along the same axis, offset sideways. The older
+       legs keep the tube radius plus 10 m from its housing, the approach
+       leg keeps minSep from the older legs and the tube radius plus 10 m
+       from the block, the housing keeps 30 m from the block's footprint.
+       Six tries (longer approach, the other bend sense); if none fits, the
+       last leg is drawn again, up to four times; then there is no shaft. */
+    var shaft = null;
+    function boxesNearXZ(a, b, m) {
+      return a.min[0] < b.max[0] + m && a.max[0] > b.min[0] - m && a.min[2] < b.max[2] + m && a.max[2] > b.min[2] - m;
+    }
+    function placeShaft() {
+      var SH = globalThis.Shaft;
+      if (!SH) throw new Error('makeRoute: cfg.shaft needs Shaft (assets/js/shaft.js) loaded first');
+      var sSeed = 1 + ((Math.imul(R.seed ^ 0x2c9277b5, 2654435761) >>> 0) % 99991);
+      var lead = R.shaftLead;
+      var tryOnce = function () {
+        var last = pts[pts.length - 1];
+        var hs = Math.round(G.h / (Math.PI / 2)) * (Math.PI / 2);
+        var ax = [Math.round(Math.sin(hs)), 0, Math.round(-Math.cos(hs))];
+        var yaw = Math.atan2(-ax[0], -ax[2]);
+        var yc = R.shaftAltMin + rand() * (R.shaftAltMax - R.shaftAltMin);
+        for (var tr = 0; tr < 6; tr++) {
+          var D = Math.max(R.spMin, Math.abs(last[1] - yc) / (R.slope * 0.95)) + Math.floor(tr / 2) * 140;
+          var A = [last[0] + ax[0] * D, yc, last[2] + ax[2] * D];
+          var legA = sub(A, last), ok = true, s, jj, kk;
+          if (G.legPrev && angle(G.legPrev, legA) > R.maxLeg * DEG) continue;
+          var O = [A[0] + ax[0] * lead, yc, A[2] + ax[2] * lead];
+          var sh = SH.makeShaft(sSeed, { origin: O, yaw: yaw, lead: lead, bendSign: tr % 2 ? -1 : 1 });
+          var boxes = SH.reservedBoxes(sh);
+          for (jj = 0; jj + 1 < pts.length && ok; jj++) {
+            for (s = 0; s <= 8 && ok; s++) {
+              var qq = add(pts[jj], mul(sub(pts[jj + 1], pts[jj]), s / 8));
+              for (kk = 0; kk < boxes.length; kk++) if (boxDist(boxes[kk], qq) < R.tubeR + 10) { ok = false; break; }
+            }
+          }
+          for (jj = 0; jj + 2 < pts.length && ok; jj++) {
+            if (noSep[jj]) continue;
+            for (s = 0; s <= 8; s++) if (pointSegDist(add(last, mul(legA, s / 8)), pts[jj], pts[jj + 1]) < R.minSep) { ok = false; break; }
+          }
+          for (jj = 0; jj < avoid.length && ok; jj++) {
+            for (s = 0; s <= 8; s++) if (boxDist(avoid[jj], add(last, mul(legA, s / 8))) < R.tubeR + 10) { ok = false; break; }
+          }
+          if (ok && block) for (kk = 0; kk < boxes.length; kk++) if (boxesNearXZ(boxes[kk], block.reserved, 30)) { ok = false; break; }
+          if (!ok) continue;
+          var ft = SH.flythrough(sh, { lead: lead, ringR: R.ringR });
+          var i0 = pts.length;
+          for (jj = 0; jj < ft.waypoints.length; jj++) pts.push(ft.waypoints[jj].p.slice());
+          for (jj = i0; jj < pts.length - 1; jj++) noSep[jj] = true;
+          for (kk = 0; kk < boxes.length; kk++) avoid.push(boxes[kk]);
+          G.h = hs; G.legPrev = sub(pts[pts.length - 1], pts[pts.length - 2]);
+          var ports = SH.portals(sh);
+          var lo = [Infinity, 0, Infinity], hi = [-Infinity, 4000, -Infinity];
+          for (kk = 0; kk < boxes.length; kk++) for (var a2 = 0; a2 < 3; a2 += 2) {
+            lo[a2] = Math.min(lo[a2], boxes[kk].min[a2]); hi[a2] = Math.max(hi[a2], boxes[kk].max[a2]);
+          }
+          return {
+            kind: 'shaft', seed: sSeed, yaw: yaw, origin: O, alt: yc, shaft: sh, ft: ft, axis: ax, i0: i0, count: ft.waypoints.length,
+            entry: ports[0], exit: ports[1], bounds: SH.bounds(sh),
+            /* the housing's envelope: the city builds nothing in these boxes
+               (reservedList, one per 100 m of axis); reserved is their union
+               up to the sky, for code that takes one box per special */
+            reservedList: boxes, reserved: { min: lo, max: hi }
+          };
+        }
+        return null;
+      };
+      var keep = block ? block.i0 + 5 : 2;
+      for (var rg = 0; rg < 5; rg++) {
+        var got = tryOnce();
+        if (got) return got;
+        if (rg === 4 || pts.length <= keep) break;
+        /* draw the last leg again: the random stream has moved on */
+        pts.pop();
+        var pl = pts[pts.length - 1], pq = pts[pts.length - 2];
+        G.legPrev = sub(pl, pq);
+        G.h = Math.atan2(pl[0] - pq[0], -(pl[2] - pq[2]));
+        grow(1);
+      }
+      return null;
+    }
+
+    /* Regular points: R.n in all, two fewer for each special placed (the
+       block's and the shaft's own points stand in for them). */
     var nBefore = Math.max(2, Math.min(R.n - 2, Math.round((R.n - 2) * R.mengerAt)));
+    var mAfter = Math.max(1, Math.round((R.n - 2) * (1 - R.shaftAt)) - 1);
     if (R.menger) {
       grow(nBefore - 1);
       block = placeMenger();
-      grow(block ? R.n - 2 - nBefore : R.n - nBefore);
+      if (R.shaft) {
+        grow(Math.max(1, R.n - 4 - nBefore - mAfter) + (block ? 0 : 2));
+        shaft = placeShaft();
+        grow(mAfter + (shaft ? 0 : 2));
+      } else grow(block ? R.n - 2 - nBefore : R.n - nBefore);
+    } else if (R.shaft) {
+      grow(Math.max(2, R.n - 3 - mAfter));
+      shaft = placeShaft();
+      grow(mAfter + (shaft ? 0 : 2));
     } else grow(R.n - 1);
     var n = pts.length;
-    var specials = block ? [block] : [];
+    var specials = [];
+    if (block) specials.push(block);
+    if (shaft) specials.push(shaft);
     var bi0 = block ? block.i0 : -1;
     var inBlockWp = function (k) { return bi0 >= 0 && k >= bi0 && k < bi0 + 5; };
+    var si0 = shaft ? shaft.i0 : -1;
+    var inShaftWp = function (k) { return si0 >= 0 && k >= si0 && k < si0 + shaft.count; };
 
     var dirs = pts.map(function (pt, k) {
       if (inBlockWp(k)) return block.axis.slice();
+      if (inShaftWp(k)) return shaft.ft.waypoints[k - si0].dir.slice();
       if (k === 0) return norm(sub(pts[1], pts[0]));
       if (k === n - 1) return norm(sub(pts[n - 1], pts[n - 2]));
       return norm(add(norm(sub(pt, pts[k - 1])), norm(sub(pts[k + 1], pt))));
@@ -456,6 +572,12 @@ var Hikyaku = (function () {
         kind = e === 0 || e === 4 ? 'via' : e === 1 || e === 3 ? 'portal' : 'ring';
         biome = 'menger';
         if (kind === 'portal') portal = e === 1 ? block.entry : block.exit;
+      }
+      if (inShaftWp(k)) {
+        var sw = shaft.ft.waypoints[k - si0];
+        kind = sw.kind === 'portal' ? 'portal' : sw.kind === 'ring' ? 'ring' : 'via';
+        biome = 'shaft';
+        if (kind === 'portal') portal = sw.portal === 'entry' ? shaft.entry : shaft.exit;
       }
       var f = frameOf(dirs[k]);
       var w = {
@@ -480,7 +602,7 @@ var Hikyaku = (function () {
     for (i = 0; i + 1 < n; i++) {
       var c = len(sub(pts[i + 1], pts[i]));
       segments.push({ i: i, p0: pts[i], p1: pts[i + 1], m0: mul(dirs[i], c), m1: mul(dirs[i + 1], c), chord: c,
-        biome: inBlockWp(i) && inBlockWp(i + 1) ? 'menger' : 'open' });
+        biome: inBlockWp(i) && inBlockWp(i + 1) ? 'menger' : inShaftWp(i) && inShaftWp(i + 1) ? 'shaft' : 'open' });
     }
 
     /* u runs from 0 at the start gate to n - 1 at the finish. */
@@ -523,6 +645,11 @@ var Hikyaku = (function () {
        holds (13.5 m in an 81 m tunnel), not the 45 m tube. */
     if (block) {
       for (i = 0; i < samples.length; i++) samples[i].inBlock = globalThis.Menger.inside(block.block, samples[i].p, 0);
+    }
+    /* Inside the shaft the duct holds its own clearance (the race line keeps
+       12 m from the wall, tested). */
+    if (shaft) {
+      for (i = 0; i < samples.length; i++) samples[i].inShaft = globalThis.Shaft.inside(shaft.shaft, samples[i].p);
     }
     var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (i = 0; i < samples.length; i++) {
@@ -814,8 +941,8 @@ var Hikyaku = (function () {
      Menger block's lattice keeps its lanes apart. A street carries lanes
      with probability `density`; a lane reaches as far as the street stays
      within `margin` of the route (all of it is beyond the fog from the
-     route) and is cut 25 m before a Menger block's bounds, where it
-     dithers out (fadeEnds). Haulers get rarer the lower the lane.
+     route) and is cut 25 m before a Menger block's bounds or the shaft's
+     housing, where it dithers out (fadeEnds). Haulers get rarer the lower the lane.
 
      The block's own lanes (Menger.laneSet) join the list as they are.
 
@@ -887,6 +1014,10 @@ var Hikyaku = (function () {
     var smp = route.tube.samples, specs = [], i, k;
     var flip = C.axisFlip >= 0 ? C.axisFlip & 1 : seed & 1;
     var blocks = (route.specials || []).filter(function (sp) { return sp.kind === 'menger'; });
+    /* Lanes are cut before every block and before the shaft's housing (its
+       reserved boxes, one per 100 m of axis). */
+    var cuts = blocks.map(function (sp) { return sp.bounds; });
+    (route.specials || []).forEach(function (sp) { if (sp.kind === 'shaft') cuts = cuts.concat(sp.reservedList); });
 
     /* ---- city lanes ---- */
     for (var li = 0; li < LY.length; li++) {
@@ -909,8 +1040,8 @@ var Hikyaku = (function () {
           /* keep right: +x travels at z = c + offset, +z at x = c - offset */
           var line = c + (ax === 0 ? dsg : -dsg) * C.offset;
           var iv = [[e0, e1]];
-          for (var bI = 0; bI < blocks.length; bI++) {
-            var bb = blocks[bI].bounds;
+          for (var bI = 0; bI < cuts.length; bI++) {
+            var bb = cuts[bI];
             if (line < bb.min[pa] - C.cut || line > bb.max[pa] + C.cut || y < bb.min[1] - C.cut || y > bb.max[1] + C.cut) continue;
             var c0 = bb.min[aa] - C.cut, c1 = bb.max[aa] + C.cut, nv = [];
             for (var q = 0; q < iv.length; q++) {
@@ -1100,6 +1231,7 @@ const HK = Hikyaku;
 const HC = HikyakuCity;
 const HT = HikyakuTraffic;
 const MG = Menger;
+const SHF = Shaft;
 const CR = ColorRamps;
 const G = HF.G0;
 
@@ -1132,17 +1264,19 @@ function hazeOf(p) {
 }
 
 /* URL hooks. ?seed= makes a route shareable and best times comparable.
-   ?shot=start|ring|top|city|canyon|mouth|inside places the camera
-   deterministically and ignores input, for headless screenshots (mouth:
-   120 m before the block's entry portal, inside: at its centre ring,
-   looking at the exit); ?nohid=1 skips the 3D mouse;
+   ?shot=start|ring|top|city|canyon|mouth|inside|shaftmouth|shaftinside
+   places the camera deterministically and ignores input, for headless
+   screenshots (mouth: 120 m before the block's entry portal, inside: at
+   its centre ring, looking at the exit; shaftmouth: 120 m before the
+   shaft's entry portal, shaftinside: at the shaft's first ring, looking
+   down the duct to the first fan); ?nohid=1 skips the 3D mouse;
    ?bench=1 measures tile builds and frame times and logs them with
    console.error (headless Chrome prints that to stderr). ?shot=high is the
    owner's view of 2026-10-25: chase camera 320 m up, nose down over the
    city. ?fog=<haze per km> and ?weather=rain|dry override the stored
    settings without storing them. Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1195,9 +1329,10 @@ const CITY_HUES = [ACCENT, 0xff3fa4];
 const BUDGET_KEYS = ['bXp', 'bXn', 'bYp', 'bYn', 'bZn', 'bZp', 'bBoost', 'aPitch', 'aYaw', 'aRoll', 'mass', 'cd'];
 const ENUMS = { camMode: ['chase', 'cockpit'], weather: ['auto', 'dry', 'rain'] };
 const STORE = 'hk.cfg';
-/* Best times per seed. The key changed with step 6: a seed's route now runs
-   through a Menger block, so times from the old routes do not compare. */
-const BEST = 'hk.best2';
+/* Best times per seed. The key changed with step 6 (a seed's route runs
+   through a Menger block) and again with the shaft (and through a
+   ventilation shaft): times from the old routes do not compare. */
+const BEST = 'hk.best3';
 const SHIP_L = 15;
 /* Bounding radius of the courier's collision hull about its centre of mass,
    for the vehicle query (hikyaku-traffic.js nearVehicles takes the radius
@@ -1531,8 +1666,11 @@ function App() {
      than a tile and placed on the route by makeRoute. Their reserved boxes
      (the 2 x 2 tiles around the block) go to the city, which builds
      nothing inside them. */
-  const specials = useMemo(() => route.specials.map((sp) => sp.reserved), [route]);
-  const block = route.specials.length ? route.specials[0] : null;
+  const specials = useMemo(() => route.specials.flatMap((sp) => sp.reservedList || [sp.reserved]), [route]);
+  const block = route.specials.find((sp) => sp.kind === 'menger') || null;
+  /* The ventilation shaft (shaft.js): its housing's envelope is in
+     `specials` too, per 100 m of axis. */
+  const shaftSp = route.specials.find((sp) => sp.kind === 'shaft') || null;
   /* The traffic lanes, a pure function of the route and the density, with
      the gaps at the race line already cut (hkcore makeLanes). */
   const lanes = useMemo(() => (p.traffic ? HK.makeLanes(route, { density: p.trafficDensity }) : null),
@@ -1552,7 +1690,7 @@ function App() {
   const rebuildCity = () => setCityCfg({ density: p.cityDensity, maxH: p.cityMaxH, accents: p.cityAccents });
 
   const cfgRef = useRef(null);
-  cfgRef.current = { p, craft, killCraft, route, city, block, lanes, geo };
+  cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, lanes, geo };
 
   const der = useMemo(() => HF.speeds(craft, p.gravity ? G : 0), [craft, p.gravity]);
 
@@ -1716,7 +1854,7 @@ function App() {
     scene.add(rain.mesh);
 
     const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, rings: null, gates: null, cityR: null,
-      traffic: null, menger: null, hullBoxes: null, groundMat: null };
+      traffic: null, menger: null, shaft: null, hullBoxes: null, groundMat: null };
     glRef.current = g;
 
     const colNext = new THREE.Color(ACCENT);
@@ -1776,6 +1914,10 @@ function App() {
       } else if ((SHOT === 'mouth' || SHOT === 'inside') && cfg.block) {
         const ws = cfg.route.waypoints, i0 = cfg.block.i0;
         state.s = SHOT === 'mouth' ? poseAt(ws[i0 + 1].p, ws[i0 + 1].dir, 120) : poseAt(ws[i0 + 2].p, ws[i0 + 2].dir, -10);
+      } else if ((SHOT === 'shaftmouth' || SHOT === 'shaftinside') && cfg.shaft) {
+        const ws = cfg.route.waypoints.slice(cfg.shaft.i0, cfg.shaft.i0 + cfg.shaft.count);
+        const entry = ws.find((w) => w.kind === 'portal'), ring = ws.find((w) => w.kind === 'ring');
+        state.s = SHOT === 'shaftmouth' ? poseAt(entry.p, entry.dir, 120) : poseAt(ring.p, ring.dir, 0);
       }
       if (SHOT === 'high') {
         const w = open[Math.min(5, open.length - 1)];
@@ -1990,6 +2132,16 @@ function App() {
         const blk = cfg.block;
         if (blk) { const mb = MG.boxesNear(blk.block, state.s.p, 12); for (let i = 0; i < mb.length; i++) near.push(mb[i]); }
         let cs = HK.contactsBoxes(state.s, cr.hull.verts, near);
+        /* The shaft: its wall, dressing and housing, and the fans, which
+           turn on the traffic clock (race time from the start gate on), so
+           every run of a seed meets the same blades. Only near the housing. */
+        const shf = cfg.shaft;
+        if (shf && SHF.near(shf.shaft, state.s.p, 20)) {
+          const cw = SHF.contactsWall(state.s, cr.hull.verts, shf.shaft);
+          const cf = SHF.contactsFans(state.s, cr.hull.verts, shf.shaft, HK.trafficTime(state.race, state.simT + H_STEP));
+          if (cw.length) cs = cs.concat(cw);
+          if (cf.length) cs = cs.concat(cf);
+        }
         /* Vehicles: the ones whose bounding sphere reaches the ship's, at
            the traffic time of the new state. vs in each contact is the
            vehicle's surface velocity, so a hauler hits like a moving wall. */
@@ -2008,7 +2160,8 @@ function App() {
             if (hit.impact > 1.5) {
               state.hits++;
               const ky = hit.contact.key;
-              say((ky === 'g' ? 'GROUND ' : ky[0] === 'v' ? 'TRAFFIC ' : 'HIT ') + fmt(hit.impact, 1) + ' m/s', 1000, ts);
+              say((ky === 'g' ? 'GROUND ' : ky[0] === 'v' ? 'TRAFFIC ' : ky === 'sw' || ky === 'sh' ? 'SHAFT ' : ky[0] === 'f' ? 'FAN ' : 'HIT ')
+                + fmt(hit.impact, 1) + ' m/s', 1000, ts);
             }
           }
         }
@@ -2123,6 +2276,18 @@ function App() {
         trMs = performance.now() - t0;
       }
       if (g.menger) g.menger.update(state.simT, camera.position);
+      /* The shaft's fans on the traffic clock, as in the contacts. Inside
+         the duct the sun and the sky light fade (to a fifth, over the first
+         40 m behind a mouth): the duct is lit by its own lamps, and the
+         courier should not look like it flies in daylight down there. */
+      if (g.shaft) g.shaft.update(tTraffic, camera.position);
+      {
+        const shf = cfg.shaft;
+        const dIn = shf ? SHF.depthIn(shf.shaft, [camera.position.x, camera.position.y, camera.position.z]) : -1;
+        const kIn = dIn > 0 ? Math.min(1, dIn / 40) : 0;
+        sun.intensity = 0.9 * (1 - 0.8 * kIn);
+        hemi.intensity = 1.1 * (1 - 0.8 * kIn);
+      }
 
       /* ---- HUD ---- */
       const H = hudRef.current;
@@ -2218,6 +2383,7 @@ function App() {
             bench.info.vehicles = ts2.total; bench.info.lanes = cfg.lanes ? cfg.lanes.lanes.length : 0;
           }
           if (g.menger) bench.info.mengerBuildMs = Math.round(g.menger.stats.buildMs);
+          if (g.shaft) { bench.info.shaftBuildMs = Math.round(g.shaft.stats.buildMs); bench.info.shaftTris = g.shaft.stats.tris; }
         }
       } else sink = bench[bench.phase];
       if (sink) cityR.group.visible = bench.phase === 'A';
@@ -2384,6 +2550,25 @@ function App() {
     };
   }, [ready, route, block]);
 
+  /* ---- the ventilation shaft --------------------------------------------
+     Built once per route (about 200 ms: the swept wall and the dressing
+     along 1.5 km, off the hot path), fogged by the page's atmosphere. The
+     loop turns the fans. Cable bundles keep clear of the race line, passed
+     as paths. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !shaftSp) return undefined;
+    const path = [];
+    for (const sm of route.tube.samples) if (sm.inShaft) path.push(sm.p);
+    const vis = SHF.build(g.THREE, shaftSp.shaft, { paths: [path], fog: g.fog, accent: ACCENT, warm: WARM });
+    g.scene.add(vis.group);
+    g.shaft = vis;
+    return () => {
+      vis.dispose();
+      if (g.shaft === vis) g.shaft = null;
+    };
+  }, [ready, route, shaftSp]);
+
   /* ---- traffic ---------------------------------------------------------
      One traffic system for the city lanes and the block's lanes. The page
      owns the clock (hkcore trafficTime); the loop passes it in. */
@@ -2528,6 +2713,7 @@ function App() {
       </div>
       <div className="hk-derived">
         <span>Rings and portals, then the finish</span><b>${route.waypoints.filter((w) => w.kind === 'ring').length} + ${route.waypoints.filter((w) => w.kind === 'portal').length} + 1</b>
+        <span>On the route</span><b>${route.specials.map((sp) => (sp.kind === 'menger' ? 'block' : sp.kind)).join(', ') || 'open city only'}</b>
         <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
         <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
         <span>City tile</span><b>${HC.TILE} m, window ${2 * p.cityRadius + 1} x ${2 * p.cityRadius + 1}</b>
