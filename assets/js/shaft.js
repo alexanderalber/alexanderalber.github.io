@@ -641,6 +641,13 @@
       rings.push({ s: s, x: rho * Math.cos(th), y: rho * Math.sin(th), th: th });
       th = Math.atan2(Math.sin(th), Math.cos(th));
     }
+    /* opts.rings: explicit stations [{ s, x, y }] instead of the generated
+       ones (a host building that wants its own count); the fan passes still
+       follow their neighbours */
+    if (opts.rings) {
+      rings.length = 0;
+      for (const q of opts.rings) rings.push({ s: q.s, x: q.x, y: q.y, th: Math.atan2(q.y, q.x) });
+    }
     const pts = [];
     const f0 = frameAt(sh, 0), f1 = frameAt(sh, L);
     pts.push({ s: -lead, x: 0, y: 0, kind: 'approach' });
@@ -1282,7 +1289,7 @@ void main(){
      sky light kept inside, 0.12), med ({ t, density }: the duct medium, bone
      position and per metre), lampGain, paths (race lines; cables that come
      within 6 m of one are left out). Returns { group, update(t, cameraPos),
-     dispose, stats }. */
+     dispose, stats }. Host options: rimGain, mouthRims (see below). */
   function build(THREE, sh, opts) {
     opts = opts || {};
     const t0 = (typeof performance !== 'undefined' ? performance : Date).now();
@@ -1293,6 +1300,10 @@ void main(){
     const med = opts.med || { t: 0.07, density: 0.0034 };
     const medC = boneRGB(stops, med.t);
     const lampGain = opts.lampGain == null ? 1 : opts.lampGain;
+    /* rimGain scales the light of the warm mouth rims (1); mouthRims: false
+       leaves out the rim geometry and halos at the mouths (a host building
+       with quiet portals draws its own) */
+    const rimGain = opts.rimGain == null ? 1 : opts.rimGain;
     const LA = 50 * Math.PI / 180, LR = RR - 3.2;
     const CORNER = [A - RECT.c / 2 - 0.3, Bh - RECT.c / 2 - 0.3];
     const thC = Math.atan2(CORNER[1], CORNER[0]);
@@ -1307,8 +1318,8 @@ void main(){
       uShLoft: { value: new THREE.Vector4(lf[0], lf[1], lf[2], lf[3]) },
       uShStrip: { value: new THREE.Vector4(CORNER[0], CORNER[1], (RR - 0.5) * Math.cos(thC), (RR - 0.5) * Math.sin(thC)) },
       uShStripCol: { value: new THREE.Vector3().fromArray(hexLin(accent, 5)) },
-      uShRim: { value: [new THREE.Vector4(A + 1, Bh + 1, -H.proud - 0.2, 40), new THREE.Vector4(A - 0.4, Bh - 0.4, 6, 22),
-        new THREE.Vector4(A + 1, Bh + 1, L + H.proud + 0.2, 40), new THREE.Vector4(A - 0.4, Bh - 0.4, L - 6, 22)] },
+      uShRim: { value: [new THREE.Vector4(A + 1, Bh + 1, -H.proud - 0.2, 40 * rimGain), new THREE.Vector4(A - 0.4, Bh - 0.4, 6, 22 * rimGain),
+        new THREE.Vector4(A + 1, Bh + 1, L + H.proud + 0.2, 40 * rimGain), new THREE.Vector4(A - 0.4, Bh - 0.4, L - 6, 22 * rimGain)] },
       uShRimCol: { value: new THREE.Vector3().fromArray(hexLin(warm, 1)) },
       uShInScale: { value: opts.inScale == null ? 0.12 : opts.inScale },
       uShP0: { value: new THREE.Vector3(f0.p[0], f0.p[1], f0.p[2]) }, uShN0: { value: new THREE.Vector3(f0.T[0], 0, f0.T[2]) },
@@ -1536,6 +1547,7 @@ void main(){
     /* the opening offset by d: the chamfer line moves by d too */
     const grow = (P, d) => chamferPoly(A + d, Bh + d, RECT.c + d * (2 - Math.SQRT2));
     const mouth = (sEdge, sgn) => {
+      if (opts.mouthRims === false) return;
       /* sgn -1: entry (outside at s < 0), +1: exit (outside at s > L) */
       const sF = sEdge + sgn * H.proud;
       const inn = poly, outer = grow(poly, H.collar);

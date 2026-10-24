@@ -1,57 +1,65 @@
-/* pyramid.js -- the type P arcology of Hikyaku: a steep truncated pyramid
- * whose interior is the ventilation system. The race enters through a gate at
- * the back of a deep notch in the front face, flies the duct (shaft.js) with
- * one right turn, and leaves through a splayed portal on a side face.
+/* pyramid.js -- the type P arcology of Hikyaku (concept D4): a banded
+ * ziggurat-pyramid whose interior is the ventilation system. The race comes
+ * in through a deep corner cut at the south-west, under a gate of two
+ * inhabited beams and past a leaning leg, enters the duct (shaft.js) in the
+ * cut's east wall, turns left once inside and leaves through a quiet portal
+ * on the north face.
  *
- * Concept: notes/tools/hikyaku/concepts/PYRAMID-VARIANTS.md, variant D2
- * (pyr-d2.html, lib/pyrslope.js, lib/pyrpath.js). Kept from there: the
- * dimensions, the hollow shell (outer surfaces only, so nothing can cross the
- * duct), the faces cut around exact holes instead of boxes split by cuts, and
- * the collision proposal (half-spaces for the faces, air regions for the
- * notch and the reveals, boxes for everything axis-aligned). New here: world
- * placement, the contacts in the record shape of SixDOF.resolve, the route
- * pass points, and a build on the game's own materials.
+ * Concept: notes/tools/hikyaku/concepts/PYRAMID-VARIANTS.md, variant D4 and
+ * "D4 update: the corner gate" (pyr-d4.html, lib/pyrbands.js, lib/pyrpath.js
+ * bandedDims). Kept from there: dimensions, courtyards, cantilevers, fins,
+ * gate, duct, ring stations and the collision concept (band half-spaces,
+ * open-air regions, boxes for what projects, the leg as a plane prism). New
+ * here: world placement, contacts in the record shape of SixDOF.resolve, the
+ * route pass points, the campus hint, and a build on the game's materials.
+ * The surroundings (campus, ring road, boulevards, plaza) are not here: the
+ * city builds them in the reserved region (campus hint below).
  *
  * Two layers, like menger.js and shaft.js:
  *
  *   - Pure layer, no three.js, no DOM: makePyramid, toLocal, toWorld,
- *     contacts, boxesNear, flythrough, portals, inside, bounds, fitCheck.
- *     notes/dev/pyramid.test.mjs checks it. Needs globalThis.Shaft (the duct).
+ *     dirWorld, contacts, boxesNear, clearance, flythrough, portals, inside,
+ *     bounds, fitCheck. notes/dev/pyramid.test.mjs checks it. Needs
+ *     globalThis.Shaft (the duct).
  *   - Visual layer: build(THREE, layout, opts). THREE is a parameter, never an
  *     import. Uses ColorRamps (bone greys) and Shaft.build for the duct.
  *
- * Local frame: y up, the centre of the base at the origin, the front (notch)
- * on +z, so a pilot flying in travels along -z. The duct turns right, toward
- * +x, and leaves through the east face. World placement: origin (centre of
- * the base on the ground) and a yaw that is a multiple of 90 degrees in
- * three.js's rotation.y convention, as menger.js and shaft.js: local -z goes
- * to (-sin yaw, 0, -cos yaw). Multiples of 90 keep every box axis-aligned.
+ * Local frame: y up, the centre of the base at the origin, south (the plaza
+ * side) on +z, east on +x. The corner cut is at the south-west (x < -x0,
+ * z > z0). A pilot flies in along +x, the duct turns LEFT to -z (north).
+ * World placement: origin (centre of the base on the ground) and a yaw that
+ * is a multiple of 90 degrees in three.js's rotation.y convention, as
+ * menger.js and shaft.js: local +x goes to (cos yaw, 0, -sin yaw).
  *
- * Dimensions (D2): skirt 1280 x 60 m; frustum 1120 m wide at its foot (60 m),
- * faces at 62 degrees (cot c = 0.53), flat top 378 m wide at 760 m. Front
- * notch: walls at |x| = 100 + 0.08 y, gate wall at z = 300, open where the
- * face is in front of the gate (up to 551 m). Duct axis at 200 m, above all
- * three lane heights.
+ * Large form: skirt 1320 x 60 m; band 1 (62 degrees, 1160 m at its foot,
+ * 60 to 290 m), terrace, band 2 (66 degrees, 812 m, 290 to 520 m), terrace,
+ * band 3 (58 degrees, 520 m, 520 to 720 m), roof 272 m wide with the exhaust
+ * crown. Articulation: nine courtyards cut into the slopes (two with
+ * bridges), four cantilevers, fins in three widths per band stopping at the
+ * terraces, buildings on the terraces. The corner cut (band 1 height) is
+ * framed at its top by an L of two inhabited beams (58 m tall, flush with the
+ * band 1 slope, the wedge between beam front and slope filled) and one
+ * smooth leg leaning down to the forecourt along the corner edge's line.
  *
- * Collision. The frustum is convex: four face planes n . p = d (n outward,
- * tilted up by the slope) and the roof plane y = TOP. A point behind all of
- * them is in the shell unless it is in an air region: the notch, the two
- * splayed reveals, the hole of each mouth plate, or the duct's own wall band
- * near the mouths (that belongs to the shaft's contacts). A point in the
- * shell leaves through the cheapest exit: a face, the roof, back into the
- * notch or a reveal (the largest violated constraint of that region, a lower
- * bound of the distance), or into a plate's hole. Nothing deeper than `cap`
- * (30 m) answers: the duct runs at least the fit margin (above 60 m) behind
- * every plane, so a hull in the duct gets nothing from here, and a hull can
- * only be that deep by tunnelling. On the outside of the faces, fins and
- * bands are slabs on the face planes (out along n, fins also sideways).
- * Skirt, roof, crown and clutter are boxes in the game's box shape
- * ({ min, max, c, half, idx }, boxesNear) for hkcore contactsBoxes.
+ * Collision. Each band is four half-spaces n . p <= d with its own y range;
+ * above band k and outside band k+1 the terrace is the ceiling. A point in a
+ * band is in the shell unless it is in an open-air region: the cut under the
+ * beams, the pocket behind them, the nine courtyards (each with its own wall
+ * planes), the two splayed reveals, the holes in the mouth plates, or the
+ * duct's wall band near the mouths (the shaft's contacts). In the shell it
+ * leaves through the cheapest exit: a face, the terrace or roof above, or into
+ * an air region (its largest violated wall, a lower bound of the distance).
+ * Nothing deeper than `cap` (20 m) answers: the duct keeps more than that
+ * from every plane (fitCheck), so a hull in the duct gets nothing from here.
+ * The leg is a convex prism of four planes and a y range, solid inside the
+ * cut. Fins, corner fins, cornices and ledges are slabs on the face planes.
+ * Everything else that projects (terraces, beams, cantilevers, bridges,
+ * terrace buildings, skirt, crown, forecourt) is a box in the game's box
+ * shape for hkcore contactsBoxes (boxesNear).
  *
- * Detail layers (terraces, balconies, grilles and the like, concept D3) are
- * meant to go into layout.details: boxes in face-local coordinates (face id,
- * u, y, w, h, d, kind), drawn as one instanced mesh per kind. build() already
- * draws them; makePyramid fills the list with a first, sparse kind (ledges).
+ * Detail layers go into layout.details, drawn as one instanced mesh per
+ * kind: face-local boxes { kind, band, face, u, y, w, h, d } or local AABBs
+ * { kind, lo, hi }. The window texture is the city's facade shader.
  *
  * Everything hangs on globalThis.HikyakuPyramid.
  */
@@ -59,25 +67,52 @@
   'use strict';
 
   const ACCENT = 0x2ee8ff, WARM = 0xffa63d;
+  const H90 = Math.PI / 2;
   const DEF = {
-    skirtHalf: 640, skirtH: 60, hb: 560, H: 700, c: 0.53, CW: 100, cc: 0.08, GZ: 300,
-    ductY: 200,            /* duct axis altitude */
-    gateD: 30,             /* gate plane to the duct mouth */
-    plate: 2.4,            /* mouth plate depth (shaft proud) */
-    PW: 140, PH: 112,      /* portal opening at the plate */
-    splay: 0.35,           /* reveal widening per metre of depth */
-    s1: 370,               /* straight from the mouth to the bend */
-    bendR: 180, ramp: 40,  /* the right turn: plateau radius, curvature ramps */
-    exitTopD: 12,          /* the opening's top edge this far behind the east face */
-    loftIn: [90, 180], loftOut: [153, 73],   /* lofts: from the entry, and before the exit */
-    fanIn: 90,             /* first round fan this far before the bend */
-    fanOut: [183, 38],     /* second round fan and the square fan, before the exit */
-    fins: [-0.5, 0.5], finW: 40, finD: 10, cornerW: 34, cornerD: 13,
-    bands: [0.2, 0.5, 0.78], bandH: 7, bandD: 1.5,
-    notchFins: [40, 120, 220], notchFinW: 10, notchFinD: 5, pilasterW: 12, pilasterD: 6,
-    lead: 260, leave: 160, /* route: approach before the gate, leave beyond the exit */
-    wallT: 12, cap: 30, plaza: 120, fitHalf: 62
+    skirtHalf: 660, skirtH: 60,
+    bands: [{ hb: 580, h: 230, c: 0.53 }, { hb: 406, h: 230, c: 0.44 }, { hb: 260, h: 200, c: 0.62 }],
+    /* the corner cut at the south-west and its gate */
+    cutX: 210, cutZ: 210, beamH: 58, beamD: 50, legW: 50, soffitY: 288, forecourtZ: 360,
+    courts: [
+      { band: 0, face: 'W', ua: -60, ub: 40, depth: 45 },
+      { band: 0, face: 'N', ua: 170, ub: 260, depth: 45 },
+      { band: 0, face: 'S', ua: 240, ub: 330, depth: 45 },
+      { band: 1, face: 'S', ua: -180, ub: -90, depth: 42, bridge: 400 },
+      { band: 1, face: 'E', ua: 40, ub: 130, depth: 42 },
+      { band: 1, face: 'N', ua: 60, ub: 150, depth: 42 },
+      { band: 1, face: 'W', ua: -200, ub: -110, depth: 42, bridge: 430 },
+      { band: 2, face: 'W', ua: 30, ub: 110, depth: 38 },
+      { band: 2, face: 'S', ua: -100, ub: -30, depth: 38 }
+    ],
+    cantis: [
+      { band: 1, face: 'E', u0: -260, u1: -150, ya: 380, yb: 440, out: 40 },
+      { band: 0, face: 'S', u0: -120, u1: 20, ya: 230, yb: 280, out: 35 },
+      { band: 1, face: 'W', u0: 130, u1: 230, ya: 420, yb: 470, out: 30 },
+      { band: 2, face: 'N', u0: -60, u1: 40, ya: 600, yb: 640, out: 30 }
+    ],
+    /* fins per band: u as a fraction of the band's top half width, width w;
+       depth 9 + w / 10. Corner fins narrower up the building. */
+    fins: [
+      [{ u: -0.8, w: 44 }, { u: -0.25, w: 22 }, { u: 0.4, w: 30 }],
+      [{ u: -0.55, w: 30 }, { u: 0.15, w: 50 }, { u: 0.7, w: 20 }],
+      [{ u: 0, w: 60 }]
+    ],
+    cornerW: [34, 26, 18], cornerD: 12, corniceH: 9, corniceD: 8, ledgeH: 2.4, ledgeD: 7,
+    /* the duct */
+    ductY: 165, gateD: 28, plate: 2.4, PW: 140, PH: 112, splay: 0.35,
+    s1: 250, bendR: 180, ramp: 40, exitTopD: 12,
+    loftIn: [90, 180], loftOut: [149, 69],
+    fanAt: [215, 700], fanSquareOut: 37,
+    /* ring stations (s, offset x right, y up); the last one counts back from the exit */
+    rings: [{ s: 120, x: -14, y: 8 }, { s: 400, x: 12, y: -10 }, { s: 620, x: -14, y: 12 }, { s: 820, x: 16, y: -8 }, { s: 960, x: -10, y: -12 }, { s: -99, x: 8, y: 10 }],
+    /* route */
+    lead: 560, leave: 160,
+    /* reserved region round the skirt: margins west, east, north, south */
+    plaza: [360, 410, 360, 510],
+    wallT: 12, cap: 20, fitHalf: 62
   };
+  const FACE_IDS = ['S', 'E', 'N', 'W'];
+  const FACE_NH = { S: [0, 0, 1], E: [1, 0, 0], N: [0, 0, -1], W: [-1, 0, 0] };
 
   /* ---- helpers ------------------------------------------------------------ */
   function mulberry32(seed) {
@@ -105,6 +140,16 @@
     if (!S) throw new Error('HikyakuPyramid needs Shaft: load /assets/js/shaft.js first');
     return S;
   }
+  /* box minus box: up to six pieces of a that are not in c */
+  function subtractBox(a, c) {
+    const lo = a.lo.slice(), hi = a.hi.slice(), out = [];
+    if (c.hi[0] <= lo[0] || c.lo[0] >= hi[0] || c.hi[1] <= lo[1] || c.lo[1] >= hi[1] || c.hi[2] <= lo[2] || c.lo[2] >= hi[2]) return [a];
+    for (let ax = 0; ax < 3; ax++) {
+      if (c.lo[ax] > lo[ax]) { const h = hi.slice(); h[ax] = c.lo[ax]; out.push(Object.assign({}, a, { lo: lo.slice(), hi: h })); lo[ax] = c.lo[ax]; }
+      if (c.hi[ax] < hi[ax]) { const l = lo.slice(); l[ax] = c.hi[ax]; out.push(Object.assign({}, a, { lo: l, hi: hi.slice() })); hi[ax] = c.hi[ax]; }
+    }
+    return out;
+  }
 
   /* ---- placement ------------------------------------------------------------ */
   function toWorld(L, p) {
@@ -119,65 +164,94 @@
 
   /* ---- the layout --------------------------------------------------------------
      makePyramid(seed, opts): opts.origin [x, 0, z] or { x, z }, opts.yaw
-     (multiple of 90 degrees), opts.avoid (world points the clutter keeps 34 m
-     from, e.g. the route samples), opts.idxBase (box idx offset, so the keys
-     of contactsBoxes never collide with the city's), any DEF key. */
+     (multiple of 90 degrees), opts.avoid (world points the terrace buildings
+     and cantilevers keep 34 m from, e.g. route samples), opts.idxBase (box
+     idx offset for contactsBoxes keys), any DEF key. */
   function makePyramid(seed, opts) {
     opts = opts || {};
     const S = needShaft();
     const C = Object.assign({}, DEF, opts);
-    const yaw = opts.yaw || 0, qy = yaw / (Math.PI / 2);
+    const yaw = opts.yaw || 0, qy = yaw / H90;
     if (Math.abs(qy - Math.round(qy)) > 1e-6) throw new Error('HikyakuPyramid: yaw must be a multiple of 90 degrees');
     const o = opts.origin;
     const origin = Array.isArray(o) ? [o[0], o[1] || 0, o[2]] : o ? [o.x || 0, o.y || 0, o.z || 0] : [0, 0, 0];
     const L = { seed: seed >>> 0, cfg: C, yaw: yaw, origin: origin, cy: Math.round(Math.cos(yaw)), sy: Math.round(Math.sin(yaw)) };
     const rng = mulberry32((seed >>> 0) ^ 0x7a1d0c3b);
+    const T = (lo, hi) => lo + (hi - lo) * rng();
 
-    /* dimensions */
-    const y0 = C.skirtH, TOP = y0 + C.H, q = Math.hypot(1, C.c), qc = Math.hypot(1, C.cc), qs = Math.hypot(1, C.splay);
-    const D = {
-      skirtHalf: C.skirtHalf, skirtH: C.skirtH, hb: C.hb, c: C.c, y0: y0, TOP: TOP, topHalf: C.hb - C.H * C.c,
-      CW: C.CW, cc: C.cc, GZ: C.GZ, notchTop: y0 + (C.hb - C.GZ) / C.c, q: q, qc: qc, qs: qs,
-      dFace: (C.hb + C.c * y0) / q
-    };
-    D.half = (y) => C.hb - (y - y0) * C.c;
-    D.cw = (y) => C.CW + C.cc * y;
-    L.dims = D;
-    /* faces: S (front, +z), E, N, W; n outward (tilted up), T the u axis */
-    L.faces = [['S', [0, 0, 1]], ['E', [1, 0, 0]], ['N', [0, 0, -1]], ['W', [-1, 0, 0]]].map(([id, nh]) => ({
-      id: id, nh: nh, n: [nh[0] / q, C.c / q, nh[2] / q], d: D.dFace, T: cross([0, 1, 0], nh)
+    /* bands */
+    const SKH = C.skirtHalf, SH = C.skirtH;
+    let yb = SH;
+    const B = C.bands.map((b, k) => {
+      const q = Math.hypot(1, b.c), r = { k: k, hb: b.hb, c: b.c, y0: yb, y1: yb + b.h, q: q, ht: b.hb - b.h * b.c, dF: (b.hb + b.c * yb) / q };
+      yb += b.h;
+      return r;
+    });
+    B.forEach((b, k) => { b.next = k + 1 < B.length ? B[k + 1].hb : 0; });
+    const TOP = yb;
+    const half = (k, y) => B[k].hb - (y - B[k].y0) * B[k].c;
+    L.bands = B;
+    L.dims = { skirtHalf: SKH, skirtH: SH, TOP: TOP, topHalf: B[B.length - 1].ht, bands: B };
+    L.half = half;
+    /* faces: per band S, E, N, W; n outward (tilted up), T the u axis */
+    L.faces = [];
+    B.forEach((b, k) => FACE_IDS.forEach((id, j) => {
+      const nh = FACE_NH[id];
+      L.faces.push({ band: k, j: j, id: id, nh: nh, T: cross([0, 1, 0], nh), n: [nh[0] / b.q, b.c / b.q, nh[2] / b.q], d: b.dF, y0: b.y0, y1: b.y1 });
     }));
+    const face = (k, id) => L.faces[k * 4 + FACE_IDS.indexOf(id)];
+    const facePt = (f, u, y, d) => { const h = half(f.band, y); return [f.nh[0] * h + f.T[0] * u + f.n[0] * (d || 0), y + f.n[1] * (d || 0), f.nh[2] * h + f.T[2] * u + f.n[2] * (d || 0)]; };
+    L.facePt = facePt;
 
-    /* the duct: mouth GZ - gateD behind the gate, s1 straight, one ramped
-       right turn, then straight to exitTopD behind the east face */
-    const yc = C.ductY, zs = C.GZ - C.gateD;
-    const rp = Math.min(C.ramp, Math.PI / 2 * C.bendR * 0.5), wB = Math.PI / 2 * C.bendR + rp;
-    /* where the turn ends (local), integrated like Shaft.makeShaft does */
-    const probe = S.makeShaft(1, { origin: [0, yc, zs], yaw: 0, length: C.s1 + wB + 10, loft: [1, 2, 3, 4], fans: [],
-      bends: [{ kind: 'arc', s0: C.s1, angle: Math.PI / 2, R: C.bendR, ramp: C.ramp }], housing: false });
-    const fe = S.frameAt(probe, C.s1 + wB);
-    const xe = D.half(yc + C.PH / 2) - C.plate - C.exitTopD;   /* the duct end */
-    const s2 = xe - fe.p[0];
-    if (!(s2 > 60)) throw new Error('HikyakuPyramid: no room for the exit leg');
+    /* the corner gate: two beams (an L in plan), flush with band 1's slope,
+       reaching back to the inner edge of the terrace above; one leg */
+    const b0 = B[0], yT = b0.y1, yB = yT - C.beamH;
+    const zo = half(0, yT) - 2, zi = Math.min(zo - C.beamD, B[1].hb - 20);
+    const xi = -C.cutX, xo = -(half(0, yT) - 2);
+    const xw1 = Math.max(xo + C.beamD, -(B[1].hb - 20));
+    const shear = b0.c * (yB - SH), w = C.legW;
+    const cTop = [xo + w / 2, zo - w / 2], cFoot = [cTop[0] - shear, cTop[1] + shear];
+    L.gate = {
+      yB: yB, yT: yT, xo: xo, xi: xi, zo: zo, zi: zi, xw1: xw1, zw0: C.cutZ, zw1: zi,
+      beamS: { lo: [xo, yB, zi], hi: [xi, yT, zo] }, beamW: { lo: [xo, yB, C.cutZ], hi: [xw1, yT, zi] },
+      leg: { y0: SH, y1: yB, w: w, top: cTop, foot: cFoot, lean: b0.c }
+    };
+    /* leg planes: x - c y <= ..., the four sheared sides */
+    {
+      const c0 = b0.c, q0 = Math.hypot(1, c0), fx = cFoot[0] - c0 * SH, fz = cFoot[1] + c0 * SH;
+      L.gate.leg.planes = [
+        { n: [1 / q0, -c0 / q0, 0], d: (fx + w / 2) / q0 }, { n: [-1 / q0, c0 / q0, 0], d: -(fx - w / 2) / q0 },
+        { n: [0, c0 / q0, 1 / q0], d: (fz + w / 2) / q0 }, { n: [0, -c0 / q0, -1 / q0], d: -(fz - w / 2) / q0 }
+      ];
+    }
+
+    /* the duct: mouth gateD behind the cut's east wall at forecourtZ, s1
+       east, one ramped LEFT turn, then north to exitTopD behind the north
+       face of band 1 */
+    const yc = C.ductY, xs = -C.cutX + C.gateD, zs = C.forecourtZ;
+    const shYaw = yaw - H90;     /* the shaft's dir0 is local +x */
+    const rp = Math.min(C.ramp, H90 * C.bendR * 0.5), wB = H90 * C.bendR + rp;
+    const bend = [{ kind: 'arc', s0: C.s1, angle: -H90, R: C.bendR, ramp: C.ramp }];
+    const probe = S.makeShaft(1, { origin: toWorld(L, [xs, yc, zs]), yaw: shYaw, length: C.s1 + wB + 10, loft: [1, 2, 3, 4], fans: [], bends: bend, housing: false });
+    const fe = toLocal(L, S.frameAt(probe, C.s1 + wB).p);
+    const ze = -(half(0, yc + C.PH / 2) - C.plate - C.exitTopD);
+    const s2 = fe[2] - ze;
+    if (!(s2 > 100)) throw new Error('HikyakuPyramid: no room for the exit leg');
     const len = C.s1 + wB + s2;
     const loft = [C.loftIn[0], C.loftIn[1], len - C.loftOut[0], len - C.loftOut[1]];
-    const fans = [{ s: C.s1 - C.fanIn, kind: 'round' }, { s: len - C.fanOut[0], kind: 'round' }, { s: len - C.fanOut[1], kind: 'square' }];
+    const fans = [{ s: C.fanAt[0], kind: 'round' }, { s: C.fanAt[1], kind: 'round' }, { s: len - C.fanSquareOut, kind: 'square' }];
     const sSeed = 1 + ((Math.imul((seed >>> 0) ^ 0x51f7e2a9, 2654435761) >>> 0) % 99991);
-    const duct = S.makeShaft(sSeed, {
-      origin: toWorld(L, [0, yc, zs]), yaw: yaw, length: len, loft: loft, fans: fans,
-      bends: [{ kind: 'arc', s0: C.s1, angle: Math.PI / 2, R: C.bendR, ramp: C.ramp }],
-      housing: false, proud: C.plate, collar: 16, wallT: C.wallT
-    });
-    L.duct = duct;
-    L.bend = { s0: C.s1, s1: C.s1 + wB, R: C.bendR, ramp: rp };
-    const eL = toLocal(L, S.frameAt(duct, len).p);
+    L.duct = S.makeShaft(sSeed, { origin: toWorld(L, [xs, yc, zs]), yaw: shYaw, length: len, loft: loft, fans: fans, bends: bend,
+      housing: false, proud: C.plate, collar: 16, wallT: C.wallT });
+    L.bend = { s0: C.s1, s1: C.s1 + wB, R: C.bendR, ramp: rp, turn: 'left' };
+    L.rings = C.rings.map((r) => ({ s: r.s < 0 ? len + r.s : r.s, x: r.x, y: r.y }));
+    const eL = toLocal(L, S.frameAt(L.duct, len).p);
 
     /* portals: station point E (duct end), outward o, lateral N; the reveal
        starts at the plate front (t = 0) and ends at the outer plane */
-    const mkPortal = (id, E, o, N, outer, sEnd) => {
-      const P = { id: id, E: E, o: o, N: N, outer: outer, sEnd: sEnd, hw: C.PW / 2, hh: C.PH / 2, splay: C.splay, plate: C.plate,
+    const mkPortal = (id, E, o, N, outer) => {
+      const P = { id: id, E: E, o: o, N: N, outer: outer, hw: C.PW / 2, hh: C.PH / 2, splay: C.splay, plate: C.plate,
         skip: id === 'entry' ? loft[0] : len - loft[3] };
-      /* outer rim: the inner corners at the plate front, splayed until they meet the outer plane */
       const F = sa(E, o, C.plate);
       P.rim = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
         const p0 = [F[0] + N[0] * a * P.hw, F[1] + b * P.hh, F[2] + N[2] * a * P.hw];
@@ -185,185 +259,282 @@
         const t = (outer.d - dot(outer.n, p0)) / dot(outer.n, dv);
         return sa(p0, dv, Math.max(4, t));
       });
-      /* where the axis crosses the outer plane */
       const ta = (outer.d - dot(outer.n, E)) / dot(outer.n, o);
       P.axisOut = sa(E, o, ta);
       P.depthOut = ta;
       return P;
     };
-    const fE = L.faces[1];
+    const fN0 = face(0, 'N');
     L.portalsL = [
-      mkPortal('entry', [0, yc, zs], [0, 0, 1], [1, 0, 0], { n: [0, 0, 1], d: C.GZ }, 0),
-      mkPortal('exit', eL, [1, 0, 0], [0, 0, 1], { n: fE.n, d: fE.d }, len)
+      mkPortal('entry', [xs, yc, zs], [-1, 0, 0], [0, 0, 1], { n: [-1, 0, 0], d: C.cutX }),
+      mkPortal('exit', eL, [0, 0, -1], [1, 0, 0], { n: fN0.n, d: fN0.d })
     ];
 
-    /* face holes, as (u, y) trapezoids: the notch on S, the exit on E */
-    const trap = (rim, T) => {
-      const uv = rim.map((p) => [dot(p, T), p[1]]);
-      const ya = (uv[0][1] + uv[1][1]) / 2, yb = (uv[2][1] + uv[3][1]) / 2;
-      return { ya: ya, yb: yb, uL: [Math.min(uv[0][0], uv[1][0]), Math.min(uv[2][0], uv[3][0])], uR: [Math.max(uv[0][0], uv[1][0]), Math.max(uv[2][0], uv[3][0])] };
+    /* holes per face (u, y): courts, the cut on band 1 S and W below the
+       beams, the exit on band 1 N; and the entry in the cut's east wall */
+    const trap = (rim, Tv) => {
+      const uv = rim.map((p) => [dot(p, Tv), p[1]]);
+      return { ya: (uv[0][1] + uv[1][1]) / 2, yb: (uv[2][1] + uv[3][1]) / 2,
+        uL: [Math.min(uv[0][0], uv[1][0]), Math.min(uv[2][0], uv[3][0])], uR: [Math.max(uv[0][0], uv[1][0]), Math.max(uv[2][0], uv[3][0])] };
     };
-    L.holes = { S: [{ ya: y0, yb: D.notchTop, notch: true }], E: [trap(L.portalsL[1].rim, fE.T)], W: [], N: [], gate: [trap(L.portalsL[0].rim, [1, 0, 0])] };
-
-    /* slabs on the faces (fins, corner fins, bands) and in the notch */
-    const slabs = [];
-    for (let k = 0; k < 4; k++) {
-      for (const f of C.fins) slabs.push({ face: k, kind: 'fin', u: f * D.topHalf, w: C.finW, d: C.finD, y0: y0, y1: TOP });
-      slabs.push({ face: k, kind: 'corner', w: C.cornerW, d: C.cornerD, y0: y0, y1: TOP });
-      for (const b of C.bands) { const yb = y0 + b * (TOP - y0); slabs.push({ face: k, kind: 'band', d: C.bandD, y0: yb, y1: yb + C.bandH, lit: true }); }
-      slabs.push({ face: k, kind: 'band', d: 2.5, y0: TOP - 26, y1: TOP - 4, lit: false });
-      slabs.push({ face: k, kind: 'band', d: C.bandD, y0: y0, y1: y0 + 9, lit: false });
+    L.faces.forEach((f) => { f.holes = []; });
+    for (const ct of C.courts) {
+      const b = B[ct.band];
+      face(ct.band, ct.face).holes.push({ ya: b.y0, yb: b.y1, uL: [ct.ua, ct.ua], uR: [ct.ub, ct.ub], court: true });
     }
-    L.slabs = slabs;
-    L.notchSlabs = [];
-    for (const sx of [-1, 1]) for (const zf of C.notchFins) L.notchSlabs.push({ kind: 'nfin', sx: sx, z0: C.GZ + zf, z1: C.GZ + zf + C.notchFinW, d: C.notchFinD });
-    for (const sx of [-1, 1]) L.notchSlabs.push({ kind: 'pilaster', sx: sx, w: C.pilasterW, d: C.pilasterD });
+    face(0, 'S').holes.push({ ya: b0.y0, yb: yB, uL: [-1e4, -1e4], uR: [xi, xi], cut: true });
+    face(0, 'W').holes.push({ ya: b0.y0, yb: yB, uL: [C.cutZ, C.cutZ], uR: [1e4, 1e4], cut: true });
+    fN0.holes.push(trap(L.portalsL[1].rim, fN0.T));
+    L.entryHole = trap(L.portalsL[0].rim, [0, 0, 1]);
 
-    /* boxes: skirt, cornices, grilles, terrace clutter, roof, crown */
+    /* open-air regions: convex, rows { n, d } with inside <=> n . p <= d for
+       all rows. kind 'cut' (under the beams, behind the beams) or 'court' */
+    const air = [];
+    air.push({ kind: 'cut', id: 'under', rows: [{ n: [1, 0, 0], d: xi }, { n: [0, 0, -1], d: -C.cutZ }, { n: [0, 1, 0], d: yB }] });
+    air.push({ kind: 'cut', id: 'behind', rows: [{ n: [1, 0, 0], d: xi }, { n: [-1, 0, 0], d: -xw1 }, { n: [0, 0, -1], d: -C.cutZ }, { n: [0, 0, 1], d: zi },
+      { n: [0, 1, 0], d: C.soffitY }, { n: [0, -1, 0], d: -yB }] });
+    for (const ct of C.courts) {
+      const f = face(ct.band, ct.face), b = B[ct.band];
+      air.push({ kind: 'court', id: ct.band + ct.face, court: ct, band: ct.band, face: f.j, rows: [
+        { n: f.T.slice(), d: ct.ub }, { n: f.T.map((v) => -v), d: -ct.ua },
+        { n: f.n.map((v) => -v), d: -(f.d - ct.depth / b.q) },
+        { n: [0, 1, 0], d: b.y1 }, { n: [0, -1, 0], d: -b.y0 }
+      ] });
+    }
+    L.air = air;
+
+    /* slabs on the faces: fins, corner fins, cornice lip, mid ledge */
+    L.slabs = [];
+    B.forEach((b, k) => FACE_IDS.forEach((id, j) => {
+      const list = [];
+      for (const fi of C.fins[k]) list.push({ kind: 'fin', u: fi.u * b.ht, w: fi.w, d: 9 + fi.w / 10, y0: b.y0, y1: b.y1 });
+      list.push({ kind: 'corner', w: C.cornerW[k], d: C.cornerD, y0: b.y0, y1: b.y1 });
+      list.push({ kind: 'band', d: C.corniceD, y0: b.y1 - C.corniceH, y1: b.y1, part: 'cornice' });
+      const ym = (b.y0 + b.y1) / 2;
+      list.push({ kind: 'band', d: C.ledgeD, y0: ym, y1: ym + C.ledgeH, part: 'ledge' });
+      for (const s of list) { s.band = k; s.face = j; L.slabs.push(s); }
+    }));
+    L.slabMax = Math.max.apply(null, L.slabs.map((s) => s.d));
+
+    /* boxes */
     const boxes = [];
-    const box = (x0, y0b, z0, x1, y1b, z1, tone, prog, coll) => boxes.push({ lo: [x0, y0b, z0], hi: [x1, y1b, z1], tone: tone, prog: prog == null ? 4 : prog, coll: coll !== false, seed: rng() });
-    const SKH = C.skirtHalf, SH = C.skirtH, wN = Math.max(D.cw(0), D.cw(SH)), GZ = C.GZ, hb = C.hb, TH = D.topHalf;
-    box(-SKH, 0, -SKH, SKH, SH, GZ, 0.4, 2);
-    box(-SKH, 0, GZ, -wN, SH, SKH, 0.4, 2);
-    box(wN, 0, GZ, SKH, SH, SKH, 0.4, 2);
-    for (const [a, b] of [[SH - 8, SH], [SH * 0.45, SH * 0.45 + 3]]) {
-      box(-SKH - 6, a, -SKH - 6, SKH + 6, b, -SKH, 0.6);
-      box(-SKH - 6, a, -SKH, -SKH, b, SKH + 6, 0.6);
-      box(SKH, a, -SKH, SKH + 6, b, SKH + 6, 0.6);
-      box(-SKH, a, SKH, -wN, b, SKH + 6, 0.6);
-      box(wN, a, SKH, SKH, b, SKH + 6, 0.6);
-    }
-    /* intake grilles on all four skirt faces: a 2.5 m proud panel each (the
-       slats are a detail for later) */
-    for (let i = 0; i < 6; i++) {
-      const a = -SKH + 80 + i * (2 * SKH - 160) / 5, w = 70;
-      box(a - w / 2, 6, -SKH - 2.5, a + w / 2, SH * 0.42, -SKH, 0.16);
-      box(SKH, 6, a - w / 2, SKH + 2.5, SH * 0.42, a + w / 2, 0.16);
-      box(-SKH - 2.5, 6, a - w / 2, -SKH, SH * 0.42, a + w / 2, 0.16);
-      if (Math.abs(a) > wN + 50) box(a - w / 2, 6, SKH, a + w / 2, SH * 0.42, SKH + 2.5, 0.16);
-    }
-    /* terrace clutter on the skirt top, in clusters, clear of the approach,
-       the exit leg and opts.avoid */
-    const ex = L.portalsL[1].axisOut;
+    const box = (lo, hi, tone, prog, coll, part) => boxes.push({ lo: lo, hi: hi, tone: tone, prog: prog == null ? 4 : prog, coll: coll !== false, seed: rng(), part: part || '' });
     const avoidL = (opts.avoid || []).map((p) => toLocal(L, p));
-    const clear = (x0, yA, z0, x1, yB, z1) => {
-      if (z1 > GZ - 20 && Math.min(Math.abs(x0), Math.abs(x1), x0 * x1 < 0 ? 0 : Infinity) < D.cw(SH) + 60) return false;
-      if (x1 > hb - 20 && z1 > ex[2] - 120 && z0 < ex[2] + 120) return false;
+    const clear = (lo, hi, R) => {
+      const r2 = (R || 34) * (R || 34);
       for (const p of avoidL) {
-        const dx = Math.max(x0 - p[0], 0, p[0] - x1), dy = Math.max(yA - p[1], 0, p[1] - yB), dz = Math.max(z0 - p[2], 0, p[2] - z1);
-        if (dx * dx + dy * dy + dz * dz < 34 * 34) return false;
+        const dx = Math.max(lo[0] - p[0], 0, p[0] - hi[0]), dy = Math.max(lo[1] - p[1], 0, p[1] - hi[1]), dz = Math.max(lo[2] - p[2], 0, p[2] - hi[2]);
+        if (dx * dx + dy * dy + dz * dz < r2) return false;
       }
       return true;
     };
-    for (let side = 0; side < 4; side++) for (let cl = 0; cl < 4; cl++) {
-      const along = -SKH + 60 + rng() * (2 * SKH - 120), dep = hb + 12 + rng() * (SKH - hb - 24);
-      for (let k = 0; k < 5; k++) {
-        const w = 8 + rng() * 22, d = Math.min(8 + rng() * 16, SKH - hb - 16), h = 5 + rng() * 13;
-        const a = along + (rng() - 0.5) * 80, b = Math.min(SKH - 6 - d / 2, Math.max(hb + 6 + d / 2, dep));
-        let x, z;
-        if (side === 0) { x = b; z = a; } else if (side === 1) { x = -b; z = a; } else if (side === 2) { x = a; z = -b; } else { x = a; z = b; }
-        const sx = side < 2 ? d : w, sz = side < 2 ? w : d;
-        const tone = 0.3 + rng() * 0.25, prog = rng() < 0.3 ? 2 : 4;
-        if (!clear(x - sx / 2, SH, z - sz / 2, x + sx / 2, SH + h, z + sz / 2)) continue;
-        box(x - sx / 2, SH, z - sz / 2, x + sx / 2, SH + h, z + sz / 2, tone, prog);
+    /* skirt, cornice and rib */
+    box([-SKH, 0, -SKH], [SKH, SH, SKH], 0.36, 2, true, 'skirt');
+    for (const [a, c2] of [[SH - 8, SH], [SH * 0.45, SH * 0.45 + 3]]) {
+      box([-SKH - 6, a, -SKH - 6], [SKH + 6, c2, -SKH], 0.6); box([-SKH - 6, a, SKH], [SKH + 6, c2, SKH + 6], 0.6);
+      box([-SKH - 6, a, -SKH], [-SKH, c2, SKH], 0.6); box([SKH, a, -SKH], [SKH + 6, c2, SKH], 0.6);
+    }
+    /* terraces (12 m slabs between the band below and the band above), the
+       courts carved out of them; the roof slab and parapet */
+    const carves = C.courts.map((ct) => {
+      const f = face(ct.band, ct.face), b = B[ct.band];
+      const t0 = facePt(f, ct.ua, b.y1, 2), t1 = sa(facePt(f, ct.ub, b.y1, 0), f.nh, -ct.depth);
+      return { lo: [Math.min(t0[0], t1[0]) - 0.5, b.y1 - 13, Math.min(t0[2], t1[2]) - 0.5], hi: [Math.max(t0[0], t1[0]) + 0.5, b.y1 + 1, Math.max(t0[2], t1[2]) + 0.5] };
+    });
+    B.forEach((b, k) => {
+      const ht = b.ht + 2, y = b.y1;
+      if (k + 1 < B.length) {
+        const hi = B[k + 1].hb - 20;
+        let ring = [{ lo: [-ht, y - 12, -ht], hi: [ht, y, -hi] }, { lo: [-ht, y - 12, hi], hi: [ht, y, ht] },
+          { lo: [-ht, y - 12, -hi], hi: [-hi, y, hi] }, { lo: [hi, y - 12, -hi], hi: [ht, y, hi] }];
+        for (const cv of carves) ring = ring.flatMap((r) => subtractBox(r, cv));
+        for (const r of ring) box(r.lo, r.hi, 0.5, 4, true, 'terrace');
+      } else box([-ht, y - 10, -ht], [ht, y, ht], 0.5, 4, true, 'roof');
+    });
+    {
+      const TH = B[2].ht;
+      box([-TH - 4, TOP, -TH - 4], [TH + 4, TOP + 7, -TH + 6], 0.6); box([-TH - 4, TOP, TH - 6], [TH + 4, TOP + 7, TH + 4], 0.6);
+      box([-TH - 4, TOP, -TH + 6], [-TH + 6, TOP + 7, TH - 6], 0.6); box([TH - 6, TOP, -TH + 6], [TH + 4, TOP + 7, TH - 6], 0.6);
+      /* exhaust crown: louvre banks round a well (solid for the contacts), corner piers, the well floor */
+      const cH = TH * 0.62, ch = 46;
+      L.crown = { half: cH, h: ch, y: TOP };
+      box([-cH, TOP, cH - 1], [cH, TOP + ch - 3, cH + 1], 0.55); box([-cH, TOP, -cH - 1], [cH, TOP + ch - 3, -cH + 1], 0.55);
+      box([cH - 1, TOP, -cH], [cH + 1, TOP + ch - 3, cH], 0.55); box([-cH - 1, TOP, -cH], [-cH + 1, TOP + ch - 3, cH], 0.55);
+      for (const sx of [-1, 1]) for (const sz of [-1, 1]) box([sx * cH - 8, TOP, sz * cH - 8], [sx * cH + 8, TOP + ch + 6, sz * cH + 8], 0.62);
+      box([-cH + 2, TOP, -cH + 2], [cH - 2, TOP + 4, cH - 2], 0.08);
+    }
+    /* the gate: beams with cornice and lit soffit band, the soffit over the
+       pocket behind them, the leg's base block */
+    {
+      const G = L.gate;
+      box(G.beamS.lo, G.beamS.hi, 0.42, 3, true, 'beam');
+      box([xo - 1, yT - 4, zi - 1], [xi, yT + 1, zo + 1], 0.62, 4, true, 'beam');
+      box([xo, yB - 2, zi], [xi, yB, zo], 0.3, 4, true, 'beam');
+      box(G.beamW.lo, G.beamW.hi, 0.42, 3, true, 'beam');
+      box([xo - 1, yT - 4, C.cutZ], [xw1 + 1, yT + 1, zi], 0.62, 4, true, 'beam');
+      box([xo, yB - 2, C.cutZ], [xw1, yB, zi], 0.3, 4, true, 'beam');
+      box([-(B[1].hb), C.soffitY, C.cutZ], [xi, C.soffitY + 12, B[1].hb], 0.3, 4, true, 'soffit');
+      const bw = w + 30;
+      box([cFoot[0] - bw / 2, SH, cFoot[1] - bw / 2], [cFoot[0] + bw / 2, SH + 18, cFoot[1] + bw / 2], 0.34, 4, true, 'legbase');
+    }
+    /* the forecourt: a road along the approach, vehicles, a parked row, a service block */
+    {
+      const zr = C.forecourtZ, xa = -SKH, xb = -C.cutX - 4;
+      box([xa, SH, zr - 14], [xb, SH + 0.5, zr + 14], 0.15, 4, true, 'road');
+      for (let k = 0; k < 9; k++) {
+        const x = xa + 30 + k * (xb - xa - 60) / 8 + T(-6, 6), lane = k % 2 ? -6 : 6;
+        box([x - 4, SH + 0.5, zr + lane - 1.6], [x + 4, SH + 2.6, zr + lane + 1.6], T(0.25, 0.42), 4, true, 'vehicle');
+      }
+      for (let k = 0; k < 6; k++) box([-C.cutX - 30 - k * 9, SH, C.cutZ + 8], [-C.cutX - 24 - k * 9, SH + 2.2, C.cutZ + 20], T(0.2, 0.4), 4, true, 'vehicle');
+      box([-C.cutX - 26, SH, zr + 60], [-C.cutX - 4, SH + 14, zr + 110], 0.3, 2, true, 'service');
+    }
+    /* courts: floors (band 2 and 3 courts stand on the terrace below) and bridges */
+    for (const ct of C.courts) {
+      const f = face(ct.band, ct.face), b = B[ct.band];
+      const p0 = facePt(f, ct.ua, b.y0, 0), p1 = sa(facePt(f, ct.ub, b.y0, 0), f.nh, -ct.depth);
+      if (ct.band > 0) box([Math.min(p0[0], p1[0]), b.y0 - 4, Math.min(p0[2], p1[2])], [Math.max(p0[0], p1[0]), b.y0, Math.max(p0[2], p1[2])], 0.4, 4, true, 'courtfloor');
+      if (ct.bridge) {
+        const yb2 = ct.bridge, q0 = sa(facePt(f, ct.ua, yb2, 0), f.nh, -ct.depth * 0.5), q1 = sa(facePt(f, ct.ub, yb2, 0), f.nh, -ct.depth * 0.5 + 10);
+        box([Math.min(q0[0], q1[0]), yb2, Math.min(q0[2], q1[2])], [Math.max(q0[0], q1[0]), yb2 + 7, Math.max(q0[2], q1[2])], 0.45, 3, true, 'bridge');
       }
     }
-    /* roof slab and parapet */
-    box(-TH, TOP - 10, -TH, TH, TOP, TH, 0.5);
-    box(-TH - 4, TOP, -TH - 4, TH + 4, TOP + 7, -TH + 6, 0.6);
-    box(-TH - 4, TOP, TH - 6, TH + 4, TOP + 7, TH + 4, 0.6);
-    box(-TH - 4, TOP, -TH + 6, -TH + 6, TOP + 7, TH - 6, 0.6);
-    box(TH - 6, TOP, -TH + 6, TH + 4, TOP + 7, TH - 6, 0.6);
-    /* exhaust crown: four louvre banks round a well, corner piers. The
-       banks are solid boxes for the contacts; the slats are drawn only */
-    const cH = TH * 0.62, cyH = 46;
-    L.crown = { half: cH, h: cyH, y: TOP };
-    box(-cH, TOP, cH - 1, cH, TOP + cyH - 3, cH + 1, 0.55, 4, true);
-    box(-cH, TOP, -cH - 1, cH, TOP + cyH - 3, -cH + 1, 0.55, 4, true);
-    box(cH - 1, TOP, -cH, cH + 1, TOP + cyH - 3, cH, 0.55, 4, true);
-    box(-cH - 1, TOP, -cH, -cH + 1, TOP + cyH - 3, cH, 0.55, 4, true);
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) box(sx * cH - 8, TOP, sz * cH - 8, sx * cH + 8, TOP + cyH + 6, sz * cH + 8, 0.62);
-    box(-cH + 2, TOP, -cH + 2, cH - 2, TOP + 4, cH - 2, 0.08);
+    /* cantilevered blocks with a roof lip */
+    L.cantis = [];
+    for (const ca of C.cantis) {
+      const nh = FACE_NH[ca.face], Tv = cross([0, 1, 0], nh);
+      const dIn = half(ca.band, ca.yb) - 18, dOut = half(ca.band, ca.ya) + ca.out;
+      const P = (u, d, y) => [Tv[0] * u + nh[0] * d, y, Tv[2] * u + nh[2] * d];
+      const p0 = P(ca.u0, dIn, ca.ya), p1 = P(ca.u1, dOut, ca.yb);
+      const lo = [Math.min(p0[0], p1[0]), ca.ya, Math.min(p0[2], p1[2])], hi = [Math.max(p0[0], p1[0]), ca.yb, Math.max(p0[2], p1[2])];
+      if (!clear(lo, hi)) continue;
+      box(lo, hi, 0.42, 3, true, 'canti');
+      box([lo[0] - 1, ca.yb, lo[2] - 1], [hi[0] + 1, ca.yb + 3, hi[2] + 1], 0.62, 4, true, 'canti');
+      L.cantis.push(Object.assign({ lo: lo, hi: hi }, ca));
+    }
+    /* buildings on the terraces, a few tall enough to break the skyline */
+    B.forEach((b, k) => {
+      if (k + 1 >= B.length) return;
+      const y = b.y1, inner = B[k + 1].hb + 6, outer = b.ht - 4;
+      if (outer - inner < 14) return;
+      FACE_IDS.forEach((id) => {
+        const nh = FACE_NH[id], Tv = cross([0, 1, 0], nh);
+        for (let a = -outer + 40; a < outer - 40; a += T(40, 90)) {
+          if (rng() < 0.3) continue;
+          const tall = rng() < 0.12;
+          const bw = T(14, 40), bd = Math.min(outer - inner - 4, T(10, 30)), h = tall ? T(40, 75) : T(6, 22);
+          const c = [Tv[0] * a + nh[0] * (inner + outer) / 2, Tv[2] * a + nh[2] * (inner + outer) / 2];
+          const ax = Math.abs(Tv[0]) > 0.5, sx = ax ? bw : bd, sz = ax ? bd : bw;
+          if (k === 0 && c[0] < -C.cutX + 30 && c[1] > C.cutZ - 30) continue;
+          if (C.courts.some((ct) => ct.band === k && ct.face === id && a > ct.ua - 30 && a < ct.ub + 30)) continue;
+          const lo = [c[0] - sx / 2, y, c[1] - sz / 2], hi = [c[0] + sx / 2, y + h, c[1] + sz / 2];
+          if (!clear(lo, hi)) continue;
+          box(lo, hi, T(0.3, 0.5), tall ? 3 : rng() < 0.4 ? 2 : 1, true, 'terracebldg');
+        }
+      });
+    });
+    /* the exit apron under the north portal's sill */
+    {
+      const PX = L.portalsL[1], r0 = PX.rim[0], r1 = PX.rim[1], ya = Math.min(r0[1], r1[1]);
+      const zf = Math.max(r0[2], r1[2]);
+      box([PX.E[0] - 80, ya - 6, zf - 30], [PX.E[0] + 80, ya - 2, zf], 0.4, 4, true, 'apron');
+    }
     L.boxesL = boxes;
 
     /* world boxes for the contacts, in the game's shape, plus a 2-D grid */
     const idxBase = opts.idxBase || 0;
     L.boxes = [];
-    for (let i = 0; i < boxes.length; i++) {
-      const b = boxes[i];
+    for (const b of boxes) {
       if (!b.coll) continue;
       const a = toWorld(L, b.lo), c = toWorld(L, b.hi);
       const mn = [Math.min(a[0], c[0]), a[1], Math.min(a[2], c[2])], mx = [Math.max(a[0], c[0]), c[1], Math.max(a[2], c[2])];
       L.boxes.push({ min: mn, max: mx, c: [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2],
-        half: [(mx[0] - mn[0]) / 2, (mx[1] - mn[1]) / 2, (mx[2] - mn[2]) / 2], idx: idxBase + L.boxes.length });
+        half: [(mx[0] - mn[0]) / 2, (mx[1] - mn[1]) / 2, (mx[2] - mn[2]) / 2], idx: idxBase + L.boxes.length, part: b.part });
     }
-    const G = 64, gx0 = origin[0] - SKH - 16, gz0 = origin[2] - SKH - 16, gn = Math.ceil((2 * SKH + 32) / G);
+    const Gc = 64, gx0 = origin[0] - SKH - 64, gz0 = origin[2] - SKH - 64, gn = Math.ceil((2 * SKH + 128) / Gc);
     const cells = new Array(gn * gn);
     for (let i = 0; i < cells.length; i++) cells[i] = [];
     L.boxes.forEach((b, i) => {
-      const i0 = Math.max(0, Math.floor((b.min[0] - gx0) / G)), i1 = Math.min(gn - 1, Math.floor((b.max[0] - gx0) / G));
-      const k0 = Math.max(0, Math.floor((b.min[2] - gz0) / G)), k1 = Math.min(gn - 1, Math.floor((b.max[2] - gz0) / G));
+      const i0 = Math.max(0, Math.floor((b.min[0] - gx0) / Gc)), i1 = Math.min(gn - 1, Math.floor((b.max[0] - gx0) / Gc));
+      const k0 = Math.max(0, Math.floor((b.min[2] - gz0) / Gc)), k1 = Math.min(gn - 1, Math.floor((b.max[2] - gz0) / Gc));
       for (let k = k0; k <= k1; k++) for (let j = i0; j <= i1; j++) cells[k * gn + j].push(i);
     });
-    L._grid = { G: G, x0: gx0, z0: gz0, n: gn, cells: cells, stamp: new Uint32Array(L.boxes.length), tick: 0 };
+    L._grid = { G: Gc, x0: gx0, z0: gz0, n: gn, cells: cells, stamp: new Uint32Array(L.boxes.length), tick: 0 };
 
-    /* detail layer: face-local boxes, one instanced draw per kind. First
-       kind: ledges every ten storeys across the window fields */
+    /* detail layers: face-local boxes and local AABBs, one instanced draw per kind */
     L.details = [];
-    const bandY = C.bands.map((b) => y0 + b * (TOP - y0));
-    for (let k = 0; k < 4; k++) {
-      for (let y = y0 + 36; y < TOP - 30; y += 36) {
-        if (bandY.some((b) => Math.abs(y - b) < 12)) continue;
-        const h = D.half(y), cols = [-h + C.cornerW, ...C.fins.map((f) => f * TH), h - C.cornerW];
-        for (let j = 0; j + 1 < cols.length; j++) {
-          const a = cols[j] + (j > 0 ? C.finW / 2 : 0), b = cols[j + 1] - (j + 1 < cols.length - 1 ? C.finW / 2 : 0);
-          if (b - a > 20) L.details.push({ face: k, kind: 'ledge', u: (a + b) / 2, y: y, w: b - a - 4, h: 0.8, d: 1.2 });
-        }
+    for (const f of L.faces) {
+      const b = B[f.band], ym = (b.y0 + b.y1) / 2 + C.ledgeH;
+      /* planters on the mid ledge */
+      for (let u = -half(f.band, ym) + 40; u < half(f.band, ym) - 40; u += T(10, 20)) {
+        if (rng() < 0.4) continue;
+        L.details.push({ kind: 'planter', band: f.band, face: f.j, u: u, y: ym + 1, w: T(4, 8), h: T(1.2, 3), d: 2.5, out: T(2.5, 5.5) });
       }
+      /* intake grilles in pairs at a quarter height */
+      const yg = b.y0 + (b.y1 - b.y0) * 0.27;
+      for (const u of [-0.5 * b.ht, 0.55 * b.ht]) L.details.push({ kind: 'grille', band: f.band, face: f.j, u: u, y: yg, w: 18, h: 12, d: 1.2, out: 0.6 });
     }
-    /* details must not sit in a hole */
-    L.details = L.details.filter((dt) => !inHoleUV(L, dt.face, dt.u - dt.w / 2, dt.y) && !inHoleUV(L, dt.face, dt.u + dt.w / 2, dt.y) && !inHoleUV(L, dt.face, dt.u, dt.y));
+    L.details = L.details.filter((dt) => !inHoleUV(L, dt.band * 4 + dt.face, dt.u - dt.w / 2, dt.y) && !inHoleUV(L, dt.band * 4 + dt.face, dt.u + dt.w / 2, dt.y));
+    /* lamp posts along the forecourt road; plant rows on the skirt top */
+    for (let x = -SKH + 10; x < -C.cutX - 4; x += 22) for (const o2 of [-22, 22]) L.details.push({ kind: 'lamp', lo: [x - 0.5, SH, C.forecourtZ + o2 - 0.5], hi: [x + 0.5, SH + 12, C.forecourtZ + o2 + 0.5] });
+    for (const side of [[1, 0], [0, -1]]) for (let k = 0; k < 14; k++) {
+      const a = -SKH + 60 + k * 80, dep = B[0].hb + 20 + (k % 2) * 22;
+      const cx = side[0] ? dep : a, cz = side[0] ? a : -dep;
+      if (side[0] === 0 && Math.abs(cx - L.portalsL[1].E[0]) < 120) continue;
+      L.details.push({ kind: 'plant', lo: [cx - 8, SH, cz - 8], hi: [cx + 8, SH + 6, cz + 8] });
+    }
 
-    /* bounds, reserved region, fit */
-    const P = C.plaza;
-    const r0 = toWorld(L, [-SKH - P, 0, -SKH - P]), r1 = toWorld(L, [SKH + P, 0, SKH + P]);
-    L.reserved = { min: [Math.min(r0[0], r1[0]), 0, Math.min(r0[2], r1[2])], max: [Math.max(r0[0], r1[0]), 4000, Math.max(r0[2], r1[2])] };
-    const b0 = toWorld(L, [-SKH - 8, 0, -SKH - 8]), b1 = toWorld(L, [SKH + 8, 0, SKH + 8]);
-    L._bounds = { min: [Math.min(b0[0], b1[0]), 0, Math.min(b0[2], b1[2])], max: [Math.max(b0[0], b1[0]), origin[1] + TOP + cyH + 8, Math.max(b0[2], b1[2])] };
-    L.entryDir = dirWorld(L, [0, 0, -1]);
-    L.exitDir = dirWorld(L, [1, 0, 0]);
-    L.fit = fitCheck(L);
+    /* bounds, reserved region, campus hint, fit, the contact record */
+    const P0 = C.plaza;
+    const r0w = toWorld(L, [-SKH - P0[0], 0, -SKH - P0[2]]), r1w = toWorld(L, [SKH + P0[1], 0, SKH + P0[3]]);
+    L.reserved = { min: [Math.min(r0w[0], r1w[0]), 0, Math.min(r0w[2], r1w[2])], max: [Math.max(r0w[0], r1w[0]), 4000, Math.max(r0w[2], r1w[2])] };
+    const b0w = toWorld(L, [-SKH - 8, 0, -SKH - 8]), b1w = toWorld(L, [SKH + 8, 0, SKH + 8]);
+    L._bounds = { min: [Math.min(b0w[0], b1w[0]), 0, Math.min(b0w[2], b1w[2])], max: [Math.max(b0w[0], b1w[0]), origin[1] + TOP + 60, Math.max(b0w[2], b1w[2])] };
+    L.entryDir = dirWorld(L, [1, 0, 0]);
+    L.exitDir = dirWorld(L, [0, 0, -1]);
     L._k = makeContactK(L);
+    L.fit = fitCheck(L);
+    const ft = flythrough(L);
+    const wps = ft.waypoints, fpw = toWorld(L, [-SKH, 0, -SKH]), fpw2 = toWorld(L, [SKH, 0, SKH]);
+    L.campus = {
+      footprint: { min: [Math.min(fpw[0], fpw2[0]), 0, Math.min(fpw[2], fpw2[2])], max: [Math.max(fpw[0], fpw2[0]), SH, Math.max(fpw[2], fpw2[2])] },
+      reserved: L.reserved,
+      /* the plaza side: south of the building in local terms, the side with the widest margin */
+      plazaSide: dirWorld(L, [0, 0, 1]),
+      /* where the corner cut opens (south-west, unit) */
+      cutSide: dirWorld(L, [-Math.SQRT1_2, 0, Math.SQRT1_2]),
+      /* corridors the campus keeps free: the approach along the cut, the leave leg */
+      approachLegs: [
+        { a: wps[0].p.slice(), b: wps[1].p.slice(), width: 160, y: [SH, wps[0].p[1] + 80], kind: 'approach' },
+        { a: wps[wps.length - 2].p.slice(), b: wps[wps.length - 1].p.slice(), width: 160, y: [SH, wps[0].p[1] + 80], kind: 'leave' }
+      ]
+    };
     return L;
   }
 
-  /* (u, y) inside one of the face's holes? (for the details) */
-  function inHoleUV(L, k, u, y) {
-    const D = L.dims, id = L.faces[k].id;
-    for (const h of L.holes[id]) {
-      if (y < h.ya || y > h.yb) continue;
-      if (h.notch) { if (Math.abs(u) < D.cw(y) + 6) return true; continue; }
-      const f = (y - h.ya) / (h.yb - h.ya), uL = h.uL[0] + (h.uL[1] - h.uL[0]) * f, uR = h.uR[0] + (h.uR[1] - h.uR[0]) * f;
+  /* (u, y) on face index fi inside one of its holes (plus 6 m)? */
+  function inHoleUV(L, fi, u, y) {
+    for (const h of L.faces[fi].holes) {
+      if (y < h.ya - 6 || y > h.yb + 6) continue;
+      const fr = Math.min(1, Math.max(0, (y - h.ya) / (h.yb - h.ya)));
+      const uL = h.uL[0] + (h.uL[1] - h.uL[0]) * fr, uR = h.uR[0] + (h.uR[1] - h.uR[0]) * fr;
       if (u > uL - 6 && u < uR + 6) return true;
     }
     return false;
   }
 
-  /* Fit check: the smallest perpendicular distance from a fitHalf square
-     around the duct centre line (in the duct's N/B frame, sampled every 4 m)
-     to the face planes, the roof and the notch, away from the two mouths
-     (where the reveals cut through on purpose). */
+  /* Fit check: the smallest margin of a fitHalf square around the duct
+     centre line (duct N/B frame, every 4 m, away from both mouths) to the
+     shell's surfaces: the band planes, terrace ceilings, air regions and
+     the leg (lower bounds of the distance). */
   function fitCheck(L) {
-    const S = needShaft(), C = L.cfg, D = L.dims, sh = L.duct, h = C.fitHalf;
+    const S = needShaft(), C = L.cfg, sh = L.duct, h = C.fitHalf, K = L._k;
     let worst = { m: Infinity, s: 0 };
-    for (let s = C.gateD + 60; s <= sh.length - 70; s += 4) {
+    for (let s = C.gateD + 70; s <= sh.length - 70; s += 4) {
       const f = S.frameAt(sh, s);
       for (const a of [-h, 0, h]) for (const b of [-h, 0, h]) {
         const p = toLocal(L, [f.p[0] + f.N[0] * a, f.p[1] + b, f.p[2] + f.N[2] * a]);
-        let m = D.TOP - p[1];
-        for (const fc of L.faces) m = Math.min(m, fc.d - dot(fc.n, p));
-        if (p[2] > D.GZ - 1 && Math.abs(p[0]) < D.cw(p[1]) + 1) m = -1;
-        if (m < worst.m) worst = { m: m, s: s };
+        const m = shellMargin(K, p[0], p[1], p[2]);
+        if (m < worst.m) worst = { m: m, s: s, p: p.map(Math.round) };
       }
     }
     return worst;
@@ -371,28 +542,43 @@
 
   /* ---- contacts -------------------------------------------------------------
      The hot path reads one flat record (L._k, built once by makeContactK)
-     instead of the layout, so every access is a fixed-shape load. */
+     instead of the layout, and the current point from a Float64Array: the
+     hot functions are too big to inline, and a double passed to a call that
+     is not inlined gets boxed. */
+  const AIR_ROWS = 6;
   function makeContactK(L) {
-    const D = L.dims, C = L.cfg, R = globalThis.Shaft.RECT;
+    const C = L.cfg, B = L.bands, R = globalThis.Shaft.RECT, G = L.gate;
     const port = (P) => ({ ex: P.E[0], ey: P.E[1], ez: P.E[2], ox: P.o[0], oz: P.o[2], nx: P.N[0], nz: P.N[2],
       plate: P.plate, hw: P.hw, hh: P.hh, sp: P.splay, skip: P.skip, onx: P.outer.n[0], ony: P.outer.n[1], onz: P.outer.n[2], od: P.outer.d });
-    const slabRows = (k) => {
-      const list = L.slabs.filter((s) => s.face === k), a = new Float64Array(list.length * 6);
-      list.forEach((s, i) => { a.set([s.kind === 'fin' ? 0 : s.kind === 'corner' ? 1 : 2, s.u || 0, s.w || 0, s.d, s.y0, s.y1], i * 6); });
+    const planes = new Float64Array(48), band = new Float64Array(B.length * 6), TT = new Float64Array(8);
+    L.faces.forEach((f, i) => planes.set([f.n[0], f.n[1], f.n[2], f.d], i * 4));
+    B.forEach((b, k) => band.set([b.y0, b.y1, b.next, b.c, b.hb, b.q], k * 6));
+    for (let j = 0; j < 4; j++) { const f = L.faces[j]; TT[j * 2] = f.T[0]; TT[j * 2 + 1] = f.T[2]; }
+    const na = L.air.length, air = new Float64Array(na * AIR_ROWS * 4), airN = new Int32Array(na), airInfo = new Float64Array(na * 5);
+    L.air.forEach((a, i) => {
+      airN[i] = a.rows.length;
+      a.rows.forEach((r, q) => air.set([r.n[0], r.n[1], r.n[2], r.d], (i * AIR_ROWS + q) * 4));
+      airInfo.set(a.kind === 'court' ? [1, a.band, a.face, a.court.ua, a.court.ub] : [0, -1, -1, 0, 0], i * 5);
+    });
+    const slabs = L.faces.map((f, fi) => {
+      const list = L.slabs.filter((s) => s.band * 4 + s.face === fi), a = new Float64Array(list.length * 6);
+      list.forEach((s, i) => a.set([s.kind === 'fin' ? 0 : s.kind === 'corner' ? 1 : 2, s.u || 0, s.w || 0, s.d, s.y0, s.y1], i * 6));
       return a;
-    };
-    const nf = L.notchSlabs.filter((s) => s.kind === 'nfin'), nfa = new Float64Array(nf.length * 4);
-    nf.forEach((s, i) => nfa.set([s.sx, s.z0, s.z1, s.d], i * 4));
-    const fa = new Float64Array(20);
-    L.faces.forEach((f, k) => fa.set([f.n[0], f.n[1], f.n[2], f.T[0], f.T[2]], k * 5));
+    });
+    const leg = new Float64Array(16);
+    G.leg.planes.forEach((p, i) => leg.set([p.n[0], p.n[1], p.n[2], p.d], i * 4));
+    const allAir = new Int32Array(na);
+    for (let i = 0; i < na; i++) allAir[i] = i;
     return {
-      y0: D.y0, top: D.TOP, lim: C.hb + 16, iq: 1 / D.q, c: D.c, cq: D.c / D.q, dF: D.dFace, GZ: D.GZ, CW: D.CW, cc: D.cc,
-      iqc: 1 / D.qc, qs: D.qs, iqs: 1 / D.qs, notchTop: D.notchTop, cornerD: C.cornerD, cap: C.cap, wallT: C.wallT,
-      pilD: C.pilasterD, pilW: C.pilasterW, nfD: C.notchFinD, hb: C.hb, cz: L.cy, sz: L.sy,
-      ox: L.origin[0], oy: L.origin[1], oz: L.origin[2],
+      y0: C.skirtH, top: L.dims.TOP, lim: C.skirtHalf + 20, nb: B.length, by1a: B[0].y1, by1b: B[1].y1,
+      planes: planes, band: band, TT: TT, air: air, airN: airN, airInfo: airInfo, na: na, allAir: allAir,
+      leg: leg, legY0: G.leg.y0, legY1: G.leg.y1,
+      slabs: slabs, slabMax: L.slabMax, cutX: C.cutX, cutZ: C.cutZ, cap: C.cap, wallT: C.wallT, iqs: 1 / Math.hypot(1, C.splay), qs: Math.hypot(1, C.splay),
+      fkeys: L.faces.map((f) => 'pyr' + f.id + (f.band + 1)),
+      cz: L.cy, sz: L.sy, ox: L.origin[0], oy: L.origin[1], oz: L.origin[2],
       bx0: L._bounds.min[0], bx1: L._bounds.max[0], bz0: L._bounds.min[2], bz1: L._bounds.max[2], by1: L._bounds.max[1],
       ra: R.a, rb: R.b, rc: R.a + R.b - R.c,
-      pe: port(L.portalsL[0]), px: port(L.portalsL[1]), nfins: nfa, faces: fa, slabs: [0, 1, 2, 3].map(slabRows)
+      pe: port(L.portalsL[0]), px: port(L.portalsL[1])
     };
   }
   const SQ12 = Math.SQRT1_2;
@@ -402,45 +588,33 @@
     const a = au - K.ra, b = av - K.rb, c = (au + av - K.rc) * SQ12;
     return a > b ? (a > c ? a : c) : (b > c ? b : c);
   }
-  const _c = { pen: 0, n0: 0, n1: 0, n2: 0, key: '' };
-  /* the current point (local x, y, z, and h for the slabs): the hot
-     functions are too big to inline, and a double passed to a call that is
-     not inlined gets boxed, so they read it from here instead */
   const PT = new Float64Array(4);
-  /* what a hull can reach, decided once per hull from its bounding sphere:
-     faces (as exits or for their slabs), the roof, the notch, each portal,
-     and per face the slabs (row offsets) it can touch */
-  const _h = { f0: false, f1: false, f2: false, f3: false, top: false, notch: false, pe: false, px: false,
-    sl: [new Int32Array(16), new Int32Array(16), new Int32Array(16), new Int32Array(16)], ns: new Int32Array(4) };
-  function hullScope(K, x, y, z, rh) {
-    const iq = K.iq, cyq = K.cq * y - K.dF, lo = -(K.cap + rh + 1), hi = K.cornerD + rh + 1;
-    const d = [z * iq + cyq, x * iq + cyq, -z * iq + cyq, -x * iq + cyq];
-    _h.f0 = d[0] > lo && d[0] < hi; _h.f1 = d[1] > lo && d[1] < hi; _h.f2 = d[2] > lo && d[2] < hi; _h.f3 = d[3] > lo && d[3] < hi;
-    _h.top = y - K.top > lo;
-    const cw = K.CW + K.cc * y, ax = x < 0 ? -x : x;
-    _h.notch = y - rh < K.notchTop && (ax - cw - K.cc * rh) * K.iqc < K.cap + rh + 2 && z + rh > K.GZ - K.cap - 2;
-    const pr = (P) => (x - P.ex) * P.ox + (z - P.ez) * P.oz + rh >= -(Math.max(40, P.skip) + 1);
-    _h.pe = pr(K.pe); _h.px = pr(K.px);
-    for (let k = 0; k < 4; k++) {
-      const F = K.faces, o = k * 5, S = K.slabs[k], out = _h.sl[k];
-      let n = 0;
-      if (d[k] > -rh - 1 && d[k] < hi) {
-        const u = x * F[o + 3] + z * F[o + 4], au = u < 0 ? -u : u, hy = K.hb - (y - K.y0) * K.c;
-        for (let i = 0; i < S.length; i += 6) {
-          if (y + rh < S[i + 4] || y - rh > S[i + 5]) continue;
-          const kind = S[i];
-          if (kind === 0 && Math.abs(u - S[i + 1]) > S[i + 2] / 2 + rh + 1) continue;
-          if (kind === 1 && au < hy - S[i + 2] - rh - 2 * K.cornerD) continue;
-          out[n++] = i;
-        }
-      }
-      _h.ns[k] = n;
-    }
-  }
+  const _c = { pen: 0, n0: 0, n1: 0, n2: 0, key: '' };
   function set(pen, n0, n1, n2, key) {
     if (pen < _c.pen) { _c.pen = pen; _c.n0 = n0; _c.n1 = n1; _c.n2 = n2; _c.key = key; }
   }
-  /* reveal air: inside the prism, and (bounded) inside its outer plane */
+  /* what a hull can reach, decided once per hull from its bounding sphere */
+  const _h = { leg: false, pe: false, px: false, air: new Int32Array(32), na: 0, sl: [], ns: new Int32Array(12),
+    mv: new Float64Array(32), mq: new Int32Array(32) };
+  for (let i = 0; i < 12; i++) _h.sl.push(new Int32Array(16));
+  function bandOf(K, y) { return y < K.by1a ? 0 : y < K.by1b ? 1 : 2; }
+  /* largest violated row of air region i at (x, y, z); the row in _h.mq[slot] */
+  function airViol(K, i, x, y, z, slot) {
+    const A = K.air, n = K.airN[i];
+    let m = -Infinity, arg = 0;
+    for (let q = 0; q < n; q++) {
+      const o = (i * AIR_ROWS + q) * 4, v = A[o] * x + A[o + 1] * y + A[o + 2] * z - A[o + 3];
+      if (v > m) { m = v; arg = q; }
+    }
+    if (slot >= 0) _h.mq[slot] = arg;
+    return m;
+  }
+  function legViol(K, x, y, z) {
+    const G = K.leg;
+    let m = Math.max(K.legY0 - y, y - K.legY1);
+    for (let q = 0; q < 16; q += 4) { const v = G[q] * x + G[q + 1] * y + G[q + 2] * z - G[q + 3]; if (v > m) m = v; }
+    return m;
+  }
   function revealAir(P, bounded) {
     const x = PT[0], y = PT[1], z = PT[2];
     const ex = x - P.ex, ey = y - P.ey, ez = z - P.ez;
@@ -450,8 +624,8 @@
     if ((u < 0 ? -u : u) > P.hw + w || (ey < 0 ? -ey : ey) > P.hh + w) return false;
     return !bounded || x * P.onx + y * P.ony + z * P.onz <= P.od;
   }
-  /* a point in the frustum near one portal: in its reveal, its plate's
-     hole, or the duct's wall band near the mouth (the shaft's business) */
+  /* a point in the shell near one portal: in its reveal, its plate's hole,
+     or the duct's wall band near the mouth (the shaft's business) */
   function portalAir(K, P) {
     const x = PT[0], y = PT[1], z = PT[2];
     const ex = x - P.ex, ey = y - P.ey, ez = z - P.ez;
@@ -471,6 +645,9 @@
     const t = a - P.plate, u = ex * P.nx + ez * P.nz, iqs = K.iqs, sp = P.sp;
     const au = u < 0 ? -u : u, av = ey < 0 ? -ey : ey;
     const gu = (au - P.hw - sp * t) * iqs, gv = (av - P.hh - sp * t) * iqs, gt = -t;
+    /* beyond the outer plane the reveal is not the way out */
+    const go = x * P.onx + y * P.ony + z * P.onz - P.od;
+    if (go > 0 && go >= gu && go >= gv && go >= gt) return;
     if (gt >= gu && gt >= gv) set(gt, P.ox, 0, P.oz, key);
     else if (gu >= gv) { const sg = u < 0 ? -1 : 1; set(gu, (-sg * P.nx + sp * P.ox) * iqs, 0, (-sg * P.nz + sp * P.oz) * iqs, key); }
     else { const sg = ey < 0 ? -1 : 1; set(gv, sp * P.ox * iqs, -sg * iqs, sp * P.oz * iqs, key); }
@@ -482,79 +659,85 @@
       }
     }
   }
-  /* one local point; fills _c and returns true if it is in contact */
+  /* the shell's exits for a point inside band k and in no air region:
+     faces, ceiling, air regions in _h, portals in _h. Fills _c. */
+  function shellExits(K, k, x, y, z, v) {
+    const Pp = K.planes, o = k * 16;
+    for (let j = 0; j < 4; j++) set(-v[j], Pp[o + j * 4], Pp[o + j * 4 + 1], Pp[o + j * 4 + 2], K.fkeys[k * 4 + j]);
+    const bd = K.band, b = k * 6, ax = x < 0 ? -x : x, az = z < 0 ? -z : z;
+    if (k + 1 < K.nb) { if ((ax > az ? ax : az) > bd[b + 2]) set(bd[b + 1] - y, 0, 1, 0, 'pyrTerrace'); }
+    else set(K.top - y, 0, 1, 0, 'pyrRoof');
+    const A = K.air;
+    for (let s = 0; s < _h.na; s++) {
+      const i = _h.air[s], q = _h.mq[s], ro = (i * AIR_ROWS + q) * 4;
+      set(_h.mv[s], -A[ro], -A[ro + 1], -A[ro + 2], K.airInfo[i * 5] ? 'pyrCourt' : 'pyrCut');
+    }
+    if (_h.pe) portalCand(K, K.pe, 'pyrRevE');
+    if (_h.px) portalCand(K, K.px, 'pyrRevX');
+  }
+  const _v = new Float64Array(4);
+  /* one local point (PT); fills _c and returns true if it is in contact */
   function pointLocal(K) {
     const x = PT[0], y = PT[1], z = PT[2];
     if (y < K.y0 || y > K.top + 1) return false;
     const lim = K.lim;
     if (x > lim || x < -lim || z > lim || z < -lim) return false;
-    const iq = K.iq, cyq = K.cq * y - K.dF, H = _h, NEG = -1e9;
-    /* a face out of the hull's scope is more than cap behind every point */
-    const dS = H.f0 ? z * iq + cyq : NEG, dE = H.f1 ? x * iq + cyq : NEG, dN = H.f2 ? -z * iq + cyq : NEG, dW = H.f3 ? -x * iq + cyq : NEG;
-    const dT = H.top ? y - K.top : NEG;
-    let m = dS > dE ? dS : dE;
-    if (dN > m) m = dN;
-    if (dW > m) m = dW;
-    if (dT > m) m = dT;
-    const cw = K.CW + K.cc * y, ax = x < 0 ? -x : x;
-    const inNotch = H.notch && z > K.GZ && ax < cw;
     _c.pen = Infinity;
+    /* the leg: a convex prism, out through its nearest side */
+    if (_h.leg && y > K.legY0 && y < K.legY1) {
+      const G = K.leg;
+      let inside = true;
+      for (let q = 0; q < 16; q += 4) { const vv = G[q] * x + G[q + 1] * y + G[q + 2] * z - G[q + 3]; _v[q >> 2] = vv; if (vv >= 0) inside = false; }
+      if (inside) {
+        for (let q = 0; q < 4; q++) set(-_v[q], G[q * 4], G[q * 4 + 1], G[q * 4 + 2], 'pyrLeg');
+        return true;
+      }
+    }
+    const k = bandOf(K, y), Pp = K.planes, o = k * 16;
+    let m = -Infinity;
+    for (let j = 0; j < 4; j++) { const vv = Pp[o + j * 4] * x + Pp[o + j * 4 + 1] * y + Pp[o + j * 4 + 2] * z - Pp[o + j * 4 + 3]; _v[j] = vv; if (vv > m) m = vv; }
     if (m > 0) {
-      /* outside the frustum: slabs on the faces within reach */
-      if (m > K.cornerD + 1 || dT > 0) return false;
-      const cd = K.cornerD;
-      if (dS > 0 && dS < cd && !inNotch) (PT[3] = dS, slabFace(K, 0));
-      if (dE > 0 && dE < cd && (!H.px || !revealAir(K.px, false))) (PT[3] = dE, slabFace(K, 1));
-      if (dN > 0 && dN < cd) (PT[3] = dN, slabFace(K, 2));
-      if (dW > 0 && dW < cd) (PT[3] = dW, slabFace(K, 3));
-      return _c.pen < Infinity;
-    }
-    if (inNotch) {
-      /* notch air, but the fins on its walls and the gate's pilasters */
-      if (y > K.notchTop) return false;
-      const iqc = K.iqc, nf = K.nfins, cc = K.cc;
-      for (let i = 0; i < nf.length; i += 4) {
-        const sx = nf[i], z0 = nf[i + 1], z1 = nf[i + 2], d = nf[i + 3];
-        const h = (cw - sx * x) * iqc;
-        if (h >= d || z <= z0 || z >= z1) continue;
-        const pO = d - h, pA = z - z0, pB = z1 - z;
-        if (pO <= pA && pO <= pB) set(pO, -sx * iqc, cc * iqc, 0, 'pyrNotch');
-        else if (pA < pB) set(pA, 0, 0, -1, 'pyrNotch'); else set(pB, 0, 0, 1, 'pyrNotch');
-      }
-      const pz = K.pilD - (z - K.GZ);
-      if (pz > 0) {
-        const sx = x < 0 ? -1 : 1, h = (cw - ax) * iqc;
-        if (h < K.pilW) { const px = K.pilW - h; if (pz <= px) set(pz, 0, 0, 1, 'pyrGate'); else set(px, -sx * iqc, cc * iqc, 0, 'pyrGate'); }
+      /* outside the band: slabs on the faces within reach */
+      if (m > K.slabMax + 1 || y > K.top) return false;
+      for (let j = 0; j < 4; j++) {
+        const h = _v[j];
+        if (h <= 0 || h >= K.slabMax || slabMasked(K, k, j, x, z)) continue;
+        PT[3] = h;
+        slabFace(K, k * 4 + j);
       }
       return _c.pen < Infinity;
     }
-    if ((H.pe && portalAir(K, K.pe)) || (H.px && portalAir(K, K.px))) return false;
-    /* in the shell: the cheapest exit */
-    const cq = K.cq;
-    if (H.f0) set(-dS, 0, cq, iq, 'pyrS');
-    if (H.f1) set(-dE, iq, cq, 0, 'pyrE');
-    if (H.f2) set(-dN, 0, cq, -iq, 'pyrN');
-    if (H.f3) set(-dW, -iq, cq, 0, 'pyrW');
-    if (H.top) set(-dT, 0, 1, 0, 'pyrRoof');
-    if (H.notch && y < K.notchTop) {
-      const iqc = K.iqc, g1 = (x - cw) * iqc, g2 = (-x - cw) * iqc, g3 = K.GZ - z;
-      if (g3 >= g1 && g3 >= g2) set(g3, 0, 0, 1, 'pyrGate');
-      else if (g1 >= g2) set(g1, -iqc, K.cc * iqc, 0, 'pyrNotch');
-      else set(g2, iqc, K.cc * iqc, 0, 'pyrNotch');
+    /* inside the band: open air? */
+    for (let s = 0; s < _h.na; s++) {
+      const mv = airViol(K, _h.air[s], x, y, z, s);
+      if (mv <= 0) return false;
+      _h.mv[s] = mv;
     }
-    if (H.pe) portalCand(K, K.pe, 'pyrRevE');
-    if (H.px) portalCand(K, K.px, 'pyrRevX');
+    if ((_h.pe && portalAir(K, K.pe)) || (_h.px && portalAir(K, K.px))) return false;
+    shellExits(K, k, x, y, z, _v);
     return _c.pen <= K.cap;
   }
-  /* slabs on face k for a point h metres outside it */
-  function slabFace(K, k) {
-    const h = PT[3];
-    const x = PT[0], y = PT[1], z = PT[2];
-    const F = K.faces, o = k * 5, n0 = F[o], n1 = F[o + 1], n2 = F[o + 2], T0 = F[o + 3], T2 = F[o + 4];
-    const u = x * T0 + z * T2, au = u < 0 ? -u : u, hy = K.hb - (y - h * n1 - K.y0) * K.c;
-    const S = K.slabs[k], idx = _h.sl[k], ns = _h.ns[k];
-    for (let j = 0; j < ns; j++) {
-      const i = idx[j], kind = S[i], d = S[i + 3];
+  /* no slabs where the face is cut away: the corner cut, courts, the exit */
+  function slabMasked(K, k, j, x, z) {
+    const u = x * K.TT[j * 2] + z * K.TT[j * 2 + 1];
+    if (k === 0 && ((j === 0 && u < -K.cutX) || (j === 3 && u > K.cutZ))) return true;
+    const I = K.airInfo;
+    for (let s = 0; s < _h.na; s++) {
+      const i = _h.air[s] * 5;
+      if (I[i] === 1 && I[i + 1] === k && I[i + 2] === j && u > I[i + 3] && u < I[i + 4]) return true;
+    }
+    if (k === 0 && j === 2 && _h.px && revealAir(K.px, false)) return true;
+    return false;
+  }
+  /* slabs on face fi for a point PT[3] metres outside it */
+  function slabFace(K, fi) {
+    const x = PT[0], y = PT[1], z = PT[2], h = PT[3];
+    const Pp = K.planes, o = fi * 4, n0 = Pp[o], n1 = Pp[o + 1], n2 = Pp[o + 2];
+    const j = fi & 3, T0 = K.TT[j * 2], T2 = K.TT[j * 2 + 1], b = (fi >> 2) * 6, bd = K.band;
+    const u = x * T0 + z * T2, au = u < 0 ? -u : u, hy = bd[b + 4] - (y - h * n1 - bd[b]) * bd[b + 3];
+    const S = K.slabs[fi], idx = _h.sl[fi], ns = _h.ns[fi];
+    for (let jj = 0; jj < ns; jj++) {
+      const i = idx[jj], kind = S[i], d = S[i + 3];
       if (h >= d || y < S[i + 4] || y > S[i + 5]) continue;
       const pO = d - h;
       if (kind === 0) {
@@ -571,41 +754,103 @@
     }
   }
 
-  /* Can a sphere (local centre x, y, z, radius rh) touch nothing? The
-     hull-level gate: the whole hull outside the faces, in the open notch,
-     in a reveal, or deep in the shell (the duct), each with rh to spare. */
-  function hullFree(K, x, y, z, rh) {
+  /* Decide, once per hull (local centre, radius rh), what it can reach, into
+     _h. Returns true if it can reach nothing: outside every band with room
+     to spare, deep in the shell (the duct), or inside an air region with
+     nothing solid in it near. */
+  function hullScope(K, x, y, z, rh) {
     if (y + rh < K.y0 || y - rh > K.top + 1) return true;
-    const iq = K.iq, cyq = K.cq * y - K.dF;
-    const m = Math.max(z * iq + cyq, x * iq + cyq, -z * iq + cyq, -x * iq + cyq, y - K.top);
-    if (m - rh > K.cornerD + 1) return true;
-    const cw = K.CW + K.cc * y, ax = x < 0 ? -x : x;
-    if (z - K.GZ > K.pilD + rh + 1 && (cw - ax - K.cc * rh) * K.iqc > K.nfD + rh + 1) return true;
-    const qs = K.qs;
+    const cap = K.cap, r1 = rh + 1;
+    _h.leg = legViol(K, x, y, z) < r1;
+    for (let i = 0; i < 12; i++) _h.ns[i] = 0;
+    const kLo = bandOf(K, Math.max(K.y0, y - rh)), kHi = bandOf(K, Math.min(K.top, y + rh));
+    let near = false, deep = true;
+    const Pp = K.planes, bd = K.band, ax = x < 0 ? -x : x, az = z < 0 ? -z : z, r = ax > az ? ax : az;
+    for (let k = kLo; k <= kHi; k++) {
+      let m = -Infinity;
+      for (let j = 0; j < 4; j++) {
+        const o = (k * 4 + j) * 4, v = Pp[o] * x + Pp[o + 1] * y + Pp[o + 2] * z - Pp[o + 3];
+        if (v > m) m = v;
+        if (v > -r1 && v < K.slabMax + r1) {
+          /* the slabs of this face the sphere can touch */
+          const fi = k * 4 + j, S = K.slabs[fi], out = _h.sl[fi], b = k * 6;
+          const u = x * K.TT[j * 2] + z * K.TT[j * 2 + 1], au = u < 0 ? -u : u, hy = bd[b + 4] - (y - bd[b]) * bd[b + 3];
+          let n = 0;
+          for (let i = 0; i < S.length; i += 6) {
+            if (y + rh < S[i + 4] || y - rh > S[i + 5]) continue;
+            if (S[i] === 0 && Math.abs(u - S[i + 1]) > S[i + 2] / 2 + r1) continue;
+            if (S[i] === 1 && au < hy - S[i + 2] - r1 - 2 * K.slabMax) continue;
+            out[n++] = i;
+          }
+          _h.ns[fi] = n;
+        }
+      }
+      if (m < K.slabMax + r1) near = true;
+      if (m > -(cap + r1)) deep = false;
+      const ceil = k + 1 < K.nb ? (r > bd[k * 6 + 2] - r1 ? bd[k * 6 + 1] - y : Infinity) : K.top - y;
+      if (ceil < cap + r1) deep = false;
+    }
+    if (!near && !_h.leg) return true;
+    _h.na = 0;
+    let inAir = false;
+    for (let i = 0; i < K.na; i++) {
+      const mv = airViol(K, i, x, y, z, -1);
+      if (mv < cap + r1) { _h.air[_h.na++] = i; if (mv < -r1) inAir = true; }
+    }
+    /* a portal matters within its skip zone behind the mouth, up to its
+       outer plane, and laterally within reach of its reveal */
+    const pr = (P) => {
+      const ex = x - P.ex, ez = z - P.ez, a = ex * P.ox + ez * P.oz;
+      if (a + rh < -(Math.max(40, P.skip) + 1)) return false;
+      if (x * P.onx + y * P.ony + z * P.onz - P.od > rh + K.slabMax + 1) return false;
+      const t = Math.max(0, a - P.plate), u = Math.abs(ex * P.nx + ez * P.nz), v = Math.abs(y - P.ey);
+      return u - P.hw - P.sp * t < cap + r1 + 30 && v - P.hh - P.sp * t < cap + r1 + 30;
+    };
+    _h.pe = pr(K.pe); _h.px = pr(K.px);
+    if (deep && !_h.leg && _h.na === 0 && !_h.pe && !_h.px) return true;
+    /* every point in an open-air region: only the leg is solid in there
+       (slabs are masked in front of courts and the cut) */
+    if (inAir && !_h.leg) return true;
+    /* every point in a reveal */
     for (let i = 0; i < 2; i++) {
       const P = i ? K.px : K.pe, ex = x - P.ex, ey = y - P.ey, ez = z - P.ez;
       const t = ex * P.ox + ez * P.oz - P.plate, u = ex * P.nx + ez * P.nz;
-      if (t > rh && Math.abs(u) + rh * qs < P.hw + P.sp * (t - rh) && Math.abs(ey) + rh * qs < P.hh + P.sp * (t - rh) &&
-        (i === 1 || z + rh < K.GZ + 40)) return true;
-    }
-    if (m + rh < -K.cap) {
-      /* deep: free unless the notch or a reveal is near */
-      if (y - rh < K.notchTop && Math.max(K.GZ - z, (ax - cw) * K.iqc) - rh - K.cc * rh <= K.cap) return false;
-      for (let i = 0; i < 2; i++) {
-        const P = i ? K.px : K.pe;
-        if ((x - P.ex) * P.ox + (z - P.ez) * P.oz + rh >= -40) return false;
-      }
-      return true;
+      if (t > rh && Math.abs(u) + rh * K.qs < P.hw + P.sp * (t - rh) && Math.abs(ey) + rh * K.qs < P.hh + P.sp * (t - rh) &&
+        x * P.onx + y * P.ony + z * P.onz - P.od < -rh && !_h.leg) return true;
     }
     return false;
   }
+  /* the full scope, for single points (clearance, fitCheck) */
+  function scopeAll(K) {
+    _h.leg = true; _h.pe = true; _h.px = true; _h.na = K.na;
+    for (let i = 0; i < K.na; i++) _h.air[i] = i;
+    for (let i = 0; i < 12; i++) { const S = K.slabs[i], out = _h.sl[i]; let n = 0; for (let q = 0; q < S.length; q += 6) out[n++] = q; _h.ns[i] = n; }
+  }
+  /* Signed margin of a local point to the shell: positive in the shell (the
+     depth of its cheapest exit), negative outside, in the open air, in the
+     leg or in a mouth zone. For fitCheck. */
+  function shellMargin(K, x, y, z) {
+    scopeAll(K);
+    if (y < K.y0 || y > K.top) return -1;
+    if (legViol(K, x, y, z) < 0) return -1;
+    const k = bandOf(K, y), Pp = K.planes, o = k * 16;
+    let m = -Infinity;
+    for (let j = 0; j < 4; j++) { const vv = Pp[o + j * 4] * x + Pp[o + j * 4 + 1] * y + Pp[o + j * 4 + 2] * z - Pp[o + j * 4 + 3]; _v[j] = vv; if (vv > m) m = vv; }
+    if (m > 0) return -m;
+    for (let s = 0; s < _h.na; s++) { const mv = airViol(K, _h.air[s], x, y, z, s); if (mv <= 0) return mv; _h.mv[s] = mv; }
+    PT[0] = x; PT[1] = y; PT[2] = z;
+    if (portalAir(K, K.pe) || portalAir(K, K.px)) return -1;
+    _c.pen = Infinity;
+    shellExits(K, k, x, y, z, _v);
+    return _c.pen;
+  }
 
-  /* contacts(layout, pts, st): the face planes, notch, reveals, plates and
-     slabs, in the record SixDOF.resolve takes ({ n, r, pen, key, vs, part }).
-     With st ({ p, q }) the points are body points, as hkcore contactsBoxes
-     takes them (r = q pts[i]); without st they are world points and r is
-     taken from their centroid. The boxes (skirt, roof, crown, clutter) are
-     not in here: boxesNear hands them to contactsBoxes. */
+  /* contacts(layout, pts, st): band faces, terraces, roof, open-air walls,
+     reveals, plates, the leg and the slabs, in the record SixDOF.resolve
+     takes ({ n, r, pen, key, vs, part }). With st ({ p, q }) the points are
+     body points, as hkcore contactsBoxes takes them (r = q pts[i]); without
+     st they are world points and r is taken from their centroid. The boxes
+     are not in here: boxesNear hands them to contactsBoxes. */
   const _rh = { pts: null, n: 0, r: 0 };
   function contacts(L, pts, st) {
     const out = [], K = L._k, n = pts.length;
@@ -613,8 +858,6 @@
     let cx = 0, cy = 0, cz = 0, rh = 0;
     if (st) {
       cx = st.p[0]; cy = st.p[1]; cz = st.p[2];
-      /* the hull radius, cached for the last point array seen (the game
-         passes the same hull every substep) */
       if (pts === _rh.pts && n === _rh.n) rh = _rh.r;
       else { for (let i = 0; i < n; i++) rh = Math.max(rh, Math.hypot(pts[i][0], pts[i][1], pts[i][2])); _rh.pts = pts; _rh.n = n; _rh.r = rh; }
     } else {
@@ -625,9 +868,7 @@
     if (cx < K.bx0 - rh || cx > K.bx1 + rh || cz < K.bz0 - rh || cz > K.bz1 + rh || cy > K.by1 + rh) return out;
     {
       const dx = cx - ox, dz = cz - oz;
-      const lx = dx * lc - dz * ls, lz = dx * ls + dz * lc;
-      if (hullFree(K, lx, cy - oy, lz, rh)) return out;
-      hullScope(K, lx, cy - oy, lz, rh);
+      if (hullScope(K, dx * lc - dz * ls, cy - oy, dx * ls + dz * lc, rh)) return out;
     }
     const q = st ? st.q : null;
     const q0 = q ? q[0] : 0, q1 = q ? q[1] : 0, q2 = q ? q[2] : 0, q3 = q ? q[3] : 0;
@@ -635,7 +876,6 @@
       const v = pts[i];
       let rx, ry, rz;
       if (q) {
-        /* r = q v q* (q = [w, x, y, z]) */
         const tx = 2 * (q2 * v[2] - q3 * v[1]), ty = 2 * (q3 * v[0] - q1 * v[2]), tz = 2 * (q1 * v[1] - q2 * v[0]);
         rx = v[0] + q0 * tx + q2 * tz - q3 * ty; ry = v[1] + q0 * ty + q3 * tx - q1 * tz; rz = v[2] + q0 * tz + q1 * ty - q2 * tx;
       } else { rx = v[0] - cx; ry = v[1] - cy; rz = v[2] - cz; }
@@ -649,23 +889,29 @@
 
   /* Free space at world point p for the camera clamp (hkcore cameraClamp
      takes probes that return it): a lower bound of the distance to the
-     shell's surfaces, negative in the shell. Outside the faces it is the
-     largest plane distance minus the deepest slab; in the notch the
-     distance to its walls minus their fins and to the gate minus its
-     pilasters; in a reveal the distance to its sides (and to the plate,
-     unless the point is in front of the duct's opening). In the plate's
-     hole and the duct's wall band near the mouths, and below the skirt top
-     (the skirt is boxes), it returns 1e9: the shaft and the boxes decide
-     there. In the shell: minus the depth of the cheapest exit. */
+     shell, negative in it. Outside the bands: the largest plane distance
+     minus the deepest slab; in an open-air region: the distance to its
+     nearest wall (and to the leg); in a reveal: to its sides. In the mouth
+     zones and below the skirt top (boxes) it returns 1e9: the shaft and the
+     boxes decide there. */
   function clearance(L, p) {
     const K = L._k, lc = K.cz, ls = K.sz, dx = p[0] - K.ox, dz = p[2] - K.oz;
     const x = dx * lc - dz * ls, y = p[1] - K.oy, z = dx * ls + dz * lc;
     if (y < K.y0) return 1e9;
-    const iq = K.iq, cyq = K.cq * y - K.dF;
-    const m = Math.max(z * iq + cyq, x * iq + cyq, -z * iq + cyq, -x * iq + cyq, y - K.top);
-    if (m > 0) return m - K.cornerD;
-    const cw = K.CW + K.cc * y, ax = x < 0 ? -x : x;
-    if (z > K.GZ && ax < cw) return Math.min((cw - ax) * K.iqc - K.nfD, Math.max(z - K.GZ - K.pilD, (cw - ax) * K.iqc - K.pilW));
+    if (y > K.top) return y - K.top;
+    scopeAll(K);
+    const lv = legViol(K, x, y, z);
+    if (lv < 0) return lv;
+    const k = bandOf(K, y), Pp = K.planes, o = k * 16;
+    let m = -Infinity;
+    for (let j = 0; j < 4; j++) { const vv = Pp[o + j * 4] * x + Pp[o + j * 4 + 1] * y + Pp[o + j * 4 + 2] * z - Pp[o + j * 4 + 3]; _v[j] = vv; if (vv > m) m = vv; }
+    if (m > 0) return Math.min(m - K.slabMax, lv);
+    for (let s = 0; s < _h.na; s++) {
+      const mv = airViol(K, _h.air[s], x, y, z, s);
+      if (mv <= 0) return Math.min(-mv, lv);
+      _h.mv[s] = mv;
+    }
+    PT[0] = x; PT[1] = y; PT[2] = z;
     for (let i = 0; i < 2; i++) {
       const P = i ? K.px : K.pe, ex = x - P.ex, ey = y - P.ey, ez = z - P.ez;
       const a = ex * P.ox + ez * P.oz, t = a - P.plate, u = ex * P.nx + ez * P.nz;
@@ -677,13 +923,8 @@
       if (a < 0 && -a <= P.skip && au < 80 && av < 70 && rectF(K, u, ey) < K.wallT) return 1e9;
       if (a >= 0 && t < 0 && rectF(K, u, ey) < 0) return 1e9;
     }
-    _h.f0 = _h.f1 = _h.f2 = _h.f3 = _h.top = _h.notch = _h.pe = _h.px = true;
-    PT[0] = x; PT[1] = y; PT[2] = z;
     _c.pen = Infinity;
-    const cq = K.cq, d = [z * iq + cyq, x * iq + cyq, -z * iq + cyq, -x * iq + cyq];
-    set(-d[0], 0, cq, iq, ''); set(-d[1], iq, cq, 0, ''); set(-d[2], 0, cq, -iq, ''); set(-d[3], -iq, cq, 0, ''); set(K.top - y, 0, 1, 0, '');
-    if (y < K.notchTop) set(Math.max((x - cw) * K.iqc, (-x - cw) * K.iqc, K.GZ - z), 0, 0, 0, '');
-    portalCand(K, K.pe, ''); portalCand(K, K.px, '');
+    shellExits(K, k, x, y, z, _v);
     return -_c.pen;
   }
 
@@ -705,20 +946,18 @@
     }
     return out;
   }
-
   function bounds(L) { return L._bounds; }
-  /* inside the building's bounding volume grown by margin */
   function inside(L, p, margin) {
     const m = margin || 0, b = L._bounds;
     return p[0] >= b.min[0] - m && p[0] <= b.max[0] + m && p[1] >= b.min[1] - m && p[1] <= b.max[1] + m && p[2] >= b.min[2] - m && p[2] <= b.max[2] + m;
   }
 
   /* Portals in the Menger shape: { id, p, n, w, h, right, up, depth, kind,
-     biome, c, rim }. p is where the duct axis crosses the outer plane (gate
-     or east face), n the outward normal of the opening (along the axis), w x h
-     the opening at the plate (140 x 112; the reveal only widens outward, so a
-     gate of that size at p is free air), depth the straight free run behind
-     the opening, c the centre of the outer rim, rim its corners. */
+     biome, c, rim }. p is where the duct axis crosses the outer plane (the
+     cut's east wall, the north face of band 1), n the outward normal along
+     the axis, w x h the opening at the plate (140 x 112; the reveal only
+     widens outward, so a gate of that size at p is free air), depth the
+     straight free run behind the opening, c the centre of the outer rim. */
   function portals(L) {
     const sh = L.duct, fans = sh.fans;
     const firstFan = Math.min.apply(null, fans.map((f) => f.s)), lastFan = Math.max.apply(null, fans.map((f) => f.s));
@@ -734,17 +973,17 @@
     });
   }
 
-  /* The route through the building: approach (lead metres before the gate,
-     on the axis, outside the face), the entry portal (gate plane), the duct's
-     rings and fan passes (Shaft.flythrough: no ring within 60 m of a fan or a
-     mouth), the exit portal (east face), leave (leave metres beyond it, on
-     the axis). Returns { waypoints, points, entry, exit, exitDir, length },
-     waypoints[i] = { p, dir, up, kind, s, portal, fan } with s the duct arc
-     length (negative before the mouth, beyond length after it). */
+  /* The route through the building: approach (lead metres before the entry
+     portal, on the axis: the straight run along the cut, under the west
+     beam), the entry portal (cut wall plane), the six ring stations and the
+     three fan passes (Shaft.flythrough with explicit rings), the exit portal
+     (north face), leave (leave metres beyond it). Returns { waypoints,
+     points, entry, exit, exitDir, length }, waypoints[i] = { p, dir, up,
+     kind, s, portal, fan }, s the duct arc length. */
   function flythrough(L, opts) {
     const S = needShaft(), C = L.cfg, sh = L.duct, o = opts || {};
     const lead = o.lead == null ? C.lead : o.lead, leave = o.leave == null ? C.leave : o.leave;
-    const ft = S.flythrough(sh, { lead: 0, ringR: o.ringR });
+    const ft = S.flythrough(sh, { lead: 0, ringR: o.ringR, rings: L.rings });
     const pI = L.portalsL[0], pX = L.portalsL[1];
     const sIn = -pI.depthOut, sOut = sh.length + pX.depthOut;
     const pts = [{ s: sIn - lead, kind: 'approach' }, { s: sIn, kind: 'portal', portal: 'entry' }];
@@ -863,6 +1102,14 @@
     }
   }
 
+
+  /* Build: the shell (bands cut around their holes, slabs as prisms, cut
+     walls, wedges, courts, the leg, every box) as one mesh in the city's
+     facade convention; light lines and gold rims as one glow mesh; halos as
+     one additive instanced mesh; one InstancedMesh per detail kind; the duct
+     through Shaft.build with quiet mouths. opts: fog (the page's makeFog),
+     facadeMaterial (the city renderer's; not disposed here), paths (race
+     lines, for the duct's cables), accent, warm, fanRange (1500 m). */
   function build(THREE, L, opts) {
     opts = opts || {};
     const S = needShaft();
@@ -872,170 +1119,169 @@
       const i = Math.min(stops.length - 2, Math.floor(t)), f = t - i, a = stops[i], b = stops[i + 1], k = g == null ? 1 : g;
       return [toLin(a[0] + (b[0] - a[0]) * f) * k, toLin(a[1] + (b[1] - a[1]) * f) * k, toLin(a[2] + (b[2] - a[2]) * f) * k];
     };
-    const C = L.cfg, D = L.dims, fog = opts.fog || null;
+    const C = L.cfg, B = L.bands, G = L.gate, fog = opts.fog || null, half = L.half;
     const warm = opts.warm == null ? WARM : opts.warm, accent = opts.accent == null ? ACCENT : opts.accent;
     const rng = mulberry32(L.seed ^ 0x2b0f11);
     const owned = [];
     const toW = (p) => toWorld(L, p), dW = (d) => dirWorld(L, d);
-    const soup = new Soup();
-    const glow = new Soup();
-    const halos = [];
-    const glowBox = (lo, hi, col) => glow.box(lo, hi, col, 0, 4, toW, dW);
-    const glowQuad = (a, b, c, d, n, col) => glow.quad(toW(a), toW(b), toW(c), toW(d), dW(n), col, 0, [0, 0, 0, 0], 0, 0, 4);
-    const warmC = hexLin(warm, 2.2), sodC = hexLin(warm, 1.3), cyanC = hexLin(accent, 2.0);
-    const { hb, c, y0, TOP, GZ, notchTop: NT } = D;
-    const half = D.half, cw = D.cw, TH = D.topHalf;
-
-    /* ---- the four faces ---- */
-    const mkFace = (k) => {
-      const F = L.faces[k], nh = F.nh, T = F.T, n = F.n;
-      const P = (u, y, d) => {
-        const off = half(y);
-        return [nh[0] * off + T[0] * u + n[0] * (d || 0), y + n[1] * (d || 0), nh[2] * off + T[2] * u + n[2] * (d || 0)];
-      };
-      const holes = L.holes[F.id].map((h) => h.notch
-        ? { ya: h.ya, yb: h.yb, uL: (y) => -cw(y), uR: (y) => cw(y) }
-        : { ya: h.ya, yb: h.yb, uL: (y) => h.uL[0] + (h.uL[1] - h.uL[0]) * (y - h.ya) / (h.yb - h.ya), uR: (y) => h.uR[0] + (h.uR[1] - h.uR[0]) * (y - h.ya) / (h.yb - h.ya) });
-      return { k: k, n: n, T: T, P: P, holes: holes, uMin: (y) => -half(y), uMax: (y) => half(y) };
+    const soup = new Soup(), glow = new Soup(), halos = [];
+    const sodC = hexLin(warm, 1.3), warmC = hexLin(warm, 2.0), cyanC = hexLin(accent, 2.0), whiteC = bone(0.95, 1.4);
+    const SH = C.skirtH, TOP = L.dims.TOP;
+    /* a light line from a to b (local), width wd, facing nrm */
+    const line = (a, b, wd, nrm, col) => {
+      const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], s = norm(cross(nrm, d)), h = wd / 2;
+      glow.quad(toW(sa(a, s, -h)), toW(sa(b, s, -h)), toW(sa(b, s, h)), toW(sa(a, s, h)), dW(nrm), col, 0, [0, 0, 0, 0], 0, 0, 4);
     };
-    const faces = [0, 1, 2, 3].map(mkFace);
-    /* quads and prisms on a face */
+    const holeFns = (hs) => hs.map((h) => ({ ya: h.ya, yb: h.yb,
+      uL: (y) => h.uL[0] + (h.uL[1] - h.uL[0]) * (y - h.ya) / Math.max(1e-9, h.yb - h.ya),
+      uR: (y) => h.uR[0] + (h.uR[1] - h.uR[0]) * (y - h.ya) / Math.max(1e-9, h.yb - h.ya) }));
+    /* quads and prisms on a face (f.P(u, y, d), f.n, f.T) */
     const emitter = (f, col, seed, code, d0, d1, uRef, W, top) => (a0, b0, b1, a1, ya, yb) => {
-      const P = f.P;
+      const P = (u, y, d) => toW(f.P(u, y, d)), n = dW(f.n);
       const us = (a, b) => [a - uRef(ya), b - uRef(ya), b - uRef(ya), a - uRef(ya)];
-      if (d1 - d0 < 0.01) {
-        soup.quad(toW(P(a0, ya, d1)), toW(P(b0, ya, d1)), toW(P(b1, yb, d1)), toW(P(a1, yb, d1)), dW(f.n), col, seed,
-          [a0 - uRef(ya), b0 - uRef(ya), b1 - uRef(ya), a1 - uRef(ya)], W, top, code);
-        return;
-      }
-      /* prism: front, two sides, top and bottom (the back is hidden) */
-      const Q = (u, y, d) => toW(P(u, y, d));
-      soup.quad(Q(a0, ya, d1), Q(b0, ya, d1), Q(b1, yb, d1), Q(a1, yb, d1), dW(f.n), col, seed, us(a0, b0), W, top, code);
-      const side = (u0, u1, sg) => {
-        const e = [f.T[0] * sg, 0, f.T[2] * sg];
-        soup.quad(Q(u0, ya, d0), Q(u0, ya, d1), Q(u1, yb, d1), Q(u1, yb, d0), dW(e), col, seed, [0, d1 - d0, d1 - d0, 0], d1 - d0, top, code);
-      };
+      if (d1 - d0 < 0.01) { soup.quad(P(a0, ya, d1), P(b0, ya, d1), P(b1, yb, d1), P(a1, yb, d1), n, col, seed, [a0 - uRef(ya), b0 - uRef(ya), b1 - uRef(ya), a1 - uRef(ya)], W, top, code); return; }
+      soup.quad(P(a0, ya, d1), P(b0, ya, d1), P(b1, yb, d1), P(a1, yb, d1), n, col, seed, us(a0, b0), W, top, code);
+      const side = (u0, u1, sg) => soup.quad(P(u0, ya, d0), P(u0, ya, d1), P(u1, yb, d1), P(u1, yb, d0), dW([f.T[0] * sg, 0, f.T[2] * sg]), col, seed, [0, d1 - d0, d1 - d0, 0], d1 - d0, top, code);
       side(a0, a1, -1); side(b0, b1, 1);
-      soup.quad(Q(a1, yb, d0), Q(b1, yb, d0), Q(b1, yb, d1), Q(a1, yb, d1), dW([0, 1, 0]), col, seed, [0, b1 - a1, b1 - a1, 0], b1 - a1, top, 4);
-      soup.quad(Q(a0, ya, d0), Q(b0, ya, d0), Q(b0, ya, d1), Q(a0, ya, d1), dW([0, -1, 0]), col, seed, [0, b0 - a0, b0 - a0, 0], b0 - a0, top, 4);
+      soup.quad(P(a1, yb, d0), P(b1, yb, d0), P(b1, yb, d1), P(a1, yb, d1), dW([0, 1, 0]), col, seed, [0, b1 - a1, b1 - a1, 0], b1 - a1, top, 4);
+      soup.quad(P(a0, ya, d0), P(b0, ya, d0), P(b0, ya, d1), P(a0, ya, d1), dW([0, -1, 0]), col, seed, [0, b0 - a0, b0 - a0, 0], b0 - a0, top, 4);
     };
-    const bandY = [y0, ...C.bands.map((b) => y0 + b * (TOP - y0)), TOP];
-    const colU = [-1e4, ...C.fins.map((f) => f * TH), 1e4];
+
+    /* ---- the bands' faces: window fields, fins, corner fins, cornice, ledge ---- */
+    const faces = L.faces.map((F) => ({ F: F, n: F.n, T: F.T, P: (u, y, d) => L.facePt(F, u, y, d), holes: holeFns(F.holes),
+      uMin: (y) => -half(F.band, y), uMax: (y) => half(F.band, y) }));
     for (const f of faces) {
-      /* window fields between fins and bands: one panel, one seed */
-      for (let i = 0; i + 1 < bandY.length; i++) for (let j = 0; j + 1 < colU.length; j++) {
-        const seed = rng(), prog = rng() < 0.7 ? 3 : 0, tone = 0.4 + rng() * 0.12;
-        const ya = bandY[i], yb = bandY[i + 1];
-        const u0 = Math.max(colU[j], -half(ya)), u1 = Math.min(colU[j + 1], half(ya));
-        fill(emitter(f, bone(tone), seed, prog, 0, 0, (y) => Math.max(colU[j], -half(y)), u1 - u0, yb), f, ya, yb, { u0: colU[j], u1: colU[j + 1] });
+      const F = f.F, b = B[F.band], ht = b.ht, mid = (b.y0 + b.y1) / 2;
+      const fins = C.fins[F.band], cols = [-1e4, ...fins.map((q) => q.u * ht), 1e4];
+      for (const [ya, yb] of [[b.y0, mid], [mid, b.y1]]) for (let j = 0; j + 1 < cols.length; j++) {
+        const seed = rng(), prog = rng() < 0.6 ? 3 : rng() < 0.5 ? 0 : 1, tone = 0.38 + rng() * 0.14;
+        fill(emitter(f, bone(tone), seed, prog, 0, 0, (y) => Math.max(cols[j], -half(F.band, y)), Math.min(cols[j + 1], half(F.band, ya)) - Math.max(cols[j], -half(F.band, ya)), yb), f, ya, yb, { u0: cols[j], u1: cols[j + 1] });
       }
-      /* fins, corner fins, bands: plain, lighter */
+      /* slabs; on band 1 S and W not over the cut (the wedge is plain face) */
+      const lim = F.band === 0 && F.id === 'S' ? { u0: -C.cutX } : F.band === 0 && F.id === 'W' ? { u1: C.cutZ } : {};
       for (const s of L.slabs) {
-        if (s.face !== f.k) continue;
-        const col = bone(s.kind === 'band' ? (s.lit ? 0.78 : 0.22) : 0.62), seed = rng();
-        if (s.kind === 'fin') fill(emitter(f, col, seed, 4, 0, s.d, () => s.u - s.w / 2, s.w, TOP), f, s.y0, s.y1, { u0: s.u - s.w / 2, u1: s.u + s.w / 2 });
-        else if (s.kind === 'corner') {
+        if (s.band !== F.band || s.face !== F.j) continue;
+        const col = bone(s.kind === 'band' ? 0.66 : 0.6), seed = rng();
+        if (s.kind === 'fin') {
+          const o = { u0: Math.max(s.u - s.w / 2, lim.u0 == null ? -1e4 : lim.u0), u1: Math.min(s.u + s.w / 2, lim.u1 == null ? 1e4 : lim.u1), d0: 0, d1: s.d };
+          if (o.u1 - o.u0 < 1) continue;
+          fill(emitter(f, col, seed, 4, 0, s.d, () => o.u0, s.w, b.y1), f, s.y0, s.y1, o);
+          for (const [a, c2] of spans(f, b.y1 - 2, o.u0, o.u1)) line(f.P(a + 2, b.y1 - 2, s.d + 0.3), f.P(c2 - 2, b.y1 - 2, s.d + 0.3), 1.6, F.n, sodC);
+        } else if (s.kind === 'corner') {
           for (const sg of [-1, 1]) {
-            const cf = Object.assign({}, f, sg < 0 ? { uMax: (y) => -half(y) + s.w } : { uMin: (y) => half(y) - s.w });
-            fill(emitter(cf, col, seed, 4, 0, s.d, (y) => cf.uMin(y), s.w, TOP), cf, s.y0, s.y1);
+            if ((sg < 0 && lim.u0 != null) || (sg > 0 && lim.u1 != null)) continue;
+            const cf = Object.assign({}, f, sg < 0 ? { uMax: (y) => -half(F.band, y) + s.w } : { uMin: (y) => half(F.band, y) - s.w });
+            fill(emitter(cf, col, seed, 4, 0, s.d, (y) => cf.uMin(y), s.w, b.y1), cf, s.y0, s.y1);
           }
         } else {
-          fill(emitter(f, col, seed, 4, 0, s.d, (y) => -half(y), 2 * half(s.y0), s.y1), f, s.y0, s.y1);
-          if (s.lit) {
-            /* a light line along the lit band */
-            const yl = (s.y0 + s.y1) / 2;
-            for (const [a, b] of spans(f, yl, -half(yl), half(yl))) {
-              const A0 = f.P(a, yl - 1.6, s.d + 0.15), B0 = f.P(b, yl - 1.6, s.d + 0.15), B1 = f.P(b, yl + 1.6, s.d + 0.15), A1 = f.P(a, yl + 1.6, s.d + 0.15);
-              glowQuad(A0, B0, B1, A1, f.n, sodC);
-            }
-          }
+          const o = Object.assign({ d0: 0, d1: s.d }, lim);
+          fill(emitter(f, col, seed, 4, 0, s.d, (y) => -half(F.band, y), 2 * half(F.band, s.y0), s.y1), f, s.y0, s.y1, o);
+          const yl = s.part === 'cornice' ? s.y0 - 0.6 : s.y0 + 0.4;
+          for (const [a, c2] of spans(f, yl, lim.u0 == null ? -half(F.band, yl) : lim.u0, lim.u1 == null ? half(F.band, yl) : lim.u1)) line(f.P(a, yl, s.d + 0.2), f.P(c2, yl, s.d + 0.2), s.part === 'cornice' ? 1.2 : 0.9, F.n, sodC);
         }
       }
     }
+    /* terrace edges, lit */
+    B.forEach((b, k) => {
+      if (k + 1 >= B.length) return;
+      const ht = b.ht + 3, y = b.y1 + 0.6, E4 = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+      for (let q = 0; q < 4; q++) line([E4[q][0] * ht, y, E4[q][1] * ht], [E4[(q + 1) % 4][0] * ht, y, E4[(q + 1) % 4][1] * ht], 1.6, [0, 1, 0], sodC);
+    });
 
-    /* ---- the notch: splayed walls, the gate wall, their fins ---- */
-    const qc = D.qc, zEnd = (y) => (y < y0 ? D.skirtHalf : half(y));
-    for (const sx of [-1, 1]) {
-      const n = [-sx / qc, C.cc / qc, 0];
-      const f = { n: n, T: [0, 0, 1], holes: [], uMin: () => GZ, uMax: zEnd, P: (u, y, d) => [sx * cw(y) + n[0] * (d || 0), y + n[1] * (d || 0), u + n[2] * (d || 0)] };
-      const seed = rng();
-      for (const [ya, yb] of [[0, y0], [y0, NT]]) fill(emitter(f, bone(0.5), seed, 1, 0, 0, () => GZ, D.skirtHalf - GZ, NT), f, ya, yb);
-      for (const s of L.notchSlabs) if (s.kind === 'nfin' && s.sx === sx) fill(emitter(f, bone(0.62), rng(), 4, 0, s.d, () => s.z0, s.z1 - s.z0, NT), f, 0, NT, { u0: s.z0, u1: s.z1 });
-      /* warm light strips along the notch walls, so the notch reads at portal distance */
-      for (let y = 30; y < NT - 10; y += 46) {
-        const z1 = zEnd(y) - 4;
-        if (z1 - GZ < 30) continue;
-        glowQuad(f.P(GZ + 4, y - 0.8, 1), f.P(z1, y - 0.8, 1), f.P(z1, y + 0.8, 1), f.P(GZ + 4, y + 0.8, 1), n, sodC);
-      }
-    }
+    /* ---- the corner cut: its two walls (windows), the wedge undersides, the leg ---- */
     {
-      const gh = L.holes.gate[0];
-      const f = { n: [0, 0, 1], T: [1, 0, 0], uMin: (y) => -cw(y), uMax: (y) => cw(y), P: (u, y, d) => [u, y, GZ + (d || 0)],
-        holes: [{ ya: gh.ya, yb: gh.yb, uL: (y) => gh.uL[0] + (gh.uL[1] - gh.uL[0]) * (y - gh.ya) / (gh.yb - gh.ya), uR: (y) => gh.uR[0] + (gh.uR[1] - gh.uR[0]) * (y - gh.ya) / (gh.yb - gh.ya) }] };
-      fill(emitter(f, bone(0.45), rng(), 2, 0, 0, (y) => -cw(y), 2 * cw(0), NT), f, 0, NT);
-      for (const s of L.notchSlabs) if (s.kind === 'pilaster') {
-        const pf = Object.assign({}, f, s.sx < 0 ? { uMax: (y) => -cw(y) + s.w } : { uMin: (y) => cw(y) - s.w });
-        fill(emitter(pf, bone(0.62), rng(), 4, 0, s.d, (y) => pf.uMin(y), s.w, NT), pf, 0, NT);
+      const X = C.cutX, Zc = C.cutZ, b0 = B[0];
+      const eh = holeFns([L.entryHole])[0];
+      const wallE = { n: [-1, 0, 0], T: [0, 0, 1], holes: [eh], P: (u, y, d) => [-X - (d || 0), y, u], uMin: () => Zc, uMax: (y) => (y < G.yB ? half(0, y) : G.zi) };
+      const wallN = { n: [0, 0, 1], T: [1, 0, 0], holes: [], P: (u, y, d) => [u, y, Zc + (d || 0)], uMin: (y) => (y < G.yB ? -half(0, y) : G.xw1), uMax: () => -X };
+      for (const w of [wallE, wallN]) {
+        const seed = rng();
+        fill(emitter(w, bone(0.46), seed, 1, 0, 0, w.uMin, 400, G.yB), w, b0.y0, G.yB);
+        fill(emitter(w, bone(0.46), seed, 1, 0, 0, w.uMin, 200, C.soffitY), w, G.yB, C.soffitY);
+        for (let y = b0.y0 + 30; y < G.yB - 6; y += 36) {
+          if (w === wallE && Math.abs(y - C.ductY) < 70) continue;
+          line(w.P(w.uMin(y) + 4, y, 0.6), w.P(w.uMax(y) - 4, y, 0.6), 0.8, w.n, sodC);
+        }
       }
+      /* undersides of the wedges between the beam fronts and the slope */
+      const hB = half(0, G.yB), down = dW([0, -1, 0]);
+      const flat = (x0, x1, z0, z1) => soup.quad(toW([x0, G.yB, z0]), toW([x1, G.yB, z0]), toW([x1, G.yB, z1]), toW([x0, G.yB, z1]), down, bone(0.3), 0.5, [0, 0, 0, 0], 0, 0, 4);
+      flat(-hB, G.xi, G.zo, hB);
+      flat(-hB, G.xo, G.zw0, G.zo);
+      /* lit lower edges of the beams and the wedge strips */
+      line([G.xo, G.yB - 2.6, G.zo - 2], [G.xi, G.yB - 2.6, G.zo - 2], 1.2, [0, -1, 0], sodC);
+      line([G.xo, G.yB - 2.6, G.zi + 2], [G.xi, G.yB - 2.6, G.zi + 2], 1.2, [0, -1, 0], sodC);
+      for (const xx of [G.xo + 2, G.xw1 - 2]) line([xx, G.yB - 2.6, G.zw0], [xx, G.yB - 2.6, G.zi], 1.2, [0, -1, 0], sodC);
+      for (let x = G.xi - 20; x > G.xo; x -= 24) halos.push([toW([x, G.yB - 6, (G.zi + G.zo) / 2]), 22, 22, hexLin(warm, 0.07)]);
+      for (let z = G.zw0 + 20; z < G.zw1; z += 24) halos.push([toW([(G.xo + G.xw1) / 2, G.yB - 6, z]), 22, 22, hexLin(warm, 0.07)]);
+      /* the leg: four sheared quads, lit long edges */
+      const lg = G.leg, w = lg.w, sq = (c, y) => [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b2]) => [c[0] + a * w / 2, y, c[1] + b2 * w / 2]);
+      const lo = sq(lg.foot, lg.y0), hi = sq(lg.top, lg.y1), cen = [(lg.foot[0] + lg.top[0]) / 2, (lg.y0 + lg.y1) / 2, (lg.foot[1] + lg.top[1]) / 2];
+      const seed = rng();
+      for (let k = 0; k < 4; k++) {
+        const q = [lo[k], lo[(k + 1) % 4], hi[(k + 1) % 4], hi[k]];
+        let nn = norm(cross([q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]], [q[3][0] - q[0][0], q[3][1] - q[0][1], q[3][2] - q[0][2]]));
+        const mid = [(q[0][0] + q[2][0]) / 2 - cen[0], 0, (q[0][2] + q[2][2]) / 2 - cen[2]];
+        if (dot(nn, mid) < 0) nn = nn.map((v) => -v);
+        soup.quad(toW(q[0]), toW(q[1]), toW(q[2]), toW(q[3]), dW(nn), bone(0.44), seed, [0, w, w, 0], w, lg.y1, 1);
+        const out = norm([lo[k][0] - lg.foot[0], 0, lo[k][2] - lg.foot[1]]);
+        line(sa(lo[k], out, 1.2), sa(hi[k], out, 1.2), 1.4, out, sodC);
+      }
+      halos.push([toW([lg.foot[0], SH + 8, lg.foot[1]]), 60, 40, hexLin(warm, 0.08)]);
+      /* the forecourt road: kerbs and a sodium centre line */
+      for (const o2 of [-14, 14]) line([-C.skirtHalf, SH + 0.7, C.forecourtZ + o2], [-X - 4, SH + 0.7, C.forecourtZ + o2], 0.9, [0, 1, 0], whiteC);
+      line([-C.skirtHalf, SH + 0.7, C.forecourtZ], [-X - 4, SH + 0.7, C.forecourtZ], 0.5, [0, 1, 0], sodC);
     }
 
-    /* ---- portals: splayed reveal, plate with the duct's hole, gold rims, sill dots ---- */
-    for (const P of L.portalsL) {
-      const E = P.E, o = P.o, N = P.N, up = [0, 1, 0];
-      const at = (u, v, a) => [E[0] + N[0] * u + o[0] * a, E[1] + v, E[2] + N[2] * u + o[2] * a];
-      const inner = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => at(a * P.hw, b * P.hh, P.plate));
-      const col = bone(0.32), seed = rng();
-      for (let k = 0; k < 4; k++) {
-        const a = inner[k], b = inner[(k + 1) % 4], cc2 = P.rim[(k + 1) % 4], d = P.rim[k];
-        const mid = [(a[0] + b[0]) / 2 - E[0], (a[1] + b[1]) / 2 - E[1], (a[2] + b[2]) / 2 - E[2]];
-        const lat = norm([mid[0] - o[0] * dot(mid, o), mid[1], mid[2] - o[2] * dot(mid, o)]);
-        const nIn = norm(cross([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
-        const nn = dot(nIn, lat) > 0 ? [-nIn[0], -nIn[1], -nIn[2]] : nIn;
-        soup.quad(toW(a), toW(b), toW(cc2), toW(d), dW(nn), col, seed, [0, 0, 0, 0], 0, 0, 4);
+    /* ---- courtyards: side walls, back wall, lit mouth edges ---- */
+    for (const ct of C.courts) {
+      const F = L.faces[ct.band * 4 + FACE_IDS.indexOf(ct.face)], b = B[ct.band];
+      const P = (u, y, d) => L.facePt(F, u, y, d), back = (u, y) => sa(P(u, y, 0), F.nh, -ct.depth);
+      const seed = rng();
+      for (const [u, sg] of [[ct.ua, 1], [ct.ub, -1]]) {
+        const q = [P(u, b.y0, 0), back(u, b.y0), back(u, b.y1), P(u, b.y1, 0)];
+        soup.quad(toW(q[0]), toW(q[1]), toW(q[2]), toW(q[3]), dW(F.T.map((v) => v * sg)), bone(0.46), seed, [0, ct.depth, ct.depth, 0], ct.depth, b.y1, 1);
+        line(P(u, b.y0 + 4, 1), P(u, b.y1 - 4, 1), 1.0, F.n, sodC);
       }
-      /* the plate: the opening minus the duct profile */
+      const bq = [back(ct.ua, b.y0), back(ct.ub, b.y0), back(ct.ub, b.y1), back(ct.ua, b.y1)];
+      soup.quad(toW(bq[0]), toW(bq[1]), toW(bq[2]), toW(bq[3]), dW(F.n), bone(0.46), seed, [0, ct.ub - ct.ua, ct.ub - ct.ua, 0], ct.ub - ct.ua, b.y1, 1);
+      halos.push([toW(sa(back((ct.ua + ct.ub) / 2, (b.y0 + b.y1) / 2), F.nh, ct.depth * 0.4)), 70, 70, hexLin(warm, 0.05)]);
+    }
+
+    /* ---- portals: quiet. A dark reveal and plate, one thin gold rim at the outer edge ---- */
+    for (const P of L.portalsL) {
+      const E = P.E, o = P.o, N = P.N;
+      const at = (u, v, a) => [E[0] + N[0] * u + o[0] * a, E[1] + v, E[2] + N[2] * u + o[2] * a];
+      const inner = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b2]) => at(a * P.hw, b2 * P.hh, P.plate));
+      const col = bone(0.14), seed = rng();
+      for (let k = 0; k < 4; k++) {
+        const a = inner[k], b2 = inner[(k + 1) % 4], c2 = P.rim[(k + 1) % 4], d = P.rim[k];
+        const mid = [(a[0] + b2[0]) / 2 - E[0], (a[1] + b2[1]) / 2 - E[1], (a[2] + b2[2]) / 2 - E[2]];
+        const lat = norm([mid[0] - o[0] * dot(mid, o), mid[1], mid[2] - o[2] * dot(mid, o)]);
+        const nIn = norm(cross([b2[0] - a[0], b2[1] - a[1], b2[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
+        soup.quad(toW(a), toW(b2), toW(c2), toW(d), dW(dot(nIn, lat) > 0 ? nIn.map((v) => -v) : nIn), col, seed, [0, 0, 0, 0], 0, 0, 4);
+      }
       const shp = new THREE.Shape([new THREE.Vector2(-P.hw, -P.hh), new THREE.Vector2(P.hw, -P.hh), new THREE.Vector2(P.hw, P.hh), new THREE.Vector2(-P.hw, P.hh)]);
       const R = S.RECT, cP = [[R.a - R.c, R.b], [-(R.a - R.c), R.b], [-R.a, R.b - R.c], [-R.a, -(R.b - R.c)], [-(R.a - R.c), -R.b], [R.a - R.c, -R.b], [R.a, -(R.b - R.c)], [R.a, R.b - R.c]];
       shp.holes.push(new THREE.Path(cP.map((p) => new THREE.Vector2(p[0], p[1]))));
       const sg = new THREE.ShapeGeometry(shp), pa = sg.getAttribute('position'), ix = sg.index;
       for (let t = 0; t < ix.count; t += 3) {
         const v = [0, 1, 2].map((e) => { const id = ix.getX(t + e); return toW(at(pa.getX(id), pa.getY(id), P.plate)); });
-        soup.tri(v[0], v[1], v[2], dW(o), bone(0.28), seed, 0, 0, 0, 0, 0, 4);
+        soup.tri(v[0], v[1], v[2], dW(o), bone(0.12), seed, 0, 0, 0, 0, 0, 4);
       }
       sg.dispose();
-      /* gold rims: the outer edge and the inner end */
-      const rod = (A, B, r) => {
-        const d = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], l = Math.hypot(d[0], d[1], d[2]);
-        const t = [d[0] / l, d[1] / l, d[2] / l];
-        let e1 = Math.abs(t[1]) < 0.9 ? norm(cross(t, up)) : norm(cross(t, [1, 0, 0]));
-        const e2 = cross(t, e1);
-        for (let k = 0; k < 4; k++) {
-          const a0 = k * Math.PI / 2 + Math.PI / 4, a1 = a0 + Math.PI / 2;
-          const o0 = sa(sa([0, 0, 0], e1, Math.cos(a0) * r), e2, Math.sin(a0) * r), o1 = sa(sa([0, 0, 0], e1, Math.cos(a1) * r), e2, Math.sin(a1) * r);
-          const nm = norm([o0[0] + o1[0], o0[1] + o1[1], o0[2] + o1[2]]);
-          glowQuad(sa(A, o0, 1), sa(A, o1, 1), sa(B, o1, 1), sa(B, o0, 1), nm, warmC);
-        }
-      };
       for (let k = 0; k < 4; k++) {
-        rod(P.rim[k], P.rim[(k + 1) % 4], 0.9);
-        rod(sa(inner[k], o, 0.8), sa(inner[(k + 1) % 4], o, 0.8), 0.6);
+        const a = P.rim[k], b2 = P.rim[(k + 1) % 4];
+        line(sa(a, o, 0.3), sa(b2, o, 0.3), 0.7, o, warmC);
       }
-      /* landing dots down the bottom panel (the sill) */
-      for (let f = 0.08; f < 1; f += 0.1) for (const xq of [-0.8, -0.3, 0.3, 0.8]) {
-        const a = inner[0].map((v, i) => v + (inner[1][i] - v) * (xq + 1) / 2), b = P.rim[0].map((v, i) => v + (P.rim[1][i] - v) * (xq + 1) / 2);
-        const p = a.map((v, i) => v + (b[i] - v) * f);
-        glowBox([p[0] - 0.6, p[1] + 0.05, p[2] - 0.6], [p[0] + 0.6, p[1] + 0.5, p[2] + 0.6], warmC);
-      }
-      const cR = P.rim.reduce((a, q) => [a[0] + q[0] / 4, a[1] + q[1] / 4, a[2] + q[2] / 4], [0, 0, 0]);
-      halos.push([toW(cR), 2 * P.hw * 1.6, 2 * P.hh * 1.6, hexLin(warm, 0.05)]);
     }
 
-    /* ---- boxes (skirt, roof, crown, clutter) in the same soup ---- */
+    /* ---- boxes (skirt, terraces, roof, crown, gate, courts, cantilevers, buildings, forecourt) ---- */
     for (const b of L.boxesL) soup.box(b.lo, b.hi, bone(b.tone), b.seed, b.prog, toW, dW);
     /* crown: louvre slats (drawn only), sodium rim, cyan line at its foot, the plume */
     {
-      const cH = L.crown.half, cy = L.crown.h;
-      for (let y = TOP + 4; y < TOP + cy - 3; y += 4.2) {
+      const cH = L.crown.half, ch = L.crown.h;
+      for (let y = TOP + 4; y < TOP + ch - 3; y += 4.2) {
         const col = bone(0.66), s = rng();
         soup.box([-cH, y, cH + 1], [cH, y + 1.6, cH + 2.2], col, s, 4, toW, dW);
         soup.box([-cH, y, -cH - 2.2], [cH, y + 1.6, -cH - 1], col, s, 4, toW, dW);
@@ -1044,17 +1290,15 @@
       }
       const E4 = [[-cH, -cH], [cH, -cH], [cH, cH], [-cH, cH]];
       for (let k = 0; k < 4; k++) {
-        const a = E4[k], b = E4[(k + 1) % 4], lo = (u, v) => Math.min(u, v), hi = (u, v) => Math.max(u, v);
-        glowBox([lo(a[0], b[0]) - 1.2, TOP + cy + 6, lo(a[1], b[1]) - 1.2], [hi(a[0], b[0]) + 1.2, TOP + cy + 8.4, hi(a[1], b[1]) + 1.2], sodC);
-        glowBox([lo(a[0], b[0]) * 1.03 - 0.7, TOP + 1, lo(a[1], b[1]) * 1.03 - 0.7], [hi(a[0], b[0]) * 1.03 + 0.7, TOP + 2.4, hi(a[1], b[1]) * 1.03 + 0.7], cyanC);
+        const a = E4[k], b2 = E4[(k + 1) % 4];
+        line([a[0], TOP + ch + 7, a[1]], [b2[0], TOP + ch + 7, b2[1]], 2.4, [0, 1, 0], sodC);
+        line([a[0] * 1.03, TOP + 1.6, a[1] * 1.03], [b2[0] * 1.03, TOP + 1.6, b2[1] * 1.03], 1.4, [0, 1, 0], cyanC);
       }
-      for (let k = 0; k < 18; k++) {
-        halos.push([toW([(rng() - 0.5) * cH * 1.2, TOP + 30 + k * 26, (rng() - 0.5) * cH * 1.2]), 110 + k * 18, 110 + k * 18, bone(0.85, 0.07 - k * 0.0028)]);
-      }
+      for (let k = 0; k < 18; k++) halos.push([toW([(rng() - 0.5) * cH * 1.2, TOP + 30 + k * 26, (rng() - 0.5) * cH * 1.2]), 110 + k * 18, 110 + k * 18, bone(0.85, 0.07 - k * 0.0028)]);
       halos.push([toW([0, TOP + 20, 0]), cH * 2.6, cH * 1.4, hexLin(warm, 0.12)]);
     }
-    /* notch floodlight */
-    for (let y = 30; y < NT; y += 55) halos.push([toW([0, y, GZ + 50]), 110, 110, hexLin(warm, 0.02)]);
+    /* lamp heads on the forecourt */
+    for (const dt of L.details) if (dt.kind === 'lamp') halos.push([toW([(dt.lo[0] + dt.hi[0]) / 2, dt.hi[1] + 0.6, (dt.lo[2] + dt.hi[2]) / 2]), 5, 5, hexLin(warm, 0.9)]);
 
     /* ---- materials and meshes ---- */
     const group = new THREE.Group();
@@ -1068,46 +1312,54 @@
     const shell = new THREE.Mesh(soup.geometry(THREE), facadeMat);
     shell.name = 'pyramid-shell';
     group.add(shell);
-    const glowMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+    const glowMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
     if (fog) fog.patch(glowMat, { fogK: 0.5 });
     owned.push(glowMat);
     const glowMesh = new THREE.Mesh(glow.geometry(THREE), glowMat);
     glowMesh.name = 'pyramid-glow';
     group.add(glowMesh);
 
-    /* detail layer: one instanced mesh per kind, boxes in face-local frames */
+    /* detail layer: one instanced mesh per kind; face-local boxes sit on
+       their face (u, y) and stand out by `out` along its normal; local
+       AABBs are scaled unit boxes */
     const kinds = {};
     for (const dt of L.details) (kinds[dt.kind] = kinds[dt.kind] || []).push(dt);
-    const detailMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().fromArray(bone(0.6)), roughness: 0.8, metalness: 0.1 });
+    const detailMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().fromArray(bone(0.55)), roughness: 0.8, metalness: 0.1 });
     if (fog) fog.patch(detailMat);
     owned.push(detailMat);
     const unit = new THREE.BoxGeometry(1, 1, 1);
-    const m4 = new THREE.Matrix4(), m4b = new THREE.Matrix4();
+    const m4 = new THREE.Matrix4(), m4b = new THREE.Matrix4(), V = (a) => new THREE.Vector3(a[0], a[1], a[2]);
     for (const kind of Object.keys(kinds)) {
       const list = kinds[kind];
       const im = new THREE.InstancedMesh(unit, detailMat, list.length);
       im.name = 'pyramid-detail-' + kind;
       list.forEach((dt, i) => {
-        const f = faces[dt.face], T = dW(f.T), n = dW(f.n), B = cross(n, T);
-        const p = toW(f.P(dt.u, dt.y, dt.d / 2));
-        m4.makeBasis(new THREE.Vector3().fromArray(T), new THREE.Vector3().fromArray(B), new THREE.Vector3().fromArray(n));
-        m4b.makeScale(dt.w, dt.h, dt.d);
-        m4.multiply(m4b).setPosition(p[0], p[1], p[2]);
+        if (dt.lo) {
+          const c = toW([(dt.lo[0] + dt.hi[0]) / 2, (dt.lo[1] + dt.hi[1]) / 2, (dt.lo[2] + dt.hi[2]) / 2]);
+          const sx = dt.hi[0] - dt.lo[0], sz = dt.hi[2] - dt.lo[2], swap = L.cy === 0;
+          m4.makeScale(swap ? sz : sx, dt.hi[1] - dt.lo[1], swap ? sx : sz).setPosition(c[0], c[1], c[2]);
+        } else {
+          const F = L.faces[dt.band * 4 + dt.face], Tw = dW(F.T), n = dW(F.n), Bw = cross(n, Tw);
+          const p = toW(L.facePt(F, dt.u, dt.y, (dt.out || 0) + dt.d / 2));
+          m4.makeBasis(V(Tw), V(Bw), V(n));
+          m4b.makeScale(dt.w, dt.h, dt.d);
+          m4.multiply(m4b).setPosition(p[0], p[1], p[2]);
+        }
         im.setMatrixAt(i, m4);
       });
       im.computeBoundingSphere();
       group.add(im);
     }
 
-    /* halos: additive soft discs (portal glow, crown plume, notch flood) */
+    /* halos: additive soft discs */
     const quad = new THREE.PlaneGeometry(1, 1);
     const hg = new THREE.InstancedBufferGeometry();
     hg.index = quad.index; hg.setAttribute('position', quad.getAttribute('position')); hg.setAttribute('uv', quad.getAttribute('uv'));
-    const HP = [], HS = [], HC = [];
-    for (const h of halos) { HP.push(h[0][0], h[0][1], h[0][2]); HS.push(h[1], h[2]); HC.push(h[3][0], h[3][1], h[3][2]); }
+    const HP = [], HS = [], HCl = [];
+    for (const h of halos) { HP.push(h[0][0], h[0][1], h[0][2]); HS.push(h[1], h[2]); HCl.push(h[3][0], h[3][1], h[3][2]); }
     hg.setAttribute('iPos', new THREE.InstancedBufferAttribute(new Float32Array(HP), 3));
     hg.setAttribute('iSize', new THREE.InstancedBufferAttribute(new Float32Array(HS), 2));
-    hg.setAttribute('iCol', new THREE.InstancedBufferAttribute(new Float32Array(HC), 3));
+    hg.setAttribute('iCol', new THREE.InstancedBufferAttribute(new Float32Array(HCl), 3));
     hg.instanceCount = halos.length;
     const haloMat = new THREE.ShaderMaterial({
       uniforms: { uFogK: { value: 0.45 } },
@@ -1125,11 +1377,11 @@
     haloMesh.frustumCulled = false;
     group.add(haloMesh);
 
-    /* the duct */
-    const duct = S.build(THREE, L.duct, { fog: fog, paths: opts.paths || [], accent: accent, warm: warm, inScale: opts.inScale, med: opts.med, lampGain: opts.lampGain });
+    /* the duct, with quiet mouths: no warm rim geometry, rim light dimmed */
+    const duct = S.build(THREE, L.duct, { fog: fog, paths: opts.paths || [], accent: accent, warm: warm, inScale: opts.inScale, med: opts.med, lampGain: opts.lampGain,
+      rimGain: opts.rimGain == null ? 0.25 : opts.rimGain, mouthRims: false });
     group.add(duct.group);
 
-    /* fans turn only near the pilot */
     const fanR = opts.fanRange == null ? 1500 : opts.fanRange;
     const fc = S.frameAt(L.duct, L.duct.length / 2).p;
     const update = function (t, cameraPos) {
@@ -1161,7 +1413,7 @@
   }
 
   globalThis.HikyakuPyramid = {
-    DEF: DEF, ACCENT: ACCENT, WARM: WARM,
+    DEF: DEF, ACCENT: ACCENT, WARM: WARM, FACE_IDS: FACE_IDS,
     makePyramid: makePyramid, toWorld: toWorld, toLocal: toLocal, dirWorld: dirWorld,
     contacts: contacts, boxesNear: boxesNear, clearance: clearance, flythrough: flythrough, portals: portals,
     inside: inside, bounds: bounds, fitCheck: fitCheck, boxDist: boxDist,
