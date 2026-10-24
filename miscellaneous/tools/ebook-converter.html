@@ -6666,6 +6666,70 @@
       };
     }
 
+    // ── Kindle layout ──────────────────────────────────────────────────────────
+    // A Kindle never breaks a page inside a table cell. A table cell taller
+    // than the screen is cut off, and paging can jump straight past it; the
+    // four-arrow pan icon in the middle of the page is the reader's hint
+    // that it treats the block as a table. Books in the LitRPG genre put whole
+    // character sheets into one-column tables used as a box, with single
+    // cells of several thousand characters. Such a table carries no tabular
+    // information, so it becomes plain blocks, with a rule where the box
+    // edges and row lines were. Tables with two or more columns stay tables.
+    const KL_TABLE_RE = /<table\b[^>]*>((?:(?!<table\b)[\s\S])*?)<\/table\s*>/gi;
+
+    function flattenTableHtml(inner) {
+      const body = inner
+        .replace(/<caption\b[^>]*>([\s\S]*?)<\/caption\s*>/gi, '<div>$1</div>')
+        .replace(/<\/?(?:thead|tbody|tfoot|colgroup)\b[^>]*>|<col\b[^>]*>/gi, '');
+      const rows = body.split(/<tr\b[^>]*>/i);
+      const lead = rows.shift();
+      const blocks = [];
+      if (/\S/.test(lead.replace(/<\/tr\s*>/gi, ''))) blocks.push(lead.replace(/<\/tr\s*>/gi, ''));
+      for (const r of rows) {
+        const cells = r.match(/<t[dh]\b[^>]*>/gi) || [];
+        if (cells.length > 1) return null;
+        if (cells.length && /\bcolspan\s*=\s*["']?\s*[2-9]/i.test(cells[0])) return null;
+        const content = r.replace(/<\/?t[dh]\b[^>]*>|<\/tr\s*>/gi, '').trim();
+        if (content) blocks.push('<div>' + content + '</div>');
+      }
+      if (!blocks.length) return '';
+      return '<hr/>' + blocks.join('<hr/>') + '<hr/>';
+    }
+
+    function flattenTables(html) {
+      let n = 0;
+      let prev;
+      // Innermost first, so a box nested inside a box comes apart too. A real
+      // table is parked behind a placeholder meanwhile, so the box around it
+      // can still go and the table itself survives.
+      const kept = [];
+      do {
+        prev = html;
+        html = html.replace(KL_TABLE_RE, function (m0, inner) {
+          const flat = flattenTableHtml(inner);
+          if (flat === null) { kept.push(m0); return '\u0000KLT' + (kept.length - 1) + '\u0000'; }
+          n++;
+          return flat;
+        });
+      } while (html !== prev);
+      html = html.replace(/\u0000KLT(\d+)\u0000/g, function (m0, i) { return kept[+i]; });
+      return { html: html, count: n };
+    }
+
+    function kindleLayout(book) {
+      let tables = 0;
+      const sections = book.sections.map(function (sec) {
+        if (!sec.html) return sec;
+        const t = flattenTables(sec.html);
+        tables += t.count;
+        return t.count ? Object.assign({}, sec, { html: t.html }) : sec;
+      });
+      return {
+        book: Object.assign({}, book, { sections: sections }),
+        counts: { tables: tables },
+      };
+    }
+
     function escapeRegExp(s) {
       return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
@@ -7737,6 +7801,11 @@
             const lang = opts.typography === 'auto' ? null : opts.typography;
             book = cleanTypography(book, lang).book;
           }
+          if (textOps && opts.kindle) {
+            const k = kindleLayout(book);
+            book = k.book;
+            if (k.counts.tables) entry.notes.push('Kindle layout: ' + k.counts.tables + ' tables');
+          }
           const rep = textOps ? opts.replace : null;
           if (rep && rep.query) {
             const r = bookReplace(book, rep.query, rep.replacement || '', rep);
@@ -7854,6 +7923,7 @@
       // book editing
       mapTextNodes: mapTextNodes, smartenHtml: smartenHtml,
       cleanTypography: cleanTypography, bookFind: bookFind, bookReplace: bookReplace,
+      flattenTables: flattenTables, kindleLayout: kindleLayout,
       escapeRegExp: escapeRegExp,
       tocHref: tocHref, tocSectionIndex: tocSectionIndex, normalizeToc: normalizeToc,
       tocPositions: tocPositions, tocWeights: tocWeights, textWeight: textWeight,
@@ -8312,6 +8382,7 @@
     function EditTools({ book, onBook, srcBytes }) {
       const [typoLang, setTypoLang] = useState('auto');
       const [typoMsg, setTypoMsg] = useState('');
+      const [kindleMsg, setKindleMsg] = useState('');
       const [query, setQuery] = useState('');
       const [replacement, setReplacement] = useState('');
       const [useRegex, setUseRegex] = useState(false);
@@ -8361,7 +8432,7 @@
       // Only the most recent action should be reporting; otherwise the panel
       // fills up with messages from things the user did minutes ago.
       const clearMessages = () => {
-        setTypoMsg(''); setSrMsg(null); setTocMsg(''); setCoverMsg('');
+        setTypoMsg(''); setKindleMsg(''); setSrMsg(null); setTocMsg(''); setCoverMsg('');
       };
 
       // Runs as soon as a MOBI arrives and again whenever a check is toggled or
@@ -8377,6 +8448,16 @@
       const repairable = diag ? diag.problems.filter((p) => p.fixable).length : 0;
       const repairStuck = !!diag && repairable < diag.problems.length;
 
+
+      const runKindle = () => {
+        clearMessages();
+        const r = Core.kindleLayout(book);
+        const c = r.counts;
+        if (c.tables > 0) onBook(r.book);
+        setKindleMsg(c.tables > 0
+          ? 'Turned ' + c.tables + (c.tables === 1 ? ' table' : ' tables') + ' into paragraphs.'
+          : 'Nothing to change: no one-column tables found.');
+      };
 
       const runTypo = () => {
         clearMessages();
@@ -8912,6 +8993,27 @@
           `}
         </details>
 
+        <details className="ec-edit">
+          <summary>
+            Kindle layout
+            <span className="ec-editnote">one-column tables</span>
+          </summary>
+
+          <p className="ec-edithelp">
+            A Kindle never breaks a page inside a table cell. Character sheets and status
+            boxes set as one-column tables get cut off or skipped when you page through them,
+            and the Kindle shows a four-arrow icon in their place. This turns such tables into
+            ordinary paragraphs, with a line where the box edges were. Tables with two or more
+            columns stay tables.
+          </p>
+          <div style=${{ marginBottom: 6 }}>
+            <button className="tool-btn tool-btn-sm" onClick=${runKindle}>Fix for Kindle</button>
+          </div>
+          ${kindleMsg && html`
+            <p style=${{ fontSize: 13, color: 'var(--tool-ok-text)', marginBottom: 6 }}>${kindleMsg}</p>
+          `}
+        </details>
+
         <!--
           Repair is hidden entirely for anything that is not a MOBI or AZW3,
           rather than shown greyed out. Every check inside it is about the Palm
@@ -9065,6 +9167,24 @@
                 <button key=${o[0] || 'off'}
                   className=${'lang-seg' + (opts.typo === o[0] ? ' active' : '')}
                   onClick=${() => set('typo', o[0])}>${o[1]}</button>
+              `)}
+            </div>
+          </details>
+
+          <details className="ec-edit">
+            <summary>
+              Kindle layout
+              <span className="ec-editnote">${opts.kindle ? 'runs on every file' : 'off'}</span>
+            </summary>
+            <p className="ec-edithelp">
+              Turns one-column tables, which a Kindle cannot break across pages, into
+              ordinary paragraphs.
+            </p>
+            <div className="seg-row" style=${{ display: 'flex', flexWrap: 'wrap' }}>
+              ${[[true, 'On'], [false, 'Off']].map((o) => html`
+                <button key=${String(o[0])}
+                  className=${'lang-seg' + (!!opts.kindle === o[0] ? ' active' : '')}
+                  onClick=${() => set('kindle', o[0])}>${o[1]}</button>
               `)}
             </div>
           </details>
@@ -9358,6 +9478,7 @@
         const opts = {
           repair: !!bopts.repair,
           typography: bopts.typo || null,
+          kindle: !!bopts.kindle,
           replace: bopts.query ? {
             query: bopts.query, replacement: bopts.replacement,
             regex: bopts.regex, matchCase: bopts.matchCase, wholeWord: bopts.wholeWord,
