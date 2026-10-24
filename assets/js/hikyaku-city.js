@@ -267,10 +267,14 @@
   /* City life constants (see holoPlace and beaconPlace in makeTile).
      HOLO_P: chance per tile at life rate 1. Only about 40 % of the tiles
      round a core have a candidate pair at all, so at liveliness 1 every
-     one of them gets its hologram: 31 to 42 of 81 tiles over three seeds,
-     one per 2 to 3 tiles; 16 to 19 at the default liveliness 0.6. HOLO_SAT: the hologram colour keeps this
+     one of them gets its hologram: 23 to 40 of 81 tiles over three seeds
+     (the full-width rule of 2026-10-25 needs one tier face per tower
+     over the quad's height), 14 to 23 at the default liveliness 0.6. HOLO_SAT: the hologram colour keeps this
      fraction of the HSV saturation of its neon hue (see holoRGB). */
   var HOLO_P = 1, HOLO_SAT = 0.45, HOLO_SIMILAR = 0.25, HOLO_GAP = [40, 120], HOLO_MIN_TOP = 120;
+  /* the quad spans the gap face to face, HOLO_INSET metres short of each
+     face; the ticker scrolls at HOLO_SPEED m/s */
+  var HOLO_INSET = 1.5, HOLO_SPEED = [3, 8], HOLO_CELLS = 64;
   var BEACON_TALL = 250;
   /* beacon and hologram light, sRGB numbers for the additive layers: the
      aviation red and the plant amber are small point lights, the only
@@ -982,7 +986,11 @@
     /* Holograms: rarely a floating billboard between two neighbouring
        towers of similar height (within HOLO_SIMILAR), whose facing tiers
        stand HOLO_GAP[0] to HOLO_GAP[1] apart with free air between, in the
-       upper third of the lower tower. One per tile at most, with chance
+       upper third of the lower tower. Since 2026-10-25 (owner: "das
+       Hologramm sollte jeweils die komplette Breite ueberspannen") the quad
+       spans the whole gap, HOLO_INSET short of each face, its side edges
+       running along one tier face of each tower over its full height, with
+       no yaw; it tilts only about its long axis. One per tile at most, with chance
        HOLO_P times the life rate; no candidate, no hologram. Out of the
        tube (every sample point Rm + 4 m from it), out of the lane bands,
        2 m clear of every box of the tile. No collision. */
@@ -1013,46 +1021,57 @@
         for (k = 0; k < boxes.length; k++) if (boxDist(boxes[k], q) < m) return false;
         return true;
       }
+      /* boxes of one building, for the edge check */
+      function nearG(q, g, d) {
+        for (var k = 0; k < boxes.length; k++) if (boxes[k].g === g && boxDist(boxes[k], q) <= d) return true;
+        return false;
+      }
       for (var tr = 0; tr < Math.min(pairs.length, 12) * 3; tr++) {
         var pr2 = pairs[(p0 + Math.floor(tr / 3)) % pairs.length], A = pr2[0], B = pr2[1];
         var Hm = Math.min(A.top, B.top);
-        var h = HR.range(15, 30), wt = HR.range(30, 60), tilt = HR.range(3, 9) * (HR.chance(0.5) ? 1 : -1) * Math.PI / 180;
-        var yaw = HR.range(-6, 6) * Math.PI / 180, u = HR(), v = HR();
+        var h = HR.range(15, 30), tilt = HR.range(3, 9) * (HR.chance(0.5) ? 1 : -1) * Math.PI / 180;
+        var u = HR(), v = HR();
         var ylo = Hm * 2 / 3 + h / 2 + 1, yhi = Hm - h / 2 - 4;
         if (yhi < ylo) continue;
-        var yc = ylo + (yhi - ylo) * u;
+        var yc = ylo + (yhi - ylo) * u, hy = h / 2 * Math.cos(tilt), hz = h / 2 * Math.abs(Math.sin(tilt));
+        /* the same tier of each tower over the whole height of the quad, so
+           both side edges run along one face from bottom to top */
         var ta = tierY(A, yc), tb = tierY(B, yc);
-        if (!ta || !tb) continue;
+        if (!ta || !tb || tierY(A, yc - hy - 1) !== ta || tierY(A, yc + hy + 1) !== ta ||
+          tierY(B, yc - hy - 1) !== tb || tierY(B, yc + hy + 1) !== tb) continue;
         var ox = Math.min(ta.x1, tb.x1) - Math.max(ta.x0, tb.x0), oz = Math.min(ta.z1, tb.z1) - Math.max(ta.z0, tb.z0);
         var gx = Math.max(tb.x0 - ta.x1, ta.x0 - tb.x1), gz = Math.max(tb.z0 - ta.z1, ta.z0 - tb.z1);
         var axis = -1, gap = 0, g0 = 0, o0 = 0, o1 = 0;
         if (oz >= 12 && gx >= HOLO_GAP[0] && gx <= HOLO_GAP[1]) { axis = 0; gap = gx; g0 = Math.min(ta.x1, tb.x1); o0 = Math.max(ta.z0, tb.z0); o1 = o0 + oz; }
         else if (ox >= 12 && gz >= HOLO_GAP[0] && gz <= HOLO_GAP[1]) { axis = 1; gap = gz; g0 = Math.min(ta.z1, tb.z1); o0 = Math.max(ta.x0, tb.x0); o1 = o0 + ox; }
         if (axis < 0) continue;
-        var w = Math.min(wt, gap - 10);
-        if (w < 30) continue;
-        var ac = g0 + gap / 2, cc = (o0 + o1) / 2 + (v - 0.5) * 0.5 * (o1 - o0);
+        /* full width: face to face, minus the inset on each side */
+        var w = gap - 2 * HOLO_INSET;
+        /* across the faces: the tilted quad leans hz to either side, and
+           both edges keep 2 m of face beyond that */
+        var cl = o0 + hz + 2, ch = o1 - hz - 2;
+        if (ch < cl) continue;
+        var ac = g0 + gap / 2, cc = (cl + ch) / 2 + (v - 0.5) * 0.5 * (ch - cl);
         var c = axis === 0 ? [ac, yc, cc] : [cc, yc, ac];
-        /* right: along the gap, yawed; n0 the horizontal normal; up tilted
-           about right, towards n0 */
-        var right = axis === 0 ? [Math.cos(yaw), 0, Math.sin(yaw)] : [Math.sin(yaw), 0, Math.cos(yaw)];
+        /* right: along the gap, no yaw (the edges stay parallel to the
+           faces); n0 the horizontal normal; up tilted about right */
+        var right = axis === 0 ? [1, 0, 0] : [0, 0, 1];
         var n0 = [-right[2], 0, right[0]];
         var up = [n0[0] * Math.sin(tilt), Math.cos(tilt), n0[2] * Math.sin(tilt)];
-        var hy = h / 2 * Math.cos(tilt);
         if (inLaneBand(yc - hy - 2, yc + hy + 2)) continue;
         var ok = true;
-        for (var a = 0; a <= 8 && ok; a++) for (var b = 0; b <= 4 && ok; b++) {
-          var su = (a / 8 - 0.5) * w, sv = (b / 4 - 0.5) * h;
-          ok = free([c[0] + right[0] * su + up[0] * sv, c[1] + up[1] * sv, c[2] + right[2] * su + up[2] * sv], 2);
-        }
-        /* free air across the whole gap at the centre height, face to face */
-        for (a = 1; a < 12 && ok; a++) {
-          var sg = (a / 12 - 0.5) * (gap - 2);
-          ok = free(axis === 0 ? [ac + sg, yc, cc] : [cc, yc, ac + sg], 0.5);
+        for (var a = 0; a <= 24 && ok; a++) for (var b = 0; b <= 8 && ok; b++) {
+          var su = (a / 24 - 0.5) * w, sv = (b / 8 - 0.5) * h;
+          var q = [c[0] + right[0] * su + up[0] * sv, c[1] + up[1] * sv, c[2] + right[2] * su + up[2] * sv];
+          ok = free(q, 0.9);
+          /* the side edges sit on the two towers */
+          if (ok && (a === 0 || a === 24)) ok = nearG(q, (g0 === (axis === 0 ? ta.x1 : ta.z1)) === (a === 0) ? A.g : B.g, HOLO_INSET + 0.3);
         }
         if (!ok) continue;
         out.push({ p: c, right: right, up: up, w: w, h: h, hue: nAcc === 1 ? 0 : HR.int(0, 1), sat: HOLO_SAT,
-          seed: HR(), a: A.g, b: B.g });
+          seed: HR(), a: A.g, b: B.g,
+          /* ticker: scroll speed in m/s and direction along right (+1 or -1) */
+          speed: HR.range(HOLO_SPEED[0], HOLO_SPEED[1]), dir: HR.chance(0.5) ? 1 : -1 });
         break;
       }
       return out;
@@ -1550,49 +1569,134 @@
      picture: no shimmer, no popping. The mean of program p for a
      building with seed s (facadeCover below, the same formula in GLSL):
 
-       cover_p = (1 - 2 mull_p - div_p / 2) (1 - sill_p - head_p)
-                 (1 - 1 / Nplant(s)) (1 - pierOn_p(s) / Npier(s))
-       emission = gain * M_p * cover_p * (1 - blank) (1 - cornice) (1 - crown)
-       diffuse  = 1 - 0.68 * window + k_p * bw_p * (1 - 1 / Nplant(s)) + cornice
+       cover = [(1 - 2 mull(s)) (1 - pierOn_p(s) / Npier(s))
+                - div(s) (1 / m(s) - pierOn_p(s) / lcm(m(s), Npier(s)))]
+               (1 - sill(s) - head(s)) (1 - 1 / Nplant(s))
+       emission = gain * M_p * T(s) * cover * (1 - blank) (1 - cornice) (1 - crown)
+       diffuse  = 1 + (G(s) - 1) * window + (F(s) - 1) * (1 - window)
+                    + k(s) * bw(s) * (1 - 1 / Nplant(s)) + cornice
 
-     with M_p the mean of LUT band p (windowLUT means[p]) and blank,
+     with every (s) a per building value from the program's range
+     (facadeParams: m the divider period 1, 2 or 3, T the lit colour of
+     luminance 1, G the glass, F the frame), M_p the mean of LUT band p (windowLUT means[p]) and blank,
      cornice, crown the box filtered coverage of the blind corners and
      stripe, the cornice storey and the lit crown band: those are bigger
      than a cell and are filtered over the pixel footprint exactly, so they
      keep their mean at every distance too. The diffuse terms add instead
      of multiplying, so the window and the spandrel band (disjoint in the
      cell, band below the sill) average without a cross term. */
+  /* Per building window character (2026-10-25, owner: windows "sehen
+     aktuell noch alle genau gleich aus"). Inside the fixed frame (3.6 m
+     storey, bone palette, the program's LUT band and so its lit share)
+     every building draws its own values from its seed, each from the
+     program's range [lo, hi]: bay width; mullion width; sill and head
+     (ribbon glazing with a low sill and a thin head, or punched windows
+     with a high sill and a deep head); the mullion pattern (single,
+     paired: a wider divider on every second mullion, or every third
+     wider; pPair and pThird are the shares, the rest is single); the
+     spandrel band's height and brightness (darker or lighter than the
+     wall); the glass brightness and a narrow cool to warm glass tint; the
+     frame brightness (the wall between the glass); and the colour
+     temperature of its lit windows (cool white offices, warm flats, pale
+     green-white industry, luminance kept at 1). Blind corners (cornerP)
+     were per building already. */
   var FACADE_PROGRAMS = [
-    { name: 'curtain', bay: [1.2, 1.6], mull: 0.06, sill: 0.30, head: 0.05, pierP: 0.35, plant: [12, 8],
-      cornerP: 0.25, coreP: 0.2, div: 0, bandW: 0.06, bandK: 0.45, lut: 0, grp: [2, 1] },
-    { name: 'residential', bay: [2.3, 2.5], mull: 0.14, sill: 0.36, head: 0.12, pierP: 0, plant: [16, 6],
-      cornerP: 0.55, coreP: 0.45, div: 0.22, bandW: 0.11, bandK: 0.8, lut: 1, grp: [4, 2] },
-    { name: 'industrial', bay: [3.2, 4.2], mull: 0.3, sill: 0.52, head: 0.16, pierP: 0.5, plant: [6, 4],
-      cornerP: 0.8, coreP: 0.6, div: 0, bandW: 0.22, bandK: 0.35, lut: 2, grp: [3, 1] },
-    { name: 'landmark', bay: [1.3, 1.5], mull: 0.05, sill: 0.28, head: 0.05, pierP: 0.6, plant: [10, 4],
-      cornerP: 0.5, coreP: 0, div: 0, bandW: 0.06, bandK: 0.5, lut: 3, grp: [2, 1] }
+    { name: 'curtain', bay: [1.1, 2.1], mull: [0.03, 0.09], sill: [0.16, 0.4], head: [0.03, 0.12],
+      div: 0.16, pPair: 0.25, pThird: 0.2, bandW: [0.04, 0.14], bandK: [-0.3, 0.6],
+      pierP: 0.35, plant: [12, 8], cornerP: 0.3, coreP: 0.2, lut: 0, grp: [[1, 4], [1, 1]],
+      lit: [[0.78, 0.97, 1.4], [1.0, 1.0, 1.0]] },
+    { name: 'residential', bay: [1.6, 2.8], mull: [0.07, 0.18], sill: [0.28, 0.48], head: [0.07, 0.18],
+      div: 0.22, pPair: 0.45, pThird: 0.25, bandW: [0.06, 0.24], bandK: [0, 0.9],
+      pierP: 0, plant: [16, 6], cornerP: 0.5, coreP: 0.45, lut: 1, grp: [[2, 4], [1, 2]],
+      lit: [[1.36, 0.94, 0.52], [1.06, 1.0, 0.88]] },
+    { name: 'industrial', bay: [2.6, 4.4], mull: [0.14, 0.32], sill: [0.4, 0.62], head: [0.1, 0.22],
+      div: 0.28, pPair: 0.3, pThird: 0.3, bandW: [0.12, 0.32], bandK: [-0.25, 0.5],
+      pierP: 0.5, plant: [6, 4], cornerP: 0.75, coreP: 0.6, lut: 2, grp: [[2, 5], [1, 1]],
+      lit: [[0.8, 1.1, 0.82], [0.95, 1.03, 1.06]] },
+    { name: 'landmark', bay: [1.2, 1.7], mull: [0.035, 0.07], sill: [0.2, 0.32], head: [0.04, 0.08],
+      div: 0.12, pPair: 0.3, pThird: 0.3, bandW: [0.04, 0.12], bandK: [0.2, 0.7],
+      pierP: 0.6, plant: [10, 4], cornerP: 0.5, coreP: 0, lut: 3, grp: [[1, 3], [1, 1]],
+      lit: [[0.88, 0.98, 1.2], [1.06, 1.0, 0.9]] }
   ];
+  /* glass brightness as a fraction of the wall tone (the old fixed value
+     was 0.32), the two ends of the glass tint, the frame brightness */
+  var FAC_GLASS = [0.22, 0.42], FAC_TINT = [[0.93, 0.99, 1.08], [1.07, 1.0, 0.9]], FAC_FRAME = [0.82, 1.2];
+  /* the glow of the unlit glass (the LUT's dim texels), per building:
+     from nearly black panes to a faint grid that shows the window
+     pattern in the dark. Skewed towards dark glass, gain = lo + (hi -
+     lo) h^2 for a uniform hash h: mean lo + (hi - lo) / 3 = 1, so the
+     city's far brightness stays (the unlit texels carry 15 to 50 % of a
+     band's mean) */
+  var FAC_DIM = [0.2, 2.6];
+  /* lit colours scaled to luminance 1 (Rec. 709), so a temperature never
+     makes a building brighter or darker */
+  function lumOne(c) { var l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; return [c[0] / l, c[1] / l, c[2] / l]; }
+  function glv(c) { return c.map(function (v) { return v.toFixed(3); }).join(', '); }
   function fract(x) { return x - Math.floor(x); }
-  /* Per building values of a program, as the shader derives them from the
-     seed s (fract of products, the same constants as FACADE_FRAG). */
-  function facadeParams(p, s) {
-    var P = FACADE_PROGRAMS[p];
-    var pierOn = fract(s * 2.9) < P.pierP ? 1 : 0;
-    return { P: P, pierOn: pierOn, pierN: 3 + Math.floor(fract(s * 5.3) * 4),
-      plantN: P.plant[0] + Math.floor(fract(s * 8.7) * P.plant[1]), plantOff: Math.floor(s * 37) };
+  /* The per building hashes: fract(s * K) in float32, as the shader
+     computes fract(vSeed * K) (the seed reaches the fragment stage as a
+     flat varying, so no new attribute). Large, unrelated K give values
+     that are independent in practice; the old constants (2.9, 5.3, 8.7,
+     13.37, 37, 53, 97) keep their roles. */
+  var FAC_K = [137.31, 271.93, 389.17, 521.71, 643.37, 787.13, 911.57, 1049.31, 1181.93, 1307.77, 1453.11, 1597.29, 1733.41, 1871.63];
+  var FH = { bay: 0, mull: 1, sill: 2, head: 3, pat: 4, bandW: 5, bandK: 6, glass: 7, tint: 8, frame: 9, lit: 10, dim: 11, grpX: 12, grpY: 13 };
+  function facHash(s, k) { var f = Math.fround, v = f(f(s) * f(FAC_K[k])); return v - Math.floor(v); }
+  function facHashGL(k) { return 'fract(vSeed * ' + FAC_K[k].toFixed(2) + ')'; }
+  function mixR(r, t) { return r[0] + (r[1] - r[0]) * t; }
+  /* the building's window group, gx bays by gy storeys per LUT texel */
+  function facGrp(P, s) {
+    return [P.grp[0][0] + Math.floor(facHash(s, FH.grpX) * (P.grp[0][1] - P.grp[0][0] + 1)),
+      P.grp[1][0] + Math.floor(facHash(s, FH.grpY) * (P.grp[1][1] - P.grp[1][0] + 1))];
   }
-  /* The far value of the window coverage, program p, seed s. */
+  /* Per building values of a program, as the shader derives them from the
+     seed s (FACADE_FRAG uses the same hashes and the same formulas). */
+  /* the cell geometry alone (what facadeCover and facadeNear need) */
+  function facadeGeom(p, s) {
+    var P = FACADE_PROGRAMS[p];
+    var hp = facHash(s, FH.pat), m = hp < P.pPair ? 2 : (hp < P.pPair + P.pThird ? 3 : 1);
+    return { P: P, pierOn: fract(s * 2.9) < P.pierP ? 1 : 0, pierN: 3 + Math.floor(fract(s * 5.3) * 4),
+      plantN: P.plant[0] + Math.floor(fract(s * 8.7) * P.plant[1]), plantOff: Math.floor(s * 37),
+      bay: mixR(P.bay, facHash(s, FH.bay)), mull: mixR(P.mull, facHash(s, FH.mull)),
+      sill: mixR(P.sill, facHash(s, FH.sill)), head: mixR(P.head, facHash(s, FH.head)),
+      pattern: m, div: m > 1 ? P.div : 0 };
+  }
+  function facadeParams(p, s) {
+    var q = facadeGeom(p, s), P = q.P;
+    var tl = facHash(s, FH.lit), A = lumOne(P.lit[0]), B = lumOne(P.lit[1]);
+    var tg = facHash(s, FH.tint), ga = mixR(FAC_GLASS, facHash(s, FH.glass));
+    return Object.assign(q, {
+      bandW: mixR(P.bandW, facHash(s, FH.bandW)), bandK: mixR(P.bandK, facHash(s, FH.bandK)),
+      glass: [0, 1, 2].map(function (j) { return ga * mixR([FAC_TINT[0][j], FAC_TINT[1][j]], tg); }),
+      frame: mixR(FAC_FRAME, facHash(s, FH.frame)),
+      lit: [0, 1, 2].map(function (j) { return A[j] + (B[j] - A[j]) * tl; }),
+      dim: [0, 1, 2].map(function (j) { var hd = facHash(s, FH.dim); return mixR(FAC_DIM, hd * hd) * mixR([FAC_TINT[0][j], FAC_TINT[1][j]], tg); }),
+      grp: facGrp(P, s),
+      corner: fract(s * 13.37 + 0.31) < P.cornerP ? 1 : 0 });
+  }
+  /* The far value of the window coverage, program p, seed s: the mean of
+     facadeNear over the cell grid, with the building's own values. */
   function facadeCover(p, s) {
-    var q = facadeParams(p, s), P = q.P;
-    return (1 - 2 * P.mull - P.div / 2) * (1 - P.sill - P.head) * (1 - 1 / q.plantN) * (1 - q.pierOn / q.pierN);
+    var q = facadeGeom(p, s), m = q.pattern, n = q.pierN;
+    /* a divider on a pier bay is hidden by the pier: the two coincide on
+       one bay in lcm(m, n) */
+    var lcm = m * n / (n % m === 0 ? m : 1);
+    var xs = (1 - 2 * q.mull) * (1 - q.pierOn / n) - q.div * (1 / m - q.pierOn / lcm);
+    return xs * (1 - q.sill - q.head) * (1 - 1 / q.plantN);
+  }
+  /* The far light of a window of building s, program p, from the LUT
+     part means L.parts (windowLUT): what FACADE_FRAG blends to (lutF),
+     and the expectation of the near value over the band's texels. */
+  function facadeLight(p, s, L) {
+    var q = facadeParams(p, s), P = q.P, m = L.parts[P.lut];
+    return [0, 1, 2].map(function (j) { return m[2][j] * q.lit[j] + m[1][j] + m[0][j] * q.dim[j]; });
   }
   /* The near window coverage at cell coordinates (gx bays, gy storeys),
      hard edged, as FACADE_FRAG draws it at aa = 0 (for the test that the
      mean of the one is the other). */
   function facadeNear(p, s, gx, gy) {
-    var q = facadeParams(p, s), P = q.P, cx = Math.floor(gx), cy = Math.floor(gy), fx = gx - cx, fy = gy - cy;
-    var axl = P.mull + P.div * (((cx % 2) + 2) % 2 === 0 ? 1 : 0);
-    var wx = fx > axl && fx < 1 - P.mull ? 1 : 0, wy = fy > P.sill && fy < 1 - P.head ? 1 : 0;
+    var q = facadeGeom(p, s), cx = Math.floor(gx), cy = Math.floor(gy), fx = gx - cx, fy = gy - cy;
+    var axl = q.mull + q.div * (gmod(cx, q.pattern) < 0.5 ? 1 : 0);
+    var wx = fx > axl && fx < 1 - q.mull ? 1 : 0, wy = fy > q.sill && fy < 1 - q.head ? 1 : 0;
     var plant = (((cy + q.plantOff) % q.plantN) + q.plantN) % q.plantN === 0 ? 1 : 0;
     var pier = q.pierOn && ((cx % q.pierN) + q.pierN) % q.pierN === 0 ? 1 : 0;
     return wx * wy * (1 - plant) * (1 - pier);
@@ -1635,9 +1739,9 @@
      fi of a building with seed s, program p, at time t and life speed
      life (epochs per second), LUT size 64 as the renderer builds it. */
   function facadeTexel(p, s, fi, cx, cy, t, life) {
-    var P = FACADE_PROGRAMS[p], size = 64;
-    var sx = Math.floor(cx / P.grp[0]) + Math.floor(s * 53) + fi * 17;
-    var sy = Math.floor(cy / P.grp[1]) + Math.floor(s * 97) + fi * 5;
+    var P = FACADE_PROGRAMS[p], size = 64, G = facGrp(P, s);
+    var sx = Math.floor(cx / G[0]) + Math.floor(s * 53) + fi * 17;
+    var sy = Math.floor(cy / G[1]) + Math.floor(s * 97) + fi * 5;
     var perFl = P.lut === 0 || P.lut === 3 ? 1 : 0;
     var hl = fract(Math.sin(sx * (1 - perFl) * 12.9898 + sy * 78.233 + s * 37.1 + fi * 3.3) * 43758.5453);
     var ep = Math.floor(t * life * (0.7 + 0.6 * hl) + hl);
@@ -1652,7 +1756,7 @@
     '  float plain = step(3.5, code) * step(code, 4.5);',
     '  float crown = step(4.5, code);',
     '  int pr = int(min(code, 3.0) + 0.5);',
-    '  vec4 PA = uProgA[pr], PB = uProgB[pr], PC = uProgC[pr], PD = uProgD[pr];',
+    '  vec4 PA = uProgA[pr], PB = uProgB[pr], PC = uProgC[pr], PD = uProgD[pr], PE = uProgE[pr], PF = uProgF[pr], PG = uProgG[pr];',
     '  float W = vFac.x, top = vFac.y, u = vFacU, y = vCgWPos.y;',
     '  float fi = abs(n.x) > 0.5 ? (n.x > 0.0 ? 0.0 : 1.0) : (n.z > 0.0 ? 2.0 : 3.0);',
     /* hb per building (corners), hf per face (the core stripe) */
@@ -1661,24 +1765,30 @@
     '  float cw = step(hb, PC.x) * mix(4.0, 12.0, fract(hb * 7.77));',
     '  cw *= step(2.0 * cw + 10.0, W);',
     '  float span = max(W - 2.0 * cw, 1.0);',
-    '  float bayN = mix(PA.x, PA.y, fract(vSeed * 7.13));',
+    '  float bayN = mix(PA.x, PA.y, ' + facHashGL(FH.bay) + ');',
     '  float nb = max(1.0, floor(span / bayN + 0.5));',
     '  vec2 g = vec2((u - cw) * nb / span, y / uStorey);',
     '  vec2 cid = floor(g);',
     '  vec2 f = fract(g);',
     '  vec2 fw = max(fwidth(g), vec2(1e-4));',
-    '  float ax = PA.z, sill = PA.w, head = PB.x;',
-    /* the residential divider: a wider mullion on every even bay */
-    '  float axl = ax + PC.z * step(mod(cid.x, 2.0), 0.5);',
+    /* the building's own window character (facadeParams) */
+    '  float ax = mix(PA.z, PA.w, ' + facHashGL(FH.mull) + ');',
+    '  float sill = mix(PB.x, PB.y, ' + facHashGL(FH.sill) + '), head = mix(PB.z, PB.w, ' + facHashGL(FH.head) + ');',
+    '  float hp = ' + facHashGL(FH.pat) + ';',
+    '  float pm = hp < PC.w ? 2.0 : (hp < PC.w + PD.w ? 3.0 : 1.0);',
+    '  float dv = PC.z * step(1.5, pm);',
+    /* the divider: a wider mullion on every second or third bay */
+    '  float axl = ax + dv * step(mod(cid.x, pm), 0.5);',
     '  float wx = smoothstep(axl - fw.x, axl + fw.x, f.x) * (1.0 - smoothstep(1.0 - ax - fw.x, 1.0 - ax + fw.x, f.x));',
     '  float wy = smoothstep(sill - fw.y, sill + fw.y, f.y) * (1.0 - smoothstep(1.0 - head - fw.y, 1.0 - head + fw.y, f.y));',
-    '  float pierOn = step(fract(vSeed * 2.9), PB.y - 1e-4);',
+    '  float pierOn = step(fract(vSeed * 2.9), PF.x - 1e-4);',
     '  float pierN = 3.0 + floor(fract(vSeed * 5.3) * 4.0);',
-    '  float plantN = PB.z + floor(fract(vSeed * 8.7) * PB.w);',
+    '  float plantN = PF.y + floor(fract(vSeed * 8.7) * PF.z);',
     '  float plant = step(mod(cid.y + floor(vSeed * 37.0), plantN), 0.5) * step(3.0, cid.y);',
     '  float pier = pierOn * step(mod(cid.x, pierN), 0.5);',
     /* the far mean of this program: facadeCover in the JavaScript */
-    '  float cover = (1.0 - 2.0 * ax - 0.5 * PC.z) * (1.0 - sill - head) * (1.0 - 1.0 / plantN) * (1.0 - pierOn / pierN);',
+    '  float lcm = pm * pierN / (mod(pierN, pm) < 0.5 ? pm : 1.0);',
+    '  float cover = ((1.0 - 2.0 * ax) * (1.0 - pierOn / pierN) - dv * (1.0 / pm - pierOn / lcm)) * (1.0 - sill - head) * (1.0 - 1.0 / plantN);',
     '  float aa = clamp(max(fw.x, fw.y) * 1.2 - 0.2, 0.0, 1.0);',
     '  float win = mix(wx * wy * (1.0 - plant) * (1.0 - pier), cover, aa);',
     /* blind corners, the one core stripe, the cornice storey and the
@@ -1692,19 +1802,35 @@
     '  float corn = cgCov(top - uStorey, top, y, fy) * (1.0 - crown) * (1.0 - plain);',
     '  float crownB = crown * cgCov(top - 2.0 * uStorey, top, y, fy);',
     '  win *= (1.0 - blank) * (1.0 - corn) * (1.0 - crownB) * (1.0 - plain);',
-    '  vec2 sid = floor(cid / PD.yz) + floor(vec2(vSeed * 53.0, vSeed * 97.0)) + vec2(fi * 17.0, fi * 5.0);',
+    /* the building's window group: gx bays by gy storeys share a texel */
+    '  vec2 grp = PG.xz + floor(vec2(' + facHashGL(FH.grpX) + ', ' + facHashGL(FH.grpY) + ') * (PG.yw - PG.xz + 1.0));',
+    '  vec2 sid = floor(cid / grp) + floor(vec2(vSeed * 53.0, vSeed * 97.0)) + vec2(fi * 17.0, fi * 5.0);',
     /* window life: a time-shifted re-draw from the same band (facadeTexel) */
     '  float perFl = 1.0 - step(0.5, PD.x) * step(PD.x, 2.5);',
     '  float hl = fract(sin(sid.x * (1.0 - perFl) * 12.9898 + sid.y * 78.233 + vSeed * 37.1 + fi * 3.3) * 43758.5453);',
     '  sid += floor(uTime * uLife * (0.7 + 0.6 * hl) + hl) * vec2(23.0, 7.0);',
     '  vec2 tc = vec2(mod(sid.x, uLutSize) + 0.5, PD.x * 16.0 + mod(sid.y, 16.0) + 0.5) / uLutSize;',
-    '  vec3 lut = mix(texture2D(uLUT, tc).rgb * 2.0, uLutMean[pr], aa);',
+    /* the building's light: lit windows in its colour temperature (T,
+       luminance 1), unlit glass glowing with its own gain and tint (D),
+       neon accents as they are. Linear in the texel classes, so the far
+       value is the class means weighted the same way. */
+    '  vec3 litT = mix(uLitA[pr], uLitB[pr], ' + facHashGL(FH.lit) + ');',
+    '  float hd = ' + facHashGL(FH.dim) + ';',
+    '  vec3 dimD = mix(' + FAC_DIM[0].toFixed(3) + ', ' + FAC_DIM[1].toFixed(3) + ', hd * hd) * mix(vec3(' + glv(FAC_TINT[0]) + '), vec3(' + glv(FAC_TINT[1]) + '), ' + facHashGL(FH.tint) + ');',
+    '  vec4 tx = texture2D(uLUT, tc);',
+    '  float cLit = step(0.75, tx.a), cAcc = step(0.25, tx.a) * (1.0 - cLit);',
+    '  vec3 lutN = tx.rgb * 2.0 * (cLit * litT + cAcc + (1.0 - cLit - cAcc) * dimD);',
+    '  vec3 lutF = uLutLit[pr] * litT + uLutAcc[pr] + uLutDim[pr] * dimD;',
+    '  vec3 lut = mix(lutN, lutF, aa);',
     /* spandrel band at the foot of each storey, lighter than the wall: the
        storey lines read where no window is lit */
-    '  float bw = PC.w;',
+    '  float bw = mix(PE.x, PE.y, ' + facHashGL(FH.bandW) + '), kb = mix(PE.z, PE.w, ' + facHashGL(FH.bandK) + ');',
     '  float band = (1.0 - smoothstep(bw - fw.y, bw + fw.y, f.y)) * (1.0 - plant);',
     '  float bandP = mix(band, bw * (1.0 - 1.0 / plantN), aa) * (1.0 - plain);',
-    '  diffuseColor.rgb *= 1.0 + wall * (PD.w * bandP + 1.0 * corn - 0.68 * win);',
+    /* glass and frame: linear in win, so the far mean is the near mean */
+    '  vec3 glass = mix(' + FAC_GLASS[0].toFixed(3) + ', ' + FAC_GLASS[1].toFixed(3) + ', ' + facHashGL(FH.glass) + ') * mix(vec3(' + glv(FAC_TINT[0]) + '), vec3(' + glv(FAC_TINT[1]) + '), ' + facHashGL(FH.tint) + ');',
+    '  float frame = mix(' + FAC_FRAME[0].toFixed(3) + ', ' + FAC_FRAME[1].toFixed(3) + ', ' + facHashGL(FH.frame) + ');',
+    '  diffuseColor.rgb *= 1.0 + wall * (kb * bandP + corn + (1.0 - plain) * ((frame - 1.0) * (1.0 - win) + (glass - 1.0) * win));',
     '  diffuseColor.rgb *= mix(uRoofDark, 1.0, wall);',
     '  {',
     '    vec2 rp = vCgWPos.xz / 6.0;',
@@ -1726,7 +1852,7 @@
     '}'
   ].join('\n');
   var FACADE_DECL = 'varying vec3 vCgWNrm; flat varying float vSeed; varying float vFacU; flat varying vec3 vFac;\n' +
-    'uniform sampler2D uLUT; uniform vec3 uLutMean[4]; uniform vec4 uProgA[4]; uniform vec4 uProgB[4]; uniform vec4 uProgC[4]; uniform vec4 uProgD[4];\n' +
+    'uniform sampler2D uLUT; uniform vec3 uLutLit[4]; uniform vec3 uLutAcc[4]; uniform vec3 uLutDim[4]; uniform vec4 uProgA[4]; uniform vec4 uProgB[4]; uniform vec4 uProgC[4]; uniform vec4 uProgD[4]; uniform vec4 uProgE[4]; uniform vec4 uProgF[4]; uniform vec4 uProgG[4]; uniform vec3 uLitA[4]; uniform vec3 uLitB[4];\n' +
     'uniform float uStorey; uniform float uWinGain; uniform float uLutSize; uniform float uRoofDark;\n' +
     'uniform float uTime; uniform float uLife; uniform float uBreath;\n' +
     'float cgCov(float a, float b, float x, float w){ return clamp((min(b, x + 0.5 * w) - max(a, x - 0.5 * w)) / w, 0.0, 1.0); }\n';
@@ -1745,11 +1871,14 @@
      clustered by floor, a muted warm share, a few accent windows. With
      o.bands the rows are cut into bands of size / bands.length rows, each
      with its own parameters. Returns the texel bytes, the overall mean and
-     the mean of each band, as the shader reads them (x 2, linear). */
+     the mean of each band, as the shader reads them (x 2, linear), and
+     the same means split by texel class (unlit, accent, lit, stored in
+     the alpha byte), because a building scales its lit and its unlit
+     windows separately (FACADE_FRAG). */
   function windowLUT(seed, o) {
     var size = o.size || 64, bands = o.bands || [o], nb = bands.length, rows = size / nb;
     var accents = o.accents || [];
-    var R = rng(seed), data = new Uint8Array(size * size * 4), sum = [0, 0, 0], bs = [];
+    var R = rng(seed), data = new Uint8Array(size * size * 4), sum = [0, 0, 0], bs = [], ps = [];
     for (var y = 0; y < size; y++) {
       var bi = Math.min(nb - 1, Math.floor(y / rows)), B = bands[bi];
       if (!bs[bi]) bs[bi] = [0, 0, 0];
@@ -1757,12 +1886,14 @@
       var rl = B.rowLen || [4, 20], warm = B.warm == null ? 0.25 : B.warm, accentRate = B.accentRate == null ? 0.0015 : B.accentRate;
       var rowOn = R() < rowLit, rowStart = R.int(0, size), rowLen = R.int(rl[0], rl[1]);
       for (var x = 0; x < size; x++) {
-        var i = (y * size + x) * 4, c, r = R();
+        var i = (y * size + x) * 4, c, r = R(), cls = 0;
         var inRow = rowOn && ((x - rowStart + size) % size) < rowLen;
         if (accents.length && r < accentRate) {
           var a = accents[Math.floor(R() * accents.length)];
           c = [a[0] * 0.8, a[1] * 0.8, a[2] * 0.8];
+          cls = 1;
         } else if (r < lit || (inRow && R() < 0.8)) {
+          cls = 2;
           c = boneRGB(R.range(0.55, 0.95));
           if (R() < warm) c = [c[0], c[1] * 0.88, c[2] * 0.7];
           var k = R.range(0.5, 1.0);
@@ -1778,14 +1909,21 @@
           /* the texture is sRGB; the shader sees linear values */
           var lv = toLin(byte / 255) * 2;
           sum[j] += lv; bs[bi][j] += lv;
+          if (!ps[bi]) ps[bi] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+          ps[bi][cls][j] += lv;
         }
-        data[i + 3] = 255;
+        /* alpha: the texel's class, 0 unlit, 128 neon accent, 255 lit */
+        data[i + 3] = LUT_ALPHA[cls];
       }
     }
     var nn = size * size, per = rows * size;
     return { data: data, size: size, mean: [sum[0] / nn, sum[1] / nn, sum[2] / nn],
-      means: bs.map(function (m) { return [m[0] / per, m[1] / per, m[2] / per]; }) };
+      means: bs.map(function (m) { return [m[0] / per, m[1] / per, m[2] / per]; }),
+      /* per band the share of the mean from each class: parts[b][cls],
+         cls 0 unlit, 1 accent, 2 lit; the three add up to means[b] */
+      parts: ps.map(function (q) { return q.map(function (m) { return [m[0] / per, m[1] / per, m[2] / per]; }); }) };
   }
+  var LUT_ALPHA = [0, 128, 255];
 
   /* The sky: the atmosphere model for a ray that never ends (see makeFog),
      the overcast deck behind it. At the horizon and below it the ray is
@@ -1929,12 +2067,19 @@
       uniforms: {
         uTime: timeU, uLife: lifeU, uBreath: breathU,
         uLUT: { value: lutTex }, uLutSize: { value: L.size },
-        uLutMean: { value: L.means.map(function (m) { return new THREE.Vector3(m[0], m[1], m[2]); }) },
+        uLutDim: { value: L.parts.map(function (q) { return new THREE.Vector3(q[0][0], q[0][1], q[0][2]); }) },
+        uLutAcc: { value: L.parts.map(function (q) { return new THREE.Vector3(q[1][0], q[1][1], q[1][2]); }) },
+        uLutLit: { value: L.parts.map(function (q) { return new THREE.Vector3(q[2][0], q[2][1], q[2][2]); }) },
         uStorey: { value: STOREY },
-        uProgA: { value: progVec(function (P) { return [P.bay[0], P.bay[1], P.mull, P.sill]; }) },
-        uProgB: { value: progVec(function (P) { return [P.head, P.pierP, P.plant[0], P.plant[1]]; }) },
-        uProgC: { value: progVec(function (P) { return [P.cornerP, P.coreP, P.div, P.bandW]; }) },
-        uProgD: { value: progVec(function (P) { return [P.lut, P.grp[0], P.grp[1], P.bandK]; }) },
+        uProgA: { value: progVec(function (P) { return [P.bay[0], P.bay[1], P.mull[0], P.mull[1]]; }) },
+        uProgB: { value: progVec(function (P) { return [P.sill[0], P.sill[1], P.head[0], P.head[1]]; }) },
+        uProgC: { value: progVec(function (P) { return [P.cornerP, P.coreP, P.div, P.pPair]; }) },
+        uProgD: { value: progVec(function (P) { return [P.lut, 0, 0, P.pThird]; }) },
+        uProgE: { value: progVec(function (P) { return [P.bandW[0], P.bandW[1], P.bandK[0], P.bandK[1]]; }) },
+        uProgF: { value: progVec(function (P) { return [P.pierP, P.plant[0], P.plant[1], 0]; }) },
+        uProgG: { value: progVec(function (P) { return [P.grp[0][0], P.grp[0][1], P.grp[1][0], P.grp[1][1]]; }) },
+        uLitA: { value: FACADE_PROGRAMS.map(function (P) { var c = lumOne(P.lit[0]); return new THREE.Vector3(c[0], c[1], c[2]); }) },
+        uLitB: { value: FACADE_PROGRAMS.map(function (P) { var c = lumOne(P.lit[1]); return new THREE.Vector3(c[0], c[1], c[2]); }) },
         uWinGain: { value: o.winGain == null ? 1.6 : o.winGain }, uRoofDark: { value: 0.8 }
       }
     };
@@ -2044,53 +2189,72 @@
     });
 
     /* holograms: one additive, translucent quad per tile hologram, all in
-       one buffer. Placeholder content until the sign atlas comes: rows of
-       bands and blocky glyph rectangles that drift sideways (each row its
-       own slow speed, alternating direction), a highlight bar sweeping
-       across every 6 to 10 s, scanlines every 0.6 m creeping upward, a
-       slow wobble and rare 1/8 s dropouts. Everything a closed formula of
-       uTime. Pastel colour (holoRGB, HOLO_SAT), additive, so it reads as
-       light in the air, not as a panel; it fades with the fog like the
-       glows, and the detail averages out with distance (no shimmer). */
+       one buffer, spanning the gap between two towers. The content is a
+       ticker (2026-10-25, owner: in films such a sign scrolls sideways):
+       one band of blocky glyphs, 4 x 5 pseudo pixels per glyph with word
+       gaps and the odd solid logo block, between two dashed bars, the
+       whole band moving along the quad at aTick m/s (3 to 8, sign the
+       direction, both from the tile hash). The pattern repeats every
+       HOLO_CELLS glyph cells and the scroll offset is taken modulo that
+       period, so the wrap is seamless and float precision never drifts
+       with t. On top: a highlight bar sweeping across every 6 to 10 s,
+       scanlines every 0.6 m creeping upward, a slow wobble and rare 1/8 s
+       dropouts. Everything a closed formula of uTime. Pastel colour
+       (holoRGB, HOLO_SAT), additive, so it reads as light in the air, not
+       as a panel; it fades with the fog like the glows, and the glyph
+       detail averages out with distance (no shimmer). */
     var holoMat = new THREE.ShaderMaterial({
       uniforms: Object.assign({ uFogK: { value: 0.55 }, uTime: timeU }, fog.uniforms),
       vertexShader: [
         FOG_DECL, 'uniform float uFogK;',
-        'attribute vec2 aUv; attribute vec3 aCol; attribute vec2 aSize; attribute float aSeed;',
-        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed;',
+        'attribute vec2 aUv; attribute vec3 aCol; attribute vec2 aSize; attribute float aSeed; attribute float aTick;',
+        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed; flat varying float vTick;',
         'void main(){',
-        '  vUv = aUv; vSize = aSize; vSeed = aSeed;',
+        '  vUv = aUv; vSize = aSize; vSeed = aSeed; vTick = aTick;',
         '  vCol = aCol * (1.0 - cgFogAmt(position, uFogK));',
         '  gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0);',
         '}'].join('\n'),
       fragmentShader: [
         'uniform float uTime;',
-        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed;',
+        'varying vec2 vUv; varying vec3 vCol; varying vec2 vSize; flat varying float vSeed; flat varying float vTick;',
         'float hh(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233)) + vSeed * 61.3) * 43758.5453); }',
         'void main(){',
         '  float t = uTime;',
         '  vec2 p = vUv * vSize;',
         '  float e = min(min(p.x, vSize.x - p.x), min(p.y, vSize.y - p.y));',
-        '  float edge = smoothstep(0.0, 2.0, e);',
-        '  float frame = exp(-pow((e - 0.7) / 0.3, 2.0));',
-        '  float rh = vSize.y / 5.0, ri = floor(p.y / rh), fy = fract(p.y / rh);',
-        '  float sp = (0.6 + 1.0 * hh(vec2(ri, 1.0))) * (mod(ri, 2.0) < 0.5 ? 1.0 : -1.0);',
-        '  float x = p.x + t * sp, cw = rh * 0.75, ci = floor(x / cw), fx = fract(x / cw);',
-        '  float band = step(hh(vec2(ri, 2.0)), 0.3);',
-        '  float g = step(0.35, hh(vec2(ci, ri))) * step(0.14, fx) * step(fx, 0.86) * step(0.2, fy) * step(fy, 0.8);',
-        '  g *= 1.0 - step(0.5, hh(vec2(ci, ri + 9.0))) * step(0.42, fx) * step(fx, 0.6) * step(0.5, fy);',
-        '  float bnd = step(0.18, fy) * step(fy, 0.82) * (0.45 + 0.15 * sin(t * 0.9 + ri * 2.1));',
-        '  float content = mix(g, bnd, band);',
-        '  float fw = max(fwidth(x / cw), fwidth(p.y / rh));',
-        '  content = mix(content, 0.3, clamp(fw * 2.0 - 0.3, 0.0, 1.0));',
-        '  float per = 6.0 + 4.0 * fract(vSeed * 7.1);',
-        '  float bx = (fract(t / per + vSeed) * 1.4 - 0.2) * vSize.x;',
+        '  float edge = smoothstep(0.0, 1.5, e);',
+        '  float frame = exp(-pow((e - 0.6) / 0.3, 2.0));',
+        '  float v = vUv.y;',
+        /* glyph cell: 0.72 of the glyph row high, the row 0.5 of the quad */
+        '  float rh = vSize.y * 0.5, cw = rh * 0.72, per = ' + HOLO_CELLS.toFixed(1) + ' * cw;',
+        '  float x = mod(p.x - mod(vTick * t, per), per);',
+        '  float xc = x / cw, ci = floor(xc), fx = fract(xc);',
+        '  float gy = (v - 0.25) / 0.5, inRow = step(0.0, gy) * step(gy, 1.0);',
+        '  float gap = step(hh(vec2(ci, 3.0)), 0.16);',
+        '  float logo = step(hh(vec2(ci, 4.0)), 0.07) * (1.0 - gap);',
+        '  float px = floor(clamp((fx - 0.12) / 0.76, 0.0, 0.999) * 4.0), py = floor(clamp(gy, 0.0, 0.999) * 5.0);',
+        '  float inG = step(0.12, fx) * step(fx, 0.88);',
+        '  float pix = step(0.45, hh(vec2(ci * 7.0 + px, py + 11.0)));',
+        '  float pg = fract(clamp((fx - 0.12) / 0.76, 0.0, 0.999) * 4.0), pv = fract(clamp(gy, 0.0, 0.999) * 5.0);',
+        '  pix *= step(0.1, pg) * step(pg, 0.9) * step(0.1, pv) * step(pv, 0.9);',
+        '  float glyph = inRow * inG * (1.0 - gap) * mix(pix, 1.0, logo);',
+        /* the two dashed bars, the same scroll: segments of two cells */
+        '  float sx = x / (2.0 * cw), si = floor(sx), sf = fract(sx);',
+        '  float dash = step(0.3, hh(vec2(si, 7.0))) * step(0.08, sf) * step(sf, 0.92);',
+        '  float bars = (step(0.08, v) * step(v, 0.15) + step(0.85, v) * step(v, 0.92)) * dash;',
+        '  float content = glyph + 0.6 * bars;',
+        /* far: the mean of the band (about 0.3 in the row, 0.42 dash share) */
+        '  float fw = max(fwidth(xc) * 4.0, fwidth(gy) * 5.0);',
+        '  float meanC = inRow * 0.3 + 0.6 * 0.42 * (step(0.08, v) * step(v, 0.15) + step(0.85, v) * step(v, 0.92));',
+        '  content = mix(content, meanC, clamp(fw * 1.5 - 0.3, 0.0, 1.0));',
+        '  float sw = 6.0 + 4.0 * fract(vSeed * 7.1);',
+        '  float bx = (fract(t / sw + vSeed) * 1.4 - 0.2) * vSize.x;',
         '  float bar = exp(-pow((p.x - bx) / 3.0, 2.0));',
         '  float sl = 0.5 + 0.5 * sin((p.y - t * 0.4) * 10.472);',
         '  float scan = mix(0.5 + 0.5 * sl, 0.75, clamp(fwidth(p.y / 0.6) * 2.0 - 0.5, 0.0, 1.0));',
         '  float drop = step(0.985, fract(sin(floor(t * 8.0) * 12.9898 + vSeed * 78.233) * 43758.5453));',
         '  float flick = (0.9 + 0.1 * sin(t * 1.7 + vSeed * 40.0) * sin(t * 0.37 + vSeed * 9.0)) * (1.0 - 0.6 * drop);',
-        '  float I = ((0.07 + 0.4 * content + 0.3 * bar) * edge + 0.35 * frame) * scan * flick;',
+        '  float I = ((0.06 + 0.5 * content + 0.25 * bar) * edge + 0.3 * frame) * scan * flick;',
         '  gl_FragColor = vec4(vCol * I, 1.0);',
         '}'].join('\n'),
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
@@ -2234,7 +2398,7 @@
       ['signs', 'glow', 'streak', 'cables', 'holo'].forEach(dropLayer);
       var sp = [], su = [], sc = [], ss = [], sd = [];
       var gp = [], gs = [], gc = [], gb = [];
-      var hp = [], hu = [], hc = [], hs = [], hd = [];
+      var hp = [], hu = [], hc = [], hs = [], hd = [], hk = [];
       var ta = [], tb = [], tw = [], tc = [];
       var cl = [];
       var lampC = hueOut(-1, 1);
@@ -2287,7 +2451,7 @@
           var HUV = [[0, 0], [1, 0], [1, 1], [0, 1]];
           [0, 1, 2, 0, 2, 3].forEach(function (k) {
             hp.push(HP[k][0], HP[k][1], HP[k][2]); hu.push(HUV[k][0], HUV[k][1]);
-            hc.push(hcol[0] * HOLO_GAIN, hcol[1] * HOLO_GAIN, hcol[2] * HOLO_GAIN); hs.push(H.w, H.h); hd.push(H.seed);
+            hc.push(hcol[0] * HOLO_GAIN, hcol[1] * HOLO_GAIN, hcol[2] * HOLO_GAIN); hs.push(H.w, H.h); hd.push(H.seed); hk.push((H.speed || 5) * (H.dir || 1));
           });
         }
         for (i = 0; i < t.streets.length; i++) {
@@ -2343,6 +2507,7 @@
         g5.setAttribute('aCol', new THREE.Float32BufferAttribute(hc, 3));
         g5.setAttribute('aSize', new THREE.Float32BufferAttribute(hs, 2));
         g5.setAttribute('aSeed', new THREE.Float32BufferAttribute(hd, 1));
+        g5.setAttribute('aTick', new THREE.Float32BufferAttribute(hk, 1));
         layers.holo = new THREE.Mesh(g5, holoMat);
         layers.holo.frustumCulled = false;
         layers.holo.renderOrder = 3;
@@ -2427,9 +2592,10 @@
     tileKey: tileKey, tileOf: tileOf, inLaneBand: inLaneBand, boxDist: boxDist, boxesOverlap: boxesOverlap,
     makeTile: makeTile, tilesAround: tilesAround, wanted: wanted, makeCity: makeCity, findCanyon: findCanyon,
     boneRGB: boneRGB, windowLUT: windowLUT, toLin: toLin, LUT_BANDS: LUT_BANDS,
-    FACADE_PROGRAMS: FACADE_PROGRAMS, facadeCover: facadeCover, facadeNear: facadeNear,
+    FACADE_PROGRAMS: FACADE_PROGRAMS, facadeCover: facadeCover, facadeNear: facadeNear, facadeParams: facadeParams,
+    FAC_GLASS: FAC_GLASS, FAC_FRAME: FAC_FRAME, FAC_TINT: FAC_TINT, FAC_DIM: FAC_DIM, facadeLight: facadeLight,
     FOG_MED: FOG_MED, fogTau: fogTau, skylineBoxes: skylineBoxes, loadedRect: loadedRect, skylineHidden: skylineHidden, fogTauInf: fogTauInf, WEATHER: WEATHER, weatherAt: weatherAt,
-    HOLO_P: HOLO_P, HOLO_SAT: HOLO_SAT, HOLO_SIMILAR: HOLO_SIMILAR, HOLO_GAP: HOLO_GAP, HOLO_MIN_TOP: HOLO_MIN_TOP, BEACON_TALL: BEACON_TALL,
+    HOLO_P: HOLO_P, HOLO_SAT: HOLO_SAT, HOLO_INSET: HOLO_INSET, HOLO_SPEED: HOLO_SPEED, HOLO_SIMILAR: HOLO_SIMILAR, HOLO_GAP: HOLO_GAP, HOLO_MIN_TOP: HOLO_MIN_TOP, BEACON_TALL: BEACON_TALL,
     holoRGB: holoRGB, hsvSat: hsvSat, rateOf: rateOf, lifeRate: lifeRate, LIFE_T: LIFE_T, lifeSpeed: lifeSpeed, facadeTexel: facadeTexel,
     makeFog: makeFog, makeSky: makeSky, makeCityRenderer: makeCityRenderer
   };
