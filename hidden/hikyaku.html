@@ -1357,10 +1357,12 @@ function hazeOf(p) {
    ?bench=1 measures tile builds and frame times and logs them with
    console.error (headless Chrome prints that to stderr). ?shot=high is the
    owner's view of 2026-10-25: chase camera 320 m up, nose down over the
-   city. ?fog=<haze per km> and ?weather=rain|dry override the stored
-   settings without storing them. Test hooks, kept cheap. */
+   city, ?shot=landmark looks at the landmark nearest to the sixth open
+   ring from 600 m. ?fog=<haze per km> and ?weather=rain|dry override the stored
+   settings without storing them, ?variety=<0 to 1> the city's variety
+   (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
-const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
@@ -1368,6 +1370,7 @@ const URL_SEED = parseInt(URLP.get('seed'), 10);
    shots a metre apart shows z-fighting, which one frame cannot) */
 const URL_CAMDX = parseFloat(URLP.get('camdx')) || 0;
 const URL_FOG = parseFloat(URLP.get('fog'));
+const URL_VARIETY = parseFloat(URLP.get('variety'));
 const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
 const DEF = {
@@ -1391,6 +1394,10 @@ const DEF = {
      kH of the atmosphere in hikyaku-city.js makeFog, per metre at ground
      level; the ground soup does not depend on it. */
   cityDensity: 0.92, cityMaxH: 420, cityAccents: 2, fogDensity: 0.0026, cityRadius: 4,
+  /* City variety (CITY-VARIETY.md, first round): districts, archetypes and
+     facade programs from 0 (the old uniform city) to 1, the scale of the
+     district noise in metres, and the landmarks. Applied on "Rebuild". */
+  cityVariety: 0.7, cityDistrict: 1200, cityLandmarks: true,
   /* Weather: auto lets rain come and go (HikyakuCity.weatherAt), dry and
      rain pin it. particles: the drifting motes that show speed. */
   weather: 'auto', particles: true,
@@ -1406,8 +1413,10 @@ const DEF = {
      are dropped once, so the new defaults (both off) reach a browser that
      stored the old ones (both on). Below 3, the city and fog values are
      dropped once: the fog slider means the haze of the new atmosphere and
-     the city grew taller (look round of 2026-10-25). */
-  cfgV: 3
+     the city grew taller (look round of 2026-10-25). Version 4 added
+     cityVariety, cityDistrict and cityLandmarks; nothing is dropped, the
+     merge fills the three missing keys with their defaults. */
+  cfgV: 4
 };
 const TRAFFIC_DENSITIES = [{ value: 0.25, label: 'Sparse' }, { value: 0.5, label: 'Normal' }, { value: 0.8, label: 'Dense' }];
 /* The two neon hues of the city (handoff: one or two per scene). The first
@@ -1820,16 +1829,18 @@ function App() {
   /* The generator settings the city was built with. The panel edits p and
      "Rebuild" copies them over, so dragging a slider does not throw away
      every tile on each step. */
-  const [cityCfg, setCityCfg] = useState(() => {
-    const q = loadStored();
-    return { density: q.cityDensity, maxH: q.cityMaxH, accents: q.cityAccents };
-  });
+  const cityOf = (q) => ({ density: q.cityDensity, maxH: q.cityMaxH, accents: q.cityAccents,
+    variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks });
+  const [cityCfg, setCityCfg] = useState(() => cityOf(loadStored()));
   const city = useMemo(() => HC.makeCity(route, {
     density: cityCfg.density, maxH: cityCfg.maxH, accents: cityCfg.accents,
+    variety: Number.isFinite(URL_VARIETY) ? Math.max(0, Math.min(1, URL_VARIETY)) : cityCfg.variety,
+    districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks,
     core: routeCore(route), reserved: specials
   }), [route, cityCfg, specials]);
-  const cityPending = cityCfg.density !== p.cityDensity || cityCfg.maxH !== p.cityMaxH || cityCfg.accents !== p.cityAccents;
-  const rebuildCity = () => setCityCfg({ density: p.cityDensity, maxH: p.cityMaxH, accents: p.cityAccents });
+  const cityNow = cityOf(p);
+  const cityPending = Object.keys(cityNow).some((k) => cityNow[k] !== cityCfg[k]);
+  const rebuildCity = () => setCityCfg(cityNow);
 
   const cfgRef = useRef(null);
   cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, lanes, geo };
@@ -2068,6 +2079,26 @@ function App() {
         const off = SHF.ROUND_R - 6, a = 15 * Math.PI / 180;
         const dir = [f.T[0] * Math.cos(a) - f.N[0] * Math.sin(a), 0, f.T[2] * Math.cos(a) - f.N[2] * Math.sin(a)];
         state.s = poseAt([f.p[0] + f.N[0] * off, f.p[1], f.p[2] + f.N[2] * off], dir, 0);
+      }
+      if (SHOT === 'landmark') {
+        /* the landmark nearest to the sixth open ring, seen from 600 m on
+           the route's side, 470 m up, above the roofs */
+        const w = open[Math.min(5, open.length - 1)], C = cfg.city.cfg, cell = HC.TILE * HC.LM_CELL;
+        let best = null;
+        for (let i = -2; i <= 2; i++) for (let k = -2; k <= 2; k++) {
+          const L = HC.landmarkAt(Math.floor(w.p[0] / cell) + i, Math.floor(w.p[2] / cell) + k, C, cfg.route);
+          if (!L) continue;
+          const c = [(L.rect[0] + L.rect[2]) / 2, 380, (L.rect[1] + L.rect[3]) / 2];
+          const d = Math.hypot(c[0] - w.p[0], c[2] - w.p[2]);
+          if (!best || d < best.d) best = { c, d };
+        }
+        if (best) {
+          const h = Math.hypot(best.c[0] - w.p[0], best.c[2] - w.p[2]) || 1;
+          const u = [(best.c[0] - w.p[0]) / h, (best.c[2] - w.p[2]) / h];
+          const cam = [best.c[0] - u[0] * 600, 470, best.c[2] - u[1] * 600];
+          const v = SD.sub(best.c, cam), l = SD.len(v);
+          state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
+        }
       }
       if (SHOT === 'high') {
         const w = open[Math.min(5, open.length - 1)];
@@ -2976,21 +3007,29 @@ function App() {
       <//>
 
       <${Section} id="city" title="City" open=${sec === 'city'} onToggle=${toggleSec}
-        summary=${(cityPending ? 'rebuild to apply, ' : '') + 'up to ' + fmt(cityCfg.maxH, 0) + ' m, ' + cityCfg.accents + ' accent' + (cityCfg.accents === 1 ? '' : 's')}>
+        summary=${(cityPending ? 'rebuild to apply, ' : '') + 'up to ' + fmt(cityCfg.maxH, 0) + ' m, variety ' + fmt(cityCfg.variety, 2) + ', ' + cityCfg.accents + ' accent' + (cityCfg.accents === 1 ? '' : 's')}>
         <${Slider} label="Density" digits=${2} min=${0.3} max=${1} step=${0.05}
           value=${p.cityDensity} onChange=${upd('cityDensity')} />
         <${Slider} label="Max height" unit="m" digits=${0} min=${120} max=${500} step=${10}
           value=${p.cityMaxH} onChange=${upd('cityMaxH')} />
         <${Seg} label="Neon accent colours" value=${p.cityAccents} onChange=${upd('cityAccents')}
           options=${[{ value: 0, label: 'None' }, { value: 1, label: 'One' }, { value: 2, label: 'Two' }]} />
+        <${Slider} label="Variety" digits=${2} min=${0} max=${1} step=${0.05}
+          value=${p.cityVariety} onChange=${upd('cityVariety')} />
+        <${Slider} label="District size" unit="m" digits=${0} min=${600} max=${2000} step=${50}
+          value=${p.cityDistrict} onChange=${upd('cityDistrict')} />
         <div className="hk-chips">
+          <button className=${'lang-seg' + (p.cityLandmarks ? ' active' : '')} onClick=${() => upd('cityLandmarks')(!p.cityLandmarks)}>Landmarks</button>
           <button className=${'lang-seg' + (cityPending ? ' active' : '')} onClick=${rebuildCity}>Rebuild</button>
         </div>
         <${Slider} label="Haze" unit="per km" digits=${1} scale=${1000} min=${0.001} max=${0.008} step=${0.0001}
           value=${p.fogDensity} onChange=${upd('fogDensity')} />
         <${Slider} label="Tile window" unit="tiles each way" digits=${0} min=${2} max=${5} step=${1}
           value=${p.cityRadius} onChange=${upd('cityRadius')} />
-        <p className="hk-note">Density, height and accents apply on "Rebuild". The city never builds inside the
+        <p className="hk-note">Density, height, accents, variety, district size and landmarks apply on "Rebuild".
+          "Variety" mixes in residential and industrial districts with their own building types and facades;
+          at 0 the city is the old uniform field of setback towers. Landmarks stand one per 2.6 km cell, 150 to
+          400 m beside the route. The city never builds inside the
           45 m tube around the route: buildings there are lowered, split into a canyon or left out, so every ring
           stays reachable. Bridges and cables keep clear of the three future traffic altitudes
           (${HC.LANE_Y.join(', ')} m). The tile window loads around the ship, biased forward; fog hides its edge.
