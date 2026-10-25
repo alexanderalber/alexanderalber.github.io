@@ -232,6 +232,7 @@
   <script src="/assets/js/shaft.js"></script>
   <script src="/assets/js/pyramid.js"></script>
   <script src="/assets/js/block.js"></script>
+  <script src="/assets/js/climb.js"></script>
   <script src="/assets/js/dust.js"></script>
   <script type="application/ld+json">
   {
@@ -261,7 +262,7 @@
        the traffic clock. No DOM, no three.js, no React, so
        notes/dev/hikyaku.test.mjs pulls this block out by id and evaluates it
        on top of assets/js/sixdof.js, hikyaku-city.js, hikyaku-traffic.js,
-       menger.js, shaft.js, pyramid.js and block.js (their pure layers). Moving any of it into the app block
+       menger.js, shaft.js, pyramid.js, block.js and climb.js (their pure layers). Moving any of it into the app block
        breaks that seam. -->
   <script id="hkcore">
 var Hikyaku = (function () {
@@ -397,6 +398,14 @@ var Hikyaku = (function () {
        the block ends at least blockClimb metres up, so the climb to its
        506 m approach stays near 1.2 km. */
     arco: 'auto', arcoTries: 8, pyramidLead: 560, pyramidLeave: 160, blockClimb: 260,
+    /* The obstacles on the block arcology's climb (assets/js/climb.js,
+       owner 2026-10-26: CLIMB-OBSTACLES.md variant B plus one gate tower of
+       variant A): a slab tower with a hole in the city part, a freighter
+       crossing over the curve, a cargo zeppelin over the campus. Each
+       opening is sized from the finished curve, so the waypoints stay as
+       they are. climbR: the local radius in the tower's hole and under the
+       freighter, climbRZep between the zeppelin's hull and its rack. */
+    climb: true, climbR: 12, climbRZep: 15,
     /* Freighter lanes (HikyakuTraffic.freighterLanes) over the route's box
        plus freightMargin, the full set at density 1 (the panel's density
        picks a subset in makeLanes). A lane whose hull sweep comes within
@@ -412,6 +421,8 @@ var Hikyaku = (function () {
   var MENGER_IDX = 1e15;
   /* the same for the two arcologies (their box counts stay far below 1e15) */
   var PYRAMID_IDX = 2e15, BLOCKB_IDX = 3e15;
+  /* the climb's obstacles (climb.js) */
+  var CLIMB_IDX = 4e15;
   /* The arcology type of a seed when cfg.arco is 'auto': the top bit of a
      multiplicative hash, so it is independent of the seed's parity. */
   function arcoOf(seed) {
@@ -1312,6 +1323,43 @@ var Hikyaku = (function () {
       }
       smI.r = rI;
     }
+    /* The climb to the block arcology: obstacles on the existing curve
+       (climb.js layout), built after the curve is final, each opening
+       sized from it like the block's package holes. The samples near them
+       take the module's local radius (tubeAt: the distance to the nearest
+       obstacle, from 12 m in an opening up to the tube's 45 m), and the
+       city keeps the full tube there through the module's air boxes in
+       the reserved list. */
+    var climb = null;
+    if (arco && arco.kind === 'block' && R.climb && globalThis.HikyakuClimb) climb = placeClimb();
+    if (climb) {
+      for (i = 0; i < samples.length; i++) {
+        var rCl = globalThis.HikyakuClimb.tubeAt(climb, samples[i].p);
+        if (rCl < samples[i].r) { samples[i].r = rCl; samples[i].inClimb = true; }
+      }
+    }
+    function placeClimb() {
+      var CLM = globalThis.HikyakuClimb, ka = arco.i0 - 1, sgC = segments[ka], cv = [], sC = 0, prv = null, q;
+      var nC = Math.max(8, Math.ceil(sgC.chord * 1.05));
+      for (q = 0; q <= nC; q++) {
+        var eC = spline(ka + q / nC);
+        if (prv) sC += len(sub(eC.p, prv));
+        cv.push({ p: eC.p, s: sC, u: ka + q / nC });
+        prv = eC.p;
+      }
+      var others = [], avoidC = [];
+      for (q = 0; q < samples.length; q++) if (samples[q].u < ka - 1e-9 || samples[q].u > ka + 1 + 1e-9) others.push({ p: samples[q].p, r: samples[q].r });
+      for (q = 0; q < specials.length; q++) {
+        if (specials[q] === arco) continue;
+        if (specials[q].reservedList) avoidC = avoidC.concat(specials[q].reservedList);
+        else if (specials[q].reserved) avoidC.push(specials[q].reserved);
+      }
+      var cSeed = 1 + ((Math.imul(R.seed ^ 0x2545f491, 2654435761) >>> 0) % 99991);
+      var cl = CLM.layout({ seed: cSeed, axis: arco.axis, curve: cv, others: others, avoid: avoidC, solid: [arco.bounds],
+        campus: arco.reserved, idxBase: CLIMB_IDX, opts: { tubeR: R.tubeR, gateR: R.climbR, freightR: R.climbR, zepR: R.climbRZep } });
+      if (cl) { cl.i0 = ka; cl.arco = arco.kind; }
+      return cl;
+    }
     var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (i = 0; i < samples.length; i++) {
       for (j = 0; j < 3; j++) {
@@ -1342,6 +1390,12 @@ var Hikyaku = (function () {
           var sb = specials[j].bounds, mC = R.freightClear;
           if (sw.min[0] < sb.max[0] + mC && sw.max[0] > sb.min[0] - mC && sw.min[2] < sb.max[2] + mC && sw.max[2] > sb.min[2] - mC
             && sw.min[1] < sb.max[1] + mC) bad = true;
+        }
+        /* nor the climb's obstacles, nor its own freighter's sweep */
+        for (j = 0; climb && j < climb.events.length && !bad; j++) {
+          var ce = climb.events[j], cbb = ce.bounds, mCl = ce.kind === 'freighter' ? 10 : R.freightClear;
+          if (sw.min[0] < cbb.max[0] + mCl && sw.max[0] > cbb.min[0] - mCl && sw.min[2] < cbb.max[2] + mCl && sw.max[2] > cbb.min[2] - mCl
+            && sw.min[1] < cbb.max[1] + mCl && sw.max[1] > cbb.min[1] - mCl) bad = true;
         }
         if (bad) { freight.skipped++; continue; }
         var cb = { min: [0, R.freightFloor, 0], max: [0, fy + 80, 0], freight: freight.lanes.length };
@@ -1381,6 +1435,7 @@ var Hikyaku = (function () {
       else reserved.push(specials[i].reserved);
     }
     reserved = reserved.concat(freight.corridors);
+    if (climb) reserved = reserved.concat(climb.reserved);
     var tube = {
       /* r: the default radius, the largest; every sample has its own r */
       r: R.tubeR, samples: samples,
@@ -1412,6 +1467,8 @@ var Hikyaku = (function () {
     return {
       seed: R.seed, cfg: R, n: n, waypoints: waypoints, segments: segments, specials: specials,
       freight: freight, reserved: reserved,
+      /* the climb's obstacles (climb.js layout), null without a block */
+      climb: climb,
       /* the arcology: the type wanted (from the seed or cfg.arco), the type
          placed (null: none), whether that is the other type, and how often
          the last leg was drawn again for it and how many candidate
@@ -1774,7 +1831,7 @@ var Hikyaku = (function () {
     var HT = globalThis.HikyakuTraffic, HCt = globalThis.HikyakuCity, MG = globalThis.Menger;
     if (!HT || !HCt) throw new Error('makeLanes needs HikyakuTraffic and HikyakuCity loaded first');
     var C = merge(DEF_LANES, cfg);
-    var out = { lanes: [], freight: [], specs: [], crossings: [], parallels: [], cfg: C,
+    var out = { lanes: [], freight: [], specs: [], crossings: [], parallels: [], cfg: C, climb: null,
       stats: { lanes: 0, city: 0, block: 0, campus: 0, freight: 0, freighters: 0, vehicles: 0, crossings: 0, parallels: 0, phased: 0, emptied: 0, spaced: 0, dropped: 0 } };
     if (!C.on && !C.freight) return out;
     var seed = route.seed >>> 0;
@@ -1791,6 +1848,8 @@ var Hikyaku = (function () {
     /* and before an arcology's reserved region */
     var arcos = (route.specials || []).filter(function (sp) { return sp.kind === 'pyramid' || sp.kind === 'block'; });
     arcos.forEach(function (sp) { cuts.push(sp.reserved); });
+    /* and at the climb's obstacles (the gate tower reaches the lane bands) */
+    if (route.climb) cuts = cuts.concat(route.climb.reserved);
 
     /* ---- city lanes ---- */
     for (var li = 0; li < LY.length && C.on; li++) {
@@ -1903,6 +1962,19 @@ var Hikyaku = (function () {
       specs.push(fq);
     }
     out.stats.freight = specs.length - out.stats.city - out.stats.block - out.stats.campus;
+    /* ---- the climb's freighter (climb.js), flown under: its belly keeps
+       the local radius plus 3 m over the curve, so it needs no window and
+       stays out of the crossing rule. Its phase (below) puts the
+       freighter's middle over the crossing freightLead seconds after the
+       nominal arrival, so the pilot meets it overhead. The lane ends short
+       of every other leg (climb.js, tested). On with the freighters. */
+    var climbSpec = null;
+    if (C.freight && fDen > 0 && route.climb && route.climb.freighter) {
+      var cfz = route.climb.freighter;
+      climbSpec = Object.assign({}, cfz, { points: cfz.points.map(function (pp) { return pp.slice(); }), id: specs.length, kind: 'climb', alt: -1, empty: 0 });
+      specs.push(climbSpec);
+    }
+    out.stats.climb = climbSpec ? 1 : 0;
 
     /* ---- the crossing rule ---- */
     var s0 = null;
@@ -1917,6 +1989,15 @@ var Hikyaku = (function () {
       for (var q = 0; q < arcoEnds.length; q++) if (arc >= arcoEnds[q] && arc <= arcoEnds[q] + C.arcoAfter) return C.arcoWindow / 2;
       return C.window / 2;
     }
+    if (climbSpec) {
+      var frE = route.climb.fr, arcC = null;
+      for (i = 0; i < smp.length; i++) if (smp[i].u >= frE.cu - 1e-9) { arcC = smp[i].s - s0; break; }
+      var tC = arcC / C.vNom + route.climb.C.freightLead;
+      var lnC = HT.makeLane(Object.assign({}, climbSpec, { phase: 0 }));
+      var sCx = HT.nearestS(lnC, climbSpec.cross).s;
+      climbSpec.phase = ((sCx - lnC.speed * tC) % lnC.period + lnC.period) % lnC.period;
+      out.climb = { spec: climbSpec.id, lane: -1, t: tC, s: sCx, arc: arcC };
+    }
     function free(lane, ck) {
       var hf = ck.half;
       var f = HT.gapsAcross(lane, ck.s, ck.t - hf, ck.t + hf, { clear: C.clear });
@@ -1924,6 +2005,7 @@ var Hikyaku = (function () {
     }
     for (var si = 0; si < specs.length; si++) {
       var sp = specs[si];
+      if (sp.kind === 'climb') { sp.fix = 'climb'; sp.crossings = 0; continue; }
       var lane = HT.makeLane(sp);
       /* runs of race samples within `near` of the lane */
       var checks = [], paras = [], run = null;
@@ -2000,8 +2082,9 @@ var Hikyaku = (function () {
       if (specs[si].fix === 'dropped') continue;
       var ln = HT.makeLane(specs[si]);
       ln.spec = specs[si];
-      if (specs[si].kind === 'freight') {
+      if (specs[si].kind === 'freight' || specs[si].kind === 'climb') {
         ln.freight = specs[si].freight;
+        if (specs[si].kind === 'climb') out.climb.lane = out.freight.length;
         laneOf[specs[si].id] = out.freight.length;
         out.freight.push(ln);
         out.stats.freighters += laneVehicles(ln);
@@ -2342,7 +2425,8 @@ var Hikyaku = (function () {
     var md = null;
     for (var i = 0; i < MODES.length; i++) if (MODES[i].id === mode) md = MODES[i];
     if (!md || !md.timed) return null;
-    return String(seed) + (flags && flags.canyon === false ? ':nc' : '') + (flags && flags.arco === false ? ':na' : '');
+    return String(seed) + (flags && flags.canyon === false ? ':nc' : '') + (flags && flags.arco === false ? ':na' : '')
+      + (flags && flags.climb === false && flags.arco !== false ? ':nk' : '');
   }
 
   /* ---- attract camera -----------------------------------------------------
@@ -2385,6 +2469,18 @@ var Hikyaku = (function () {
       }
       var top = sp.bounds.max[1] + ATTRACT.lift;
       if (a != null && b != null) skips.push({ a: a, b: b, top: top, kind: sp.kind, ramp: Math.max(ATTRACT.ramp, top - yLo) });
+    }
+    /* the climb's gate tower and zeppelin (the freighter moves on) */
+    var cl = route.climb;
+    for (k = 0; cl && k < cl.events.length; k++) {
+      var ev = cl.events[k];
+      if (ev.kind === 'freighter') continue;
+      var ea = null, eb = null, yE = Infinity;
+      for (i = 0; i < sm.length; i++) {
+        if (ea == null && sm[i].u >= ev.cu - 1e-9) { ea = sm[i].s - ev.depth / 2 - 20; eb = sm[i].s + ev.depth / 2 + 20; yE = sm[i].p[1]; }
+      }
+      var topE = ev.bounds.max[1] + ATTRACT.lift;
+      if (ea != null) skips.push({ a: ea, b: eb, top: topE, kind: 'climb', ramp: Math.max(ATTRACT.ramp, topE - yE) });
     }
     c = { sm: sm, s0: s0, s1: s1, length: s1 - s0, skips: skips };
     for (k = 0; k < skips.length; k++) {
@@ -2438,7 +2534,7 @@ var Hikyaku = (function () {
 
   return {
     DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
-    PYRAMID_IDX: PYRAMID_IDX, BLOCKB_IDX: BLOCKB_IDX, arcoOf: arcoOf,
+    PYRAMID_IDX: PYRAMID_IDX, BLOCKB_IDX: BLOCKB_IDX, CLIMB_IDX: CLIMB_IDX, arcoOf: arcoOf,
     makeRoute: makeRoute, startState: startState, quatFromAxes: quatFromAxes, frameOf: frameOf,
     boxDist: boxDist, contactsBoxes: contactsBoxes,
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
@@ -2469,6 +2565,7 @@ const MG = Menger;
 const SHF = Shaft;
 const HP = HikyakuPyramid;
 const HB = HikyakuBlock;
+const CLM = HikyakuClimb;
 const CR = ColorRamps;
 const HE = HikyakuEvents;
 const G = HF.G0;
@@ -2545,9 +2642,13 @@ function hazeOf(p) {
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
 const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign', 'altstadt', 'crown', 'title', 'campus',
-  'pyr-far', 'pyr-portal', 'pyr-gate', 'pyr-inside', 'pyr-exit', 'blk-far', 'blk-portal', 'blk-inside', 'blk-exit', 'blk-campus'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+  'pyr-far', 'pyr-portal', 'pyr-gate', 'pyr-inside', 'pyr-exit', 'blk-far', 'blk-portal', 'blk-inside', 'blk-exit', 'blk-campus',
+  'clb-gate', 'clb-freighter', 'clb-zeppelin', 'clb-side'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
+/* ?climb=0: the block's climb without its obstacles (comparison shots; the
+   clb-* hooks still pose the ship where they would stand) */
+const URL_CLIMB = URLP.get('climb') !== '0';
 /* &menu=pause on a shot hook shows the pause menu over that shot (the
    overlay check); the title has its own hook, ?shot=title */
 const URL_MENU = URLP.get('menu');
@@ -2576,9 +2677,17 @@ const URL_EVENT = ['laser', 'searchlight'].indexOf(URLP.get('event')) >= 0 ? URL
   : (SHOT === 'laser' || SHOT === 'searchlight' ? SHOT : null);
 const URL_MUSIC = URLP.get('music') === '1';
 const URL_DRONE = URLP.get('mount') === 'drone';
-/* ?ground=<id>: a ground layer mockup (HikyakuCity.GROUND, GROUND-CONCEPT.md
-   in the notes), off without it; no config key, no panel entry */
-const URL_GROUND = HC.GROUND && HC.GROUND[URLP.get('ground')] ? URLP.get('ground') : null;
+/* The ground decks (HikyakuCity.GROUND.layered, Ground V2: decks, rails,
+   ramps, parking decks, stations), on by default since owner point 22
+   (2026-10-26), the panel's "Ground decks" switch. ?ground=off or
+   ?ground=0 switches them off, ?ground=layered (the old flag), on or 1
+   switches them on, both without storing; null: the stored setting. */
+const URL_GROUND = (() => {
+  const g = URLP.get('ground');
+  if (g === 'off' || g === '0') return false;
+  if (g === 'on' || g === '1' || (g && HC.GROUND && HC.GROUND[g])) return true;
+  return null;
+})();
 const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
 const DEF = {
@@ -2620,6 +2729,10 @@ const DEF = {
      campusPlan). A new key, filled by the merge, so no cfgV bump.
      Applied on "Rebuild". */
   campus: true,
+  /* The ground decks along the main streets (HikyakuCity.GROUND.layered,
+     owner point 22: on by default). The switch rebuilds the city at once.
+     A new key, filled by the merge, so no cfgV bump. */
+  ground: true,
   /* Weather: auto lets rain come and go (HikyakuCity.weatherAt), dry and
      rain pin it. particles: the dust that shows speed (makeDust); dust:
      its density, a multiple of DUST.base; dustStreak: its streak length,
@@ -2654,6 +2767,11 @@ const DEF = {
      the block, by the seed). Like the canyon, the switch takes effect
      with the next route. A new key, filled by the merge, so no cfgV bump. */
   arco: true,
+  /* The obstacles on the block arcology's climb (hkcore makeRoute,
+     cfg.climb, climb.js): a gate tower, a freighter and a cargo zeppelin.
+     Like the canyon, the switch takes effect with the next route. A new
+     key, filled by the merge, so no cfgV bump. */
+  climb: true,
   /* The panel: open or closed, and the open section. Stored with the rest,
      so a reload looks the way it was left. */
   panel: false, sec: '',
@@ -3175,6 +3293,9 @@ function camClampAt(cfg, from, want, full, tVeh, tFan) {
   /* the block arcology: its free space (capped at 40 m, negative in a box) */
   const ab = cfg.arcoB;
   if (ab && HB.inside(ab.blk, mid, 60)) probes.push((p) => HB.clearance(ab.blk, p));
+  /* the climb's obstacles: their boxes */
+  const clb = cfg.climb;
+  if (clb && CLM.near(clb, mid, r + 20)) probes.push(CLM.boxesNear(clb, mid, r + 2));
   return HK.cameraClamp(from, want, CAM_R, probes, { min: CAM_MIN });
 }
 
@@ -3298,9 +3419,11 @@ function App() {
      built around it. */
   const [routeCanyon, setRouteCanyon] = useState(() => p.canyon !== false);
   const [routeArco, setRouteArco] = useState(() => p.arco !== false);
-  const route = useMemo(() => HK.makeRoute({ seed: p.seed, canyon: routeCanyon, arco: routeArco ? 'auto' : false }),
-    [p.seed, routeCanyon, routeArco]);
-  const bestKey = HK.bestKey('trial', p.seed, { canyon: routeCanyon, arco: routeArco });
+  const [routeClimb, setRouteClimb] = useState(() => p.climb !== false);
+  const route = useMemo(() => HK.makeRoute({ seed: p.seed, canyon: routeCanyon, arco: routeArco ? 'auto' : false, climb: routeClimb && URL_CLIMB }),
+    [p.seed, routeCanyon, routeArco, routeClimb]);
+  /* the climb's obstacles only change block routes, so only those get the flag */
+  const bestKey = HK.bestKey('trial', p.seed, { canyon: routeCanyon, arco: routeArco, climb: route.arco.got === 'B' ? !!route.climb : undefined });
   /* Oversized structures (the Menger block, later arcologies) are bigger
      than a tile and placed on the route by makeRoute. Their reserved boxes
      (the 2 x 2 tiles around the block) go to the city, which builds
@@ -3316,6 +3439,8 @@ function App() {
      city's campus replaces them by the building's footprint. */
   const pyrSp = route.specials.find((sp) => sp.kind === 'pyramid') || null;
   const blkSp = route.specials.find((sp) => sp.kind === 'block') || null;
+  /* the obstacles on the block's climb (climb.js): gate tower, freighter, zeppelin */
+  const climbSp = route.climb || null;
   /* The generator settings the city was built with. The panel edits p and
      "Rebuild" copies them over, so dragging a slider does not throw away
      every tile on each step. */
@@ -3323,13 +3448,14 @@ function App() {
     variety: q.cityVariety, districtSize: q.cityDistrict, landmarks: q.cityLandmarks, oldTown: q.cityOldTown, campus: q.campus,
     liveliness: q.liveliness, holograms: q.holograms, beacons: q.beacons });
   const [cityCfg, setCityCfg] = useState(() => cityOf(loadStored()));
+  const groundOn = URL_GROUND === null ? p.ground !== false : URL_GROUND;
   const city = useMemo(() => HC.makeCity(route, {
     density: cityCfg.density, maxH: cityCfg.maxH, accents: cityCfg.accents,
     variety: Number.isFinite(URL_VARIETY) ? Math.max(0, Math.min(1, URL_VARIETY)) : cityCfg.variety,
     districtSize: cityCfg.districtSize, landmarks: cityCfg.landmarks, oldTown: cityCfg.oldTown, campus: cityCfg.campus,
     liveliness: cityCfg.liveliness, holograms: cityCfg.holograms, beacons: cityCfg.beacons,
-    core: routeCore(route), reserved: specials, signs: SIGN_META, ground: URL_GROUND
-  }), [route, cityCfg, specials]);
+    core: routeCore(route), reserved: specials, signs: SIGN_META, ground: groundOn ? 'layered' : null
+  }), [route, cityCfg, specials, groundOn]);
   /* The traffic lanes, a pure function of the route and the density, with
      the gaps at the race line already cut (hkcore makeLanes). The ring
      lanes round the campuses follow the campus the city was built with. */
@@ -3344,7 +3470,7 @@ function App() {
   const rebuildCity = () => setCityCfg(cityNow);
 
   const cfgRef = useRef(null);
-  cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, pyramid: pyrSp, arcoB: blkSp, lanes, allLanes, geo };
+  cfgRef.current = { p, craft, killCraft, route, city, block, shaft: shaftSp, pyramid: pyrSp, arcoB: blkSp, climb: climbSp, lanes, allLanes, geo };
 
   /* ---- music -----------------------------------------------------------
      synthwave.js needs a user gesture for its AudioContext, so every start
@@ -3613,6 +3739,7 @@ function App() {
     setP((q) => ({ ...q, seed: n }));
     setRouteCanyon(p.canyon !== false);
     setRouteArco(p.arco !== false);
+    setRouteClimb(p.climb !== false);
     resetRef.current++;
   };
 
@@ -3814,7 +3941,7 @@ function App() {
        city or behind the skyline; beyond that their groups are hidden. */
     const farFog = SHF.farFog(THREE, fog);
     const g = { THREE, renderer, scene, camera, worldGrp, shipGrp, ship, fog, farFog, rings: null, gates: null, cityR: null,
-      traffic: null, menger: null, shaft: null, pyramid: null, arcoB: null, hullBoxes: null, groundMat: null };
+      traffic: null, menger: null, shaft: null, pyramid: null, arcoB: null, climb: null, hullBoxes: null, groundMat: null };
     glRef.current = g;
 
     const colNext = new THREE.Color(ACCENT);
@@ -4087,6 +4214,34 @@ function App() {
         const cam = c.slice(); cam[1] = ln.freight.y + 100; cam[ac] = ln.freight.row + 20; cam[ax] += 260 * Math.sign(ln.points[1][ax] - ln.points[0][ax]);
         const v = SD.sub(c, cam), l = SD.len(v);
         state.s = poseAt(cam, [v[0] / l, v[1] / l, v[2] / l], 0);
+      }
+      /* The climb's obstacles: the ship on the curve before the gate's
+         hole and the zeppelin's gap (chase view), and before the
+         freighter's crossing with the traffic clock fixed so its freighter
+         is about overhead when the ship gets there. With ?climb=0 the
+         poses come from the same route with the obstacles on. */
+      if (SHOT && SHOT.startsWith('clb-')) {
+        const R0 = cfg.route;
+        const cl = R0.climb || (R0.arco.got === 'B' ? HK.makeRoute({ seed: R0.seed, canyon: R0.cfg.canyon, arco: R0.cfg.arco, climb: true }).climb : null);
+        const ev = cl ? cl.events.find((e) => e.kind === SHOT.slice(4)) : null;
+        if (cl && SHOT === 'clb-side') {
+          /* from the side, 720 m off the climb's middle event, the whole climb in view */
+          const e0 = cl.events[0], e1 = cl.events[cl.events.length - 1], S = R0.tube.samples;
+          const mid = [(e0.c[0] + e1.c[0]) / 2, (e0.c[1] + e1.c[1]) / 2, (e0.c[2] + e1.c[2]) / 2];
+          const k = S.findIndex((q) => q.u >= e0.cu - 1e-9);
+          state.s = poseAt(S[k].p, S[k].d, 150);
+          state.fixCam = { p: [mid[0] + cl.right[0] * 720, mid[1] + 60, mid[2] + cl.right[2] * 720], at: [mid[0], mid[1] - 20, mid[2]], fov: 62 };
+          const c = state.fixCam.p, b = cl.bounds, m = 3 * HC.TILE;
+          state.streamBox = [Math.min(b.min[0], c[0]) - m, Math.min(b.min[2], c[2]) - m, Math.max(b.max[0], c[0]) + m, Math.max(b.max[2], c[2]) + m];
+        }
+        if (ev) {
+          const back = SHOT === 'clb-freighter' ? 110 : 150, S = R0.tube.samples;
+          let k = S.findIndex((q) => q.u >= ev.cu - 1e-9);
+          const sTarget = S[k].s - back;
+          while (k > 0 && S[k].s > sTarget) k--;
+          state.s = poseAt(S[k].p, S[k].d, 0);
+          if (SHOT === 'clb-freighter' && cfg.lanes && cfg.lanes.climb) state.tFix = cfg.lanes.climb.t - back / 45 + 1.2;
+        }
       }
       if (SHOT === 'high' || SHOT === 'searchlight') {
         const w = open[Math.min(5, open.length - 1)];
@@ -4372,6 +4527,14 @@ function App() {
           const cb = HB.contacts(ab.blk, cr.hull.verts, state.s);
           if (cb.length) cs = cs.concat(cb);
         }
+        /* The climb's obstacles: the gate tower's slab pieces touch, so
+           their contacts also leave through exposed faces only. The city
+           has no tiles in the tower's reserved boxes. */
+        const clb = cfg.climb;
+        if (clb && CLM.near(clb, state.s.p, 20)) {
+          const cc = CLM.contacts(clb, cr.hull.verts, state.s);
+          if (cc.length) cs = cs.concat(cc);
+        }
         /* The shaft: its wall, dressing and housing, and the fans, which
            turn on the traffic clock (race time from the start gate on), so
            every run of a seed meets the same blades. Only near the housing. */
@@ -4403,7 +4566,8 @@ function App() {
               const ky = hit.contact.key;
               const bi = ky[0] === 'b' ? +ky.slice(1) : NaN;
               say((ky === 'g' ? 'GROUND ' : ky[0] === 'v' ? 'TRAFFIC ' : ky === 'sw' || ky === 'sh' ? 'SHAFT ' : ky[0] === 'f' ? 'FAN '
-                : ky.startsWith('pyr') || (bi >= HK.PYRAMID_IDX && bi < HK.BLOCKB_IDX) ? 'PYRAMID ' : ky.startsWith('blk') ? 'ARCOLOGY ' : 'HIT ')
+                : ky.startsWith('pyr') || (bi >= HK.PYRAMID_IDX && bi < HK.BLOCKB_IDX) ? 'PYRAMID ' : ky.startsWith('blk') ? 'ARCOLOGY '
+                : ky.startsWith('clb') ? (hit.contact.part === 'zeppelin' ? 'ZEPPELIN ' : 'TOWER ') : 'HIT ')
                 + fmt(hit.impact, 1) + ' m/s', 1000, ts);
             }
           }
@@ -4682,6 +4846,7 @@ function App() {
       const camA = [camera.position.x, camera.position.y, camera.position.z];
       if (g.pyramid) g.pyramid.update(tTraffic, camA);
       if (g.arcoB) g.arcoB.update(tTraffic, camA);
+      if (g.climb) g.climb.update(tTraffic, camA);
       g.farFog.update(camera.position);
       {
         const shf = cfg.shaft, pyr = cfg.pyramid, ab = cfg.arcoB;
@@ -4802,6 +4967,7 @@ function App() {
           if (g.shaft) { bench.info.shaftBuildMs = Math.round(g.shaft.stats.buildMs); bench.info.shaftTris = g.shaft.stats.tris; }
           if (g.pyramid) { bench.info.pyramidTris = g.pyramid.stats.tris; bench.info.pyramidBuildMs = g.pyramid.buildMs; }
           if (g.arcoB) { bench.info.blockTris = g.arcoB.stats.tris; bench.info.blockBuildMs = g.arcoB.buildMs; }
+          if (g.climb) { bench.info.climbTris = g.climb.stats.tris; bench.info.climbBuildMs = g.climb.buildMs; }
         }
       } else sink = bench[bench.phase];
       if (sink) cityR.group.visible = bench.phase === 'A';
@@ -5061,6 +5227,25 @@ function App() {
       if (g.arcoB === vis) g.arcoB = null;
     };
   }, [ready, route, blkSp, city]);
+  /* The obstacles on the block's climb (climb.js): built once per route
+     like the arcology, the gate tower in the city's facade material, the
+     zeppelin, their glows and halos; one group per obstacle, so the far
+     fade hides each on its own. The rotors turn on the traffic clock. */
+  useEffect(() => {
+    const g = glRef.current;
+    if (!g || !climbSp || !g.cityR) return undefined;
+    const t0 = performance.now();
+    const vis = CLM.build(g.THREE, climbSp, { fog: g.farFog, facadeMaterial: g.cityR.facadeMaterial, accent: ACCENT, warm: WARM });
+    vis.buildMs = Math.round(performance.now() - t0);
+    g.scene.add(vis.group);
+    for (const pt of vis.parts) g.farFog.track(pt);
+    g.climb = vis;
+    return () => {
+      vis.dispose();
+      for (const pt of vis.parts) g.farFog.untrack(pt);
+      if (g.climb === vis) g.climb = null;
+    };
+  }, [ready, route, climbSp, city]);
 
   /* ---- traffic ---------------------------------------------------------
      One traffic system for the city lanes, the block's lanes and the
@@ -5349,7 +5534,9 @@ function App() {
         <span>Rings and portals, then the finish</span><b>${route.waypoints.filter((w) => w.kind === 'ring').length} + ${route.waypoints.filter((w) => w.kind === 'portal').length} + 1</b>
         <span>On the route</span><b>${(route.specials.slice().sort((a, b) => a.i0 - b.i0)
           .map((sp) => ({ menger: 'Menger block', pyramid: 'pyramid arcology', block: 'block arcology' })[sp.kind] || sp.kind)
-          .join(', ') || 'open city only') + (route.arco.fallback ? ' (the ' + (route.arco.want === 'P' ? 'pyramid' : 'block') + ' did not fit)' : '')}</b>
+          .join(', ') || 'open city only')
+          + (route.climb ? '; on the climb to it: ' + route.climb.events.map((e) => ({ gate: 'gate tower', freighter: 'freighter', zeppelin: 'cargo zeppelin' })[e.kind]).join(', ') : '')
+          + (route.arco.fallback ? ' (the ' + (route.arco.want === 'P' ? 'pyramid' : 'block') + ' did not fit)' : '')}</b>
         <span>Route length</span><b>${fmt(route.length / 1000, 2)} km</b>
         <span>Tightest curve radius</span><b>${fmt(route.minRadius, 0)} m</b>
         <span>City tile</span><b>${HC.TILE} m, window ${2 * p.cityRadius + 1} x ${2 * p.cityRadius + 1}</b>
@@ -5359,8 +5546,9 @@ function App() {
       <div className="hk-chips">
         <button className=${'lang-seg' + (p.canyon ? ' active' : '')} onClick=${() => upd('canyon')(!p.canyon)}>Street canyon</button>
         <button className=${'lang-seg' + (p.arco ? ' active' : '')} onClick=${() => upd('arco')(!p.arco)}>Arcology</button>
+        <button className=${'lang-seg' + (p.climb ? ' active' : '')} onClick=${() => upd('climb')(!p.climb)}>Climb obstacles</button>
       </div>
-      ${p.canyon !== routeCanyon || p.arco !== routeArco ? html`<p className="hk-note">The canyon and arcology switches apply to the next route (Go, Random route or another seed).</p>` : null}
+      ${p.canyon !== routeCanyon || p.arco !== routeArco || p.climb !== routeClimb ? html`<p className="hk-note">The canyon, arcology and climb switches apply to the next route (Go, Random route or another seed).</p>` : null}
 
       <${Section} id="run" title="Race and last run" open=${sec === 'run'} onToggle=${toggleSec}
         summary=${(lastRun ? HK.formatRun(lastRun.time, lastRun.penalty) + (lastRun.best ? ', best' : '') : 'no run yet')
@@ -5583,6 +5771,7 @@ function App() {
           <button className=${'lang-seg' + (p.overlay ? ' active' : '')} onClick=${() => upd('overlay')(!p.overlay)}>Collision hull</button>
           <button className=${'lang-seg' + (p.shadows ? ' active' : '')} onClick=${() => upd('shadows')(!p.shadows)}>Shadows</button>
           <button className=${'lang-seg' + (p.particles ? ' active' : '')} onClick=${() => upd('particles')(!p.particles)}>Particles</button>
+          <button className=${'lang-seg' + (groundOn ? ' active' : '')} onClick=${() => upd('ground')(!groundOn)}>Ground decks</button>
         </div>
         ${p.particles ? html`<${React.Fragment}>
           <${Slider} label="Dust density" unit="x" digits=${2} min=${0.25} max=${3} step=${0.25}
@@ -5592,7 +5781,8 @@ function App() {
         <//>` : null}
         <${Seg} label="Weather" value=${p.weather} onChange=${upd('weather')}
           options=${[{ value: 'auto', label: 'Auto' }, { value: 'dry', label: 'Dry' }, { value: 'rain', label: 'Rain' }]} />
-        <p className="hk-note">"Collision hull" shows the 18 points and the hull the physics uses. Shadows are off by default
+        <p className="hk-note">"Ground decks" are the raised streets, rails, ramps, parking decks and stations
+          along the main streets; switching rebuilds the city. "Collision hull" shows the 18 points and the hull the physics uses. Shadows are off by default
           because they cost frame time. "Particles" are the dust motes that show your speed: they stand in the air,
           and at speed each one draws a short streak along its motion past you. "Dust streaks" at 0 leaves round dots. On "Auto", rain comes
           and goes: a shower of 40 to 90 s in most five-minute stretches, fading in and out over 10 s.</p>
