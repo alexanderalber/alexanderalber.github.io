@@ -96,6 +96,18 @@
     .hk-btns .tool-btn-sm { flex: 0 0 auto; }
     .ctl-sec > .hk-btns:first-child { margin-top: 0; }
     .hk-menu .hk-seed { margin: 0 0 8px; }
+    /* the keyboard escape under the locked start entries (KB_ESCAPE) */
+    .hk-entries .hk-kb { align-self: flex-start; margin: -2px 0 2px 0.85rem; }
+    /* The veil behind the menus (title screens and pause, owner
+       2026-10-26): the whole picture a little darker and softer, so the
+       card reads as the thing in front. Black and not a --tool-* colour:
+       the scene is a night city in every skin, and the veil only dims it.
+       Behind the HUD (z 3), so the frozen clock and splits stay sharp in
+       the pause menu. The blur is 2 px over the full canvas, cheap on the
+       compositor; drop the line if it ever costs frames. */
+    .hk-veil { position: absolute; inset: 0; z-index: 2; pointer-events: none;
+      background: rgba(0, 0, 0, .4); backdrop-filter: blur(2px); animation: hk-veil-in .25s ease-out; }
+    @keyframes hk-veil-in { from { opacity: 0; } }
     /* the wrap of the attract camera from the finish back to the start */
     .hk-fade { position: absolute; inset: 0; z-index: 2; pointer-events: none; background: black; opacity: 0; }
     .hk-hint { position: absolute; top: 80px; left: 50%; transform: translateX(-50%); z-index: 3;
@@ -2184,11 +2196,12 @@ var Hikyaku = (function () {
   ];
 
   /* The first state. A screenshot hook (?shot=) skips the menu and flies
-     the time trial at once, except ?shot=title, which shows the menu. mode
+     the time trial at once, except ?shot=title, which shows the menu;
+     menu 'pause' (&menu=pause) puts the shot behind the pause menu. mode
      is the last used mode (hk.cfg lastMode), for the focus only. */
   function menuInit(o) {
     o = o || {};
-    if (o.shot && o.shot !== 'title') return { screen: 'flying', mode: 'trial', run: 0, back: null };
+    if (o.shot && o.shot !== 'title') return { screen: o.menu === 'pause' ? 'paused' : 'flying', mode: 'trial', run: 0, back: null };
     return { screen: 'title', mode: o.mode === 'trial' ? 'trial' : 'free', run: 0, back: null };
   }
 
@@ -2258,6 +2271,20 @@ var Hikyaku = (function () {
     if (o.name) return 'connected';
     if (o.err) return 'error';
     return 'none';
+  }
+
+  /* Whether the title's flight entries (Free run, Time trial and the
+     trial screen's Start) are locked, and why. Hikyaku is made for a 3D
+     mouse, so there is no start without one (owner, 2026-10-26). null:
+     open, with a connected device, with ?nohid=1 (the test and shot hook,
+     card hidden) or once the visitor took the keyboard escape (kb, kept
+     for the session). 'device': WebHID is there, no device yet.
+     'browser': no WebHID in this browser, only the escape opens it. */
+  function startLock(o) {
+    o = o || {};
+    if (o.kb) return null;
+    if (o.input === 'connected' || o.input === 'hidden') return null;
+    return o.input === 'unsupported' ? 'browser' : 'device';
   }
 
   /* The key of a result inside a mode's store: the seed, plus ':nc' for a
@@ -2371,7 +2398,7 @@ var Hikyaku = (function () {
     cameraClamp: cameraClamp, vehicleBoxes: vehicleBoxes, musicIntensity: musicIntensity,
     pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime,
     MODES: MODES, menuInit: menuInit, menuStep: menuStep, menuTitle: menuTitle, menuPaused: menuPaused,
-    flightInputLive: flightInputLive, hudParts: hudParts, inputState: inputState, bestKey: bestKey,
+    flightInputLive: flightInputLive, hudParts: hudParts, inputState: inputState, startLock: startLock, bestKey: bestKey,
     ATTRACT: ATTRACT, attractPose: attractPose
   };
 })();
@@ -2450,7 +2477,8 @@ function hazeOf(p) {
    before the duct's end, past the square fan. blk-far looks at the block from 1.8 km, blk-portal
    is the ship over the lid three pass points before the roof portal,
    blk-inside looks down the first package's shaft from the upper void,
-   blk-exit the ship 90 m before the exit portal on the hall run. On a seed
+   blk-exit the ship 90 m before the exit portal on the hall run,
+   blk-campus the campus under the exit leg from outside. On a seed
    with the other type they fall back to the start view.
    ?shot=freighter looks across a freighter lane at 300 m with the traffic
    clock fixed so a freighter is in view, ?shot=laser and ?shot=searchlight
@@ -2465,9 +2493,22 @@ function hazeOf(p) {
    (for comparison shots). Test hooks, kept cheap. */
 const URLP = new URLSearchParams(location.search);
 const SHOT = ['start', 'ring', 'top', 'city', 'canyon', 'canyonrun', 'mouth', 'inside', 'high', 'shaftmouth', 'shaftinside', 'shaftwall', 'landmark', 'blockfar', 'hologram', 'freighter', 'laser', 'searchlight', 'sign', 'altstadt', 'crown', 'title', 'campus',
-  'pyr-far', 'pyr-portal', 'pyr-gate', 'pyr-inside', 'pyr-exit', 'blk-far', 'blk-portal', 'blk-inside', 'blk-exit'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
+  'pyr-far', 'pyr-portal', 'pyr-gate', 'pyr-inside', 'pyr-exit', 'blk-far', 'blk-portal', 'blk-inside', 'blk-exit', 'blk-campus'].indexOf(URLP.get('shot')) >= 0 ? URLP.get('shot') : null;
 const BENCH = URLP.get('bench') === '1';
 const NOHID = URLP.get('nohid') === '1';
+/* &menu=pause on a shot hook shows the pause menu over that shot (the
+   overlay check); the title has its own hook, ?shot=title */
+const URL_MENU = URLP.get('menu');
+/* &speed=<m/s> on a shot hook: rain and dust see the camera move that fast */
+const URL_SPEED = parseFloat(URLP.get('speed')) || 0;
+/* The keyboard escape under the locked start entries (hkcore startLock):
+   a small link "Continue with keyboard" that opens them for the rest of
+   the browser session (sessionStorage hk.kb). The page is public and most
+   visitors come without a 3D mouse. Proposed 2026-10-26, not yet
+   confirmed by the owner: false removes the link and the session flag
+   with it, nothing else depends on it. */
+const KB_ESCAPE = true;
+const KB_STORE = 'hk.kb';
 const URL_SEED = parseInt(URLP.get('seed'), 10);
 /* camdx: shift the rendered camera sideways by that many metres (a pair of
    shots a metre apart shows z-fighting, which one frame cannot) */
@@ -2527,8 +2568,11 @@ const DEF = {
      Applied on "Rebuild". */
   campus: true,
   /* Weather: auto lets rain come and go (HikyakuCity.weatherAt), dry and
-     rain pin it. particles: the drifting motes that show speed. */
-  weather: 'auto', particles: true,
+     rain pin it. particles: the dust that shows speed (makeDust); dust:
+     its density, a multiple of DUST.base; dustStreak: its streak length,
+     a multiple of the exposure (0: dots). New keys, filled by the merge,
+     so no cfgV bump. */
+  weather: 'auto', particles: true, dust: 1, dustStreak: 1,
   /* Traffic (step 5): on/off, the share of streets that carry lanes, and
      two debug views. */
   traffic: true, trafficDensity: 0.5, trafficTint: false, trafficHulls: false,
@@ -2546,7 +2590,7 @@ const DEF = {
   /* The race: seconds added per missed ring or portal (hkcore raceStep). */
   missPenalty: 5,
   /* The street canyon on the route (hkcore makeRoute, cfg.canyon). The
-     panel switch takes effect with the next route (New route or a seed),
+     panel switch takes effect with the next route (Go, Random route or a seed),
      so a run in progress keeps its route. */
   canyon: true,
   /* The arcology on the route (hkcore makeRoute, cfg.arco: the pyramid or
@@ -2881,6 +2925,104 @@ void main(){
   };
 }
 
+/* Dust: the speed cue. Motes stand still in the world (a slight drift)
+   and the ship flies through them; optic flow is speed over distance, so
+   close clutter is the one channel that carries speed at all (dust.js
+   explains it). Up to 2026-10-26 this was Dust.makeField, round points;
+   the owner wanted more of it and a feel for speed, so it moved onto the
+   rain's machinery: one instanced quad per mote, the lattice folded round
+   the camera in the vertex shader, and each mote drawn from its place
+   back along its motion as the eye sees it (wind minus camera velocity,
+   times an exposure), a round dot at rest and a short streak at speed.
+   dust.js chose points because a streak lies while the ship turns (the
+   apparent motion is then not along v); at the short exposure here that
+   error is a few pixels, and the stretch is what was asked for.
+   Width is in pixels (3.6 near, 1.6 at the far edge, a little over the points
+   were), so a near mote stays a mote. A long streak spreads its light
+   (alpha falls with the square root of its length over its width). The
+   cell is S metres; motes fade over the outer half of the half cell, so
+   the fold never shows, and within 1.5 to 4 m of the eye. max instances
+   are built, the density slider sets instanceCount (the lattice is
+   uniform random, so any prefix is an even thinning). One draw call. */
+const DUST = { S: 130, base: 9000, max: 27000, exp: 0.028, maxLen: 7, alpha: 0.85, wind: [0.45, 0.06, 0.3] };
+function makeDust(THREE, color) {
+  const rnd = Dust.rng(0x6b1);
+  const n = DUST.max, base = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) base[i] = rnd();
+  const q = new THREE.PlaneGeometry(1, 2).translate(0.5, 0, 0);
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.index = q.index; geo.setAttribute('position', q.getAttribute('position'));
+  geo.setAttribute('iBase', new THREE.InstancedBufferAttribute(base, 3));
+  geo.instanceCount = DUST.base;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uCam: { value: new THREE.Vector3() }, uShift: { value: new THREE.Vector3() }, uS: { value: DUST.S },
+      uRel: { value: new THREE.Vector3() }, uExp: { value: DUST.exp }, uMaxL: { value: DUST.maxLen },
+      uPx: { value: 0.002 }, uAlpha: { value: DUST.alpha }, uColor: { value: new THREE.Color(color[0], color[1], color[2]) }
+    },
+    vertexShader: `
+uniform vec3 uCam; uniform vec3 uShift; uniform float uS; uniform vec3 uRel; uniform float uExp; uniform float uMaxL; uniform float uPx;
+attribute vec3 iBase;
+varying vec2 vP; varying vec3 vG; varying float vA;
+void main(){
+  vec3 d = iBase * uS + uShift - uCam;
+  d = (fract(d / uS + 0.5) - 0.5) * uS;
+  vec3 head = uCam + d;
+  vec3 toCam = cameraPosition - head;
+  float dist0 = length(toCam);
+  float r = length(d) / (0.5 * uS);
+  float w = mix(1.8, 0.8, clamp(r, 0.0, 1.0)) * dist0 * uPx;
+  vec3 st = -uRel * uExp;
+  float L = length(st);
+  if (L > uMaxL) { st *= uMaxL / L; L = uMaxL; }
+  vec3 dn = L > 1e-3 ? st / L : normalize(cross(toCam, vec3(0.0, 1.0, 0.0)) + vec3(1e-4));
+  float Lq = L + 2.0 * w;
+  vec3 wp = head + dn * (position.x * Lq - w);
+  vec3 side = normalize(cross(dn, toCam) + vec3(1e-5));
+  wp += side * position.y * w;
+  vP = position.xy;
+  vG = vec3(Lq, w, L);
+  vA = (1.0 - smoothstep(0.5, 1.0, r)) * smoothstep(1.5, 4.0, dist0) * clamp(sqrt(2.0 * w / Lq), 0.25, 1.0);
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+}`,
+    fragmentShader: `
+uniform float uAlpha; uniform vec3 uColor;
+varying vec2 vP; varying vec3 vG; varying float vA;
+void main(){
+  float a = vP.x * vG.x - vG.y;
+  float dx = a < 0.0 ? -a : max(a - vG.z, 0.0);
+  float q = dx / vG.y;
+  float k = exp(-(q * q + vP.y * vP.y) * 3.0) * (1.0 - 0.55 * clamp(a / max(vG.z, 1e-3), 0.0, 1.0));
+  float al = k * uAlpha * vA;
+  if (al < 0.004) discard;
+  gl_FragColor = vec4(uColor, al);
+}`,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 3;
+  q.dispose();
+  return {
+    mesh,
+    /* cam: camera position; t: seconds (the drift); vCam: the camera's
+       velocity; density: the panel's multiple of DUST.base; streak: the
+       panel's multiple of the exposure (0: dots only); px: metres per
+       pixel at 1 m, 2 tan(fov / 2) over the drawing buffer height. */
+    update(cam, t, vCam, density, streak, px) {
+      const u = mat.uniforms, S = u.uS.value, W = DUST.wind;
+      u.uCam.value.copy(cam);
+      u.uShift.value.set(((W[0] * t) % S + S) % S, ((W[1] * t) % S + S) % S, ((W[2] * t) % S + S) % S);
+      u.uRel.value.set(W[0] - vCam[0], W[1] - vCam[1], W[2] - vCam[2]);
+      u.uExp.value = DUST.exp * Math.max(0, streak);
+      u.uPx.value = px;
+      geo.instanceCount = Math.max(0, Math.min(DUST.max, Math.round(DUST.base * density)));
+      mesh.visible = geo.instanceCount > 0;
+    },
+    dispose() { geo.dispose(); mat.dispose(); }
+  };
+}
+
 /* A ship pose for the screenshot hooks: back along dir from p, nose along
    dir, wings level. */
 function poseAt(p, dir, back) {
@@ -3037,7 +3179,7 @@ function App() {
   /* The start screen and the menus (hkcore menuInit and menuStep): one
      screen value, a shot hook skips the menu. menuRef lets the loop and
      the key handler read the current screen. */
-  const [menu, menuDo] = useReducer(HK.menuStep, { shot: SHOT, mode: p.lastMode }, HK.menuInit);
+  const [menu, menuDo] = useReducer(HK.menuStep, { shot: SHOT, mode: p.lastMode, menu: URL_MENU }, HK.menuInit);
   const menuRef = useRef(menu);
   menuRef.current = menu;
   const parts = HK.hudParts(menu);
@@ -3059,6 +3201,10 @@ function App() {
   const [best, setBest] = useState(loadBest);
   const [lastRun, setLastRun] = useState(null);
   const [seedText, setSeedText] = useState(String(loadStored().seed));
+  /* the keyboard escape taken in this session (KB_ESCAPE, hkcore startLock) */
+  const [kbOk, setKbOk] = useState(() => {
+    try { return KB_ESCAPE && sessionStorage.getItem(KB_STORE) === '1'; } catch (e) { return false; }
+  });
 
   const stageRef = useRef(null);
   const hudRef = useRef({});
@@ -3423,6 +3569,19 @@ function App() {
     const want = box && (box.querySelector('[data-focus]') || box.querySelector('button:not(:disabled)'));
     if (want) want.focus({ preventScroll: true });
   }, [menu.screen]);
+  /* The start lock (hkcore startLock) moves the title's marked entry: the
+     connect button while locked, the last used mode once open. When it
+     changes (the device connects, or the keyboard escape), the focus
+     follows, unless the visitor is typing in a field. */
+  const startLocked = HK.startLock({ input: HK.inputState({ supported: dev.supported, nohid: NOHID, name: dev.name, err: dev.err }), kb: kbOk });
+  useEffect(() => {
+    if (menu.screen !== 'title' || (SHOT && SHOT !== 'title')) return;
+    const a = document.activeElement;
+    if (a && /INPUT|TEXTAREA|SELECT/.test(a.tagName)) return;
+    const box = menuBoxRef.current;
+    const want = box && (box.querySelector('[data-focus]') || box.querySelector('button:not(:disabled)'));
+    if (want) want.focus({ preventScroll: true });
+  }, [startLocked]);
 
   /* ---- the scene and the loop ------------------------------------------
      Built once. The route-dependent meshes are rebuilt in the effect below;
@@ -3503,10 +3662,10 @@ function App() {
        loop calls traffic.update(trafficTime, camera) when it is set.
        menger: the block's visual, from the block effect. hullBoxes: the
        vehicle hull debug view. */
-    /* Speed cue and weather: drifting motes (dust.js, as in the corridor)
+    /* Speed cue and weather: dust that streaks with speed (makeDust above)
        and rain that comes and goes (makeRain above). */
-    const dust = Dust.makeField(THREE, { count: 2600, color: boneAt(0.62), seed: 0x6b1 });
-    scene.add(dust.obj);
+    const dust = makeDust(THREE, boneAt(0.8));
+    scene.add(dust.mesh);
     const rain = makeRain(THREE, 32000);   /* 2 triangles a drop; 14000 until 2026-10-25 */
     scene.add(rain.mesh);
 
@@ -3748,6 +3907,13 @@ function App() {
           state.fixCam = { p: W([q[0] + 12, q[1], q[2] + 14]), at: W([hole[0] - 4, 238, hole[1]]), fov: 80, up: HB.dirWorld(L, [1, 0, 0]) };
         } else if (SHOT === 'blk-exit') {
           state.s = poseAt(ports[1].p, ports[1].dir, 90);
+        } else if (SHOT === 'blk-campus') {
+          /* outside, beside and above the exit portal, looking at the
+             campus under the exit leg (the ring road's sunk stretch) */
+          const E = ports[1], d = E.dir, h = Math.hypot(d[0], d[2]) || 1, f = [d[0] / h, 0, d[2] / h], sd = [-f[2], 0, f[0]];
+          state.s = poseAt(E.p, E.dir, 90);
+          state.fixCam = { p: [E.p[0] + f[0] * 330 + sd[0] * 230, 120, E.p[2] + f[2] * 330 + sd[2] * 230],
+            at: [E.p[0] + f[0] * 110, 22, E.p[2] + f[2] * 110], fov: 70, up: [0, 1, 0] };
         }
       }
       state.tFix = null;
@@ -4231,15 +4397,25 @@ function App() {
         const cp = camera.position;
         if (state.camPrev && dt > 0) {
           const k = Math.min(1, dt * 8);
-          for (let i = 0; i < 3; i++) state.camVel[i] += k * ((cp.getComponent(i) - state.camPrev[i]) / dt - state.camVel[i]);
+          const jx = cp.x - state.camPrev[0], jy = cp.y - state.camPrev[1], jz = cp.z - state.camPrev[2];
+          /* a cut (reset, the attract camera's wrap, a view switch) is not
+             a velocity: above 900 m/s the smoothed value starts over */
+          if (Math.hypot(jx, jy, jz) / dt > 900) state.camVel = [0, 0, 0];
+          else for (let i = 0; i < 3; i++) state.camVel[i] += k * ((cp.getComponent(i) - state.camPrev[i]) / dt - state.camVel[i]);
         }
         state.camPrev = [cp.x, cp.y, cp.z];
-        rain.update(cp, wallT, lvl, SHOT ? s.v : state.camVel);
-        dust.obj.visible = pp.particles;
-        if (pp.particles) {
-          Dust.update(dust, [cp.x, cp.y, cp.z], { far: 90, sizeNear: 3.2, sizeFar: 1.4, opNear: 0.55, opFar: 0.1,
-            edge: 0.3, pix: renderer.getPixelRatio() });
+        /* a shot stands still; &speed=<m/s> lets rain and dust see the
+           camera move that fast along its view (the streak check) */
+        let vSeen = SHOT ? s.v : state.camVel;
+        if (SHOT && URL_SPEED > 0) {
+          const vd = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(URL_SPEED);
+          vSeen = [vd.x, vd.y, vd.z];
         }
+        rain.update(cp, wallT, lvl, vSeen);
+        if (pp.particles) {
+          const pxM = 2 * Math.tan(camera.fov * Math.PI / 360) / Math.max(1, renderer.domElement.height);
+          dust.update(cp, wallT, vSeen, pp.dust, pp.dustStreak, pxM);
+        } else dust.mesh.visible = false;
       }
       /* The traffic layer: every pose a closed formula of the traffic time
          (race time once the start gate is crossed, hkcore trafficTime). */
@@ -4488,7 +4664,7 @@ function App() {
       window.removeEventListener('mousemove', onMove);
       host.removeEventListener('wheel', onWheel);
       ship.dispose();
-      dust.geo.dispose(); dust.obj.material.dispose(); rain.dispose();
+      dust.dispose(); rain.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
       glRef.current = null;
@@ -4799,23 +4975,41 @@ function App() {
   const pick = (type) => () => menuDo({ type });
   const urlSeedNow = Number.isFinite(URL_SEED) && URL_SEED > 0 && p.seed === URL_SEED;
   const freshSeed = () => 1 + Math.floor(Math.random() * 99999);
+  /* The seed field takes its number on Enter and when it loses the focus
+     (the native change); Go takes it even when it is the current seed
+     (that restarts the route with the current canyon and arcology
+     switches). Random route rolls a seed into the field. Its mousedown
+     keeps the focus in the field, so the blur does not first build the
+     typed route (owner, 2026-10-26: typing 1 and pressing "New route"
+     looked as if the seed was changed behind his back). */
   const commitSeedText = () => { const v = parseInt(seedText, 10); if (v > 0 && v !== p.seed) setSeed(v); else setSeedText(String(p.seed)); };
+  const goSeedText = () => { const v = parseInt(seedText, 10); if (v > 0) setSeed(v); else setSeedText(String(p.seed)); };
+  const keepFocus = (e) => e.preventDefault();
+  /* The start lock (startLocked above): on the title the connect button
+     is the call to action and the flight entries say why they are grey. */
+  const lockTitle = menu.screen === 'title' && !!startLocked;
+  const lockNote = startLocked === 'browser' ? 'Needs a 3D mouse, and this browser cannot use one.' : 'Connect a 3D mouse first.';
+  const takeKeyboard = () => {
+    setKbOk(true);
+    try { sessionStorage.setItem(KB_STORE, '1'); } catch (e) { /* private mode: this page view only */ }
+  };
   const connectBtn = html`<div className="hk-btns">
-    <button className="tool-btn tool-btn-sm" data-music="1" onClick=${connect}>Connect 3D mouse</button>
+    <button className=${lockTitle ? 'tool-btn tool-btn-primary' : 'tool-btn tool-btn-sm'} data-music="1"
+      data-focus=${lockTitle ? '1' : undefined} onClick=${connect}>Connect 3D mouse</button>
   </div>`;
   const inputCard = inState === 'hidden' ? null : html`<div className="ctl-sec">
     ${inState === 'none' ? html`<${React.Fragment}>
       <p className="hk-line">3D mouse: not connected.</p>
       ${connectBtn}
-      <p className="hk-note">Hikyaku is made for a 3D mouse, a 3Dconnexion SpaceMouse. Click the button and pick it in
-        the list the browser shows. Without one, the keyboard works too.</p>
+      <p className="hk-note">${'Hikyaku is made for a 3D mouse, a 3Dconnexion SpaceMouse. Click the button and pick it in the list the browser shows.'
+        + (startLocked ? '' : ' Without one, the keyboard works too.')}</p>
     <//>` : inState === 'connected' ? html`<p className="hk-line">${'✓ ' + dev.name + ' connected.'}</p>`
     : inState === 'error' ? html`<${React.Fragment}>
       <p className="hk-line">${'The 3D mouse did not connect: ' + String(dev.err).replace(/[.\s]+$/, '')
         + '. Unplug it, plug it back in, and try again.'}</p>
       ${connectBtn}
-    <//>` : html`<p className="hk-note">This browser cannot use a 3D mouse. That needs WebHID, which only Chromium
-      browsers have (Chrome, Edge, Opera). You can fly with the keyboard.</p>`}
+    <//>` : html`<p className="hk-note">${'This browser cannot use a 3D mouse. That needs WebHID, which only Chromium browsers have (Chrome, Edge, Opera).'
+      + (startLocked ? '' : ' You can fly with the keyboard.')}</p>`}
   </div>`;
   const entry = (key, label, note, onClick, opt) => html`<button key=${key} className="tool-btn hk-entry"
       onClick=${onClick} disabled=${!!(opt && opt.disabled)} data-focus=${opt && opt.focus ? '1' : undefined}>
@@ -4830,9 +5024,17 @@ function App() {
       </div>
       ${inputCard}
       <div className="ctl-sec"><div className="hk-entries">
-        ${HK.MODES.map((m) => entry(m.id, m.label,
-          m.note + (m.id === 'trial' && urlSeedNow ? ' Seed ' + p.seed + ' from the address.' : ''),
-          m.enabled ? pick(m.id) : null, { disabled: !m.enabled, focus: m.id === (p.lastMode || 'free') }))}
+        ${HK.MODES.map((m) => {
+          const fly = m.id === 'free' || m.id === 'trial', locked = fly && lockTitle;
+          const e = entry(m.id, m.label,
+            locked ? lockNote : m.note + (m.id === 'trial' && urlSeedNow ? ' Seed ' + p.seed + ' from the address.' : ''),
+            m.enabled && !locked ? pick(m.id) : null,
+            { disabled: !m.enabled || locked, focus: !lockTitle && m.id === (p.lastMode || 'free') });
+          /* the keyboard escape, right under the two start entries */
+          return m.id === 'trial' && locked && KB_ESCAPE ? html`<${React.Fragment} key=${m.id}>${e}
+            <button className="tool-linkbtn hk-kb" data-focus=${startLocked === 'browser' ? '1' : undefined}
+              onClick=${takeKeyboard}>Continue with keyboard</button><//>` : e;
+        })}
         ${entry('settings', 'Settings', 'Flight model, camera, city, traffic, music.', () => setPanel(true))}
         ${entry('controls', 'Controls', 'Keys and 3D mouse.', pick('controls'))}
       </div></div>
@@ -4848,7 +5050,7 @@ function App() {
             onChange=${(e) => setSeedText(e.target.value)}
             onKeyDown=${(e) => { if (e.key === 'Enter') commitSeedText(); }}
             onBlur=${commitSeedText} />
-          <button className="tool-btn tool-btn-sm" onClick=${() => setSeed(freshSeed())}>New seed</button>
+          <button className="tool-btn tool-btn-sm" onMouseDown=${keepFocus} onClick=${() => setSeed(freshSeed())}>Random route</button>
         </div>
         <p className="hk-line">${bestHere > 0 ? 'Best on this seed: ' + HK.formatTime(bestHere) : 'No time on this seed yet.'}</p>
         ${!routeCanyon ? html`<p className="hk-note">The canyon is off. Times for this seed without the canyon are kept apart.</p>` : null}
@@ -4856,7 +5058,7 @@ function App() {
         <p className="hk-note">The same seed gives the same city and route. Send the page address to race someone on it.</p>
       </div>
       <div className="ctl-sec"><div className="hk-btns">
-        <button className="tool-btn tool-btn-primary" data-focus="1"
+        <button className="tool-btn tool-btn-primary" data-focus="1" disabled=${!!startLocked}
           onClick=${() => { commitSeedText(); menuDo({ type: 'start' }); }}>Start</button>
         <button className="tool-btn" onClick=${pick('back')}>Back</button>
       </div></div>
@@ -4886,6 +5088,7 @@ function App() {
 
   return html`<${React.Fragment}>
     <div className="hk-stage" ref=${stageRef}></div>
+    ${menuCard ? html`<div className="hk-veil"></div>` : null}
     <div className="hk-fade" ref=${(el) => { H.fade = el; }}></div>
     <a className="hk-back" href="/miscellaneous/#games">${'←'} Games</a>
 
@@ -4932,7 +5135,7 @@ function App() {
       </div>
       <div className="ctl-sec"><div className="hk-btns">
         <button className="tool-btn tool-btn-primary" onClick=${pick('restart')}>Fly again</button>
-        <button className="tool-btn" onClick=${() => { setSeed(freshSeed()); menuDo({ type: 'newseed' }); }}>New seed</button>
+        <button className="tool-btn" onClick=${() => { setSeed(freshSeed()); menuDo({ type: 'newseed' }); }}>Random route</button>
         <button className="tool-btn" onClick=${pick('menu')}>Menu</button>
       </div></div>
     </div>` : null}
@@ -4960,9 +5163,10 @@ function App() {
         <span>Seed</span>
         <input type="number" min="1" step="1" value=${seedText}
           onChange=${(e) => setSeedText(e.target.value)}
-          onKeyDown=${(e) => { if (e.key === 'Enter') { const v = parseInt(seedText, 10); if (v > 0) setSeed(v); } }}
-          onBlur=${() => { const v = parseInt(seedText, 10); if (v > 0 && v !== p.seed) setSeed(v); else setSeedText(String(p.seed)); }} />
-        <button className="lang-seg" onClick=${() => setSeed(1 + Math.floor(Math.random() * 99999))}>New route</button>
+          onKeyDown=${(e) => { if (e.key === 'Enter') goSeedText(); }}
+          onBlur=${commitSeedText} />
+        <button className="tool-btn tool-btn-sm" onClick=${goSeedText}>Go</button>
+        <button className="tool-btn tool-btn-sm" onMouseDown=${keepFocus} onClick=${() => setSeed(freshSeed())}>Random route</button>
       </div>
       <div className="hk-derived">
         <span>Rings and portals, then the finish</span><b>${route.waypoints.filter((w) => w.kind === 'ring').length} + ${route.waypoints.filter((w) => w.kind === 'portal').length} + 1</b>
@@ -4979,7 +5183,7 @@ function App() {
         <button className=${'lang-seg' + (p.canyon ? ' active' : '')} onClick=${() => upd('canyon')(!p.canyon)}>Street canyon</button>
         <button className=${'lang-seg' + (p.arco ? ' active' : '')} onClick=${() => upd('arco')(!p.arco)}>Arcology</button>
       </div>
-      ${p.canyon !== routeCanyon || p.arco !== routeArco ? html`<p className="hk-note">The canyon and arcology switches apply to the next route (New route or another seed).</p>` : null}
+      ${p.canyon !== routeCanyon || p.arco !== routeArco ? html`<p className="hk-note">The canyon and arcology switches apply to the next route (Go, Random route or another seed).</p>` : null}
 
       <${Seg} label="View" value=${p.camMode} onChange=${upd('camMode')}
         options=${[{ value: 'chase', label: 'Chase' }, { value: 'cockpit', label: 'Cockpit' }]} />
@@ -5196,10 +5400,17 @@ function App() {
           <button className=${'lang-seg' + (p.shadows ? ' active' : '')} onClick=${() => upd('shadows')(!p.shadows)}>Shadows</button>
           <button className=${'lang-seg' + (p.particles ? ' active' : '')} onClick=${() => upd('particles')(!p.particles)}>Particles</button>
         </div>
+        ${p.particles ? html`<${React.Fragment}>
+          <${Slider} label="Dust density" unit="x" digits=${2} min=${0.25} max=${3} step=${0.25}
+            value=${p.dust} onChange=${upd('dust')} />
+          <${Slider} label="Dust streaks" unit="x" digits=${2} min=${0} max=${2} step=${0.25}
+            value=${p.dustStreak} onChange=${upd('dustStreak')} />
+        <//>` : null}
         <${Seg} label="Weather" value=${p.weather} onChange=${upd('weather')}
           options=${[{ value: 'auto', label: 'Auto' }, { value: 'dry', label: 'Dry' }, { value: 'rain', label: 'Rain' }]} />
         <p className="hk-note">"Collision hull" shows the 18 points and the hull the physics uses. Shadows are off by default
-          because they cost frame time. "Particles" are the drifting motes that show your speed. On "Auto", rain comes
+          because they cost frame time. "Particles" are the dust motes that show your speed: they stand in the air,
+          and at speed each one draws a short streak along its motion past you. "Dust streaks" at 0 leaves round dots. On "Auto", rain comes
           and goes: a shower of 40 to 90 s in most five-minute stretches, fading in and out over 10 s.</p>
       <//>
 
