@@ -244,6 +244,10 @@
                 plain sight (in front of a Menger block, say) without a
                 pop. Default 0, no fade. Rendering only: poses, contacts and
                 gaps are unchanged
+       cull     cull distance of this lane in metres, from its box to the
+                camera; it can only lower the type bands' cull (default
+                null: the bands decide). The block arcology's interior
+                lanes use 600. Rendering only
      The concept form is still accepted: { x0, y0, zA, zB, dir, v, mix,
      gap } becomes a straight open lane along z (dir > 0 runs from zB to zA),
      mix ['hauler', 'car', ...] becomes weights, gap [a, b] a spacing of the
@@ -383,7 +387,9 @@
       up: norm(o.up || [0, 1, 0]), up2: norm(o.up2 || [0, 0, 1]),
       maxBank: o.maxBank != null ? +o.maxBank : 0.6, express: !!o.express,
       margin: o.margin != null ? +o.margin : 1,
-      fadeEnds: o.fadeEnds != null ? Math.max(0, +o.fadeEnds) : 0
+      fadeEnds: o.fadeEnds != null ? Math.max(0, +o.fadeEnds) : 0,
+      /* cull distance of this lane (box to camera), below the type bands' */
+      cull: o.cull != null ? Math.max(0, +o.cull) : null
     };
     if (lane.empty === 1) throw new Error('makeLane: empty = 1 would leave every slot empty');
     let Rmax = 0, lenMax = 0;
@@ -1791,6 +1797,7 @@ void main(){
     /* per lane: the largest cull of the types it carries */
     const laneCull = new Map();
     for (const v of vehicles) laneCull.set(v.lane, Math.max(laneCull.get(v.lane) || 0, TB[v.type].cull));
+    for (const [lane, c] of laneCull) if (lane.cull != null) laneCull.set(lane, Math.min(c, lane.cull));
 
     function release(v) { if (v.slot >= 0) { pools[v.type][v.slot].owner = -1; v.slot = -1; } }
     function setDebug(on) {
