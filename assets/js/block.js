@@ -22,8 +22,8 @@
  *
  *   - Pure layer, no three.js, no DOM: makeBlock, flythrough, pageCurve,
  *     lanes, portals, contacts, boxesNear, clearance, depthIn, campusSpec,
- *     inside, inBuilding, bounds, solidShare, toWorld, toLocal, dirWorld,
- *     yawFor. notes/dev/block.test.mjs checks it.
+ *     inside, inBuilding, bounds, solidShare, tubeAt, toWorld, toLocal,
+ *     dirWorld, yawFor. notes/dev/block.test.mjs checks it.
  *   - Visual layer: build(THREE, layout, opts). THREE is a parameter, never
  *     an import. Reads ColorRamps (bone greys).
  *
@@ -45,6 +45,15 @@
  * down (R 76 m) into the roof portal, weave down with offsets of +-28 m
  * (extremes at 300 and 160 m, deck spacing 140 m), pull out (R 76 m), a
  * 212 m hall run, out through the east end wall at 42 m.
+ *
+ * Atrium variant B (needle eyes, concepts/ATRIUM-DIFFICULTY.md, owner
+ * decision 2026-10-26), on by default: the route holes of P1 and P2 keep
+ * 10 m + 3 m round the race line instead of 25.5 m (about 50 x 30 and
+ * 49 x 30 m instead of 75 x 56 and 74 x 56), the roof portal stays 80 x
+ * 60 m, and each of the four rings stands in a frame gate with collision
+ * (two bridges wall to wall, two posts, a thin gold rim). Everything else
+ * keeps the tube; tubeAt(L, p) gives the local guarantee. The route itself
+ * does not change. Option needle: null restores the wide holes, no gates.
  *
  * Everything solid is an axis-aligned box. The box list is the collision
  * list (layout.boxes, the { min, max, c, half, idx } shape of hkcore
@@ -81,6 +90,16 @@
     plaza: 280,            /* reserved band round the footprint (campus and plaza) */
     campus: true,          /* the module's own campus (solid) */
     surround: null,        /* ring road, boulevards, plaza (drawn); null: as campus */
+    /* atrium variant B (needle eyes, owner decision 2026-10-26): the route
+       holes of the two packages keep needle + 3 m round the race line
+       instead of the tube's 25.5 m, and a frame gate with collision stands
+       at each of the four rings. needle null (or not below the tube) gives
+       the old wide holes and no gates. */
+    needle: 10,            /* local clearance radius in the package holes and the gates */
+    gates: true,           /* frame gates at the rings (only with a needle) */
+    gateMin: 16,           /* smallest half opening: ring radius 10 + 1.5 grace + 4.2 half span of the courier */
+    gateBar: 3,            /* bar width in the gate's plane */
+    gateDepth: 3,          /* bar depth along the gate's normal */
     laneEnd: 40,           /* horizontal lanes end this far inside the reserved box */
     fadeEnds: 60,
     cell: 40               /* contact grid */
@@ -427,20 +446,94 @@
     P.rngE = r;
   }
 
+  /* the local clearance radius of variant B, or null (wide holes, no gates) */
+  function needleOf(C) { return C.needle != null && C.needle < TUBE ? +C.needle : null; }
   /* a package's route hole is the route's extent over the package height
-     (+- the tube) plus the tube and 3 m on every side: the reveal never comes
-     closer than 22.5 m, whatever the weave does inside the package */
+     (+- the tube) plus a rim on every side. The lid (the roof portal, an
+     invitation rather than a test) and every hole without a needle keep the
+     tube and 3 m: the reveal never comes closer than 22.5 m, whatever the
+     weave does inside the package. With a needle (variant B) the two
+     packages keep the needle and 3 m, at least needle + 5 m half size, and
+     the band reaches over the soffit; every such hole is a needle zone. */
   function sizeHoles(P) {
+    const nr = needleOf(P.C);
+    P.needleZones = [];
     for (const d of P.decks) {
+      const nd = nr != null && !d.lid, yb = d.y - (nd && d.soffit ? 2 : 0);
       let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-      for (const p of P.route.pts) if (p[1] > d.y - TUBE && p[1] < d.y + d.th + TUBE && Math.abs(p[0]) < GEO.AX) {
+      for (const p of P.route.pts) if (p[1] > yb - TUBE && p[1] < d.y + d.th + TUBE && Math.abs(p[0]) < GEO.AX) {
         x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); z0 = Math.min(z0, p[2]); z1 = Math.max(z1, p[2]);
       }
-      const m = TUBE + 3;
-      const h = [(x0 + x1) / 2, (z0 + z1) / 2, Math.max(32, (x1 - x0) / 2 + m), Math.max(28, (z1 - z0) / 2 + m)];
+      const m = nd ? nr + 3 : TUBE + 3, mx = nd ? nr + 5 : 32, mz = nd ? nr + 5 : 28;
+      const h = [(x0 + x1) / 2, (z0 + z1) / 2, Math.max(mx, (x1 - x0) / 2 + m), Math.max(mz, (z1 - z0) / 2 + m)];
       if (d.lid) { h[0] = P.C.x0; h[2] = Math.max(h[2], 40); h[3] = Math.max(h[3], 30); }
       d.holes = [h]; d.route = h;
+      if (nd) P.needleZones.push({ name: d.name, r: nr, a: [h[0] - h[2], yb - TUBE, h[1] - h[3], h[0] + h[2], d.y + d.th + TUBE, h[1] + h[3]] });
     }
+  }
+
+  /* Variant B's frame gates, one per ring: an axis-aligned frame in the
+     plane across the ring's dominant direction (horizontal in V1, V2 and
+     halfway round the pull-out, upright on the hall run). The opening is
+     the race line's extent within needle + half the depth of the plane plus
+     needle + 3 m on every side, at least gateMin; two bridges run along z
+     from wall to wall, two posts close the opening (in the hall down to the
+     floor). Bars are carved where a lane passes (its reach plus 2 m) and
+     must keep the needle from the design curve; a slab of the tube's width
+     round the plane is a needle zone. Called after the furniture, so the
+     random streams and every other box index stay as they were. */
+  function gates(P) {
+    const C = P.C, nr = needleOf(C);
+    P.gates = [];
+    if (!C.gates || nr == null) return;
+    const R = P.route, W = C.gateBar, T = C.gateDepth, m = nr + 3;
+    const V = [-GEO.AX, GEO.voids[2][0], -GEO.SZ0, GEO.AX, GEO.lid[0] - 2, GEO.SZ0];
+    let dropped = 0;
+    P.ringS.forEach((s, i) => {
+      const p = R.at(s), t = R.tan(s);
+      const ax = Math.abs(t[1]) >= Math.abs(t[0]) && Math.abs(t[1]) >= Math.abs(t[2]) ? 1 : Math.abs(t[0]) >= Math.abs(t[2]) ? 0 : 2;
+      const sp = ax === 2 ? 0 : 2, cr = ax === 1 ? 0 : 1, c = p[ax];
+      /* the run of curve samples round the ring within the band (the weave
+         crosses the same plane elsewhere; the bars' clearance check covers that) */
+      const lo = p.slice(), hi = p.slice(), k0 = Math.round(s / R.step);
+      for (const dk of [-1, 1]) {
+        for (let k = k0; k >= 0 && k < R.pts.length && Math.abs(R.pts[k][ax] - c) <= T / 2 + nr; k += dk) {
+          for (let j = 0; j < 3; j++) { lo[j] = Math.min(lo[j], R.pts[k][j]); hi[j] = Math.max(hi[j], R.pts[k][j]); }
+        }
+      }
+      const cs = (lo[sp] + hi[sp]) / 2, cc = (lo[cr] + hi[cr]) / 2;
+      const hs = Math.max(C.gateMin, (hi[sp] - lo[sp]) / 2 + m), hc = Math.max(C.gateMin, (hi[cr] - lo[cr]) / 2 + m);
+      const bar = (s0, s1, c0, c1) => { const a = [0, 0, 0, 0, 0, 0]; a[ax] = c - T / 2; a[ax + 3] = c + T / 2; a[sp] = s0; a[sp + 3] = s1; a[cr] = c0; a[cr + 3] = c1; return a; };
+      const cTop = cc + hc + W, cBot = cr === 1 ? V[1] : cc - hc - W;
+      let list = [
+        bar(V[sp], V[sp + 3], cc + hc, cc + hc + W), bar(V[sp], V[sp + 3], cc - hc - W, cc - hc),
+        bar(cs - hs - W, cs - hs, cBot, cTop), bar(cs + hs, cs + hs + W, cBot, cTop)
+      ].map((a) => ({ a: a, kind: 'gate' }));
+      /* a lane cuts a bar right across: the gap spans the bar's section */
+      for (const l of P.lanes) {
+        const e = laneBoxL(l), g = laneRadius(l) + 2, env = [e[0] - g, e[1] - g, e[2] - g, e[3] + g, e[4] + g, e[5] + g];
+        const out = [];
+        for (const b of list) {
+          if (!overlaps(b.a, env)) { out.push(b); continue; }
+          const a = b.a, lg = [0, 1, 2].reduce((m, j) => (a[j + 3] - a[j] > a[m + 3] - a[m] ? j : m), 0);
+          if (env[lg] > a[lg] + 0.05) { const q = a.slice(); q[lg + 3] = env[lg]; out.push({ a: q, kind: b.kind }); }
+          if (env[lg + 3] < a[lg + 3] - 0.05) { const q = a.slice(); q[lg] = env[lg + 3]; out.push({ a: q, kind: b.kind }); }
+        }
+        list = out;
+      }
+      const bars = [];
+      for (const b of list) {
+        if (!P.clearOf(b.a, nr)) { dropped++; continue; }
+        const q = box(b.a[0], b.a[1], b.a[2], b.a[3], b.a[4], b.a[5], 0.2, Z.BLANK, 'gate', 0.4 + 0.05 * i);
+        P.solids.push(q); bars.push(q.a);
+      }
+      const o = [0, 0, 0]; o[ax] = c; o[sp] = cs; o[cr] = cc;
+      P.gates.push({ name: 'ring' + (i + 1), s: s, ax: ax, sp: sp, cr: cr, c: o, hs: hs, hc: hc, depth: T, bars: bars });
+      const z = V.slice();
+      z[ax] = c - T / 2 - TUBE; z[ax + 3] = c + T / 2 + TUBE;
+      P.needleZones.push({ name: 'ring' + (i + 1), r: nr, a: z });
+    });
+    P.stats.gates = P.gates.length; P.stats.gateDropped = dropped;
   }
 
   /* lanes on the Menger 54 m lattice: x-lanes on z = 27 + 54k, z-lanes on
@@ -769,6 +862,7 @@
     const yV1 = (GEO.voids[0][0] + GEO.voids[0][1]) / 2, yV2 = (GEO.voids[1][0] + GEO.voids[1][1]) / 2;
     const xb = C.x0 - C.amp, sP = R.cross(1, C.yB - C.R2 * Math.SQRT1_2, P.sIn);
     P.ringS = [R.cross(1, yV1, P.sIn), R.cross(1, yV2, P.sIn), sP, R.cross(0, xb + C.R2 + 112, sP)];
+    gates(P);
     decorate(P);
     return P;
   }
@@ -784,9 +878,13 @@
   function decorate(P) {
     const r = makeRng((P.seed ^ 0x5bd1e995) | 0), C = P.C, Lg = [], Dt = [];
     const top = GEO.lid[1], yR = GEO.top, bb = P.bbox;
-    const line = (a, b, w, c, g) => Lg.push({ t: 'line', a: a, b: b, w: w, c: c, g: g });
+    /* rT: the drop radius of what is pushed now (the tube; the needle at the
+       hole and gate rims of variant B, which sit closer than the tube) */
+    let rT = TUBE;
+    const nr = needleOf(C);
+    const line = (a, b, w, c, g) => Lg.push({ t: 'line', a: a, b: b, w: w, c: c, g: g, r: rT });
     const panel = (lo, hi, c, g) => Lg.push({ t: 'box', lo: lo, hi: hi, c: c, g: g });
-    const dot = (p, s, c, g) => Lg.push({ t: 'dot', p: p, s: s, c: c, g: g });
+    const dot = (p, s, c, g) => Lg.push({ t: 'dot', p: p, s: s, c: c, g: g, r: rT });
     const halo = (p, sx, sy, c, g, blink) => Lg.push({ t: 'halo', p: p, sx: sx, sy: sy, c: c, g: g, blink: blink || 0 });
     const det = (k, lo, hi, tone) => Dt.push({ k: k, lo: lo, hi: hi, tone: tone });
     const rod = (k, a, b, rr, tone) => Dt.push({ k: k, a: a, b: b, r: rr, tone: tone });
@@ -996,6 +1094,7 @@
     }
     /* ---- inside: the route holes as lit shafts, lift holes, soffit lamps ---- */
     for (const d of P.decks) {
+      rT = nr != null && !d.lid ? nr : TUBE;
       const q = d.route, yT = d.y + d.th, yBt = d.y - (d.soffit ? 2 : 0);
       const x0 = q[0] - q[2], x1 = q[0] + q[2], z0 = q[1] - q[3], z1 = q[1] + q[3];
       /* gold rims at both ends of the shaft, the lid's (the roof portal) heavier */
@@ -1022,6 +1121,27 @@
         for (const s of xs) if (s[1] - s[0] > 4) line([s[0], yBt - 0.15, z], [s[1], yBt - 0.15, z], 0.5, 'sod', 0.7);
       }
     }
+    /* the gates: a thin gold rim round the opening on both faces, sodium
+       dots under the long bars */
+    for (const gt of P.gates || []) {
+      rT = nr;
+      const ax = gt.ax, sp = gt.sp, cr = gt.cr, o = gt.c;
+      const at = (dn, ds, dc) => { const v = [0, 0, 0]; v[ax] = o[ax] + dn; v[sp] = o[sp] + ds; v[cr] = o[cr] + dc; return v; };
+      for (const dn of [-gt.depth / 2 - 0.05, gt.depth / 2 + 0.05]) {
+        const hs = gt.hs - 0.3, hc = gt.hc - 0.3;
+        line(at(dn, -hs, -hc), at(dn, hs, -hc), 0.5, 'warm', 1); line(at(dn, hs, -hc), at(dn, hs, hc), 0.5, 'warm', 1);
+        line(at(dn, hs, hc), at(dn, -hs, hc), 0.5, 'warm', 1); line(at(dn, -hs, hc), at(dn, -hs, -hc), 0.5, 'warm', 1);
+      }
+      for (const b of gt.bars) {
+        if (b[sp + 3] - b[sp] < 40) continue;
+        for (let u = b[sp] + 6; u < b[sp + 3] - 3; u += 12) {
+          const v = [0, 0, 0]; v[sp] = u; v[ax] = o[ax]; v[cr] = (b[cr] + b[cr + 3]) / 2;
+          if (ax === 1) v[1] = b[1] - 0.4; else v[cr] = b[cr] - 0.4;
+          dot(v, 0.45, 'sod', 0.7);
+        }
+      }
+    }
+    rT = TUBE;
     for (const m of P.marks) {
       const a = m.a;
       if (m.type === 'lamp') dot(m.p, 0.6, 'sod', 0.8);
@@ -1071,8 +1191,9 @@
       return null;
     };
     for (const q of Lg) {
-      const a = lineBox(q);
-      if (a && !P.clearOf(a, TUBE)) { dropped++; continue; }
+      const a = lineBox(q), rq = q.r == null ? TUBE : q.r;
+      delete q.r;
+      if (a && !P.clearOf(a, rq)) { dropped++; continue; }
       P.lights.push(q);
     }
     for (const q of Dt) {
@@ -1253,6 +1374,10 @@
     L.exitDir = dirWorld(L, [1, 0, 0]);
     L.lights = P.lights; L.details = P.details;
     L.decks = P.decks.map((d) => ({ name: d.name, y0: d.y - (d.soffit ? 2 : 0), y1: d.y + d.th, hole: d.route.slice(), lift: d.lift.map((q) => q.slice()) }));
+    /* variant B's gates, plan frame: c the opening's centre on the ring's
+       plane, ax the plane's normal axis, hs and hc the half opening along sp
+       (z: the bridges' axis) and cr, bars the solid boxes */
+    L.gates = (P.gates || []).map((g) => ({ name: g.name, ax: g.ax, sp: g.sp, cr: g.cr, c: g.c.slice(), hs: g.hs, hc: g.hc, depth: g.depth, bars: g.bars.map((a) => a.slice()) }));
     L.stats = Object.assign({ boxes: L.boxes.length, lights: P.lights.length, details: P.details.length }, P.stats);
     L._lanes = worldLanes(L);
     return L;
@@ -1374,6 +1499,19 @@
     return inside < Infinity ? -inside : best;
   }
   function bounds(L) { return L._bounds; }
+  /* The clearance the race line is guaranteed at world point p: the tube
+     (22.5 m), but the needle (10 m) in variant B's package holes and gate
+     planes, growing back to the tube at one metre per metre outside them
+     (the canyon's cone). Every box keeps at least this much from the page
+     curve (tested on the module's placements and the page's routes). */
+  function tubeAt(L, p) {
+    const zs = L.plan.needleZones;
+    if (!zs || !zs.length) return TUBE;
+    const q = toLocal(L, p);
+    let r = TUBE;
+    for (const z of zs) r = Math.min(r, z.r + ptBoxDist(q, z.a));
+    return r;
+  }
   /* How deep world point p is in the interior, for the fog and light
      blend: -1 outside the interior zone (atrium plus lid, and the exit's
      reveal), else the distance to the nearer of the two portal openings
@@ -1779,7 +1917,7 @@
   }
 
   globalThis.HikyakuBlock = {
-    DEF: DEF, GEO: GEO, TUBE: TUBE, ACCENT: ACCENT, WARM: WARM,
+    DEF: DEF, GEO: GEO, TUBE: TUBE, ACCENT: ACCENT, WARM: WARM, tubeAt: tubeAt,
     makeBlock: makeBlock, campusSpec: campusSpec, flythrough: flythrough, pageCurve: pageCurve, lanes: lanes, laneRadius: laneRadius, portals: portals,
     contacts: contacts, boxesNear: boxesNear, clearance: clearance, inside: inside, inBuilding: inBuilding, bounds: bounds, depthIn: depthIn,
     toWorld: toWorld, toLocal: toLocal, dirWorld: dirWorld, dirLocal: dirLocal, yawFor: yawFor, boxDist: boxDist,
