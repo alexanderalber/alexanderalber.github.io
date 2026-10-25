@@ -377,9 +377,15 @@
     for (const P of [[-0.34, 2.6, 0], [-0.52, 1.9, 1], [-0.68, 1.9, 0], [2.52, 2.2, 1], [2.7, 1.5, 0]]) {
       for (const sp of spans) pipes.push({ th: P[0], r: P[1], alt: P[2], s0: sp[0], s1: sp[1], rc: ROUND_R - 3.6 - P[1] });
     }
-    /* catwalk on the floor of the round section */
+    /* catwalk on the floor of the round section. A segment keeps 9 m from
+       every fan plane over its whole length, not just at its ends: the
+       blades sweep down to 50.6 m from the axis and the deck's edge is at
+       46.3 m, so a segment spanning a fan plane (both ends 9 m or more
+       away, as at the pyramid's first fan) had the blades turning through
+       it. The blades reach 5.2 m along the axis, the hub 4.8 m upstream. */
     const walk = { y: -ROUND_R + 9, hw: 11, rail: 3.2, segs: [] };
-    for (let s = lf[1] + 4; s < lf[2] - 4; s += 20) if (!busy(s, 9) && !busy(s + 20, 9)) walk.segs.push([s, s + 20]);
+    const fanIn = (a, b, d) => sh.fans.some((f) => a < f.s + d && b > f.s - d);
+    for (let s = lf[1] + 4; s < lf[2] - 4; s += 20) if (!fanIn(s, s + 20, 9)) walk.segs.push([s, s + 20]);
     /* lamp stations: ceiling bars in the rectangular parts, two wall lamps
        in the round part, none in the lofts */
     const lamps = [];
