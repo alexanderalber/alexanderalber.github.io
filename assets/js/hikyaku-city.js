@@ -77,6 +77,10 @@
     /* the old town fringe (round two of CITY-VARIETY.md): low courtyard
        blocks and houses in patches at the city's rim, see districtAt */
     oldTown: true,
+    /* the campus round every special (2026-10-25, see campusPlan): on, it
+       replaces the special's empty reserved square; campuses: an explicit
+       list of campus descriptions instead of the route's specials */
+    campus: true, campuses: null,
     accents: 2,           /* number of neon hues, 0 to 2 */
     roofGap: 15,          /* roof below the tube bottom, metres */
     margin: 3,            /* extra metres outside the tube radius */
@@ -330,6 +334,614 @@
     return best;
   }
 
+  /* ---- the campus round a special (2026-10-25) -----------------------------
+     A special (the Menger block now; the pyramid and the block arcology
+     later) used to reserve a square of city that stayed empty: for the
+     Menger the 2 x 2 tiles round its tile corner, 432 m of nothing round a
+     243 m block. The campus fills that band with what a building of that
+     size needs round it (look reference: concepts/lib/pyrsurround.js):
+
+       - low, dense service buildings, 12 to 42 m: logistics halls (some
+         with an office annex), parking decks with lit levels (one PROG_SLIT
+         box per storey, so every level carries its light line),
+         substations (control house and a yard of transformer blocks under
+         amber lamps), low service offices, and one transit station;
+       - ties to the special's wall: bridges and conveyor tubes from the
+         first ring of buildings, ending on a solid part of the wall
+         (attach.solid) below attach.maxY, so they never end in a hole;
+       - a ring road: an elevated deck (top CAMPUS.deckY, under the lowest
+         lane band) on the first street ring at least ringMin from the
+         footprint, with the light streams of the ground layer mockup;
+       - two approach boulevards: the ring's two side lines run on outward
+         on the plaza side, with lamp masts;
+       - the plaza, only on the plaza side (the entry portal's face for the
+         Menger): a lit deck over the soup with tall light masts, landing
+         pads and kiosk rows;
+       - a rail viaduct from the station outward, under 45 m;
+       - and the city resuming beyond the campus at 30 % of its height,
+         back to full one tile further out (campusRamp).
+
+     Nothing of it goes above CAMPUS.top (45 m, the bottom of the lowest
+     lane band) except the plaza's light masts, which keep mastClear from
+     every street line (so 10 m from every lane line), and the rail's
+     lights. Everything keeps out of the special's footprint, its approach
+     legs and its own lanes (keep), the route tube (clear in makeTile) and
+     every reserved box; the ring lane (campusRing, for the traffic) keeps
+     5 m from every campus box.
+
+     The API for a special. A special on route.specials either carries
+     sp.campus itself, or campusOf derives one (only kind 'menger' so far):
+
+       { footprint: { min, max },       the special's own box, kept free
+         plaza: [nx, 0, nz] or null,     outward normal of the plaza face
+         legs: [{ a, b, r }],            approach legs: capsules kept free
+         keep: [{ a, b, r }],            more capsules (the special's lanes)
+         attach: { maxY, solid: [{ min, max }] } or null,
+                                         where ties may end: on the face
+                                         plane, inside one solid box, below
+                                         maxY; null: no ties
+         replaces: { min, max } or null, the reserved box the campus
+                                         replaces (matched by geometry)
+         seed }
+
+     makeTile takes the campuses from route.specials (or from opts.campuses,
+     a list of such objects) unless opts.campus is false; campus false is
+     the old city exactly. Everything here is a pure function of the
+     campus and the city seed, so tiles agree in any load order: the plan
+     is world wide, each tile builds the part inside its square and drops
+     what its own tube and reserved boxes forbid. */
+  var CAMPUS = {
+    ringMin: 45,             /* ring road line at least this far from the footprint */
+    rampOff: 54, ramp: 216, rampLo: 0.3,   /* height ramp beyond the campus */
+    top: 45,                 /* nothing above, except the plaza masts */
+    deckY: 30, deckT: 2, deckHW: 7, deckAir: 3, chunk: 27,
+    plazaY: 28, plazaT: 2.4, plazaGap: 3,
+    mastTop: 62, mastClear: 15,
+    railY: 44, railT: 1.6, railHW: 1.5, railAir: 4,
+    lampH: 9,
+    tieW: 7, tieH: 4.5, pipe: 3.4,
+    laneR: 9,                /* keep-out round the special's lanes: hauler plus 4.3 m */
+    ringLaneY: 35, ringLaneR: 40, ringLaneKeep: 5
+  };
+  /* the four sides of a footprint: outward normal n, its axis a, the lateral axis l */
+  var CSIDES = [{ n: [1, 0, 0], a: 0, l: 2 }, { n: [-1, 0, 0], a: 0, l: 2 }, { n: [0, 0, 1], a: 2, l: 0 }, { n: [0, 0, -1], a: 2, l: 0 }];
+  /* rect index of side s's edge in [x0, z0, x1, z1] */
+  var CEDGE = [2, 0, 3, 1];
+
+  /* Distance from segment ab to box: the distance from a point moving
+     along the segment to a convex set is convex in the parameter, so a
+     golden section search finds the minimum (to well under a millimetre
+     on the segments used here). */
+  function segBoxDist(a, b, box) {
+    var d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], G = 0.381966;
+    function f(t) { return boxDist(box, [a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t]); }
+    var lo = 0, hi = 1, x1 = G, x2 = 1 - G, f1 = f(x1), f2 = f(x2);
+    for (var i = 0; i < 46; i++) {
+      if (f1 < f2) { hi = x2; x2 = x1; f2 = f1; x1 = lo + G * (hi - lo); f1 = f(x1); }
+      else { lo = x1; x1 = x2; f1 = f2; x2 = hi - G * (hi - lo); f2 = f(x2); }
+    }
+    return Math.min(f(0), f(1), f1, f2);
+  }
+  /* The box of a campus run from a to b along its axis, with the air over
+     it if air */
+  function runBox(run, a, b, air) {
+    var pa = run.axis === 0 ? 2 : 0, lo = [0, run.y - run.th, 0], hi = [0, run.y + (air ? run.air : 0), 0];
+    lo[run.axis] = a; hi[run.axis] = b; lo[pa] = run.line - run.hw; hi[pa] = run.line + run.hw;
+    return { min: lo, max: hi };
+  }
+  /* true if box b keeps r from every capsule of the list */
+  function keepFree(b, list) {
+    for (var i = 0; i < list.length; i++) {
+      var k = list[i], r = k.r;
+      if (Math.min(k.a[0], k.b[0]) - r > b.max[0] || Math.max(k.a[0], k.b[0]) + r < b.min[0] ||
+        Math.min(k.a[1], k.b[1]) - r > b.max[1] || Math.max(k.a[1], k.b[1]) + r < b.min[1] ||
+        Math.min(k.a[2], k.b[2]) - r > b.max[2] || Math.max(k.a[2], k.b[2]) + r < b.min[2]) continue;
+      if (segBoxDist(k.a, k.b, b) < r) return false;
+    }
+    return true;
+  }
+
+  /* The campus of a special: its own sp.campus, or for a Menger block one
+     derived from the route's description of it. The legs run 600 m out
+     from both portals along their normals, a capsule of half the larger
+     portal side plus 12 m; keep holds every lane of the block, 12 m longer
+     at both ends (the hauler's half length) and laneR thick; the block's
+     solid boxes on its four faces are where ties may end, below the first
+     row of level-2 cells (32 m), where the first holes start. */
+  var campusCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function campusOf(sp) {
+    if (!sp || typeof sp !== 'object') return null;
+    if (sp.campus) return sp.campus;
+    if (sp.kind !== 'menger' || !sp.bounds) return null;
+    var c = campusCache ? campusCache.get(sp) : null;
+    if (c) return c;
+    var bb = sp.bounds, legs = [], keep = [], solid = [];
+    [sp.entry, sp.exit].forEach(function (P) {
+      if (!P || !P.n || Math.abs(P.n[1]) > 0.5) return;
+      legs.push({ a: P.p.slice(), b: [P.p[0] + P.n[0] * 600, P.p[1], P.p[2] + P.n[2] * 600], r: Math.max(P.w, P.h) / 2 + 12 });
+    });
+    var lanes = (sp.block && sp.block.lanes) || [];
+    lanes.forEach(function (l) {
+      for (var i = 0; i + 1 < l.points.length; i++) {
+        var a = l.points[i], b = l.points[i + 1], d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        var e = 12 / (Math.hypot(d[0], d[1], d[2]) || 1);
+        keep.push({ a: [a[0] - d[0] * e, a[1] - d[1] * e, a[2] - d[2] * e], b: [b[0] + d[0] * e, b[1] + d[1] * e, b[2] + d[2] * e], r: CAMPUS.laneR });
+      }
+    });
+    ((sp.block && sp.block.boxes) || []).forEach(function (q) {
+      if (Math.abs(q.max[0] - bb.max[0]) < 0.6 || Math.abs(q.min[0] - bb.min[0]) < 0.6 ||
+        Math.abs(q.max[2] - bb.max[2]) < 0.6 || Math.abs(q.min[2] - bb.min[2]) < 0.6) solid.push({ min: q.min.slice(), max: q.max.slice() });
+    });
+    c = { kind: 'menger', footprint: { min: bb.min.slice(), max: bb.max.slice() },
+      plaza: sp.entry && Math.abs(sp.entry.n[1]) < 0.5 ? sp.entry.n.slice() : null,
+      legs: legs, keep: keep, attach: { maxY: 32, solid: solid },
+      replaces: sp.reserved ? { min: sp.reserved.min.slice(), max: sp.reserved.max.slice() } : null, seed: (sp.seed >>> 0) || 1 };
+    if (campusCache) campusCache.set(sp, c);
+    return c;
+  }
+
+  /* The rings of a campus. ring: the street lines the ring road runs on
+     (first multiple of 108 m at least ringMin outside the footprint, per
+     side); claim: one street further out, every block whose centre lies
+     inside belongs to the campus; infl: claim plus the height ramp. All
+     [x0, z0, x1, z1]. */
+  var prepCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function prepCampus(cs) {
+    var P = prepCache ? prepCache.get(cs) : null;
+    if (P) return P;
+    var K = CAMPUS, f = cs.footprint, H = TILE / 2;
+    var F = [f.min[0], f.min[2], f.max[0], f.max[2]];
+    var ring = [Math.floor((F[0] - K.ringMin) / H) * H, Math.floor((F[1] - K.ringMin) / H) * H,
+      Math.ceil((F[2] + K.ringMin) / H) * H, Math.ceil((F[3] + K.ringMin) / H) * H];
+    var claim = [ring[0] - H, ring[1] - H, ring[2] + H, ring[3] + H];
+    var ex = K.rampOff + K.ramp, infl = [claim[0] - ex, claim[1] - ex, claim[2] + ex, claim[3] + ex];
+    var ps = -1;
+    if (cs.plaza) for (var s = 0; s < 4; s++) if (CSIDES[s].n[0] * cs.plaza[0] + CSIDES[s].n[2] * cs.plaza[2] > 0.7) ps = s;
+    P = { cs: cs, F: F, fy: f.max[1], ring: ring, claim: claim, infl: infl, ps: ps, plans: {} };
+    /* the ring lane (campusRing) as segments, arcs every 15 degrees */
+    var lane = ringLanePath(ring), seg = [];
+    for (var i = 0; i < lane.length; i++) seg.push({ a: lane[i], b: lane[(i + 1) % lane.length], r: K.ringLaneKeep });
+    P.ringSeg = seg;
+    if (prepCache) prepCache.set(cs, P);
+    return P;
+  }
+  function ringLanePath(ring) {
+    var K = CAMPUS, y = K.ringLaneY, r = K.ringLaneR, C4 = [[ring[0], ring[1]], [ring[2], ring[1]], [ring[2], ring[3]], [ring[0], ring[3]]], out = [];
+    for (var i = 0; i < 4; i++) {
+      var c = C4[i], p = C4[(i + 3) % 4], q = C4[(i + 1) % 4];
+      var u = [Math.sign(c[0] - p[0]), Math.sign(c[1] - p[1])], v = [Math.sign(q[0] - c[0]), Math.sign(q[1] - c[1])];
+      var m = [c[0] - u[0] * r + v[0] * r, c[1] - u[1] * r + v[1] * r];
+      for (var k = 0; k <= 6; k++) {
+        var a = k / 6 * Math.PI / 2, ca = Math.cos(a), sa = Math.sin(a);
+        out.push([m[0] - v[0] * r * ca + u[0] * r * sa, y, m[1] - v[1] * r * ca + u[1] * r * sa]);
+      }
+    }
+    return out;
+  }
+  /* The ring lane for the traffic (makeLanes): the ring road's square at
+     ringLaneY, a closed loop with corners of ringLaneR, for a special or a
+     campus. null when the special has no campus. */
+  function campusRing(spOrCampus) {
+    var cs = spOrCampus && spOrCampus.footprint ? spOrCampus : campusOf(spOrCampus);
+    if (!cs) return null;
+    var g = prepCampus(cs).ring, y = CAMPUS.ringLaneY;
+    return { points: [[g[0], y, g[1]], [g[2], y, g[1]], [g[2], y, g[3]], [g[0], y, g[3]]], loop: true, radius: CAMPUS.ringLaneR, y: y };
+  }
+  /* The prepared campuses of a city configuration (opts.campus, opts.campuses,
+     else the route's specials). */
+  function campusList(C, route) {
+    if (!(C.campus == null ? DEF.campus : C.campus)) return [];
+    var src = C.campuses || (route && route.specials ? route.specials.map(campusOf).filter(Boolean) : []);
+    return src.map(prepCampus);
+  }
+  function inRect(r, x, z) { return x > r[0] && x < r[2] && z > r[1] && z < r[3]; }
+  /* Height factor of the city at (x, z): rampLo at the campus edge (a
+     block centre rampOff beyond the claimed ring), 1 a ramp width
+     further out. */
+  function campusRamp(list, x, z) {
+    var f = 1, K = CAMPUS;
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i].claim, d = Math.max(c[0] - x, x - c[2], c[1] - z, z - c[3], 0);
+      f = Math.min(f, K.rampLo + (1 - K.rampLo) * smooth(K.rampOff, K.rampOff + K.ramp, d));
+    }
+    return f;
+  }
+
+  /* The world wide plan of one campus for city seed `seed`, cached:
+     { runs, plaza, blocks, station, stats }. Plan level checks are the
+     pure ones (footprint, legs, keep, the ring lane, solid wall for ties);
+     makeTile adds the tube, the reserved boxes and the tile's own boxes. */
+  function cBox(x0, y0, z0, x1, y1, z1, kind, prog, tone, sd) {
+    return { min: [x0, y0, z0], max: [x1, y1, z1], kind: kind, prog: prog == null ? PROG_PLAIN : prog, tone: tone, seed: sd, g: -1, campus: true };
+  }
+  function rBox(r, y0, y1, kind, prog, tone, sd) { return cBox(r[0], y0, r[1], r[2], y1, r[3], kind, prog, tone, sd); }
+  function campusPlan(P, seed) {
+    var key = String(seed >>> 0);
+    if (P.plans[key]) return P.plans[key];
+    var K = CAMPUS, H = TILE / 2, cs = P.cs, F = P.F, ring = P.ring;
+    var keep = (cs.keep || []).concat(cs.legs || []), keepAll = keep.concat(P.ringSeg);
+    var RM = rng(hashU(Math.round(F[0]), Math.round(F[1]), (seed ^ cs.seed) >>> 0, 900));
+    var plan = { runs: [], plaza: null, blocks: [], station: null, keep: keep, keepAll: keepAll,
+      stats: { blocks: 0, buildings: 0, ties: 0, plazaItems: 0 } };
+    function faceOf(s) { return F[CEDGE[s]]; }
+    function ringOf(s) { return ring[CEDGE[s]]; }
+    /* world rect from depth d0..d1 beyond side s's face and lateral l0..l1 */
+    function sideRect(s, d0, d1, l0, l1) {
+      var S = CSIDES[s], f0 = faceOf(s), sg = S.n[S.a];
+      var a0 = sg > 0 ? f0 + d0 : f0 - d1, a1 = sg > 0 ? f0 + d1 : f0 - d0;
+      return S.a === 0 ? [a0, l0, a1, l1] : [l0, a0, l1, a1];
+    }
+    /* street lines are multiples of 108 m on both axes */
+    function offStreets(x, z, m) {
+      return Math.abs(x - Math.round(x / H) * H) >= m && Math.abs(z - Math.round(z / H) * H) >= m;
+    }
+
+    /* ---- runs: the ring, the boulevards, the rail ---- */
+    var dk = { kind: 'deck', y: K.deckY, th: K.deckT, hw: K.deckHW, air: K.deckAir, hue: -1 };
+    function run(role, axis, line, a, b, base) {
+      var r = { role: role, axis: axis, line: line, a: Math.min(a, b), b: Math.max(a, b) };
+      for (var k in base) r[k] = base[k];
+      plan.runs.push(r);
+      return r;
+    }
+    /* along z on the x lines, the full side; along x on the z lines, between them */
+    run('ring', 2, ring[0], ring[1] - K.deckHW, ring[3] + K.deckHW, dk);
+    run('ring', 2, ring[2], ring[1] - K.deckHW, ring[3] + K.deckHW, dk);
+    run('ring', 0, ring[1], ring[0] + K.deckHW, ring[2] - K.deckHW, dk);
+    run('ring', 0, ring[3], ring[0] + K.deckHW, ring[2] - K.deckHW, dk);
+    var reach = H + K.rampOff + K.ramp;
+    if (P.ps >= 0) {
+      var S0 = CSIDES[P.ps], rl = ringOf(P.ps), sg0 = S0.n[S0.a];
+      for (var j = 0; j < 2; j++) {
+        var lat = S0.l === 0 ? ring[j ? 2 : 0] : ring[j ? 3 : 1];
+        var br = run('blvd', S0.a, lat, rl + sg0 * K.deckHW, rl + sg0 * reach, dk);
+        br.lamps = true; br.from = rl;
+      }
+    }
+
+    /* ---- the station: a ring B block beside the line through the centre ---- */
+    var sides = [];
+    for (var s = 0; s < 4; s++) if (P.ps < 0 || CSIDES[s].a !== CSIDES[P.ps].a) sides.push(s);
+    var sS = sides[Math.floor(RM() * sides.length)], SS = CSIDES[sS], sgS = SS.n[SS.a];
+    var cLat = SS.l === 0 ? (F[0] + F[2]) / 2 : (F[1] + F[3]) / 2, sLine = Math.round(cLat / H) * H, sSide = RM() < 0.5 ? 1 : -1;
+    var rS = ringOf(sS);
+    run('rail', SS.a, sLine, rS, rS + sgS * (reach + H), { kind: 'rail', y: K.railY, th: K.railT, hw: K.railHW, air: K.railAir, hue: RM() < 0.5 ? 0 : 1 });
+    /* the station block's lateral and depth index */
+    var stLat = sSide > 0 ? sLine / H : sLine / H - 1, stDep = sgS > 0 ? rS / H : rS / H - 1;
+    var stI = SS.a === 0 ? stDep : stLat, stK = SS.a === 0 ? stLat : stDep;
+
+    /* the lot inside a block: m on every edge, g on the edge toward the
+       footprint (side tow), so ties have room */
+    function inset(r, m, tow, g) {
+      var o = [r[0] + m, r[1] + m, r[2] - m, r[3] - m];
+      if (tow === 0) o[0] = r[0] + g; else if (tow === 1) o[2] = r[2] - g;
+      else if (tow === 2) o[1] = r[1] + g; else if (tow === 3) o[3] = r[3] - g;
+      return o;
+    }
+    /* a group: boxes, lights and the rest that stand or fall together */
+    function group(blk) {
+      var gp = { boxes: [], glows: [], streaks: [], accents: [], pads: [] };
+      blk.groups.push(gp);
+      return gp;
+    }
+    function okAll(list) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].max[1] > K.top + 1e-9 || !keepFree(list[i], keepAll)) return false;
+      }
+      return true;
+    }
+    function commit(blk, gp) {
+      if (!okAll(gp.boxes)) { blk.groups.splice(blk.groups.indexOf(gp), 1); return false; }
+      plan.stats.buildings++;
+      return true;
+    }
+    /* a flat sign on face fc ([nx, nz]) of rect r */
+    function sign(gp, r, fc, y, w, h, R) {
+      var px = fc[0] > 0 ? r[2] : fc[0] < 0 ? r[0] : (r[0] + r[2]) / 2, pz = fc[1] > 0 ? r[3] : fc[1] < 0 ? r[1] : (r[1] + r[3]) / 2;
+      var fw = fc[0] ? r[3] - r[1] : r[2] - r[0];
+      if (fw < w + 4) return;
+      var o = R.range(-0.3, 0.3) * (fw - w - 4), t = fc[0] ? [0, 1] : [1, 0];
+      gp.accents.push({ p: [px + t[0] * o + fc[0] * 0.3, y, pz + t[1] * o + fc[1] * 0.3], n: [fc[0], 0, fc[1]], w: w, h: h,
+        hue: R.chance(0.6) ? 0 : 1, seed: R(), kind: 'flat' });
+    }
+    var BUILD = {
+      /* a logistics hall, 18 to 29 m, the cooling row on its roof, now and
+         then an office annex of 32 to 40 m at one end; amber lamps over the
+         loading doors */
+      hall: function (blk, L, R, tow) {
+        var gp = group(blk), alongX = L[2] - L[0] >= L[3] - L[1], h = STOREY * R.int(5, 8), tone = R.range(0.18, 0.23);
+        var hr = L.slice(), an = null;
+        if (R.chance(0.4)) {
+          var k = R.range(0.3, 0.4), lo = R.chance(0.5), ax = alongX ? 0 : 1, len = L[ax + 2] - L[ax];
+          an = L.slice();
+          if (lo) { an[ax + 2] = L[ax] + len * k; hr[ax] = an[ax + 2]; } else { an[ax] = L[ax + 2] - len * k; hr[ax + 2] = an[ax]; }
+          gp.boxes.push(rBox(an, 0, STOREY * R.int(9, 11), 'cbody', 0, 0.25, R()));
+        }
+        gp.boxes.push(rBox(hr, 0, h, 'cbody', 2, tone, R()));
+        /* the cooling row along the hall's long side */
+        var hw = hr[2] - hr[0], hd = hr[3] - hr[1], aX = hw >= hd, len2 = aX ? hw : hd, wid = aX ? hd : hw;
+        var nc = R.int(2, 5), csz = Math.min(R.range(8, 10), wid - 6), gap = R.range(3, 5);
+        while (nc > 1 && nc * csz + (nc - 1) * gap > len2 - 6) nc--;
+        var r0 = (aX ? hr[0] : hr[1]) + 3 + R() * Math.max(0, len2 - 6 - nc * csz - (nc - 1) * gap), c0 = (aX ? hr[1] : hr[0]) + 3 + R() * Math.max(0, wid - 6 - csz);
+        for (var i = 0; i < nc && csz >= 5; i++) {
+          var a1 = r0 + i * (csz + gap), ch = R.range(5.5, 8);
+          gp.boxes.push(aX ? cBox(a1, h, c0, a1 + csz, h + ch, c0 + csz, 'croof', PROG_PLAIN, 0.2, R()) : cBox(c0, h, a1, c0 + csz, h + ch, a1 + csz, 'croof', PROG_PLAIN, 0.2, R()));
+        }
+        /* loading doors: amber lamps on a long face that does not face the footprint */
+        var faces = aX ? [[0, 1], [0, -1]] : [[1, 0], [-1, 0]];
+        var fc = faces[R.int(0, 1)];
+        if (tow >= 0 && CSIDES[tow].n[0] === -fc[0] && CSIDES[tow].n[2] === -fc[1]) fc = [-fc[0], -fc[1]];
+        var nd = R.int(2, 4);
+        for (i = 0; i < nd; i++) {
+          var t = (i + 0.5) / nd, px = fc[0] ? (fc[0] > 0 ? hr[2] : hr[0]) + fc[0] * 1.2 : hr[0] + (hr[2] - hr[0]) * t;
+          var pz = fc[1] ? (fc[1] > 0 ? hr[3] : hr[1]) + fc[1] * 1.2 : hr[1] + (hr[3] - hr[1]) * t;
+          gp.glows.push({ p: [px, 6, pz], size: 6, hue: -2, gain: 0.55 });
+        }
+        if (R.chance(0.35)) sign(gp, an || hr, fc, Math.min(h, an ? 30 : h) - 4, R.range(9, 14), R.range(2.5, 3.6), R);
+        commit(blk, gp);
+      },
+      /* parking decks: one or two, 5 to 9 levels, each level a box whose
+         foot carries the lit line (PROG_SLIT), a stair head on the roof */
+      park: function (blk, L, R) {
+        var w = L[2] - L[0], d = L[3] - L[1], alongX = w >= d, short = alongX ? d : w, nL = R.int(5, 9);
+        var rects = [];
+        if (short >= 56 && R.chance(0.6)) {
+          var half = (short - 8) / 2;
+          if (alongX) rects.push([L[0], L[1], L[2], L[1] + half], [L[0], L[3] - half, L[2], L[3]]);
+          else rects.push([L[0], L[1], L[0] + half, L[3]], [L[2] - half, L[1], L[2], L[3]]);
+        } else rects.push(L.slice());
+        var gp = group(blk), tone = R.range(0.2, 0.25);
+        for (var q = 0; q < rects.length; q++) {
+          var r = rects[q], n = Math.max(4, nL - (q ? R.int(0, 2) : 0)), sd = R();
+          for (var lv = 0; lv < n; lv++) gp.boxes.push(rBox(r, lv * STOREY, (lv + 1) * STOREY, 'cbody', PROG_SLIT, tone, sd));
+          var top = n * STOREY, cxr = R.chance(0.5), czr = R.chance(0.5);
+          var sx0 = cxr ? r[2] - 8 : r[0] + 2, sz0 = czr ? r[3] - 8 : r[1] + 2;
+          gp.boxes.push(cBox(sx0, top, sz0, sx0 + 6, top + 5, sz0 + 6, 'croof', PROG_PLAIN, 0.26, sd));
+          if (r[2] - r[0] >= 20 && r[3] - r[1] >= 20) gp.pads.push({ p: [(r[0] + r[2]) / 2, top, (r[1] + r[3]) / 2], n: [0, 1, 0], w: r[2] - r[0], d: r[3] - r[1], kind: 'roof' });
+        }
+        commit(blk, gp);
+      },
+      /* a substation: a control house along one edge, a yard of
+         transformer blocks, amber lamps over some of them */
+      sub: function (blk, L, R, tow) {
+        var gp = group(blk), w = L[2] - L[0], d = L[3] - L[1], alongX = w >= d;
+        /* the house on the edge toward the footprint, where there is one, so the ties reach it */
+        var e = tow >= 0 ? (tow === 0 || tow === 2 ? 0 : 1) : R.int(0, 1), dep = 14, house, yard;
+        if (tow >= 0) alongX = tow >= 2;
+        if (alongX) { house = e ? [L[0], L[3] - dep, L[2], L[3]] : [L[0], L[1], L[2], L[1] + dep]; yard = e ? [L[0], L[1], L[2], L[3] - dep - 6] : [L[0], L[1] + dep + 6, L[2], L[3]]; }
+        else { house = e ? [L[2] - dep, L[1], L[2], L[3]] : [L[0], L[1], L[0] + dep, L[3]]; yard = e ? [L[0], L[1], L[2] - dep - 6, L[3]] : [L[0] + dep + 6, L[1], L[2], L[3]]; }
+        gp.boxes.push(rBox(house, 0, 3 * STOREY, 'cbody', 2, R.range(0.18, 0.22), R()));
+        var tw = 8, td = 7, gx = 5, gz = 5, yw = yard[2] - yard[0], yd = yard[3] - yard[1];
+        var nx = Math.max(1, Math.floor((yw + gx) / (tw + gx))), nz = Math.max(1, Math.floor((yd + gz) / (td + gz)));
+        var ox = yard[0] + (yw - (nx * tw + (nx - 1) * gx)) / 2, oz = yard[1] + (yd - (nz * td + (nz - 1) * gz)) / 2;
+        for (var i = 0; i < nx; i++) for (var k = 0; k < nz; k++) {
+          if (R.chance(0.15)) continue;
+          var x = ox + i * (tw + gx), z = oz + k * (td + gz), th = R.chance(0.3) ? 9 : 7.2;
+          gp.boxes.push(cBox(x, 0, z, x + tw, th, z + td, 'cbody', PROG_PLAIN, R.range(0.26, 0.32), R()));
+          if (R.chance(0.4)) gp.glows.push({ p: [x + tw / 2, th + 1.5, z + td / 2], size: 4, hue: -2, gain: 0.7 });
+        }
+        commit(blk, gp);
+      },
+      /* a low service office, one or two tiers to at most 11 storeys, roof plant */
+      office: function (blk, L, R) {
+        var gp = group(blk), n1 = R.int(6, 8), prog = R.chance(0.6) ? 0 : 1, tone = R.range(0.22, 0.27), sd = R();
+        var w = L[2] - L[0], d = L[3] - L[1];
+        var r1 = [L[0], L[1], L[2], L[3]];
+        if (w > 50) { var k = R.range(0.7, 0.9); if (R.chance(0.5)) r1[2] = L[0] + w * k; else r1[0] = L[2] - w * k; }
+        gp.boxes.push(rBox(r1, 0, n1 * STOREY, 'cbody', prog, tone, sd));
+        var top = n1 * STOREY;
+        if (R.chance(0.55)) {
+          var n2 = Math.min(11, n1 + R.int(2, 3)), q = [r1[0] + (r1[2] - r1[0]) * R.range(0, 0.3), r1[1] + (r1[3] - r1[1]) * R.range(0, 0.3), 0, 0];
+          q[2] = q[0] + (r1[2] - r1[0]) * R.range(0.5, 0.65); q[3] = q[1] + (r1[3] - r1[1]) * R.range(0.5, 0.65);
+          gp.boxes.push(rBox(q, top, n2 * STOREY, 'cbody', prog, tone, sd));
+          top = n2 * STOREY;
+          if (top + 7 <= K.top) gp.boxes.push(cBox(q[0] + 2, top, q[1] + 2, q[0] + 2 + Math.min(14, q[2] - q[0] - 4), top + 6, q[1] + 2 + Math.min(10, q[3] - q[1] - 4), 'croof', PROG_PLAIN, tone * 0.85, sd));
+        } else if (top + 8 <= K.top) gp.boxes.push(cBox(r1[0] + 3, top, r1[1] + 3, r1[0] + 3 + Math.min(16, r1[2] - r1[0] - 6), top + 7, r1[1] + 3 + Math.min(12, r1[3] - r1[1] - 6), 'croof', PROG_PLAIN, tone * 0.85, sd));
+        if (R.chance(0.45)) {
+          var fcs = [[1, 0], [-1, 0], [0, 1], [0, -1]], fc = fcs[R.int(0, 3)];
+          sign(gp, r1, fc, R.range(10, Math.max(11, n1 * STOREY - 12)), R.range(4, 6), R.range(10, 15), R);
+        }
+        commit(blk, gp);
+      }
+    };
+    /* The transit station: a hall of 11 storeys along the rail line, the
+       lit platform at the rail's height between hall and viaduct, lights
+       along the rail side of its roof, a tall sign toward the ring road and
+       a long one on the far side. */
+    function stationBlock(blk, R) {
+      var gp = group(blk), r = blk.rect, h = 11 * STOREY;
+      var lat0 = sSide > 0 ? sLine + 19 : sLine - 53, lat1 = sSide > 0 ? sLine + 53 : sLine - 19;
+      var pl0 = sSide > 0 ? sLine + K.railHW + 0.8 : sLine - 19, pl1 = sSide > 0 ? sLine + 19 : sLine - K.railHW - 0.8;
+      var d0 = SS.a === 0 ? r[0] + 2 : r[1] + 2, d1 = SS.a === 0 ? r[2] - 2 : r[3] - 2;
+      var hall = SS.a === 0 ? [d0, lat0, d1, lat1] : [lat0, d0, lat1, d1];
+      var plat = SS.a === 0 ? [d0 + 4, pl0, d1 - 4, pl1] : [pl0, d0 + 4, pl1, d1 - 4];
+      gp.boxes.push(rBox(hall, 0, h, 'cbody', 0, 0.27, R()));
+      gp.boxes.push(rBox(plat, K.railY - 3.6, K.railY - 0.8, 'cbody', PROG_SLIT, 0.3, R()));
+      var eLat = sSide > 0 ? lat0 + 0.6 : lat1 - 0.6;
+      for (var t = d0 + 6; t < d1 - 4; t += 12) gp.glows.push({ p: SS.a === 0 ? [t, h + 0.8, eLat] : [eLat, h + 0.8, t], size: 8, hue: -1, gain: 0.5 });
+      var inner = [-SS.n[0], -SS.n[2]], far = SS.a === 0 ? [0, sSide] : [sSide, 0];
+      sign(gp, hall, inner, 22, 7, 18, R);
+      sign(gp, hall, far, 32, 26, 4.5, R);
+      plan.station = { rect: hall, side: sS, line: sLine };
+      commit(blk, gp);
+    }
+    /* Ties from the first ring of buildings to the footprint's face:
+       bridges (tieW wide, tieH high, on the storey grid) and conveyor
+       tubes (pipe square), each ending inside one solid box of the face
+       below attach.maxY, clear of keep and the ring lane, and of each
+       other by 1.5 m. */
+    function ties(blk, L, R, s) {
+      var S = CSIDES[s], at = cs.attach, fc0 = faceOf(s), e = CEDGE[s ^ 1];
+      var front = [];
+      blk.groups.forEach(function (gp) {
+        gp.boxes.forEach(function (b) {
+          if (b.kind !== 'cbody' || b.min[1] > 0) return;
+          var fcb = S.a === 0 ? (S.n[0] > 0 ? b.min[0] : b.max[0]) : (S.n[2] > 0 ? b.min[2] : b.max[2]);
+          if (Math.abs(fcb - L[e]) < 0.6) front.push(b);
+        });
+      });
+      if (!front.length) return;
+      /* the top of the stack over a front box (a parking deck is one box per level) */
+      var topOf = function (b) {
+        var t = b.max[1];
+        blk.groups.forEach(function (gp) {
+          gp.boxes.forEach(function (q) {
+            if (q.kind === 'cbody' && Math.abs(q.min[0] - b.min[0]) < 1e-6 && Math.abs(q.max[0] - b.max[0]) < 1e-6 &&
+              Math.abs(q.min[2] - b.min[2]) < 1e-6 && Math.abs(q.max[2] - b.max[2]) < 1e-6) t = Math.max(t, q.max[1]);
+          });
+        });
+        return t;
+      };
+      var out = [], nT = R.int(2, 4);
+      for (var n = 0; n < nT; n++) {
+        var bridge = n === 0 ? R.chance(0.75) : R.chance(0.35), w = bridge ? K.tieW : K.pipe, hh = bridge ? K.tieH : K.pipe;
+        for (var tr = 0; tr < 10; tr++) {
+          var b = front[R.int(0, front.length - 1)], l0 = S.l === 0 ? b.min[0] : b.min[2], l1 = S.l === 0 ? b.max[0] : b.max[2];
+          var top = Math.min(topOf(b), at.maxY);
+          if (l1 - l0 < w + 6) continue;
+          var lc = R.range(l0 + w / 2 + 3, l1 - w / 2 - 3);
+          var y0 = bridge ? STOREY * R.int(2, Math.floor((top - hh - 1) / STOREY)) : R.range(6, top - hh - 2);
+          if (!(y0 >= 6) || y0 + hh > top - 1) continue;
+          var fb = S.a === 0 ? (S.n[0] > 0 ? b.min[0] : b.max[0]) : (S.n[2] > 0 ? b.min[2] : b.max[2]);
+          var a0 = Math.min(fc0, fb), a1 = Math.max(fc0, fb);
+          var tb = S.a === 0 ? cBox(a0, y0, lc - w / 2, a1, y0 + hh, lc + w / 2, bridge ? 'ctie' : 'cpipe', PROG_PLAIN, bridge ? 0.24 : 0.3, R())
+            : cBox(lc - w / 2, y0, a0, lc + w / 2, y0 + hh, a1, bridge ? 'ctie' : 'cpipe', PROG_PLAIN, bridge ? 0.24 : 0.3, R());
+          /* the end on the wall: inside one solid box flush with the face */
+          var solidOK = false;
+          for (var q = 0; q < at.solid.length && !solidOK; q++) {
+            var sb = at.solid[q], fl = S.n[S.a] > 0 ? Math.abs(sb.max[S.a] - fc0) < 0.6 : Math.abs(sb.min[S.a] - fc0) < 0.6;
+            solidOK = fl && sb.min[S.l] <= lc - w / 2 + 1e-6 && sb.max[S.l] >= lc + w / 2 - 1e-6 && sb.min[1] <= y0 + 1e-6 && sb.max[1] >= y0 + hh - 1e-6;
+          }
+          if (!solidOK || !keepFree(tb, keepAll)) continue;
+          var hit = false;
+          for (q = 0; q < out.length && !hit; q++) hit = boxesOverlap(tb, out[q].boxes[0], 1.5);
+          if (hit) continue;
+          var sk = [];
+          if (bridge) {
+            for (var sgn = -1; sgn <= 1; sgn += 2) {
+              var o = lc + sgn * (w / 2 - 0.3);
+              sk.push(S.a === 0 ? { a: [a0, y0 - 0.1, o], b: [a1, y0 - 0.1, o], w: 0.5, hue: -1, gain: 0.3 } : { a: [o, y0 - 0.1, a0], b: [o, y0 - 0.1, a1], w: 0.5, hue: -1, gain: 0.3 });
+            }
+          } else sk.push(S.a === 0 ? { a: [a0, y0 - 0.2, lc], b: [a1, y0 - 0.2, lc], w: 0.6, hue: -2, gain: 0.45 } : { a: [lc, y0 - 0.2, a0], b: [lc, y0 - 0.2, a1], w: 0.6, hue: -2, gain: 0.45 });
+          out.push({ boxes: [tb], streaks: sk, glows: [], accents: [], pads: [], tie: true });
+          plan.stats.ties++;
+          break;
+        }
+      }
+      for (var i = 0; i < out.length; i++) blk.groups.push(out[i]);
+    }
+
+    /* ---- blocks ---- */
+    var i0 = Math.floor(P.claim[0] / H), i1 = Math.ceil(P.claim[2] / H), k0 = Math.floor(P.claim[1] / H), k1 = Math.ceil(P.claim[3] / H);
+    for (var bi = i0; bi < i1; bi++) for (var bk = k0; bk < k1; bk++) {
+      var cx = bi * H + H / 2, cz = bk * H + H / 2;
+      if (!inRect(P.claim, cx, cz)) continue;
+      var rect = [bi * H + HALF_ST, bk * H + HALF_ST, bi * H + H - HALF_ST, bk * H + H - HALF_ST];
+      var blk = { i: bi, k: bk, rect: rect, zone: inRect(ring, cx, cz) ? 'A' : 'B', side: -1, kind: 'none', groups: [] };
+      plan.blocks.push(blk);
+      if (rect[2] > F[0] - 1 && rect[0] < F[2] + 1 && rect[3] > F[1] - 1 && rect[1] < F[3] + 1) { blk.kind = 'core'; continue; }
+      var sx = cx > F[2] ? 0 : cx < F[0] ? 1 : -1, sz = cz > F[3] ? 2 : cz < F[1] ? 3 : -1;
+      blk.side = sx >= 0 && sz >= 0 ? 4 : (sx >= 0 ? sx : sz);
+      if (blk.zone === 'A' && P.ps >= 0 && (blk.side === P.ps || (blk.side === 4 && (P.ps === sx || P.ps === sz)))) { blk.kind = 'plaza'; continue; }
+      var R = rng(hashU(bi, bk, (seed ^ cs.seed) >>> 0, 911));
+      if (bi === stI && bk === stK) { blk.kind = 'station'; stationBlock(blk, R); continue; }
+      var u = R(), W = blk.zone === 'A' ? (blk.side === 4 ? [0.3, 0.7, 1, 1] : [0.4, 0.75, 1, 1]) : [0.3, 0.6, 0.75, 1];
+      blk.kind = u < W[0] ? 'hall' : u < W[1] ? 'park' : u < W[2] ? 'sub' : 'office';
+      var tow = blk.zone === 'A' && blk.side < 4 ? blk.side : -1;
+      var L = inset(rect, R.range(3, 5), tow, R.range(12, 20));
+      BUILD[blk.kind](blk, L, R, tow);
+      plan.stats.blocks++;
+      if (tow >= 0 && cs.attach) ties(blk, L, R, tow);
+    }
+
+    /* ---- the plaza ---- */
+    if (P.ps >= 0) {
+      var SP = CSIDES[P.ps], dRing = Math.abs(ringOf(P.ps) - faceOf(P.ps));
+      var D0 = K.plazaGap, D1 = dRing - HALF_ST - 1;
+      var Lo = (SP.l === 0 ? ring[0] : ring[1]) + HALF_ST + 1, Li = (SP.l === 0 ? ring[2] : ring[3]) - HALF_ST - 1;
+      var PR = sideRect(P.ps, D0, D1, Lo, Li), yT = K.plazaY, yB = K.plazaY - K.plazaT;
+      /* cells: 18 m along the plaza normal, 9 m across, on the world grid,
+         so no cell crosses a tile edge */
+      var csx = SP.a === 0 ? 18 : 9, csz = SP.a === 2 ? 18 : 9, cells = [], cmap = {};
+      for (var gx = Math.floor(PR[0] / csx); gx * csx < PR[2]; gx++) for (var gz = Math.floor(PR[1] / csz); gz * csz < PR[3]; gz++) {
+        var cr = [Math.max(PR[0], gx * csx), Math.max(PR[1], gz * csz), Math.min(PR[2], (gx + 1) * csx), Math.min(PR[3], (gz + 1) * csz)];
+        if (cr[2] - cr[0] < 0.5 || cr[3] - cr[1] < 0.5) continue;
+        var cb = rBox(cr, yB, yT, 'cdeck', PROG_PLAIN, 0.27, 0.5);
+        var cell = { gx: gx, gz: gz, row: SP.a === 0 ? gx : gz, box: cb, ok: keepFree(cb, keepAll) };
+        cells.push(cell); cmap[gx + ',' + gz] = cell;
+      }
+      var items = [];
+      /* the cells under a world rect, all plan-ok, else null */
+      var under = function (r) {
+        var out2 = [];
+        for (var ax2 = Math.floor(r[0] / csx); ax2 * csx < r[2] - 1e-9; ax2++) for (var az2 = Math.floor(r[1] / csz); az2 * csz < r[3] - 1e-9; az2++) {
+          var c2 = cmap[ax2 + ',' + az2];
+          if (!c2 || !c2.ok) return null;
+          out2.push(c2);
+        }
+        return out2;
+      };
+      var sameTile = function (r) { return Math.floor(r[0] / TILE) === Math.floor((r[2] - 1e-6) / TILE) && Math.floor(r[1] / TILE) === Math.floor((r[3] - 1e-6) / TILE); };
+      var W2 = function (lat, d) { var q = sideRect(P.ps, d, d, lat, lat); return [q[0], q[1]]; };
+      var addItem = function (r, boxes2, extra) {
+        if (!sameTile(r)) return false;
+        var sup = under(r);
+        if (!sup) return false;
+        for (var q = 0; q < boxes2.length; q++) if (!keepFree(boxes2[q], keepAll)) return false;
+        var it = { rect: r, boxes: boxes2, support: sup, glows: [], streaks: [], accents: [], pads: [] };
+        for (var k in extra) it[k] = extra[k];
+        items.push(it); plan.stats.plazaItems++;
+        return true;
+      };
+      var RP = rng(hashU(Math.round(PR[0]), Math.round(PR[1]), (seed ^ cs.seed) >>> 0, 913));
+      /* landing pads, 24 m */
+      [[0.16, 0.3], [0.84, 0.3], [0.16, 0.74], [0.84, 0.74]].forEach(function (fq) {
+        var c = W2(Lo + (Li - Lo) * fq[0], D0 + (D1 - D0) * fq[1]), hw = 12, r = [c[0] - hw, c[1] - hw, c[0] + hw, c[1] + hw];
+        var y1 = yT + 1.2, sk = [], gl = [];
+        var E = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
+        for (var k = 0; k < 4; k++) {
+          sk.push({ a: [E[k][0], y1 + 0.15, E[k][1]], b: [E[(k + 1) % 4][0], y1 + 0.15, E[(k + 1) % 4][1]], w: 0.8, hue: -2, gain: 0.8 });
+          gl.push({ p: [E[k][0], y1 + 0.6, E[k][1]], size: 3.5, hue: -2, gain: 1 });
+        }
+        gl.push({ p: [c[0], y1 + 1, c[1]], size: 26, hue: -1, gain: 0.06 });
+        addItem(r, [rBox(r, yT, y1, 'cpad', PROG_PLAIN, 0.34, RP())], { streaks: sk, glows: gl,
+          pads: [{ p: [c[0], y1, c[1]], n: [0, 1, 0], w: 24, d: 24, kind: 'deck' }] });
+      });
+      /* light masts: along the outer edge and the two lateral ends, off
+         every street line by mastClear */
+      var masts = [];
+      for (var lt = Lo + 20; lt < Li - 15; lt += 46) masts.push([lt, D1 - 4]);
+      for (var dd = D0 + 14; dd < D1 - 12; dd += 22) { masts.push([Lo + 4, dd]); masts.push([Li - 4, dd]); }
+      masts.forEach(function (m2) {
+        var c = W2(m2[0], m2[1]);
+        if (!offStreets(c[0], c[1], K.mastClear)) return;
+        var r = [c[0] - 0.7, c[1] - 0.7, c[0] + 0.7, c[1] + 0.7];
+        addItem(r, [rBox(r, yT, K.mastTop, 'clamp', PROG_PLAIN, 0.2, RP())], { glows: [
+          { p: [c[0], K.mastTop + 0.8, c[1]], size: 10, hue: -1, gain: 1 },
+          { p: [c[0], 40, c[1]], size: 60, hue: -1, gain: 0.05 }] });
+      });
+      /* kiosk rows across the middle, a quarter of the stalls missing */
+      [0.3, 0.38, 0.62, 0.7].forEach(function (fl, ri) {
+        var lat = Lo + (Li - Lo) * fl, face = ri % 2 ? 1 : -1;
+        for (var dk2 = D0 + 10; dk2 < D1 - 10; dk2 += 9) {
+          if (RP() < 0.25) continue;
+          var c = W2(lat, dk2), r = SP.l === 0 ? [c[0] - 3, c[1] - 2.5, c[0] + 3, c[1] + 2.5] : [c[0] - 2.5, c[1] - 3, c[0] + 2.5, c[1] + 3];
+          var gp2 = SP.l === 0 ? [c[0] + face * 3.6, yT + 3.6, c[1]] : [c[0], yT + 3.6, c[1] + face * 3.6];
+          var hu = RP() < 0.85 ? -1 : (RP() < 0.5 ? 0 : 1);
+          addItem(r, [rBox(r, yT, yT + 5, 'ckiosk', PROG_SLIT, RP.range(0.22, 0.38), RP())], { glows: [{ p: gp2, size: 3, hue: hu, gain: 0.7 }] });
+        }
+      });
+      /* a warm wash along the middle */
+      for (var wq = 0; wq < 6; wq++) {
+        var c3 = W2(Lo + (Li - Lo) * (wq + 0.5) / 6, (D0 + D1) / 2);
+        addItem([c3[0] - 0.5, c3[1] - 0.5, c3[0] + 0.5, c3[1] + 0.5], [], { glows: [{ p: [c3[0], yT + 2, c3[1]], size: 40, hue: -1, gain: 0.04 }] });
+      }
+      plan.plaza = { rect: PR, side: P.ps, cells: cells, items: items, csx: csx, csz: csz, y: yT, D: [D0, D1], L: [Lo, Li] };
+    }
+    P.plans[key] = plan;
+    return plan;
+  }
+
   /* City life constants (see holoPlace and beaconPlace in makeTile).
      HOLO_P: chance per tile at life rate 1. Only about 40 % of the tiles
      round a core have a candidate pair at all, so at liveliness 1 every
@@ -427,14 +1039,50 @@
        ones that cap a lot (not the air: it lies inside a street), WALLS:
        the canyon walls, AIR: the air boxes */
     var RES = [], RESCAP = [], WALLS = [], AIR = [];
+    /* the campuses whose reach (claim plus ramp) meets this tile; each one
+       replaces its special's reserved box by the footprint itself (flagged
+       campusF, which the ties may touch) */
+    var CP = campusList(C, route).filter(function (P) {
+      return P.infl[2] > x0 && P.infl[0] < x0 + TILE && P.infl[3] > z0 && P.infl[1] < z0 + TILE;
+    });
+    function replacedBy(rb) {
+      for (var k = 0; k < CP.length; k++) {
+        var q = CP[k].cs.replaces;
+        if (q && Math.abs(q.min[0] - rb.min[0]) < 1e-6 && Math.abs(q.min[2] - rb.min[2]) < 1e-6 &&
+          Math.abs(q.max[0] - rb.max[0]) < 1e-6 && Math.abs(q.max[2] - rb.max[2]) < 1e-6) return true;
+      }
+      return false;
+    }
+    for (var cpi = 0; cpi < CP.length; cpi++) {
+      var cF = CP[cpi].F;
+      if (!(cF[2] > x0 - 8 && cF[0] < x0 + TILE + 8 && cF[3] > z0 - 8 && cF[1] < z0 + TILE + 8)) continue;
+      var fb = { min: [cF[0], 0, cF[1]], max: [cF[2], CP[cpi].fy, cF[3]], campusF: true };
+      RES.push(fb); RESCAP.push(fb);
+    }
     if (C.reserved) {
       for (var ri = 0; ri < C.reserved.length; ri++) {
         var rb = C.reserved[ri];
         if (!(rb.max[0] > x0 - 8 && rb.min[0] < x0 + TILE + 8 && rb.max[2] > z0 - 8 && rb.min[2] < z0 + TILE + 8)) continue;
+        if (CP.length && rb.kind !== 'wall' && rb.kind !== 'air' && replacedBy(rb)) continue;
         if (rb.kind === 'wall') { WALLS.push(rb); continue; }
         RES.push(rb);
         if (rb.kind === 'air') AIR.push(rb); else RESCAP.push(rb);
       }
+    }
+    /* the campus runs (ring road, boulevards, rail) with the air over them:
+       skybridges and cables of this tile keep out (they cross only the
+       tile's inner streets, so this matters for runs on inner lines) */
+    var CENV = [];
+    for (var cpj = 0; cpj < CP.length; cpj++) {
+      var crs = campusPlan(CP[cpj], C.seed).runs;
+      for (var crk = 0; crk < crs.length; crk++) {
+        var ce = runBox(crs[crk], crs[crk].a, crs[crk].b, true);
+        if (ce.max[0] > x0 - 10 && ce.min[0] < x0 + TILE + 10 && ce.max[2] > z0 - 10 && ce.min[2] < z0 + TILE + 10) CENV.push(ce);
+      }
+    }
+    function cenvHit(b) {
+      for (var k = 0; k < CENV.length; k++) if (boxesOverlap(b, CENV[k], 1)) return true;
+      return false;
     }
     /* the wall a block lies in, or null */
     function wallOf(b0, c0, b1, c1) {
@@ -480,10 +1128,10 @@
        tube sample (the samples are 4 m apart, so the curve between two of
        them is at most 2 m closer, inside the 3 m margin) and stays out of
        every reserved box. */
-    function clear(b) {
+    function clear(b, tie) {
       var k;
       for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < SR[k]) return false;
-      for (k = 0; k < RES.length; k++) if (boxesOverlap(b, RES[k], 2)) return false;
+      for (k = 0; k < RES.length; k++) if (!(tie && RES[k].campusF) && boxesOverlap(b, RES[k], 2)) return false;
       return true;
     }
     function pointClear(p) {
@@ -1016,7 +1664,18 @@
         var bx1 = bx0 + BLOCK, bz1 = bz0 + BLOCK, blk = bxI + 2 * bzI;
         var r = R(), al = R.range(4, 8) / 2, pick = R(), rb = R.range(0.9, 1.15);
         var bcx = bx0 + BLOCK / 2, bcz = bz0 + BLOCK / 2;
-        if (LM && LM.ix === ix && LM.iz === iz && LM.blk === blk && placeLandmark(LM, [bx0, bz0, bx1, bz1], blk)) continue;
+        /* a campus block (not a canyon wall) is built by campusBuild below;
+           a landmark never stands in a campus or its ramp; the ramp scales
+           the plans' heights (rampF, 1 outside) */
+        var rampF = 1;
+        if (CP.length) {
+          var claimed = false;
+          for (var cpk = 0; cpk < CP.length; cpk++) if (inRect(CP[cpk].claim, bcx, bcz)) claimed = true;
+          if (claimed && !wallOf(bx0, bz0, bx1, bz1)) continue;
+          rampF = campusRamp(CP, bcx, bcz);
+        }
+        if (LM && LM.ix === ix && LM.iz === iz && LM.blk === blk && !(CP.length && CP.some(function (q) { return inRect(q.infl, bcx, bcz); })) &&
+          placeLandmark(LM, [bx0, bz0, bx1, bz1], blk)) continue;
         var dist = districtAt(bcx, bcz, C), hf = heightField(bcx, bcz, C);
         var arch = pickArch(dist, KV, pick);
         /* courts are broad and low: not in the deep core, where the
@@ -1053,6 +1712,7 @@
           var hh = old ? hBase : Math.min(archHeight(a, dist, hBase * (rl + (rb - rl) * KV)), C.maxH - 6);
           if (li !== hp) hh = Math.max(old ? OLD_MIN_FL * STOREY : C.minH, hh * (1 + (fall - 1) * KV));
           if (WB) hh = Math.min(Math.max(hh, wMin), Math.max(wMin, C.maxH - 6));
+          if (rampF < 1 && !old && !WB) hh = Math.max(C.minH, hh * rampF);
           plans.push({ arch: a, h: hh, prog: old ? PROG_OLD : dist, dist: dist, hp: li === hp && split > 1, peak: li === hp,
             tone: DIST_TONE[dist] + (t0 - DIST_TONE[dist]) * (1 - KV), face: WB ? WB.face : null,
             minFl: old ? OLD_MIN_FL : 0, maxFl: old ? OLD_FL[1] : 0 });
@@ -1252,7 +1912,7 @@
             var bx = axis === 0
               ? mk(ta.x1, by, cc - bw2 / 2, tb.x0, by + bh2, cc + bw2 / 2, R.range(0.2, 0.32), R(), 'bridge', -1, 0)
               : mk(cc - bw2 / 2, by, ta.z1, cc + bw2 / 2, by + bh2, tb.z0, R.range(0.2, 0.32), R(), 'bridge', -1, 0);
-            if (!clear(bx)) continue;
+            if (!clear(bx) || (CENV.length && cenvHit(bx))) continue;
             bridges.push(boxes.length);
             boxes.push(bx);
             nBridge++;
@@ -1279,7 +1939,8 @@
           var ok = true;
           for (var s = 0; s <= 8 && ok; s++) {
             var u = s / 8;
-            ok = pointClear([pa[0] + (pb[0] - pa[0]) * u, pa[1] + (pb[1] - pa[1]) * u - sag * 4 * u * (1 - u), pa[2] + (pb[2] - pa[2]) * u]);
+            var cq = [pa[0] + (pb[0] - pa[0]) * u, pa[1] + (pb[1] - pa[1]) * u - sag * 4 * u * (1 - u), pa[2] + (pb[2] - pa[2]) * u];
+            ok = pointClear(cq) && !(CENV.length && cenvHit({ min: cq, max: cq }));
           }
           if (ok) cables.push({ a: pa, b: pb, sag: sag });
         }
@@ -1301,7 +1962,150 @@
        Both features draw from their own sub-streams (salts 61 and 62), so
        the buildings, signs and bridges of a tile are the same with them on
        or off, and a rate change moves nothing else. */
+    var campus = CP.length ? campusBuild() : null;
     var holograms = holoPlace(), beacons = beaconPlace();
+
+    /* ---- the campus (campusPlan): this tile's part of every campus that
+       reaches it, after the city and before the city life, so holograms
+       keep clear of it. A run is cut in chunks of CAMPUS.chunk on the
+       world grid; a chunk is kept, with the air over it, if the tube, the
+       reserved boxes, the keep capsules and the tile's boxes allow, and
+       only the tile whose square holds the run's line emits its lights.
+       Plaza cells go the same way, a plaza item needs every cell under
+       it, a building group stands or falls as a whole, a tie on its own.
+       Plan boxes are shared by every tile and cache, so the tile gets
+       copies. */
+    function campusBuild() {
+      var K = CAMPUS, out = { runs: [], glows: [], streaks: [],
+        stats: { boxes: 0, buildings: 0, ties: 0, dropped: 0, chunks: 0, cells: 0, items: 0 } };
+      function inSq(b) { return b.min[0] >= x0 - 1e-6 && b.max[0] <= x0 + TILE + 1e-6 && b.min[2] >= z0 - 1e-6 && b.max[2] <= z0 + TILE + 1e-6; }
+      function clip(b) {
+        var q = { min: [Math.max(b.min[0], x0), b.min[1], Math.max(b.min[2], z0)], max: [Math.min(b.max[0], x0 + TILE), b.max[1], Math.min(b.max[2], z0 + TILE)] };
+        return q.max[0] - q.min[0] > 0.05 && q.max[2] - q.min[2] > 0.05 ? q : null;
+      }
+      /* overlap with the tile's boxes by more than m; noDeck skips the
+         campus decks (runs meet end to end and at the ring's corners) */
+      function hits(b, m, noDeck) {
+        for (var k = 0; k < boxes.length; k++) {
+          if (noDeck && boxes[k].kind === 'cdeck') continue;
+          if (boxesOverlap(b, boxes[k], m)) return true;
+        }
+        return false;
+      }
+      function own(b, kind, prog, tone, sd) {
+        return { min: b.min.slice(), max: b.max.slice(), kind: kind || b.kind, prog: prog == null ? (b.prog == null ? PROG_PLAIN : b.prog) : prog,
+          tone: tone == null ? b.tone : tone, seed: sd == null ? b.seed : sd, g: -1, campus: true };
+      }
+      function put(b) { boxes.push(b); out.stats.boxes++; }
+      function lights(it) {
+        var k;
+        for (k = 0; k < it.glows.length; k++) out.glows.push(it.glows[k]);
+        for (k = 0; k < it.streaks.length; k++) out.streaks.push(it.streaks[k]);
+        if (nAcc) for (k = 0; k < it.accents.length; k++) accents.push(Object.assign({}, it.accents[k], { p: it.accents[k].p.slice(), n: it.accents[k].n.slice(), hue: nAcc === 1 ? 0 : it.accents[k].hue }));
+        for (k = 0; k < it.pads.length; k++) pads.push({ p: it.pads[k].p.slice(), n: [0, 1, 0], w: it.pads[k].w, d: it.pads[k].d, kind: it.pads[k].kind });
+      }
+      function placeRun(plan, run) {
+        var ax = run.axis, t0 = ax === 0 ? x0 : z0, p0 = ax === 0 ? z0 : x0, pa = ax === 0 ? 2 : 0;
+        if (run.line + run.hw <= p0 || run.line - run.hw >= p0 + TILE) return;
+        var lo = Math.max(run.a, t0), hi = Math.min(run.b, t0 + TILE);
+        if (hi - lo < 0.5) return;
+        var mine = run.line >= p0 && run.line < p0 + TILE, deck = run.kind === 'deck', keepL = deck ? plan.keep : plan.keepAll;
+        var ch = K.chunk, kept = [], s, i;
+        for (s = Math.floor(lo / ch) * ch; s < hi - 1e-9; s += ch) {
+          var ca = Math.max(s, lo), cb = Math.min(s + ch, hi);
+          if (cb - ca < 0.5) continue;
+          var env = runBox(run, ca, cb, true), ec = clip(env);
+          if (ec && clear(env) && keepFree(env, keepL) && !hits(ec, 0.5, deck)) kept.push([ca, cb]);
+        }
+        for (i = 0; i < kept.length; i++) {
+          var a0 = kept[i][0], a1 = kept[i][1];
+          while (i + 1 < kept.length && Math.abs(kept[i + 1][0] - a1) < 1e-6) a1 = kept[++i][1];
+          var db = clip(runBox(run, a0, a1, false));
+          if (db) { put(own(db, deck ? 'cdeck' : 'crail', PROG_PLAIN, deck ? 0.16 : 0.18, 0.31)); out.stats.chunks++; }
+          if (mine) out.runs.push({ kind: run.kind, axis: ax, line: run.line, a: a0, b: a1, y: run.y, hue: run.hue, w: run.hw * 2 });
+          /* pylons: decks every 108 m at mid block, the rail every 27 m off
+             the street crossings; from the ground to the deck's underside */
+          var pw = deck ? 1.2 : 0.8;
+          for (s = Math.ceil((a0 + 2) / 27) * 27; s < a1 - 2; s += 27) {
+            var m = ((s % 108) + 108) % 108;
+            if (deck ? Math.abs(m - 54) > 1e-6 : m < 1e-6) continue;
+            var pl = { min: [0, 0, 0], max: [0, run.y - run.th, 0] };
+            pl.min[ax] = s - pw; pl.max[ax] = s + pw; pl.min[pa] = run.line - pw; pl.max[pa] = run.line + pw;
+            var pc = clip(pl);
+            if (pc && clear(pl) && keepFree(pl, keepL) && !hits(pc, -0.01)) put(own(pc, 'cpylon', PROG_PLAIN, 0.12, 0.17));
+          }
+          /* lamp masts on a boulevard, every 36 m, sides alternating, not
+             within 20 m of the ring road */
+          if (run.lamps) for (s = Math.ceil((a0 + 3 - 18) / 36) * 36 + 18; s < a1 - 3; s += 36) {
+            if (Math.abs(s - run.from) < 20) continue;
+            var sd2 = (Math.floor(s / 36) & 1) ? 1 : -1, lp = run.line + sd2 * (run.hw - 0.6);
+            if (!(lp >= p0 && lp < p0 + TILE)) continue;
+            var lb = { min: [0, run.y, 0], max: [0, run.y + K.lampH, 0] };
+            lb.min[ax] = s - 0.35; lb.max[ax] = s + 0.35; lb.min[pa] = lp - 0.35; lb.max[pa] = lp + 0.35;
+            if (!clear(lb) || !keepFree(lb, plan.keepAll) || hits(lb, -0.01)) continue;
+            put(own(lb, 'clamp', PROG_PLAIN, 0.2, 0.23));
+            var tp = [0, run.y + K.lampH + 0.4, 0], pool = [0, run.y + 0.6, 0];
+            tp[ax] = pool[ax] = s; tp[pa] = lp; pool[pa] = run.line + sd2 * (run.hw - 2.5);
+            out.glows.push({ p: tp, size: 7, hue: -1, gain: 0.8 }, { p: pool, size: 16, hue: -1, gain: 0.07 });
+          }
+        }
+      }
+      function placePlaza(pz) {
+        var ok = {}, rows = {}, la = CSIDES[pz.side].l, na = 2 - la;
+        pz.cells.forEach(function (c) {
+          if (!c.ok || !inSq(c.box)) return;
+          if (!clear(c.box) || hits(c.box, 0.3)) return;
+          ok[c.gx + ',' + c.gz] = true;
+          (rows[c.row] || (rows[c.row] = [])).push(c);
+        });
+        Object.keys(rows).forEach(function (rk) {
+          var list = rows[rk].sort(function (p, q) { return p.box.min[la] - q.box.min[la]; });
+          for (var i = 0; i < list.length; i++) {
+            var b0 = list[i].box, l1 = b0.max[la];
+            while (i + 1 < list.length && Math.abs(list[i + 1].box.min[la] - l1) < 1e-6) l1 = list[++i].box.max[la];
+            var st = own(b0, 'cdeck', PROG_PLAIN, 0.27, 0.5);
+            st.max[la] = l1;
+            put(st); out.stats.cells++;
+            /* the light grid: the strip's near edge, and a line across it every 27 m */
+            var y = pz.y + 0.15, nearE = CSIDES[pz.side].n[na] > 0 ? st.min[na] : st.max[na];
+            var A = [0, y, 0], B = [0, y, 0];
+            A[na] = B[na] = nearE; A[la] = st.min[la]; B[la] = st.max[la];
+            out.streaks.push({ a: A, b: B, w: 0.5, hue: -1, gain: 0.18 });
+            for (var q = Math.ceil(st.min[la] / 27) * 27; q < st.max[la]; q += 27) {
+              var C2 = [0, y, 0], D2 = [0, y, 0];
+              C2[la] = D2[la] = q; C2[na] = st.min[na]; D2[na] = st.max[na];
+              out.streaks.push({ a: C2, b: D2, w: 0.5, hue: -1, gain: 0.18 });
+            }
+          }
+        });
+        pz.items.forEach(function (it) {
+          for (var k = 0; k < it.support.length; k++) if (!ok[it.support[k].gx + ',' + it.support[k].gz]) return;
+          for (k = 0; k < it.boxes.length; k++) if (!clear(it.boxes[k]) || hits(it.boxes[k], -0.01)) return;
+          for (k = 0; k < it.boxes.length; k++) put(own(it.boxes[k]));
+          lights(it);
+          out.stats.items++;
+        });
+      }
+      CP.forEach(function (P) {
+        var plan = campusPlan(P, C.seed);
+        plan.runs.forEach(function (run) { placeRun(plan, run); });
+        if (plan.plaza) placePlaza(plan.plaza);
+        plan.blocks.forEach(function (blk) {
+          var r = blk.rect;
+          if (!blk.groups.length || !(r[0] >= x0 && r[2] <= x0 + TILE && r[1] >= z0 && r[3] <= z0 + TILE)) return;
+          if (wallOf(r[0], r[1], r[2], r[3])) return;
+          blk.groups.forEach(function (gp) {
+            var good = true, k;
+            for (k = 0; k < gp.boxes.length && good; k++) good = clear(gp.boxes[k], !!gp.tie) && !hits(gp.boxes[k], gp.tie ? -0.01 : 0.3);
+            if (!good) { out.stats.dropped++; return; }
+            for (k = 0; k < gp.boxes.length; k++) put(own(gp.boxes[k]));
+            lights(gp);
+            if (gp.tie) out.stats.ties++; else out.stats.buildings++;
+          });
+        });
+      });
+      return out;
+    }
 
     /* Holograms: rarely a floating billboard between two neighbouring
        towers of similar height (within HOLO_SIMILAR), whose facing tiers
@@ -1486,7 +2290,7 @@
       bo.idx = tid * 4096 + bi;
       if (bo.max[1] > top) top = bo.max[1];
     }
-    return {
+    var tileOut = {
       key: tileKey(ix, iz), ix: ix, iz: iz, x0: x0, z0: z0, seed: C.seed,
       boxes: boxes, lots: lots, lights: lights, accents: accents, pads: pads,
       holograms: holograms, beacons: beacons,
@@ -1495,6 +2299,12 @@
       buildings: buildings.map(function (b) { return { g: b.g, arch: b.arch, dist: b.dist, prog: b.prog, block: b.block, top: b.top, wall: !!b.face, roof: b.roof }; }),
       landmark: landmark
     };
+    /* the campus lights and counts, only where a campus reaches (so a city
+       without one is the old city to the byte): runs { kind, axis, line, a,
+       b, y, hue, w } as the ground layer's, glows { p, size, hue (-1 warm
+       white, -2 amber, 0 or 1 neon), gain }, streaks { a, b, w, hue, gain } */
+    if (campus) tileOut.campus = campus;
+    return tileOut;
   }
 
   /* ---- ground layer mockup (notes/tools/hikyaku/GROUND-CONCEPT.md) ------
@@ -2997,6 +3807,38 @@
       var lampC = hueOut(-1, 1);
       var gList = [], qa = [], qb = [], qw = [], qc = [], qp = [];
       var sl = [], meta = signLayer ? signAtlas.meta : null, effN = sigEffN();
+      /* one ground or campus run: edge strips and four vehicle streams on a
+         deck (a warm lamp pool under it every chunk), the train and its
+         strip on a rail */
+      function pushRun(gr) {
+        var gax = gr.axis, oax = gax === 0 ? 2 : 0;
+        var lane = function (off, y, w, spd, spc, mode, col, ph) {
+          var A3 = [0, y, 0], B3 = [0, y, 0];
+          A3[gax] = gr.a; B3[gax] = gr.b; A3[oax] = B3[oax] = gr.line + off;
+          qa.push(A3[0], A3[1], A3[2]); qb.push(B3[0], B3[1], B3[2]);
+          qw.push(w, spd, spc, mode); qc.push(col[0], col[1], col[2]); qp.push(ph);
+        };
+        var ph0 = (Math.round(gr.line) * 7.31) % 500;
+        if (gr.kind === 'deck') {
+          var edge = !(gr.hue >= 0) ? hueOut(-1, 0.22) : hueOut(gr.hue, 0.5), hw2 = gr.w / 2 - 0.4;
+          lane(-hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0); lane(hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0);
+          lane(-4.6, gr.y + 0.8, 1.1, 21, 13, 1, HEAD, ph0); lane(-1.9, gr.y + 0.8, 1.1, 26, 17, 1, HEAD, ph0 + 5);
+          lane(1.9, gr.y + 0.8, 1.1, -24, 15, 1, TAIL, ph0 + 3); lane(4.6, gr.y + 0.8, 1.1, -19, 12, 1, TAIL, ph0 + 9);
+          for (var ga = Math.ceil((gr.a - 13.5) / 27) * 27 + 13.5; ga < gr.b; ga += 27) {
+            var gq = [0, gr.y - 3, 0]; gq[gax] = ga; gq[oax] = gr.line;
+            gp.push(gq[0], gq[1], gq[2]); gs.push(16, 16); gc.push(POOL[0], POOL[1], POOL[2]); gb.push(0, 0, 1);
+          }
+        } else {
+          lane(0, gr.y + 2.1, 2.6, 28, 480, 2, TRAIN, ph0 * 1.7);
+          lane(0, gr.y + 0.2, 0.25, 0, 1, 0, hueOut(-1, 0.3), 0);
+        }
+      }
+      /* campus light colours, sRGB numbers: -1 warm white (the head
+         lights' colour), -2 amber (the beacons' plant lamp), else a neon hue */
+      function campusCol(h, gain) {
+        var c = h === -1 ? HEAD : h === -2 ? BEACON_AMBER : hueOut(h, 1);
+        return [c[0] * gain, c[1] * gain, c[2] * gain];
+      }
       tiles.forEach(function (e) {
         var t = e.tile, i;
         for (i = 0; i < t.accents.length; i++) {
@@ -3088,28 +3930,20 @@
            each run and a warm lamp pool under the deck every chunk */
         if (t.ground) {
           for (i = 0; i < t.ground.boxes.length; i++) gList.push(t.ground.boxes[i]);
-          for (i = 0; i < t.ground.runs.length; i++) {
-            var gr = t.ground.runs[i], gax = gr.axis, oax = gax === 0 ? 2 : 0;
-            var lane = function (off, y, w, spd, spc, mode, col, ph) {
-              var A3 = [0, y, 0], B3 = [0, y, 0];
-              A3[gax] = gr.a; B3[gax] = gr.b; A3[oax] = B3[oax] = gr.line + off;
-              qa.push(A3[0], A3[1], A3[2]); qb.push(B3[0], B3[1], B3[2]);
-              qw.push(w, spd, spc, mode); qc.push(col[0], col[1], col[2]); qp.push(ph);
-            };
-            var ph0 = (Math.round(gr.line) * 7.31) % 500;
-            if (gr.kind === 'deck') {
-              var edge = gr.hue < 0 ? hueOut(-1, 0.22) : hueOut(gr.hue, 0.5), hw2 = gr.w / 2 - 0.4;
-              lane(-hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0); lane(hw2, gr.y + 0.7, 0.3, 0, 1, 0, edge, 0);
-              lane(-4.6, gr.y + 0.8, 1.1, 21, 13, 1, HEAD, ph0); lane(-1.9, gr.y + 0.8, 1.1, 26, 17, 1, HEAD, ph0 + 5);
-              lane(1.9, gr.y + 0.8, 1.1, -24, 15, 1, TAIL, ph0 + 3); lane(4.6, gr.y + 0.8, 1.1, -19, 12, 1, TAIL, ph0 + 9);
-              for (var ga = gr.a + 13.5; ga < gr.b; ga += 27) {
-                var gq = [0, gr.y - 3, 0]; gq[gax] = ga; gq[oax] = gr.line;
-                gp.push(gq[0], gq[1], gq[2]); gs.push(16, 16); gc.push(POOL[0], POOL[1], POOL[2]); gb.push(0, 0, 1);
-              }
-            } else {
-              lane(0, gr.y + 2.1, 2.6, 28, 480, 2, TRAIN, ph0 * 1.7);
-              lane(0, gr.y + 0.2, 0.25, 0, 1, 0, hueOut(-1, 0.3), 0);
-            }
+          for (i = 0; i < t.ground.runs.length; i++) pushRun(t.ground.runs[i]);
+        }
+        /* the campus (makeTile campusBuild): its decks and rails carry the
+           same light streams; its glows and streaks join the shared layers */
+        if (t.campus) {
+          var cpg = t.campus;
+          for (i = 0; i < cpg.runs.length; i++) pushRun(cpg.runs[i]);
+          for (i = 0; i < cpg.glows.length; i++) {
+            var cg = cpg.glows[i], cc = campusCol(cg.hue, cg.gain);
+            gp.push(cg.p[0], cg.p[1], cg.p[2]); gs.push(cg.size, cg.size); gc.push(cc[0], cc[1], cc[2]); gb.push(0, 0, 1);
+          }
+          for (i = 0; i < cpg.streaks.length; i++) {
+            var cs2 = cpg.streaks[i], sc2 = campusCol(cs2.hue, cs2.gain);
+            ta.push(cs2.a[0], cs2.a[1], cs2.a[2]); tb.push(cs2.b[0], cs2.b[1], cs2.b[2]); tw.push(cs2.w, 0); tc.push(sc2[0], sc2[1], sc2[2]);
           }
         }
         for (i = 0; i < t.cables.length; i++) {
@@ -3277,6 +4111,8 @@
     hash: hash, hashU: hashU, rng: rng, noise2: noise2, fbm: fbm, heightField: heightField,
     STOREY: STOREY, ARCHES: ARCHES, ARCH_W: ARCH_W, LM_CELL: LM_CELL, LM_NEAR: LM_NEAR, LM_FAR: LM_FAR,
     districtAt: districtAt, landmarkAt: landmarkAt, pickArch: pickArch, rank3: rank3, oldTownNear: oldTownNear,
+    CAMPUS: CAMPUS, campusOf: campusOf, campusList: campusList, campusPlan: campusPlan, prepCampus: prepCampus, campusRamp: campusRamp,
+    campusRing: campusRing, segBoxDist: segBoxDist, keepFree: keepFree, runBox: runBox,
     PROG_PLAIN: PROG_PLAIN, PROG_CROWN: PROG_CROWN, PROG_OLD: PROG_OLD, PROG_SLIT: PROG_SLIT, SLIT_H: SLIT_H,
     OLD_FL: OLD_FL, OLD_MIN_FL: OLD_MIN_FL, OLD_HF: OLD_HF, OLD_SHARE: OLD_SHARE,
     tileKey: tileKey, tileOf: tileOf, inLaneBand: inLaneBand, boxDist: boxDist, boxesOverlap: boxesOverlap,
