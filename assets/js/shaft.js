@@ -580,6 +580,66 @@
     return out;
   }
 
+  /* fanFree: free space around p for one fan at time t, for the chase
+     camera: the distance to the nearest solid part of contactsFans' model
+     (hub and mount, spokes or struts, the square fan's plate between its
+     hole and the duct's corners, and the blades as their three boxes at
+     fanAngle(fan, t)). Exact box distances, so a lower bound of the true
+     distance; negative inside a part. The fans turn once in 20 to 30 s, so
+     a camera passes the rotor plane through a gap in the blades and stops
+     only where a blade, the hub or the plate is really in the way. The
+     duct wall is not part of it. */
+  function fanFree(sh, fi, p, t) {
+    const fan = sh.fans[fi], F = sh.fanFrames[fi];
+    const C = F.p, T = F.T, N = F.N;
+    const rx = p[0] - C[0], ry = p[1] - C[1], rz = p[2] - C[2];
+    const along = rx * T[0] + rz * T[2];
+    /* every part sits within along -12 to 16 (the hub's mount reaches 13);
+       beyond 5 m from that band the bound is all a caller needs */
+    const far = Math.max(-12 - along, along - 16);
+    if (far > 5) return far;
+    const x = rx * N[0] + rz * N[2], y = ry, z = -along;
+    const rho = Math.hypot(x, y);
+    const box3 = (a, b, c) => {
+      const ox = Math.max(a, 0), oy = Math.max(b, 0), oz = Math.max(c, 0);
+      return Math.sqrt(ox * ox + oy * oy + oz * oz) + Math.min(Math.max(a, b, c), 0);
+    };
+    /* hub and mount: a cylinder, as a box in (rho, along) */
+    const hm = (fan.hubFront + fan.hubBack) / 2, hh = (fan.hubBack - fan.hubFront) / 2;
+    let d = box3(rho - fan.hub, Math.abs(along - hm) - hh, -1);
+    /* the square fan's plate: an annulus from the hole to the duct's corners */
+    if (fan.hole) {
+      const ro = Math.hypot(RECT.a, RECT.b) + 2, rm = (fan.hole + ro) / 2, rh = (ro - fan.hole) / 2;
+      d = Math.min(d, box3(Math.abs(rho - rm) - rh, Math.abs(along) - fan.plateHZ, -1));
+    }
+    for (const sp of fan.spokes) {
+      const ca = Math.cos(sp.a), sa = Math.sin(sp.a);
+      const u = x * ca + y * sa, v = -x * sa + y * ca, w = along - sp.z;
+      const hr = (sp.r1 - sp.r0) / 2;
+      d = Math.min(d, box3(Math.abs(u - (sp.r0 + hr)) - hr, Math.abs(v) - sp.ht, Math.abs(w) - sp.hz));
+    }
+    /* blades: the same three pitched boxes per blade (their corners reach
+       about 1.03 R from the axis) */
+    const r0 = fan.hub - 0.6, R = fan.radius;
+    if (rho > R * 1.05 + d || rho < r0 - d) return d;
+    const phi = fanAngle(fan, t), cp = Math.cos(fan.pitch), spt = Math.sin(fan.pitch);
+    const ht = fan.thick / 2 + 0.4;
+    for (let bi = 0; bi < fan.blades; bi++) {
+      const tb = phi + bi * 2 * Math.PI / fan.blades;
+      for (let sg = 0; sg < 3; sg++) {
+        const ua = sg / 3, ub = (sg + 1) / 3, um = (ua + ub) / 2;
+        const ra = r0 + (R - r0) * ua, rb = r0 + (R - r0) * ub, rm = (ra + rb) / 2;
+        const ang = tb + bladeSweep(fan, um);
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        const qx = x * ca + y * sa, qy = -x * sa + y * ca, qz = z;
+        const hc = rb * bladeHalf(fan, ub);
+        const u = qx - rm, v = qy * cp + qz * spt, w = -qy * spt + qz * cp;
+        d = Math.min(d, box3(Math.abs(u) - (rb - ra) / 2, Math.abs(v) - hc, Math.abs(w) - ht));
+      }
+    }
+    return d;
+  }
+
   /* ---- portals -----------------------------------------------------------
      { id, p, n, w, h, right, up, depth, kind: 'portal', biome: 'shaft' } in
      the shape of Menger.portals: p the centre of the mouth on the facade
@@ -1689,7 +1749,7 @@ void main(){
     mulberry32: mulberry32, makeShaft: makeShaft, frameAt: frameAt, toWorld: toWorld, toLocal: toLocal,
     psiAt: psiAt, curvAt: curvAt, loftK: loftK, secF: secF, secGrad: secGrad, sectionRadius: sectionRadius,
     wallDist: wallDist, inside: inside, depthIn: depthIn, near: near,
-    fanAngle: fanAngle, fanOmega: fanOmega, contactsWall: contactsWall, contactsFans: contactsFans,
+    fanAngle: fanAngle, fanOmega: fanOmega, contactsWall: contactsWall, contactsFans: contactsFans, fanFree: fanFree,
     portals: portals, flythrough: flythrough, bounds: bounds, reservedBoxes: reservedBoxes,
     build: build
   };

@@ -2911,22 +2911,22 @@ function shaftFree(sh, p) {
   const dOut = Math.hypot(Math.max(qs, 0), Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qs, qx, qy), 0);
   return Math.max(dIn, dOut);
 }
-/* A fan as a slab across the duct, as thick as its pitched blades (or the
-   square fan's plate) reach along the axis. The gaps between the blades are
-   not free for the camera: it passes the fan plane only once the ship has. */
-function fanSlab(sh, fi) {
-  const fan = sh.fans[fi], F = sh.fanFrames[fi];
-  const chord = fan.radius * fan.cover * Math.PI / fan.blades / Math.cos(fan.pitch);
-  const zh = Math.max(fan.plateHZ || 0, chord * Math.sin(fan.pitch) + fan.thick / 2 * Math.cos(fan.pitch) + 0.4) + 0.3;
-  const along = (p) => (p[0] - F.p[0]) * F.T[0] + (p[2] - F.p[2]) * F.T[2];
-  return {
-    along: along,
-    f: (p) => {
-      const x = (p[0] - F.p[0]) * F.N[0] + (p[2] - F.p[2]) * F.N[2], y = p[1] - F.p[1];
-      if (x * x + y * y > (SHF.ROUND_R + 8) * (SHF.ROUND_R + 8)) return 1e9;
-      return Math.abs(along(p)) - zh;
-    }
-  };
+/* The fans near the camera segment as probes: Shaft.fanFree at the fans'
+   own clock (the traffic clock the drawn rotors turn on), so the camera
+   passes a rotor plane through a gap between the blades and stops only at
+   a blade, the hub or the square fan's plate. Until 2026-10-26 a fan was a
+   solid slab across the duct: the camera sat on the fan's face (8 m behind
+   the ship at first) until the ship was 42 m past it, so the square fan
+   37 m before the pyramid's duct end pinned it for the whole last stretch.
+   The rotors turn once in 20 to 30 s, so for the second the camera needs
+   a blade is in the way or it is not: in about half the passes the camera
+   now goes through a gap at full distance. */
+function fanProbes(sh, from, full, tFan, probes) {
+  for (let fi = 0; fi < sh.fans.length; fi++) {
+    const F = sh.fanFrames[fi];
+    const along = (from[0] - F.p[0]) * F.T[0] + (from[2] - F.p[2]) * F.T[2];
+    if (Math.abs(along) < full + 20) probes.push((p) => SHF.fanFree(sh, fi, p, tFan));
+  }
 }
 /* Free space inside the pyramid's duct: the distance to its wall, the
    section continued straight out of the mouths. shaftFree's outer half
@@ -2945,7 +2945,7 @@ function pyrCutK(L, p) {
   return d <= 0 ? 0 : smooth01(d / 150);
 }
 function smooth01(x) { const t = Math.max(0, Math.min(1, x)); return t * t * (3 - 2 * t); }
-function camClampAt(cfg, from, want, full, tVeh) {
+function camClampAt(cfg, from, want, full, tVeh, tFan) {
   const mid = [(from[0] + want[0]) / 2, (from[1] + want[1]) / 2, (from[2] + want[2]) / 2];
   const r = full / 2 + CAM_R + 1;
   const probes = [cfg.city.boxesNear(mid, r)];
@@ -2958,24 +2958,16 @@ function camClampAt(cfg, from, want, full, tVeh) {
   if (shf && SHF.near(shf.shaft, from, full + 10)) {
     const sh = shf.shaft;
     probes.push((p) => shaftFree(sh, p));
-    for (let fi = 0; fi < sh.fans.length; fi++) {
-      const sl = fanSlab(sh, fi);
-      if (Math.abs(sl.along(from)) < full + 20) probes.push(sl.f);
-    }
+    fanProbes(sh, from, full, tFan, probes);
   }
   /* the pyramid: its boxes, its shell (clearance) or, in the duct, the
-     duct's wall, whichever leaves more room, and the fans as slabs */
+     duct's wall, whichever leaves more room, and the fans' parts */
   const pyr = cfg.pyramid;
   if (pyr && HP.inside(pyr.pyr, mid, r + 20)) {
     const L = pyr.pyr, sh = L.duct;
     probes.push(HP.boxesNear(L, mid, r));
     probes.push((p) => Math.max(HP.clearance(L, p), ductIn(sh, p)));
-    if (SHF.near(sh, from, full + 10)) {
-      for (let fi = 0; fi < sh.fans.length; fi++) {
-        const sl = fanSlab(sh, fi);
-        if (Math.abs(sl.along(from)) < full + 20) probes.push(sl.f);
-      }
-    }
+    if (SHF.near(sh, from, full + 10)) fanProbes(sh, from, full, tFan, probes);
   }
   /* the block arcology: its free space (capped at 40 m, negative in a box) */
   const ab = cfg.arcoB;
@@ -4148,7 +4140,8 @@ function App() {
            the curve the way the chase camera is from the ship */
         const full = SD.len(SD.sub(att.p, att.at));
         const tCam = g.traffic ? (state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT)) : null;
-        const cc = camClampAt(cfg, att.at, att.p, full, tCam);
+        const tFan = state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT);
+        const cc = camClampAt(cfg, att.at, att.p, full, tCam, tFan);
         let dA = state.attD == null ? cc.d : Math.min(state.attD, full);
         if (cc.d < dA) dA = cc.d;
         else dA += (cc.d - dA) * (1 - Math.exp(-dt / CAM_TAU));
@@ -4171,7 +4164,8 @@ function App() {
         const full = SD.len(off);
         const want = [s.p[0] + off[0], s.p[1] + off[1], s.p[2] + off[2]];
         const tCam = g.traffic ? (state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT)) : null;
-        const cc = camClampAt(cfg, s.p, want, full, tCam);
+        const tFan = state.tFix != null ? state.tFix : HK.trafficTime(state.race, state.simT);
+        const cc = camClampAt(cfg, s.p, want, full, tCam, tFan);
         let dC = state.camD == null ? cc.d : Math.min(state.camD, full);
         if (cc.d < dC) dC = cc.d;
         else dC += (cc.d - dC) * (1 - Math.exp(-dt / CAM_TAU));
@@ -4320,7 +4314,7 @@ function App() {
         M.biome = shf && SHF.near(shf.shaft, s.p, 5) && SHF.inside(shf.shaft, s.p) ? 'shaft'
           : pyr && SHF.near(pyr.duct, s.p, 5) && SHF.inside(pyr.duct, s.p) ? 'shaft'
           : blk && MG.inside(blk.block, s.p, 0) ? 'menger'
-          : ab && HB.depthIn(ab.blk, s.p) >= 0 ? 'menger' : 'open';
+          : ab && HB.depthIn(ab.blk, s.p) >= 0 ? 'block' : 'open';
         if (state.rain > 0.6) M.rain = true; else if (state.rain < 0.4) M.rain = false;
         M.acc += dt;
         if (M.started && SW && M.acc > 0.25) {

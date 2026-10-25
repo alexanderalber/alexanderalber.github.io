@@ -14,7 +14,7 @@
    Global API (window.Synthwave):
      start({seed, intensity, biome, rain, volume, bpm})   (call from a user gesture)
      stop(), pause(), resume(), playing()
-     setIntensity(0..1), setBiome('open'|'menger'|'shaft'), setRain(bool),
+     setIntensity(0..1), setBiome('open'|'menger'|'shaft'|'block'), setRain(bool),
      setVolume(0..1), setBpm(n)
      onBar = function (bar, time) {}       UI hook, fired when a bar starts
      analyser()                            AnalyserNode on the master
@@ -287,10 +287,17 @@ Composer.prototype.nextBar = function (intensity) {
 /* --------------------------------------------------------------- audio layer */
 
 const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+/* block: the block arcology's interior (2026-10-26), a brutalist vertical
+   hall, more than half of it solid concrete. Against the Menger block's
+   open lattice (bright, long ping-pong echoes, rain through the voids) it
+   is dark and heavy: highs cut to 2.4 kHz, a big hall, few echoes, no
+   rain, the low city rumble carried by the structure at more than its
+   open-air level. */
 const BIOMES = {
   open:   { lp: 18000, rev: 0.32, fb: 0.36, rain: 1,   city: 1 },
   menger: { lp: 6500,  rev: 0.42, fb: 0.46, rain: 0.6, city: 0.7 },
-  shaft:  { lp: 1300,  rev: 0.75, fb: 0.30, rain: 0,   city: 0.35 }
+  shaft:  { lp: 1300,  rev: 0.75, fb: 0.30, rain: 0,   city: 0.35 },
+  block:  { lp: 2400,  rev: 0.64, fb: 0.18, rain: 0,   city: 1.8 }
 };
 
 function Engine(ctx, opts) {
@@ -887,7 +894,7 @@ const Synthwave = {
   },
 
   // pure layer, for tests and tools
-  Engine, Composer, rng, deg, pent, PROGS, TONIC, MINOR, PENTA, CHORD_NAMES, SECTION_BARS
+  Engine, Composer, rng, deg, pent, PROGS, TONIC, MINOR, PENTA, CHORD_NAMES, SECTION_BARS, BIOMES
 };
 
 root.Synthwave = Synthwave;
