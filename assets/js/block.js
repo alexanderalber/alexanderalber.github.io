@@ -1778,6 +1778,9 @@
     const group = new THREE.Group();
     group.name = 'block';
     let facadeMat = opts.facadeMaterial || null;
+    /* with the page's far fade (Shaft.farFog) the shared facade gets an own
+       copy that fades like every other material here; the copy is ours */
+    if (facadeMat && fog && fog.adopt) { facadeMat = fog.adopt(facadeMat); owned.push(facadeMat); }
     if (!facadeMat) {
       facadeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.15 });
       if (fog) fog.patch(facadeMat);
