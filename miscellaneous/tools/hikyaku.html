@@ -2272,6 +2272,14 @@ var Hikyaku = (function () {
      keeps the menu silent: the first gesture only unlocks the audio, the
      music starts with the race and fades to nothing back in the menu. */
   var MENU_MUSIC = true, MENU_GAIN = 0.5, MENU_INTENSITY = 0.09, MENU_BPM = 101;
+  /* How the race start changes pieces (flight feedback item 24: menu to
+     race sounded like two pieces at once). Either way the menu's drift
+     already plays in the race palette's key. 'fade': the menu music fades
+     out over half a second and is dropped with its reverb and echo tails,
+     the race piece fades in over half a second with its build
+     (Synthwave.swap). 'bar': the race palette takes over in place at the
+     next bar line, the old voices ring out shortly. The owner compares. */
+  var START_SWAP = 'fade';
   var RACE_VARIANTS = ['classic', 'dark', 'bright'];
   /* The music volume for the menu or the race. */
   function musicLevel(volume, race) {
@@ -2540,7 +2548,7 @@ var Hikyaku = (function () {
     ringPass: ringPass, makeRace: makeRace, raceStep: raceStep, missAt: missAt, elapsed: elapsed,
     formatTime: formatTime, formatRun: formatRun, makeLanes: makeLanes, trafficTime: trafficTime,
     cameraClamp: cameraClamp, vehicleBoxes: vehicleBoxes, musicIntensity: musicIntensity,
-    MENU_MUSIC: MENU_MUSIC, MENU_GAIN: MENU_GAIN, MENU_INTENSITY: MENU_INTENSITY, MENU_BPM: MENU_BPM,
+    MENU_MUSIC: MENU_MUSIC, MENU_GAIN: MENU_GAIN, MENU_INTENSITY: MENU_INTENSITY, MENU_BPM: MENU_BPM, START_SWAP: START_SWAP,
     RACE_VARIANTS: RACE_VARIANTS, musicLevel: musicLevel, raceVariant: raceVariant,
     HIT_MIN: HIT_MIN, HIT_FULL: HIT_FULL, hitStrength: hitStrength,
     MUSIC_RAMP_DUCT: MUSIC_RAMP_DUCT, MUSIC_RAMP_BLOCK: MUSIC_RAMP_BLOCK, musicDepthMix: musicDepthMix,
@@ -3528,6 +3536,18 @@ function App() {
      browser may keep the context suspended, and the hint has to stay. */
   const [musicAudible, setMusicAudible] = useState(false);
   const [musicHidTried, setMusicHidTried] = useState(false);
+  /* The start options for the menu's calm drift or the route's race palette
+     (hkcore MENU_MUSIC). The menu plays in the key of the race palette of
+     the route seed (item 24), so the race start changes colour, not key. */
+  const musicOpts = (q, M, race) => {
+    const S = window.Synthwave, rv = HK.raceVariant(q.seed);
+    return race
+      ? { seed: q.musicSeed, paletteSeed: q.seed, variant: rv, intensity: M.int, bpm: q.musicBpm, opening: 'build',
+          biome: M.biome, biomeMix: M.mix, rain: M.rain, volume: HK.musicLevel(q.musicVolume, true) }
+      : { seed: q.musicSeed, variant: 'drift', calm: true, tonic: S.palette(q.seed, rv).tonic,
+          intensity: HK.MENU_INTENSITY, bpm: HK.MENU_BPM,
+          biome: M.biome, biomeMix: M.mix, rain: M.rain, volume: HK.musicLevel(q.musicVolume, false) };
+  };
   const musicPlay = useCallback(() => {
     const S = window.Synthwave, M = musicRef.current;
     if (!S) return false;
@@ -3535,12 +3555,7 @@ function App() {
     try {
       if (M.started) S.resume();
       else {
-        /* the menu's calm drift or the route's race palette (hkcore MENU_MUSIC) */
-        S.start(M.race
-          ? { seed: q.musicSeed, paletteSeed: q.seed, variant: HK.raceVariant(q.seed), intensity: M.int, bpm: q.musicBpm,
-              biome: M.biome, biomeMix: M.mix, rain: M.rain, volume: HK.musicLevel(q.musicVolume, true) }
-          : { seed: q.musicSeed, variant: 'drift', calm: true, intensity: HK.MENU_INTENSITY, bpm: HK.MENU_BPM,
-              biome: M.biome, biomeMix: M.mix, rain: M.rain, volume: HK.musicLevel(q.musicVolume, false) });
+        S.start(musicOpts(q, M, M.race));
         M.started = true;
       }
     } catch (e) { console.error('Synthwave.start failed: ' + (e && e.message)); return false; }
@@ -3605,11 +3620,14 @@ function App() {
   useEffect(() => {
     if (sfxRef.current) sfxRef.current.setVolume(p.sfxVolume);
   }, [p.sfxVolume]);
-  /* Menu to race and back (items 12 and 13). The race start switches to
-     the route's palette at the next bar (setVariant now), opening with a
-     build, takes the panel tempo and pulls the volume up (tau 0.7 s). Back
-     in the menu the calm drift returns at the next bar, quieter and slower.
-     A restart stays in the race and changes nothing. */
+  /* Menu to race and back (items 12, 13, 24). The race start changes to
+     the route's palette as hkcore START_SWAP says: 'fade' swaps pieces
+     (out and in over half a second each, the race piece opening with its
+     build), 'bar' switches in place at the next bar (setVariant now) and
+     pulls the volume up (tau 0.7 s). With the music off (M) it always
+     switches in place, so the start does not wake the context. Back in
+     the menu the calm drift returns at the next bar in the race's key,
+     quieter and slower. A restart stays in the race and changes nothing. */
   useEffect(() => {
     const race = HK.flightInputLive(menu) || HK.menuPaused(menu);
     const M = musicRef.current, S = window.Synthwave, q = cfgRef.current.p;
@@ -3620,18 +3638,27 @@ function App() {
       if (race && M.armed && q.music) musicPlay();
       return;
     }
-    if (race) {
+    if (race && HK.START_SWAP === 'fade' && M.live) {
+      S.swap(musicOpts(q, M, true));
+    } else if (race) {
       S.setCalm(false);
       S.setVariant(HK.raceVariant(q.seed), { now: true, next: 'build', seed: q.seed });
       S.setBpm(q.musicBpm);
       S.setVolume(HK.musicLevel(q.musicVolume, true), 0.7);
     } else {
       S.setCalm(true);
-      S.setVariant('drift', { now: true, next: 'drift', seed: q.musicSeed });
+      S.setVariant('drift', { now: true, next: 'drift', seed: q.musicSeed, tonic: S.palette(q.seed, HK.raceVariant(q.seed)).tonic });
       S.setBpm(HK.MENU_BPM);
       S.setVolume(HK.musicLevel(q.musicVolume, false), 1.5);
     }
   }, [menu.screen, musicPlay]);
+  /* a new route seed in the menu: the drift moves to the new race key at
+     its next section */
+  useEffect(() => {
+    const S = window.Synthwave, M = musicRef.current;
+    if (!S || !M.started || M.race) return;
+    S.setVariant('drift', { seed: p.musicSeed, tonic: S.palette(p.seed, HK.raceVariant(p.seed)).tonic });
+  }, [p.seed]);
   const musicSeedRef = useRef(p.musicSeed);
   useEffect(() => {
     if (musicSeedRef.current === p.musicSeed) return;

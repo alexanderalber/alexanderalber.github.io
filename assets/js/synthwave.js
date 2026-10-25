@@ -32,6 +32,13 @@
        seed: draw the palette from this seed (start({paletteSeed}) likewise)
      setCalm(bool)          from the next section on, only drift and breakdown
                             (no drums); start({calm: true}) begins that way
+     swap(opts, {gap, fadeIn})   a new piece: the running one fades out over
+                            gap s and is dropped with its reverb and echo
+                            tails, the new one (start opts, plus opening:
+                            the first section type) fades in over fadeIn s.
+                            SWAP holds the defaults.
+     start({tonic}) and setVariant(name, {tonic}) pin the key of the palette
+                            (hikyaku: the menu's drift in the race's key)
      impact(k)              a collision of strength 0..1: the music ducks and
                             darkens at once, and a hit in key lands on the
                             next sixteenth (IMPACT holds the constants)
@@ -98,7 +105,7 @@ const VARIANTS = {
              padWave: 'triangle', hats: '16', half: 0, drift: 0.05, motif: 'busy' },
   drift:   { bpm: [106, 114], half: 0.2, drift: 0.6, pluck: 'soft', hats: 'sparse', motif: 'sparse' }
 };
-function makePalette(seed, variant) {
+function makePalette(seed, variant, tonic) {
   const r = rng(hash(seed >>> 0 || 1, 0x9a1e77e));
   const V = VARIANTS[variant] || VARIANTS.auto;
   const pin = (key, draw) => {
@@ -123,6 +130,7 @@ function makePalette(seed, variant) {
     half: pin('half', () => r() < 0.4 ? 0 : 0.15 + 0.3 * r()),
     drift: pin('drift', () => r() < 0.3 ? 0 : 0.1 + 0.3 * r())
   };
+  if (tonic != null && tonic >= 40 && tonic <= 60) p.tonic = Math.round(tonic);   // pinned from outside, after the draws
   p.key = NOTE_NAMES[p.tonic % 12] + 'm';
   p.seed = seed >>> 0 || 1;
   p.id = [p.tonic, p.bassWave, p.leadWave, p.arpWave, p.padWave, p.pluck].join('/');  // what the engine must rebuild for
@@ -222,11 +230,13 @@ const CALM = { intro: 1, drift: 1, breakdown: 1 };
    start should not wait up to 32 s); o.next names the type of the section
    the new variant opens with ('build' brings a riser and a snare roll).
    o.seed draws the palette from another seed than the notes (hikyaku: the
-   route's seed, so every route has its own sound). */
+   route's seed, so every route has its own sound), o.tonic pins its key.
+   A cut section opens on the tonic chord, so the step from the old
+   section's last chord is a cadence in the shared key, not a jump. */
 Composer.prototype.setVariant = function (variant, o) {
-  const p = makePalette(o && o.seed != null ? o.seed : this.seed, variant);
+  const p = makePalette(o && o.seed != null ? o.seed : this.seed, variant, o && o.tonic);
   this.cut = null;
-  if (p.variant === this.pal.variant && p.seed === this.pal.seed) { this.pendingPal = null; return; }
+  if (p.variant === this.pal.variant && p.seed === this.pal.seed && p.id === this.pal.id) { this.pendingPal = null; return; }
   this.pendingPal = p;
   if (o && o.now && this.sec) this.cut = SECTION_BARS[o.next] ? o.next : true;
 };
@@ -260,7 +270,8 @@ Composer.prototype.newSection = function (k) {
   let type = forced || this.nextType(this.sec ? this.sec.type : null, r, k);
   if (this.calm && !CALM[type]) type = this.sec && this.sec.type === 'drift' ? 'breakdown' : 'drift';
   // the same progression comes back often: that is what makes it loop-like
-  const p1 = this.prog && r() < 0.55 ? this.prog : pick(r, PROGS);
+  const p1 = forced ? pick(r, PROGS.filter(q => q[0] === 0))
+    : this.prog && r() < 0.55 ? this.prog : pick(r, PROGS);
   const p2 = r() < 0.6 ? p1 : pick(r, PROGS);
   this.prog = p1;
   this.sec = {
@@ -460,6 +471,14 @@ function envParams(biome, mix) {
    closer than this merge, unless the new one is clearly harder. */
 const IMPACT = { duck: 0.35, duckHold: 0.04, duckTau: 0.12, drop: 700, dropTau: 0.18,
                  level: 0.8, minK: 0.05, lock: 0.12 };
+/* Changing pieces (2026-10-26, flight feedback item 24: menu to race
+   sounded like two pieces at once). In place (setVariant now): the old
+   bass and arp voices fade with voiceTau instead of 20 ms, pads still
+   sounding at the cut release with padTau, so the new chord comes in on
+   the bar line. swap(): gap s fade-out of the whole old player, then the
+   new one fades in over fadeIn s. */
+const SWAP = { gap: 0.5, fadeIn: 0.5, voiceTau: 0.25, voiceStop: 2, padTau: 0.12 };
+
 /* Where a hit lands: marks are the scheduled bars {t0, sd, root}; the one
    playing at now gives the next sixteenth at or after now + lead and its
    chord root. null before the first bar. */
@@ -519,6 +538,7 @@ function Engine(ctx, opts) {
   this.mix.connect(this.impLp).connect(this.impG).connect(this.biomeLp);
   this.marks = [];
   this.lastImpact = { t: -1, k: 0 };
+  this.pads = [];                          // {gain, end}: the last pads, for a palette change
 
   this.drums = c.createGain(); this.drums.gain.value = 0.9; this.drums.connect(this.mix);
   this.duck = c.createGain(); this.duck.connect(this.mix);         // sidechained music bus
@@ -590,8 +610,13 @@ Engine.prototype.setPalette = function (p, t) {
   const old = [this.bassV].concat(this.arpV);
   for (const v of old) {
     v.amp.gain.cancelScheduledValues(t);
-    v.amp.gain.setTargetAtTime(0, t, 0.02);
-    for (const o of v.oscs) { try { o.stop(t + 0.5); } catch (e) {} }
+    v.amp.gain.setTargetAtTime(0, t, SWAP.voiceTau);
+    for (const o of v.oscs) { try { o.stop(t + SWAP.voiceStop); } catch (e) {} }
+  }
+  for (const pd of this.pads) {              // pads of the old palette that still ring at t
+    if (pd.end <= t) continue;
+    pd.gain.cancelScheduledValues(t);
+    pd.gain.setTargetAtTime(0, t, SWAP.padTau);
   }
   this.bassV = this.makeBass(p.bassWave);
   this.arpV = [this.makeArp(-0.45, p.arpWave), this.makeArp(0.45, p.arpWave)];
@@ -875,6 +900,8 @@ Engine.prototype.pad = function (t, notes, len, g, bright) {
   }
   lp.connect(a).connect(this.music);
   this.send(a, 0.7);
+  this.pads.push({ gain: a.gain, end: t + len + 2.5 });
+  if (this.pads.length > 6) this.pads.shift();
 };
 
 /* Two arp voices, left and right, take turns: each note rings for two steps. */
@@ -1044,6 +1071,18 @@ Engine.prototype.scheduleBar = function (bar, t0) {
   return 16 * sd;
 };
 
+/* A composer from start/render opts: seed, variant, calm, paletteSeed,
+   tonic, opening (the type of the first section). */
+function makeComposer(opts) {
+  const comp = new Composer(opts.seed, opts.variant);
+  comp.calm = !!opts.calm;
+  if (opts.paletteSeed != null || opts.tonic != null) {
+    comp.pal = makePalette(opts.paletteSeed != null ? opts.paletteSeed : opts.seed, opts.variant, opts.tonic);
+  }
+  if (SECTION_BARS[opts.opening]) comp.cut = opts.opening;
+  return comp;
+}
+
 /* ---------------------------------------------------------------- live player */
 
 const Synthwave = {
@@ -1056,15 +1095,14 @@ const Synthwave = {
     const Ctx = root.AudioContext || root.webkitAudioContext;
     const ctx = this._ctx || (this._ctx = new Ctx({ latencyHint: 'playback' }));
     if (ctx.state === 'suspended') ctx.resume();
-    const comp = new Composer(opts.seed, opts.variant);
-    comp.calm = !!opts.calm;
-    if (opts.paletteSeed != null) comp.pal = makePalette(opts.paletteSeed, opts.variant);
+    const comp = makeComposer(opts);
     const eng = new Engine(ctx, Object.assign({}, opts, { palette: comp.pal }));
-    const fadeIn = eng.out.gain;
+    const t0 = ctx.currentTime + (opts.at > 0 ? opts.at : 0), fadeIn = eng.out.gain;
     fadeIn.setValueAtTime(0, ctx.currentTime);
-    fadeIn.linearRampToValueAtTime(opts.volume, ctx.currentTime + 1.5);
+    fadeIn.setValueAtTime(0, t0);
+    fadeIn.linearRampToValueAtTime(opts.volume, t0 + (opts.fadeIn > 0 ? opts.fadeIn : 1.5));
     const s = this._s = { ctx, eng, comp, intensity: opts.intensity, bpmFixed: !!opts.bpm,
-                          volume: opts.volume, next: ctx.currentTime + 0.1, timers: [] };
+                          volume: opts.volume, next: t0 + (opts.at > 0 ? 0 : 0.1), timers: [] };
     const tick = () => {
       if (this._s !== s) return;
       const ahead = root.document && root.document.hidden ? 1.5 : 0.3;
@@ -1085,17 +1123,29 @@ const Synthwave = {
     tick();
   },
 
-  stop() {
+  /* fade: seconds to silence (default 0.6); then the engine is dropped,
+     reverb and echo tails with it */
+  stop(fade) {
     const s = this._s;
     if (!s) return;
     this._s = null;
     clearInterval(s.interval);
     s.timers.forEach(clearTimeout);
-    const t = s.ctx.currentTime, g = s.eng.out.gain;
+    const f = fade > 0 ? fade : 0.6, t = s.ctx.currentTime, g = s.eng.out.gain;
     g.cancelScheduledValues(t);
     g.setValueAtTime(g.value, t);
-    g.linearRampToValueAtTime(0, t + 0.6);
-    setTimeout(() => { s.eng.out.disconnect(); s.eng.sources.forEach(x => { try { x.stop(); } catch (e) {} }); }, 800);
+    g.linearRampToValueAtTime(0, t + f);
+    setTimeout(() => { s.eng.out.disconnect(); s.eng.sources.forEach(x => { try { x.stop(); } catch (e) {} }); }, (f + 0.2) * 1000);
+  },
+
+  /* Fade out, drop, fade in a new piece (the hikyaku race start). opts as
+     start(); o.gap, o.fadeIn default to SWAP. A suspended context is
+     resumed by start as usual. */
+  swap(opts, o) {
+    o = o || {};
+    const gap = o.gap > 0 ? o.gap : SWAP.gap;
+    if (this._s) this.stop(gap);
+    this.start(Object.assign({}, opts, { at: this._ctx ? gap : 0, fadeIn: o.fadeIn > 0 ? o.fadeIn : SWAP.fadeIn }));
   },
 
   pause() { if (this._ctx) this._ctx.suspend(); },
@@ -1152,10 +1202,11 @@ const Synthwave = {
   render(seconds, opts) {
     opts = Object.assign({ seed: 1, intensity: 0.6, biome: 'open', rain: false, volume: 0.8, bpm: null, variant: 'auto', sampleRate: 48000 }, opts || {});
     const ctx = new OfflineAudioContext(2, Math.ceil(opts.sampleRate * seconds), opts.sampleRate);
-    const comp = new Composer(opts.seed, opts.variant);
-    comp.calm = !!opts.calm;
-    if (opts.paletteSeed != null) comp.pal = makePalette(opts.paletteSeed, opts.variant);
-    const eng = new Engine(ctx, Object.assign({}, opts, { palette: comp.pal }));
+    let comp = makeComposer(opts);
+    let eng = new Engine(ctx, Object.assign({}, opts, { palette: comp.pal }));
+    let bpmFixed = opts.bpm;
+    // opts.swap: {at, mode: 'fade' | 'bar', ...start opts of the new piece}, the hikyaku race start
+    const sw = opts.swap ? Object.assign({}, opts.swap) : null;
     // Schedule bar by bar as the render advances, like the live player does:
     // nodes created far ahead would all cost processing time from the start.
     for (const ev of opts.env || []) eng.setEnv(ev[1], ev[2], ev[0]);
@@ -1164,10 +1215,29 @@ const Synthwave = {
     let next = 0.05;
     const feed = () => {
       while (next < ctx.currentTime + 0.5 && next < seconds) {
+        if (sw && (sw.mode === 'fade' ? next > sw.at : next >= sw.at)) {   // fade: at sw.at itself, after the old bar holding it
+          if (sw.mode === 'fade') {
+            const g = eng.out.gain, gap = sw.gap || SWAP.gap, t1 = sw.at + gap;
+            g.setValueAtTime(g.value, sw.at); g.linearRampToValueAtTime(0, t1);
+            const o2 = Object.assign({}, opts, sw, { swap: null });
+            comp = makeComposer(o2);
+            eng = new Engine(ctx, Object.assign({}, o2, { palette: comp.pal }));
+            eng.out.gain.setValueAtTime(0, 0); eng.out.gain.setValueAtTime(0, t1);
+            eng.out.gain.linearRampToValueAtTime(o2.volume, t1 + (sw.fadeIn || SWAP.fadeIn));
+            bpmFixed = o2.bpm; if (bpmFixed) eng.setBpm(bpmFixed, t1);
+            next = t1;                     // the old bar already scheduled plays out under the fade
+          } else {
+            comp.calm = false;
+            comp.setVariant(sw.variant, { now: true, next: sw.opening || 'build', seed: sw.paletteSeed, tonic: sw.tonic });
+            if (sw.bpm) { bpmFixed = sw.bpm; eng.setBpm(sw.bpm, next); }
+          }
+          bars.push({ t: next, type: 'SWAP ' + sw.mode });
+          opts.swap = null; sw.at = Infinity;
+        }
         if (opts.switchVariant && next >= (opts.switchAt || 0)) { if (opts.switchNow) comp.calm = false; comp.setVariant(opts.switchVariant, { now: opts.switchNow, next: opts.switchNext }); opts.switchVariant = null; }
         const bar = comp.nextBar(opts.intensity);
-        if (!opts.bpm && bar.palette.bpm !== eng.bpm) eng.setBpm(bar.palette.bpm, next);
-        bars.push({ t: next, type: bar.type, chord: bar.chordName, key: bar.palette.key, bpm: eng.bpm });
+        if (!bpmFixed && bar.palette.bpm !== eng.bpm) eng.setBpm(bar.palette.bpm, next);
+        bars.push({ t: next, type: bar.type, chord: bar.chordName, key: bar.palette.key, tonic: bar.tonic, bpm: eng.bpm });
         next += eng.scheduleBar(bar, next);
       }
       while (imps.length && imps[0][0] < next - 0.3) { const x = imps.shift(); eng.impact(x[1], x[0]); }
@@ -1194,7 +1264,7 @@ const Synthwave = {
 
   // pure layer, for tests and tools
   Engine, Composer, rng, deg, pent, PROGS, TONIC, MINOR, PENTA, CHORD_NAMES, SECTION_BARS, makePalette, VARIANT_DEFS: VARIANTS,
-  BIOMES, ENV_TAU, envParams, envTau, IMPACT, impactGrid
+  BIOMES, ENV_TAU, envParams, envTau, IMPACT, impactGrid, SWAP, makeComposer
 };
 
 root.Synthwave = Synthwave;
