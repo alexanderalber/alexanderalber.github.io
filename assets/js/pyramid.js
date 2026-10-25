@@ -1387,17 +1387,78 @@
     const holeFns = (hs) => hs.map((h) => ({ ya: h.ya, yb: h.yb,
       uL: (y) => h.uL[0] + (h.uL[1] - h.uL[0]) * (y - h.ya) / Math.max(1e-9, h.yb - h.ya),
       uR: (y) => h.uR[0] + (h.uR[1] - h.uR[0]) * (y - h.ya) / Math.max(1e-9, h.yb - h.ya) }));
-    /* quads and prisms on a face (f.P(u, y, d), f.n, f.T) */
-    const emitter = (f, col, seed, code, d0, d1, uRef, W, top) => (a0, b0, b1, a1, ya, yb) => {
+    /* quads and prisms on a face (f.P(u, y, d), f.n, f.T); sideCode: the
+       facade program of a prism's two sides (default code) */
+    const emitter = (f, col, seed, code, d0, d1, uRef, W, top, sideCode) => (a0, b0, b1, a1, ya, yb) => {
       const P = (u, y, d) => toW(f.P(u, y, d)), n = dW(f.n);
       const us = (a, b) => [a - uRef(ya), b - uRef(ya), b - uRef(ya), a - uRef(ya)];
       if (d1 - d0 < 0.01) { soup.quad(P(a0, ya, d1), P(b0, ya, d1), P(b1, yb, d1), P(a1, yb, d1), n, col, seed, [a0 - uRef(ya), b0 - uRef(ya), b1 - uRef(ya), a1 - uRef(ya)], W, top, code); return; }
       soup.quad(P(a0, ya, d1), P(b0, ya, d1), P(b1, yb, d1), P(a1, yb, d1), n, col, seed, us(a0, b0), W, top, code);
-      const side = (u0, u1, sg) => soup.quad(P(u0, ya, d0), P(u0, ya, d1), P(u1, yb, d1), P(u1, yb, d0), dW([f.T[0] * sg, 0, f.T[2] * sg]), col, seed, [0, d1 - d0, d1 - d0, 0], d1 - d0, top, code);
+      const side = (u0, u1, sg) => soup.quad(P(u0, ya, d0), P(u0, ya, d1), P(u1, yb, d1), P(u1, yb, d0), dW([f.T[0] * sg, 0, f.T[2] * sg]), col, seed, [0, d1 - d0, d1 - d0, 0], d1 - d0, top, sideCode == null ? code : sideCode);
       side(a0, a1, -1); side(b0, b1, 1);
       soup.quad(P(a1, yb, d0), P(b1, yb, d0), P(b1, yb, d1), P(a1, yb, d1), dW([0, 1, 0]), col, seed, [0, b1 - a1, b1 - a1, 0], b1 - a1, top, 4);
       soup.quad(P(a0, ya, d0), P(b0, ya, d0), P(b0, ya, d1), P(a0, ya, d1), dW([0, -1, 0]), col, seed, [0, b0 - a0, b0 - a0, 0], b0 - a0, top, 4);
     };
+
+    /* Fin articulation. Fins and corner fins carry no windows (code 4), so
+       on their own they read as blank slabs: the 44 m fin beside the exit
+       portal looked like a missing texture in flight. They get the four
+       scales on their face instead: a proud service strip down the middle
+       with a sodium light bar, panel joints every five blades (a dark band
+       0.3 m proud, clear of the depth fight) and ribs in the panels wider
+       than 14 m (elements, 5 to 20 m), louvre blades every 3 m (texture),
+       tilted so they shade apart from the slab. Drawn only: the contacts
+       keep the plain slab, nothing stands more than 2 m in front of it.
+       Own random stream, so the window fields keep their seeds. ff: a face
+       whose uMin/uMax bound the fin (linear in y), d the slab's depth, w
+       its width. */
+    const art = mulberry32(L.seed ^ 0x5f1a7c);
+    const finLine = (ff, F, ya, yb, u, d, wd, col) => {
+      let y0 = null;
+      const flush = (y1) => { if (y0 != null && y1 - y0 > 2) line(ff.P(u(y0), y0, d), ff.P(u(y1), y1, d), wd, F.n, col); y0 = null; };
+      for (let y = ya; y <= yb + 1e-6; y += 1) {
+        const free = spans(ff, y, u(y) - wd, u(y) + wd).length === 1;
+        if (free && y0 == null) y0 = y;
+        if (!free) flush(y - 1);
+      }
+      flush(yb);
+    };
+    let finArt = 0;
+    const articulate = (ff, F, ya, yb, d, w) => {
+      finArt++;
+      const seed = art(), sw = Math.min(8, Math.max(4, Math.round(w * 0.16))), sd = 1.6;
+      const cU = (y) => (ff.uMin(y) + ff.uMax(y)) / 2;
+      const sub = (lo, hi) => Object.assign({}, ff, { uMin: lo, uMax: hi });
+      const strip = sub((y) => cU(y) - sw / 2, (y) => cU(y) + sw / 2);
+      const panels = [sub(ff.uMin, strip.uMin), sub(strip.uMax, ff.uMax)];
+      const y0 = ya + 3, y1 = yb - 6;
+      fill(emitter(strip, bone(0.5), seed, 4, d, d + sd, strip.uMin, sw, yb), strip, y0, y1);
+      finLine(ff, F, y0 + 2, y1 - 2, cU, d + sd + 0.3, 0.6, k07);
+      /* blades: bottom edge 0.9 m proud, top edge 0.1 m, so the blade faces
+         a little down from the slab and shades darker under the sky light */
+      const blade = (pf, col) => (a0, b0, b1, a1, ya2, yb2) => {
+        const q = [pf.P(a0, ya2, d + 0.9), pf.P(b0, ya2, d + 0.9), pf.P(b1, yb2, d + 0.1), pf.P(a1, yb2, d + 0.1)];
+        let nn = norm(cross([q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]], [q[3][0] - q[0][0], q[3][1] - q[0][1], q[3][2] - q[0][2]]));
+        if (dot(nn, F.n) < 0) nn = nn.map((v) => -v);
+        soup.quad(toW(q[0]), toW(q[1]), toW(q[2]), toW(q[3]), dW(nn), col, seed, [0, 0, 0, 0], 0, 0, 4);
+      };
+      const bCol = bone(0.6), jCol = bone(0.34), rCol = bone(0.64);
+      for (const pf of panels) {
+        if (pf.uMax(y0) - pf.uMin(y0) < 2) continue;
+        let n = 0;
+        for (let y = y0; y + 1.4 <= y1; y += 3, n++) {
+          if (n % 5 === 4) fill(emitter(pf, jCol, seed, 4, d + 0.3, d + 0.3, pf.uMin, 0, yb), pf, y + 0.2, y + 1.2);
+          else fill(blade(pf, bCol), pf, y, y + 1.4);
+        }
+        /* a rib down the middle of a panel wider than 14 m */
+        const pm = (y) => (pf.uMin(y) + pf.uMax(y)) / 2;
+        if (pf.uMax(y0) - pf.uMin(y0) > 14) {
+          const rib = sub((y) => pm(y) - 0.4, (y) => pm(y) + 0.4);
+          fill(emitter(rib, rCol, seed, 4, d, d + 1.2, rib.uMin, 0.8, yb), rib, y0, y1);
+        }
+      }
+    };
+    const k07 = hexLin(warm, 0.9);
 
     /* ---- the bands' faces: window fields, fins, corner fins, cornice, ledge ---- */
     const faces = L.faces.map((F) => ({ F: F, n: F.n, T: F.T, P: (u, y, d) => L.facePt(F, u, y, d), holes: holeFns(F.holes),
@@ -1417,13 +1478,19 @@
         if (s.kind === 'fin') {
           const o = { u0: Math.max(s.u - s.w / 2, lim.u0 == null ? -1e4 : lim.u0), u1: Math.min(s.u + s.w / 2, lim.u1 == null ? 1e4 : lim.u1), d0: 0, d1: s.d };
           if (o.u1 - o.u0 < 1) continue;
-          fill(emitter(f, s.part === 'shaft' ? bone(0.5) : col, seed, 4, 0, s.d, () => o.u0, s.w, b.y1), f, s.y0, s.y1, o);
+          /* a fin's sides carry windows (program 3, like most window
+             fields): where a hole cuts a fin, its side faces the opening
+             (beside the exit portal: 13 m deep, 150 m long, facing the
+             pilot on the way out), and a blank side there read as a gap */
+          fill(emitter(f, s.part === 'shaft' ? bone(0.5) : col, seed, 4, 0, s.d, () => o.u0, s.w, b.y1, s.part === 'shaft' ? 4 : 3), f, s.y0, s.y1, o);
           if (s.part !== 'shaft') for (const [a, c2] of spans(f, b.y1 - 2, o.u0, o.u1)) line(f.P(a + 2, b.y1 - 2, s.d + 0.3), f.P(c2 - 2, b.y1 - 2, s.d + 0.3), 1.6, F.n, sodC);
+          if (s.part !== 'shaft') articulate(Object.assign({}, f, { uMin: () => o.u0, uMax: () => o.u1 }), F, s.y0, s.y1, s.d, o.u1 - o.u0);
         } else if (s.kind === 'corner') {
           for (const sg of [-1, 1]) {
             if ((sg < 0 && lim.u0 != null) || (sg > 0 && lim.u1 != null)) continue;
             const cf = Object.assign({}, f, sg < 0 ? { uMax: (y) => -half(F.band, y) + s.w } : { uMin: (y) => half(F.band, y) - s.w });
             fill(emitter(cf, col, seed, 4, 0, s.d, (y) => cf.uMin(y), s.w, b.y1), cf, s.y0, s.y1);
+            articulate(cf, F, s.y0, s.y1, s.d, s.w);
           }
         } else {
           const o = Object.assign({ d0: 0, d1: s.d }, lim);
@@ -1672,7 +1739,7 @@
     });
     return {
       group: group, duct: duct, update: update,
-      stats: { tris: Math.round(tris), shellTris: soup.count(), glowTris: glow.count(), halos: halos.length, details: L.details.length, boxes: L.boxesL.length, duct: duct.stats },
+      stats: { tris: Math.round(tris), shellTris: soup.count(), finArt: finArt, glowTris: glow.count(), halos: halos.length, details: L.details.length, boxes: L.boxesL.length, duct: duct.stats },
       dispose: function () {
         duct.dispose();
         group.traverse((o) => { if (o.geometry && o.geometry !== unit) o.geometry.dispose(); });
