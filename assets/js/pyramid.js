@@ -1360,7 +1360,8 @@
      facade convention; light lines and gold rims as one glow mesh; halos as
      one additive instanced mesh; one InstancedMesh per detail kind; the duct
      through Shaft.build with quiet mouths. opts: fog (the page's makeFog),
-     facadeMaterial (the city renderer's; not disposed here), paths (race
+     facadeMaterial (the city renderer's; not disposed here; with a
+     Shaft.farFog fog a fading copy of it is used and disposed), paths (race
      lines, for the duct's cables), accent, warm, fanRange (1500 m). */
   function build(THREE, L, opts) {
     opts = opts || {};
@@ -1642,6 +1643,9 @@
     const group = new THREE.Group();
     group.name = 'pyramid';
     let facadeMat = opts.facadeMaterial || null;
+    /* with the page's far fade (Shaft.farFog) the shared facade gets an own
+       copy that fades like every other material here; the copy is ours */
+    if (facadeMat && fog && fog.adopt) { facadeMat = fog.adopt(facadeMat); owned.push(facadeMat); }
     if (!facadeMat) {
       facadeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.15 });
       if (fog) fog.patch(facadeMat);

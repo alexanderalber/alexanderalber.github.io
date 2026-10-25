@@ -1003,6 +1003,9 @@ vec3 shFog(vec3 col, vec3 wp, float k, float outside, float additive){
     outc = mix(outc, uShMed.rgb * (1.0 - additive), 1.0 - exp(-k * uShMed.w * d * (iv.y - iv.x)));
     if (iv.x > 0.001) outc = mix(outc, fc, 1.0 - exp(-k * cgTau(cam, pa)));
   }
+#ifdef CG_FAR
+  outc = mix(outc, cgFarSky(wp) * (1.0 - additive), cgFarK(wp));
+#endif
   return outc;
 }
 #endif
@@ -1750,6 +1753,124 @@ void main(){
     };
   }
 
+  /* ---- the specials' sight distance (farFog) -------------------------------
+     The city has no fixed sight distance of its own: its tiles stream in a
+     9 x 9 window (1.3 to 2.1 km ahead, less behind), and the skyline ring at
+     1.6 to 2 km stands where they stop. The specials (pyramid, block, Menger
+     block, shaft) are built once and stay resident, so with the city's
+     physical fog alone their upper parts, above the haze, stayed visible at
+     3 to 5 km: behind the skyline, which is meant to be the end of the world
+     (owner, 2026-10-26: no special may be seen farther than the city).
+
+     farFog(THREE, fog, opts) wraps the page's makeFog with one extra term on
+     top of the same medium: a fade over the horizontal distance from the
+     camera, from opts.near (default 900 m) to opts.far (1500 m, inside the
+     skyline's nearest faces at about 1545 m), towards the colour of the sky
+     in that direction (the sky shader's formula), so a fully faded fragment
+     is the sky behind it. cgFogAmt and cgFogColor are redefined on top of
+     the originals (renamed cgFogAmt0, cgFogColor0), so every shader that
+     already fogs through the atmosphere gets the fade unchanged: glows and
+     halos multiply by (1 - cgFogAmt) and go dark. Beyond opts.far the lit
+     materials discard, so they can never cover the skyline or anything else
+     behind them. The duct medium (shFog here) adds the term under CG_FAR.
+
+     Same API as makeFog (uniforms, glsl, set, patch, inject, state, shared
+     uniform objects, so set() and the page's per-frame blends reach it),
+     plus:
+       adopt(mat)    a copy of a material patched by the original fog (the
+                     city's facade material), compiled through the original's
+                     onBeforeCompile plus the fade; the caller owns it
+       range(n, f)   set the fade; range(Infinity) switches it off (map view)
+       track(group)  hide a group (visible = false) while its box, taken
+                     from its plain meshes, lies wholly beyond `far`;
+                     untrack(group); update(cameraPosition) once a frame
+     Without opts.fog the modules keep their own fog; with the plain makeFog
+     they behave as before. */
+  const FAR_GLSL = `
+#define CG_FAR 1
+uniform vec2 cgFar;
+float cgFarK(vec3 wp){ return smoothstep(cgFar.x, cgFar.y, length(wp.xz - cameraPosition.xz)); }
+vec3 cgFarSky(vec3 wp){
+  vec3 v = wp - cameraPosition; vec3 d = v / max(length(v), 1e-3);
+  float T = d.y > 0.0 ? exp(-cgTauInf(cameraPosition.y, d.y)) : 0.0;
+  return mix(cgFogDir(d), cgSkyTop, T);
+}
+float cgFogAmt(vec3 wp, float k){ return 1.0 - (1.0 - cgFogAmt0(wp, k)) * (1.0 - cgFarK(wp)); }
+vec3 cgFogColor(vec3 wp){ return mix(cgFogColor0(wp), cgFarSky(wp), cgFarK(wp)); }
+`;
+  function farFog(THREE, fog, opts) {
+    if (!fog || fog.far) return fog || null;
+    const o = opts || {};
+    const base = fog.glsl;
+    const ren = base.replace(/\bfloat cgFogAmt\(/, 'float cgFogAmt0(').replace(/\bvec3 cgFogColor\(/, 'vec3 cgFogColor0(');
+    if (ren.indexOf('cgFogAmt0(') < 0 || ren.indexOf('cgFogColor0(') < 0) throw new Error('farFog: the fog GLSL has no cgFogAmt / cgFogColor to wrap');
+    const glsl = ren + FAR_GLSL;
+    const FU = { cgFar: { value: new THREE.Vector2(o.near == null ? 900 : o.near, o.far == null ? 1500 : o.far) } };
+    const U = Object.assign({}, fog.uniforms, FU);
+    const swap = (s) => s.split(base).join(glsl);
+    const finish = (sh) => {
+      Object.assign(sh.uniforms, FU);
+      sh.vertexShader = swap(sh.vertexShader);
+      sh.fragmentShader = swap(sh.fragmentShader);
+      if (sh.fragmentShader.indexOf('varying vec3 vCgWPos;') >= 0) {
+        sh.fragmentShader = sh.fragmentShader.replace('#include <clipping_planes_fragment>',
+          '#include <clipping_planes_fragment>\n  if (cgFarK(vCgWPos) > 0.999) discard;');
+      }
+    };
+    function patch(mat, po) {
+      fog.patch(mat, po);
+      const inner = mat.onBeforeCompile, k0 = mat.customProgramCacheKey.bind(mat);
+      mat.onBeforeCompile = function (sh, r) { inner.call(mat, sh, r); finish(sh); };
+      mat.customProgramCacheKey = function () { return k0() + '|far'; };
+      mat.needsUpdate = true;
+      return mat;
+    }
+    function adopt(src) {
+      const mat = src.clone(), inner = src.onBeforeCompile, k0 = src.customProgramCacheKey.bind(src);
+      mat.onBeforeCompile = function (sh, r) { inner.call(src, sh, r); finish(sh); };
+      mat.customProgramCacheKey = function () { return k0() + '|far'; };
+      return mat;
+    }
+    function inject(mat) {
+      const mark = '/*CG_FOG*/';
+      mat.vertexShader = mat.vertexShader.split(mark).join(glsl);
+      mat.fragmentShader = mat.fragmentShader.split(mark).join(glsl);
+      fog.inject(mat);
+      Object.assign(mat.uniforms, FU);
+      return mat;
+    }
+    function range(near, far) {
+      if (!isFinite(near)) FU.cgFar.value.set(1e9, 2e9);
+      else FU.cgFar.value.set(near, far == null ? near + 600 : far);
+    }
+    /* the box (world x0, z0, x1, z1) of a group's plain meshes; the halo
+       layers are InstancedBufferGeometry quads at the origin and do not
+       count (they sit on the building anyway) */
+    const tracked = new Map();
+    function track(group) {
+      group.updateMatrixWorld(true);
+      const bx = new THREE.Box3(), tmp = new THREE.Box3();
+      group.traverse((m) => {
+        if (!m.isMesh || !m.geometry || m.geometry.isInstancedBufferGeometry) return;
+        if (m.isInstancedMesh) { if (!m.boundingBox) m.computeBoundingBox(); tmp.copy(m.boundingBox); }
+        else { if (!m.geometry.boundingBox) m.geometry.computeBoundingBox(); tmp.copy(m.geometry.boundingBox); }
+        bx.union(tmp.applyMatrix4(m.matrixWorld));
+      });
+      if (!bx.isEmpty()) tracked.set(group, [bx.min.x, bx.min.z, bx.max.x, bx.max.z]);
+      return group;
+    }
+    function untrack(group) { tracked.delete(group); }
+    function update(cam) {
+      const f = FU.cgFar.value.y;
+      for (const [grp, b] of tracked) {
+        const dx = Math.max(b[0] - cam.x, 0, cam.x - b[2]), dz = Math.max(b[1] - cam.z, 0, cam.z - b[3]);
+        grp.visible = dx * dx + dz * dz < f * f;
+      }
+    }
+    return { far: true, base: fog, uniforms: U, glsl: glsl, set: fog.set, state: fog.state,
+      patch: patch, inject: inject, adopt: adopt, range: range, track: track, untrack: untrack, update: update, tracked: tracked };
+  }
+
   const Shaft = {
     RECT: RECT, ROUND_R: ROUND_R, DEF: DEF, ACCENT: ACCENT, WARM: WARM,
     mulberry32: mulberry32, makeShaft: makeShaft, frameAt: frameAt, toWorld: toWorld, toLocal: toLocal,
@@ -1757,7 +1878,7 @@ void main(){
     wallDist: wallDist, inside: inside, depthIn: depthIn, near: near,
     fanAngle: fanAngle, fanOmega: fanOmega, contactsWall: contactsWall, contactsFans: contactsFans, fanFree: fanFree,
     portals: portals, flythrough: flythrough, bounds: bounds, reservedBoxes: reservedBoxes,
-    build: build
+    build: build, farFog: farFog, FAR_GLSL: FAR_GLSL
   };
   globalThis.Shaft = Shaft;
 })();
