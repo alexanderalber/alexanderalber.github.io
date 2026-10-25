@@ -162,15 +162,107 @@
     return [dx * c - dz * s, w[1] - o[1], dx * s + dz * c];
   }
 
+  /* ---- seed variation ------------------------------------------------------------
+     The massing above band 1 and the articulation change with the seed;
+     everything the route touches does not: band 1 (its planes carry the cut,
+     the gate and the exit face), the duct, the portals, the ring stations,
+     the approach and leave legs, the reserved region and the campus hint,
+     and the total height (bounds). Varied: where band 2 ends and band 3
+     begins (440 to 600 m), the angles of bands 2 and 3, the width of the
+     upper terrace and of the roof, the fins of bands 2 and 3, where the nine
+     courtyards sit and how wide they are, where the four cantilevers sit and
+     how far they reach. Band 1 courts stay out of the duct's way (the south
+     court only moves east, away from the bend; the north court keeps off the
+     exit), and makePyramid checks the duct's fit margin against the
+     unvaried layout and falls back if a variant comes closer. A key passed
+     in opts is never varied; opts.vary === false switches the whole thing off
+     (the concept's D4 numbers). */
+  function variant(seed, base, attempt) {
+    const r = mulberry32(((seed >>> 0) ^ 0x3c51a7e9) + attempt * 0x9e37);
+    const T = (lo, hi) => lo + (hi - lo) * r();
+    const has = (k) => Object.prototype.hasOwnProperty.call(base._opts, k);
+    const V = {};
+    let bands = base.bands;
+    if (!has('bands')) {
+      const b1 = base.bands[1], b2 = base.bands[2], H = b1.h + b2.h;
+      const h1 = Math.round(T(150, 310)), c1 = T(0.34, 0.54), ht1 = b1.hb - h1 * c1;
+      const hb2 = Math.round(ht1 - T(26, 60)), h2 = H - h1;
+      const c2 = Math.min(0.72, Math.max(0.3, (hb2 - T(108, 150)) / h2));
+      bands = V.bands = [base.bands[0], { hb: b1.hb, h: h1, c: +c1.toFixed(3) }, { hb: hb2, h: h2, c: +c2.toFixed(3) }];
+    }
+    /* top half widths per band, as makePyramid computes them */
+    const htOf = (k) => bands[k].hb - bands[k].h * bands[k].c;
+    const y0Of = (k) => base.skirtH + bands.slice(0, k).reduce((a, b) => a + b.h, 0);
+    if (!has('fins')) {
+      const W1 = [20, 26, 30, 38, 44, 50];
+      const pick = () => W1.splice(Math.floor(r() * W1.length), 1)[0];
+      const f1 = [T(-0.85, -0.5), T(-0.3, 0.25), T(0.45, 0.8)].map((u) => ({ u: +u.toFixed(3), w: pick() }));
+      V.fins = [base.fins[0], f1, [{ u: +T(-0.3, 0.3).toFixed(3), w: Math.round(T(40, 70)) }]];
+    }
+    if (!has('courts')) {
+      V.courts = base.courts.map((ct) => {
+        const k = ct.band, lim = htOf(k) - base.cornerW[k] - 10;
+        const w = Math.round(k < 2 ? T(70, 100) : T(56, 80));
+        let lo = -lim, hi = lim - w;
+        if (k === 0 && ct.face === 'S') lo = Math.max(lo, ct.ua);           /* east only: away from the bend */
+        if (k === 0 && ct.face === 'W') hi = Math.min(hi, base.cutZ - 40 - w);
+        if (k === 0 && ct.face === 'N') lo = Math.max(lo, -150);            /* off the exit at u = -268 */
+        if (k === 1 && ct.face === 'S') lo = Math.max(lo, -base.cutX + 10);
+        if (k === 1 && ct.face === 'W') hi = Math.min(hi, base.cutZ - 10 - w);
+        if (!(hi > lo)) return ct;
+        const ua = Math.round(T(lo, hi)), o = Object.assign({}, ct, { ua: ua, ub: ua + w });
+        if (ct.bridge) {
+          const y0 = y0Of(k), y1 = y0 + bands[k].h;
+          o.bridge = Math.round(T(y0 + 40, y1 - 40));
+        }
+        return o;
+      });
+    }
+    if (!has('cantis')) {
+      const courts = V.courts || base.courts;
+      V.cantis = base.cantis.map((ca) => {
+        const k = ca.band, y0 = y0Of(k), y1 = y0 + bands[k].h, h = ca.yb - ca.ya;
+        const len = Math.round((ca.u1 - ca.u0) * T(0.8, 1.2)), lim = htOf(k) - base.cornerW[k] - 20;
+        let lo = -lim, hi = lim - len;
+        if (k === 0 && ca.face === 'S') lo = Math.max(lo, -150);
+        for (let t = 0; t < 40 && hi > lo; t++) {
+          const u0 = Math.round(T(lo, hi)), ya = Math.round(T(y0 + 30, y1 - 25 - h));
+          if (courts.some((ct) => ct.band === k && ct.face === ca.face && u0 < ct.ub + 20 && u0 + len > ct.ua - 20)) continue;
+          return Object.assign({}, ca, { u0: u0, u1: u0 + len, ya: ya, yb: ya + h, out: Math.round(T(24, 42)) });
+        }
+        return ca;
+      });
+    }
+    return V;
+  }
+  const _fitRef = new Map();
+  /* the duct's fit margin of the unvaried layout with the same duct options */
+  function fitRef(seed, opts) {
+    const key = JSON.stringify(opts, (k, v) => (k === 'origin' || k === 'yaw' || k === 'avoid' || k === 'idxBase' || k === 'rings' ? undefined : v));
+    if (!_fitRef.has(key)) _fitRef.set(key, layoutOf(seed, Object.assign({}, opts, { vary: false })).fit.m);
+    return _fitRef.get(key);
+  }
+
   /* ---- the layout --------------------------------------------------------------
      makePyramid(seed, opts): opts.origin [x, 0, z] or { x, z }, opts.yaw
      (multiple of 90 degrees), opts.avoid (world points the terrace buildings
      and cantilevers keep 34 m from, e.g. route samples), opts.idxBase (box
-     idx offset for contactsBoxes keys), any DEF key. */
+     idx offset for contactsBoxes keys), opts.vary (false: no seed variation
+     of the massing), any DEF key. */
   function makePyramid(seed, opts) {
     opts = opts || {};
+    if (opts.vary === false) return layoutOf(seed, opts);
+    const ref = fitRef(seed, opts);
+    for (let a = 0; a < 4; a++) {
+      const L = layoutOf(seed, opts, variant(seed, Object.assign({ _opts: opts }, DEF, opts), a));
+      if (L.fit.m >= ref - 1e-9) return L;
+    }
+    return layoutOf(seed, opts);
+  }
+  function layoutOf(seed, opts, V) {
     const S = needShaft();
-    const C = Object.assign({}, DEF, opts);
+    const C = Object.assign({}, DEF, V || {}, opts);
+    C.varied = !!V;
     const yaw = opts.yaw || 0, qy = yaw / H90;
     if (Math.abs(qy - Math.round(qy)) > 1e-6) throw new Error('HikyakuPyramid: yaw must be a multiple of 90 degrees');
     const o = opts.origin;
@@ -318,7 +410,42 @@
 
     /* boxes */
     const boxes = [];
-    const box = (lo, hi, tone, prog, coll, part) => boxes.push({ lo: lo, hi: hi, tone: tone, prog: prog == null ? 4 : prog, coll: coll !== false, seed: rng(), part: part || '' });
+    const box = (lo, hi, tone, prog, coll, part, col) => boxes.push({ lo: lo, hi: hi, tone: tone, prog: prog == null ? 4 : prog, coll: coll !== false, seed: rng(), part: part || '', col: col || null });
+    /* the lit detail kinds (D3/D4: service shafts, the exit yard with its
+       crane and containers, docking bays, cooling rings, crown machinery,
+       terrace cranes) draw from their own stream, so they move with the seed
+       without shifting the terrace buildings; their lights go to L.lights
+       (local frame): { t: 'line', a, b, w, n, c, g }, { t: 'halo', p, s,
+       c, g }, { t: 'ring', x, z, y, r, w, c, g }; c a colour name (sod,
+       warm, cyan, red, white), g a gain */
+    const dr = mulberry32((seed >>> 0) ^ 0x1b873593);
+    const D = (lo, hi) => lo + (hi - lo) * dr();
+    const lights = [];
+    const lline = (a, b, w, n, c, g) => lights.push({ t: 'line', a: a, b: b, w: w, n: n, c: c, g: g });
+    const lhalo = (p, s, c, g) => lights.push({ t: 'halo', p: p, s: s, c: c, g: g });
+    const CONT = [0x7a4a32, 0x3f5f66, 0x8a7a52, 0x5a4a6a, 0x6b6f72, 0x2f4a3a];
+    const contCol = () => { const h = CONT[Math.floor(dr() * CONT.length)]; return [0, 8, 16].map((s) => Math.pow(((h >> (16 - s)) & 255) / 255, 2.2) * 0.9); };
+    const ovl = (lo, hi, m) => boxes.some((b) => b.lo[0] < hi[0] + m && b.hi[0] > lo[0] - m && b.lo[2] < hi[2] + m && b.hi[2] > lo[2] - m && b.lo[1] < hi[1] && b.hi[1] > lo[1]);
+    /* a tower crane: mast (solid) from y0, jib along the unit (dx, dz), counter-jib and weight behind, hook, beacons */
+    const crane = (x, z, y0, hm, jib, dx, dz) => {
+      const yt = y0 + hm, px = -dz, pz = dx;
+      box([x - 1.6, y0, z - 1.6], [x + 1.6, yt, z + 1.6], 0.3, 4, true, 'crane');
+      const seg = (a0, a1, w, h, y, tone) => {
+        const p0 = [x + dx * a0, z + dz * a0], p1 = [x + dx * a1, z + dz * a1];
+        box([Math.min(p0[0], p1[0]) - Math.abs(px) * w / 2, y, Math.min(p0[1], p1[1]) - Math.abs(pz) * w / 2],
+          [Math.max(p0[0], p1[0]) + Math.abs(px) * w / 2, y + h, Math.max(p0[1], p1[1]) + Math.abs(pz) * w / 2], tone, 4, false, 'cranejib');
+      };
+      seg(-14, jib, 2.4, 2.6, yt, 0.34);
+      seg(-14, -6, 5, 5, yt - 5.5, 0.18);
+      box([x - 2.4, yt + 2.6, z - 2.4], [x + 2.4, yt + 9, z + 2.4], 0.3, 4, false, 'cranejib');
+      const hx = x + dx * jib * 0.7, hz = z + dz * jib * 0.7, hy = yt - D(12, 30);
+      box([hx - 0.15, hy, hz - 0.15], [hx + 0.15, yt, hz + 0.15], 0.1, 4, false, 'cranejib');
+      const along = Math.abs(dx) > 0.5;
+      box([hx - (along ? 6.1 : 1.25), hy - 2.6, hz - (along ? 1.25 : 6.1)], [hx + (along ? 6.1 : 1.25), hy, hz + (along ? 1.25 : 6.1)], 0.4, 4, false, 'container', contCol());
+      lhalo([x, yt + 10, z], 5, 'red', 0.9);
+      lhalo([x + dx * jib, yt + 3.2, z + dz * jib], 3.2, 'red', 0.8);
+      lhalo([hx, hy - 3.2, hz], 4, 'sod', 0.5);
+    };
     const avoidL = (opts.avoid || []).map((p) => toLocal(L, p));
     const clear = (lo, hi, R) => {
       const r2 = (R || 34) * (R || 34);
@@ -362,6 +489,38 @@
       box([cH - 1, TOP, -cH], [cH + 1, TOP + ch - 3, cH], 0.55); box([-cH - 1, TOP, -cH], [-cH + 1, TOP + ch - 3, cH], 0.55);
       for (const sx of [-1, 1]) for (const sz of [-1, 1]) box([sx * cH - 8, TOP, sz * cH - 8], [sx * cH + 8, TOP + ch + 6, sz * cH + 8], 0.62);
       box([-cH + 2, TOP, -cH + 2], [cH - 2, TOP + 4, cH - 2], 0.08);
+      /* crown machinery: the machine house in the well, four fan rings on
+         its roof, masts with beacons and two helipads on the roof outside
+         the crown; offsets, heights and corners from the seed */
+      const mw = cH * D(0.5, 0.7), md = cH * D(0.4, 0.6), mox = D(-0.15, 0.15) * cH, moz = D(-0.15, 0.15) * cH, mh = D(34, 50);   /* its top and fan rings show over the louvres */
+      box([mox - mw, TOP + 4, moz - md], [mox + mw, TOP + 4 + mh, moz + md], 0.22, 4, true, 'machine');
+      const fr = Math.min(mw, md) * 0.42;
+      for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+        const fx = mox + sx * mw * 0.5, fz = moz + sz * md * 0.5;
+        lights.push({ t: 'ring', x: fx, z: fz, y: TOP + 4.6 + mh, r: fr, w: 1.0, c: 'cyan', g: 0.9 });
+        lhalo([fx, TOP + 6 + mh, fz], fr * 2.4, 'cyan', 0.06);
+      }
+      for (const sx of [-1, 1]) lline([mox - mw + 1, TOP + 4 + mh * 0.5, moz + sx * (md + 0.3)], [mox + mw - 1, TOP + 4 + mh * 0.5, moz + sx * (md + 0.3)], 0.8, [0, 0, sx], 'sod', 0.8);
+      const cor = [[-1, -1], [1, -1], [1, 1], [-1, 1]], k0 = Math.floor(dr() * 4), mid = (cH + 8 + TH - 6) / 2, ps = Math.min(24, TH - cH - 20);
+      for (const j of [k0, (k0 + 2) % 4]) {
+        const [sx, sz] = cor[j], px = sx * mid, pz = sz * mid;
+        if (ps < 12) break;
+        box([px - ps / 2, TOP, pz - ps / 2], [px + ps / 2, TOP + 1.2, pz + ps / 2], 0.2, 4, true, 'helipad');
+        const h = ps / 2 - 1.5, y = TOP + 1.5;
+        for (let q = 0; q < 4; q++) { const a = cor[q], b2 = cor[(q + 1) % 4]; lline([px + a[0] * h, y, pz + a[1] * h], [px + b2[0] * h, y, pz + b2[1] * h], 0.6, [0, 1, 0], 'white', 0.8); }
+        lline([px - h * 0.4, y, pz - h * 0.45], [px - h * 0.4, y, pz + h * 0.45], 0.9, [0, 1, 0], 'cyan', 0.9);
+        lline([px + h * 0.4, y, pz - h * 0.45], [px + h * 0.4, y, pz + h * 0.45], 0.9, [0, 1, 0], 'cyan', 0.9);
+        lline([px - h * 0.4, y, pz], [px + h * 0.4, y, pz], 0.9, [0, 1, 0], 'cyan', 0.9);
+        lhalo([px, TOP + 3, pz], ps * 1.6, 'cyan', 0.04);
+      }
+      /* masts: the two corners without a pad, and one on an edge next to the first pad */
+      for (const j of [(k0 + 1) % 4, (k0 + 3) % 4, k0]) {
+        const [sx, sz] = cor[j], hm = D(40, 95);
+        const x = j === k0 ? sx * mid * D(0.1, 0.4) : sx * mid, z = j === k0 ? sz * (TH - 10) : sz * mid;
+        box([x - 0.8, TOP, z - 0.8], [x + 0.8, TOP + hm, z + 0.8], 0.4, 4, false, 'mast');
+        lhalo([x, TOP + hm + 1, z], 6, 'red', 0.95);
+        lhalo([x, TOP + hm * 0.55, z], 3.5, 'red', 0.6);
+      }
     }
     /* the gate: beams with cornice and lit soffit band, the soffit over the
        pocket behind them, the leg's base block */
@@ -432,11 +591,53 @@
         }
       });
     });
-    /* the exit apron under the north portal's sill */
+    /* construction cranes on the terraces: one to three, face, place and
+       jib from the seed, clear of courts, terrace buildings and avoid */
+    {
+      const n = 1 + Math.floor(dr() * 3);
+      for (let i = 0, t = 0; i < n && t < 30; t++) {
+        const k = dr() < 0.6 ? 0 : 1, b = B[k], y = b.y1, inner = B[k + 1].hb + 8, outer = b.ht - 8;
+        if (outer - inner < 10) continue;
+        const id = FACE_IDS[Math.floor(dr() * 4)], nh = FACE_NH[id], Tv = cross([0, 1, 0], nh);
+        const a = D(-outer + 50, outer - 50), dep = D(inner, outer);
+        const x = Tv[0] * a + nh[0] * dep, z = Tv[2] * a + nh[2] * dep;
+        if (k === 0 && x < -C.cutX + 40 && z > C.cutZ - 40) continue;
+        if (C.courts.some((ct) => ct.band === k && ct.face === id && a > ct.ua - 30 && a < ct.ub + 30)) continue;
+        const lo = [x - 3, y, z - 3], hi = [x + 3, y + 100, z + 3];
+        if (ovl(lo, hi, 4) || !clear(lo, hi, 60)) continue;
+        const sg = dr() < 0.5 ? 1 : -1;
+        crane(x, z, y, D(55, 90), D(38, 58), Tv[0] * sg, Tv[2] * sg);
+        i++;
+      }
+    }
+    /* the exit apron under the north portal's sill, its containers; the
+       yard on the skirt top beside it: a crane (side, distance and jib
+       from the seed), container stacks and a parked hauler */
     {
       const PX = L.portalsL[1], r0 = PX.rim[0], r1 = PX.rim[1], ya = Math.min(r0[1], r1[1]);
-      const zf = Math.max(r0[2], r1[2]);
-      box([PX.E[0] - 80, ya - 6, zf - 30], [PX.E[0] + 80, ya - 2, zf], 0.4, 4, true, 'apron');
+      const zf = Math.max(r0[2], r1[2]), ex = PX.E[0];
+      box([ex - 80, ya - 6, zf - 30], [ex + 80, ya - 2, zf], 0.4, 4, true, 'apron');
+      for (const s of [-1, 1]) for (let row = 0; row < 3; row++) {
+        const cx = ex + s * D(52, 66), cz = zf - 6 - row * 7, lv = Math.floor(dr() * 3);
+        for (let l = 0; l <= lv; l++) box([cx - 6.1, ya - 2 + l * 2.7, cz - 1.25], [cx + 6.1, ya - 2 + l * 2.7 + 2.6, cz + 1.25], 0.4, 4, false, 'container', contCol());
+      }
+      lline([ex - 79, ya - 1.6, zf - 29.6], [ex + 79, ya - 1.6, zf - 29.6], 0.5, [0, 0, -1], 'sod', 0.5);
+      for (let x = ex - 76; x <= ex + 76; x += 12) lhalo([x, ya - 1, zf - 29], 2.2, 'sod', 0.5);
+      const side = dr() < 0.5 ? -1 : 1, kx = ex + side * D(115, 170), kz = -(B[0].hb + D(30, 62));
+      const jz = dr() < 0.5;
+      const yard = { x: kx, z: kz };
+      L.yard = yard;
+      if (clear([kx - 3, SH, kz - 3], [kx + 3, SH + 100, kz + 3], 60)) {
+        crane(kx, kz, SH, D(70, 92), D(40, 56), jz ? 0 : side, jz ? -1 : 0);
+        for (let i = 0; i < 10; i++) {
+          const cx = kx - side * D(14, 50), cz = kz + D(-14, 14), lv = Math.floor(dr() * 3);
+          if (Math.abs(cx - ex) < 96) continue;
+          for (let l = 0; l <= lv; l++) box([cx - 6.1, SH + l * 2.7, cz - 1.25], [cx + 6.1, SH + l * 2.7 + 2.6, cz + 1.25], 0.4, 4, false, 'container', contCol());
+        }
+        const hx = kx + side * 16;
+        box([hx - 3, SH, kz - 9], [hx + 3, SH + 5, kz + 9], 0.32, 4, false, 'hauler');
+        lhalo([hx, SH + 2.5, kz - 9.4], 2.4, 'white', 0.7);
+      }
     }
     L.boxesL = boxes;
 
@@ -469,19 +670,70 @@
         if (rng() < 0.4) continue;
         L.details.push({ kind: 'planter', band: f.band, face: f.j, u: u, y: ym + 1, w: T(4, 8), h: T(1.2, 3), d: 2.5, out: T(2.5, 5.5) });
       }
-      /* intake grilles in pairs at a quarter height */
-      const yg = b.y0 + (b.y1 - b.y0) * 0.27;
-      for (const u of [-0.5 * b.ht, 0.55 * b.ht]) L.details.push({ kind: 'grille', band: f.band, face: f.j, u: u, y: yg, w: 18, h: 12, d: 1.2, out: 0.6 });
+      /* intake grilles in pairs at a quarter height (unvaried: the concept's places) */
+      const yg = b.y0 + (b.y1 - b.y0) * (C.varied ? D(0.2, 0.34) : 0.27);
+      for (const u of C.varied ? [-D(0.35, 0.65) * b.ht, D(0.35, 0.7) * b.ht] : [-0.5 * b.ht, 0.55 * b.ht]) L.details.push({ kind: 'grille', band: f.band, face: f.j, u: u, y: yg, w: 18, h: 12, d: 1.2, out: 0.6 });
     }
     L.details = L.details.filter((dt) => !inHoleUV(L, dt.band * 4 + dt.face, dt.u - dt.w / 2, dt.y) && !inHoleUV(L, dt.band * 4 + dt.face, dt.u + dt.w / 2, dt.y));
-    /* lamp posts along the forecourt road; plant rows on the skirt top */
+    /* service shafts: proud strips (slabs, so they collide like fins) with a
+       ladder of small lights, two per face on bands 1 and 2, one on band 3;
+       places from the seed, clear of fins, holes, the cut, the corners,
+       cantilevers and grilles */
+    L.shafts = [];
+    for (const f of L.faces) {
+      const b = B[f.band], k = f.band, want = k < 2 ? 2 : 1, sw = 7, sd = 4;
+      const ya = b.y0 + 6, yb = b.y1 - C.corniceH - 3, lim = b.ht - C.cornerW[k] - sw / 2 - 8;
+      const fins = L.slabs.filter((s) => s.band === k && s.face === f.j && s.kind === 'fin');
+      let got = 0;
+      for (let t = 0; t < 24 && got < want; t++) {
+        const u = D(-lim, lim);
+        if (k === 0 && ((f.id === 'S' && u < -C.cutX + 24) || (f.id === 'W' && u > C.cutZ - 24))) continue;
+        if (fins.some((s) => Math.abs(u - s.u) < s.w / 2 + sw / 2 + 8)) continue;
+        if (L.shafts.some((q) => q.face === f.j && q.band === k && Math.abs(q.u - u) < 60)) continue;
+        if (L.details.some((dt) => dt.kind === 'grille' && dt.band === k && dt.face === f.j && Math.abs(dt.u - u) < dt.w / 2 + sw / 2 + 4)) continue;
+        if (L.cantis.some((ca) => ca.band === k && ca.face === f.id && u > ca.u0 - sw - 6 && u < ca.u1 + sw + 6)) continue;
+        let hole = false;
+        for (let y = ya; y <= yb && !hole; y += 6) hole = inHoleUV(L, f.band * 4 + f.j, u - sw / 2, y) || inHoleUV(L, f.band * 4 + f.j, u + sw / 2, y);
+        if (hole) continue;
+        const s = { kind: 'fin', part: 'shaft', u: u, w: sw, d: sd, y0: ya, y1: yb, band: k, face: f.j };
+        L.slabs.push(s); L.shafts.push(s); got++;
+        for (let y = ya + 5; y < yb - 2; y += 7.5) lhalo(facePt(f, u, y, sd + 0.6), 2.4, 'sod', 0.75);
+        lhalo(facePt(f, u, yb - 1, sd + 0.8), 3.6, 'cyan', 0.8);
+        for (const e of [-1, 1]) lline(facePt(f, u + e * (sw / 2 + 0.3), ya + 2, sd * 0.5), facePt(f, u + e * (sw / 2 + 0.3), yb - 2, sd * 0.5), 0.35, f.n, 'sod', 0.45);
+      }
+    }
+    /* lamp posts along the forecourt road; plant rows on the skirt top (not in the yard) with cyan fan rings */
     for (let x = -SKH + 10; x < -C.cutX - 4; x += 22) for (const o2 of [-22, 22]) L.details.push({ kind: 'lamp', lo: [x - 0.5, SH, C.forecourtZ + o2 - 0.5], hi: [x + 0.5, SH + 12, C.forecourtZ + o2 + 0.5] });
     for (const side of [[1, 0], [0, -1]]) for (let k = 0; k < 14; k++) {
       const a = -SKH + 60 + k * 80, dep = B[0].hb + 20 + (k % 2) * 22;
       const cx = side[0] ? dep : a, cz = side[0] ? a : -dep;
       if (side[0] === 0 && Math.abs(cx - L.portalsL[1].E[0]) < 120) continue;
+      if (side[0] === 0 && L.yard && Math.abs(cx - L.yard.x) < 72) continue;
       L.details.push({ kind: 'plant', lo: [cx - 8, SH, cz - 8], hi: [cx + 8, SH + 6, cz + 8] });
+      if (dr() < 0.8) {
+        lights.push({ t: 'ring', x: cx, z: cz, y: SH + 6.3, r: 5.4, w: 0.7, c: 'cyan', g: 0.85 });
+        lhalo([cx, SH + 8, cz], 14, 'cyan', 0.05);
+      }
     }
+    /* docking bays round the skirt's east and north faces: a dark door,
+       a lit lintel, side lights, now and then a hauler at the door */
+    for (const id of ['E', 'N']) {
+      const nh = FACE_NH[id], Tv = cross([0, 1, 0], nh), at = SKH + 0.4;
+      for (let a = -SKH + 40; a < SKH - 40; a += D(44, 70)) {
+        if (dr() < 0.22) continue;
+        const w = D(14, 22), h = D(8, 12), P3 = (u, y, d) => [nh[0] * (at + d) + Tv[0] * u, y, nh[2] * (at + d) + Tv[2] * u];
+        lights.push({ t: 'door', a: P3(a - w / 2, 0.2, 0), b: P3(a + w / 2, h, 0), n: nh });
+        lline(P3(a - w / 2 - 1, h + 0.9, 0.3), P3(a + w / 2 + 1, h + 0.9, 0.3), 0.7, nh, 'sod', 0.9);
+        for (const e of [-1, 1]) lhalo(P3(a + e * (w / 2 + 1.6), h * 0.6, 0.8), 2.2, dr() < 0.2 ? 'cyan' : 'sod', 0.7);
+        lhalo(P3(a, h * 0.5, 5), w * 1.6, 'sod', 0.05);
+        if (dr() < 0.4) {
+          const c = P3(a, 0, 3.4), al = Math.abs(Tv[0]) > 0.5;
+          box([c[0] - (al ? 6.5 : 2.6), 0, c[2] - (al ? 2.6 : 6.5)], [c[0] + (al ? 6.5 : 2.6), 4.6, c[2] + (al ? 2.6 : 6.5)], 0.3, 4, false, 'hauler');
+          lhalo(P3(a - 6.8, 2.2, 3.4), 1.8, 'red', 0.6);
+        }
+      }
+    }
+    L.lights = lights;
 
     /* bounds, reserved region, campus hint, fit, the contact record */
     const P0 = C.plaza;
@@ -1165,8 +1417,8 @@
         if (s.kind === 'fin') {
           const o = { u0: Math.max(s.u - s.w / 2, lim.u0 == null ? -1e4 : lim.u0), u1: Math.min(s.u + s.w / 2, lim.u1 == null ? 1e4 : lim.u1), d0: 0, d1: s.d };
           if (o.u1 - o.u0 < 1) continue;
-          fill(emitter(f, col, seed, 4, 0, s.d, () => o.u0, s.w, b.y1), f, s.y0, s.y1, o);
-          for (const [a, c2] of spans(f, b.y1 - 2, o.u0, o.u1)) line(f.P(a + 2, b.y1 - 2, s.d + 0.3), f.P(c2 - 2, b.y1 - 2, s.d + 0.3), 1.6, F.n, sodC);
+          fill(emitter(f, s.part === 'shaft' ? bone(0.5) : col, seed, 4, 0, s.d, () => o.u0, s.w, b.y1), f, s.y0, s.y1, o);
+          if (s.part !== 'shaft') for (const [a, c2] of spans(f, b.y1 - 2, o.u0, o.u1)) line(f.P(a + 2, b.y1 - 2, s.d + 0.3), f.P(c2 - 2, b.y1 - 2, s.d + 0.3), 1.6, F.n, sodC);
         } else if (s.kind === 'corner') {
           for (const sg of [-1, 1]) {
             if ((sg < 0 && lim.u0 != null) || (sg > 0 && lim.u1 != null)) continue;
@@ -1277,7 +1529,26 @@
     }
 
     /* ---- boxes (skirt, terraces, roof, crown, gate, courts, cantilevers, buildings, forecourt) ---- */
-    for (const b of L.boxesL) soup.box(b.lo, b.hi, bone(b.tone), b.seed, b.prog, toW, dW);
+    for (const b of L.boxesL) soup.box(b.lo, b.hi, b.col || bone(b.tone), b.seed, b.prog, toW, dW);
+    /* the lit detail kinds' lights (L.lights): bars, halos, fan rings, dark doors */
+    {
+      const LC = { sod: sodC, warm: warmC, cyan: cyanC, red: hexLin(0xff3a28, 2.0), white: whiteC };
+      const k = (c, g) => { const v = LC[c] || sodC; return [v[0] * g, v[1] * g, v[2] * g]; };
+      for (const it of L.lights || []) {
+        if (it.t === 'line') line(it.a, it.b, it.w, it.n, k(it.c, it.g));
+        else if (it.t === 'halo') { const v = LC[it.c] || sodC; halos.push([toW(it.p), it.s, it.s, [v[0] * it.g * 0.5, v[1] * it.g * 0.5, v[2] * it.g * 0.5]]); }
+        else if (it.t === 'ring') {
+          const n = 14, col = k(it.c, it.g);
+          for (let i = 0; i < n; i++) {
+            const a0 = i / n * 2 * Math.PI, a1 = (i + 1) / n * 2 * Math.PI;
+            line([it.x + Math.cos(a0) * it.r, it.y, it.z + Math.sin(a0) * it.r], [it.x + Math.cos(a1) * it.r, it.y, it.z + Math.sin(a1) * it.r], it.w, [0, 1, 0], col);
+          }
+        } else if (it.t === 'door') {
+          const a = it.a, b2 = it.b;
+          soup.quad(toW(a), toW([b2[0], a[1], b2[2]]), toW(b2), toW([a[0], b2[1], a[2]]), dW(it.n), bone(0.08), 0.5, [0, 0, 0, 0], 0, 0, 4);
+        }
+      }
+    }
     /* crown: louvre slats (drawn only), sodium rim, cyan line at its foot, the plume */
     {
       const cH = L.crown.half, ch = L.crown.h;

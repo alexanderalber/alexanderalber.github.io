@@ -848,6 +848,20 @@
       const z = s * 154;
       panel([x - 7, 1, Math.min(z, z + s * 0.6)], [x + 7, 9, Math.max(z, z + s * 0.6)], 'sod', 0.55);
       halo([x, 5, z + s * 4], 20, 10, 'sod', 0.06);
+      /* E's elements: the ramp in front of every dock (stepped, the detail
+         boxes are axis-aligned), a lit kerb at its foot */
+      for (const [l, hgt] of [[34, 0.4], [22, 0.8], [11, 1.2]]) det('apron', [x - 6, 0, Math.min(z, z + s * l)], [x + 6, hgt, Math.max(z, z + s * l)], 0.26);
+      line([x - 6, 0.5, z + s * 34.2], [x + 6, 0.5, z + s * 34.2], 0.3, 'sod', 0.45);
+    }
+    /* E's elements, lit: the terrace parapet's edge at the set-back (one
+       more line across the calm long faces), a cyan top line on the four
+       intake grilles of the slab ends */
+    for (const s of [-1, 1]) line([-GEO.LX, GEO.set + 2.6, s * (GEO.SZ1 + 0.3)], [GEO.LX, GEO.set + 2.6, s * (GEO.SZ1 + 0.3)], 0.5, 'sod', 0.6);
+    for (const x of [-1, 1]) for (const s of [-1, 1]) {
+      const zg = [s * (GEO.SZ0 + 10), s * (GEO.SZ1 - 10)], xg = x * (GEO.LX + 2.3);
+      line([xg, 110.6, zg[0]], [xg, 110.6, zg[1]], 0.6, 'cyan', 0.8);
+      line([xg, 34.4, zg[0]], [xg, 34.4, zg[1]], 0.4, 'sod', 0.4);
+      halo([xg + x * 3, 72, (zg[0] + zg[1]) / 2], 70, 60, 'cyan', 0.025);
     }
     /* ---- E's articulation: the lid vault, duct runs, tower and pod lights ---- */
     const arch = (x) => { const pts = []; for (let k = 0; k <= 8; k++) { const z = -70 + 140 * k / 8; pts.push([x, top + 28 * (1 - (z / 70) * (z / 70)), z]); } return pts; };
