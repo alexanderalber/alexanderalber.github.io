@@ -32,13 +32,17 @@
        seed: draw the palette from this seed (start({paletteSeed}) likewise)
      setCalm(bool)          from the next section on, only drift and breakdown
                             (no drums); start({calm: true}) begins that way
+     impact(k)              a collision of strength 0..1: the music ducks and
+                            darkens at once, and a hit in key lands on the
+                            next sixteenth (IMPACT holds the constants)
      palette(seed, variant) -> the palette object, VARIANTS: the names
      onBar = function (bar, time) {}       UI hook, fired when a bar starts
      analyser()                            AnalyserNode on the master
      render(seconds, opts) -> Promise<AudioBuffer>   offline, same music;
        opts.switchVariant + opts.switchAt (s) switch the variant mid-render
        (opts.switchNow, opts.switchNext as in setVariant), opts.env:
-       [[t, biome, mix], ...] environment moves at t (s)
+       [[t, biome, mix], ...] environment moves at t (s), opts.impacts:
+       [[t, k], ...] collisions at t
      toWav(audioBuffer) -> ArrayBuffer      16-bit PCM
 */
 (function (root) {
@@ -447,6 +451,26 @@ function envParams(biome, mix) {
   const lin = k => O[k] + (B[k] - O[k]) * m;
   return { lp: O.lp * Math.pow(B.lp / O.lp, m), rev: lin('rev'), fb: lin('fb'), rain: lin('rain'), city: lin('city') };
 }
+/* Collisions in the music (2026-10-26, flight feedback item 15). Two
+   layers. At once: the whole mix ducks to duck^k of its level and a
+   lowpass drops towards drop Hz (geometric in k), both swell back with
+   their release constants; that lands on the frame of the contact. On the
+   grid: a low hit on the root of the playing chord, quantised to the next
+   sixteenth (at most 127 ms late at 118 BPM), level times k. lock: hits
+   closer than this merge, unless the new one is clearly harder. */
+const IMPACT = { duck: 0.35, duckHold: 0.04, duckTau: 0.12, drop: 700, dropTau: 0.18,
+                 level: 0.8, minK: 0.05, lock: 0.12 };
+/* Where a hit lands: marks are the scheduled bars {t0, sd, root}; the one
+   playing at now gives the next sixteenth at or after now + lead and its
+   chord root. null before the first bar. */
+function impactGrid(now, marks, lead) {
+  let m = null;
+  for (const x of marks) if (x.t0 <= now && (!m || x.t0 > m.t0)) m = x;
+  if (!m) return null;
+  const at = now + (lead == null ? 0.005 : lead);
+  return { t: m.t0 + Math.ceil((at - m.t0) / m.sd - 1e-9) * m.sd, root: m.root };
+}
+
 /* Which constant a move from environment a to b gets. */
 function envTau(a, b) {
   if (b.lp < a.lp * 0.98) return ENV_TAU.in;
@@ -487,7 +511,14 @@ function Engine(ctx, opts) {
   this.biomeLp.connect(glue);
   this.mix = c.createGain();
   this.mix.gain.value = 0.7;
-  this.mix.connect(this.biomeLp);
+  // collisions (impact): a lowpass and a gain of their own, so neither the
+  // biome's cutoff nor the kick's sidechain automation is touched
+  this.impLp = c.createBiquadFilter();
+  this.impLp.type = 'lowpass'; this.impLp.frequency.value = 20000; this.impLp.Q.value = 0.7;
+  this.impG = c.createGain();
+  this.mix.connect(this.impLp).connect(this.impG).connect(this.biomeLp);
+  this.marks = [];
+  this.lastImpact = { t: -1, k: 0 };
 
   this.drums = c.createGain(); this.drums.gain.value = 0.9; this.drums.connect(this.mix);
   this.duck = c.createGain(); this.duck.connect(this.mix);         // sidechained music bus
@@ -584,6 +615,39 @@ Engine.prototype.setEnv = function (biome, mix, at) {
   this.biome = BIOMES[biome] ? biome : 'open';
   this.envMix = clamp(mix == null ? 1 : +mix || 0, 0, 1);
   this.applyEnv(envTau(a, envParams(this.biome, this.envMix)), at);
+};
+
+/* A collision of strength k (0..1) at now: duck and filter drop at once,
+   a hit in key on the next sixteenth. */
+Engine.prototype.impact = function (k, now) {
+  const I = IMPACT, t = now == null ? this.ctx.currentTime : now;
+  k = clamp(+k || 0, 0, 1);
+  if (k < I.minK) return;
+  const L = this.lastImpact;
+  if (t - L.t < I.lock && k < L.k * 1.5) return;
+  this.lastImpact = { t, k };
+  const g = this.impG.gain, f = this.impLp.frequency;
+  g.cancelScheduledValues(t); g.setValueAtTime(g.value, t);
+  g.linearRampToValueAtTime(Math.pow(I.duck, k), t + 0.01);
+  g.setTargetAtTime(1, t + 0.01 + I.duckHold, I.duckTau);
+  f.cancelScheduledValues(t); f.setValueAtTime(f.value, t);
+  f.exponentialRampToValueAtTime(20000 * Math.pow(I.drop / 20000, k), t + 0.015);
+  f.setTargetAtTime(20000, t + 0.03, I.dropTau);
+  const q = impactGrid(t, this.marks);
+  if (!q) return;
+  // the hit: a sine falling an octave onto the root plus a short dark saw,
+  // behind the duck (it should not duck itself), through the biome
+  const c = this.ctx, tt = q.t, fr = mtof(q.root), lv = I.level * k;
+  const o = this.osc('sine', fr * 2, 0, tt, tt + 0.7);
+  o.frequency.setValueAtTime(fr * 2, tt);
+  o.frequency.exponentialRampToValueAtTime(fr, tt + 0.08);
+  const sw = this.osc('sawtooth', fr, 0, tt, tt + 0.4);
+  const lp = this.filter('lowpass', 500 + 900 * k, 1.2);
+  const sg = c.createGain(); sg.gain.value = 0.35;
+  const a = this.hit(tt, 0.5 * lv, 0.18);
+  o.connect(a); sw.connect(lp).connect(sg).connect(a);
+  a.connect(this.biomeLp);
+  this.send(a, 0.35);
 };
 
 Engine.prototype.impulse = function (secs, pre) {
@@ -954,6 +1018,10 @@ Engine.prototype.siren = function (t, dur, f) {
 Engine.prototype.scheduleBar = function (bar, t0) {
   if (bar.palette && bar.palette !== this.pal) this.setPalette(bar.palette, t0);
   const sd = this.stepDur();
+  if (bar.tonic != null) {                 // the grid for impact()
+    this.marks.push({ t0, sd, root: deg(bar.chord, bar.tonic - 12) });
+    if (this.marks.length > 4) this.marks.shift();
+  }
   for (const e of bar.events) {
     if (this.only && !this.only.includes(e.v)) continue;
     const t = t0 + e.s * sd, len = e.l * sd;
@@ -1056,6 +1124,7 @@ const Synthwave = {
   },
   setVariant(v, o) { if (this._s) this._s.comp.setVariant(v, o); },
   setCalm(on) { if (this._s) this._s.comp.calm = !!on; },
+  impact(k) { const s = this._s; if (s && s.ctx.state === 'running') s.eng.impact(k); },
   palette(seed, variant) { return makePalette(seed, variant); },
   VARIANTS: Object.keys(VARIANTS),
   setVolume(v, tau) {
@@ -1090,6 +1159,7 @@ const Synthwave = {
     // Schedule bar by bar as the render advances, like the live player does:
     // nodes created far ahead would all cost processing time from the start.
     for (const ev of opts.env || []) eng.setEnv(ev[1], ev[2], ev[0]);
+    const imps = (opts.impacts || []).slice().sort((x, y) => x[0] - y[0]);   // [[t, k], ...] collisions
     const bars = [], q = 128 / opts.sampleRate;
     let next = 0.05;
     const feed = () => {
@@ -1100,6 +1170,7 @@ const Synthwave = {
         bars.push({ t: next, type: bar.type, chord: bar.chordName, key: bar.palette.key, bpm: eng.bpm });
         next += eng.scheduleBar(bar, next);
       }
+      while (imps.length && imps[0][0] < next - 0.3) { const x = imps.shift(); eng.impact(x[1], x[0]); }
       const at = Math.ceil((next - 0.4) / q) * q;
       if (next < seconds && at < seconds) ctx.suspend(at).then(() => { feed(); ctx.resume(); });
     };
@@ -1123,7 +1194,7 @@ const Synthwave = {
 
   // pure layer, for tests and tools
   Engine, Composer, rng, deg, pent, PROGS, TONIC, MINOR, PENTA, CHORD_NAMES, SECTION_BARS, makePalette, VARIANT_DEFS: VARIANTS,
-  BIOMES, ENV_TAU, envParams, envTau
+  BIOMES, ENV_TAU, envParams, envTau, IMPACT, impactGrid
 };
 
 root.Synthwave = Synthwave;

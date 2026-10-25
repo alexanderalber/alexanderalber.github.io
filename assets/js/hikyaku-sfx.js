@@ -7,17 +7,19 @@
  *
  * Two layers, like courier.js:
  *
- *   - Pure layer, no Web Audio. params(thrust, boost, v) maps the controls
+ *   - Pure layer, no Web Audio. params(thrust, fwd, v) maps the controls
  *     to the sound: thrust 0..1 (the largest RCS channel use over all
- *     axes), boost 0..1 (the main engine) and the airspeed v in m/s give
+ *     axes but forward), fwd 0..1 (the forward thrust in use, up to 2.5 g:
+ *     HikyakuFlight info.fwdUse, the rear nozzles) and the airspeed v in
+ *     m/s give
  *     the hum's pitch and level, the engine hiss's band and level, and the
  *     wind's filter and level. Tested in notes/dev/hikyaku-sfx.test.mjs.
  *   - Audio layer: create(ctx?, opts) builds three voices on a context.
  *       hum:  two slightly detuned saws an octave apart, low-passed: the
  *             drive. Present at idle (the ship hovers on its fans), rises in
- *             pitch and level with thrust, more with the boost.
+ *             pitch and level with thrust, more with forward thrust.
  *       hiss: looped noise through a band-pass whose centre climbs with
- *             thrust and boost: the exhaust.
+ *             thrust and forward thrust: the exhaust.
  *       wind: looped noise, high- and low-passed; both edges open with
  *             speed, the level goes with v squared (dynamic pressure).
  *     Without ctx it makes its own AudioContext, so switching the music off
@@ -26,10 +28,10 @@
  *     call resume() in a key or click handler.
  *
  * API (globalThis.HikyakuSfx):
- *   params(thrust, boost, v) -> { humHz, humLp, humGain, hissHz, hissGain,
+ *   params(thrust, fwd, v) -> { humHz, humLp, humGain, hissHz, hissGain,
  *                                 windHp, windLp, windGain }   gains 0..1
  *   create(ctx?, { volume }) -> {
- *     ctx, update(thrust, boost, v), setVolume(0..1), setActive(bool),
+ *     ctx, update(thrust, fwd, v), setVolume(0..1), setActive(bool),
  *     resume(), stop() }
  *   setActive(false) fades the layer out (menu, pause), true fades it in.
  */
@@ -38,7 +40,7 @@
 
   var C = {
     MAX_GAIN: 0.16,     // bus gain at volume 1; calibrated against the music, see notes/tools/hikyaku/SOUND-PATCH.md
-    V_WIND: 90,         // m/s where the wind is at full level (the boost top speed is about 95)
+    V_WIND: 75,         // m/s where the wind is at full level (the top speed, HikyakuFlight vNose)
     W_HUM: 0.55, W_HISS: 0.3, W_WIND: 0.5,   // voice weights inside the bus
     TAU_ENGINE: 0.08,   // s, follows the stick closely
     TAU_WIND: 0.35,     // s, air has inertia
@@ -49,8 +51,8 @@
   function clamp01(x) { x = +x; return x > 0 ? (x < 1 ? x : 1) : 0; }
 
   /* The sound for a control state. Pure. */
-  function params(thrust, boost, v) {
-    var T = clamp01(thrust), B = clamp01(boost), w = clamp01((+v || 0) / C.V_WIND);
+  function params(thrust, fwd, v) {
+    var T = clamp01(thrust), B = clamp01(fwd), w = clamp01((+v || 0) / C.V_WIND);
     var humHz = 41 + 22 * T + 18 * B;
     return {
       humHz: humHz,
@@ -139,12 +141,12 @@
     return {
       ctx: c,
       /* every frame is fine: applied at most every MIN_DT */
-      update: function (thrust, boost, v, at) {
+      update: function (thrust, fwd, v, at) {
         if (stopped) return;
         var t = at == null ? c.currentTime : at;
         if (at == null && t - last < C.MIN_DT) return;
         last = t;
-        apply(params(thrust, boost, v), t);
+        apply(params(thrust, fwd, v), t);
       },
       setVolume: function (v) { volume = clamp01(v); if (active) busTo(C.MAX_GAIN * volume, 0.05); },
       setActive: function (on) { on = !!on; if (on === active) return; active = on; busTo(on ? C.MAX_GAIN * volume : 0, C.TAU_ACTIVE); },
