@@ -96,7 +96,10 @@
     liveliness: 0.6, holograms: 1, beacons: 1, windowLife: 1,
     /* the sign atlas metadata (assets/files/hikyaku-signs.json) or null:
        with it the blade signs carry their word and shrink to it (makeTile) */
-    signs: null
+    signs: null,
+    /* the ground layer (GROUND, groundPlace) by id, null for none: with it
+       makeTile keeps the band over the decks free (groundAir) */
+    ground: null
   };
   function rateOf(v) { return v === true ? 1 : (v === false || v == null) ? 0 : clamp(+v || 0, 0, 2); }
   /* the effective rate of one life feature: its own rate times liveliness */
@@ -366,7 +369,8 @@
      every street line (so 10 m from every lane line), and the rail's
      lights. Everything keeps out of the special's footprint, its approach
      legs and its own lanes (keep), the route tube (clear in makeTile) and
-     every reserved box; the ring lane (campusRing, for the traffic) keeps
+     every reserved box (flat decks may lie under the route where it passes
+     high enough over them, see campusProfile); the ring lane (campusRing, for the traffic) keeps
      5 m from every campus box.
 
      The API for a special. A special on route.specials either carries
@@ -401,7 +405,11 @@
     lampH: 9,
     tieW: 7, tieH: 4.5, pipe: 3.4,
     laneR: 9,                /* keep-out round the special's lanes: hauler plus 4.3 m */
-    ringLaneY: 35, ringLaneR: 40, ringLaneKeep: 5
+    ringLaneY: 35, ringLaneR: 40, ringLaneKeep: 5,
+    /* decks under the route (campusProfile): the curve at least underGap
+       over a deck's top, sunk levels no lower than underMin, ramps of
+       rampLen in rampStep steps; caps: barrier capT thick, capH tall */
+    underGap: 20, underMin: 8, rampLen: 54, rampStep: 9, capT: 0.6, capH: 1.2
   };
   /* the four sides of a footprint: outward normal n, its axis a, the lateral axis l */
   var CSIDES = [{ n: [1, 0, 0], a: 0, l: 2 }, { n: [-1, 0, 0], a: 0, l: 2 }, { n: [0, 0, 1], a: 2, l: 0 }, { n: [0, 0, -1], a: 2, l: 0 }];
@@ -942,6 +950,166 @@
     return plan;
   }
 
+  /* ---- the campus under the route (2026-10-26) -----------------------------
+     The route tube (radius plus margin) used to keep every campus deck out,
+     so where the route crosses a deck low, at the block arcology's exit
+     (42 m, over the ring road at 30 m and the plaza at 28 m), the deck just
+     stopped: a bare hole under the flight path (owner's first flight). The
+     rule for flat decks is now: a deck may lie under the route where the
+     curve passes at least underGap (20 m) over its top. The tube's sides
+     and everything above the curve stay free; what goes is the part of the
+     45 m below the curve that a 2 m slab at that depth takes. Where the
+     route crosses lower, the stretch is sunk: it ramps down over rampLen in
+     rampStep steps to the highest whole metre that keeps underGap from
+     every sample whose tube meets it, at least underMin. Where even that
+     fails, or the stretch runs to the end of its run, the deck stops at a
+     barrier across its end with two amber flashers (a cap). Rail runs never
+     sink, they only get the caps. The special's lanes (keep) and the ring
+     lane stay strict; approach legs (capsules round a line) count as
+     curve: their lowest end must pass underGap over the top.
+
+     campusProfile(P, plan, run, tube, margin): a pure function of the
+     campus, the run and the route, so every tile agrees. { chunks: [{ a,
+     b, st, y, steps }], caps: [{ at, side }] } on the CAMPUS.chunk grid
+     (the grid placeRun uses): st 'ok' (the old strict deck; placeRun
+     tests it as before), 'low' (sunk to y), 'ramp' (steps [{ a, b, y }]),
+     'cut' (nothing). A cap's side is +1 when the gap lies beyond at, -1
+     when it lies before. plazaSink(P, plan, tube, margin): the one level
+     the plaza's cells under the route sink to, or null. */
+  var profCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function underSamples(tube, margin, lo, hi) {
+    var out = [];
+    if (!tube) return out;
+    var smp = tube.samples;
+    for (var i = 0; i < smp.length; i++) {
+      var q = smp[i].p, r = (smp[i].r == null ? tube.r : smp[i].r) + margin;
+      if (q[0] > lo[0] - r && q[0] < hi[0] + r && q[2] > lo[2] - r && q[2] < hi[2] + r) out.push({ p: q, r: r });
+    }
+    return out;
+  }
+  /* the highest whole-metre top a flat box may have under the relaxed
+     rule: every sample and leg whose reach meets the box's footprint must
+     pass underGap over it. Infinity when nothing meets it. */
+  function underLevel(b, smp, legs) {
+    var lim = Infinity, i, tall = { min: [b.min[0], -1e5, b.min[2]], max: [b.max[0], 1e5, b.max[2]] };
+    for (i = 0; i < smp.length; i++) {
+      var q = smp[i].p, dx = Math.max(b.min[0] - q[0], 0, q[0] - b.max[0]), dz = Math.max(b.min[2] - q[2], 0, q[2] - b.max[2]);
+      if (dx * dx + dz * dz < smp[i].r * smp[i].r) lim = Math.min(lim, q[1] - CAMPUS.underGap);
+    }
+    for (i = 0; i < legs.length; i++) {
+      if (segBoxDist(legs[i].a, legs[i].b, tall) < legs[i].r) lim = Math.min(lim, Math.min(legs[i].a[1], legs[i].b[1]) - CAMPUS.underGap);
+    }
+    return lim === Infinity ? lim : Math.floor(lim + 1e-9);
+  }
+  /* the relaxed test itself, for a box whose top is yTop */
+  function underFree(b, yTop, smp, legs) {
+    var i, G = CAMPUS.underGap - 1e-9;
+    for (i = 0; i < smp.length; i++) if (boxDist(b, smp[i].p) < smp[i].r && smp[i].p[1] - yTop < G) return false;
+    for (i = 0; i < legs.length; i++) {
+      if (segBoxDist(legs[i].a, legs[i].b, b) < legs[i].r && Math.min(legs[i].a[1], legs[i].b[1]) - yTop < G) return false;
+    }
+    return true;
+  }
+  function campusProfile(P, plan, run, tube, margin) {
+    var c = profCache ? profCache.get(run) : null;
+    if (c && c.tube === tube && c.margin === margin) return c.prof;
+    var K = CAMPUS, ch = K.chunk, deck = run.kind === 'deck', s, i, j, k;
+    var env0 = runBox(run, run.a, run.b, true), smp = underSamples(tube, margin, env0.min, env0.max);
+    var legs = deck ? (P.cs.legs || []) : [], strictKeep = deck ? (P.cs.keep || []) : plan.keepAll;
+    var keepL = deck ? plan.keep : plan.keepAll;
+    function strict(b) {
+      for (var q = 0; q < smp.length; q++) if (boxDist(b, smp[q].p) < smp[q].r) return false;
+      return keepFree(b, keepL);
+    }
+    function lowBox(a, b, y) { return runBox({ axis: run.axis, line: run.line, hw: run.hw, th: run.th, air: run.air, y: y }, a, b, true); }
+    function lowOk(a, b, y) { var bx = lowBox(a, b, y); return underFree(bx, y, smp, legs) && keepFree(bx, strictKeep); }
+    var cks = [];
+    for (s = Math.floor(run.a / ch) * ch; s < run.b - 1e-9; s += ch) {
+      var ca = Math.max(s, run.a), cb = Math.min(s + ch, run.b);
+      if (cb - ca < 0.5) continue;
+      var env = runBox(run, ca, cb, true);
+      if (strict(env)) { cks.push({ a: ca, b: cb, st: 'ok', y: run.y }); continue; }
+      var y = deck ? Math.min(run.y, underLevel(env, smp, legs)) : -Infinity;
+      cks.push({ a: ca, b: cb, st: y >= K.underMin ? 'low' : 'cut', y: y });
+    }
+    var caps = [], used = {}, nR = Math.round(K.rampLen / ch);
+    for (i = 0; i < cks.length; i = j + 1) {
+      j = i;
+      if (cks[i].st === 'ok' || cks[i].st === 'ramp') continue;
+      while (j + 1 < cks.length && (cks[j + 1].st === 'low' || cks[j + 1].st === 'cut') && Math.abs(cks[j + 1].a - cks[j].b) < 1e-6) j++;
+      var cut = i === 0 || j === cks.length - 1, yl = run.y;
+      for (k = i; k <= j; k++) { if (cks[k].st === 'cut') cut = true; yl = Math.min(yl, cks[k].y); }
+      var ramps = [];
+      if (!cut) {
+        for (k = i; k <= j && !cut; k++) if (!lowOk(cks[k].a, cks[k].b, yl)) cut = true;
+        /* the ramps: up to nR strict chunks on each side, contiguous, not
+           already a ramp of the stretch before */
+        [[-1, i - 1], [1, j + 1]].forEach(function (sd) {
+          var list = [];
+          for (var q = sd[1], m = 0; m < nR && q >= 0 && q < cks.length && cks[q].st === 'ok' && !used[q]; q += sd[0], m++) {
+            var nb = sd[0] < 0 ? cks[q + 1] : cks[q - 1];
+            if (Math.abs(sd[0] < 0 ? nb.a - cks[q].b : cks[q].a - nb.b) > 1e-6) break;
+            list.push(q);
+          }
+          if (!list.length) cut = true;
+          ramps.push({ side: sd[0], list: list });
+        });
+      }
+      if (!cut) {
+        var plans2 = ramps.map(function (rp) {
+          var lo = Math.min.apply(null, rp.list.map(function (q) { return cks[q].a; }));
+          var hi = Math.max.apply(null, rp.list.map(function (q) { return cks[q].b; }));
+          var nS = Math.max(1, Math.round((hi - lo) / K.rampStep)), st = (hi - lo) / nS, steps = [];
+          for (var m = 0; m < nS; m++) {
+            /* m counts from the high end (away from the stretch) inward */
+            var a0 = rp.side < 0 ? lo + m * st : hi - (m + 1) * st, yS = run.y + (yl - run.y) * (m + 1) / (nS + 1);
+            steps.push({ a: a0, b: a0 + st, y: Math.round(yS * 100) / 100 });
+          }
+          return { rp: rp, steps: steps };
+        });
+        plans2.forEach(function (pl) { pl.steps.forEach(function (sp) { if (!lowOk(sp.a, sp.b, sp.y)) cut = true; }); });
+        if (!cut) {
+          for (k = i; k <= j; k++) { cks[k].st = 'low'; cks[k].y = yl; }
+          plans2.forEach(function (pl) {
+            pl.rp.list.forEach(function (q) {
+              used[q] = true;
+              cks[q].st = 'ramp';
+              cks[q].steps = pl.steps.filter(function (sp) { return sp.a < cks[q].b - 1e-6 && sp.b > cks[q].a + 1e-6; });
+            });
+          });
+        }
+      }
+      if (cut) {
+        for (k = i; k <= j; k++) cks[k].st = 'cut';
+        if (i > 0 && cks[i - 1].st === 'ok') caps.push({ at: cks[i].a, side: 1 });
+        if (j < cks.length - 1 && cks[j + 1].st === 'ok') caps.push({ at: cks[j].b, side: -1 });
+      }
+    }
+    var prof = { chunks: cks, caps: caps };
+    if (profCache) profCache.set(run, { tube: tube, margin: margin, prof: prof });
+    return prof;
+  }
+  /* The plaza's sunk level: the lowest underLevel over the cells that the
+     strict rule takes out (a uniform floor reads as a sunk lane, not as
+     stairs), or null when there are none or it falls under underMin. */
+  var sinkCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function plazaSink(P, plan, tube, margin) {
+    var pz = plan.plaza;
+    if (!pz || !tube) return null;
+    var c = sinkCache ? sinkCache.get(pz) : null;
+    if (c && c.tube === tube && c.margin === margin) return c.y;
+    var r = pz.rect, smp = underSamples(tube, margin, [r[0], 0, r[1]], [r[2], 0, r[3]]), legs = P.cs.legs || [], y = Infinity;
+    pz.cells.forEach(function (cl) {
+      var hit = !cl.ok;
+      for (var q = 0; q < smp.length && !hit; q++) if (boxDist(cl.box, smp[q].p) < smp[q].r) hit = true;
+      if (hit) y = Math.min(y, underLevel(cl.box, smp, legs));
+    });
+    y = Math.min(y, pz.y);
+    var out = y >= CAMPUS.underMin && y < pz.y ? y : null;
+    if (sinkCache) sinkCache.set(pz, { tube: tube, margin: margin, y: out });
+    return out;
+  }
+
   /* City life constants (see holoPlace and beaconPlace in makeTile).
      HOLO_P: chance per tile at life rate 1. Only about 40 % of the tiles
      round a core have a candidate pair at all, so at liveliness 1 every
@@ -1069,15 +1237,29 @@
         if (rb.kind === 'air') AIR.push(rb); else RESCAP.push(rb);
       }
     }
+    /* the ground layer's band over its decks and rails (GROUND-V2): the
+       tile's balconies, blade signs and holograms keep out of it; the
+       buildings stand off the street and never meet it */
+    if (C.ground && GROUND[C.ground]) {
+      var GAIR = groundAir(ix, iz, route, C);
+      for (var gai = 0; gai < GAIR.length; gai++) RES.push(GAIR[gai]);
+    }
     /* the campus runs (ring road, boulevards, rail) with the air over them:
        skybridges and cables of this tile keep out (they cross only the
        tile's inner streets, so this matters for runs on inner lines) */
     var CENV = [];
     for (var cpj = 0; cpj < CP.length; cpj++) {
-      var crs = campusPlan(CP[cpj], C.seed).runs;
+      var cpl = campusPlan(CP[cpj], C.seed), crs = cpl.runs;
       for (var crk = 0; crk < crs.length; crk++) {
         var ce = runBox(crs[crk], crs[crk].a, crs[crk].b, true);
-        if (ce.max[0] > x0 - 10 && ce.min[0] < x0 + TILE + 10 && ce.max[2] > z0 - 10 && ce.min[2] < z0 + TILE + 10) CENV.push(ce);
+        if (!(ce.max[0] > x0 - 10 && ce.min[0] < x0 + TILE + 10 && ce.max[2] > z0 - 10 && ce.min[2] < z0 + TILE + 10)) continue;
+        CENV.push(ce);
+        /* a sunk stretch (campusProfile) has its air lower down */
+        if (tube && crs[crk].kind === 'deck') campusProfile(CP[cpj], cpl, crs[crk], tube, C.margin).chunks.forEach(function (q) {
+          if (q.st !== 'low' && q.st !== 'ramp') return;
+          var r0 = crs[crk];
+          CENV.push(runBox({ axis: r0.axis, line: r0.line, hw: r0.hw, th: r0.th, air: r0.air, y: q.st === 'low' ? q.y : q.steps[q.steps.length - 1].y }, q.a, q.b, true));
+        });
       }
     }
     function cenvHit(b) {
@@ -2004,18 +2186,63 @@
         if (nAcc) for (k = 0; k < it.accents.length; k++) accents.push(Object.assign({}, it.accents[k], { p: it.accents[k].p.slice(), n: it.accents[k].n.slice(), hue: nAcc === 1 ? 0 : it.accents[k].hue }));
         for (k = 0; k < it.pads.length; k++) pads.push({ p: it.pads[k].p.slice(), n: [0, 1, 0], w: it.pads[k].w, d: it.pads[k].d, kind: it.pads[k].kind });
       }
-      function placeRun(plan, run) {
+      /* The relaxed tube test for a box under the route (campusProfile):
+         every tube sample of the tile that the box comes within reach of
+         must pass underGap over yTop; the reserved boxes stay strict. */
+      function clearUnder(b, yTop) {
+        var k, G = K.underGap - 1e-9;
+        for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < SR[k] && S[k][1] - yTop < G) return false;
+        for (k = 0; k < RES.length; k++) if (boxesOverlap(b, RES[k], 2)) return false;
+        return true;
+      }
+      function placeRun(P, plan, run) {
         var ax = run.axis, t0 = ax === 0 ? x0 : z0, p0 = ax === 0 ? z0 : x0, pa = ax === 0 ? 2 : 0;
         if (run.line + run.hw <= p0 || run.line - run.hw >= p0 + TILE) return;
         var lo = Math.max(run.a, t0), hi = Math.min(run.b, t0 + TILE);
         if (hi - lo < 0.5) return;
         var mine = run.line >= p0 && run.line < p0 + TILE, deck = run.kind === 'deck', keepL = deck ? plan.keep : plan.keepAll;
-        var ch = K.chunk, kept = [], s, i;
+        var ch = K.chunk, kept = [], low = [], s, i;
+        /* the run's profile under the route: strict chunks as before, sunk
+           and ramp chunks as their pieces, cut chunks not at all */
+        var prof = tube ? campusProfile(P, plan, run, tube, C.margin) : null, pmap = {};
+        if (prof) for (i = 0; i < prof.chunks.length; i++) pmap[Math.round(prof.chunks[i].a * 1000)] = prof.chunks[i];
+        var keptAt = {};
+        function at(y) { return { axis: run.axis, line: run.line, hw: run.hw, th: run.th, air: run.air, y: y }; }
         for (s = Math.floor(lo / ch) * ch; s < hi - 1e-9; s += ch) {
           var ca = Math.max(s, lo), cb = Math.min(s + ch, hi);
           if (cb - ca < 0.5) continue;
+          var pc0 = pmap[Math.round(Math.max(s, run.a) * 1000)];
+          if (pc0 && (pc0.st === 'low' || pc0.st === 'ramp')) {
+            var parts = pc0.st === 'low' ? [{ a: ca, b: cb, y: pc0.y }] : pc0.steps.map(function (sp) { return { a: Math.max(sp.a, ca), b: Math.min(sp.b, cb), y: sp.y }; });
+            parts.forEach(function (pt) {
+              if (pt.b - pt.a < 0.05) return;
+              var env2 = runBox(at(pt.y), pt.a, pt.b, true), ec2 = clip(env2);
+              if (ec2 && clearUnder(env2, pt.y) && keepFree(env2, P.cs.keep || []) && !hits(ec2, 0.5, true)) low.push(pt);
+            });
+            continue;
+          }
+          if (pc0 && pc0.st === 'cut') continue;
           var env = runBox(run, ca, cb, true), ec = clip(env);
-          if (ec && clear(env) && keepFree(env, keepL) && !hits(ec, 0.5, deck)) kept.push([ca, cb]);
+          if (ec && clear(env) && keepFree(env, keepL) && !hits(ec, 0.5, deck)) { kept.push([ca, cb]); keptAt[Math.round(ca * 1000)] = keptAt[Math.round(cb * 1000)] = true; }
+        }
+        /* pylons: decks every 108 m at mid block, the rail every 27 m off
+           the street crossings; from the ground to the deck's underside.
+           Under a sunk deck they take the deck's relaxed test. */
+        function pylons(a0, a1, y, under) {
+          var pw = deck ? 1.2 : 0.8;
+          for (var q = Math.ceil((a0 + 2) / 27) * 27; q < a1 - 2; q += 27) {
+            var m = ((q % 108) + 108) % 108;
+            if (deck ? Math.abs(m - 54) > 1e-6 : m < 1e-6) continue;
+            var pl = { min: [0, 0, 0], max: [0, y - run.th, 0] };
+            pl.min[ax] = q - pw; pl.max[ax] = q + pw; pl.min[pa] = run.line - pw; pl.max[pa] = run.line + pw;
+            var pc = clip(pl);
+            if (!pc || hits(pc, -0.01)) continue;
+            if (under ? clearUnder(pl, y) && keepFree(pl, P.cs.keep || []) : clear(pl) && keepFree(pl, keepL)) {
+              var po = own(pc, 'cpylon', PROG_PLAIN, 0.12, 0.17);
+              if (under) po.under = true;
+              put(po);
+            }
+          }
         }
         for (i = 0; i < kept.length; i++) {
           var a0 = kept[i][0], a1 = kept[i][1];
@@ -2023,17 +2250,7 @@
           var db = clip(runBox(run, a0, a1, false));
           if (db) { put(own(db, deck ? 'cdeck' : 'crail', PROG_PLAIN, deck ? 0.16 : 0.18, 0.31)); out.stats.chunks++; }
           if (mine) out.runs.push({ kind: run.kind, axis: ax, line: run.line, a: a0, b: a1, y: run.y, hue: run.hue, w: run.hw * 2 });
-          /* pylons: decks every 108 m at mid block, the rail every 27 m off
-             the street crossings; from the ground to the deck's underside */
-          var pw = deck ? 1.2 : 0.8;
-          for (s = Math.ceil((a0 + 2) / 27) * 27; s < a1 - 2; s += 27) {
-            var m = ((s % 108) + 108) % 108;
-            if (deck ? Math.abs(m - 54) > 1e-6 : m < 1e-6) continue;
-            var pl = { min: [0, 0, 0], max: [0, run.y - run.th, 0] };
-            pl.min[ax] = s - pw; pl.max[ax] = s + pw; pl.min[pa] = run.line - pw; pl.max[pa] = run.line + pw;
-            var pc = clip(pl);
-            if (pc && clear(pl) && keepFree(pl, keepL) && !hits(pc, -0.01)) put(own(pc, 'cpylon', PROG_PLAIN, 0.12, 0.17));
-          }
+          pylons(a0, a1, run.y, false);
           /* lamp masts on a boulevard, every 36 m, sides alternating, not
              within 20 m of the ring road */
           if (run.lamps) for (s = Math.ceil((a0 + 3 - 18) / 36) * 36 + 18; s < a1 - 3; s += 36) {
@@ -2049,25 +2266,71 @@
             out.glows.push({ p: tp, size: 7, hue: -1, gain: 0.8 }, { p: pool, size: 16, hue: -1, gain: 0.07 });
           }
         }
+        /* the sunk stretch and its ramp steps: same deck, flagged under
+           (the tests check them by the relaxed rule), merged per level */
+        for (i = 0; i < low.length; i++) {
+          var la0 = low[i].a, la1 = low[i].b, ly = low[i].y;
+          while (i + 1 < low.length && Math.abs(low[i + 1].a - la1) < 1e-6 && low[i + 1].y === ly) la1 = low[++i].b;
+          var lbx = clip(runBox(at(ly), la0, la1, false));
+          if (lbx) { var lo2 = own(lbx, 'cdeck', PROG_PLAIN, 0.16, 0.31); lo2.under = true; put(lo2); out.stats.chunks++; }
+          if (mine) out.runs.push({ kind: run.kind, axis: ax, line: run.line, a: la0, b: la1, y: ly, hue: run.hue, w: run.hw * 2 });
+          pylons(la0, la1, ly, true);
+        }
+        /* caps: where a stretch stays cut, the deck (or rail) ends at a
+           barrier across it with an amber flasher at each corner; built by
+           the tile that owns the end chunk, if it kept that chunk */
+        if (prof && mine) prof.caps.forEach(function (cp) {
+          var e = cp.at;
+          if (!(e > lo - 1e-6 && e < hi + 1e-6) || !keptAt[Math.round(e * 1000)]) return;
+          var inside = cp.side > 0 ? e - 1e-3 : e + 1e-3;
+          if (!(inside > lo && inside < hi)) return;
+          var bx = { min: [0, run.y, 0], max: [0, run.y + K.capH, 0] };
+          bx.min[ax] = cp.side > 0 ? e - K.capT : e; bx.max[ax] = cp.side > 0 ? e : e + K.capT;
+          bx.min[pa] = run.line - run.hw; bx.max[pa] = run.line + run.hw;
+          var bc = clip(bx);
+          if (!bc || !clear(bx) || hits(bc, -0.01, true)) return;
+          put(own(bc, 'ccap', PROG_PLAIN, 0.3, 0.41));
+          var yT = run.y + K.capH, ph = fract(e * 0.0137 + run.line * 0.0071), u = cp.side > 0 ? e - K.capT / 2 : e + K.capT / 2;
+          for (var sg = -1; sg <= 1; sg += 2) {
+            var gpnt = [0, yT + 0.35, 0];
+            gpnt[ax] = u; gpnt[pa] = run.line + sg * (run.hw - 0.4);
+            if (gpnt[pa] >= p0 && gpnt[pa] < p0 + TILE) out.glows.push({ p: gpnt, size: 3.2, hue: -2, gain: 1.4, blink: [1, fract(ph + (sg > 0 ? 0.5 : 0)), 1.1] });
+          }
+          var A = [0, yT + 0.05, 0], B = [0, yT + 0.05, 0];
+          A[ax] = B[ax] = u; A[pa] = run.line - run.hw + 0.3; B[pa] = run.line + run.hw - 0.3;
+          out.streaks.push({ a: A, b: B, w: 0.45, hue: -2, gain: 0.55 });
+        });
       }
-      function placePlaza(pz) {
-        var ok = {}, rows = {}, la = CSIDES[pz.side].l, na = 2 - la;
+      function placePlaza(P, plan, pz) {
+        var ok = {}, rows = {}, sunk = {}, la = CSIDES[pz.side].l, na = 2 - la;
+        /* cells the route takes out sink to plazaSink's one level, under
+           the relaxed rule (campusProfile), so the plaza gets a sunk lane
+           under the flight path instead of a hole */
+        var ys = plazaSink(P, plan, tube, C.margin), strictK = (P.cs.keep || []).concat(P.ringSeg), legs = P.cs.legs || [];
         pz.cells.forEach(function (c) {
-          if (!c.ok || !inSq(c.box)) return;
-          if (!clear(c.box) || hits(c.box, 0.3)) return;
+          if (!inSq(c.box)) return;
+          if (!c.ok || !clear(c.box)) {
+            if (ys == null) return;
+            var lb = { min: [c.box.min[0], ys - K.plazaT, c.box.min[2]], max: [c.box.max[0], ys, c.box.max[2]] };
+            if (!keepFree(lb, strictK) || !underFree(lb, ys, [], legs) || !clearUnder(lb, ys) || hits(lb, 0.3)) return;
+            (sunk[c.row] || (sunk[c.row] = [])).push({ box: lb });
+            return;
+          }
+          if (hits(c.box, 0.3)) return;
           ok[c.gx + ',' + c.gz] = true;
           (rows[c.row] || (rows[c.row] = [])).push(c);
         });
-        Object.keys(rows).forEach(function (rk) {
-          var list = rows[rk].sort(function (p, q) { return p.box.min[la] - q.box.min[la]; });
+        [[rows, pz.y, false], [sunk, ys, true]].forEach(function (grp) { Object.keys(grp[0]).forEach(function (rk) {
+          var list = grp[0][rk].sort(function (p, q) { return p.box.min[la] - q.box.min[la]; });
           for (var i = 0; i < list.length; i++) {
             var b0 = list[i].box, l1 = b0.max[la];
             while (i + 1 < list.length && Math.abs(list[i + 1].box.min[la] - l1) < 1e-6) l1 = list[++i].box.max[la];
             var st = own(b0, 'cdeck', PROG_PLAIN, 0.27, 0.5);
             st.max[la] = l1;
+            if (grp[2]) st.under = true;
             put(st); out.stats.cells++;
             /* the light grid: the strip's near edge, and a line across it every 27 m */
-            var y = pz.y + 0.15, nearE = CSIDES[pz.side].n[na] > 0 ? st.min[na] : st.max[na];
+            var y = grp[1] + 0.15, nearE = CSIDES[pz.side].n[na] > 0 ? st.min[na] : st.max[na];
             var A = [0, y, 0], B = [0, y, 0];
             A[na] = B[na] = nearE; A[la] = st.min[la]; B[la] = st.max[la];
             out.streaks.push({ a: A, b: B, w: 0.5, hue: -1, gain: 0.18 });
@@ -2077,7 +2340,7 @@
               out.streaks.push({ a: C2, b: D2, w: 0.5, hue: -1, gain: 0.18 });
             }
           }
-        });
+        }); });
         pz.items.forEach(function (it) {
           for (var k = 0; k < it.support.length; k++) if (!ok[it.support[k].gx + ',' + it.support[k].gz]) return;
           for (k = 0; k < it.boxes.length; k++) if (!clear(it.boxes[k]) || hits(it.boxes[k], -0.01)) return;
@@ -2088,8 +2351,8 @@
       }
       CP.forEach(function (P) {
         var plan = campusPlan(P, C.seed);
-        plan.runs.forEach(function (run) { placeRun(plan, run); });
-        if (plan.plaza) placePlaza(plan.plaza);
+        plan.runs.forEach(function (run) { placeRun(P, plan, run); });
+        if (plan.plaza) placePlaza(P, plan, plan.plaza);
         plan.blocks.forEach(function (blk) {
           var r = blk.rect;
           if (!blk.groups.length || !(r[0] >= x0 && r[2] <= x0 + TILE && r[1] >= z0 && r[3] <= z0 + TILE)) return;
@@ -2307,110 +2570,494 @@
     return tileOut;
   }
 
-  /* ---- ground layer mockup (notes/tools/hikyaku/GROUND-CONCEPT.md) ------
+  /* ---- ground layer (GROUND-CONCEPT.md, GROUND-V2.md section 2) --------
      Option 1, the layered street, behind ?ground=layered and off by
      default: viaducts and an elevated railway in the band the soup leaves
-     visible (20 to 45 m), over the buried street. A street line (every
-     108 m) is a deck line, a rail line or nothing, from a hash of its
-     index alone, so a viaduct runs on across tiles. Decks along x sit at
-     GROUND.deckY[0], along z at deckY[1], rails at railY[0|1], so no two
-     crossing structures meet. A line is cut into chunks (GROUND.chunk);
-     a chunk stays only if it, with the air its lights need, keeps clear of
-     every box of the tile (bridges, balconies, signs), of every reserved
-     box and of the route tube (own radius plus margin, as clear() in
-     makeTile). Pylons stand off the crossings. Tiles with old-town
-     buildings get nothing, the fringe stays as it is. Nothing reaches
-     GROUND.top (45 m, the bottom of the lowest lane band).
+     visible (15 to 45 m), over the buried street. Since GROUND-V2 the
+     decks come before the city, and a deck is either whole or absent:
 
-     groundPlace(tile, route, cfg) -> { boxes, runs } or null for no or an
-     unknown cfg.ground. boxes are collision boxes (kind deck | pylon |
-     rail, ground: true); runs { kind, axis (0: along x, 2: along z), line,
-     a, b (along-axis extent), y (deck top or rail top), hue } feed the
-     light layer. Pure in (tile, route, cfg). */
+     - Only the main streets carry them: the street lines on the tile edges,
+       every 216 m. A line falls into sections of G.sec tiles, shifted per
+       line by a hash of the line; the section's own hash makes it a deck,
+       a rail or nothing (G.deckP, G.railP). A rail section next to a deck
+       section of the same line stays empty, so a deck end never runs into
+       a railway.
+     - Only two things stop a section: the route tube and the reserved
+       boxes (specials, canyon air, campus claims). Both are known before
+       any tile is built, so every tile reads the same answer from a hash
+       and the route, never from its neighbours. The tube stops a structure
+       only where the curve passes less than CAMPUS.underGap over its top
+       (the rule of the campus decks, 2026-10-26), so a deck may run on
+       under a high flight path. Where something stops it, the structure
+       ends at the last crossing (every 108 m) before it.
+     - What is left of a section reaches the section's edge, where it joins
+       the same kind of structure of the next section, or it ends, and every
+       end has a reason: a deck ends in a ramp down to the street (slope
+       G.slope, a whole number of crossings long) or runs into a parking
+       garage built over the street (G.garage*); a rail ends in a station
+       (platforms and a roof over its last G.station metres, a buffer stop).
+       Ramp or garage must fit before the next stop, else the deck ends one
+       crossing earlier. A joined structure shorter than G.minDeck or
+       G.minRail goes as a whole.
+     - makeTile keeps the band G.band over every structure free (air boxes
+       in its RES list, groundAir): balconies, blade signs and holograms
+       give way to the deck, not the other way round. Bridges and cables
+       only cross the inner streets, which carry no decks.
+
+     Decks along x sit at G.deckY[0], along z at deckY[1], rails at
+     railY[0|1], so no two crossing structures meet; ramps cross the other
+     main streets low enough, garages and stations keep off the crossings'
+     pylons, and pylons stand off the crossings. Nothing reaches G.top
+     (45 m, the bottom of the lowest lane band).
+
+     groundSpans(ax, li, lo, hi, C, route) -> the final pieces of line li
+     (axis 0: along x at z = li * TILE; axis 2: along z at x = li * TILE)
+     that come near the along range lo..hi: { kind, ax, li, line, a, b (the
+     flat part, crossing to crossing), ends: [end at a, end at b], hue }
+     with end { type: 'join' | 'ramp' | 'garage' | 'station', at, dir }.
+     groundParts(piece) -> its world boxes, ramps and lights. groundPlace(
+     tile, route, cfg) -> { boxes, runs, ramps, glows, streaks, pieces } for
+     the tile's own two line segments (z = z0 over x0..x0 + TILE, x = x0
+     over z0..z0 + TILE), or null for no or an unknown cfg.ground. boxes are
+     collision boxes (kind deck | ramp | pylon | rail | platform | sroof |
+     buffer | garage, ground: true; garage boxes also carry facade: true and
+     go into the facade mesh with their lit slits); ramps { ax, line, a, b,
+     ya, yb, hw, th } the sloped slabs to draw (their collision boxes are
+     steps among boxes); runs { kind, axis, line, a, b, y, y1?, hue, w }
+     feed the light layer. All pure in (tile, route, cfg). */
   var GROUND = {
-    layered: { deckP: 0.36, railP: 0.18, deckY: [21, 29], deckT: 2, deckW: 14, deckAir: 3,
+    layered: {
+      sec: 4, deckP: 0.14, railP: 0.108,
+      deckY: [21, 29], deckT: 2, deckW: 14, deckAir: 3,
       railY: [35, 40.8], railT: 1.6, railW: 3, railAir: 4, pylon: 2.4, rpylon: 1.6,
-      chunk: 27, top: 45, accentP: 0.25 }
+      pitch: 27, cross: 108, top: 45, accentP: 0.25,
+      minDeck: 432, minRail: 648,
+      slope: 0.1, rampStep: 13.5,
+      garageP: 0.4, garageGap: 16, garageLen: 40, garageW: 24, garageLv: 12,
+      station: 120, stationOff: 16, stationW: 18, platW: 6, roofH: 4,
+      band: [15, 45], bandRail: 4
+    }
   };
+  /* the ramp length of a deck at height y: whole crossings at G.slope */
+  function gRampLen(G, y) { return Math.ceil(y / G.slope / G.cross - 1e-9) * G.cross; }
+  function gTop(G, kind, ax) { return kind === 'deck' ? G.deckY[ax ? 1 : 0] : G.railY[ax ? 1 : 0]; }
+  function gOff(G, ax, li, seed) { return hashU(li, ax + 1, seed, 81) % G.sec; }
+  function gRaw(G, ax, li, s, seed) {
+    var u = hashU(hashU(li, ax + 1, seed, 82), s, seed, 83) / 4294967296;
+    return u < G.deckP ? 'deck' : u < G.deckP + G.railP ? 'rail' : null;
+  }
+  function gKind(G, ax, li, s, seed) {
+    var k = gRaw(G, ax, li, s, seed);
+    if (k === 'rail' && (gRaw(G, ax, li, s - 1, seed) === 'deck' || gRaw(G, ax, li, s + 1, seed) === 'deck')) return null;
+    return k;
+  }
+  /* The stoppers of one city configuration, prepared once and cached on
+     the route (and the reserved list, the campuses): tube samples with
+     their clearance, reserved boxes (not the canyon walls: they are lots),
+     campus claims. Section results are cached in it too. */
+  var gCtxCache = typeof WeakMap === 'function' ? new WeakMap() : null, gNoRoute = {};
+  function groundCtx(gid, route, C) {
+    var G = GROUND[gid], seed = C.seed >>> 0, margin = C.margin == null ? DEF.margin : C.margin;
+    var campusOn = C.campus == null ? DEF.campus : C.campus;
+    var holder = route || gNoRoute, list = gCtxCache ? gCtxCache.get(holder) : null;
+    if (list) {
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i];
+        if (e.gid === gid && e.seed === seed && e.margin === margin && e.reserved === C.reserved && e.campusOn === campusOn && e.campuses === C.campuses) return e;
+      }
+    } else if (gCtxCache) { list = []; gCtxCache.set(holder, list); }
+    var smp = [], tube = route && route.tube ? route.tube : null;
+    if (tube) for (var k = 0; k < tube.samples.length; k++) {
+      var q = tube.samples[k];
+      if (q.p[1] - (q.r == null ? tube.r : q.r) - margin < G.top + 4) smp.push({ p: q.p, r: (q.r == null ? tube.r : q.r) + margin });
+    }
+    var res = (C.reserved || []).filter(function (b) { return b.kind !== 'wall'; }), claims = [];
+    /* a campus: its claim, its runs with their air (the station rail may
+       leave the claim), its approach legs (under rule, like the curve) and
+       the special's lanes (strict), sampled every 4 m */
+    campusList(C, route).forEach(function (P) {
+      claims.push(P.claim);
+      campusPlan(P, seed).runs.forEach(function (run) { res.push(runBox(run, run.a, run.b, true)); });
+      [[P.cs.legs || [], false], [P.cs.keep || [], true]].forEach(function (L) {
+        L[0].forEach(function (g) {
+          var n = Math.max(1, Math.ceil(Math.hypot(g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2]) / 4));
+          for (var j = 0; j <= n; j++) {
+            var u = j / n, p = [g.a[0] + (g.b[0] - g.a[0]) * u, g.a[1] + (g.b[1] - g.a[1]) * u, g.a[2] + (g.b[2] - g.a[2]) * u];
+            if (p[1] - g.r - 2 < G.top + 4) smp.push({ p: p, r: g.r + 2, strict: L[1] });
+          }
+        });
+      });
+    });
+    var ctx = { gid: gid, G: G, seed: seed, margin: margin, reserved: C.reserved, campusOn: campusOn, campuses: C.campuses,
+      smp: smp, res: res, claims: claims, iv: new Map(), raw: new Map(), rsv: new Map(), fin: new Map() };
+    if (list) { list.push(ctx); if (list.length > 8) list.shift(); }
+    return ctx;
+  }
+  /* Blocked intervals along line li for a column of half width hw from y0
+     to top (the structure with its air), yTop the top the under rule
+     measures from, over lo..hi: sorted, merged [[b0, b1]]. */
+  function gBlocked(ctx, ax, li, hw, y0, top, yTop, lo, hi) {
+    var line = li * TILE, la = ax === 0 ? 2 : 0, out = [], k, gap = CAMPUS.underGap - 1e-9;
+    for (k = 0; k < ctx.smp.length; k++) {
+      var s = ctx.smp[k], p = s.p, R = s.r;
+      if (p[ax] < lo - R || p[ax] > hi + R) continue;
+      var dl = Math.max(Math.abs(p[la] - line) - hw, 0);
+      if (dl >= R || (!s.strict && p[1] - yTop >= gap)) continue;
+      var dv = Math.max(p[1] - top, 0, y0 - p[1]), d2 = dl * dl + dv * dv;
+      if (d2 >= R * R) continue;
+      var h = Math.sqrt(R * R - d2);
+      out.push([p[ax] - h, p[ax] + h]);
+    }
+    for (k = 0; k < ctx.res.length; k++) {
+      var b = ctx.res[k];
+      if (b.min[la] - 2 < line + hw && b.max[la] + 2 > line - hw && b.min[1] - 2 < top && b.max[1] + 2 > y0 && b.max[ax] + 2 > lo && b.min[ax] - 2 < hi) {
+        out.push([b.min[ax] - 2, b.max[ax] + 2]);
+      }
+    }
+    for (k = 0; k < ctx.claims.length; k++) {
+      var c = ctx.claims[k], cl0 = la === 0 ? c[0] : c[1], cl1 = la === 0 ? c[2] : c[3], ca0 = ax === 0 ? c[0] : c[1], ca1 = ax === 0 ? c[2] : c[3];
+      if (cl0 - HALF_ST < line + hw && cl1 + HALF_ST > line - hw) out.push([ca0 - HALF_ST, ca1 + HALF_ST]);
+    }
+    out.sort(function (u, v) { return u[0] - v[0]; });
+    var m = [];
+    for (k = 0; k < out.length; k++) {
+      if (m.length && out[k][0] <= m[m.length - 1][1]) m[m.length - 1][1] = Math.max(m[m.length - 1][1], out[k][1]);
+      else m.push(out[k].slice());
+    }
+    return m;
+  }
+  function gHits(iv, a, b) {
+    var lo = Math.min(a, b), hi = Math.max(a, b);
+    for (var k = 0; k < iv.length; k++) if (iv[k][0] < hi && iv[k][1] > lo) return true;
+    return false;
+  }
+  function gSec(ctx, ax, li, s) {
+    var G = ctx.G, o = gOff(G, ax, li, ctx.seed);
+    return [(s * G.sec + o) * TILE, ((s + 1) * G.sec + o) * TILE];
+  }
+  function gSecOf(ctx, ax, li, x) {
+    var G = ctx.G, o = gOff(G, ax, li, ctx.seed);
+    return Math.floor((Math.floor(x / TILE) - o) / G.sec);
+  }
+  /* Raw pieces of section s: its kind, the blocked intervals (structure
+     profile, and the garage profile for decks) round it, the free parts
+     inside it snapped inward to crossings. */
+  function gRawSec(ctx, ax, li, s) {
+    var key = ax + ':' + li + ':' + s, r = ctx.raw.get(key);
+    if (r) return r;
+    var G = ctx.G, kind = gKind(G, ax, li, s, ctx.seed), S = gSec(ctx, ax, li, s);
+    r = { kind: kind, S0: S[0], S1: S[1], list: [], iv: null, ivG: null };
+    if (kind) {
+      var deck = kind === 'deck', top = gTop(G, kind, ax);
+      var lo = S[0] - 400, hi = S[1] + 400;
+      r.iv = deck ? gBlocked(ctx, ax, li, G.deckW / 2, 0, top + G.deckAir, top, lo, hi)
+        : gBlocked(ctx, ax, li, G.stationW / 2, 0, top + G.railAir, top, lo, hi);
+      if (deck) r.ivG = gBlocked(ctx, ax, li, G.garageW / 2, 0, G.garageLv * STOREY, G.garageLv * STOREY, lo, hi);
+      var x = S[0];
+      for (var k = 0; k <= r.iv.length; k++) {
+        var f0 = x, f1 = k < r.iv.length ? r.iv[k][0] : Infinity;
+        if (k < r.iv.length) x = Math.max(x, r.iv[k][1]);
+        var a = Math.max(S[0], Math.ceil(f0 / G.cross - 1e-9) * G.cross), b = Math.min(S[1], Math.floor(f1 / G.cross + 1e-9) * G.cross);
+        if (b - a > 0.5) r.list.push([a, b]);
+        if (x >= S[1]) break;
+      }
+    }
+    ctx.raw.set(key, r);
+    return r;
+  }
+  /* raw touch: section s has a piece that reaches its start (side -1) or
+     its end (side +1) */
+  function gTouch(r, side) {
+    if (!r.kind || !r.list.length) return false;
+    return side < 0 ? Math.abs(r.list[0][0] - r.S0) < 0.5 : Math.abs(r.list[r.list.length - 1][1] - r.S1) < 0.5;
+  }
+  /* Pieces of section s with both ends resolved: a raw piece reaching an
+     edge where the next section's raw piece of the same kind begins joins
+     it (unless that one fails, see below); every other deck end tries a
+     ramp and a garage (order by hash) and steps back a crossing at a time
+     until one fits; a piece with a joined end may shrink to nothing at
+     that edge and still carries the end there. A piece where nothing fits
+     fails and goes; rails end in stations, which always fit. Depends on
+     the raw pieces of s - 1, s, s + 1 only. */
+  function gResolved(ctx, ax, li, s) {
+    var key = ax + ':' + li + ':' + s, out = ctx.rsv.get(key);
+    if (out) return out;
+    var G = ctx.G, r = gRawSec(ctx, ax, li, s);
+    out = [];
+    if (r.kind) {
+      var deck = r.kind === 'deck', L = deck ? gRampLen(G, gTop(G, 'deck', ax)) : 0;
+      var rp = gRawSec(ctx, ax, li, s - 1), rn = gRawSec(ctx, ax, li, s + 1);
+      var HR = rng(hashU(hashU(li, ax + 1, ctx.seed, 84), s, ctx.seed, 85));
+      var hue = HR() < G.accentP ? (HR() < 0.5 ? 0 : 1) : -1;
+      for (var k = 0; k < r.list.length; k++) {
+        var a = r.list[k][0], b = r.list[k][1];
+        var jA = k === 0 && gTouch(r, -1) && rp.kind === r.kind && gTouch(rp, 1);
+        var jB = k === r.list.length - 1 && gTouch(r, 1) && rn.kind === r.kind && gTouch(rn, -1);
+        var ends = [jA ? { type: 'join', at: a, dir: -1 } : null, jB ? { type: 'join', at: b, dir: 1 } : null];
+        var failed = false;
+        if (deck) {
+          for (var side = 0; side < 2 && !failed; side++) {
+            if (ends[side]) continue;
+            var d = side ? 1 : -1, gFirst = HR() < G.garageP, other = ends[1 - side];
+            for (;;) {
+              var E = side ? b : a, lim = side ? a : b;
+              /* the flat part may shrink to nothing only against a joined end */
+              if (side ? E < lim - 0.5 : E > lim + 0.5) { failed = true; break; }
+              if (Math.abs(E - lim) < 0.5 && !(other && other.type === 'join')) { failed = true; break; }
+              var okR = !gHits(r.iv, E, E + d * L), okG = !gHits(r.ivG, E, E + d * (G.garageGap + G.garageLen));
+              if (okR || okG) { ends[side] = { type: (gFirst ? okG : !okR) ? 'garage' : 'ramp', at: E, dir: d }; break; }
+              if (side) b -= G.cross; else a += G.cross;
+            }
+          }
+        } else {
+          if (!ends[0]) ends[0] = { type: 'station', at: a, dir: -1 };
+          if (!ends[1]) ends[1] = { type: 'station', at: b, dir: 1 };
+        }
+        if (!failed && b - a < -0.5) failed = true;
+        out.push({ kind: r.kind, ax: ax, li: li, s: s, line: li * TILE, a: a, b: b, ends: ends, hue: hue, failed: failed, edgeA: k === 0 && jA, edgeB: k === r.list.length - 1 && jB });
+      }
+    }
+    ctx.rsv.set(key, out);
+    return out;
+  }
+  /* Final pieces of section s: a join holds only if the partner did not
+     fail (else the end is resolved after all, see gResolved's caller
+     below), and a joined pair shorter than the minimum goes as a whole.
+     A partner that spans its whole section is long enough on its own, so
+     no chain needs more than one neighbour. */
+  function gFinal(ctx, ax, li, s) {
+    var key = ax + ':' + li + ':' + s, out = ctx.fin.get(key);
+    if (out) return out;
+    var G = ctx.G, list = gResolved(ctx, ax, li, s);
+    out = [];
+    for (var k = 0; k < list.length; k++) {
+      var p = list[k];
+      if (p.failed) continue;
+      var total = p.b - p.a;
+      var prev = p.ends[0].type === 'join' ? gResolved(ctx, ax, li, s - 1) : null, next = p.ends[1].type === 'join' ? gResolved(ctx, ax, li, s + 1) : null;
+      var pq = prev && prev.length ? prev[prev.length - 1] : null, nq = next && next.length ? next[0] : null;
+      if (prev && (!pq || pq.failed)) { p = gReend(ctx, p, 0); if (!p) continue; }
+      else if (pq) total += pq.b - pq.a;
+      if (next && (!nq || nq.failed)) { p = gReend(ctx, p, 1); if (!p) continue; }
+      else if (nq) total += nq.b - nq.a;
+      if (total < (p.kind === 'deck' ? G.minDeck : G.minRail) - 0.5) continue;
+      out.push(p);
+    }
+    ctx.fin.set(key, out);
+    return out;
+  }
+  /* A joined end whose partner failed: resolve it like any other end. */
+  function gReend(ctx, p, side) {
+    var G = ctx.G, q = { kind: p.kind, ax: p.ax, li: p.li, s: p.s, line: p.line, a: p.a, b: p.b, ends: p.ends.slice(), hue: p.hue };
+    var d = side ? 1 : -1;
+    if (q.kind !== 'deck') { q.ends[side] = { type: 'station', at: side ? q.b : q.a, dir: d }; return q; }
+    var r = gRawSec(ctx, q.ax, q.li, q.s), L = gRampLen(G, gTop(G, 'deck', q.ax));
+    for (;;) {
+      var E = side ? q.b : q.a;
+      if (side ? E <= q.a + 0.5 : E >= q.b - 0.5) return null;
+      var okR = !gHits(r.iv, E, E + d * L), okG = !gHits(r.ivG, E, E + d * (G.garageGap + G.garageLen));
+      if (okR || okG) { q.ends[side] = { type: okR ? 'ramp' : 'garage', at: E, dir: d }; return q; }
+      if (side) q.b -= G.cross; else q.a += G.cross;
+    }
+  }
+  /* The final pieces of a line near lo..hi (ramps reach 324 m, garages
+     56 m beyond a piece, so one section either side is enough). */
+  function groundSpans(ax, li, lo, hi, C, route) {
+    var gid = C.ground;
+    if (!GROUND[gid]) return [];
+    var ctx = groundCtx(gid, route, C), s0 = gSecOf(ctx, ax, li, lo - 400), s1 = gSecOf(ctx, ax, li, hi + 400), out = [];
+    for (var s = s0; s <= s1; s++) {
+      var f = gFinal(ctx, ax, li, s);
+      for (var k = 0; k < f.length; k++) {
+        var p = f[k], ext = gExtent(ctx.G, p);
+        if (ext[1] > lo && ext[0] < hi) out.push(p);
+      }
+    }
+    return out;
+  }
+  /* along extent of a piece with its end structures */
+  function gExtent(G, p) {
+    var e = [p.a, p.b];
+    for (var side = 0; side < 2; side++) {
+      var en = p.ends[side], d = side ? 1 : -1, len = 0;
+      if (en.type === 'ramp') len = gRampLen(G, gTop(G, 'deck', p.ax));
+      else if (en.type === 'garage') len = G.garageGap + G.garageLen;
+      e[side] = en.at + d * len;
+    }
+    return e;
+  }
+  /* World geometry of one final piece: { boxes, ramps, runs, glows,
+     streaks, air }. air: the band boxes makeTile keeps free. */
+  function groundParts(G, p) {
+    var ax = p.ax, line = p.line, deck = p.kind === 'deck', top = gTop(G, p.kind, ax);
+    var out = { boxes: [], ramps: [], runs: [], glows: [], streaks: [], air: [] };
+    function box(a, b, hw, y0, y1, kind, tone, lat) {
+      var lo = Math.min(a, b), hi = Math.max(a, b), c = line + (lat || 0);
+      var q = ax === 0 ? { min: [lo, y0, c - hw], max: [hi, y1, c + hw] } : { min: [c - hw, y0, lo], max: [c + hw, y1, hi] };
+      q.kind = kind; q.ground = true; q.tone = tone; q.seed = (hashU(Math.round(lo), Math.round(c), 7, 86) % 1000) / 1000;
+      return q;
+    }
+    function pt(al, y, lat) { var v = [0, y, 0]; v[ax] = al; v[ax === 0 ? 2 : 0] = line + (lat || 0); return v; }
+    function offCross(x, m) { var r = x - Math.round(x / G.cross) * G.cross; return Math.abs(r) >= m; }
+    var a = p.a, b = p.b, hw = (deck ? G.deckW : G.railW) / 2, th = deck ? G.deckT : G.railT;
+    var ext = gExtent(G, p);
+    if (deck) {
+      var fa = a - (p.ends[0].type === 'garage' ? G.garageGap : 0), fb = b + (p.ends[1].type === 'garage' ? G.garageGap : 0);
+      if (fb - fa > 0.5) {
+        out.boxes.push(box(fa, fb, hw, top - th, top, 'deck', 0.13));
+        out.runs.push({ kind: 'deck', axis: ax, line: line, a: fa, b: fb, y: top, hue: p.hue, w: hw * 2 });
+      }
+      for (var x = Math.ceil((fa + 1) / G.pitch) * G.pitch; x < fb - 1; x += G.pitch) {
+        if (!offCross(x, 20)) continue;
+        out.boxes.push(box(x - G.pylon / 2, x + G.pylon / 2, G.pylon / 2, 0, top - th, 'pylon', 0.1));
+      }
+      out.air.push(box(ext[0], ext[1], hw, G.band[0], G.band[1], 'gair', 0));
+      for (var side = 0; side < 2; side++) {
+        var en = p.ends[side], d = side ? 1 : -1;
+        if (en.type === 'ramp') {
+          var L = gRampLen(G, top), E = en.at, n = Math.round(L / G.rampStep);
+          /* sloped slab from top at E down to 0 at E + d L; collision
+             steps carry the slope's mean height over each step */
+          out.ramps.push({ ax: ax, line: line, a: E, b: E + d * L, ya: top, yb: 0, hw: hw, th: th });
+          for (var k = 0; k < n; k++) {
+            var u0 = k / n, u1 = (k + 1) / n, ym = top * (1 - (u0 + u1) / 2);
+            var q = box(E + d * L * u0, E + d * L * u1, hw, Math.max(0, ym - th), Math.max(ym, 0.3), 'ramp', 0.13);
+            q.drawn = false;
+            out.boxes.push(q);
+          }
+          for (x = Math.ceil((Math.min(E, E + d * L) + 1) / G.pitch) * G.pitch; x < Math.max(E, E + d * L) - 1; x += G.pitch) {
+            var ks = Math.min(n - 1, Math.floor(Math.abs(x - E) / L * n)), yr = Math.max(0, top * (1 - (ks + 0.5) / n) - th);
+            if (yr < 3 || !offCross(x, 20)) continue;
+            out.boxes.push(box(x - G.pylon / 2, x + G.pylon / 2, G.pylon / 2, 0, yr, 'pylon', 0.1));
+          }
+          out.runs.push({ kind: 'deck', axis: ax, line: line, a: Math.min(E, E + d * L), b: Math.max(E, E + d * L),
+            y: d > 0 ? top : 0, y1: d > 0 ? 0 : top, hue: p.hue, w: hw * 2 });
+        } else if (en.type === 'garage') {
+          /* a parking garage over the street, the deck running into a lit
+             portal on its face; levels of one storey with their slits */
+          var g0 = en.at + d * G.garageGap, g1 = g0 + d * G.garageLen, sd = (hashU(Math.round(g0), Math.round(line), 7, 87) % 1000) / 1000;
+          for (var lv = 0; lv < G.garageLv; lv++) {
+            var gb = box(g0, g1, G.garageW / 2, lv * STOREY, (lv + 1) * STOREY, 'garage', 0.22);
+            gb.prog = PROG_SLIT; gb.seed = sd; gb.facade = true; gb.g = -1;
+            out.boxes.push(gb);
+          }
+          out.air.push(box(g0, g1, G.garageW / 2, 0, G.garageLv * STOREY, 'gair', 0));
+          var face = g0 - d * 0.4;
+          out.glows.push({ p: pt(face - d * 3, top + 3), size: 18, hue: -1, gain: 0.9 });
+          [[-hw, -hw], [hw, hw]].forEach(function (o) {
+            out.streaks.push({ a: pt(face, top, o[0]), b: pt(face, top + 6, o[1]), w: 0.5, hue: p.hue >= 0 ? p.hue : -2, gain: 0.9 });
+          });
+          out.streaks.push({ a: pt(face, top + 6, -hw), b: pt(face, top + 6, hw), w: 0.5, hue: p.hue >= 0 ? p.hue : -2, gain: 0.9 });
+        }
+      }
+    } else {
+      var ra = a + (p.ends[0].type === 'station' ? G.stationOff : 0), rb = b - (p.ends[1].type === 'station' ? G.stationOff : 0);
+      if (rb - ra > 0.5) {
+        out.boxes.push(box(ra, rb, hw, top - th, top, 'rail', 0.18));
+        out.runs.push({ kind: 'rail', axis: ax, line: line, a: ra, b: rb, y: top, hue: p.hue, w: hw * 2 });
+        out.air.push(box(ra, rb, G.bandRail, G.band[0], G.band[1], 'gair', 0));
+      }
+      for (x = Math.ceil((ra + 1) / G.pitch) * G.pitch; x < rb - 1; x += G.pitch) {
+        if (!offCross(x, 20)) continue;
+        out.boxes.push(box(x - G.rpylon / 2, x + G.rpylon / 2, G.rpylon / 2, 0, top - th, 'pylon', 0.1));
+      }
+      for (side = 0; side < 2; side++) {
+        en = p.ends[side]; d = side ? 1 : -1;
+        if (en.type !== 'station') continue;
+        /* the station: platforms either side of the track, a roof, roof
+           columns and pylons off the crossings, a buffer stop with an
+           amber lamp; lamps under the roof */
+        var s1 = en.at - d * G.stationOff, s0 = s1 - d * G.station, pw = G.platW, po = hw + 0.5 + pw / 2;
+        var r0 = G.roofH - 0.6;
+        [-1, 1].forEach(function (sg) {
+          out.boxes.push(box(s0, s1, pw / 2, top - 0.3, top + 0.9, 'platform', 0.2, sg * po));
+          for (var xx = Math.ceil((Math.min(s0, s1) + 3) / G.pitch) * G.pitch; xx < Math.max(s0, s1) - 3; xx += G.pitch) {
+            out.boxes.push(box(xx - 0.3, xx + 0.3, 0.3, top + 0.9, top + r0, 'sroof', 0.16, sg * (G.stationW / 2 - 0.6)));
+            if (offCross(xx, 20)) out.boxes.push(box(xx - G.rpylon / 2, xx + G.rpylon / 2, G.rpylon / 2, 0, top - 0.3, 'pylon', 0.1, sg * po));
+          }
+          out.streaks.push({ a: pt(s0, top + 1, sg * (hw + 0.6)), b: pt(s1, top + 1, sg * (hw + 0.6)), w: 0.35, hue: -1, gain: 0.8 });
+        });
+        out.boxes.push(box(s0, s1, G.stationW / 2, top + r0, top + G.roofH, 'sroof', 0.16));
+        out.boxes.push(box(s1 - d * 2, s1, 1.8, top, top + 1.5, 'buffer', 0.24));
+        out.glows.push({ p: pt(s1 - d * 1, top + 2.2), size: 6, hue: -2, gain: 1 });
+        for (var gl = 0; gl < 4; gl++) out.glows.push({ p: pt(s0 + (s1 - s0) * (gl + 0.5) / 4, top + r0 - 0.6), size: 14, hue: -1, gain: 0.7 });
+        out.air.push(box(s0, s1, G.stationW / 2, G.band[0], G.band[1], 'gair', 0));
+      }
+    }
+    return out;
+  }
+  /* Clip a box to the square of the tile at x0, z0, or null */
+  function gClipSq(b, x0, z0) {
+    if (b.max[0] <= x0 + 1e-6 || b.min[0] >= x0 + TILE - 1e-6 || b.max[2] <= z0 + 1e-6 || b.min[2] >= z0 + TILE - 1e-6) return null;
+    if (b.min[0] >= x0 && b.max[0] <= x0 + TILE && b.min[2] >= z0 && b.max[2] <= z0 + TILE) return b;
+    var q = Object.assign({}, b, { min: b.min.slice(), max: b.max.slice() });
+    q.min[0] = Math.max(q.min[0], x0); q.max[0] = Math.min(q.max[0], x0 + TILE);
+    q.min[2] = Math.max(q.min[2], z0); q.max[2] = Math.min(q.max[2], z0 + TILE);
+    return q;
+  }
+  /* Clip a part to the along range lo..hi (the tile's own segment). */
+  function gClipBox(b, ax, lo, hi) {
+    if (b.max[ax] <= lo + 1e-6 || b.min[ax] >= hi - 1e-6) return null;
+    if (b.min[ax] >= lo && b.max[ax] <= hi) return b;
+    var q = Object.assign({}, b, { min: b.min.slice(), max: b.max.slice() });
+    q.min[ax] = Math.max(q.min[ax], lo); q.max[ax] = Math.min(q.max[ax], hi);
+    return q;
+  }
+  /* The band boxes makeTile keeps free over the structures on the tile's
+     four edge lines, or [] */
+  function groundAir(ix, iz, route, C) {
+    var G = GROUND[C.ground];
+    if (!G) return [];
+    var x0 = ix * TILE, z0 = iz * TILE, out = [];
+    [[0, iz, x0], [0, iz + 1, x0], [2, ix, z0], [2, ix + 1, z0]].forEach(function (L) {
+      var ps = groundSpans(L[0], L[1], L[2], L[2] + TILE, C, route);
+      for (var k = 0; k < ps.length; k++) {
+        var air = groundParts(G, ps[k]).air;
+        for (var j = 0; j < air.length; j++) {
+          var q = gClipBox(air[j], L[0], L[2] - HALF_ST, L[2] + TILE + HALF_ST);
+          if (q) out.push(q);
+        }
+      }
+    });
+    return out;
+  }
   function groundPlace(tile, route, cfg) {
     var G = cfg && GROUND[cfg.ground];
     if (!G) return null;
-    var out = { boxes: [], runs: [] };
-    for (var bi = 0; bi < tile.buildings.length; bi++) if (tile.buildings[bi].prog === PROG_OLD) return out;
-    var seed = (cfg.seed >>> 0), margin = cfg.margin == null ? DEF.margin : cfg.margin;
-    var x0 = tile.x0, z0 = tile.z0, S = [], SR = [], RES = [], NB = [];
-    /* the edge streets x0 and z0 are shared with the tiles at ix - 1 and
-       iz - 1, whose balconies, signs and bridges reach into them: cfg.near
-       holds those tiles' boxes */
-    if (cfg.near) for (var ni = 0; ni < cfg.near.length; ni++) {
-      var nb = cfg.near[ni];
-      if (nb.max[0] > x0 - 10 && nb.min[0] < x0 + TILE + 10 && nb.max[2] > z0 - 10 && nb.min[2] < z0 + TILE + 10 && nb.min[1] < G.top) NB.push(nb);
-    }
-    if (route && route.tube) {
-      var smp = route.tube.samples, reach = route.tube.r + margin + 12;
-      for (var si = 0; si < smp.length; si++) {
-        var q = smp[si].p;
-        if (q[0] > x0 - reach && q[0] < x0 + TILE + reach && q[2] > z0 - reach && q[2] < z0 + TILE + reach && q[1] - reach < G.top) {
-          S.push(q); SR.push((smp[si].r == null ? route.tube.r : smp[si].r) + margin);
+    var C = merge(DEF, cfg);
+    if (cfg.seed != null) C.seed = cfg.seed;
+    var out = { boxes: [], runs: [], ramps: [], glows: [], streaks: [], pieces: [] };
+    var x0 = tile.x0, z0 = tile.z0, ix = Math.round(x0 / TILE), iz = Math.round(z0 / TILE);
+    /* the four edge lines: every box is clipped to the tile's square (the
+       collision grid holds what lies in the square), so a structure on an
+       edge line comes in two halves from the two tiles beside it; the
+       lights, the sloped ramp slabs and the pieces only from the tile
+       that owns the line (its line z0 or x0) */
+    [[0, iz, x0, true], [0, iz + 1, x0, false], [2, ix, z0, true], [2, ix + 1, z0, false]].forEach(function (L) {
+      var ax = L[0], lo = L[2], hi = L[2] + TILE, mine = L[3];
+      var ps = groundSpans(ax, L[1], lo, hi, C, route);
+      for (var k = 0; k < ps.length; k++) {
+        var P = groundParts(G, ps[k]), j, q;
+        for (j = 0; j < P.boxes.length; j++) if ((q = gClipSq(P.boxes[j], x0, z0))) out.boxes.push(q);
+        if (!mine) continue;
+        out.pieces.push(ps[k]);
+        for (j = 0; j < P.runs.length; j++) {
+          var r = P.runs[j], ca = Math.max(r.a, lo), cb = Math.min(r.b, hi);
+          if (cb - ca < 0.5) continue;
+          var c = Object.assign({}, r, { a: ca, b: cb });
+          if (r.y1 != null) { c.y = r.y + (r.y1 - r.y) * (ca - r.a) / (r.b - r.a); c.y1 = r.y + (r.y1 - r.y) * (cb - r.a) / (r.b - r.a); }
+          out.runs.push(c);
         }
+        for (j = 0; j < P.ramps.length; j++) {
+          var m = P.ramps[j], ka = Math.max(Math.min(m.a, m.b), lo), kb = Math.min(Math.max(m.a, m.b), hi);
+          if (kb - ka < 0.5) continue;
+          out.ramps.push({ ax: m.ax, line: m.line, a: ka, b: kb, ya: m.ya + (m.yb - m.ya) * (ka - m.a) / (m.b - m.a),
+            yb: m.ya + (m.yb - m.ya) * (kb - m.a) / (m.b - m.a), hw: m.hw, th: m.th });
+        }
+        for (j = 0; j < P.glows.length; j++) if (P.glows[j].p[ax] >= lo && P.glows[j].p[ax] < hi) out.glows.push(P.glows[j]);
+        for (j = 0; j < P.streaks.length; j++) if (P.streaks[j].a[ax] >= lo && P.streaks[j].a[ax] < hi) out.streaks.push(P.streaks[j]);
       }
-    }
-    if (cfg.reserved) for (var ri = 0; ri < cfg.reserved.length; ri++) {
-      var rb = cfg.reserved[ri];
-      if (rb.kind !== 'wall' && rb.max[0] > x0 - 20 && rb.min[0] < x0 + TILE + 20 && rb.max[2] > z0 - 20 && rb.min[2] < z0 + TILE + 20) RES.push(rb);
-    }
-    function free(b) {
-      var k;
-      if (b.max[1] > G.top) return false;
-      for (k = 0; k < S.length; k++) if (boxDist(b, S[k]) < SR[k]) return false;
-      for (k = 0; k < RES.length; k++) if (boxesOverlap(b, RES[k], 2)) return false;
-      for (k = 0; k < tile.boxes.length; k++) if (boxesOverlap(b, tile.boxes[k], 1)) return false;
-      for (k = 0; k < NB.length; k++) if (boxesOverlap(b, NB[k], 1)) return false;
-      return true;
-    }
-    function box(ax, line, a, b, hw, y0, y1) {
-      return ax === 0 ? { min: [a, y0, line - hw], max: [b, y1, line + hw] } : { min: [line - hw, y0, a], max: [line + hw, y1, b] };
-    }
-    var H = TILE / 2;
-    for (var ax = 0; ax <= 2; ax += 2) {
-      for (var j = 0; j < 2; j++) {
-        /* along x: z = z0 + 108 j, line index 2 iz + j; along z likewise */
-        var line = (ax === 0 ? z0 : x0) + H * j, idx = Math.round(line / H), a0 = ax === 0 ? x0 : z0;
-        var R = rng(hashU(idx, ax, seed, 71)), u = R();
-        var kind = u < G.deckP ? 'deck' : u < G.deckP + G.railP ? 'rail' : null;
-        if (!kind) continue;
-        var hue = R() < G.accentP ? (R() < 0.5 ? 0 : 1) : -1;
-        var deck = kind === 'deck', yt = deck ? G.deckY[ax ? 1 : 0] : G.railY[ax ? 1 : 0];
-        var th = deck ? G.deckT : G.railT, hw = (deck ? G.deckW : G.railW) / 2, air = deck ? G.deckAir : G.railAir;
-        var n = Math.round(TILE / G.chunk), keep = [];
-        for (var c = 0; c < n; c++) {
-          var ca = a0 + c * G.chunk, cb = ca + G.chunk;
-          keep.push(free(box(ax, line, ca, cb, hw, yt - th, yt + air)));
-        }
-        /* runs of kept chunks, one box each */
-        for (c = 0; c < n; c++) {
-          if (!keep[c]) continue;
-          var e = c;
-          while (e + 1 < n && keep[e + 1]) e++;
-          var ra = a0 + c * G.chunk, rbx = a0 + (e + 1) * G.chunk;
-          var B = box(ax, line, ra, rbx, hw, yt - th, yt);
-          B.kind = deck ? 'deck' : 'rail'; B.ground = true; B.tone = deck ? 0.13 : 0.18; B.seed = R();
-          out.boxes.push(B);
-          out.runs.push({ kind: B.kind, axis: ax, line: line, a: ra, b: rbx, y: yt, hue: hue, w: hw * 2 });
-          c = e;
-        }
-        /* pylons on chunk joints off the crossings, under a kept chunk */
-        for (c = 1; c < n; c++) {
-          var s = a0 + c * G.chunk;
-          if (Math.abs(s - a0 - H) < 1 || !(keep[c - 1] || keep[c])) continue;
-          var pw = (deck ? G.pylon : G.rpylon) / 2;
-          var P = box(ax, line, s - pw, s + pw, pw, 0, yt - th);
-          if (!free(P)) continue;
-          P.kind = 'pylon'; P.ground = true; P.tone = 0.1; P.seed = R();
-          out.boxes.push(P);
-        }
-      }
-    }
+    });
     return out;
   }
 
@@ -2459,29 +3106,14 @@
     if (!cfg || cfg.seed == null) C.seed = route ? ((route.seed * 2654435761 + 977) >>> 0) : 1;
     var tiles = new Map();
     var GC = 27, GN = TILE / GC;
-    /* the ground layer mockup (groundPlace), only with cfg.ground set: its
-       boxes join the tile's boxes for the collision, tile.ground keeps the
-       placement for the renderer, which leaves them out of the facade mesh */
+    /* the ground layer (groundPlace), only with cfg.ground set: its boxes
+       join the tile's boxes for the collision, tile.ground keeps the
+       placement for the renderer, which leaves them out of the facade mesh
+       (all but the garages). makeTile already kept the band over the decks
+       free, so no neighbour tile is needed. */
     var GID = cfg && GROUND[cfg.ground] ? cfg.ground : null;
-    var spare = new Map();
-    function neighbour(ix, iz) {
-      var key = tileKey(ix, iz), e = tiles.get(key);
-      if (e) return e.tile;
-      var t = spare.get(key);
-      if (!t) {
-        t = makeTile(ix, iz, C.seed, route, C);
-        spare.set(key, t);
-        if (spare.size > 24) spare.delete(spare.keys().next().value);
-      }
-      return t;
-    }
     function addGround(t) {
-      var near = [], nk = [[t.ix - 1, t.iz], [t.ix, t.iz - 1], [t.ix - 1, t.iz - 1]];
-      for (var m = 0; m < nk.length; m++) {
-        var nt = neighbour(nk[m][0], nk[m][1]);
-        for (var q = 0; q < nt.boxes.length; q++) if (!nt.boxes[q].ground) near.push(nt.boxes[q]);
-      }
-      var gp = groundPlace(t, route, { ground: GID, seed: C.seed, margin: C.margin, reserved: C.reserved, near: near });
+      var gp = groundPlace(t, route, C);
       var tid = ((t.ix + 32768) & 0xffff) * 65536 + ((t.iz + 32768) & 0xffff);
       for (var i = 0; i < gp.boxes.length; i++) {
         var b = gp.boxes[i];
@@ -2510,8 +3142,8 @@
       var key = tileKey(ix, iz);
       var e = tiles.get(key);
       if (e) return e.tile;
-      var t = GID && spare.get(key) || makeTile(ix, iz, C.seed, route, C);
-      if (GID) { spare.delete(key); addGround(t); }
+      var t = makeTile(ix, iz, C.seed, route, C);
+      if (GID) addGround(t);
       tiles.set(key, attach(t));
       return t;
     }
@@ -3263,6 +3895,50 @@
      box's roof height, code the facade program (box.prog). Roof and floor
      faces get u = W = 0. A crown frame (PROG_SLIT) carries its foot in
      place of its top: its slit is lit from the foot up. */
+  /* The ground mesh: boxArrays' output plus the sloped ramp slabs of the
+     ground layer (top, underside, both sides, the low end's face), one
+     index buffer, tone 0.13 like the decks. */
+  function rampMerge(A, ramps) {
+    if (!ramps.length) return A;
+    var nv0 = A.pos.length / 3, nf = ramps.length * 5, nv = nv0 + nf * 4;
+    var pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), col = new Float32Array(nv * 3);
+    var idx = nv > 65535 ? new Uint32Array(A.idx.length + nf * 6) : new Uint16Array(A.idx.length + nf * 6);
+    pos.set(A.pos); nrm.set(A.nrm); col.set(A.col); idx.set(A.idx);
+    var rgb = boneRGB(0.13), cl = [toLin(rgb[0]), toLin(rgb[1]), toLin(rgb[2])], v = nv0, q = A.idx.length;
+    /* a quad facing n: the corner order is turned to match */
+    function quad(P, n) {
+      var u = [P[1][0] - P[0][0], P[1][1] - P[0][1], P[1][2] - P[0][2]], w = [P[2][0] - P[0][0], P[2][1] - P[0][1], P[2][2] - P[0][2]];
+      if ((u[1] * w[2] - u[2] * w[1]) * n[0] + (u[2] * w[0] - u[0] * w[2]) * n[1] + (u[0] * w[1] - u[1] * w[0]) * n[2] < 0) P = P.slice().reverse();
+      for (var k = 0; k < 4; k++) {
+        var o = (v + k) * 3;
+        pos[o] = P[k][0]; pos[o + 1] = P[k][1]; pos[o + 2] = P[k][2];
+        nrm[o] = n[0]; nrm[o + 1] = n[1]; nrm[o + 2] = n[2];
+        col[o] = cl[0]; col[o + 1] = cl[1]; col[o + 2] = cl[2];
+      }
+      idx[q++] = v; idx[q++] = v + 1; idx[q++] = v + 2; idx[q++] = v; idx[q++] = v + 2; idx[q++] = v + 3;
+      v += 4;
+    }
+    for (var i = 0; i < ramps.length; i++) {
+      var r = ramps[i], ax = r.ax, la = ax === 0 ? 2 : 0;
+      var P = function (al, y, s) { var p = [0, y, 0]; p[ax] = al; p[la] = r.line + s * r.hw; return p; };
+      var lo = Math.max(r.ya, r.yb) === r.ya ? r.a : r.b, ya = r.ya, yb = r.yb, a = r.a, b = r.b;
+      var L = b - a, dy = yb - ya, nl = Math.hypot(L, dy) || 1;
+      /* top normal: perpendicular to the slope, up */
+      var nt = [0, L / nl, 0]; nt[ax] = -dy / nl;
+      var nb = [-nt[0], -nt[1], -nt[2]], ns = [0, 0, 0], ns2 = [0, 0, 0];
+      ns[la] = 1; ns2[la] = -1;
+      var ba = Math.max(0, ya - r.th), bb = Math.max(0, yb - r.th);
+      var T = [P(a, ya, -1), P(a, ya, 1), P(b, yb, 1), P(b, yb, -1)];
+      var B = [P(a, ba, -1), P(b, bb, -1), P(b, bb, 1), P(a, ba, 1)];
+      var S1 = [P(a, ba, 1), P(b, bb, 1), P(b, yb, 1), P(a, ya, 1)];
+      var S2 = [P(a, ba, -1), P(a, ya, -1), P(b, yb, -1), P(b, bb, -1)];
+      quad(T, nt); quad(B, nb); quad(S1, ns); quad(S2, ns2);
+      var e = lo === a ? b : a, ey = lo === a ? yb : ya, eb = Math.max(0, ey - r.th), ne = [0, 0, 0];
+      ne[ax] = (e === b) === (L > 0) ? 1 : -1;
+      quad([P(e, eb, -1), P(e, eb, 1), P(e, ey, 1), P(e, ey, -1)], ne);
+    }
+    return { pos: pos, nrm: nrm, col: col, idx: idx };
+  }
   function boxArrays(list, toneOf) {
     var nf = 0, i, f, k;
     for (i = 0; i < list.length; i++) nf += list[i].min[1] > 0.05 ? 6 : 5;
@@ -3748,7 +4424,7 @@
 
     function addTile(tile) {
       if (tiles.has(tile.key)) removeTile(tile.key);
-      var A = boxArrays(tile.ground ? tile.boxes.filter(function (b) { return !b.ground; }) : tile.boxes, tones);
+      var A = boxArrays(tile.ground ? tile.boxes.filter(function (b) { return !b.ground || b.facade; }) : tile.boxes, tones);
       var g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(A.pos, 3));
       g.setAttribute('normal', new THREE.BufferAttribute(A.nrm, 3));
@@ -3805,15 +4481,15 @@
       var ta = [], tb = [], tw = [], tc = [];
       var cl = [];
       var lampC = hueOut(-1, 1);
-      var gList = [], qa = [], qb = [], qw = [], qc = [], qp = [];
+      var gList = [], rList = [], qa = [], qb = [], qw = [], qc = [], qp = [];
       var sl = [], meta = signLayer ? signAtlas.meta : null, effN = sigEffN();
       /* one ground or campus run: edge strips and four vehicle streams on a
          deck (a warm lamp pool under it every chunk), the train and its
          strip on a rail */
       function pushRun(gr) {
-        var gax = gr.axis, oax = gax === 0 ? 2 : 0;
+        var gax = gr.axis, oax = gax === 0 ? 2 : 0, dy = gr.y1 == null ? 0 : gr.y1 - gr.y;
         var lane = function (off, y, w, spd, spc, mode, col, ph) {
-          var A3 = [0, y, 0], B3 = [0, y, 0];
+          var A3 = [0, y, 0], B3 = [0, y + dy, 0];
           A3[gax] = gr.a; B3[gax] = gr.b; A3[oax] = B3[oax] = gr.line + off;
           qa.push(A3[0], A3[1], A3[2]); qb.push(B3[0], B3[1], B3[2]);
           qw.push(w, spd, spc, mode); qc.push(col[0], col[1], col[2]); qp.push(ph);
@@ -3825,7 +4501,9 @@
           lane(-4.6, gr.y + 0.8, 1.1, 21, 13, 1, HEAD, ph0); lane(-1.9, gr.y + 0.8, 1.1, 26, 17, 1, HEAD, ph0 + 5);
           lane(1.9, gr.y + 0.8, 1.1, -24, 15, 1, TAIL, ph0 + 3); lane(4.6, gr.y + 0.8, 1.1, -19, 12, 1, TAIL, ph0 + 9);
           for (var ga = Math.ceil((gr.a - 13.5) / 27) * 27 + 13.5; ga < gr.b; ga += 27) {
-            var gq = [0, gr.y - 3, 0]; gq[gax] = ga; gq[oax] = gr.line;
+            var gy = gr.y + dy * (ga - gr.a) / (gr.b - gr.a);
+            if (gy < 8) continue;
+            var gq = [0, gy - 3, 0]; gq[gax] = ga; gq[oax] = gr.line;
             gp.push(gq[0], gq[1], gq[2]); gs.push(16, 16); gc.push(POOL[0], POOL[1], POOL[2]); gb.push(0, 0, 1);
           }
         } else {
@@ -3929,8 +4607,20 @@
         /* the ground layer mockup: structure boxes, the light ribbons on
            each run and a warm lamp pool under the deck every chunk */
         if (t.ground) {
-          for (i = 0; i < t.ground.boxes.length; i++) gList.push(t.ground.boxes[i]);
-          for (i = 0; i < t.ground.runs.length; i++) pushRun(t.ground.runs[i]);
+          var tg = t.ground;
+          for (i = 0; i < tg.boxes.length; i++) if (!tg.boxes[i].facade && tg.boxes[i].drawn !== false) gList.push(tg.boxes[i]);
+          for (i = 0; i < tg.runs.length; i++) pushRun(tg.runs[i]);
+          /* the sloped ramp slabs (their collision steps are not drawn), the
+             station and garage lamps like the campus ones */
+          for (i = 0; i < (tg.ramps || []).length; i++) rList.push(tg.ramps[i]);
+          for (i = 0; i < (tg.glows || []).length; i++) {
+            var tgl = tg.glows[i], tgc = campusCol(tgl.hue, tgl.gain);
+            gp.push(tgl.p[0], tgl.p[1], tgl.p[2]); gs.push(tgl.size, tgl.size); gc.push(tgc[0], tgc[1], tgc[2]); gb.push(0, 0, 1);
+          }
+          for (i = 0; i < (tg.streaks || []).length; i++) {
+            var tst = tg.streaks[i], tsc = campusCol(tst.hue, tst.gain);
+            ta.push(tst.a[0], tst.a[1], tst.a[2]); tb.push(tst.b[0], tst.b[1], tst.b[2]); tw.push(tst.w, 0); tc.push(tsc[0], tsc[1], tsc[2]);
+          }
         }
         /* the campus (makeTile campusBuild): its decks and rails carry the
            same light streams; its glows and streaks join the shared layers */
@@ -3939,7 +4629,9 @@
           for (i = 0; i < cpg.runs.length; i++) pushRun(cpg.runs[i]);
           for (i = 0; i < cpg.glows.length; i++) {
             var cg = cpg.glows[i], cc = campusCol(cg.hue, cg.gain);
-            gp.push(cg.p[0], cg.p[1], cg.p[2]); gs.push(cg.size, cg.size); gc.push(cc[0], cc[1], cc[2]); gb.push(0, 0, 1);
+            gp.push(cg.p[0], cg.p[1], cg.p[2]); gs.push(cg.size, cg.size); gc.push(cc[0], cc[1], cc[2]);
+            /* the cap flashers blink (mode 1, see glowMat), the rest is steady */
+            if (cg.blink) gb.push(cg.blink[0], cg.blink[1], cg.blink[2]); else gb.push(0, 0, 1);
           }
           for (i = 0; i < cpg.streaks.length; i++) {
             var cs2 = cpg.streaks[i], sc2 = campusCol(cs2.hue, cs2.gain);
@@ -4013,8 +4705,8 @@
         layers.streak.userData.kind = 'city-streaks';
         group.add(layers.streak);
       }
-      if (gList.length) {
-        var GA = boxArrays(gList, function (b) { return boneRGB(b.tone); });
+      if (gList.length || rList.length) {
+        var GA = rampMerge(boxArrays(gList, function (b) { return boneRGB(b.tone); }), rList);
         var g6 = new THREE.BufferGeometry();
         g6.setAttribute('position', new THREE.BufferAttribute(GA.pos, 3));
         g6.setAttribute('normal', new THREE.BufferAttribute(GA.nrm, 3));
@@ -4024,6 +4716,7 @@
         layers.ground.frustumCulled = false;
         layers.ground.userData.kind = 'city-ground';
         layers.ground.userData.boxes = gList.length;
+        layers.ground.userData.ramps = rList.length;
         group.add(layers.ground);
       }
       if (qa.length) {
@@ -4107,11 +4800,12 @@
 
   var HikyakuCity = {
     TILE: TILE, PITCH: PITCH, STREET: STREET, BLOCK: BLOCK, LANE_Y: LANE_Y, LANE_CLEAR: LANE_CLEAR, DEF: DEF,
-    GROUND: GROUND, groundPlace: groundPlace,
+    GROUND: GROUND, groundPlace: groundPlace, groundSpans: groundSpans, groundParts: groundParts, groundAir: groundAir, groundRampLen: gRampLen,
     hash: hash, hashU: hashU, rng: rng, noise2: noise2, fbm: fbm, heightField: heightField,
     STOREY: STOREY, ARCHES: ARCHES, ARCH_W: ARCH_W, LM_CELL: LM_CELL, LM_NEAR: LM_NEAR, LM_FAR: LM_FAR,
     districtAt: districtAt, landmarkAt: landmarkAt, pickArch: pickArch, rank3: rank3, oldTownNear: oldTownNear,
     CAMPUS: CAMPUS, campusOf: campusOf, campusList: campusList, campusPlan: campusPlan, prepCampus: prepCampus, campusRamp: campusRamp,
+    campusProfile: campusProfile, plazaSink: plazaSink, underFree: underFree,
     campusRing: campusRing, segBoxDist: segBoxDist, keepFree: keepFree, runBox: runBox,
     PROG_PLAIN: PROG_PLAIN, PROG_CROWN: PROG_CROWN, PROG_OLD: PROG_OLD, PROG_SLIT: PROG_SLIT, SLIT_H: SLIT_H,
     OLD_FL: OLD_FL, OLD_MIN_FL: OLD_MIN_FL, OLD_HF: OLD_HF, OLD_SHARE: OLD_SHARE,
