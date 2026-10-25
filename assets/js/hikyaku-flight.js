@@ -5,14 +5,16 @@
  * attitude a meaning again (notes/tools/hikyaku/HANDOFF.md, section 2):
  *
  *   - gravity acts in the world, along world -y;
- *   - the thrust budget is asymmetric per body axis AND sign (strong lift
- *     fans, weaker reversed fans, medium lateral and fore/aft), plus the old
- *     sixdof main engine as a boost along the nose;
+ *   - the thrust budget is set per body axis AND sign (strong lift fans,
+ *     equal lateral and fore/aft fans, reversed fans in between), plus the
+ *     old sixdof main engine as a boost along the nose; defaults in ISO;
  *   - a switchable flight assist cancels gravity out of whatever budget the
  *     current attitude offers, and the pilot gets the rest;
  *   - drag is F = 1/2 rho c_d A(v) |v|^2 with A taken exactly from the convex
- *     collision hull by Cauchy's projection formula, so flat into the wind is
- *     an air brake and nose first is an arrow;
+ *     collision hull by Cauchy's projection formula, mixed toward the
+ *     isotropic mean (ISO.dragMix): flat into the wind is still the better
+ *     air brake and nose first the arrow, but sideways flight no longer
+ *     collapses;
  *   - an optional, weak drag torque about the centre of pressure.
  *
  * Built on top of SixDOF (a global, assets/js/sixdof.js must load first) and
@@ -39,6 +41,40 @@ var HikyakuFlight = (function () {
 
   var G0 = 9.81;          /* standard gravity, m/s^2 */
   var RHO = 1.225;        /* sea-level air density, kg/m^3 */
+
+  /* ---- ISO: the isotropy knobs (owner feedback 2026-10-26, point 9) -----
+     Before this set the craft was strongly anisotropic: 1 g sideways and
+     backwards against 3 g up, a drag area that varied 7.4 : 1 between nose
+     first and belly first, and rotation authority from 1.0 (yaw) to 3.0
+     (roll). Everything below is a default of makeCraft. hikyaku.html passes
+     its own budget and rotation values from its DEF and the stored config,
+     so a change here reaches the page only where the page does not override
+     it (today: dragMix and dragKeepNose).
+
+       xp xn zp zn  lateral and fore/aft fans, g each way. Equal, so the
+                    craft translates the same in all four horizontal body
+                    directions.
+       yp           lift fans, g. Stays the strongest: with gravity on the
+                    lift fans carry the hover, and yp - 1 g is the climb.
+       yn           reversed fans, g. Raised to 2 so an inverted hover keeps
+                    a full g of reserve.
+       boost        main engine, g, on top of zn. zn + boost stays 3 g, so the
+                    boost top speed is unchanged.
+       pitch yaw roll  rotation authority, rad/s^2. Pitch and yaw equal, roll
+                    slightly faster (the axis a pilot corrects most).
+       dragMix      0 = drag area exactly the Cauchy area of the hull,
+                    1 = the same area in every direction. In between the
+                    area is (1 - k) A_hull(d) + k A_mean, with A_mean the
+                    mean silhouette over all directions (Cauchy: surface/4).
+       dragKeepNose rescale the mixed area so the nose-first area stays the
+                    hull's. That keeps the nose-first top speed a function
+                    of zn alone and makes dragMix move only the OTHER
+                    directions: sideways and belly first get less drag. */
+  var ISO = {
+    xp: 1.6, xn: 1.6, zp: 1.6, zn: 1.6, yp: 3.0, yn: 2.0, boost: 1.4,
+    pitch: 2.0, yaw: 2.0, roll: 2.5,
+    dragMix: 0.5, dragKeepNose: true
+  };
 
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function num(x, d) { return typeof x === 'number' && isFinite(x) ? x : d; }
@@ -117,6 +153,21 @@ var HikyakuFlight = (function () {
      weights add up to exactly A(v): the leeward half carries the other copy.
      The centre of pressure is the weight-averaged face centroid. That is the
      Newtonian (flat-plate) picture, crude but cheap and smooth in v. */
+  /* The drag area actually used, with the ISO mix (see the top of the file).
+     p carries dragMix and dragScale (makeCraft sets both); without them the
+     area is the plain Cauchy area. Returns the total area and the hull part
+     alone, already scaled, because only the hull part has a centre of
+     pressure off the centre of mass. */
+  function mixArea(hull, aHull, p) {
+    var k = clamp(num(p && p.dragMix, 0), 0, 1), sc = num(p && p.dragScale, 1);
+    var hullPart = sc * (1 - k) * aHull;
+    return { area: hullPart + sc * k * hull.surface / 4, hullPart: hullPart };
+  }
+  /* The same for a craft and any body direction d (need not be unit). */
+  function dragArea(craft, d) {
+    return mixArea(craft.hull, projectedArea(craft.hull, mul(d, 1 / len(d))), craft).area;
+  }
+
   function windward(hull, d) {
     var w = 0, cp = [0, 0, 0];
     for (var i = 0; i < hull.n.length; i++) {
@@ -146,7 +197,12 @@ var HikyakuFlight = (function () {
      crudest part of this file (it ignores flow separation entirely, and on a
      box it is exactly neutral), so at full strength it would claim a
      precision the model does not have. At 0.3 the weathervane effect is felt
-     at speed without ever out-muscling the pilot's own torque authority. */
+     at speed without ever out-muscling the pilot's own torque authority.
+
+     With the ISO mix the area is split in two: the hull part keeps its
+     centre of pressure, the isotropic part acts like a sphere about the
+     centre of mass and carries no moment. So dragMix 0.5 also halves the
+     weathervane and the flat-plate pitch-up (times dragScale). */
   function drag(hull, s, env, params) {
     var e = env || {}, p = params || {};
     var rho = num(e.rho, num(p.rho, RHO)), cd = num(p.cd, 0.9), m = num(p.mass, 3000);
@@ -157,16 +213,17 @@ var HikyakuFlight = (function () {
     var zero = { F: [0, 0, 0], Fb: [0, 0, 0], torque: [0, 0, 0], T: [0, 0, 0],
       area: 0, cp: [0, 0, 0], speed: u, decel: 0 };
     if (!(u > 1e-9)) {
-      zero.area = projectedArea(hull, [0, 0, -1]);   /* readout only: nose-first area */
+      zero.area = mixArea(hull, projectedArea(hull, [0, 0, -1]), p).area;   /* readout only: nose first */
       return zero;
     }
     var qc = qConj(s.q);
     var dB = mul(qRot(qc, vr), 1 / u);
     var ww = windward(hull, dB);
-    var A = ww.area;                                 /* equals projectedArea(hull, dB) */
+    var mx = mixArea(hull, ww.area, p);              /* ww.area equals projectedArea(hull, dB) */
+    var A = mx.area;
     var mag = 0.5 * rho * cd * A * u * u;
     var Fb = mul(dB, -mag);
-    var torque = mul(cross(ww.cp, Fb), kT);
+    var torque = mul(cross(ww.cp, mul(dB, -0.5 * rho * cd * mx.hullPart * u * u)), kT);
     return {
       F: mul(vr, -mag / u), Fb: Fb, torque: torque, T: mul(torque, 1 / m),
       area: A, cp: ww.cp, speed: u, decel: mag / m
@@ -183,7 +240,7 @@ var HikyakuFlight = (function () {
 
      Channels are numbered by axis, the command for axis i is c[i], and the
      z command is -fwd because fwd points along -z. */
-  var DEF_BUDGET = { xp: 1.0 * G0, xn: 1.0 * G0, yp: 3.0 * G0, yn: 1.5 * G0, zp: 1.0 * G0, zn: 1.0 * G0 };
+  var DEF_BUDGET = { xp: ISO.xp * G0, xn: ISO.xn * G0, yp: ISO.yp * G0, yn: ISO.yn * G0, zp: ISO.zp * G0, zn: ISO.zn * G0 };
   function caps(b) { return { p: [b.xp, b.yp, b.zp], n: [b.xn, b.yn, b.zn] }; }
   function cmdVec(cmd) {
     return [clamp(num(cmd.right, 0), -1, 1), clamp(num(cmd.up, 0), -1, 1), -clamp(num(cmd.fwd, 0), -1, 1)];
@@ -200,8 +257,8 @@ var HikyakuFlight = (function () {
      g cos(phi) on y.
      Each component is then clamped to the budget of ITS sign. The forward
      channel overflows into the boost engine, because the boost is just a
-     bigger forward thruster and a nose-up hover on 1 g forward RCS alone would
-     sit exactly on the edge. Whatever cannot be covered is missing, the craft
+     bigger forward thruster (with the ISO budget the forward fans alone hold
+     a nose-up hover; the overflow matters for weaker forward budgets). Whatever cannot be covered is missing, the craft
      sinks by that much, and info.saturated says so.
 
      The pilot then flies on what is LEFT. Per axis the net thrust is one
@@ -249,14 +306,14 @@ var HikyakuFlight = (function () {
   }
 
   /* ---- craft ------------------------------------------------------------
-     Defaults, all from the handoff where it gives a number:
-       mass 3000 kg; budget yp 3 g, yn 1.5 g, x and z 1 g each way;
-       aBoost 2 g, so full forward RCS plus full boost is the 3 g of the
-       handoff's boost case; cd 0.9 (middle of the 0.8 to 1.0 range);
-       rho 1.225; dragTorque 0.3; assist on.
-     Rotational authority (rad/s^2) is not in the handoff: pitch 1.5, yaw 1.0,
-     roll 3.0, a 180 degree pitch flip in 2 sqrt(pi/1.5) = 2.9 s. Guesses for
-     tuning with the Space Mouse. rateDamp is SixDOF.dampTorque's gain, 0 off.
+     Defaults: budget, boost and rotational authority from ISO at the top of
+     the file (until 2026-10-26: yp 3 g, yn 1.5 g, x and z 1 g each way,
+     boost 2 g, pitch 1.5, yaw 1.0, roll 3.0 rad/s^2); mass 3000 kg;
+     cd 0.9 (middle of the 0.8 to 1.0 range); rho 1.225; dragTorque 0.3;
+     assist on. Full forward RCS plus full boost stays the 3 g of the
+     handoff's boost case. rateDamp is SixDOF.dampTorque's gain, 0 off.
+     dragMix and dragKeepNose (defaults from ISO) set the drag area;
+     makeCraft turns them into dragScale.
      Inertia: I given wins (specific moments, [pitch x, yaw y, roll z]). Else
      a given hull is principalized (recentred on its centre of mass, rotated
      onto its principal axes) and I is taken from it. With neither, the hull
@@ -280,11 +337,19 @@ var HikyakuFlight = (function () {
     }
     var b = {}, k;
     for (k in DEF_BUDGET) b[k] = num(o.budget && o.budget[k], DEF_BUDGET[k]);
+    var hull = hullIn && hullIn.n && o.I ? hullIn : prepHull({ verts: verts, faces: faces });
+    /* dragScale: with dragKeepNose the mixed nose-first area
+       (1 - k) A_nose + k A_mean is scaled back to A_nose. */
+    var mix = clamp(num(o.dragMix, ISO.dragMix), 0, 1);
+    var keep = o.dragKeepNose == null ? ISO.dragKeepNose : !!o.dragKeepNose;
+    var aNose = projectedArea(hull, [0, 0, -1]);
+    var aMix = (1 - mix) * aNose + mix * hull.surface / 4;
     return {
-      hull: hullIn && hullIn.n && o.I ? hullIn : prepHull({ verts: verts, faces: faces }),
+      hull: hull,
       mass: num(o.mass, 3000), I: I, budget: b,
-      aBoost: num(o.aBoost, 2.0 * G0),
-      aPitch: num(o.aPitch, 1.5), aYaw: num(o.aYaw, 1.0), aRoll: num(o.aRoll, 3.0),
+      aBoost: num(o.aBoost, ISO.boost * G0),
+      aPitch: num(o.aPitch, ISO.pitch), aYaw: num(o.aYaw, ISO.yaw), aRoll: num(o.aRoll, ISO.roll),
+      dragMix: mix, dragScale: keep && aMix > 0 ? aNose / aMix : 1,
       cd: num(o.cd, 0.9), rho: num(o.rho, RHO),
       assist: o.assist == null ? true : !!o.assist,
       dragTorque: clamp(num(o.dragTorque, 0.3), 0, 1),
@@ -323,7 +388,7 @@ var HikyakuFlight = (function () {
       a: aW, aBody: qRot(qConj(s.q), aW), T: T,
       thrustBody: th.a, gravity: g, dragAccel: mul(dr.F, 1 / craft.mass),
       info: {
-        airspeed: dr.speed, area: dr.speed > 1e-9 ? dr.area : projectedArea(craft.hull, [0, 0, -1]),
+        airspeed: dr.speed, area: dr.area,
         dragDecel: dr.decel, cp: dr.cp, dragTorque: dr.torque,
         assist: !!hold, assistUse: use, reserve: reserve,
         saturated: hold ? hold.saturated : false, missing: hold ? hold.missing : 0
@@ -376,8 +441,7 @@ var HikyakuFlight = (function () {
      Equilibrium speed when a constant acceleration a (m/s^2) pushes the
      craft along the body direction dir: 1/2 rho c_d A(dir) v^2 = m a. */
   function terminalSpeed(craft, dir, a, rho) {
-    var d = mul(dir, 1 / len(dir));
-    var A = projectedArea(craft.hull, d);
+    var A = dragArea(craft, dir);
     var r = num(rho, craft.rho);
     if (!(A > 0) || !(a > 0)) return a > 0 ? Infinity : 0;
     return Math.sqrt(2 * craft.mass * a / (r * craft.cd * A));
@@ -385,19 +449,22 @@ var HikyakuFlight = (function () {
 
   /* The three numbers of the handoff, for the HUD and the tuning page:
      nose first at full forward RCS, nose first at full RCS plus boost, and a
-     flat (belly down) fall with no thrust at all. */
+     flat (belly down) fall with no thrust at all. Since the ISO round also
+     sideways (full starboard RCS) and backwards (full aft RCS). */
   function speeds(craft, g) {
     var gg = num(g, G0);
     return {
       noseFirst: terminalSpeed(craft, [0, 0, -1], craft.budget.zn),
       boost: terminalSpeed(craft, [0, 0, -1], craft.budget.zn + craft.aBoost),
-      flatFall: terminalSpeed(craft, [0, -1, 0], gg)
+      flatFall: terminalSpeed(craft, [0, -1, 0], gg),
+      side: terminalSpeed(craft, [1, 0, 0], craft.budget.xp),
+      back: terminalSpeed(craft, [0, 0, 1], craft.budget.zp)
     };
   }
 
   return {
-    G0: G0, RHO: RHO, DEF_BUDGET: DEF_BUDGET, COURIER_RATIO: COURIER_RATIO,
-    prepHull: prepHull, projectedArea: projectedArea, windward: windward, drag: drag,
+    G0: G0, RHO: RHO, ISO: ISO, DEF_BUDGET: DEF_BUDGET, COURIER_RATIO: COURIER_RATIO,
+    prepHull: prepHull, projectedArea: projectedArea, dragArea: dragArea, windward: windward, drag: drag,
     assist: assist, thrust: thrust, makeCraft: makeCraft,
     accel: accel, step: step, terminalSpeed: terminalSpeed, speeds: speeds
   };
