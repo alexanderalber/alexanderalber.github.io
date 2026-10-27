@@ -2540,6 +2540,72 @@ var Hikyaku = (function () {
       lap: Math.floor(t / period), period: period };
   }
 
+  /* Adaptive render resolution (2026-10-28). A laptop with a 2x display
+     renders 3828 x 1911, 5.8 times the pixels of the 1578 x 802 desktop
+     view, and the GPU cost here is mostly per pixel (T1200 bench: 6.8 ms
+     at the block mouth, 4.2 of them without the city). So the canvas pixel
+     ratio is the lever: levels from min(2, devicePixelRatio) down in 0.25
+     steps to 1, never below CSS resolution, so a 1x display has one level
+     and nothing changes there. The judge is half a second of frames.
+     With the GPU timer query (gpu: ms per frame, seen past vsync) a window
+     above RES.down of the budget drops straight to the highest level whose
+     cost, scaled by pixel count, is predicted at RES.aim of it, and a
+     window whose prediction for the next level up stays under RES.up
+     climbs one step; the gap between the two keeps it from oscillating.
+     Without the timer the frame time decides: a slow window drops one
+     step, RES.upWait good windows in a row climb one, and a drop within
+     four windows of a climb doubles that wait. The budget is one display
+     refresh (the fastest tenth of the frames seen so far), but never less
+     than 1/144 s: resolution is not traded for frame rates beyond that. */
+  var RES = { step: 0.25, cap: 2, win: 500, down: 0.75, aim: 0.6, up: 0.55, slow: 1.25, good: 1.08,
+    upWait: 6, upWaitMax: 64, settle: 1, minFrame: 1000 / 144, maxDt: 250 };
+  function resLevels(dpr) {
+    var top = Math.min(RES.cap, Math.max(1, dpr || 1)), out = [top];
+    for (var r = Math.ceil(top / RES.step - 1e-9) * RES.step - RES.step; r >= 1 - 1e-9; r -= RES.step) {
+      if (r < top - 1e-9) out.push(Math.round(r * 100) / 100);
+    }
+    return out;
+  }
+  function resInit(dpr, gpu) {
+    return { levels: resLevels(dpr), i: 0, gpu: !!gpu, refresh: 1000 / 60, dts: [], gms: [], sum: 0,
+      settle: 0, good: 0, wait: RES.upWait, sinceUp: Infinity };
+  }
+  function quantile(a, f) {
+    var b = a.slice().sort(function (x, y) { return x - y; });
+    return b[Math.min(b.length - 1, Math.floor(f * b.length))];
+  }
+  /* One frame: dt in ms, gpu the timer results that came in (ms, may be
+     empty). Returns the pixel ratio to render with. */
+  function resStep(st, dt, gpu) {
+    var L = st.levels;
+    if (gpu) for (var k = 0; k < gpu.length; k++) if (gpu[k] > 0) st.gms.push(gpu[k]);
+    if (!(dt > 0) || dt > RES.maxDt) return L[st.i];
+    st.dts.push(dt); st.sum += dt;
+    if (st.sum < RES.win) return L[st.i];
+    var dMed = quantile(st.dts, 0.5), dFast = quantile(st.dts, 0.1);
+    var gMed = st.gms.length >= 5 ? quantile(st.gms, 0.5) : null;
+    st.dts = []; st.gms = []; st.sum = 0;
+    st.refresh = Math.min(st.refresh, Math.max(1000 / 360, dFast));
+    st.sinceUp++;
+    if (st.settle > 0) { st.settle--; return L[st.i]; }
+    var T = Math.max(st.refresh, RES.minFrame), r = L[st.i], j = st.i;
+    var cost = function (g, to) { return g * (to / r) * (to / r); };
+    if (st.gpu) {
+      if (gMed == null) return L[st.i];
+      if (gMed > RES.down * T) {
+        while (j < L.length - 1 && cost(gMed, L[j]) > RES.aim * T) j++;
+      } else if (j > 0 && cost(gMed, L[j - 1]) < RES.up * T) j--;
+    } else if (dMed > RES.slow * T) {
+      if (j < L.length - 1) j++;
+      if (st.sinceUp <= 4) st.wait = Math.min(RES.upWaitMax, st.wait * 2);
+      st.good = 0;
+    } else if (dMed <= RES.good * st.refresh) {
+      if (++st.good >= st.wait && j > 0) { j--; st.good = 0; st.sinceUp = 0; }
+    } else st.good = 0;
+    if (j !== st.i) { st.i = j; st.settle = RES.settle; }
+    return L[st.i];
+  }
+
   return {
     DEF_ROUTE: DEF_ROUTE, DEF_LANES: DEF_LANES, DEF_RACE: DEF_RACE, LANE_TYPES: LANE_TYPES, MENGER_IDX: MENGER_IDX, TRAFFIC_LEAD: TRAFFIC_LEAD,
     PYRAMID_IDX: PYRAMID_IDX, BLOCKB_IDX: BLOCKB_IDX, CLIMB_IDX: CLIMB_IDX, arcoOf: arcoOf,
@@ -2555,7 +2621,8 @@ var Hikyaku = (function () {
     pauseClock: pauseClock, pauseSet: pauseSet, pauseTime: pauseTime,
     MODES: MODES, menuInit: menuInit, menuStep: menuStep, menuTitle: menuTitle, menuPaused: menuPaused,
     flightInputLive: flightInputLive, hudParts: hudParts, inputState: inputState, startLock: startLock, bestKey: bestKey,
-    ATTRACT: ATTRACT, attractPose: attractPose
+    ATTRACT: ATTRACT, attractPose: attractPose,
+    RES: RES, resLevels: resLevels, resInit: resInit, resStep: resStep
   };
 })();
 if (typeof globalThis !== 'undefined') globalThis.Hikyaku = Hikyaku;
@@ -2695,6 +2762,13 @@ const URL_GROUND = (() => {
   if (g === 'off' || g === '0') return false;
   if (g === 'on' || g === '1' || (g && HC.GROUND && HC.GROUND[g])) return true;
   return null;
+})();
+/* ?res=<pixel ratio> pins the render resolution (1, 1.5, 2, ...) and
+   switches the adaptive one (hkcore resStep) off; ?bench=1 pins it at the
+   display's own ratio, capped at 2, unless ?res says otherwise. */
+const URL_RES = (() => {
+  const v = parseFloat(URLP.get('res'));
+  return v > 0 ? Math.min(3, Math.max(0.25, v)) : null;
 })();
 const URL_WEATHER = ['auto', 'dry', 'rain'].indexOf(URLP.get('weather')) >= 0 ? URLP.get('weather') : null;
 
@@ -3891,7 +3965,7 @@ function App() {
     const host = stageRef.current;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setPixelRatio(URL_RES != null ? URL_RES : Math.min(2, window.devicePixelRatio || 1));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
     renderer.setClearColor(boneColor(THREE, 0.5), 1);
@@ -4297,7 +4371,41 @@ function App() {
     let lastRunN = menuRef.current.run;
     let lastRoute = cfgRef.current.route;
 
+    /* The adaptive render resolution (hkcore resStep), off under ?res and
+       ?bench. Its GPU timer queries are its own, the bench has others. */
+    const gl = renderer.getContext();
+    const resAuto = URL_RES == null && !BENCH;
+    const resTq = resAuto ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+    const resQ = [];
+    let res = null, resDpr = 0;
+    const resCheck = () => {
+      const dpr = window.devicePixelRatio || 1;
+      if (!resAuto || dpr === resDpr) return;
+      resDpr = dpr;
+      res = HK.resInit(dpr, !!resTq);
+      renderer.setPixelRatio(res.levels[0]);
+    };
+    const resRender = (dtMs) => {
+      if (res) {
+        const got = [];
+        const dis = resQ.length ? gl.getParameter(resTq.GPU_DISJOINT_EXT) : false;
+        while (resQ.length) {
+          const q = resQ[0];
+          if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) break;
+          if (!dis) got.push(gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6);
+          gl.deleteQuery(q); resQ.shift();
+        }
+        const r = HK.resStep(res, dtMs, got);
+        if (r !== renderer.getPixelRatio()) renderer.setPixelRatio(r);
+      }
+      let q = null;
+      if (resTq && resQ.length < 4) { q = gl.createQuery(); gl.beginQuery(resTq.TIME_ELAPSED_EXT, q); }
+      renderer.render(scene, camera);
+      if (q) { gl.endQuery(resTq.TIME_ELAPSED_EXT); resQ.push(q); }
+    };
+
     const resize = () => {
+      resCheck();
       const w = host.clientWidth || window.innerWidth;
       const h = host.clientHeight || window.innerHeight;
       renderer.setSize(w, h, false);
@@ -4338,7 +4446,6 @@ function App() {
        timed on the CPU and, where the browser has the timer query, on the
        GPU. The city's GPU cost is the difference. Reported once through
        console.error. */
-    const gl = renderer.getContext();
     const tq = BENCH ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
     const bench = { builds: [], pendQ: [], phase: 'settle', settle: 0, A: { dt: [], cpu: [], gpu: [] }, B: { dt: [], cpu: [], gpu: [] }, done: false, info: null };
     const benchPoll = (sink) => {
@@ -4365,7 +4472,7 @@ function App() {
       const dbg = gl.getExtension('WEBGL_debug_renderer_info');
       const out = {
         gpu: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
-        shot: SHOT, w: renderer.domElement.width, h: renderer.domElement.height,
+        shot: SHOT, pr: renderer.getPixelRatio(), w: renderer.domElement.width, h: renderer.domElement.height,
         builds: bench.builds.length, buildPureAvg: r2(avg(pure)), buildPureMax: r2(Math.max(0, ...pure)),
         buildMeshAvg: r2(avg(mesh)), buildMeshMax: r2(Math.max(0, ...mesh)),
         frameAvg: r2(avg(bench.A.dt)), frameP95: r2(pct(bench.A.dt, 0.95)),
@@ -4931,7 +5038,7 @@ function App() {
         set('veh', Number.isFinite(dmin) ? fmt(Math.max(0, dmin), 0) + ' m' : '-', dmin < 15 ? 'hot' : '');
         if (g.hullBoxes) g.hullBoxes.update(nv);
       } else set('veh', 'off');
-      set('fps', fmt(state.fps, 0));
+      set('fps', fmt(state.fps, 0) + (res && res.levels.length > 1 ? '  ' + renderer.getPixelRatio() + 'x' : ''));
       set('clock', HK.formatRun(HK.elapsed(race, tNow), race.penalty), race.state === 'finished' ? 'acc' : '');
       set('clockSub', race.state === 'idle' ? 'fly through the start gate'
         : race.state === 'finished' ? 'finished, Backspace to fly again'
@@ -4982,7 +5089,7 @@ function App() {
         }
       }
 
-      if (!BENCH || bench.done || !cityR) { renderer.render(scene, camera); return; }
+      if (!BENCH || bench.done || !cityR) { resRender(dtRaw * 1000); return; }
 
       /* ---- bench ---- */
       let sink = null;
