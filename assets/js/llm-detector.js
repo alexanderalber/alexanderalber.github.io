@@ -1,4 +1,4 @@
-/* LLM-Detector — Vanilla-JS-Referenzimplementierung (Feature-Spec v0.4).
+/* LLM-Detector — Vanilla-JS-Referenzimplementierung (Feature-Spec v0.5).
  *
  * Spiegel von src/detector/{textproc,features,infer}.py — jede Änderung hier
  * oder dort braucht grüne Parity-Tests (tests/test_parity.py).
@@ -19,8 +19,124 @@
   var BURST_MIN_OCC = 3;
   var BLOCK_A_PREFIX = "fw_";
 
-  function normalize(text) {
+  // NFC + einheitliche Zeilenenden: genau das rechnet das UI nach, bevor es
+  // spans auf den Textarea-Inhalt legt. Die Offsets beziehen sich auf DIESEN Text.
+  function normalizeBase(text) {
     return text.normalize("NFC").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  // Was die Features sehen (ab Spec v0.5): normalizeBase + Entumbrechen.
+  function normalize(text) {
+    return unwrapWithRemovals(normalizeBase(text)).text;
+  }
+
+  // --- Entumbrechen (Spec v0.5, WP-O Teil A) ---
+  // Regel und Grenzfälle: Kommentar in src/detector/textproc.py (Spiegel).
+  var UNWRAP_MIN_LINE = 40;
+  var UNWRAP_TERMINAL = ".!?…:;";
+  var UNWRAP_CLOSERS = "\"'”’»«“‘)]";
+  var UNWRAP_HYPHENS = "-‐";
+  var WORDCHAR_END_RE = /[\p{L}\p{Nl}\p{No}]$/u;
+  var LOWER_START_RE = /^\p{Ll}/u;
+  var LIST_MARKER_RE = /^(?:[-*+•·–—>#|]|[0-9]{1,2}[.)](?=[ \t])|[a-z]\)(?=[ \t]))/;
+  var HANG_RE = /^(?:und|oder|bzw|sowie|beziehungsweise|and|or)(?![\p{L}\p{Nl}\p{No}])/u;
+
+  function rstripChars(s, chars) {
+    var e = s.length;
+    while (e > 0 && chars.indexOf(s[e - 1]) !== -1) e -= 1;
+    return s.slice(0, e);
+  }
+
+  function lstripChars(s, chars) {
+    var b = 0;
+    while (b < s.length && chars.indexOf(s[b]) !== -1) b += 1;
+    return s.slice(b);
+  }
+
+  function codepointLen(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+        var d = s.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d <= 0xdfff) i += 1;
+      }
+      n += 1;
+    }
+    return n;
+  }
+
+  function unwrapBoundary(a, b) {
+    var ar = rstripChars(a, " \t");
+    var bl = lstripChars(b, " \t");
+    if (ar.length === 0 || bl.length === 0) return "keep";
+    var a0 = lstripChars(a, " \t").charAt(0);
+    if (a0 === "#" || a0 === "|" || a0 === ">") return "keep";
+    if (LIST_MARKER_RE.test(bl)) return "keep";
+    var hyph = ar.length === a.length && a.length >= 2 &&
+      UNWRAP_HYPHENS.indexOf(a[a.length - 1]) !== -1 &&
+      WORDCHAR_END_RE.test(a.slice(0, -1));
+    var lower = LOWER_START_RE.test(bl);
+    if (hyph && lower) return HANG_RE.test(bl) ? "space" : "dehyph";
+    var t = rstripChars(ar, UNWRAP_CLOSERS);
+    if (t.length === 0 || UNWRAP_TERMINAL.indexOf(t[t.length - 1]) !== -1) return "keep";
+    if (codepointLen(ar) >= UNWRAP_MIN_LINE || lower) return hyph ? "cut" : "space";
+    return "keep";
+  }
+
+  function codeFlags(lines) {
+    var flags = [];
+    var inside = false;
+    for (var i = 0; i < lines.length; i++) {
+      if (lstripChars(lines[i], " \t").slice(0, 3) === "```") {
+        flags.push(true);
+        inside = !inside;
+      } else {
+        flags.push(inside);
+      }
+    }
+    return flags;
+  }
+
+  // Rückgabe { text, removals }: an UTF-16-Position pos des Ergebnisses wurden
+  // n Code-Units entfernt (removals = [[pos, n], ...], aufsteigend).
+  function unwrapWithRemovals(text) {
+    var lines = text.split("\n");
+    var code = codeFlags(lines);
+    var out = [lines[0]];
+    var u16 = lines[0].length;
+    var removals = [];
+    for (var k = 1; k < lines.length; k++) {
+      var a = lines[k - 1], b = lines[k];
+      var art = (code[k - 1] || code[k]) ? "keep" : unwrapBoundary(a, b);
+      if (art === "keep" || art === "space") {
+        out.push(art === "keep" ? "\n" : " ");
+        out.push(b);
+        u16 += 1 + b.length;
+        continue;
+      }
+      var rest = lstripChars(b, " \t");
+      var n = 1 + b.length - rest.length;
+      if (art === "dehyph") {
+        out[out.length - 1] = out[out.length - 1].slice(0, -1);
+        u16 -= 1;
+        n += 1;
+      }
+      removals.push([u16, n]);
+      out.push(rest);
+      u16 += rest.length;
+    }
+    return { text: out.join(""), removals: removals };
+  }
+
+  // UTF-16-Offset im entumbrochenen Text -> Offset im Eingabetext.
+  function mapOffset(o, removals) {
+    var shift = 0;
+    for (var i = 0; i < removals.length; i++) {
+      if (removals[i][0] >= o) break;
+      shift += removals[i][1];
+    }
+    return o + shift;
   }
 
   function words(text) {
@@ -424,10 +540,24 @@
     return spans;
   }
 
+  // t = normalizeBase(text). Ab Spec v0.5 werden Wörter und Sätze im
+  // entumbrochenen Text gefunden und ihre Offsets auf t zurückgerechnet.
   function buildSpans(t, bundle) {
     var lists = bundle.wordlists;
-    var tokOff = wordsWithOffsets(t);
-    var sentSp = sentenceSpansOf(t);
+    var uw = unwrapWithRemovals(t);
+    var tokOff = wordsWithOffsets(uw.text);
+    var sentSp = sentenceSpansOf(uw.text);
+    if (uw.removals.length > 0) {
+      var rem = uw.removals;
+      for (var q = 0; q < tokOff.length; q++) {
+        tokOff[q].start = mapOffset(tokOff[q].start, rem);
+        tokOff[q].end = mapOffset(tokOff[q].end, rem);
+      }
+      for (var r = 0; r < sentSp.length; r++) {
+        sentSp[r].start = mapOffset(sentSp[r].start, rem);
+        sentSp[r].end = mapOffset(sentSp[r].end, rem);
+      }
+    }
     var lm = bundle.ngram_lm;
     var surprisals = [];
     if (lm && sentSp.length > 0) {
@@ -690,7 +820,7 @@
       probability_raw: pRaw,
       confidence: confidence,
       features: contributions,
-      spans: buildSpans(normalize(text), bundle),
+      spans: buildSpans(normalizeBase(text), bundle),
       notes: notes,
       word_count: wordCount,
     };
@@ -705,7 +835,7 @@
   // calibrate ist mit exportiert, damit die laengenabhaengige Kurvenschar
   // (Exp. 018) direkt Parity-geprueft werden kann — ohne den Umweg ueber einen
   // vollstaendigen detect()-Lauf. Siehe tests/test_calibration_parity.py.
-  var api = { normalize: normalize, words: words, sentences: sentences, extractFeatures: extractFeatures, detectLanguage: detectLanguage, detect: detect, calibrate: calibrate };
+  var api = { normalize: normalize, normalizeBase: normalizeBase, words: words, sentences: sentences, extractFeatures: extractFeatures, detectLanguage: detectLanguage, detect: detect, calibrate: calibrate };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else if (typeof globalThis !== "undefined") globalThis.llmDetector = api;
 })();
