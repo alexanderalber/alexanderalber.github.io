@@ -21,9 +21,10 @@
  *
  * THE CONVENTION
  * An icon goes on a button that performs an ACTION on something: download,
- * upload, copy, run, reset, remove, open elsewhere. Choices, filters, tabs and
- * next/previous stay bare. A row where every button has a picture is a wall of
- * pictograms and the icon stops carrying any signal at all.
+ * upload, copy, run, reset, remove, open elsewhere. Choices, filters and tabs stay
+ * bare. Next/previous stay bare too, except the step buttons of a multi-step tool,
+ * where the arrow says which way the step goes. A row where every button has a
+ * picture is a wall of pictograms and the icon stops carrying any signal at all.
  *
  * Geometry: a 24x24 viewBox, no fill, stroke-width 2, round caps and joins, so
  * the set reads as one family and matches the stroke weight of the tool UI.
@@ -73,7 +74,10 @@
     /* two strands curving into one stem that leaves upwards: several things
        joined into one (several books into an omnibus). Not plus, which adds
        one more of something, and not link, which connects without fusing. */
-    merge: '<path d="M6 21c0-5 6-5 6-10"/><path d="M18 21c0-5-6-5-6-10"/><path d="M12 11V3"/><path d="M8 7l4-4 4 4"/>'
+    merge: '<path d="M6 21c0-5 6-5 6-10"/><path d="M18 21c0-5-6-5-6-10"/><path d="M12 11V3"/><path d="M8 7l4-4 4 4"/>',
+    /* the step buttons of a multi-step tool: one step back, one step on */
+    arrowLeft: '<path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/>',
+    arrowRight: '<path d="M5 12h14"/><path d="M13 6l6 6-6 6"/>'
   };
 
   /* The attributes every icon shares. Spelled once, in both output forms. */
