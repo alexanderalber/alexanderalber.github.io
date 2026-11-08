@@ -445,7 +445,7 @@
           <li>Give each area one of five materials: bare FR4, soldermask over bare FR4, exposed copper, soldermask over copper (the default), or silkscreen. A sixth choice, cutout, mills the area out of the board.</li>
           <li>A bare FR4 window on the front also opens the back, so light can pass through. The tool applies that rule for you.</li>
           <li>Place the electronics: LEDs, a CR2032 holder and a button, all on the back. The tool derives the nets from the parts; there is no schematic to draw.</li>
-          <li>Check the result: whether every net is one piece of copper and nothing is shorted, and whether trace widths, clearances, annular rings and drill sizes are within what the fab can make.</li>
+          <li>Check the result: whether every net is one piece of copper and nothing is shorted, and whether trace widths, clearances, annular rings, drill sizes and drill spacing are within what the fab can make.</li>
           <li>Look at the finished board in 3D: real materials, lighting environments, a day and night slider, and the LEDs shining through the windows from behind.</li>
           <li>Download Gerber and Excellon files as a zip, in the KiCad 9 conventions Aisler and JLCPCB expect. Or download the board as an editable KiCad project with the parts and holes as real footprints.</li>
         </ul>
@@ -4127,10 +4127,25 @@ var PCB = (function () {
        then there is no rim either: appending it to the per-region fallback
        would hit the very restore problem above. The DRC keeps reporting the
        clearance in that case, which is the honest outcome. */
-    var rimPaint = edgeMm > 0 ? function (mask, mw, mh, mk) {
-      var rim = cachedRimMask(outline, cutRings, edgeMm, mw, mh, mk);
-      if (!rim) return;
-      for (var i = 0; i < rim.length; i++) if (rim[i]) mask[i] = 1;
+    /* Unplated holes get the same treatment, with the fab's NPTH-to-copper
+       distance: copper at the rim of such a hole can plate it through by
+       accident. Same rounding as the rim (up, plus one pixel), clipped to the
+       board, and not part of the memo, because a few circles cost nothing. */
+    var npthMm = opts.npthCopperMm != null ? +opts.npthCopperMm
+      : (fabLimits(doc.board && doc.board.fab, doc.board && doc.board.finish).npthCopperMm || 0);
+    var npthHoles = npthMm > 0 ? holeList.filter(function (h) { return !h.plated; }) : [];
+    var rimPaint = (edgeMm > 0 || npthHoles.length) ? function (mask, mw, mh, mk) {
+      var i;
+      var rim = edgeMm > 0 ? cachedRimMask(outline, cutRings, edgeMm, mw, mh, mk) : null;
+      if (rim) for (i = 0; i < rim.length; i++) if (rim[i]) mask[i] = 1;
+      if (!npthHoles.length) return;
+      var extra = (Math.ceil(npthMm * mk) + 1) / mk;
+      var grown = new Uint8Array(mw * mh), onBoard = new Uint8Array(mw * mh);
+      npthHoles.forEach(function (h) {
+        fillPolysPx(grown, mw, mh, [circlePoly(h.x, h.y, h.d / 2 + extra, ctol)], mk, 1);
+      });
+      fillPolysPx(onBoard, mw, mh, outline, mk, 1);
+      for (i = 0; i < grown.length; i++) if (grown[i] && onBoard[i]) mask[i] = 1;
     } : null;
 
     /* Every list below that used to be a concat of per-region groups goes
@@ -4592,6 +4607,12 @@ var PCB = (function () {
      document drill-to-edge separately (only copper-to-edge 0.3) and JLCPCB only
      recommends 0.3 to 0.5 in a blog post, so it warns for both and never
      errors.
+     holeSpaceMm is edge to edge between two drills. AISLER states 0.3 for every
+     drill and removes the ones that break it. JLCPCB lists 0.2 for vias and 0.45
+     for holes in pads and defines neither further, and this tool has no separate
+     via, so 0.2 is the error and 0.45 the warning. npthCopperMm also sets how
+     far deriveLayers takes the copper back from an unplated hole. It is AISLER's
+     0.25 (their article on holes also says 0.3 once) and JLCPCB's NPTH to track.
      Not checked in this session and deliberately absent: the soldermask dam
      (0.10, and 0.13 under black or white mask), the minimum router radius and
      the slot widths. Those are sliver-analysis territory; the prose reminder
@@ -4608,7 +4629,10 @@ var PCB = (function () {
       drillMinNpthMm: 0.5,     // hard
       drillMaxMm: 5.6,         // hard
       silkMm: 0.15,            // hard
-      holeEdgeWarnMm: 0.3      // not documented separately, warn only
+      holeEdgeWarnMm: 0.3,     // not documented separately, warn only
+      holeSpaceMm: 0.3,        // hard, edge to edge
+      holeSpaceWarnMm: null,
+      npthCopperMm: 0.25       // hard
     },
     jlcpcb: {
       traceMm: 0.10,           // hard, 1 oz
@@ -4621,7 +4645,10 @@ var PCB = (function () {
       drillMinNpthMm: 0.5,     // hard
       drillMaxMm: 6.3,         // hard
       silkMm: 0.15,            // hard
-      holeEdgeWarnMm: 0.3      // blog recommendation only, warn only
+      holeEdgeWarnMm: 0.3,     // blog recommendation only, warn only
+      holeSpaceMm: 0.2,        // the smallest spacing they list (vias)
+      holeSpaceWarnMm: 0.45,   // their value for holes in pads
+      npthCopperMm: 0.2        // hard, NPTH to track
     }
   };
 
@@ -7409,6 +7436,36 @@ var PCB = (function () {
           'copper-edge', 'error', side, lim.copperEdgeMm, noisePx);
       }
 
+      /* 3b. copper around an unplated hole. The derivation keeps this free on
+         its own, so this is the receipt. A pad has its own rule with the name
+         of the pad, and a gap within a pixel of the limit passes. */
+      if (lim.npthCopperMm != null) {
+        (doc.holes || []).forEach(function (hh) {
+          if (hh.plated) return;
+          var r = +hh.d / 2, reach = r + lim.npthCopperMm;
+          var x0 = Math.max(0, Math.floor((+hh.x - reach) * px));
+          var x1 = Math.min(w - 1, Math.ceil((+hh.x + reach) * px));
+          var y0 = Math.max(0, Math.floor((+hh.y - reach) * px));
+          var y1 = Math.min(h - 1, Math.ceil((+hh.y + reach) * px));
+          var best = Infinity;
+          for (var py = y0; py <= y1; py++) {
+            for (var pxi = x0; pxi <= x1; pxi++) {
+              if (!cu.data[py * w + pxi]) continue;
+              var dd = Math.hypot((pxi + 0.5) / px - +hh.x, (py + 0.5) / px - +hh.y);
+              if (dd < best) best = dd;
+            }
+          }
+          var copperGap = best - r;
+          if (copperGap < lim.npthCopperMm - 1 / px) {
+            findings.push({
+              rule: 'hole-copper', severity: 'error', side: side,
+              x: round4(+hh.x), y: round4(+hh.y),
+              valueMm: round4(copperGap), limitMm: lim.npthCopperMm, ref: hh.id
+            });
+          }
+        });
+      }
+
       /* 7b. painted silk areas, same machinery, silk layer instead of copper. */
       var silk = rasterizeLayer(derived, side === 'front' ? 'F.Silkscreen' : 'B.Silkscreen', px);
       minWidthRule(findings, state, silk.data, w, h, px, 'silk-width', side, lim.silkMm,
@@ -7417,13 +7474,15 @@ var PCB = (function () {
 
     /* 4, 5, 6: the holes, exactly and without a raster. */
     var edges = (derived.outline || []).concat(derived.cutouts || []);
-    var geo = function (rule, severity, hh, valueMm, limitMm) {
-      findings.push({
+    var geo = function (rule, severity, hh, valueMm, limitMm, other) {
+      var f = {
         rule: rule, severity: severity, side: null,
         x: round4(+hh.x), y: round4(+hh.y),
         valueMm: valueMm == null ? null : round4(valueMm),
         limitMm: limitMm, ref: hh.id
-      });
+      };
+      if (other != null) f.other = other;
+      findings.push(f);
     };
     (doc.holes || []).forEach(function (hh) {
       var d = +hh.d;
@@ -7442,10 +7501,91 @@ var PCB = (function () {
       if (lim.drillMaxMm != null && d > lim.drillMaxMm) {
         geo('drill-size', 'error', hh, d, lim.drillMaxMm);
       }
-      if (lim.holeEdgeWarnMm != null && edges.length) {
+      if (edges.length) {
         var gapMm = distToPolys(edges, +hh.x, +hh.y) - d / 2;
-        if (gapMm < lim.holeEdgeWarnMm) geo('hole-edge', 'warn', hh, gapMm, lim.holeEdgeWarnMm);
+        /* A bore that touches no board at all is a mistake at any limit, and
+           one that is partly on the board stays the warning below. */
+        var onBoard = pointInPolys(derived.outline || [], +hh.x, +hh.y)
+          && !pointInPolys(derived.cutouts || [], +hh.x, +hh.y);
+        if (!onBoard && gapMm >= 0) geo('hole-outside', 'error', hh, null, null);
+        else if (lim.holeEdgeWarnMm != null && gapMm < lim.holeEdgeWarnMm) {
+          geo('hole-edge', 'warn', hh, gapMm, lim.holeEdgeWarnMm);
+        }
       }
+    });
+
+    /* 4b. Holes against holes, pads and part bodies, exact like the rules above.
+       The epsilon lets a gap of exactly the limit pass despite the square root.
+       An empty limit field drops the number but never the overlap test: two
+       bores that run into each other are wrong at any spacing. */
+    var EPS = 1e-9;
+    var holeList = doc.holes || [];
+    var edgeGap = function (poly, x, y, r) {
+      var dist = distToPolys([poly], x, y);
+      return (pointInPolys([poly], x, y) ? -dist : dist) - r;
+    };
+    holeList.forEach(function (a, ia) {
+      for (var ib = ia + 1; ib < holeList.length; ib++) {
+        var b = holeList[ib];
+        var between = Math.hypot(+a.x - +b.x, +a.y - +b.y) - (+a.d + +b.d) / 2;
+        var mid = { id: a.id, x: (+a.x + +b.x) / 2, y: (+a.y + +b.y) / 2 };
+        var hardGap = lim.holeSpaceMm == null ? 0 : lim.holeSpaceMm;
+        if (between < hardGap - EPS) geo('hole-hole', 'error', mid, between, hardGap, b.id);
+        else if (lim.holeSpaceWarnMm != null && between < lim.holeSpaceWarnMm - EPS) {
+          geo('hole-hole', 'warn', mid, between, lim.holeSpaceWarnMm, b.id);
+        }
+      }
+    });
+
+    /* A pad is copper, so an unplated hole has to stay the fab's distance away
+       from it. A plated hole near a pad is a copper question the raster rules
+       already answer, and a plated hole IN a pad can be built (via in pad): it
+       only warns, because the bore takes pad area and drains solder. */
+    var partList = docParts(doc);
+    holeList.forEach(function (hh) {
+      var x = +hh.x, y = +hh.y, r = +hh.d / 2;
+      partList.forEach(function (p) {
+        var onPad = false;
+        partPads(p).forEach(function (pad) {
+          var gapPad = edgeGap(pad.poly, x, y, r);
+          if (gapPad < 0) onPad = true;
+          var npth = lim.npthCopperMm == null ? 0 : lim.npthCopperMm;
+          if (!hh.plated && gapPad < npth - EPS) {
+            onPad = true;
+            geo('hole-pad', 'error', hh, gapPad, npth, p.id + '.' + pad.name);
+          } else if (hh.plated && gapPad < -EPS) {
+            geo('hole-pad', 'warn', hh, gapPad, 0, p.id + '.' + pad.name);
+          }
+        });
+        /* The body outlines are approximations, the LED head a guess, and a
+           hole under a part can be meant (light, a clip). So only a warning, no
+           distance, and none on top of a finding for a pad of the same part. */
+        if (onPad) return;
+        var c = p.def.bodyCircle, under = false;
+        if (p.def.body && edgeGap(padPoly(p.def.body, p), x, y, r) < -EPS) under = true;
+        if (c) {
+          var at = partPoint(p, c.cxMm, c.cyMm);
+          if (Math.hypot(at[0] - x, at[1] - y) - c.rMm - r < -EPS) under = true;
+        }
+        if (under) geo('hole-body', 'warn', hh, null, null, p.ref);
+      });
+    });
+
+    /* The derivation keeps copper off the edge everywhere except at a plated
+       ring, which it draws last on purpose. So copper at the edge is nearly
+       always a ring, and saying which one is the useful part of the finding. A
+       hole already reported as off the board needs no second finding. */
+    var offBoard = {};
+    findings.forEach(function (f) { if (f.rule === 'hole-outside') offBoard[f.ref] = 1; });
+    findings = findings.filter(function (f) {
+      if (f.rule !== 'copper-edge') return true;
+      var owner = holeList.filter(function (hh) {
+        return hh.plated && Math.hypot(f.x - +hh.x, f.y - +hh.y) <= +hh.ring / 2 + 1 / px;
+      })[0];
+      if (!owner) return true;
+      if (offBoard[owner.id]) return false;
+      f.ref = owner.id;
+      return true;
     });
 
     /* 7a. silk strokes are checked on their stated width, which is exact and
@@ -7485,7 +7625,7 @@ var PCB = (function () {
 
      The question this answers came from looking at a narrow neck between two
      areas and asking whether anything checks that it carries the current.
-     Nothing did, and the DRC above is the wrong place for it: its seven rules
+     Nothing did, and the DRC above is the wrong place for it: its rules
      are all about what a FAB can make, and none of them knows that copper
      conducts. The honest answer needs the resistance over the whole path, not
      the width at the narrowest point, because a short neck in a wide plane
@@ -8663,6 +8803,7 @@ var PCB = (function () {
           rules: {
             min_clearance: lim.spaceMm,
             min_copper_edge_clearance: lim.copperEdgeMm,
+            min_hole_to_hole: lim.holeSpaceMm,
             min_silk_clearance: lim.silkMm,
             min_text_thickness: lim.silkMm,
             min_through_hole_diameter: lim.drillMinPthMm,
@@ -13392,7 +13533,12 @@ var PCB = (function () {
     'silk-width': 'Silkscreen line too thin',
     restring: 'Annular ring too small',
     'drill-size': 'Drill diameter out of range',
-    'hole-edge': 'Hole too close to the board edge'
+    'hole-edge': 'Hole too close to the board edge',
+    'hole-outside': 'Hole not on the board',
+    'hole-hole': 'Holes overlap or sit too close',
+    'hole-pad': 'Hole on or too close to a part pad',
+    'hole-body': 'Hole under a part',
+    'hole-copper': 'Copper too close to an unplated hole'
   };
 
   /* The editable limits, in the order they are shown. Every entry names the
@@ -13409,7 +13555,10 @@ var PCB = (function () {
     { k: 'drillPthWarnMm', label: 'Plated drill, advised', hard: false },
     { k: 'drillMinNpthMm', label: 'Min unplated drill', hard: true },
     { k: 'drillMaxMm', label: 'Max drill', hard: true },
-    { k: 'holeEdgeWarnMm', label: 'Hole to edge, advised', hard: false }
+    { k: 'holeEdgeWarnMm', label: 'Hole to edge, advised', hard: false },
+    { k: 'holeSpaceMm', label: 'Hole to hole', hard: true },
+    { k: 'holeSpaceWarnMm', label: 'Hole to hole, advised', hard: false },
+    { k: 'npthCopperMm', label: 'Unplated hole to copper', hard: true }
   ];
 
   const CHECK_SIDES = [
@@ -15345,10 +15494,26 @@ var PCB = (function () {
     }
 
     function drcText(f) {
-      const name = RULE_LABEL[f.rule] || f.rule;
+      const ring = f.rule === 'copper-edge' && !!f.ref;
+      const name = ring ? 'Copper ring of a plated hole reaches the board edge' : (RULE_LABEL[f.rule] || f.rule);
       const val = f.valueMm == null ? '' : mm2(f.valueMm) + ' against ' + mm2(f.limitMm);
-      const where = f.side ? f.side : (f.ref || '');
-      return { name: name, val: val || ('limit ' + mm2(f.limitMm)), where: where };
+      /* The label the holes list shows, because a hole's id appears nowhere on
+         the page. Empty for anything that is not a hole. */
+      const holeName = (id) => {
+        const i = doc.holes.findIndex((h) => h.id === id);
+        return i < 0 ? '' : (doc.holes[i].plated ? 'PTH ' : 'NPTH ') + (i + 1);
+      };
+      const named = (id) => holeName(id) || padName(id);
+      const where = f.side
+        ? [holeName(f.ref), f.side].filter(Boolean).join(', ')
+        : [f.ref, f.other].filter(Boolean).map(named).join(', ');
+      return {
+        name: name,
+        val: val || (f.rule === 'hole-outside' ? 'outside the outline or in a cutout'
+          : f.limitMm == null ? 'inside its outline' : 'limit ' + mm2(f.limitMm)),
+        where: where,
+        hint: ring ? ' Move the hole inward or make its ring smaller.' : ''
+      };
     }
 
     /* Every marker the check canvas draws, with what it belongs to. Connectivity
@@ -17007,7 +17172,7 @@ var PCB = (function () {
           The board is a rectangle in millimetres with the origin at its top left corner and y pointing down.
           Everything else in this tool is drawn inside it. The fab preset decides which mask colours are
           on offer, which limits the check tab measures against and how far the copper stays from the
-          routed edge.
+          routed edge and from unplated holes.
         </p>`)}
         <div className="ctl-card">
           <div className="ctl-sec">
@@ -17577,7 +17742,7 @@ var PCB = (function () {
             touching. It reads the same copper the export writes. So a bare window on the FRONT that cuts a
             trace on the back shows up here as a broken net.</p>
           <p><b>Design checks</b> ask whether a fab can make the board: trace widths, copper spacing, copper to
-            the board edge, silkscreen line widths, annular rings, drill diameters and drill to edge. Both fabs
+            the board edge, silkscreen line widths, annular rings, drill diameters, drill to edge, and drills against each other and against the parts. Both fabs
             are documented profiles, and the numbers are editable below.</p>
           <p>With the automatic back copper on (the default under board config), the tool separates the nets itself.
             The connectivity report is then a receipt: if anything here is red, the tool got it wrong, and the
@@ -17923,14 +18088,14 @@ var PCB = (function () {
                   ${dErr.length ? html`<div className="pcb-findlist">
                     ${dErr.map((f) => {
     const t = drcText(f);
-    return findRow('drc', dFind.indexOf(f), f, t.name + ': ' + t.val + (t.where ? ' (' + t.where + ')' : ''),
+    return findRow('drc', dFind.indexOf(f), f, t.name + ': ' + t.val + (t.where ? ' (' + t.where + ').' : '') + t.hint,
       { color: 'var(--tool-sig-bad)' });
   })}
                   </div>` : null}
                   ${dWarn.length ? html`<div className="pcb-findlist">
                     ${dWarn.map((f) => {
     const t = drcText(f);
-    return findRow('drc', dFind.indexOf(f), f, t.name + ': ' + t.val + (t.where ? ' (' + t.where + ')' : ''),
+    return findRow('drc', dFind.indexOf(f), f, t.name + ': ' + t.val + (t.where ? ' (' + t.where + ').' : '') + t.hint,
       { color: 'var(--tool-sig-warn)' });
   })}
                   </div>` : null}
@@ -18092,7 +18257,7 @@ var PCB = (function () {
             the back copper between the nets itself. Nothing to wire.</p>
           <p><b>The check tab</b> reads the derived copper, as the fab will see it. It says whether every net is one
             piece of copper and no two nets touch. On a button press it measures trace widths, clearances, annular
-            rings and drill sizes against the limits the two fabs publish.</p>
+            rings, drill sizes and drill spacing against the limits the two fabs publish.</p>
           <p><b>The 3d-viz tab</b> shows the board as a lit 1.6 mm slab with a milled edge, and the LEDs on the back
             shining through the windows. It is a depiction; the export tab shows what the fab will make.</p>
           <p><b>Areas</b> are found on a raster of ${PCB.PX_PER_MM} pixels per millimetre, so an edge sits within
