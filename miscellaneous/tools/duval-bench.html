@@ -85,14 +85,39 @@
       border: 1px solid var(--tool-border); border-radius: 8px; box-shadow: var(--tool-panel-shadow); }
     .db-gridline { stroke: var(--tool-hairline); stroke-width: 1; }
     .db-axis { fill: var(--tool-note); font: 11px system-ui, sans-serif; }
-    /* One colour per vendor, taken from the signal groups so that all three
-       skins carry it. The marker shape repeats the distinction. */
-    .db-v-openai { --v: var(--tool-ok-text); }
-    .db-v-anthropic { --v: var(--tool-warn-text); }
-    .db-v-google { --v: var(--tool-info-text); }
+    /* One colour per vendor. The --tool-sig-* set is the one made for plot
+       marks: saturated on dark, two steps deeper on white. The *-text colours
+       used before are meant for text on a tinted box and came out pastel on
+       dark and near black on white. The marker shape repeats the distinction. */
+    .db-v-openai { --v: var(--tool-sig-good); }
+    .db-v-anthropic { --v: var(--tool-sig-warn); }
+    .db-v-google { --v: var(--tool-sig-info); }
     .db-v-deepseek { --v: var(--tool-emph); }
+    /* Light: the signal set is two steps deep there, because it also has to
+       carry text on white. A filled mark needs less, and at that depth the
+       four read as nearly black. One step up in the same hues, and a middle
+       grey for the neutral one. */
+    html[data-skin="light"] .db-v-openai { --v: #22c55e; }
+    html[data-skin="light"] .db-v-anthropic { --v: #f59e0b; }
+    html[data-skin="light"] .db-v-google { --v: #0ea5e9; }
+    html[data-skin="light"] .db-v-deepseek { --v: #64748b; }
+    /* Grey has one accent and a grey ladder, so the four vendors are spread
+       over both: the accent, white, a middle grey and the dark ink. The signal
+       greys of that skin are three light greys and read as one colour here. */
+    html[data-skin="grey"] .db-v-openai { --v: var(--tool-emph); }
+    html[data-skin="grey"] .db-v-anthropic { --v: var(--tool-sig-info); }
+    html[data-skin="grey"] .db-v-google { --v: var(--tool-hairline); }
+    html[data-skin="grey"] .db-v-deepseek { --v: var(--tool-ink); }
     .db-mark { fill: var(--v); stroke: var(--tool-surface); stroke-width: 1.2; cursor: pointer; }
+    /* Marks are drawn around the origin and placed by a transform, so that a
+       change of the score shown moves them instead of redrawing them. */
+    .db-move { transition: transform .5s cubic-bezier(.3, 0, .2, 1); }
+    @media (prefers-reduced-motion: reduce) { .db-move { transition: none; } }
     .db-mark:hover, .db-mark.sel { stroke: var(--tool-emph); stroke-width: 1.6; }
+    /* One answer missing: outline only, in the vendor's colour. */
+    .db-mark.db-part { fill: var(--tool-surface); stroke: var(--v); stroke-width: 1.8; }
+    .db-outlab { fill: var(--tool-label); font: 500 11px system-ui, sans-serif; text-anchor: middle; pointer-events: none;
+      paint-order: stroke; stroke: var(--tool-surface); stroke-width: 3px; }
     .db-ring { fill: none; stroke: var(--tool-emph); stroke-width: 1.4; }
     .db-sellab { fill: var(--tool-emph); font: 600 12px system-ui, sans-serif;
       paint-order: stroke; stroke: var(--tool-surface); stroke-width: 3px; }
@@ -287,6 +312,16 @@
       return null;
     }
 
+    // The published table ends PD at y = 33, yet a sample of nearly pure
+    // hydrogen lands between 33 and 33.3, above it, and reads S by the letter.
+    // Some implementations carry the PD sliver up to the corner instead. Both
+    // readings count there: for such a sample this returns the second code
+    // that is also accepted, otherwise null.
+    function dbPentAlso(h2, ch4, c2h6, c2h4, c2h2) {
+      const pt = dbPentPoint(h2, ch4, c2h6, c2h4, c2h2);
+      return pt && pt[1] > 33 && pt[0] > -1 && pt[0] < 0 ? 'PD' : null;
+    }
+
     // Pentagon plane to the bench's own 600 x 600 drawing, H2 at the top.
     function dbPentXY(pt) {
       return [300 + 6.4 * pt[0], 318 - 6.4 * pt[1]];
@@ -334,8 +369,9 @@
     }
 
     // answers: what the model said per sample. refs: the reference zone per
-    // sample. order: the zone codes of this diagram.
-    function dbScore(answers, refs, order) {
+    // sample. order: the zone codes of this diagram. also: optional, per
+    // sample a second code that counts as right, or null.
+    function dbScore(answers, refs, order, also) {
       const per = {};
       order.forEach(z => { per[z] = { n: 0, hit: 0, miss: {} }; });
       const labels = {};
@@ -345,7 +381,7 @@
         const got = dbNorm(answers ? answers[i] : null) || '(nothing)';
         labels[got] = (labels[got] || 0) + 1;
         per[ref].n++;
-        if (got === ref) { hit++; per[ref].hit++; }
+        if (got === ref || (also && also[i] && got === also[i])) { hit++; per[ref].hit++; }
         else { wrong.push(i); per[ref].miss[got] = (per[ref].miss[got] || 0) + 1; }
       });
       order.forEach(z => {
@@ -432,14 +468,25 @@
     const DB_VIA_SHORT = { agent: 'Agent', api: 'API', chat: 'Chat' };
     const DB_METRICS = [['avg', 'Average'], ['triangle', 'Triangle'], ['pentagon', 'Pentagon']];
 
-    // Score of one entry for one metric, 0 to 1, or null when an answer is missing.
+    // Score of one entry for one metric, 0 to 1. A single diagram is null when
+    // its answer is missing. The average counts a missing answer as zero, and
+    // is null only when both are missing.
     function dbMetric(entry, metric) {
       const t = entry.triangle ? entry.triangle.score : null;
       const p = entry.pentagon ? entry.pentagon.score : null;
       if (metric === 'triangle') return t;
       if (metric === 'pentagon') return p;
-      return t === null || p === null ? null : (t + p) / 2;
+      return t === null && p === null ? null : ((t || 0) + (p || 0)) / 2;
     }
+
+    // True when exactly one of the two answers is missing.
+    function dbPartial(entry) {
+      return !entry.triangle !== !entry.pentagon;
+    }
+
+    // Models that carry their name in the chart all the time: the ones that
+    // sit far above the others of their time.
+    const DB_CHART_LABELS = ['gpt-4', 'opus-3', 'gemini-3-flash', 'fable-5'];
 
     // Days since 1970 for an ISO date, as the time axis of the chart.
     function dbDay(iso) {
@@ -475,7 +522,7 @@
     const PENT_PTS = PENT.map(g => dbPentPoint(g[0], g[1], g[2], g[3], g[4]));
     const DATA = {
       triangle: { pts: [].concat.apply([], CELLS.map(c => c.p)), refs: CELLS.map(c => dbRef(c.p[0], c.p[1], c.p[2])) },
-      pentagon: { pts: [].concat.apply([], PENT), refs: PENT.map(g => dbPentRef(g[0], g[1], g[2], g[3], g[4])) }
+      pentagon: { pts: [].concat.apply([], PENT), refs: PENT.map(g => dbPentRef(g[0], g[1], g[2], g[3], g[4])), also: PENT.map(g => dbPentAlso(g[0], g[1], g[2], g[3], g[4])) }
     };
     const ALL_PENT = PENT.map((g, i) => i);
     const pct = x => (100 * x).toFixed(1) + ' %';
@@ -562,8 +609,11 @@
     function Chart({ entries, metric, selected, onSelect }) {
       const S = useMemo(() => dbChartScale(entries), [entries]);
       const C = DB_CHART;
+      const at = (x, y) => ({ transform: 'translate(' + x.toFixed(1) + 'px, ' + y.toFixed(1) + 'px)' });
       const pts = entries.map(e => ({ e, v: dbMetric(e, metric) })).filter(p => p.v !== null);
       const sel = pts.filter(p => p.e.id === selected)[0];
+      const part = p => metric === 'avg' && dbPartial(p.e);
+      const named = pts.filter(p => DB_CHART_LABELS.indexOf(p.e.id) >= 0 && p.e.id !== selected);
       return html`
         <svg className="db-chart" viewBox=${'0 0 ' + C.w + ' ' + C.h} role="img" aria-label="Score of every model by release date">
           ${[0, 0.25, 0.5, 0.75, 1].map(v => html`
@@ -579,16 +629,21 @@
             </g>
           `)}
           ${pts.map(p => html`
-            <path key=${p.e.id} className=${'db-mark db-v-' + p.e.vendor + (p.e.id === selected ? ' sel' : '')}
-                  d=${markerPath(p.e.vendor, S.x(dbDay(p.e.released)), S.y(p.v), 5)}
+            <path key=${p.e.id} className=${'db-mark db-move db-v-' + p.e.vendor + (part(p) ? ' db-part' : '') + (p.e.id === selected ? ' sel' : '')}
+                  d=${markerPath(p.e.vendor, 0, 0, 5)} style=${at(S.x(dbDay(p.e.released)), S.y(p.v))}
                   onClick=${() => onSelect(p.e.id)}>
-              <title>${p.e.label + ', ' + p.e.released + ': ' + pct(p.v)}</title>
+              <title>${p.e.label + ', ' + p.e.released + ': ' + pct(p.v) + (part(p) ? ' (no answer for the ' + (p.e.triangle ? 'pentagon' : 'triangle') + ', counted as zero)' : '')}</title>
             </path>
           `)}
+          ${named.map(p => html`
+            <g key=${'n-' + p.e.id} className="db-move" style=${at(S.x(dbDay(p.e.released)), S.y(p.v))}>
+              <text className="db-outlab" x="0" y=${p.v > 0.9 ? 20 : -11}>${p.e.label}</text>
+            </g>
+          `)}
           ${sel && html`
-            <g>
-              <circle className="db-ring" cx=${S.x(dbDay(sel.e.released))} cy=${S.y(sel.v)} r="10" />
-              <text className="db-sellab" x=${S.x(dbDay(sel.e.released))} y=${S.y(sel.v) + (sel.v > 0.85 ? 26 : -16)}
+            <g key=${sel.e.id} className="db-move" style=${at(S.x(dbDay(sel.e.released)), S.y(sel.v))}>
+              <circle className="db-ring" cx="0" cy="0" r="10" />
+              <text className="db-sellab" x="0" y=${sel.v > 0.85 ? 26 : -16}
                     textAnchor=${S.x(dbDay(sel.e.released)) > C.w - 120 ? 'end' : 'middle'}>${sel.e.label}</text>
             </g>
           `}
@@ -661,7 +716,7 @@
       const scores = useMemo(() => {
         const o = {};
         DB_TASK_ORDER.forEach(tk => {
-          if (results[tk] && results[tk].answers) o[tk] = dbScore(results[tk].answers, DATA[tk].refs, DB_TASKS[tk].order);
+          if (results[tk] && results[tk].answers) o[tk] = dbScore(results[tk].answers, DATA[tk].refs, DB_TASKS[tk].order, DATA[tk].also);
         });
         return o;
       }, [results]);
@@ -748,6 +803,22 @@
         try { history.replaceState(null, '', '#' + encodeURIComponent(id)); } catch (x) {}
       };
 
+      // Bring the selected row into view inside the list, without moving the
+      // page: scrollIntoView would scroll the window as well. A row that is
+      // already fully visible stays where it is.
+      const listRef = useRef(null);
+      useEffect(() => {
+        const wrap = listRef.current;
+        const row = wrap && wrap.querySelector('tr.sel');
+        if (!row) return;
+        const head = wrap.querySelector('thead');
+        const top = row.offsetTop - (head ? head.offsetHeight : 0);
+        const bottom = row.offsetTop + row.offsetHeight;
+        if (top >= wrap.scrollTop && bottom <= wrap.scrollTop + wrap.clientHeight) return;
+        const calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        wrap.scrollTo({ top: Math.max(0, top - (wrap.clientHeight - row.offsetHeight) / 3), behavior: calm ? 'auto' : 'smooth' });
+      }, [selected, index]);
+
       const entries = index ? index.entries : [];
       const entry = entries.filter(e => e.id === selected)[0] || null;
       const newestFirst = useMemo(() => entries.slice().reverse(), [index]);
@@ -762,7 +833,7 @@
           ${index && html`
             <div>
               <div className="db-chartbar">
-                <div className="seg-row" role="group" aria-label="Score shown in the chart">
+                <div className="seg-row">
                   ${DB_METRICS.map(m => html`
                     <button key=${m[0]} className=${'lang-seg' + (metric === m[0] ? ' active' : '')}
                             onClick=${() => setMetric(m[0])}>${m[1]}</button>
@@ -775,9 +846,9 @@
                 </div>
               </div>
               <${Chart} entries=${entries} metric=${metric} selected=${selected} onSelect=${pick} />
-              <p className="db-cap db-chartcap">Each mark is one model, placed at its release date. Click a mark, or a row in the table, to see that model's answers.</p>
+              <p className="db-cap db-chartcap">Each mark is one model, placed at its release date. Click a mark, or a row in the table, to see that model's answers. A hollow mark is a model with one of its two answers missing. The average counts the missing one as zero.</p>
 
-              <div className="db-listwrap">
+              <div className="db-listwrap" ref=${listRef}>
                 <table className="db-table db-list">
                   <thead><tr><th>Model</th><th>Vendor</th><th>Released</th><th>Triangle</th><th>Pentagon</th><th>Run</th></tr></thead>
                   <tbody>
@@ -832,7 +903,7 @@
               <summary>How the scores are computed</summary>
               <div className="fold-body">
                 <p>Triangle: the bench cuts the triangle into 10,000 equal small triangles. It asks the model's classify function for the zone at the centre of each one and compares the answer with the reference. The score is the share of the triangle's area the model gets right. No cell centre lies on a zone boundary, so "greater than" against "greater or equal" changes nothing.</p>
-                <p>Pentagon: a sample has five gases, so there is no area to cut up. The bench draws 10,000 gas mixtures at random, always the same ones. Mixtures led by one or two gases are made common on purpose. Otherwise nearly every sample would land in the middle of the pentagon. The score is the share of samples the model puts in the reference zone. A model has to get two things right here: the way a sample becomes a point, and the zones.</p>
+                <p>Pentagon: a sample has five gases, so there is no area to cut up. The bench draws 10,000 gas mixtures at random, always the same ones. Mixtures led by one or two gases are made common on purpose. Otherwise nearly every sample would land in the middle of the pentagon. The score is the share of samples the model puts in the reference zone. One spot accepts two answers. The published PD zone ends just below the hydrogen corner, so a sample of nearly pure hydrogen lands above it, in S. There the bench counts PD as right too. A model has to get two things right here: the way a sample becomes a point, and the zones.</p>
                 <p>Spelling variants of the mixed zone (DT, D+T, T/D) count as the same code. The drawings are not scored. You judge them by eye.</p>
                 <p>Both scores are blunt. Small zones weigh little: PD, T1 and T2 together cover about 4 % of the triangle. The table per zone shows what a single number hides.</p>
               </div>
@@ -841,7 +912,7 @@
               <summary>Limits of this bench</summary>
               <div className="fold-body">
                 <p>Each model ran once per diagram. A second run can come out differently, so small gaps between two models mean little.</p>
-                <p>Some models spent the whole token limit on reasoning and never got to the answer. Those calls were repeated once with twice the limit. Where that also failed, the diagram is missing for that model, and the model has no average.</p>
+                <p>Some models spent the whole token limit on reasoning and never got to the answer. Those calls were repeated once with twice the limit. Where that also failed, the diagram is missing for that model. Its average counts the missing diagram as zero, and its mark in the chart is hollow.</p>
                 <p>The models ran in three ways, and the table names the way for each. API runs had no tools at all. Their answers arrive as text with a code block, and the bench stores the content of that block. Agent runs had tools available. The task told them to use none except one call to save the file, and the session logs show that they complied. Chat runs were done by hand in the vendor's app, with whatever reasoning effort the app chose. Nothing about them is logged.</p>
                 <p>A model cannot be stopped from having seen the diagrams in its training data, and that is the point: the bench asks what stuck.</p>
                 <p>The release dates are those of the model listings and can be off by a few weeks for older models. The references are Duval Triangle 1 as used in IEC 60599, and Duval Pentagon 1 as published by Duval and Lamarre in 2014. This is a private hobby project with no connection to the IEC or to any of the vendors.</p>
