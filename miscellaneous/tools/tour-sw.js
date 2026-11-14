@@ -20,7 +20,7 @@
    tour-* cache, so the old copy cannot survive on someone's phone.
 */
 
-var CACHE = 'tour-v2';
+var CACHE = 'tour-v3';
 
 var ALLOW = [
   '/miscellaneous/tools/walking-tour.html',
