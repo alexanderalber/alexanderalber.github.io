@@ -81,6 +81,7 @@
           <li>Three lanes. The squad fires down the lane it stands in.</li>
           <li>Every enemy that gets past costs a soldier, in any lane.</li>
           <li>Blue gates add soldiers. Shooting through a gate raises its number.</li>
+          <li>The squad holds 99 soldiers. Beyond that, gates make it hit harder.</li>
           <li>Spike fields and steel rollers take a share of the squad that stands in their lane.</li>
           <li>No ads, no shop, no account. Everything runs in your browser.</li>
         </ul>
@@ -334,11 +335,26 @@
       return best;
     }
 
+    /* The squad grows to n. Beyond CAP there is no room for more soldiers, so
+       the surplus goes into damage instead: n soldiers' worth of fire from CAP
+       soldiers. Without it the squad stopped growing at CAP while the enemies
+       kept growing by GROWTH per stage, and every run ended at the same boss.
+       Returns the change in soldiers and the damage factor (1 below CAP). */
+    function advGrow(s, n) {
+      const before = s.n;
+      n = Math.max(0, n);
+      if (n <= ADV.CAP) { s.n = n; return { v: n - before, f: 1 }; }
+      const f = n / ADV.CAP;
+      s.dmg *= f; s.n = ADV.CAP;
+      return { v: ADV.CAP - before, f: f };
+    }
+
     function advReward(s, e) {
+      let up = 0;
       if (e.reward === 'rate') s.rate = Math.min(14, s.rate * ADV.RATE_UP);
       else if (e.reward === 'dmg') s.dmg *= ADV.DMG_UP;
-      else s.n = Math.min(ADV.CAP, s.n + e.val);
-      advEvent(s, { k: 'reward', x: e.x, d: e.d, reward: e.reward, v: e.val });
+      else { const g = advGrow(s, s.n + e.val); if (g.f > 1) up = g.f; }
+      advEvent(s, { k: 'reward', x: e.x, d: e.d, reward: e.reward, v: e.val, up: up });
     }
 
     function advLose(s, v, x) {
@@ -475,10 +491,8 @@
         } else if (!e.used && z <= 0) {
           e.used = true;
           if (s.px >= e.x0 && s.px < e.x1) {
-            const before = s.n;
-            s.n = e.op === 'mul' ? s.n * e.v : s.n + e.v;
-            s.n = advClamp(s.n, 0, ADV.CAP);
-            advEvent(s, { k: 'gate', x: s.px, d: s.dist, v: s.n - before });
+            const g = advGrow(s, e.op === 'mul' ? s.n * e.v : s.n + e.v);
+            advEvent(s, { k: 'gate', x: s.px, d: s.dist, v: g.v, up: g.f > 1 ? g.f : 0 });
           }
         }
         if (z < -4) continue;
@@ -1494,11 +1508,13 @@
             G.shake = { t: now, a: Math.min(9, 2.5 + e.v * 0.6) };
           }
           else if (e.k === 'gate') {
-            if (e.v) G.fx.push({ x: e.x, d: e.d, t: s.t, txt: (e.v > 0 ? '+' : '−') + Math.abs(e.v), col: e.v > 0 ? '#9cc4ff' : '#ff8f93', px: 0.75 });
-            if (e.v > 0) G.fx.push({ x: e.x, d: e.d, t: s.t, col: '#9cc4ff', px: 2.2 });
+            /* a full squad turns the gate into damage, and says so */
+            const txt = e.up ? '+' + Math.round((e.up - 1) * 100) + '% damage' : e.v ? (e.v > 0 ? '+' : '−') + Math.abs(e.v) : '';
+            if (txt) G.fx.push({ x: e.x, d: e.d, t: s.t, txt: txt, col: e.v < 0 ? '#ff8f93' : '#9cc4ff', px: e.up ? 0.55 : 0.75 });
+            if (e.v > 0 || e.up) G.fx.push({ x: e.x, d: e.d, t: s.t, col: '#9cc4ff', px: 2.2 });
           }
           else if (e.k === 'reward') {
-            G.fx.push({ x: e.x, d: e.d, t: s.t, txt: e.reward === 'rate' ? 'Faster gun' : e.reward === 'dmg' ? 'More damage' : '+' + e.v, col: COL.gold, px: 0.55 });
+            G.fx.push({ x: e.x, d: e.d, t: s.t, txt: e.reward === 'rate' ? 'Faster gun' : e.reward === 'dmg' ? 'More damage' : e.up ? '+' + Math.round((e.up - 1) * 100) + '% damage' : '+' + e.v, col: COL.gold, px: 0.55 });
             burst(e.x, e.d, 0.6, 10, COL.wood, 5, 0.12);
           }
           else if (e.k === 'stage') {
