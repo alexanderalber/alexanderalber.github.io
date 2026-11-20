@@ -1,0 +1,1022 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-theme-live data-section="miscellaneous" data-lang-default="en">
+<head>
+  <meta charset="utf-8">
+  <script>(function(){var d='dark',P={light:'light',dark:'dark',grey:'dark'},k=function(v){return typeof P[v]=='string'},e=document.documentElement,t=new URLSearchParams(location.search).get('theme');if(k(t)){try{localStorage.setItem('theme',t)}catch(x){}}else{try{t=localStorage.getItem('theme')}catch(x){}}if(!k(t))t=d;e.dataset.skin=t;e.dataset.theme=P[t];e.dataset.themeDefault=d;e.style.colorScheme=P[t];})();</script>
+  <script>document.documentElement.lang=(new URLSearchParams(location.search).get('lang')||localStorage.getItem('lang')||'en');</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Mine Pit - Blast for Ore Below the Water Table (Prototype)</title>
+  <meta name="description" content="Prototype: blast an open pit into a hillside and follow the ore down. Below the water table, groundwater seeps in and the pit floods. Place pumps to keep it dry. Runs entirely in your browser.">
+  <link rel="stylesheet" href="/assets/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/css/custom.css">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+
+  <style>
+    .pit-bar{display:flex;flex-wrap:wrap;gap:.6rem 1.2rem;align-items:center;margin-bottom:.6rem}
+    .pit-bar label{display:flex;align-items:center;gap:.5rem;margin:0;font-size:.8rem;color:var(--tool-label)}
+    .pit-bar input[type=range]{width:130px;margin:0}
+    .pit-bar input[role=switch]{margin:0}
+    .pit-view{border:1px solid var(--tool-border);border-radius:8px;box-shadow:var(--tool-panel-shadow);
+      background:var(--pico-card-background-color);overflow:hidden;position:relative}
+    .pit-view canvas{display:block;width:100%;height:100%;touch-action:none}
+    .pit-hint{color:var(--tool-note);font-size:.8rem;margin:.4rem 0 .8rem}
+    .pit-stats{color:var(--tool-label);font-size:.85rem;margin:0 0 .8rem;font-variant-numeric:tabular-nums}
+    .pit-stats b{color:var(--tool-text);font-weight:600}
+    .pit-pumps{list-style:none;padding:0;margin:0 0 .8rem}
+    .pit-pumps li{list-style:none;display:flex;align-items:center;gap:.6rem;font-size:.85rem;color:var(--tool-label);
+      padding:.25rem 0;border-bottom:1px solid var(--tool-hairline);font-variant-numeric:tabular-nums}
+    .pit-pumps li span{flex:1 1 auto}
+    .pit-sec{display:block;width:100%;height:170px;border:1px solid var(--tool-border);border-radius:8px;
+      box-shadow:var(--tool-panel-shadow)}
+    .pit-legend{display:flex;flex-wrap:wrap;gap:.3rem 1rem;font-size:.75rem;color:var(--tool-note);margin:.4rem 0 1rem}
+    .pit-legend i{display:inline-block;width:14px;height:0;border-top:2px solid;vertical-align:middle;margin-right:.35rem}
+    .pit-h2{font-size:.95rem;color:var(--tool-text);margin:1rem 0 .4rem}
+  </style>
+
+  <script type="importmap">
+  { "imports": { "three": "/assets/js/three.module.min.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from '/assets/js/OrbitControls.js';
+    window.THREE = THREE;
+    window.PIT_OrbitControls = OrbitControls;
+    window.dispatchEvent(new Event('pit-three-ready'));
+  </script>
+
+  <script src="/assets/js/react.production.min.js"></script>
+  <script src="/assets/js/react-dom.production.min.js"></script>
+  <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/icons.js"></script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul class="site-crumbs">
+        <li><a href="/"><span class="site-logo" role="img" aria-label="alber.me"></span></a></li>
+      </ul>
+      <ul>
+        <li class="theme-switcher">
+          <button class="lang-seg theme-seg" data-theme-set="light" aria-label="Light theme" title="Light"></button><button class="lang-seg theme-seg" data-theme-set="grey" aria-label="Grey theme" title="Grey"></button><button class="lang-seg theme-seg" data-theme-set="dark" aria-label="Dark theme" title="Dark"></button>
+        </li>
+      </ul>
+    </nav>
+  </header>
+
+  <script src="/assets/js/site-nav.js"></script>
+
+  <main>
+    <div id="root" style="padding-top:var(--pico-spacing)">
+      <div class="container">
+        <h1 style="font-size:1.5rem;color:var(--tool-text);margin-bottom:8px">Mine Pit</h1>
+        <p style="color:var(--tool-label);max-width:70ch">A prototype. Blast an open pit into the hillside and sell the ore. The iron seam shows at the surface and dips into the hill. The water table sits four metres below the surface. Below it, groundwater seeps into the pit. A flooded pit cannot be blasted, so place pumps to keep it dry.</p>
+        <ul style="color:var(--tool-label);max-width:70ch">
+          <li>Every charge costs money. Ore in the blasted rock pays it back.</li>
+          <li>Surface water flows as a shallow water simulation on the graphics card.</li>
+          <li>Groundwater is a second layer. Pumping lowers the water table around the pit.</li>
+          <li>A pump lifts water at most twelve metres. Deeper pits need a chain of pumps.</li>
+          <li>Everything runs in your browser. Nothing is uploaded.</li>
+        </ul>
+      </div>
+    </div>
+  </main>
+
+  <script id="pitcore">
+    /* Mine pit core: the model constants, the terrain generator and a plain-JS
+       reference of the simulation step. The page runs the same equations in two
+       fragment shaders (block "pitgl"); this copy exists so Node can test the
+       physics and so the shaders have something to be compared against.
+
+       Grid: N x N cells of DX metres, index k = j * N + i. i runs along world x,
+       j along world z. Fields per cell:
+         b  terrain height [m]
+         d  depth of surface water [m]
+         h  groundwater head [m]; the ground is saturated up to h
+         f  outflow to the four neighbours [m3/s], order: i-1, i+1, j-1, j+1
+
+       Surface water is the virtual-pipes scheme (Mei, Decaudin, Hu 2007): each
+       cell pushes water to a neighbour in proportion to the difference of the
+       water surfaces. Groundwater is plain diffusion of the head, which is the
+       Dupuit picture with a constant thickness. The two layers exchange water
+       where they touch: where the head stands above the pit floor it seeps out,
+       and standing water on dry ground percolates down. */
+    const PIT = {
+      N: 256,          // cells per side
+      DX: 1,           // cell size [m]
+      DT: 0.05,        // time step [s]
+      G: 9.81,
+      FRICTION: 0.6,   // decay of the pipe flow [1/s]; keeps a lake from sloshing forever
+      S: 0.1,          // drainable pore space: 1 m of seepage lowers the head by 1/S m
+      KH: 0.3,         // lateral spreading of the head [m2/s]; far faster than real ground
+      KS: 0.5,         // seepage rate where head and pit water meet [1/s]
+      KI: 5e-4,        // percolation of standing water into dry ground [m/s]
+      TABLE_DEPTH: 4,  // the water table starts this far below the surface [m]
+      RAIN: 1e-3,      // storm intensity [m/s]
+      PUMP_Q: 0.4,     // pump delivery at zero lift [m3/s]
+      PUMP_HEAD: 12,   // lift at which the delivery reaches zero [m]
+      MAX_PUMPS: 8,
+      MIN_B: 0,        // bedrock floor [m]
+      MAX_B: 45,       // highest fill [m]
+      /* The game layer. Two seams; value in money per cubic metre, colour as
+         0..1 RGB for the shader and the cross-section alike. */
+      ORE: [
+        { name: 'Iron ore', value: 3, color: [0.72, 0.38, 0.14] },
+        { name: 'Gold ore', value: 14, color: [0.92, 0.76, 0.25] }
+      ],
+      CHARGES: [
+        { name: 'Small', r: 4, depth: 1.5, cost: 10 },
+        { name: 'Large', r: 8, depth: 3, cost: 35 }
+      ],
+      PUMP_COST: 250,
+      START_CASH: 150,
+      BLAST_MAX_WATER: 0.3   // deeper water than this at the charge and it will not fire [m]
+    };
+
+    function pitRand(seed) {
+      let a = seed >>> 0;
+      return function () {
+        a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /* Smooth value noise in [-1, 1] on an N x N grid, `cells` lattice cells per side. */
+    function pitNoise(N, cells, rnd) {
+      const g = cells + 2, lat = new Float32Array(g * g);
+      for (let k = 0; k < lat.length; k++) lat[k] = rnd() * 2 - 1;
+      const out = new Float32Array(N * N);
+      for (let j = 0; j < N; j++) {
+        const y = j / N * cells, y0 = Math.floor(y), ty = y - y0, sy = ty * ty * (3 - 2 * ty);
+        for (let i = 0; i < N; i++) {
+          const x = i / N * cells, x0 = Math.floor(x), tx = x - x0, sx = tx * tx * (3 - 2 * tx);
+          const a = lat[y0 * g + x0], b = lat[y0 * g + x0 + 1];
+          const c = lat[(y0 + 1) * g + x0], e = lat[(y0 + 1) * g + x0 + 1];
+          out[j * N + i] = (a + (b - a) * sx) * (1 - sy) + (c + (e - c) * sx) * sy;
+        }
+      }
+      return out;
+    }
+
+    /* The hillside without its bumps: 30 m at j = 0 falling to 20 m at j = N - 1.
+       The water table follows this plane, so it is a steady state on its own. */
+    function pitBase(j, N) { return 20 + 10 * (1 - j / (N - 1)); }
+
+    function pitInitState(N, seed) {
+      const rnd = pitRand(seed), n = N * N;
+      const n1 = pitNoise(N, 4, rnd), n2 = pitNoise(N, 12, rnd);
+      const b = new Float32Array(n), h = new Float32Array(n);
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const k = j * N + i, base = pitBase(j, N);
+        b[k] = base + 1.2 * n1[k] + 0.4 * n2[k];
+        h[k] = base - PIT.TABLE_DEPTH;
+      }
+      /* Ore: per cell and seam the elevation of the seam's middle and its
+         thickness, [z1, t1, z2, t2]. Seam 1 meets the surface near the front of
+         the map and dips into the hill, so following it leads below the water
+         table. Seam 2 lies deep and nearly flat. Both are patchy lenses: the
+         thickness is zero where the mask noise is low. Laid out in fractions of
+         the map, so a small test grid has the same geology. */
+      const w1 = pitNoise(N, 6, rnd), m1 = pitNoise(N, 3, rnd), m2 = pitNoise(N, 3, rnd);
+      const lens = (v, lo, hi) => { const t = Math.min(1, Math.max(0, (v - lo) / (hi - lo))); return t * t * (3 - 2 * t); };
+      const ore = new Float32Array(4 * n);
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const k = j * N + i, v = j / (N - 1);
+        ore[4 * k] = 22 - 30 * (0.78 - v) + 0.8 * w1[k];
+        ore[4 * k + 1] = 1.8 * lens(m1[k], -0.45, -0.05);
+        ore[4 * k + 2] = 9 + 5 * (v - 0.5) + w1[k];
+        ore[4 * k + 3] = 2.4 * lens(m2[k], -0.2, 0.2);
+      }
+      return { N: N, ore: ore, b: b, b0: new Float32Array(b), d: new Float32Array(n), h: h,
+               f: new Float32Array(4 * n), d2: new Float32Array(n), h2: new Float32Array(n),
+               f2: new Float32Array(4 * n) };
+    }
+
+    /* Delivery of one pump [m3/s] for the current state: falls linearly with the
+       lift between the two water surfaces and cannot exceed what stands in the
+       intake cell. */
+    function pitPumpFlow(p, b, d, N, P) {
+      const ki = p.in.j * N + p.in.i, ko = p.out.j * N + p.out.i;
+      const lift = Math.max(0, b[ko] + d[ko] - b[ki] - d[ki]);
+      const q = P.PUMP_Q * Math.min(1, Math.max(0, 1 - lift / P.PUMP_HEAD));
+      return { lift: lift, q: Math.min(q, d[ki] * P.DX * P.DX / P.DT) };
+    }
+
+    /* One time step. pumps: [{in:{i,j}, out:{i,j}}], rain in m/s. */
+    function pitStep(s, P, pumps, rain) {
+      const N = s.N, b = s.b, d = s.d, h = s.h, f = s.f, nf = s.f2, nd = s.d2, nh = s.h2;
+      const A = P.DX * P.DX, fr = Math.exp(-P.FRICTION * P.DT), c = P.DT * P.G * P.DX;
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const k = j * N + i, H = b[k] + d[k];
+        const fl = i > 0     ? Math.max(0, f[4 * k]     * fr + c * (H - b[k - 1] - d[k - 1])) : 0;
+        const fR = i < N - 1 ? Math.max(0, f[4 * k + 1] * fr + c * (H - b[k + 1] - d[k + 1])) : 0;
+        const ft = j > 0     ? Math.max(0, f[4 * k + 2] * fr + c * (H - b[k - N] - d[k - N])) : 0;
+        const fb = j < N - 1 ? Math.max(0, f[4 * k + 3] * fr + c * (H - b[k + N] - d[k + N])) : 0;
+        const sum = fl + fR + ft + fb;
+        const K = sum > 0 ? Math.min(1, d[k] * A / (sum * P.DT)) : 0;
+        nf[4 * k] = fl * K; nf[4 * k + 1] = fR * K; nf[4 * k + 2] = ft * K; nf[4 * k + 3] = fb * K;
+      }
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const k = j * N + i;
+        if (i === 0 || j === 0 || i === N - 1 || j === N - 1) {
+          // the map edge swallows surface water and holds the far-field head
+          nd[k] = 0; nh[k] = h[k]; continue;
+        }
+        const fin = nf[4 * (k - 1) + 1] + nf[4 * (k + 1)] + nf[4 * (k - N) + 3] + nf[4 * (k + N) + 2];
+        const fout = nf[4 * k] + nf[4 * k + 1] + nf[4 * k + 2] + nf[4 * k + 3];
+        let dd = d[k] + P.DT * (fin - fout) / A + rain * P.DT;
+        for (let q = 0; q < pumps.length; q++) {
+          const p = pumps[q], isIn = p.in.i === i && p.in.j === j, isOut = p.out.i === i && p.out.j === j;
+          if (!isIn && !isOut) continue;
+          const a = pitPumpFlow(p, b, d, N, P).q * P.DT / A;
+          if (isIn) dd -= a;
+          if (isOut) dd += a;
+        }
+        if (dd < 0) dd = 0;
+        let hh = h[k] + P.DT * P.KH * (h[k - 1] + h[k + 1] + h[k - N] + h[k + N] - 4 * h[k]) / A;
+        let x;
+        if (hh > b[k]) x = Math.max(P.KS * P.DT * (hh - (b[k] + dd)), -dd);
+        else x = -Math.min(P.KI * P.DT, dd);
+        nd[k] = dd + x; nh[k] = hh - x / P.S;
+      }
+      s.d = nd; s.d2 = d; s.h = nh; s.h2 = h; s.f = nf; s.f2 = f;
+    }
+
+    /* Round brush with a soft edge. amount > 0 digs, amount < 0 fills. Returns
+       the volume moved [m3], positive for digging. */
+    function pitBrush(b, N, ci, cj, r, amount, lo, hi) {
+      let moved = 0;
+      const i0 = Math.max(1, Math.floor(ci - r)), i1 = Math.min(N - 2, Math.ceil(ci + r));
+      const j0 = Math.max(1, Math.floor(cj - r)), j1 = Math.min(N - 2, Math.ceil(cj + r));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const q = ((i - ci) * (i - ci) + (j - cj) * (j - cj)) / (r * r);
+        if (q >= 1) continue;
+        const k = j * N + i, w = (1 - q) * (1 - q);
+        const v = Math.min(hi, Math.max(lo, b[k] - amount * w));
+        moved += b[k] - v; b[k] = v;
+      }
+      return moved;
+    }
+
+    /* One charge at cell (ci, cj): a crater of radius r and depth `depth` at its
+       middle, same soft profile as the brush. Returns the rock moved [m3], the
+       ore in it [m3] and what that ore sells for. Ore is whatever part of the
+       removed column lay inside a seam. */
+    function pitBlast(s, ci, cj, r, depth, P) {
+      const N = s.N, b = s.b, ore = s.ore, A = P.DX * P.DX;
+      let rock = 0, oreVol = 0, value = 0;
+      const i0 = Math.max(1, Math.floor(ci - r)), i1 = Math.min(N - 2, Math.ceil(ci + r));
+      const j0 = Math.max(1, Math.floor(cj - r)), j1 = Math.min(N - 2, Math.ceil(cj + r));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const q = ((i - ci) * (i - ci) + (j - cj) * (j - cj)) / (r * r);
+        if (q >= 1) continue;
+        const k = j * N + i, old = b[k], nb = Math.max(P.MIN_B, old - depth * (1 - q) * (1 - q));
+        if (nb >= old) continue;
+        rock += (old - nb) * A;
+        for (let m = 0; m < 2; m++) {
+          const zc = ore[4 * k + 2 * m], t = ore[4 * k + 2 * m + 1];
+          const ov = Math.min(old, zc + t / 2) - Math.max(nb, zc - t / 2);
+          if (t > 0 && ov > 0) { oreVol += ov * A; value += ov * A * P.ORE[m].value; }
+        }
+        b[k] = nb;
+      }
+      return { rock: rock, ore: oreVol, value: value };
+    }
+
+    /* First cell a ray hits, or null. Origin and direction in world metres; the
+       grid is centred on the world origin. */
+    function pitPick(b, N, DX, ox, oy, oz, dx, dy, dz) {
+      const half = N * DX / 2;
+      for (let t = 0; t < 1500; t += 0.4) {
+        const x = ox + dx * t, y = oy + dy * t, z = oz + dz * t;
+        if (y < -1) return null;
+        const i = Math.floor((x + half) / DX), j = Math.floor((z + half) / DX);
+        if (i < 0 || j < 0 || i >= N || j >= N) continue;
+        if (y <= b[j * N + i]) return { i: i, j: j };
+      }
+      return null;
+    }
+
+    function pitStats(s, P) {
+      let water = 0, dug = 0;
+      const n = s.N * s.N, A = P.DX * P.DX;
+      for (let k = 0; k < n; k++) {
+        water += s.d[k];
+        if (s.b0[k] > s.b[k]) dug += s.b0[k] - s.b[k];
+      }
+      return { water: water * A, dug: dug * A };
+    }
+  </script>
+
+  <script id="pitgl">
+    /* The shaders. fragFlux and fragWater are pitStep() from the core block, one
+       pass each, on two float textures that are swapped after every step:
+         tB  terrain, R = b            (uploaded from JS, digging happens there)
+         tW  water,   R = d, G = h
+         tF  flux,    RGBA = outflow to i-1, i+1, j-1, j+1
+       All constants arrive as uniforms from PIT, so the two copies cannot drift
+       in their numbers, only in their formulas. */
+    const PITGL = {
+      vertQuad: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+
+      fragCopy: `
+        precision highp float; precision highp sampler2D;
+        uniform sampler2D tSrc; varying vec2 vUv;
+        void main() { gl_FragColor = texture2D(tSrc, vUv); }`,
+
+      fragFlux: `
+        precision highp float; precision highp sampler2D;
+        uniform sampler2D tB, tW, tF;
+        uniform vec2 uTexel;
+        uniform float uDT, uG, uDX, uFr;
+        varying vec2 vUv;
+        float surf(vec2 uv) { return texture2D(tB, uv).r + texture2D(tW, uv).r; }
+        void main() {
+          vec2 ex = vec2(uTexel.x, 0.0), ey = vec2(0.0, uTexel.y);
+          float d = texture2D(tW, vUv).r;
+          float H = texture2D(tB, vUv).r + d;
+          vec4 Hn = vec4(surf(vUv - ex), surf(vUv + ex), surf(vUv - ey), surf(vUv + ey));
+          vec4 f = max(vec4(0.0), texture2D(tF, vUv) * uFr + uDT * uG * uDX * (vec4(H) - Hn));
+          if (vUv.x < uTexel.x) f.x = 0.0;
+          if (vUv.x > 1.0 - uTexel.x) f.y = 0.0;
+          if (vUv.y < uTexel.y) f.z = 0.0;
+          if (vUv.y > 1.0 - uTexel.y) f.w = 0.0;
+          float sum = f.x + f.y + f.z + f.w;
+          f *= sum > 0.0 ? min(1.0, d * uDX * uDX / (sum * uDT)) : 0.0;
+          gl_FragColor = f;
+        }`,
+
+      fragWater: `
+        precision highp float; precision highp sampler2D;
+        uniform sampler2D tB, tW, tF;
+        uniform vec2 uTexel;
+        uniform float uDT, uDX, uS, uKH, uKS, uKI, uRain, uHead;
+        uniform vec2 uPIn[8];
+        uniform vec2 uPOut[8];
+        uniform float uPQ[8];
+        varying vec2 vUv;
+        void main() {
+          vec2 ex = vec2(uTexel.x, 0.0), ey = vec2(0.0, uTexel.y);
+          vec4 w = texture2D(tW, vUv);
+          float b = texture2D(tB, vUv).r;
+          if (vUv.x < uTexel.x || vUv.y < uTexel.y || vUv.x > 1.0 - uTexel.x || vUv.y > 1.0 - uTexel.y) {
+            gl_FragColor = vec4(0.0, w.g, 0.0, 1.0);
+            return;
+          }
+          vec4 f = texture2D(tF, vUv);
+          float fin = texture2D(tF, vUv - ex).y + texture2D(tF, vUv + ex).x
+                    + texture2D(tF, vUv - ey).w + texture2D(tF, vUv + ey).z;
+          float A = uDX * uDX;
+          float d = w.r + uDT * (fin - (f.x + f.y + f.z + f.w)) / A + uRain * uDT;
+          vec2 cell = floor(gl_FragCoord.xy);
+          for (int k = 0; k < 8; k++) {
+            if (uPQ[k] <= 0.0) continue;
+            bool isIn = all(equal(cell, uPIn[k]));
+            bool isOut = all(equal(cell, uPOut[k]));
+            if (!isIn && !isOut) continue;
+            vec2 ui = (uPIn[k] + 0.5) * uTexel, uo = (uPOut[k] + 0.5) * uTexel;
+            float di = texture2D(tW, ui).r;
+            float lift = max(0.0, texture2D(tB, uo).r + texture2D(tW, uo).r - texture2D(tB, ui).r - di);
+            float a = min(uPQ[k] * clamp(1.0 - lift / uHead, 0.0, 1.0) * uDT / A, di);
+            if (isIn) d -= a;
+            if (isOut) d += a;
+          }
+          d = max(d, 0.0);
+          float h = w.g + uDT * uKH * (texture2D(tW, vUv - ex).g + texture2D(tW, vUv + ex).g
+                  + texture2D(tW, vUv - ey).g + texture2D(tW, vUv + ey).g - 4.0 * w.g) / A;
+          float x;
+          if (h > b) x = max(uKS * uDT * (h - (b + d)), -d);
+          else x = -min(uKI * uDT, d);
+          gl_FragColor = vec4(d + x, h - x / uS, 0.0, 1.0);
+        }`,
+
+      /* Display. Both meshes are the same flat grid; the height comes from the
+         textures in the vertex shader. */
+      vertTerrain: `
+        precision highp float; precision highp sampler2D;
+        uniform sampler2D tB, tB0, tW, tOre;
+        uniform vec2 uTexel;
+        uniform float uDX;
+        varying vec3 vN; varying vec3 vPos; varying float vDug; varying float vWet; varying vec4 vOre;
+        void main() {
+          vOre = texture2D(tOre, uv);
+          vec2 ex = vec2(uTexel.x, 0.0), ey = vec2(0.0, uTexel.y);
+          float b = texture2D(tB, uv).r;
+          vN = normalize(vec3(texture2D(tB, uv - ex).r - texture2D(tB, uv + ex).r, 2.0 * uDX,
+                              texture2D(tB, uv - ey).r - texture2D(tB, uv + ey).r));
+          vDug = texture2D(tB0, uv).r - b;
+          vWet = texture2D(tW, uv).g - b;
+          vPos = vec3(position.x, b, position.z);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(vPos, 1.0);
+        }`,
+
+      fragTerrain: `
+        precision highp float;
+        uniform vec3 uSun, uOre1, uOre2;
+        varying vec3 vN; varying vec3 vPos; varying float vDug; varying float vWet; varying vec4 vOre;
+        float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        vec3 strata(float y) {
+          if (y < 4.0) return vec3(0.23, 0.24, 0.27);
+          if (y < 7.0) return vec3(0.30, 0.31, 0.33);
+          if (y < 12.0) return vec3(0.38, 0.36, 0.35);
+          if (y < 14.0) return vec3(0.55, 0.50, 0.42);
+          if (y < 19.0) return vec3(0.45, 0.40, 0.36);
+          return vec3(0.60, 0.52, 0.40);
+        }
+        void main() {
+          float n = hash(floor(vPos.xz * 2.0));
+          vec3 col;
+          bool o1 = vOre.y > 0.05 && abs(vPos.y - vOre.x) < 0.5 * vOre.y;
+          bool o2 = vOre.w > 0.05 && abs(vPos.y - vOre.z) < 0.5 * vOre.w;
+          if (vDug < -0.03) col = vec3(0.50, 0.45, 0.38);
+          else if (vDug < 0.03) col = mix(vec3(0.34, 0.46, 0.24) + 0.05 * n, uOre1, o1 ? 0.6 : 0.0);
+          else if (o2) col = uOre2;
+          else if (o1) col = uOre1;
+          else if (vDug < 1.5) col = vec3(0.42, 0.31, 0.20);
+          else col = strata(vPos.y + 0.6 * sin(vPos.x * 0.07) + 0.4 * sin(vPos.z * 0.05));
+          col *= 0.94 + 0.12 * n;
+          col *= mix(1.0, 0.62, smoothstep(-0.4, 0.0, vWet));
+          float diff = max(dot(normalize(vN), uSun), 0.0);
+          col *= 0.42 + 0.78 * diff;
+          /* Contour lines every metre, a stronger one every five. The distance
+             to the nearest level is divided by its screen-space gradient, so a
+             line is about one pixel wide on any slope. On walls so steep that
+             the lines would merge they fade out. */
+          float w1 = fwidth(vPos.y), w5 = fwidth(vPos.y / 5.0);
+          float l1 = 1.0 - min(abs(fract(vPos.y - 0.5) - 0.5) / max(w1, 1e-5), 1.0);
+          float l5 = 1.0 - min(abs(fract(vPos.y / 5.0 - 0.5) - 0.5) / max(w5, 1e-5) * 0.6, 1.0);
+          float line = max(0.45 * l1 * (1.0 - smoothstep(0.25, 0.6, w1)), 0.75 * l5 * (1.0 - smoothstep(0.25, 0.6, w5)));
+          gl_FragColor = vec4(col * (1.0 - 0.6 * line), 1.0);
+        }`,
+
+      vertWater: `
+        precision highp float; precision highp sampler2D;
+        uniform sampler2D tB, tW;
+        uniform vec2 uTexel;
+        uniform float uDX;
+        varying vec3 vN; varying vec3 vPos; varying float vD;
+        float surf(vec2 uv) { return texture2D(tB, uv).r + texture2D(tW, uv).r; }
+        void main() {
+          vec2 ex = vec2(uTexel.x, 0.0), ey = vec2(0.0, uTexel.y);
+          vD = texture2D(tW, uv).r;
+          vN = normalize(vec3(surf(uv - ex) - surf(uv + ex), 2.0 * uDX, surf(uv - ey) - surf(uv + ey)));
+          vPos = vec3(position.x, texture2D(tB, uv).r + vD, position.z);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(vPos, 1.0);
+        }`,
+
+      fragWater3d: `
+        precision highp float;
+        uniform vec3 uSun;
+        varying vec3 vN; varying vec3 vPos; varying float vD;
+        void main() {
+          if (vD < 0.004) discard;
+          vec3 N = normalize(mix(vec3(0.0, 1.0, 0.0), normalize(vN), 0.35));
+          vec3 V = normalize(cameraPosition - vPos);
+          float spec = pow(max(dot(reflect(-uSun, N), V), 0.0), 60.0);
+          float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+          vec3 col = mix(vec3(0.30, 0.58, 0.70), vec3(0.06, 0.22, 0.40), smoothstep(0.0, 3.0, vD));
+          col = mix(col, vec3(0.75, 0.85, 0.92), 0.35 * fres) + 0.6 * spec;
+          gl_FragColor = vec4(col, mix(0.5, 0.93, smoothstep(0.0, 2.0, vD)));
+        }`
+    };
+  </script>
+
+  <script id="app">
+    const html = htm.bind(React.createElement);
+    const { useState, useEffect, useRef } = React;
+
+    const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    const PAL = {};
+    function readPalette() {
+      Object.assign(PAL, {
+        ground: cssVar('--tool-border'), faint: cssVar('--tool-faint'),
+        water: cssVar('--tool-sig-info'),
+        ring: cssVar('--tool-emph'), note: cssVar('--tool-note')
+      });
+    }
+    readPalette();
+
+    /* Substeps per frame. At 60 frames per second, 16 steps of 0.05 s run the
+       pit 48 times faster than real time. */
+    const SPEEDS = [['Pause', 0], ['Slow', 4], ['Normal', 16], ['Fast', 60]];
+    /* Dig and Fill are the free-hand brushes of the first prototype. They cost
+       nothing and sell nothing, so they only show up with ?debug in the URL. */
+    const DEBUG = new URLSearchParams(location.search).has('debug');
+    const TOOLS = [['blast', 'Blast'], ['pump', 'Pump'], ['look', 'Look']]
+      .concat(DEBUG ? [['dig', 'Dig'], ['fill', 'Fill']] : []);
+    const money = (v) => '$' + Math.round(v).toLocaleString('en-US');
+    const oreCss = (m) => 'rgb(' + PIT.ORE[m].color.map((c) => Math.round(c * 255)).join(',') + ')';
+    const HINTS = {
+      blast: 'Click to set off a charge. Right button rotates the view, the wheel zooms.',
+      dig: 'Drag with the left button to dig. Right button rotates the view, the wheel zooms.',
+      fill: 'Drag with the left button to pile up ground, for a dam or a ditch bank.',
+      pump: 'Click where the pump takes water in. Then click where it lets the water out. A pump costs ' + money(PIT.PUMP_COST) + '.',
+      look: 'Drag to rotate the view. Middle button moves it, the wheel zooms.'
+    };
+
+    /* Everything that touches WebGL. Reads the controls through cb.ui() on every
+       frame, so React state never has to be pushed in. */
+    function createEngine(THREE, OrbitControls, host, secCanvas, cb) {
+      const P = PIT, N = P.N, n = N * N;
+      const st = pitInitState(N, 7);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      const gl = renderer.getContext();
+      if (!gl.getExtension('EXT_color_buffer_float')) {
+        renderer.dispose();
+        throw new Error('no float render targets');
+      }
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setClearColor(0x000000, 0);
+      host.appendChild(renderer.domElement);
+
+      /* ---- simulation textures ---- */
+      const dataTex = (arr, fmt) => {
+        const t = new THREE.DataTexture(arr, N, N, fmt, THREE.FloatType);
+        t.minFilter = t.magFilter = THREE.NearestFilter;
+        t.needsUpdate = true;
+        return t;
+      };
+      const texB = dataTex(st.b, THREE.RedFormat);
+      const texB0 = dataTex(st.b0, THREE.RedFormat);
+      const texOre = dataTex(st.ore, THREE.RGBAFormat);
+      const target = () => new THREE.WebGLRenderTarget(N, N, {
+        type: THREE.FloatType, format: THREE.RGBAFormat, depthBuffer: false,
+        minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter
+      });
+      const rtW = [target(), target()], rtF = [target(), target()];
+      let cur = 0;
+
+      const texel = new THREE.Vector2(1 / N, 1 / N);
+      const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
+      quad.frustumCulled = false;
+      const quadScene = new THREE.Scene();
+      quadScene.add(quad);
+      const pass = (frag, uniforms) => new THREE.ShaderMaterial({
+        vertexShader: PITGL.vertQuad, fragmentShader: frag, uniforms: uniforms,
+        depthTest: false, depthWrite: false
+      });
+      const matCopy = pass(PITGL.fragCopy, { tSrc: { value: null } });
+      const matFlux = pass(PITGL.fragFlux, {
+        tB: { value: texB }, tW: { value: null }, tF: { value: null }, uTexel: { value: texel },
+        uDT: { value: P.DT }, uG: { value: P.G }, uDX: { value: P.DX },
+        uFr: { value: Math.exp(-P.FRICTION * P.DT) }
+      });
+      const vec8 = () => Array.from({ length: 8 }, () => new THREE.Vector2(-9, -9));
+      const matWater = pass(PITGL.fragWater, {
+        tB: { value: texB }, tW: { value: null }, tF: { value: null }, uTexel: { value: texel },
+        uDT: { value: P.DT }, uDX: { value: P.DX }, uS: { value: P.S }, uKH: { value: P.KH },
+        uKS: { value: P.KS }, uKI: { value: P.KI }, uRain: { value: 0 }, uHead: { value: P.PUMP_HEAD },
+        uPIn: { value: vec8() }, uPOut: { value: vec8() }, uPQ: { value: [0, 0, 0, 0, 0, 0, 0, 0] }
+      });
+      function run(mat, rt) {
+        quad.material = mat;
+        renderer.setRenderTarget(rt);
+        renderer.render(quadScene, quadCam);
+      }
+      function upload() {
+        const w = new Float32Array(4 * n);
+        for (let k = 0; k < n; k++) { w[4 * k] = st.d[k]; w[4 * k + 1] = st.h[k]; }
+        const tw = dataTex(w, THREE.RGBAFormat), tz = dataTex(new Float32Array(4 * n), THREE.RGBAFormat);
+        matCopy.uniforms.tSrc.value = tw; run(matCopy, rtW[cur]);
+        matCopy.uniforms.tSrc.value = tz; run(matCopy, rtF[cur]);
+        renderer.setRenderTarget(null);
+        tw.dispose(); tz.dispose();
+      }
+      upload();
+      function step(count) {
+        for (let q = 0; q < count; q++) {
+          matFlux.uniforms.tW.value = rtW[cur].texture;
+          matFlux.uniforms.tF.value = rtF[cur].texture;
+          run(matFlux, rtF[1 - cur]);
+          matWater.uniforms.tW.value = rtW[cur].texture;
+          matWater.uniforms.tF.value = rtF[1 - cur].texture;
+          run(matWater, rtW[1 - cur]);
+          cur = 1 - cur;
+        }
+      }
+      const readBuf = new Float32Array(4 * n);
+      function readback() {
+        renderer.readRenderTargetPixels(rtW[cur], 0, 0, N, N, readBuf);
+        for (let k = 0; k < n; k++) { st.d[k] = readBuf[4 * k]; st.h[k] = readBuf[4 * k + 1]; }
+      }
+
+      /* ---- scene ---- */
+      const half = N * P.DX / 2;
+      const pos = new Float32Array(n * 3), uvs = new Float32Array(n * 2);
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const k = j * N + i;
+        pos[3 * k] = (i + 0.5) * P.DX - half; pos[3 * k + 2] = (j + 0.5) * P.DX - half;
+        uvs[2 * k] = (i + 0.5) / N; uvs[2 * k + 1] = (j + 0.5) / N;
+      }
+      const idx = new Uint32Array((N - 1) * (N - 1) * 6);
+      let o = 0;
+      for (let j = 0; j < N - 1; j++) for (let i = 0; i < N - 1; i++) {
+        const a = j * N + i, b = a + 1, c = a + N, e = c + 1;
+        idx[o++] = a; idx[o++] = c; idx[o++] = b; idx[o++] = b; idx[o++] = c; idx[o++] = e;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setIndex(new THREE.BufferAttribute(idx, 1));
+
+      const sun = new THREE.Vector3(0.45, 0.8, 0.4).normalize();
+      const matTerrain = new THREE.ShaderMaterial({
+        vertexShader: PITGL.vertTerrain, fragmentShader: PITGL.fragTerrain, side: THREE.DoubleSide,
+        uniforms: { tB: { value: texB }, tB0: { value: texB0 }, tW: { value: null }, tOre: { value: texOre },
+                    uOre1: { value: new THREE.Vector3().fromArray(P.ORE[0].color) },
+                    uOre2: { value: new THREE.Vector3().fromArray(P.ORE[1].color) },
+                    uTexel: { value: texel }, uDX: { value: P.DX }, uSun: { value: sun } }
+      });
+      const matWater3d = new THREE.ShaderMaterial({
+        vertexShader: PITGL.vertWater, fragmentShader: PITGL.fragWater3d, side: THREE.DoubleSide,
+        transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+        uniforms: { tB: { value: texB }, tW: { value: null }, uTexel: { value: texel },
+                    uDX: { value: P.DX }, uSun: { value: sun } }
+      });
+      const scene = new THREE.Scene();
+      const terrain = new THREE.Mesh(geo, matTerrain), water = new THREE.Mesh(geo, matWater3d);
+      terrain.frustumCulled = water.frustumCulled = false;
+      water.renderOrder = 1;
+      scene.add(terrain, water);
+
+      const camera = new THREE.PerspectiveCamera(40, 1.6, 1, 3000);
+      camera.position.set(0, 120, 205);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 20, 28);
+      controls.maxPolarAngle = Math.PI / 2 - 0.06;
+      controls.minDistance = 15; controls.maxDistance = 600;
+      controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+      controls.update();
+
+      /* brush ring */
+      const RING = 64;
+      const ringGeo = new THREE.BufferGeometry();
+      ringGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(RING * 3), 3));
+      const ring = new THREE.LineLoop(ringGeo, new THREE.LineBasicMaterial({ color: PAL.ring, depthTest: false }));
+      ring.frustumCulled = false; ring.visible = false; ring.renderOrder = 3;
+      scene.add(ring);
+
+      /* pump markers: a box at the intake, a ball at the outlet, a straight pipe */
+      const markers = new THREE.Group();
+      scene.add(markers);
+      const matIn = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+      const matOut = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+      const matPipe = new THREE.LineBasicMaterial({ color: 0xf8fafc });
+      const boxGeo = new THREE.BoxGeometry(1.6, 1.6, 1.6), ballGeo = new THREE.SphereGeometry(0.9, 12, 8);
+      const world = (c, lift) => new THREE.Vector3((c.i + 0.5) * P.DX - half,
+        st.b[c.j * N + c.i] + st.d[c.j * N + c.i] + lift, (c.j + 0.5) * P.DX - half);
+      function updateMarkers(u) {
+        while (markers.children.length) {
+          const m = markers.children.pop();
+          if (m.isLine) m.geometry.dispose();
+        }
+        const add = (geo, mat, v) => { const m = new THREE.Mesh(geo, mat); m.position.copy(v); markers.add(m); };
+        for (const p of u.pumps) {
+          const a = world(p.in, 0.8), b = world(p.out, 0.8);
+          add(boxGeo, matIn, a); add(ballGeo, matOut, b);
+          markers.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]), matPipe));
+        }
+        if (u.pending) add(boxGeo, matIn, world(u.pending, 0.8));
+      }
+
+      /* blast flash: a ball that grows and fades */
+      const flashes = [], flashGeo = new THREE.SphereGeometry(1, 16, 10);
+      function addFlash(c, r) {
+        const m = new THREE.Mesh(flashGeo, new THREE.MeshBasicMaterial({ color: 0xffc56b, transparent: true, opacity: 0.9, depthWrite: false }));
+        m.position.copy(world(c, 0)); m.renderOrder = 2; m.userData = { t: 0, r: r };
+        scene.add(m); flashes.push(m);
+      }
+      function updateFlashes(dt) {
+        for (let q = flashes.length - 1; q >= 0; q--) {
+          const m = flashes[q], k = (m.userData.t += dt) / 0.4;
+          if (k >= 1) { scene.remove(m); m.material.dispose(); flashes.splice(q, 1); continue; }
+          m.scale.setScalar(m.userData.r * (0.3 + 0.9 * k)); m.material.opacity = 0.9 * (1 - k);
+        }
+      }
+      function blast(u, c) {
+        const ch = P.CHARGES[u.charge];
+        if (u.cash < ch.cost) { cb.note('Not enough cash for this charge.'); return; }
+        if (st.d[c.j * N + c.i] > P.BLAST_MAX_WATER) { cb.note('Too much water here. Pump it out first.'); return; }
+        const res = pitBlast(st, c.i, c.j, ch.r, ch.depth, P);
+        texB.needsUpdate = true;
+        secCol = Math.min(N - 2, Math.max(1, c.i));
+        markersDirty = true;
+        addFlash(c, ch.r);
+        cb.blasted(res, ch.cost);
+      }
+
+      /* ---- pointer ---- */
+      const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+      let hover = null, pressing = false, secCol = N >> 1, markersDirty = true;
+      function pickAt(ev) {
+        const r = renderer.domElement.getBoundingClientRect();
+        ndc.set((ev.clientX - r.left) / r.width * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+        ray.setFromCamera(ndc, camera);
+        const o = ray.ray.origin, d = ray.ray.direction;
+        return pitPick(st.b, N, P.DX, o.x, o.y, o.z, d.x, d.y, d.z);
+      }
+      function drawRing(u) {
+        ring.visible = !!hover && u.tool !== 'look';
+        if (!ring.visible) return;
+        const r = u.tool === 'pump' ? 1.2 : u.tool === 'blast' ? P.CHARGES[u.charge].r : u.radius;
+        const a = ringGeo.attributes.position.array;
+        for (let q = 0; q < RING; q++) {
+          const an = q / RING * Math.PI * 2;
+          const fi = hover.i + 0.5 + Math.cos(an) * r, fj = hover.j + 0.5 + Math.sin(an) * r;
+          const ci = Math.min(N - 1, Math.max(0, Math.floor(fi))), cj = Math.min(N - 1, Math.max(0, Math.floor(fj)));
+          a[3 * q] = fi * P.DX - half; a[3 * q + 1] = st.b[cj * N + ci] + st.d[cj * N + ci] + 0.25;
+          a[3 * q + 2] = fj * P.DX - half;
+        }
+        ringGeo.attributes.position.needsUpdate = true;
+      }
+      const el = renderer.domElement;
+      const onDown = (ev) => {
+        if (ev.button !== 0) return;
+        const u = cb.ui();
+        if (u.tool === 'look') return;
+        hover = pickAt(ev);
+        if (u.tool === 'pump') { if (hover) cb.pumpClick({ i: hover.i, j: hover.j }); return; }
+        if (u.tool === 'blast') { if (hover) blast(u, { i: hover.i, j: hover.j }); return; }
+        pressing = true;
+        try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      };
+      const onMove = (ev) => { hover = pickAt(ev); };
+      const onUp = () => { pressing = false; };
+      const onLeave = () => { if (!pressing) hover = null; };
+      el.addEventListener('pointerdown', onDown);
+      el.addEventListener('pointermove', onMove);
+      el.addEventListener('pointerup', onUp);
+      el.addEventListener('pointercancel', onUp);
+      el.addEventListener('pointerleave', onLeave);
+
+      /* ---- cross-section ---- */
+      /* A cut up the hill through the column of the last blast: uphill on the
+         left, the front of the map on the right. Along this direction the iron
+         seam dips, which a cut across the slope would not show. */
+      function drawSection() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = secCanvas.clientWidth, hgt = secCanvas.clientHeight;
+        if (!w) return;
+        if (secCanvas.width !== Math.round(w * dpr)) { secCanvas.width = Math.round(w * dpr); secCanvas.height = Math.round(hgt * dpr); }
+        const g = secCanvas.getContext('2d');
+        g.setTransform(dpr, 0, 0, dpr, 0, 0);
+        g.clearRect(0, 0, w, hgt);
+        const X = (j) => (j + 0.5) / N * w, Y = (y) => hgt - 4 - y / 34 * (hgt - 8);
+        const at = (j) => j * N + secCol, cw = w / N;
+        g.fillStyle = PAL.water;
+        for (let j = 0; j < N; j++) {
+          const k = at(j), d = st.d[k];
+          if (d > 0.004) g.fillRect(X(j) - cw / 2, Y(st.b[k] + d), cw + 0.5, Math.max(1, Y(st.b[k]) - Y(st.b[k] + d)));
+        }
+        g.fillStyle = PAL.ground;
+        g.beginPath(); g.moveTo(0, hgt);
+        for (let j = 0; j < N; j++) g.lineTo(X(j), Y(st.b[at(j)]));
+        g.lineTo(w, hgt); g.closePath(); g.fill();
+        for (let m = 0; m < 2; m++) {
+          g.fillStyle = oreCss(m);
+          for (let j = 0; j < N; j++) {
+            const k = at(j), zc = st.ore[4 * k + 2 * m], t = st.ore[4 * k + 2 * m + 1];
+            const top = Math.min(zc + t / 2, st.b[k]), bot = zc - t / 2;
+            if (t > 0.05 && top > bot) g.fillRect(X(j) - cw / 2, Y(top), cw + 0.5, Math.max(1, Y(bot) - Y(top)));
+          }
+        }
+        const line = (arr, color, dash) => {
+          g.strokeStyle = color; g.lineWidth = 1.5; g.setLineDash(dash);
+          g.beginPath();
+          for (let j = 0; j < N; j++) { if (j) g.lineTo(X(j), Y(arr[at(j)])); else g.moveTo(X(j), Y(arr[at(j)])); }
+          g.stroke(); g.setLineDash([]);
+        };
+        line(st.b0, PAL.faint, [4, 4]);
+        line(st.h, PAL.water, []);
+      }
+
+      /* ---- loop ---- */
+      function resize() {
+        const w = host.clientWidth || 600, hgt = Math.round(Math.min(700, Math.max(320, w * 0.66)));
+        host.style.height = hgt + 'px';
+        renderer.setSize(w, hgt);
+        camera.aspect = w / hgt; camera.updateProjectionMatrix();
+      }
+      resize();
+      window.addEventListener('resize', resize);
+      const onTheme = () => { readPalette(); ring.material.color.set(PAL.ring); drawSection(); };
+      window.addEventListener('themechange', onTheme);
+
+      let raf = 0, last = performance.now(), lastRead = 0, lastPumps = null, lastPending = null, dead = false;
+      function frame(t) {
+        if (dead) return;
+        raf = requestAnimationFrame(frame);
+        const u = cb.ui(), dtReal = Math.min(0.05, (t - last) / 1000);
+        last = t;
+        const look = u.tool === 'look';
+        controls.mouseButtons.LEFT = look ? THREE.MOUSE.ROTATE : null;
+        controls.touches.ONE = look ? THREE.TOUCH.ROTATE : null;
+
+        if (pressing && hover && (u.tool === 'dig' || u.tool === 'fill')) {
+          pitBrush(st.b, N, hover.i, hover.j, u.radius, (u.tool === 'dig' ? 5 : -5) * dtReal, P.MIN_B, P.MAX_B);
+          texB.needsUpdate = true;
+          secCol = Math.min(N - 2, Math.max(1, hover.i));
+          markersDirty = true;
+        }
+        const un = matWater.uniforms;
+        for (let q = 0; q < 8; q++) {
+          const p = u.pumps[q];
+          un.uPQ.value[q] = p ? P.PUMP_Q : 0;
+          if (p) { un.uPIn.value[q].set(p.in.i, p.in.j); un.uPOut.value[q].set(p.out.i, p.out.j); }
+        }
+        un.uRain.value = u.rain ? P.RAIN : 0;
+        step(u.speed);
+
+        if (u.pumps !== lastPumps || u.pending !== lastPending) { lastPumps = u.pumps; lastPending = u.pending; markersDirty = true; }
+        if (t - lastRead > 400) {
+          lastRead = t;
+          readback();
+          const s = pitStats(st, P);
+          s.pumps = u.pumps.map((p) => pitPumpFlow(p, st.b, st.d, N, P));
+          cb.stats(s);
+          drawSection();
+          markersDirty = true;
+        }
+        if (markersDirty) { updateMarkers(u); markersDirty = false; }
+        drawRing(u);
+        updateFlashes(dtReal);
+
+        matTerrain.uniforms.tW.value = rtW[cur].texture;
+        matWater3d.uniforms.tW.value = rtW[cur].texture;
+        controls.update();
+        renderer.setRenderTarget(null);
+        renderer.render(scene, camera);
+      }
+      raf = requestAnimationFrame(frame);
+
+      return {
+        reset() {
+          const f = pitInitState(N, 7);
+          st.b.set(f.b); st.d.fill(0); st.h.set(f.h);
+          texB.needsUpdate = true; secCol = N >> 1; markersDirty = true;
+          upload();
+        },
+        dispose() {
+          dead = true;
+          cancelAnimationFrame(raf);
+          window.removeEventListener('resize', resize);
+          window.removeEventListener('themechange', onTheme);
+          el.removeEventListener('pointerdown', onDown);
+          el.removeEventListener('pointermove', onMove);
+          el.removeEventListener('pointerup', onUp);
+          el.removeEventListener('pointercancel', onUp);
+          el.removeEventListener('pointerleave', onLeave);
+          controls.dispose();
+          rtW.concat(rtF).forEach((r) => r.dispose());
+          texB.dispose(); texB0.dispose(); texOre.dispose(); geo.dispose();
+          renderer.dispose();
+          if (el.parentNode) el.parentNode.removeChild(el);
+        }
+      };
+    }
+
+    const fmt = (v, dig) => v.toLocaleString('en-US', { maximumFractionDigits: dig, minimumFractionDigits: dig });
+
+    function pumpText(f) {
+      const lift = 'lift ' + fmt(f.lift, 1) + ' m';
+      if (f.lift >= PIT.PUMP_HEAD) return lift + ', too high for one pump';
+      if (f.q < 1e-4) return lift + ', intake is dry';
+      return lift + ', ' + fmt(f.q * 1000, 0) + ' l/s';
+    }
+
+    function App() {
+      const [tool, setTool] = useState('blast');
+      const [charge, setCharge] = useState(1);
+      const [cash, setCash] = useState(PIT.START_CASH);
+      const [lastBlast, setLastBlast] = useState(null);
+      const [note, setNote] = useState(null);
+      const [radius, setRadius] = useState(10);
+      const [speed, setSpeed] = useState(16);
+      const [rain, setRain] = useState(false);
+      const [pumps, setPumps] = useState([]);
+      const [pending, setPending] = useState(null);
+      const [stats, setStats] = useState(null);
+      const [webgl, setWebgl] = useState(true);
+      const hostRef = useRef(null), secRef = useRef(null), engRef = useRef(null), idRef = useRef(1);
+      const ui = useRef(null);
+      ui.current = { tool, radius, speed, rain, pumps, pending, charge, cash };
+
+      useEffect(() => {
+        let disposed = false;
+        function init() {
+          if (disposed || engRef.current || !hostRef.current) return;
+          try {
+            engRef.current = createEngine(window.THREE, window.PIT_OrbitControls, hostRef.current, secRef.current, {
+              ui: () => ui.current,
+              stats: setStats,
+              note: setNote,
+              blasted: (res, cost) => { setCash((v) => v - cost + res.value); setLastBlast(res); setNote(null); },
+              pumpClick: (c) => {
+                const u = ui.current;
+                if (u.cash < PIT.PUMP_COST) { setNote('A pump costs ' + money(PIT.PUMP_COST) + '. Sell more ore first.'); return; }
+                if (!u.pending) { if (u.pumps.length < PIT.MAX_PUMPS) { setPending(c); setNote(null); } return; }
+                if (u.pending.i === c.i && u.pending.j === c.j) return;
+                const p = { id: idRef.current++, in: u.pending, out: c };
+                setPumps((prev) => prev.concat([p]));
+                setCash((v) => v - PIT.PUMP_COST);
+                setPending(null);
+              }
+            });
+          } catch (e) { console.error(e); setWebgl(false); }
+        }
+        if (window.THREE) init(); else window.addEventListener('pit-three-ready', init);
+        return () => {
+          disposed = true;
+          window.removeEventListener('pit-three-ready', init);
+          if (engRef.current) { engRef.current.dispose(); engRef.current = null; }
+        };
+      }, []);
+
+      const pickTool = (t) => { setTool(t); setNote(null); if (t !== 'pump') setPending(null); };
+      const reset = () => {
+        setPumps([]); setPending(null); setRain(false); setCash(PIT.START_CASH); setLastBlast(null); setNote(null);
+        if (engRef.current) engRef.current.reset();
+      };
+      /* taking a pump out returns its price, so moving one is free */
+      const removePump = (id) => { setPumps((prev) => prev.filter((x) => x.id !== id)); setCash((v) => v + PIT.PUMP_COST); };
+      const full = pumps.length >= PIT.MAX_PUMPS;
+      const hint = note ? note : tool === 'pump' && pending ? 'Now click where the water should come out.'
+        : tool === 'pump' && full ? 'All ' + PIT.MAX_PUMPS + ' pumps are placed. Remove one to place another.' : HINTS[tool];
+
+      return html`
+        <div className="container">
+          <h1 style=${{ fontSize: '1.5rem', color: 'var(--tool-text)', marginBottom: 8 }}>Mine Pit</h1>
+          <p style=${{ color: 'var(--tool-label)', maxWidth: '70ch' }}>A prototype. Blast an open pit into the hillside and sell the ore. The iron seam shows at the surface and dips into the hill. The water table sits four metres below the surface. Below it, groundwater seeps into the pit. A flooded pit cannot be blasted, so place pumps to keep it dry.</p>
+
+          <div className="pit-bar">
+            <div className="seg-row">
+              ${TOOLS.map(([k, name]) => html`<button key=${k} type="button" aria-pressed=${tool === k} className=${'lang-seg' + (tool === k ? ' active' : '')} onClick=${() => pickTool(k)}>${name}</button>`)}
+            </div>
+            ${tool === 'blast' && html`<div className="seg-row">
+              ${PIT.CHARGES.map((c, q) => html`<button key=${c.name} type="button" aria-pressed=${charge === q} className=${'lang-seg' + (charge === q ? ' active' : '')} onClick=${() => setCharge(q)}>${c.name + ' ' + money(c.cost)}</button>`)}
+            </div>`}
+            ${(tool === 'dig' || tool === 'fill') && html`<label>Brush <input type="range" min="2" max="20" step="1" value=${radius} onChange=${(e) => setRadius(+e.target.value)}/> ${radius} m</label>`}
+            <div className="seg-row">
+              ${SPEEDS.map(([name, v]) => html`<button key=${name} type="button" aria-pressed=${speed === v} className=${'lang-seg' + (speed === v ? ' active' : '')} onClick=${() => setSpeed(v)}>${name}</button>`)}
+            </div>
+            <label><input type="checkbox" role="switch" checked=${rain} onChange=${(e) => setRain(e.target.checked)}/> Storm</label>
+            <button className="tool-btn tool-btn-sm" onClick=${reset}>${ToolIcons.el('reset')} Reset</button>
+          </div>
+
+          ${!webgl && html`<p style=${{ color: 'var(--tool-danger-text)' }}>This prototype needs WebGL 2 with float render targets. Your browser or graphics driver does not offer them.</p>`}
+          <div className="pit-view" ref=${hostRef}></div>
+          <p className="pit-hint">${hint}</p>
+
+          <p className="pit-stats">
+            Cash <b>${money(cash)}</b> · last blast <b>${lastBlast ? fmt(lastBlast.ore, 0) + ' m³ ore, ' + money(lastBlast.value) : 'none yet'}</b>
+          </p>
+          <p className="pit-stats">
+            Surface water <b>${stats ? fmt(stats.water, 0) : '0'} m³</b> · excavated <b>${stats ? fmt(stats.dug, 0) : '0'} m³</b> · pumping <b>${stats ? fmt(stats.pumps.reduce((a, f) => a + f.q, 0) * 1000, 0) : '0'} l/s</b>
+          </p>
+
+          ${pumps.length > 0 && html`
+            <ul className="pit-pumps">
+              ${pumps.map((p, q) => html`
+                <li key=${p.id}>
+                  <span>Pump ${q + 1}: ${stats && stats.pumps[q] ? pumpText(stats.pumps[q]) : 'starting'}</span>
+                  <button className="tool-btn tool-btn-sm" aria-label=${'Remove pump ' + (q + 1)} onClick=${() => removePump(p.id)}>${ToolIcons.el('remove')}</button>
+                </li>`)}
+            </ul>`}
+
+          <p className="pit-h2">Cross-section through the last blast, uphill on the left</p>
+          <canvas className="pit-sec" ref=${secRef}></canvas>
+          <div className="pit-legend">
+            <span><i style=${{ borderColor: 'var(--tool-faint)', borderTopStyle: 'dashed' }}></i>original surface</span>
+            <span><i style=${{ borderColor: 'var(--tool-sig-info)' }}></i>water table</span>
+            <span><i style=${{ borderColor: 'var(--tool-sig-info)', borderTopWidth: 7 }}></i>open water</span>
+            ${PIT.ORE.map((o, m) => html`<span key=${o.name}><i style=${{ borderColor: oreCss(m), borderTopWidth: 7 }}></i>${o.name.toLowerCase() + ', ' + money(o.value) + ' per m³'}</span>`)}
+          </div>
+
+          <details className="fold">
+            <summary>How the model works</summary>
+            <div className="fold-body">
+              <p>The map is 256 by 256 metres, one cell per metre. The hillside falls ten metres towards the front edge. Water that reaches any edge of the map is gone.</p>
+              <p>Open water moves between neighbouring cells in proportion to the difference of their water levels. This is the virtual pipes scheme, a common shortcut for shallow water.</p>
+              <p>Groundwater is a second height per cell: the level up to which the ground is soaked. It spreads sideways slowly. Where it stands above the pit floor it seeps out. Water standing on dry ground trickles down and raises it.</p>
+              <p>A pump delivers ${fmt(PIT.PUMP_Q * 1000, 0)} litres per second when intake and outlet are level. The delivery falls as the lift grows and reaches zero at ${PIT.PUMP_HEAD} metres. Water let out next to the pit runs or seeps back in.</p>
+              <p>A charge removes a crater of rock. The part of it that lay inside a seam is sold at once. The rest disappears, there are no spoil heaps yet. A charge does not fire under more than ${PIT.BLAST_MAX_WATER} metres of water. Removing a pump returns its price.</p>
+              <p>The numbers are tuned for watching. Real ground lets water through far more slowly.</p>
+            </div>
+          </details>
+        </div>`;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App}/>`);
+  </script>
+
+  <footer class="container">
+    <small>© 2026 Franziska and Alexander Alber · feedback@alber.me · <a href="/datenschutz.html">Privacy</a> · <a href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></small>
+  </footer>
+</body>
+</html>
