@@ -4293,6 +4293,43 @@ function analyze(ui) {
   };
 }
 
+/* Prefilled links: ?tmin=14&tmax=31&cloud=20 sets the day's forecast (degrees
+ * Celsius, cloud cover in percent). Readable on purpose, so a person or an
+ * agent can write one by hand. Values are clamped and snapped to the sliders'
+ * ranges and steps; a swapped pair is put in order. Returns only the keys that
+ * are present and numeric, as ui keys (tminC, tmaxC, cloud as a fraction). */
+var QUERY_T_RANGE = [5, 42];
+function parseQuery(search) {
+  var q = new URLSearchParams(search), out = {};
+  var snapT = function (v) {
+    return Math.round(Math.min(QUERY_T_RANGE[1], Math.max(QUERY_T_RANGE[0], v)) * 2) / 2;
+  };
+  var num = function (k) {
+    var s = q.get(k);
+    if (s == null || s.trim() === '') return null;
+    var v = Number(s.trim().replace(',', '.'));
+    return isFinite(v) ? v : null;
+  };
+  var lo = num('tmin'), hi = num('tmax'), c = num('cloud');
+  if (lo != null) out.tminC = snapT(lo);
+  if (hi != null) out.tmaxC = snapT(hi);
+  if (lo != null && hi != null && out.tminC > out.tmaxC) {
+    var t = out.tminC; out.tminC = out.tmaxC; out.tmaxC = t;
+  }
+  if (c != null) out.cloud = Math.round(Math.min(100, Math.max(0, c)) / 5) * 5 / 100;
+  return out;
+}
+
+/* The inverse: query pairs for the weather in ui, with values equal to def
+ * left out so the plain URL stays plain. */
+function queryPairs(ui, def) {
+  var p = [];
+  if (ui.tminC !== def.tminC) p.push(['tmin', String(ui.tminC)]);
+  if (ui.tmaxC !== def.tmaxC) p.push(['tmax', String(ui.tmaxC)]);
+  if (ui.cloud !== def.cloud) p.push(['cloud', String(Math.round(ui.cloud * 100))]);
+  return p;
+}
+
 
 /* ------------------------------------------------------------------ *
  * Export surface. Everything not listed here is private on purpose.
@@ -4391,6 +4428,8 @@ return {
   /* UI facing */
   analyze: analyze,
   paramsFromUi: paramsFromUi,
+  parseQuery: parseQuery,
+  queryPairs: queryPairs,
   sweepField: sweepField,
   prepareSweep: prepareSweep,
   FIELD_STEP_MIN: FIELD_STEP_MIN,
@@ -5720,6 +5759,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = TH;
       ventMode: 'cross',
       orientationShares: Object.assign({}, TH.ANALYZE_DEFAULTS.orientationShares),
     });
+    /* A prefilled link (?tmin=14&tmax=31&cloud=20) overrides the forecast. */
+    const UI_START = Object.assign({}, UI0, TH.parseQuery(location.search));
     const FIELD_STEP = 20;
 
     function App() {
@@ -5744,7 +5785,19 @@ if (typeof module !== 'undefined' && module.exports) module.exports = TH;
       const [mode, setMode] = useState('quick');
       const det = mode === 'detailed';
 
-      const [u, setU] = useState(UI0);
+      const [u, setU] = useState(UI_START);
+
+      /* Mirror the forecast into the address bar, so the link in it reproduces
+         the day. Only the weather goes there; other parameters (lang, theme)
+         are left alone. */
+      useEffect(() => {
+        try {
+          const url = new URL(location.href);
+          ['tmin', 'tmax', 'cloud'].forEach((k) => url.searchParams.delete(k));
+          TH.queryPairs(u, UI0).forEach(([k, v]) => url.searchParams.set(k, v));
+          if (url.href !== location.href) history.replaceState(null, '', url.href);
+        } catch (e) { /* address bar stays as it was */ }
+      }, [u.tminC, u.tmaxC, u.cloud]);
       const set = (k) => (v) => setU((p) => Object.assign({}, p, { [k]: v }));
       const setShare = (id) => (v) => setU((p) => Object.assign({}, p, {
         orientationShares: Object.assign({}, p.orientationShares, { [id]: v }),
