@@ -371,7 +371,73 @@
       return { ymax: top, above: above };
     }
 
+    // The same model list scored on another index version. `base` is the
+    // newest snapshot and supplies everything but the scores (architecture,
+    // release dates, config.json corrections); `scored` is an older snapshot
+    // on the other index and supplies scores, score_estimated, anchors and the
+    // scale. Models without a score there are left out and listed in `missing`:
+    // a score is never carried across index versions.
+    function rescore(base, scored) {
+      var byId = {};
+      scored.models.forEach(function (m) { byId[m.id] = m; });
+      var models = [], missing = [];
+      base.models.forEach(function (m) {
+        var o = byId[m.id];
+        if (!o) { missing.push(m.label); return; }
+        var c = Object.assign({}, m, { score: o.score });
+        if (o.score_estimated) c.score_estimated = true; else delete c.score_estimated;
+        models.push(c);
+      });
+      base.anchors.forEach(function (a) {
+        if (!scored.anchors.some(function (b) { return b.id === a.id; })) missing.push(a.label);
+      });
+      var meta = Object.assign({}, base.meta, { scale: scored.meta.scale, scored_snapshot: scored.meta.snapshot });
+      return { meta: meta, anchors: scored.anchors, models: models, missing: missing };
+    }
+
+    // Prefilled links: ?gpu=5090, ?vram=20&bw=500 (a custom GPU), ?ctx=32k
+    // (or 32768), ?kv=q8|fp16, ?index=v4|v5. Readable on purpose, so a person or an agent can
+    // write one by hand. Returns only the fields that are present and valid;
+    // anything else falls back to the tool's defaults.
+    function parseQuery(search, gpuIds, ctxValues) {
+      var q = new URLSearchParams(search), out = {};
+      var g = (q.get('gpu') || '').trim().toLowerCase();
+      if (gpuIds.indexOf(g) >= 0) out.gpu = g;
+      var v = parseFloat(q.get('vram'));
+      if (isFinite(v) && v > 0 && v <= 4096) {
+        out.vram = v;
+        if (!out.gpu) out.gpu = 'custom';
+      }
+      var b = parseFloat(q.get('bw'));
+      if (isFinite(b) && b > 0 && b <= 100000) out.bw = b;
+      var c = (q.get('ctx') || '').trim().toLowerCase(), cv = null;
+      if (/^\d+k$/.test(c)) cv = parseInt(c, 10) * 1024;
+      else if (/^\d+$/.test(c)) cv = parseInt(c, 10);
+      if (cv != null && ctxValues.indexOf(cv) >= 0) out.ctx = cv;
+      var k = (q.get('kv') || '').trim().toLowerCase();
+      if (k === 'fp16') out.kv = 2; else if (k === 'q8') out.kv = 1;
+      var ix = (q.get('index') || '').trim().toLowerCase();
+      if (ix === 'v4' || ix === 'v5') out.index = ix;
+      return out;
+    }
+
+    // The inverse: query pairs for the current state, defaults left out so the
+    // plain URL stays plain. The custom fields are written only for the custom GPU.
+    function queryPairs(st, def) {
+      var p = [];
+      if (st.gpu !== def.gpu) p.push(['gpu', st.gpu]);
+      if (st.gpu === 'custom') {
+        if (parseFloat(st.vram) > 0) p.push(['vram', String(parseFloat(st.vram))]);
+        if (parseFloat(st.bw) > 0) p.push(['bw', String(parseFloat(st.bw))]);
+      }
+      if (st.ctx !== def.ctx) p.push(['ctx', st.ctx % 1024 === 0 ? (st.ctx / 1024) + 'k' : String(st.ctx)]);
+      if (st.kv !== def.kv) p.push(['kv', st.kv === 1 ? 'q8' : 'fp16']);
+      if (st.index && st.index !== def.index) p.push(['index', st.index]);
+      return p;
+    }
+
     return {
+      parseQuery: parseQuery, queryPairs: queryPairs, rescore: rescore,
       GIB: GIB, OVERHEAD_GIB: OVERHEAD_GIB, FIT_MARGIN: FIT_MARGIN,
       EFF_LO: EFF_LO, EFF_HI: EFF_HI,
       weightsGiB: weightsGiB, kvGiB: kvGiB, vramNeeded: vramNeeded,
@@ -398,6 +464,16 @@
     { id: '2026-10', label: 'October 2026', file: '/assets/files/llm-landscape-2026-10.json' },
     { id: '2026-08', label: 'August 2026', file: '/assets/files/llm-landscape-2026-08.json' },
     { id: '2026-07', label: 'July 2026', file: '/assets/files/llm-landscape-2026-07.json' }
+  ];
+
+  // Index versions the user can switch between. The model list and the
+  // architecture always come from DATA_FILES[0]; for v4.3.2 the scores come
+  // from the October snapshot (LLMCore.rescore). v4.3.2 is the default (owner's
+  // call, 2026-11-22): on v5 the local models crowd into 0-22 and separate less.
+  // `zoom` is the initial state of the zoom switch per index.
+  const INDEXES = [
+    { id: 'v4', label: 'AA v4.3.2', scores: '/assets/files/llm-landscape-2026-10.json', zoom: false },
+    { id: 'v5', label: 'AA v5.0.1', scores: null, zoom: true }
   ];
 
   // `reserve` is memory the box needs for something other than the model. It is
@@ -936,26 +1012,58 @@
   }
 
   // ── App ─────────────────────────────────────────────────────────────────
+  const DEF = { gpu: '3090', ctx: 16384, kv: 2, index: 'v4' };
+  const Q0 = C.parseQuery(location.search, GPUS.map(g => g.id), CONTEXTS.map(c => c.v));
+
   function App() {
     const [data, setData] = useState(null);
     const [err, setErr] = useState(null);
-    const [gpu, setGpu] = useState('3090');
-    const [customVram, setCustomVram] = useState(24);
-    const [customBw, setCustomBw] = useState('');
-    const [context, setContext] = useState(16384);
-    const [kv, setKv] = useState(2); // bytes per element: 2 = FP16, 1 = Q8
+    const [gpu, setGpu] = useState(Q0.gpu || DEF.gpu);
+    const [customVram, setCustomVram] = useState(Q0.vram != null ? Q0.vram : 24);
+    const [customBw, setCustomBw] = useState(Q0.bw != null ? Q0.bw : '');
+    const [context, setContext] = useState(Q0.ctx || DEF.ctx);
+    const [kv, setKv] = useState(Q0.kv || DEF.kv); // bytes per element: 2 = FP16, 1 = Q8
+    const [index, setIndex] = useState(Q0.index || DEF.index);
+    const ixDef = INDEXES.find(x => x.id === index);
+
+    // Mirror the settings into the address bar, so the link in it reproduces
+    // the view. Other parameters (theme) are left alone.
+    useEffect(() => {
+      try {
+        const url = new URL(location.href);
+        ['gpu', 'vram', 'bw', 'ctx', 'kv', 'index'].forEach(k => url.searchParams.delete(k));
+        C.queryPairs({ gpu, vram: customVram, bw: customBw, ctx: context, kv, index }, DEF)
+          .forEach(([k, v]) => url.searchParams.set(k, v));
+        if (url.href !== location.href) history.replaceState(null, '', url.href);
+      } catch (e) { /* address bar stays as it was */ }
+    }, [gpu, customVram, customBw, context, kv, index]);
     // Hidden rather than visible families, so a family that appears in a later
     // snapshot shows up by default instead of being invisible until noticed.
     const [hidden, setHidden] = useState(() => new Set());
-    // Index axis zoomed to the local models by default (since the v5 index the
-    // closed anchors sit far above them, see LLMCore.axisTop).
-    const [zoom, setZoom] = useState(true);
+    // Zoom state per index: on v5 the closed anchors sit far above the local
+    // models, so that view opens zoomed (see LLMCore.axisTop); v4 opens full.
+    const [zoomBy, setZoomBy] = useState(() => Object.fromEntries(INDEXES.map(x => [x.id, x.zoom])));
+    const zoom = zoomBy[index];
+    const setZoom = z => setZoomBy(prev => ({ ...prev, [index]: z }));
 
+    // Base snapshot once; the score file of another index when it is first
+    // picked. Both are cached in `scoreFiles`, so switching back is instant.
+    const [base, setBase] = useState(null);
+    const [scoreFiles, setScoreFiles] = useState({});
+    const getJson = f => fetch(f).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
     useEffect(() => {
-      fetch(DATA_FILES[0].file)
-        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(setData).catch(e => setErr(String(e)));
+      getJson(DATA_FILES[0].file).then(setBase).catch(e => setErr(String(e)));
     }, []);
+    useEffect(() => {
+      const f = ixDef.scores;
+      if (!f || scoreFiles[f]) return;
+      getJson(f).then(d => setScoreFiles(prev => ({ ...prev, [f]: d }))).catch(e => setErr(String(e)));
+    }, [index]);
+    useEffect(() => {
+      if (!base) return;
+      if (!ixDef.scores) setData(base);
+      else if (scoreFiles[ixDef.scores]) setData(C.rescore(base, scoreFiles[ixDef.scores]));
+    }, [base, scoreFiles, index]);
 
     const preset = GPUS.find(g => g.id === gpu);
     const budget = preset.vram != null ? preset.vram - (preset.reserve || 0) : (parseFloat(customVram) || 0);
@@ -1035,6 +1143,17 @@
                 <${Seg} options=${[{ value: 2, label: 'FP16' }, { value: 1, label: 'Q8' }]} value=${kv} onChange=${setKv} />
               </span>
             <//>
+            <${Row} label="Index:">
+              <${Seg} options=${INDEXES.map(x => ({ value: x.id, label: x.label }))} value=${index} onChange=${setIndex} />
+            <//>
+            <p style=${{ margin: '2px 0 8px', fontSize: 12, color: COL.foot, maxWidth: '70ch' }}>
+              ${index === 'v4'
+                ? html`<${React.Fragment}>The previous Artificial Analysis index, with the scores of the October 2026 snapshot. Same models, same memory math.
+                    ${data.missing && data.missing.length > 0 ? ' Not scored on it, so left out: ' + data.missing.join(', ') + '.' : ''}<//>`
+                : html`<${React.Fragment}>The current Artificial Analysis index (since 27 October 2026). It is harder, so the local models crowd into the bottom of the scale.
+<//>`}
+              ${' '}${data.models.filter(m => m.score_estimated).length} of ${data.models.length} model scores on this index are estimates, marked * in the model table.
+            </p>
             <${Row} label="Families:">
               <${FamilyFilter} families=${families} hidden=${hidden} onToggle=${toggleFamily} onSet=${setHidden} />
             <//>
@@ -1084,7 +1203,7 @@
           </details>
 
           <p style=${{ marginTop: 24, fontSize: 11, color: COL.foot, lineHeight: 1.7 }}>
-            Data snapshot: ${data.meta.snapshot}${data.meta.status === 'provisional' ? ' (provisional)' : ''} ·
+            Data snapshot: ${data.meta.snapshot}${data.meta.status === 'provisional' ? ' (provisional)' : ''}${data.meta.scored_snapshot ? ', scores from ' + data.meta.scored_snapshot : ''} ·
             index: ${data.meta.scale.name} · benchmarks: ${data.meta.scale.benchmarks_used.join(', ')} ·
             sources: ${sourceGroups(data.meta.scale.sources).map((g, i) => html`<${React.Fragment} key=${g.host}>${i > 0 ? ', ' : ''}${g.urls.length === 1
               ? html`<a href=${g.urls[0]} style=${{ color: COL.foot }}>${g.host}</a>`
