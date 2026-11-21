@@ -29,12 +29,20 @@
     .adv-over p{margin:0;max-width:30ch;color:var(--tool-text);font-size:.95rem}
     .adv-over p.adv-sub{color:var(--tool-label);font-size:.8rem}
     .adv-over button{width:auto;margin:0}
+    /* the result comes up after the defeat has played out */
+    .adv-end{animation:adv-end .4s ease-out both}
+    @keyframes adv-end{from{opacity:0}to{opacity:1}}
+    @media (prefers-reduced-motion:reduce){.adv-end{animation:none}}
     .adv-hint{color:var(--tool-note);font-size:.8rem;text-align:center;margin:.5rem auto 1rem;max-width:440px}
+    .adv-music{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:.5rem .75rem;margin:.6rem auto 0;max-width:440px}
+    .adv-music button{width:auto}
   </style>
 
   <script src="/assets/js/react.production.min.js"></script>
   <script src="/assets/js/react-dom.production.min.js"></script>
   <script src="/assets/js/htm.js"></script>
+  <script src="/assets/js/synthwave.js"></script>
+  <script src="/assets/js/arcade-music.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -79,7 +87,7 @@
         <p style="color:var(--tool-label);max-width:70ch">Mobile ads keep showing a lane shooter. One soldier walks down a road, gates add to the squad, and a crowd comes down the lane. The installed game is usually something else. This page is that lane shooter.</p>
         <ul style="color:var(--tool-label);max-width:70ch">
           <li>Three lanes. The squad fires down the lane it stands in.</li>
-          <li>Every enemy that gets past costs a soldier, in any lane.</li>
+          <li>Enemies that reach the squad attack it, from any lane. Each blow costs a soldier.</li>
           <li>Blue gates add soldiers. Shooting through a gate raises its number.</li>
           <li>The squad holds 99 soldiers. Beyond that, gates make it hit harder.</li>
           <li>Spike fields and steel rollers take a share of the squad that stands in their lane.</li>
@@ -131,6 +139,10 @@
       SPIKE_LEN: 2.5, // length of a spike field
       BRUTE: 14,      // health of a brute in stage 1
       BRUTE_COST: 4,  // soldiers a brute costs when it gets past
+      REACH: 0.9,     // an enemy this close stops walking and attacks the squad
+      LUNGE: 9,       // sideways speed of an attacker: faster than MOVE, so it cannot be outrun
+      WIND: 0.35,     // seconds from contact to an attacker's first blow
+      BLOW: 0.45,     // seconds between the blows of an attacker that costs more than one soldier
       FOE: 3,         // health of an ordinary enemy in stage 1
       RATE_UP: 1.12,  // fire rate factor from a crate
       DMG_UP: 1.15,   // damage factor from a crate
@@ -367,6 +379,48 @@
     /* does the squad stand in the lane around x? The centre of the squad decides, as it does at a gate. */
     function advInLane(s, x) { return Math.abs(s.px - x) < ADV.LANE / 2; }
 
+    /* Enemies that reach the squad attack it. An enemy that walked down the
+       squad's own lane stops in front of the squad, inside the lines of fire,
+       and can still be shot before its first blow. One from another lane runs
+       round to the side of the squad, outside the fire, and its blows land.
+       Each blow takes one soldier; after e.cost blows the attacker is spent
+       and gone. So an enemy that gets through costs what it always did, it
+       just takes the soldiers where the player can see it happen. */
+    function advFront(s, e) { return Math.max(ADV.REACH, 1.4 * advWidth(s.n) + e.r); }
+    /* where an attacker wants to stand, relative to the squad: x across, z ahead */
+    function advSpot(s, e) {
+      if (e.front) { const f = advFan(s.n); return { x: advClamp(e.x, s.px - f, s.px + f), z: advFront(s, e) }; }
+      return { x: s.px + (e.x < s.px ? -1 : 1) * (advWidth(s.n) + e.r + 0.05), z: e.fz * advWidth(s.n) };
+    }
+    function advEngage(s, e, z) {
+      e.melee = true; e.mz = z; e.left = e.cost || 1;
+      e.front = advInLane(s, e.x);
+      /* a fixed depth along the side of the formation, so a crowd does not stand in one spot */
+      e.fz = ((e.ph * 7.31) % 2) - 1;
+      advEvent(s, { k: 'engage', x: e.x, d: e.d, big: !!e.big, front: e.front });
+    }
+    /* the attacker follows the squad; it is faster sideways than the squad */
+    function advMeleeMove(s, e, dt) {
+      const p = advSpot(s, e), v = ADV.LUNGE * dt;
+      e.x += advClamp(p.x - e.x, -v, v);
+      e.mz += advClamp(p.z - e.mz, -v, v);
+      e.d = s.dist + e.mz;
+    }
+    /* the attacker's blows. Returns true when it is spent. */
+    function advBlow(s, e) {
+      const p = advSpot(s, e);
+      const touch = Math.abs(e.x - p.x) < 0.2 && Math.abs(e.mz - p.z) < 0.2;
+      if (e.strike === undefined) { if (touch) e.strike = s.t + ADV.WIND; return false; }
+      if (s.t < e.strike || !touch) return false;
+      advLose(s, 1, e.x);
+      e.blow = s.t; e.left--;
+      advEvent(s, { k: 'blow', x: e.x, d: e.d, big: !!e.big });
+      if (e.left > 0) { e.strike = s.t + ADV.BLOW; return false; }
+      e.dead = true;
+      advEvent(s, { k: 'spent', x: e.x, d: e.d, big: !!e.big });
+      return true;
+    }
+
     /* One step of the game. tx is where the player wants the squad to be. */
     function advStep(s, dt, tx) {
       if (s.over) return s;
@@ -390,7 +444,10 @@
       /* enemies walk towards the squad and keep to their lane; rollers roll */
       for (let q = 0; q < s.ents.length; q++) {
         const e = s.ents[q];
-        if (e.k === 'enemy' || e.k === 'boss') {
+        if (e.melee) {
+          if (!e.dead) advMeleeMove(s, e, dt);
+          e.ph += dt * 9;
+        } else if (e.k === 'enemy' || e.k === 'boss') {
           e.d -= (e.sp || (e.k === 'boss' ? 1.0 : ADV.WALK)) * dt;
           e.ph += dt * 9;
         } else if (e.k === 'roller') {
@@ -464,8 +521,9 @@
         if (e.dead) continue;
         const z = e.d - s.dist;
         if (e.k === 'enemy') {
-          /* an enemy that gets past the squad's line costs soldiers, in any lane */
-          if (z <= 0.4) { advLose(s, e.cost || 1, e.x); continue; }
+          /* an enemy that reaches the squad's line attacks it, from any lane */
+          if (!e.melee && z <= advFront(s, e)) advEngage(s, e, z);
+          if (e.melee) { if (advBlow(s, e)) continue; s.ents[keep++] = e; continue; }
         } else if (e.k === 'boss') {
           /* the boss fills the road: it cannot be walked around, only shot */
           if (z <= 1.4) {
@@ -517,7 +575,8 @@
         if (e.dead) continue;
         if (e.k === 'spikes') { if (!e.used && z < 4.5 && z > -e.len - 0.2) bad[advLaneOf(e.x)] = true; continue; }
         if (e.k === 'roller') { if (!e.done && z < (ADV.SPEED + e.sp) * 0.9) bad[advLaneOf(e.x)] = true; continue; }
-        if (z < -0.5) continue;
+        /* an attacker at the side of the squad cannot be shot and follows the squad anyway */
+        if (z < -0.5 || (e.melee && !e.front)) continue;
         if (e.k === 'gate') {
           if (e.used) continue;
           if (val(e) < 0 && z < 4) bad[gl(e)] = true;
@@ -548,6 +607,76 @@
     }
   </script>
 
+  <script id="advmusic">
+    /* The music: which piece plays and how it follows the game. Plain
+       functions over the game state, tested by
+       notes/dev/as-advertised-music.test.mjs. The app block hands the
+       results to /assets/js/arcade-music.js (its own composer on the audio
+       plumbing of synthwave.js, the engine hikyaku plays).
+
+       Four pieces, surf by default (owner's pick, 2026-11-22). The player
+       picks one under the game (stored in localStorage 'adv-music-piece');
+       ?music=a|b|c|d overrides that for the page view. ?lead=0|1|2|3 picks
+       the melody voice of the current piece where it has alternatives
+       (arcade-music.js LEADS: surf and eurobeat; 0 the original voice,
+       default its LEAD_DEFAULT). Each run draws its key, tempo and tunes
+       from the run's seed. */
+    const ADV_MUSIC = {
+      DEFAULT: 'c',
+      ORDER: ['c', 'b', 'd', 'a'],   // the order of the selector, the default first
+      PIECES: {
+        a: { name: 'March', style: 'march' },   // 8-bit march: pulse lead, oom-pah bass, chip snare rolls
+        b: { name: 'Eurobeat', style: 'euro' }, // octave bass, offbeat stabs, a synth hook, 150+ BPM
+        c: { name: 'Surf', style: 'surf' },     // tremolo lead guitar, spring reverb, rock kit
+        d: { name: 'Disco', style: 'disco' }    // octave bass, guitar chops, brass and strings, swing
+      },
+      VOLUME: 0.55,      // in a run
+      CALM: 0.4,         // after the run: the same piece without drums
+      HIT_MIN: 0.1       // a loss below this share of the squad does not touch the music
+    };
+
+    /* the piece named in the address, or the default */
+    function advMusicPick(search) {
+      const m = /[?&]music=([a-z])/i.exec(search || '');
+      const k = m ? m[1].toLowerCase() : '';
+      return ADV_MUSIC.PIECES[k] ? k : ADV_MUSIC.DEFAULT;
+    }
+
+    /* the piece to play: the address first, then the stored choice, then the default */
+    function advMusicChoice(search, stored) {
+      if (/[?&]music=/i.test(search || '')) return advMusicPick(search);
+      return ADV_MUSIC.PIECES[stored] ? stored : ADV_MUSIC.DEFAULT;
+    }
+
+    /* the lead voice named in the address (a digit), or null for the default */
+    function advMusicLead(search) {
+      const m = /[?&]lead=([0-9])/.exec(search || '');
+      return m ? +m[1] : null;
+    }
+
+    /* Intensity 0..1 for the arrangement. It rises with the squad on a log
+       scale (5 soldiers about 0.46, a full squad 0.7), so the lead comes in
+       once the squad has grown past about ten. A boss on the road adds 0.3:
+       no breakdowns, peaks instead. */
+    function advMusicIntensity(s) {
+      if (!s || s.over) return 0.2;
+      let k = 0.3 + 0.4 * Math.log(1 + Math.max(0, s.n)) / Math.log(1 + ADV.CAP);
+      for (let q = 0; q < s.ents.length; q++) {
+        const e = s.ents[q];
+        if (e.k === 'boss' && !e.dead && e.d - s.dist < ADV.VIEW) { k += 0.3; break; }
+      }
+      return advClamp(k, 0, 1);
+    }
+
+    /* How hard a loss of v soldiers hits the music, n soldiers left: by the
+       share of the squad that is gone. One straggler out of a large squad
+       does nothing, half the squad under a roller ducks the mix hard. */
+    function advMusicHit(v, n) {
+      const share = v > 0 ? v / (v + Math.max(0, n)) : 0;
+      return share < ADV_MUSIC.HIT_MIN ? 0 : advClamp(0.25 + share, 0, 0.9);
+    }
+  </script>
+
   <script id="app">
     const html = htm.bind(React.createElement);
     const { useState, useEffect, useRef } = React;
@@ -562,7 +691,7 @@
       { kind: 'desert', road: '#7a726b', patch: 'rgba(60,30,0,.07)', joint: 'rgba(40,20,0,.2)', line: 'rgba(255,244,214,.8)', dash: 'rgba(246,200,90,.85)',
         wallTop: '#dcc7a2', wallFace: '#a58c68', wallH: 0.28, haze: '#f6dfb8', shadow: 'rgba(70,35,0,.34)', glow: 0 },
       { kind: 'city', road: '#2d3544', patch: 'rgba(0,0,0,.16)', joint: 'rgba(0,0,0,.35)', line: 'rgba(255,255,255,.55)', dash: 'rgba(255,255,255,.5)',
-        wallTop: '#5a6680', wallFace: '#3a445a', wallH: 0.6, haze: '#080d18', shadow: 'rgba(0,0,0,.5)', glow: 1 }
+        wallTop: '#5a6680', wallFace: '#3a445a', wallH: 0.6, haze: '#131230', shadow: 'rgba(0,0,0,.5)', glow: 1 }
     ];
 
     const COL = {
@@ -580,6 +709,10 @@
     const fmt = (v) => String(Math.round(v));
     const newSeed = () => (Math.random() * 4294967296) >>> 0;
     function loadBest() { try { return JSON.parse(localStorage.getItem('adv-best')) || null; } catch (x) { return null; } }
+    /* the music piece for this page view (?music=a|b|c|d) and whether music is on (default on) */
+    const MUSIC_LEAD = advMusicLead(location.search);
+    function loadMusic() { try { return localStorage.getItem('adv-music') !== '0'; } catch (x) { return true; } }
+    function loadPiece() { let k = null; try { k = localStorage.getItem('adv-music-piece'); } catch (x) {} return advMusicChoice(location.search, k); }
     /* a fixed pseudo-random number for a pair of integers: the scenery is a function of the track position */
     function h01(a, b) {
       let t = Math.imul(a | 0, 0x9E3779B1) ^ Math.imul((b | 0) + 0x7F4A7C15, 0x85EBCA6B);
@@ -588,13 +721,17 @@
     }
 
     function App() {
-      const [phase, setPhase] = useState('ready');   // ready | run | over
+      const [phase, setPhase] = useState('ready');   // ready | run | over (the canvas-only 'dying' stays 'run' here)
       const [result, setResult] = useState(null);
       const [best, setBest] = useState(loadBest);
       const cvRef = useRef(null), wrapRef = useRef(null);
       const hStage = useRef(null), hSquad = useRef(null), hPower = useRef(null), hKills = useRef(null);
       const G = useRef({ s: advStep(advNew(newSeed()), 0, 0), phase: 'ready', tx: 0, last: 0, acc: 0, raf: 0, fx: [], parts: [], banner: null, shake: null, flash: null, hurt: 0, W: 0, H: 0,
         rs: new WeakMap(), ghosts: [], born: [], pos: [], shown: 0, pt: 0, ppx: 0, lean: 0 }).current;
+      if (G.music == null) G.music = loadMusic();
+      if (G.piece == null) G.piece = loadPiece();
+      const [piece, setPiece] = useState(G.piece);
+      const [music, setMusic] = useState(G.music);
 
       function layout() {
         const cv = cvRef.current, wrap = wrapRef.current; if (!cv || !wrap) return;
@@ -617,18 +754,108 @@
         G.s = advNew(newSeed()); G.fx = []; G.parts = []; G.banner = { txt: 'Stage 1', t: 0 };
         G.tx = 0; G.acc = 0; G.phase = 'run'; G.shake = null; G.flash = null; G.hurt = 0;
         G.ghosts = []; G.born = []; G.pos = []; G.shown = 0; G.lean = 0;
+        G.die = null; G.fallen = [];
         setPhase('run');
+        musicPlay(false);
+      }
+
+      /* The run is lost. Before the result shows, the picture plays out the
+         defeat: the last soldiers fall, time slows down, the enemies walk on
+         over the spot and raise their arms, and the screen darkens. G.phase is
+         'dying' meanwhile, so Enter and Space do not start a new run yet. */
+      const DIE = 1.9, DIE_LOCK = 0.45;   // seconds of real time; key lock after the result shows
+      function die() {
+        const s = G.s, now = performance.now();
+        G.phase = 'dying'; G.die = { t0: now };
+        musicPlay(true);   // the run's piece fades into its calm version during the slow motion
+        /* the soldiers standing in the last picture fall where they stood */
+        G.fallen = [];
+        for (let i = 0; i < G.shown; i++) {
+          const q = G.pos[i]; if (!q) continue;
+          const side = q.x === 0 ? (h01(i, 7) < 0.5 ? -1 : 1) : Math.sign(q.x);
+          G.fallen.push({ x: s.px + q.x, d: s.dist + q.z, t: s.t + 0.025 + 0.16 * h01(i, 5), side: side, m: i });
+        }
+        if (!G.fallen.length) G.fallen.push({ x: s.px, d: s.dist, t: s.t + 0.025, side: 1, m: 0 });
+        for (const f of G.fallen) burst(f.x, f.d, 0.9, 5, '#7fb0ff', 3, 0.09);
+        G.fx.push({ x: s.px, d: s.dist, t: s.t, col: '#ff8f93', px: 2.6 });
+        s.shots.length = 0;   // the guns fall silent
+        G.shake = { t: now, a: 10 }; G.hurt = now;
+      }
+
+      /* How fast the world runs during the defeat, by real time r since it
+         began: a short hit-stop, slow motion, then it comes to rest. */
+      function dieScale(r) {
+        if (r < 0.12) return 0.05;
+        if (r < 1.2) return 0.35;
+        const u = advClamp((r - 1.2) / (DIE - 1.2), 0, 1);
+        return 0.35 * (1 - u * u * (3 - 2 * u));
+      }
+
+      /* the world after the run: the squad no longer counts, so this only moves things on */
+      function dieStep(dt) {
+        const s = G.s, r = (performance.now() - G.die.t0) / 1000, g = dt * dieScale(r);
+        s.t += g;
+        /* the camera brakes to a stop */
+        s.dist += ADV.SPEED * g * Math.max(0, 1 - r / 0.5);
+        for (const e of s.ents) {
+          if (e.dead || e.d - s.dist < -6) continue;
+          /* an attacker stays where it struck, over the fallen squad */
+          if (e.melee) e.d = s.dist + e.mz;
+          else if (e.k === 'enemy' || e.k === 'boss') { e.d -= (e.sp || (e.k === 'boss' ? 1.0 : ADV.WALK)) * g; e.ph += g * 9; }
+          else if (e.k === 'roller') e.d -= e.sp * g;
+        }
       }
 
       function finish() {
         const s = G.s, r = { stage: s.stage, kills: s.kills };
-        G.phase = 'over';
+        G.phase = 'over'; G.lock = performance.now() + DIE_LOCK * 1000;
         const old = loadBest();
         if (!old || r.stage > old.stage || (r.stage === old.stage && r.kills > old.kills)) {
           try { localStorage.setItem('adv-best', JSON.stringify(r)); } catch (x) {}
           setBest(r);
         }
         setResult(r); setPhase('over');
+      }
+
+      /* ---------- music (arcade-music.js, advmusic block) ----------
+         Starts with a run, which is always a click or a key press, so the
+         browser lets the AudioContext run. A run plays the piece at the run's
+         intensity; a lost run fades it into the same piece without drums.
+         The setting lives in localStorage 'adv-music', M toggles it.
+         cross: another piece was picked mid-run; it crossfades in and opens
+         on a verse, the game goes on. */
+      function musicPlay(calm, cross) {
+        const S = window.ArcadeMusic;
+        if (!S || !G.music) return;
+        const P = ADV_MUSIC.PIECES[G.piece];
+        try {
+          S.swap({ seed: G.s.seed, style: P.style, lead: MUSIC_LEAD, intensity: advMusicIntensity(G.s),
+            volume: calm ? ADV_MUSIC.CALM : ADV_MUSIC.VOLUME, calm: !!calm, opening: calm ? 'calm' : cross ? 'verse' : 'intro' },
+            cross ? { gap: 1, fadeIn: 1, cross: true } : calm ? { gap: 1.2, fadeIn: 2.5 } : { gap: 0.3, fadeIn: 0.4 });
+        } catch (x) { console.error('music: ' + (x && x.message)); }
+      }
+      function musicPiece(k) {
+        if (!ADV_MUSIC.PIECES[k] || k === G.piece) return;
+        G.piece = k; setPiece(k);
+        try { localStorage.setItem('adv-music-piece', k); } catch (x) {}
+        if (G.phase === 'run') musicPlay(false, true);
+        else if (G.phase === 'over' || G.phase === 'dying') musicPlay(true, true);
+      }
+      function musicFollow() {
+        if (G.music && window.ArcadeMusic) window.ArcadeMusic.setIntensity(advMusicIntensity(G.s));
+      }
+      function musicLoss(v) {
+        const k = advMusicHit(v, G.s.n);
+        if (k > 0 && G.music && window.ArcadeMusic) window.ArcadeMusic.impact(k);
+      }
+      function musicToggle() {
+        const on = !G.music;
+        G.music = on; setMusic(on);
+        try { localStorage.setItem('adv-music', on ? '1' : '0'); } catch (x) {}
+        if (!window.ArcadeMusic) return;
+        if (!on) window.ArcadeMusic.stop(0.3);
+        else if (G.phase === 'run') musicPlay(false);
+        else if (G.phase === 'over' || G.phase === 'dying') musicPlay(true);
       }
 
       /* ---------- drawing helpers ---------- */
@@ -659,17 +886,125 @@
 
       /* ---------- scenery ---------- */
 
+      /* An ellipse lying flat at height h, rx metres across and rz metres
+         along the track, added to the current path. */
+      function flat(ctx, x, z, h, rx, rz) {
+        const c = proj(x, z, h), f = proj(x, z + rz, h), n = proj(x, Math.max(z - rz, -ADV.CAM * 0.7), h);
+        const ex = Math.max(0.5, rx * c.m), ey = Math.max(0.3, (n.y - f.y) / 2), cy = (f.y + n.y) / 2;
+        ctx.moveTo(c.x + ex, cy); ctx.ellipse(c.x, cy, ex, ey, 0, 0, TAU);
+      }
+      /* A soft blob of one colour that fades out to its rim. The gradient is
+         made once per colour in unit size and stretched into place. */
+      function blob(ctx, x, y, rx, ry, rgb, a) {
+        const B = G.blobs || (G.blobs = {});
+        let g = B[rgb];
+        if (!g) {
+          g = B[rgb] = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+          g.addColorStop(0, 'rgba(' + rgb + ',1)'); g.addColorStop(0.5, 'rgba(' + rgb + ',.5)'); g.addColorStop(1, 'rgba(' + rgb + ',0)');
+        }
+        if (rx < 0.5 || ry < 0.5) return;
+        const al = ctx.globalAlpha;
+        ctx.save(); ctx.globalAlpha = al * a; ctx.translate(x, y); ctx.scale(rx, ry);
+        ctx.fillStyle = g; ctx.fillRect(-1, -1, 2, 2);
+        ctx.restore();
+      }
+
       function drawSea(ctx, s) {
-        const W = G.W, H = G.H, D = -14;   // the water lies 14 m below the deck
+        const W = G.W, H = G.H, R = ADV.ROAD, D = -14;   // the water lies 14 m below the deck
+        const vis = (p, r) => p.x + r > -20 && p.x - r < W + 20;
+        /* far off the water mirrors the sky and turns pale, close below it is deep */
         const g = ctx.createLinearGradient(0, 0, 0, H);
-        g.addColorStop(0, '#4a9cbf'); g.addColorStop(1, '#1c5a84');
+        g.addColorStop(0, '#86d0e0'); g.addColorStop(0.28, '#4499c2'); g.addColorStop(0.7, '#21659a'); g.addColorStop(1, '#16466f');
         ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
-        /* swell: long dark bands that drift past */
-        ctx.strokeStyle = 'rgba(10,50,90,.16)';
-        for (let k = Math.floor((s.dist + 170) / 9); k * 9 > s.dist + 6; k--) {
-          const p = proj(0, k * 9 - s.dist, D);
-          ctx.lineWidth = Math.max(1, 1.4 * p.m);
-          ctx.beginPath(); ctx.moveTo(-20, p.y); ctx.lineTo(W + 20, p.y); ctx.stroke();
+        /* The sun's path. The sun stands ahead and to the right, far away, so
+           its glitter stays put on the screen while the water runs through it. */
+        const sunX = G.cx + 0.34 * W;
+        blob(ctx, sunX, -H * 0.05, W * 0.32, H * 0.7, '255,246,206', 0.55);
+        /* cloud shadows drift slowly across the water */
+        const e = s.dist - s.t * 1.6;
+        for (let k = Math.floor((e + 200) / 60); k * 60 > e - 50; k--) {
+          const z = k * 60 + 30 * h01(k, 62) - e, x = -30 + 60 * h01(k, 61);
+          if (z < -12) continue;
+          const c = proj(x, z, D), f = proj(x, z + 9, D);
+          const rx = (9 + 8 * h01(k, 63)) * c.m;
+          if (vis(c, rx)) blob(ctx, c.x, (c.y + f.y) / 2, rx, Math.max(2, c.y - f.y) * 1.3, '8,44,84', 0.24);
+        }
+        /* swell: short wave crests, world-fixed, so they run past with the track */
+        ctx.lineCap = 'round';
+        for (const pass of [0, 1]) {
+          ctx.strokeStyle = pass ? 'rgba(220,245,255,.22)' : 'rgba(10,50,90,.2)';
+          ctx.lineWidth = pass ? 1 : 1.3;
+          ctx.beginPath();
+          for (let k = Math.floor((s.dist + 170) / 4); k * 4 > s.dist + 4; k--) {
+            for (let q = 0; q < 7; q++) {
+              const u = h01(k, q + 200);
+              if (pass && u > 0.35) continue;
+              const side = q % 2 ? 1 : -1, x = side * (R + 1 + 44 * h01(k, q + 210)), z = k * 4 + 4 * h01(k, q + 220) - s.dist;
+              const p = proj(x, z, D), l = (0.7 + 1.1 * u) * p.m;
+              if (l < 2 || !vis(p, l)) continue;
+              const y = p.y - (pass ? 0.25 * p.m : 0);
+              ctx.moveTo(p.x - l, y); ctx.quadraticCurveTo(p.x, y + l * (pass ? -0.3 : 0.3), p.x + l, y);
+            }
+          }
+          ctx.stroke();
+        }
+        /* the deck throws its shadow on the water to the left, so the road floats above the sea */
+        ctx.fillStyle = 'rgba(6,30,62,.3)';
+        quad(ctx, proj(-R - 6, -6, D), proj(-R + 1, -6, D), proj(-R + 1, 180, D), proj(-R - 6, 180, D)); ctx.fill();
+        /* small islands further out: shallows, surf, a sandy rim, a wooded hump, palms */
+        for (let k = Math.floor((s.dist + 210) / 70); k * 70 > s.dist - 40; k--) {
+          if (h01(k, 71) > 0.6) continue;
+          const side = h01(k, 72) < 0.5 ? -1 : 1, r = 4 + 4 * h01(k, 73);
+          const x = side * (R + 7 + r + 12 * h01(k, 74)), z = k * 70 + 30 * h01(k, 75) - s.dist;
+          if (z < -8) continue;
+          const c = proj(x, z, D);
+          if (!vis(c, r * 1.8 * c.m)) continue;
+          ctx.fillStyle = 'rgba(110,220,215,.42)'; ctx.beginPath(); flat(ctx, x, z, D, r * 1.7, r * 1.25); ctx.fill();
+          ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.beginPath(); flat(ctx, x, z, D, r * 1.14, r * 0.86); ctx.fill();
+          ctx.fillStyle = '#ecdba8'; ctx.beginPath(); flat(ctx, x, z, D, r, r * 0.75); ctx.fill();
+          const f = proj(x, z + r * 0.55, D), n = proj(x, z - r * 0.55, D), cy = (f.y + n.y) / 2, ry = (n.y - f.y) / 2;
+          const rx = r * 0.72 * c.m, hh = (1.6 + 2.6 * h01(k, 76)) * c.m;
+          /* the hump: shaded on the left, lit on the right */
+          ctx.fillStyle = '#2f7444';
+          ctx.beginPath(); ctx.ellipse(c.x, cy, rx, hh, 0, Math.PI, TAU); ctx.ellipse(c.x, cy, rx, ry, 0, 0, Math.PI); ctx.fill();
+          ctx.fillStyle = '#4f9f52';
+          ctx.beginPath(); ctx.ellipse(c.x + rx * 0.18, cy - hh * 0.08, rx * 0.74, hh * 0.86, 0, Math.PI, TAU); ctx.ellipse(c.x + rx * 0.18, cy - hh * 0.08, rx * 0.74, ry * 0.5, 0, 0, Math.PI); ctx.fill();
+          ctx.fillStyle = 'rgba(200,240,160,.35)';
+          ctx.beginPath(); ctx.ellipse(c.x + rx * 0.35, cy - hh * 0.55, rx * 0.3, hh * 0.25, 0, 0, TAU); ctx.fill();
+          /* palms on the beach */
+          const np = 1 + Math.floor(2.5 * h01(k, 77));
+          for (let i = 0; i < np; i++) {
+            const a = (i + 0.5) / np * 2.4 - 1.2 + 0.4 * h01(k, 80 + i), px = x + Math.sin(a) * r * 0.82, pz = z - Math.cos(a) * r * 0.55;
+            const b = proj(px, pz, D), lean = (px > x ? 1 : -1) * 0.9, th = (2.6 + 1.2 * h01(k, 90 + i));
+            const t = proj(px + lean, pz, D + th);
+            ctx.strokeStyle = '#8a6a44'; ctx.lineWidth = Math.max(1, 0.2 * b.m);
+            ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.quadraticCurveTo(b.x, (b.y + t.y) / 2, t.x, t.y); ctx.stroke();
+            ctx.strokeStyle = '#2f8a3e'; ctx.lineWidth = Math.max(1.2, 0.32 * b.m);
+            ctx.beginPath();
+            for (let j = 0; j < 5; j++) {
+              const an = -2.6 + j * 1.3 + h01(k, 100 + i * 5 + j) * 0.4, l = 1.5 * b.m;
+              ctx.moveTo(t.x, t.y); ctx.quadraticCurveTo(t.x + Math.cos(an) * l * 0.6, t.y - l * 0.45 + Math.sin(an) * l * 0.2, t.x + Math.cos(an) * l, t.y + l * 0.25 + Math.abs(Math.sin(an)) * l * 0.2);
+            }
+            ctx.stroke();
+          }
+        }
+        /* two motorboats coming the other way, each with its wake */
+        for (let i = 0; i < 2; i++) {
+          const x = (i ? 1 : -1) * (R + 9 + 5 * i), z = ((210 - 120 * i - s.t * 7 - s.dist) % 240 + 240) % 240 - 40;
+          if (z < -10 || z > 175) continue;
+          const c = proj(x, z, D);
+          if (!vis(c, 4 * c.m)) continue;
+          ctx.fillStyle = 'rgba(255,255,255,.2)';
+          quad(ctx, proj(x - 0.6, z + 1, D), proj(x - 4.5, z + 22, D), proj(x + 4.5, z + 22, D), proj(x + 0.6, z + 1, D)); ctx.fill();
+          ctx.fillStyle = 'rgba(255,255,255,.55)';
+          quad(ctx, proj(x - 0.5, z + 1.6, D), proj(x - 1.1, z + 12, D), proj(x + 1.1, z + 12, D), proj(x + 0.5, z + 1.6, D)); ctx.fill();
+          ctx.beginPath(); flat(ctx, x, z - 0.2, D, 1.1, 0.7); ctx.fill();
+          ctx.fillStyle = i ? '#e5484d' : '#f4f1e8';
+          ctx.beginPath();
+          [[-0.6, 2.4], [0.6, 2.4], [0.6, -0.6], [0, -1.5], [-0.6, -0.6]].forEach((q, j) => { const p = proj(x + q[0], z + q[1], D + 0.3); if (j) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); });
+          ctx.closePath(); ctx.fill();
+          const w0 = proj(x - 0.4, z + 0.6, D + 1.1), w1 = proj(x + 0.4, z + 1.6, D + 0.3);
+          ctx.fillStyle = '#26394f'; ctx.fillRect(w0.x, w0.y, w1.x - w0.x, w1.y - w0.y);
         }
         /* sailing boats at anchor */
         for (let k = Math.floor((s.dist + 160) / 34); k * 34 > s.dist + 14; k--) {
@@ -690,34 +1025,164 @@
             ctx.strokeStyle = '#5a4634'; ctx.lineWidth = Math.max(1, 0.1 * a.m); line(ctx, a, b);
           }
         }
-        /* glints on the water: short bright strokes that come and go */
-        ctx.strokeStyle = 'rgba(255,255,255,.42)'; ctx.lineWidth = 1.2; ctx.lineCap = 'round';
-        ctx.beginPath();
+        /* Glints: short bright strokes that fade in and out, each on its own
+           phase. A glint's strength is a smoothstep of a sine of game time; it
+           shortens with it and goes into one of a few alpha steps, one stroke
+           per step, so the fade costs no gradient and no extra path per glint. */
+        const NB = 6, bins = G.glintBins || (G.glintBins = Array.from({ length: NB }, () => []));
+        const fade = (v, th, wd) => { const e = advClamp((v - th) / wd, 0, 1); return e * e * (3 - 2 * e); };
+        const put = (p, len, a) => {
+          if (a <= 0.02) return;
+          const b = bins[Math.min(NB - 1, Math.floor(a * NB))], l = len * (0.45 + 0.55 * a);
+          b.push(p.x - l / 2, p.x + l / 2, p.y);
+        };
+        const flush = (col, lw) => {
+          ctx.strokeStyle = col; ctx.lineWidth = lw;
+          for (let i = 0; i < NB; i++) {
+            const b = bins[i];
+            if (!b.length) continue;
+            ctx.globalAlpha = (i + 1) / NB;
+            ctx.beginPath();
+            for (let j = 0; j < b.length; j += 3) { ctx.moveTo(b[j], b[j + 2]); ctx.lineTo(b[j + 1], b[j + 2]); }
+            ctx.stroke();
+            b.length = 0;
+          }
+          ctx.globalAlpha = 1;
+        };
+        ctx.lineCap = 'round';
+        /* all over the water: each glint shows for about 2 s of every 3.7, fading in and out over about 0.35 s */
         for (let k = Math.floor((s.dist + 10) / 5); k * 5 < s.dist + 175; k++) {
           for (let q = 0; q < 6; q++) {
             const u = h01(k, q);
-            if (Math.sin(s.t * 1.7 + u * 50) < -0.15) continue;
+            const a = fade(Math.sin(s.t * 1.7 + u * 50), -0.15, 0.6);
+            if (a <= 0.02) continue;
             const p = proj((q % 2 ? 1 : -1) * (4.3 + 38 * u), k * 5 + 5 * h01(k, q + 50) - s.dist, D);
             if (p.y < -4 || p.y > H + 4) continue;
-            const len = (0.8 + 2 * h01(k, q + 90)) * p.m;
-            ctx.moveTo(p.x - len / 2, p.y); ctx.lineTo(p.x + len / 2, p.y);
+            put(p, (0.8 + 2 * h01(k, q + 90)) * p.m, a);
           }
         }
-        ctx.stroke();
+        flush('rgba(255,255,255,.42)', 1.2);
+        /* in the sun's path the glitter is denser and brighter: each shows for about 1.1 s of every 2.9, fading over about 0.3 s */
+        for (let k = Math.floor((s.dist + 8) / 3); k * 3 < s.dist + 175; k++) {
+          for (let q = 0; q < 5; q++) {
+            const u = h01(k, q + 300);
+            const a = fade(Math.sin(s.t * 2.2 + u * 70), 0.35, 0.5);
+            if (a <= 0.02) continue;
+            const z = k * 3 + 3 * h01(k, q + 310) - s.dist, sc = advScale(z), m = G.ppm * sc;
+            /* spread around the sun's column on the screen, narrow far off and wide close by */
+            const sxp = sunX + (h01(k, q + 320) - 0.5) * W * (0.12 + 0.35 * sc);
+            const x = (sxp - G.cx) / m;
+            if (Math.abs(x) < R) continue;   // under the deck, hidden anyway
+            const p = proj(x, z, D);
+            if (p.y < -4 || p.y > H + 4) continue;
+            put(p, (0.6 + 1.6 * h01(k, q + 330)) * p.m, a);
+          }
+        }
+        flush('rgba(255,253,236,.9)', 1.4);
+      }
+
+      /* A sandstone butte: a block that narrows towards its top, banded with
+         strata. The sun stands to the right, so a butte left of the road shows
+         a lit face to the road and one on the right a shaded one. */
+      function butte(ctx, b) {
+        const { side, xi, xo, z0, z1, hh } = b, ti = 0.14 * Math.min(Math.abs(xo - xi), z1 - z0);
+        const xit = xi + side * ti, xot = xo - side * ti, z0t = z0 + ti, z1t = z1 - ti;
+        const L = Math.min(xi, xo), Rr = Math.max(xi, xo);
+        /* its shadow falls to the left */
+        ctx.fillStyle = 'rgba(110,55,10,.24)';
+        ctx.beginPath();
+        const s0 = proj(L, z0, 0), s1 = proj(L - hh * 1.1, z0 + hh * 0.5, 0), s2 = proj(L - hh * 1.1, z1 + hh * 0.5, 0), s3 = proj(L, z1, 0);
+        ctx.moveTo(s0.x, s0.y); ctx.lineTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y); ctx.lineTo(s3.x, s3.y); ctx.closePath(); ctx.fill();
+        /* the face towards the road, then the front, then the top */
+        ctx.fillStyle = side < 0 ? '#df9862' : '#a35a37';
+        quad(ctx, proj(xi, z0, 0), proj(xi, z1, 0), proj(xit, z1t, hh), proj(xit, z0t, hh)); ctx.fill();
+        ctx.fillStyle = '#c87a4b';
+        quad(ctx, proj(L, z0, 0), proj(Rr, z0, 0), proj(Math.max(xit, xot), z0t, hh), proj(Math.min(xit, xot), z0t, hh)); ctx.fill();
+        /* strata: darker bands round the two visible faces */
+        ctx.strokeStyle = 'rgba(110,45,20,.3)';
+        for (const f of [0.32, 0.6, 0.82]) {
+          const h = hh * f, xa = xi + side * ti * f, xb = xo - side * ti * f, za = z0 + ti * f, zb = z1 - ti * f;
+          const p0 = proj(xb, za, h), p1 = proj(xa, za, h), p2 = proj(xa, zb, h);
+          ctx.lineWidth = Math.max(0.8, 0.09 * p1.m);
+          ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+        }
+        ctx.fillStyle = '#eab27c';
+        quad(ctx, proj(xit, z0t, hh), proj(xot, z0t, hh), proj(xot, z1t, hh), proj(xit, z1t, hh)); ctx.fill();
+        /* a lit rim along the top edge */
+        ctx.strokeStyle = 'rgba(255,226,180,.7)';
+        const r0 = proj(xot, z0t, hh), r1 = proj(xit, z0t, hh), r2 = proj(xit, z1t, hh);
+        ctx.lineWidth = Math.max(0.8, 0.07 * r1.m);
+        ctx.beginPath(); ctx.moveTo(r0.x, r0.y); ctx.lineTo(r1.x, r1.y); ctx.lineTo(r2.x, r2.y); ctx.stroke();
       }
 
       function drawDesert(ctx, s) {
         const W = G.W, H = G.H, R = ADV.ROAD, D = -0.3;
+        const vis = (p, r) => p.x + r > -20 && p.x - r < W + 20;
+        /* paler and warmer far off, deeper ochre close by */
         const g = ctx.createLinearGradient(0, 0, 0, H);
-        g.addColorStop(0, '#e6c48f'); g.addColorStop(1, '#cfa268');
+        g.addColorStop(0, '#f1d6a4'); g.addColorStop(0.45, '#e2bb82'); g.addColorStop(1, '#c99760');
         ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+        /* Dunes: a lit crest with its shaded lee crescent on the left, away from the sun */
+        for (let k = Math.floor((s.dist + 180) / 16); k * 16 > s.dist - 24; k--) {
+          for (const side of [-1, 1]) {
+            if (h01(k, side + 40) > 0.75) continue;
+            const L = 3.5 + 4 * h01(k, side + 41), rz = 1.8 + 1.8 * h01(k, side + 42);
+            const x = side * (R + 1.5 + L * 0.5 + 15 * h01(k, side + 43)), z = k * 16 + 10 * h01(k, side + 44) - s.dist;
+            if (z < -14) continue;
+            const c = proj(x, z, D);
+            if (!vis(c, L * c.m)) continue;
+            /* a hump: its footprint below, its height above, the lee half in shade */
+            const f = proj(x, z + rz, D), n = proj(x, z - rz, D), cy = (f.y + n.y) / 2, ry = (n.y - f.y) / 2;
+            const rx = L * 0.5 * c.m, hh = (1.4 + 1.4 * h01(k, side + 45)) * c.m;
+            ctx.fillStyle = 'rgba(120,70,25,.2)';
+            ctx.beginPath(); ctx.ellipse(c.x - rx * 0.25, cy + ry * 0.1, rx * 1.05, ry, 0, 0, TAU); ctx.fill();
+            ctx.fillStyle = '#c88c50';
+            ctx.beginPath(); ctx.ellipse(c.x, cy, rx, hh, 0, Math.PI, TAU); ctx.ellipse(c.x, cy, rx, ry, 0, 0, Math.PI); ctx.fill();
+            ctx.fillStyle = '#f6dcab';
+            ctx.beginPath(); ctx.moveTo(c.x - rx * 0.12, cy - hh); ctx.ellipse(c.x, cy, rx, hh, 0, -Math.PI / 2 - 0.12, 0);
+            ctx.ellipse(c.x, cy, rx, ry, 0, 0, Math.PI * 0.42); ctx.quadraticCurveTo(c.x - rx * 0.32, cy - hh * 0.2, c.x - rx * 0.12, cy - hh); ctx.fill();
+            /* the sharp crest where light meets shade */
+            ctx.strokeStyle = 'rgba(255,246,220,.8)'; ctx.lineWidth = Math.max(1, 0.1 * c.m);
+            ctx.beginPath(); ctx.moveTo(c.x - rx * 0.12, cy - hh); ctx.quadraticCurveTo(c.x - rx * 0.32, cy - hh * 0.2, c.x + rx * Math.cos(Math.PI * 0.42), cy + ry * Math.sin(Math.PI * 0.42)); ctx.stroke();
+          }
+        }
+        /* wind ripples in the sand, one path for all of them */
+        ctx.strokeStyle = 'rgba(150,96,44,.18)'; ctx.lineCap = 'round';
+        ctx.beginPath();
+        for (let k = Math.floor((s.dist + 120) / 2.5); k * 2.5 > s.dist - 7; k--) {
+          for (let q = 0; q < 4; q++) {
+            const side = q % 2 ? 1 : -1, x = side * (R + 0.9 + 22 * h01(k, q + 50)), z = k * 2.5 + 2.5 * h01(k, q + 51) - s.dist;
+            const p = proj(x, z, D), l = (0.5 + 0.8 * h01(k, q + 52)) * p.m;
+            if (l < 2 || !vis(p, l)) continue;
+            ctx.moveTo(p.x - l, p.y); ctx.quadraticCurveTo(p.x - l * 0.5, p.y - l * 0.18, p.x, p.y); ctx.quadraticCurveTo(p.x + l * 0.5, p.y + l * 0.18, p.x + l, p.y);
+          }
+        }
+        ctx.lineWidth = 1.1; ctx.stroke();
+        /* the buttes in view, far to near; they get drawn in turn with the small things */
+        const bs = [];
+        for (let k = Math.floor((s.dist + 170) / 34); k * 34 > s.dist - 30; k--) {
+          for (const side of [1, -1]) {
+            if (h01(k, side + 60) > 0.6) continue;
+            const xi = side * (R + 3.5 + 6 * h01(k, side + 61)), xo = xi + side * (5 + 5 * h01(k, side + 62));
+            const z0 = k * 34 + 20 * h01(k, side + 63) - s.dist, z1 = z0 + 4 + 5 * h01(k, side + 64);
+            if (z1 < -10) continue;
+            const c = proj(xi, z0, 0);
+            if ((side > 0 && c.x > W + 20) || (side < 0 && c.x < -20)) continue;
+            bs.push({ side, xi, xo, z0, z1, hh: 2.4 + 2.6 * h01(k, side + 65) });
+          }
+        }
+        bs.sort((a, b) => b.z0 - a.z0);
+        let bi = 0;
         for (let k = Math.floor((s.dist + 150) / 3); k * 3 > s.dist - 7; k--) {
+          while (bi < bs.length && bs[bi].z0 > k * 3 - s.dist) butte(ctx, bs[bi++]);
           for (const side of [-1, 1]) {
             const u = h01(k, side + 3);
             if (u > 0.8) continue;
             const x = side * (R + 1.2 + 24 * Math.pow(h01(k, side + 5), 1.5)), z = k * 3 + 3 * h01(k, side + 9) - s.dist;
             const p = proj(x, z, D), sz = (0.5 + 1.1 * h01(k, side + 21)) * p.m;
             if (p.x < -40 || p.x > W + 40) continue;
+            /* nothing grows inside a butte */
+            if (u >= 0.3 && bs.some((b) => b.side === side && Math.abs(x) > Math.abs(b.xi) - 0.8 && Math.abs(x) < Math.abs(b.xo) + 0.8 && z > b.z0 - 1.5 && z < b.z1 + 0.8)) continue;
             if (u < 0.3) {
               /* a patch of darker sand */
               ctx.fillStyle = 'rgba(150,100,50,.14)';
@@ -753,11 +1218,31 @@
             }
           }
         }
+        while (bi < bs.length) butte(ctx, bs[bi++]);
       }
 
+      const NEON = ['255,70,170', '70,226,255', '176,120,255', '255,186,70'];
       function drawCity(ctx, s) {
         const W = G.W, H = G.H, R = ADV.ROAD, D = -36, CELL = 15;
-        ctx.fillStyle = '#060a13'; ctx.fillRect(-20, -20, W + 40, H + 40);
+        /* the street far below; far off the city's own light hangs in the air */
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, '#1b1838'); g.addColorStop(0.4, '#0b0f1f'); g.addColorStop(1, '#05080f');
+        ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+        /* cross streets glow between the blocks, cars run along them */
+        for (let k = Math.floor((s.dist + 175) / CELL); k * CELL > s.dist - 22; k--) {
+          const z = k * CELL + 0.4 - s.dist;
+          if (z < -12) continue;
+          const c = proj(0, z, D), f = proj(0, z + 1.6, D);
+          blob(ctx, G.cx, (c.y + f.y) / 2, W * 0.75, Math.max(2, (c.y - f.y) * 2.2), '255,150,70', 0.22);
+          ctx.fillStyle = 'rgba(255,214,150,.8)';
+          for (let q = 0; q < 6; q++) {
+            const side = q % 2 ? 1 : -1, dir = h01(k, q + 40) < 0.5 ? 1 : -1;
+            const x = side * (R + 1 + (((h01(k, q + 41) * 40 + dir * s.t * (5 + 4 * h01(k, q + 42))) % 40) + 40) % 40);
+            const p = proj(x, z + 0.8, D), r = Math.max(0.8, 0.22 * p.m);
+            ctx.fillStyle = dir * side > 0 ? 'rgba(255,110,80,.7)' : 'rgba(255,240,200,.95)';
+            ctx.fillRect(p.x - r, p.y - r * 0.5, r * 2, r);
+          }
+        }
         for (let k = Math.floor((s.dist + 175) / CELL); k * CELL > s.dist - 22; k--) {
           for (const col of [1, 0]) for (const side of [-1, 1]) {
             const id = k * 4 + col * 2 + (side > 0 ? 1 : 0);
@@ -771,11 +1256,32 @@
             const xl = Math.min(a.x, b.x), wp = Math.abs(b.x - a.x);
             if (xl > W + 10 || xl + wp < -10 || a1.y > H + 10) continue;
             const fh = (top - D) * a.m;
-            /* the wall facing the road */
-            ctx.fillStyle = '#0d1422';
+            /* The walls are lit from above by the city and sink into the dark
+               street below: one gradient by height serves both walls. */
+            const wg = ctx.createLinearGradient(0, a.y, 0, a.y + Math.min(fh, 26 * a.m));
+            wg.addColorStop(0, '#1a2440'); wg.addColorStop(1, '#070b16');
+            /* the wall facing the road, with a few lit windows of its own */
+            ctx.fillStyle = wg;
             quad(ctx, a, a1, { x: a1.x, y: a1.y + (top - D) * a1.m }, { x: a.x, y: a.y + fh }); ctx.fill();
+            ctx.fillStyle = 'rgba(3,6,14,.4)'; ctx.fill();
+            if (!col && a.m > 2.6 && a.y < H) {
+              const nz = Math.max(2, Math.floor(dep / 2.6)), nr = Math.min(6, Math.floor((top - D) / 3));
+              ctx.fillStyle = 'rgba(255,200,120,.55)';
+              ctx.beginPath();
+              for (let r = 0; r < nr; r++) {
+                const h = top - r * 3 - 1.1;
+                for (let c = 0; c < nz; c++) {
+                  if (h01(id * 173 + r * 19 + c, 11) > 0.26) continue;
+                  const zc = z0 + (c + 0.5) * dep / nz, x = side * xi;
+                  const p0 = proj(x, zc - 0.45, h), p1 = proj(x, zc + 0.45, h), p2 = proj(x, zc + 0.45, h - 1.3), p3 = proj(x, zc - 0.45, h - 1.3);
+                  if (p0.y > H) continue;
+                  ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.lineTo(p3.x, p3.y); ctx.closePath();
+                }
+              }
+              ctx.fill();
+            }
             /* front */
-            ctx.fillStyle = '#141d30'; ctx.fillRect(xl, a.y, wp, fh);
+            ctx.fillStyle = wg; ctx.fillRect(xl, a.y, wp, fh);
             if (a.m > 2.2 && a.y < H) {
               const nc = Math.max(2, Math.floor(w / 2.4)), nr = Math.min(9, Math.floor((top - D) / 3));
               const cw = wp / nc;
@@ -784,18 +1290,50 @@
                 if (y > H) break;
                 for (let c = 0; c < nc; c++) {
                   const u = h01(id * 131 + r * 17 + c, 9);
-                  if (u > 0.34) continue;
-                  ctx.fillStyle = u < 0.2 ? 'rgba(255,206,120,.85)' : u < 0.29 ? 'rgba(140,214,255,.75)' : 'rgba(255,238,200,.5)';
+                  if (u > 0.44) continue;
+                  ctx.fillStyle = u < 0.26 ? 'rgba(255,206,120,.85)' : u < 0.37 ? 'rgba(140,214,255,.75)' : 'rgba(255,238,200,.5)';
                   ctx.fillRect(xl + (c + 0.5) * cw - 0.5 * a.m, y, 1.0 * a.m, 1.4 * a.m);
                 }
               }
             }
-            /* roof */
+            /* a neon sign on the front: a glowing bar, or a blade sign on the corner towards the road */
+            const ns = h01(id, 7);
+            if (ns < 0.4 && a.y < H && a.m > 1.6) {
+              const nc = NEON[Math.floor(h01(id, 8) * NEON.length)], fl = 0.85 + 0.15 * Math.sin(s.t * 7 + id);
+              if (ns < 0.22) {
+                const y = a.y + 1.0 * a.m, x0 = xl + wp * 0.16, bw = wp * 0.68, bh = 0.9 * a.m;
+                blob(ctx, x0 + bw / 2, y + bh / 2, bw * 0.75, bh * 2.6, nc, 0.4 * fl);
+                ctx.fillStyle = 'rgba(' + nc + ',' + (0.9 * fl).toFixed(2) + ')'; ctx.fillRect(x0, y, bw, bh);
+                ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.fillRect(x0 + bw * 0.08, y + bh * 0.38, bw * 0.84, bh * 0.24);
+              } else {
+                const x = side * (xi - 0.1), p0 = proj(x, z0 + 0.4, top - 1), p1 = proj(x, z0 + 1.4, top - 1), p2 = proj(x, z0 + 1.4, top - 7.5), p3 = proj(x, z0 + 0.4, top - 7.5);
+                blob(ctx, (p0.x + p2.x) / 2, (p0.y + p2.y) / 2, 2.2 * a.m, 4.6 * a.m, nc, 0.35 * fl);
+                ctx.fillStyle = 'rgba(' + nc + ',' + (0.9 * fl).toFixed(2) + ')'; quad(ctx, p0, p1, p2, p3); ctx.fill();
+                ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = Math.max(1, 0.12 * a.m); line(ctx, { x: (p0.x + p1.x) / 2, y: p0.y + 0.6 * a.m }, { x: (p2.x + p3.x) / 2, y: p2.y - 0.6 * a.m });
+              }
+            }
+            /* roof, its edges caught by the light */
             ctx.fillStyle = '#1e2b47'; quad(ctx, a, b, b1, a1); ctx.fill();
-            ctx.strokeStyle = 'rgba(120,150,210,.35)'; ctx.lineWidth = 1; line(ctx, a, b);
+            ctx.strokeStyle = 'rgba(140,170,230,.45)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(a.x, a.y); ctx.lineTo(a1.x, a1.y); ctx.stroke();
+            if (h01(id, 10) < 0.16) {
+              /* a neon outline round the roof; the wide faint stroke under it is the glow */
+              const nc = NEON[Math.floor(h01(id, 12) * NEON.length)];
+              quad(ctx, a, b, b1, a1);
+              ctx.strokeStyle = 'rgba(' + nc + ',.25)'; ctx.lineWidth = Math.max(3, 0.5 * a.m); ctx.stroke();
+              ctx.strokeStyle = 'rgba(' + nc + ',.95)'; ctx.lineWidth = Math.max(1, 0.12 * a.m); ctx.stroke();
+            }
             if (h01(id, 6) < 0.5) {
               const c0 = proj(side * (xi + w * 0.3), z0 + dep * 0.3, top), c1 = proj(side * (xi + w * 0.6), z0 + dep * 0.3, top);
               ctx.fillStyle = '#2a3a5c'; ctx.fillRect(Math.min(c0.x, c1.x), c0.y - 1.2 * c0.m, Math.abs(c1.x - c0.x), 1.2 * c0.m);
+              ctx.fillStyle = '#34476d'; ctx.fillRect(Math.min(c0.x, c1.x), c0.y - 1.2 * c0.m, Math.abs(c1.x - c0.x), 0.3 * c0.m);
+            }
+            if (h01(id, 13) < 0.3) {
+              /* a mast with a slowly pulsing light. Not red: red on this canvas means danger. */
+              const m0 = proj(side * (xi + w * 0.7), z0 + dep * 0.65, top), m1 = proj(side * (xi + w * 0.7), z0 + dep * 0.65, top + 3.5);
+              ctx.strokeStyle = '#46557a'; ctx.lineWidth = Math.max(1, 0.1 * m0.m); line(ctx, m0, m1);
+              const pl = 0.5 + 0.5 * Math.sin(s.t * 2.4 + id * 1.7);
+              blob(ctx, m1.x, m1.y, 1.4 * m0.m, 1.4 * m0.m, '190,225,255', 0.45 * pl);
+              ctx.fillStyle = 'rgba(225,240,255,' + (0.4 + 0.6 * pl).toFixed(2) + ')'; ctx.beginPath(); ctx.arc(m1.x, m1.y, Math.max(1, 0.16 * m0.m), 0, TAU); ctx.fill();
             }
           }
         }
@@ -841,6 +1379,12 @@
       function drawPoles(ctx, s) {
         const x = ADV.ROAD + 1.9, GAPP = 26;
         const wireH = (d) => { const u = ((d / GAPP) % 1 + 1) % 1; return 6.1 - 3.2 * u * (1 - u); };
+        /* heat on the far road: it mirrors the pale sky and breathes a little */
+        const mf = proj(0, 150), mn = proj(0, 36), ma = 0.5 + 0.08 * Math.sin(s.t * 2.3) + 0.04 * Math.sin(s.t * 5.7);
+        const mg = ctx.createLinearGradient(0, mf.y, 0, mn.y);
+        mg.addColorStop(0, 'rgba(214,232,240,' + ma.toFixed(3) + ')'); mg.addColorStop(1, 'rgba(214,232,240,0)');
+        ctx.fillStyle = mg;
+        quad(ctx, proj(-ADV.ROAD, 36), proj(ADV.ROAD, 36), proj(ADV.ROAD, 150), proj(-ADV.ROAD, 150)); ctx.fill();
         ctx.lineCap = 'butt';
         ctx.fillStyle = 'rgba(70,35,0,.2)';
         for (let d = Math.ceil((s.dist - 6) / GAPP) * GAPP; d < s.dist + 110; d += GAPP) {
@@ -909,13 +1453,34 @@
             quad(ctx, proj(lx - 0.07, d - s.dist), proj(lx + 0.07, d - s.dist), proj(lx + 0.07, d - s.dist + 2.2), proj(lx - 0.07, d - s.dist + 2.2)); ctx.fill();
           }
         }
-        /* the wall on both sides: its face towards the road, then its top */
+        /* worn wheel tracks down each lane, faint */
+        ctx.fillStyle = T.patch;
+        for (let l = -1; l <= 1; l++) {
+          for (const o of [-0.62, 0.62]) {
+            const x = l * ADV.LANE + o;
+            quad(ctx, proj(x - 0.22, zN), proj(x + 0.22, zN), proj(x + 0.22, zF), proj(x - 0.22, zF)); ctx.fill();
+          }
+        }
+        /* The walls darken the road at their foot. By day the right wall also
+           throws a strip of shadow, since the sun stands to the right. */
         const hw = T.wallH;
+        ctx.fillStyle = T.shadow;
+        for (const sx of [-1, 1]) {
+          const wd = sx > 0 && !T.glow ? 0.25 + hw * 0.9 : 0.18;
+          ctx.globalAlpha = sx > 0 && !T.glow ? 0.75 : 0.5;
+          quad(ctx, proj(sx * (R - wd), zN), proj(sx * R, zN), proj(sx * R, zF), proj(sx * (R - wd), zF)); ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        /* the wall on both sides: its face towards the road, then its top with a lit lip */
         for (const sx of [-1, 1]) {
           ctx.fillStyle = T.wallFace;
           quad(ctx, proj(sx * R, zN), proj(sx * R, zF), proj(sx * R, zF, hw), proj(sx * R, zN, hw)); ctx.fill();
+          ctx.fillStyle = 'rgba(0,0,0,.12)';
+          quad(ctx, proj(sx * R, zN), proj(sx * R, zF), proj(sx * R, zF, hw * 0.3), proj(sx * R, zN, hw * 0.3)); ctx.fill();
           ctx.fillStyle = T.wallTop;
           quad(ctx, proj(sx * R, zN, hw), proj(sx * R, zF, hw), proj(sx * (R + 0.38), zF, hw), proj(sx * (R + 0.38), zN, hw)); ctx.fill();
+          ctx.fillStyle = T.glow ? 'rgba(170,190,255,.25)' : 'rgba(255,255,255,.45)';
+          quad(ctx, proj(sx * R, zN, hw), proj(sx * R, zF, hw), proj(sx * (R + 0.07), zF, hw), proj(sx * (R + 0.07), zN, hw)); ctx.fill();
         }
         /* reflectors on the wall */
         for (let d = Math.floor((s.dist - 6) / 6.5) * 6.5; d < s.dist + 90; d += 6.5) {
@@ -1125,6 +1690,38 @@
         ctx.restore(); ctx.globalAlpha = al;
       }
 
+      /* A soldier of the lost squad tips over sideways, faster and faster,
+         lands with a small rebound, a puff of dust and the helmet rolling off,
+         and stays on the road. The shadow is drawn flat, not tipped along. */
+      const NO_SHADOW = { shadow: 'rgba(0,0,0,0)' };
+      function fallen(ctx, f, z, s, T) {
+        const FALL = 0.38;
+        const u = advClamp((s.t - f.t) / FALL, 0, 1), e = u * u;
+        const v = advClamp((s.t - f.t - FALL) / 0.18, 0, 1);
+        if (u >= 1 && !f.hit) {
+          f.hit = true;
+          burst(f.x + f.side * 0.5, f.d - 0.3, 0.05, 4, 'rgba(228,218,202,.8)', 1.4, 0.09, 0.3);
+          burst(f.x + f.side * 0.6, f.d - 0.3, 0.3, 1, COL.helmet, 1.6, 0.1, 0.8);
+        }
+        const p = proj(f.x + f.side * 0.15 * e, z - 0.35 * e), h = 1.55 * p.m;
+        const a = f.side * 1.45 * e * (1 - 0.07 * Math.sin(Math.PI * v));
+        shadow(ctx, p.x + f.side * h * 0.4 * e, p.y, h * (0.26 + 0.2 * e), T);
+        const al = ctx.globalAlpha;
+        ctx.globalAlpha = al * (1 - 0.2 * e);
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(a); ctx.translate(-p.x, -p.y);
+        soldier(ctx, p.x, p.y, h, { ph: null, idle: 0, kick: 0, lean: 0, shade: 0.15 + 0.35 * e, grow: 1 }, NO_SHADOW);
+        ctx.restore(); ctx.globalAlpha = al;
+      }
+
+      /* how far an enemy has its arms up after the defeat: one after another,
+         then pumping with the (slowing) game time */
+      function cheer(e) {
+        const r = (performance.now() - G.die.t0) / 1000, m = mem(e);
+        if (m.cheer === undefined) m.cheer = Math.random();
+        const k = advClamp((r - 0.5 - 0.35 * m.cheer) / 0.3, 0, 1);
+        return k * (0.8 + 0.2 * Math.sin(G.s.t * 14 + m.cheer * TAU));
+      }
+
       /* lag is the health a moment ago: the piece just shot away stays pale for a moment */
       function bar(ctx, x, y, w, h, u, txt, lag) {
         ctx.fillStyle = 'rgba(15,23,42,.85)'; rr(ctx, x - w / 2 - 1, y - 1, w + 2, h + 2, h / 2 + 1); ctx.fill();
@@ -1240,6 +1837,32 @@
         label(ctx, '−' + Math.round(ADV.SPIKE * 100) + '%', p.x, p.y, 0.62 * p.m, '#ff9da0');
       }
 
+      /* The line where enemies start to attack the squad: a faint red line
+         across the road. A lane with an enemy close to it glows red at the
+         bottom, the closer the stronger, and pulses once it is very near. */
+      function drawDanger(ctx, s) {
+        const zl = advFront(s, { r: 0.4 }), near = [Infinity, Infinity, Infinity];
+        for (const e of s.ents) {
+          if (e.k !== 'enemy' || e.dead || e.melee) continue;
+          const z = e.d - s.dist, l = advLaneOf(e.x);
+          if (z > zl && z < near[l]) near[l] = z;
+        }
+        for (let l = 0; l < 3; l++) {
+          const u = advClamp((14 - near[l]) / 11, 0, 1);
+          const x0 = advLaneX(l) - ADV.LANE / 2 + 0.06, x1 = advLaneX(l) + ADV.LANE / 2 - 0.06;
+          if (u > 0) {
+            const a = u * u * (near[l] < 5 ? 0.75 + 0.25 * Math.sin(s.t * 16) : 1);
+            const top = proj(0, zl + 3.2), bot = proj(0, -1.5);
+            const gr = ctx.createLinearGradient(0, bot.y, 0, top.y);
+            gr.addColorStop(0, 'rgba(229,72,77,' + (0.38 * a).toFixed(3) + ')'); gr.addColorStop(1, 'rgba(229,72,77,0)');
+            ctx.fillStyle = gr;
+            quad(ctx, proj(x0, -1.5), proj(x1, -1.5), proj(x1, zl + 3.2), proj(x0, zl + 3.2)); ctx.fill();
+          }
+          ctx.fillStyle = 'rgba(229,72,77,' + (0.3 + 0.6 * u).toFixed(3) + ')';
+          quad(ctx, proj(x0, zl - 0.07), proj(x1, zl - 0.07), proj(x1, zl + 0.07), proj(x0, zl + 0.07)); ctx.fill();
+        }
+      }
+
       /* the lane a roller is coming down blinks red, from the squad to the roller */
       function drawWarning(ctx, s, e, z) {
         if (e.done || z > 56) return;
@@ -1269,7 +1892,7 @@
         const ctx = cv.getContext('2d'), s = G.s, W = G.W, H = G.H, R = ADV.ROAD;
         const T = THEMES[(s.stage - 1) % THEMES.length], now = performance.now();
         let shx = 0, shy = 0;
-        if (G.shake && now - G.shake.t < 320 && G.phase === 'run') {
+        if (G.shake && now - G.shake.t < 320 && (G.phase === 'run' || G.phase === 'dying')) {
           const k = (1 - (now - G.shake.t) / 320) * G.shake.a;
           shx = Math.sin(now * 0.09) * k; shy = Math.cos(now * 0.117) * k;
         }
@@ -1291,10 +1914,11 @@
            haze's own hue, or the fade turns grey. */
         const hz = proj(0, ADV.VIEW * 0.45).y;
         const g = ctx.createLinearGradient(0, 0, 0, hz);
-        g.addColorStop(0, T.haze); g.addColorStop(0.35, T.haze + 'b0'); g.addColorStop(1, T.haze + '00');
+        g.addColorStop(0, T.haze); g.addColorStop(0.3, T.haze + '98'); g.addColorStop(1, T.haze + '00');
         ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, hz + 20);
 
         /* what lies flat on the road comes first, so that nothing stands under it */
+        if (G.phase === 'run') drawDanger(ctx, s);
         for (const e of s.ents) {
           if (e.dead) continue;
           const z = e.d - s.dist;
@@ -1317,6 +1941,7 @@
           items.push({ z: gh.d - s.dist, gh, u });
         }
         G.ghosts.length = keep;
+        if (G.die) for (const f of G.fallen) items.push({ z: f.d - s.dist, fl: f });
         /* The place of each soldier depends on how many there are. When the
            number changes, they walk to their new places. */
         const settle = 1 - Math.exp(-dt / 0.13);
@@ -1351,7 +1976,9 @@
             ctx.globalAlpha = al; ctx.fillStyle = '#fff6d8';
             ctx.beginPath(); ctx.arc(b.x, b.y, lw * 0.9, 0, TAU); ctx.fill();
           } else if (it.gh) {
-            if (z < ADV.VIEW && z > 0.3) ghost(ctx, proj(it.gh.x, z), it.gh, it.u, T);
+            if (z < ADV.VIEW && (z > 0.3 || it.gh.spent)) ghost(ctx, proj(it.gh.x, z), it.gh, it.u, T);
+          } else if (it.fl) {
+            fallen(ctx, it.fl, z, s, T);
           } else if (it.e) {
             const e = it.e;
             if (e.k === 'gate') { if (!e.used) drawGate(ctx, s, e, z); }
@@ -1371,7 +1998,18 @@
                 if (k >= 0 && k < 1) { zd = z - m.far * (1 - k) * (1 - k) * (1 - k); pose = -(1 - k) * (1 - k); }
                 else if (z < 3.5) pose = 1 - 2 * advClamp((3.5 - z) / 2.1, 0, 1);
                 else { const a = advClamp((9 - z) / 5, 0, 1); pose = a * a * (3 - 2 * a); }
+              } else if (e.melee) {
+                /* an attacker raises its arms while it winds up and strikes down with the blow */
+                if (e.blow !== undefined && s.t - e.blow < 0.18) pose = -1 + (s.t - e.blow) / 0.18;
+                else if (e.strike !== undefined) pose = 1 - advClamp((e.strike - s.t) / ADV.WIND, 0, 1);
+                else pose = 0.3;
+                /* a red ring at its feet, so it stands out among the soldiers */
+                const f = proj(e.x, z), rp = 0.5 + 0.5 * Math.sin(s.t * 18);
+                ctx.strokeStyle = 'rgba(229,72,77,' + (0.55 + 0.35 * rp).toFixed(2) + ')'; ctx.lineWidth = Math.max(1.5, 0.07 * f.m);
+                ctx.beginPath(); ctx.ellipse(f.x, f.y, (e.r + 0.25) * f.m, (e.r + 0.25) * f.m * 0.32, 0, 0, TAU); ctx.stroke();
               }
+              /* after the defeat every enemy raises its arms */
+              if (G.die) pose = Math.max(pose, cheer(e));
               const p = proj(e.x, zd);
 
               if (kind === 'boss' || kind === 'brute') {
@@ -1464,7 +2102,7 @@
 
         /* a red edge when soldiers are lost, a white wash when the stage changes */
         const hurt = 1 - (now - G.hurt) / 380;
-        if (hurt > 0 && G.phase === 'run') {
+        if (hurt > 0 && (G.phase === 'run' || G.phase === 'dying')) {
           const hg = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.75);
           hg.addColorStop(0, 'rgba(229,72,77,0)'); hg.addColorStop(1, 'rgba(229,72,77,' + (0.5 * hurt).toFixed(3) + ')');
           ctx.fillStyle = hg; ctx.fillRect(0, 0, W, H);
@@ -1472,6 +2110,25 @@
         if (G.flash && G.phase === 'run') {
           const u = 1 - (now - G.flash) / 700;
           if (u > 0) { ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * u * u).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H); }
+        }
+
+        /* the defeat: the picture darkens, the edge stays red, and one word
+           slams in. It fades as the result comes up and the picture stays dark. */
+        if (G.die) {
+          const r = (now - G.die.t0) / 1000;
+          const u = advClamp((r - 0.25) / 1.2, 0, 1), sm = u * u * (3 - 2 * u);
+          ctx.fillStyle = 'rgba(8,10,18,' + (0.38 * sm).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H);
+          const dg = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.8);
+          dg.addColorStop(0, 'rgba(229,72,77,0)'); dg.addColorStop(1, 'rgba(229,72,77,' + (0.38 * sm).toFixed(3) + ')');
+          ctx.fillStyle = dg; ctx.fillRect(0, 0, W, H);
+          const a = r - 0.45;
+          if (a > 0.16 && !G.die.slam) { G.die.slam = true; G.shake = { t: now, a: 5 }; }
+          const al = advClamp(a / 0.1, 0, 1) * advClamp((DIE + 0.3 - r) / 0.3, 0, 1);
+          if (al > 0) {
+            ctx.globalAlpha = al;
+            label(ctx, 'Overrun', G.cx, H * 0.36, W * 0.13 * (1 + 0.6 * Math.max(0, 1 - a / 0.16)), '#ff8f93');
+            ctx.globalAlpha = 1;
+          }
         }
 
         /* how far the stage has come: the boss waits at the right end */
@@ -1502,11 +2159,19 @@
           }
           else if (e.k === 'spark') burst(e.x, e.d, 0.9, 2, '#ffe9a8', 4, 0.05);
           else if (e.k === 'loss') {
+            musicLoss(e.v);
             G.fx.push({ x: e.x, d: e.d, t: s.t, txt: '−' + e.v, col: '#ff8f93', px: 0.6 + Math.min(0.5, e.v * 0.04) });
             burst(s.px, s.dist, 0.9, Math.min(14, 3 + e.v), '#7fb0ff', 3, 0.09);
             G.hurt = now;
             G.shake = { t: now, a: Math.min(9, 2.5 + e.v * 0.6) };
           }
+          /* an enemy reached the squad: a red mark over it; each blow sprays red where it lands */
+          else if (e.k === 'engage') { if (G.fx.length < 70) G.fx.push({ x: e.x, d: e.d, t: s.t, txt: '!', col: '#ff5a5f', px: e.big ? 1.1 : 0.8 }); }
+          else if (e.k === 'blow') {
+            burst(e.x, e.d, 0.8, e.big ? 8 : 5, '#ff5a5f', 4, 0.08);
+            if (G.fx.length < 70) G.fx.push({ x: e.x, d: e.d, t: s.t, col: '#ff5a5f', px: e.big ? 1.4 : 0.9 });
+          }
+          else if (e.k === 'spent') { if (G.ghosts.length < 90) G.ghosts.push({ x: e.x, d: e.d, t: s.t, big: e.big, spent: true }); }
           else if (e.k === 'gate') {
             /* a full squad turns the gate into damage, and says so */
             const txt = e.up ? '+' + Math.round((e.up - 1) * 100) + '% damage' : e.v ? (e.v > 0 ? '+' : '−') + Math.abs(e.v) : '';
@@ -1524,6 +2189,7 @@
           }
         }
         s.ev.length = 0;
+        musicFollow();
       }
 
       function hud() {
@@ -1548,7 +2214,10 @@
               if (G.s.over) break;
             }
             drain();
-            if (G.s.over) finish();
+            if (G.s.over) die();
+          } else if (G.phase === 'dying') {
+            dieStep(dt);
+            if (now - G.die.t0 >= DIE * 1000) finish();
           }
           draw(); hud();
         }
@@ -1562,7 +2231,10 @@
             if (!ev.repeat && G.phase === 'run') G.tx = advLaneX(advClamp(advLaneOf(G.tx) + (side === 'l' ? -1 : 1), 0, 2));
             if (G.phase === 'run' && k.startsWith('Arrow')) ev.preventDefault();
           } else if ((k === 'Enter' || k === ' ') && G.phase !== 'run' && !(ev.target && ev.target.closest && ev.target.closest('button, a, input, summary'))) {
-            ev.preventDefault(); start();
+            /* not during the defeat, and not in the first moment of the result:
+               a key still held from playing must not start the next run */
+            ev.preventDefault();
+            if (!ev.repeat && (G.phase === 'ready' || (G.phase === 'over' && performance.now() >= (G.lock || 0)))) start();
           }
         };
         window.addEventListener('keydown', key);
@@ -1573,6 +2245,26 @@
           cancelAnimationFrame(G.raf);
           window.removeEventListener('keydown', key); window.removeEventListener('resize', layout);
           if (ro) ro.disconnect();
+        };
+      }, []);
+
+      /* music: M toggles it, a hidden tab pauses it (the game stands still
+         then too), leaving the page stops it */
+      useEffect(() => {
+        const key = (ev) => {
+          if ((ev.key === 'm' || ev.key === 'M') && !ev.repeat && !ev.ctrlKey && !ev.metaKey && !ev.altKey) musicToggle();
+        };
+        const vis = () => {
+          const S = window.ArcadeMusic;
+          if (!S || !G.music) return;
+          if (document.hidden) S.pause(); else S.resume();
+        };
+        window.addEventListener('keydown', key);
+        document.addEventListener('visibilitychange', vis);
+        return () => {
+          window.removeEventListener('keydown', key);
+          document.removeEventListener('visibilitychange', vis);
+          if (window.ArcadeMusic) window.ArcadeMusic.stop(0.2);
         };
       }, []);
 
@@ -1597,18 +2289,26 @@
             <canvas ref=${cvRef}></canvas>
             ${phase === 'ready' && html`
               <div className="adv-over">
-                <p>Three lanes. The squad fires down the lane it stands in. Every enemy that gets past costs a soldier. Keep out of the way of spikes and rollers.</p>
+                <p>Three lanes. The squad fires down the lane it stands in. Enemies that reach the squad attack it, from any lane. Keep out of the way of spikes and rollers.</p>
                 <button className="tool-btn tool-btn-primary" onClick=${start}>Start</button>
                 ${best && html`<p className="adv-sub">Best so far: stage ${best.stage}, ${best.kills} kills.</p>`}
               </div>`}
             ${phase === 'over' && result && html`
-              <div className="adv-over">
+              <div className="adv-over adv-end">
                 <p>Overrun in stage ${result.stage} after ${result.kills} kills.</p>
                 <button className="tool-btn tool-btn-primary" onClick=${start}>Again</button>
                 ${best && html`<p className="adv-sub">Best so far: stage ${best.stage}, ${best.kills} kills.</p>`}
               </div>`}
           </div>
-          <p className="adv-hint">Mouse or finger: the squad follows the pointer. Keyboard: arrow keys or A and D move one lane per press. Enter starts a run.</p>
+          <div className="adv-music">
+            <button className=${'lang-seg' + (music ? ' active' : '')} aria-pressed=${music} onClick=${musicToggle}
+              title="Generated music. Key: M">${(music ? 'Music on' : 'Music off') + (MUSIC_LEAD != null ? ' (lead ' + MUSIC_LEAD + ')' : '')}</button>
+            <div className="seg-row" role="group" aria-label="Music style">
+              ${ADV_MUSIC.ORDER.map((k) => html`<button key=${k} className=${'lang-seg' + (piece === k ? ' active' : '')} aria-pressed=${piece === k}
+                onClick=${() => musicPiece(k)}>${ADV_MUSIC.PIECES[k].name}</button>`)}
+            </div>
+          </div>
+          <p className="adv-hint">Mouse or finger: the squad follows the pointer. Keyboard: arrow keys or A and D move one lane per press. Enter starts a run. M turns the music on or off.</p>
 
           <details className="fold">
             <summary>The rules</summary>
@@ -1616,7 +2316,7 @@
               <p>The road has three lanes. The squad walks forward and fires straight ahead, down the lane it stands in. You only choose where it stands. A shot hits the first enemy, crate or roller in its line. Gates do not stop it.</p>
               <p>A blue gate adds its number to the squad when you walk through it. A red gate takes soldiers away. Every shot that flies through a gate counts towards its next point, and each further point costs four times the shots of the last. A red gate can be shot until it turns blue. A violet gate doubles the squad and cannot be shot.</p>
               <p>A crate shows how much damage it still takes. The label above it names what is inside: a faster gun, more damage per shot, or extra soldiers. Walking into a crate costs two soldiers.</p>
-              <p>Enemies keep to their lane. Every enemy that gets past the squad costs one soldier, in whichever lane it walks. Orange enemies run. A large enemy with a bar over its head takes many shots and costs four soldiers when it gets past.</p>
+              <p>Enemies keep to their lane until they reach the squad. Then they attack it, whichever lane they came down. Each attacker strikes one soldier down and is gone. One from the squad's own lane stops in front of it and can still be shot before it strikes. One from another lane runs to the side of the squad, where the fire does not reach. A red line near the squad marks where the attacks start, and a lane glows red when an enemy comes close to it. Orange enemies run. A large enemy with a bar over its head takes many shots and strikes four times when it gets through.</p>
               <p>A spike field takes a quarter of the squad that walks over it, and at least one soldier. Shots fly over it. So a gate with spikes in its lane pays off for a small squad and costs a large one, unless you step out in time.</p>
               <p>A steel roller comes down its lane fast, and the lane blinks red ahead of it. It stops every shot and cannot be destroyed. If the squad stands in its lane when it arrives, half the squad is gone. The roller also flattens every enemy in its lane.</p>
               <p>Each stage ends with one large enemy. It cannot be walked around. Each time it reaches the squad it takes about a third of it and is thrown back.</p>
